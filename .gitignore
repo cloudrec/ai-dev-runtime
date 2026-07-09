@@ -31,3 +31,4 @@ Thumbs.db
 # Logs
 *.log
 logs/
+.ai-runtime-backups/
