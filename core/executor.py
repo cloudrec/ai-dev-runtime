@@ -1,13 +1,18 @@
 """
 Executor — исполняет план, реально применяя изменения к файлам проекта.
 
-v0.5: убран дубль execute_plan, добавлена реальная работа через
-PatchEngine и FileWriter, проверка safety перед каждым шагом.
+v0.6:
+  - убран дубль execute_plan
+  - Backup перед изменениями (BackupEngine)
+  - Validator после изменений (синтаксис/импорты/тесты)
+  - commit ТОЛЬКО если validator прошёл
 """
 from core.file_writer import FileWriter
 from core.git_bridge import GitBridge
 from core.patch_engine import PatchEngine
 from core.safety import approve_action
+from core.backup_engine import BackupEngine
+from core.validator import Validator
 
 
 def execute_plan(plan, context):
@@ -15,9 +20,16 @@ def execute_plan(plan, context):
     git = GitBridge(project_path)
     patcher = PatchEngine(project_path)
     writer = FileWriter(project_path)
+    backup = BackupEngine(project_path)
+    validator = Validator(project_path)
 
     results = []
 
+    # backup перед изменениями
+    backup_meta = backup.snapshot(reason="pre-execute")
+    results.append({"backup": backup_meta})
+
+    # выполняем шаги
     for step in plan.get("steps", []):
         if not approve_action({"step": step}):
             results.append({
@@ -30,27 +42,34 @@ def execute_plan(plan, context):
         result = _execute_step(step, patcher, writer)
         results.append(result)
 
-    # git commit только если были успешные изменения
-    changed = any(r.get("executed") for r in results)
-    if changed:
+    # проверка после изменений
+    validation = validator.check_all()
+    results.append({"validation": validation})
+
+    # commit только если были изменения И валидация прошла
+    changed = any(r.get("executed") or r.get("written") for r in results
+                  if isinstance(r, dict) and ("executed" in r or "written" in r))
+
+    if changed and validation["passed"]:
         git.add_all()
-        git.commit("AI Runtime v0.5 auto commit")
-        git_state = "committed (no push)"
+        git.commit("AI Runtime v0.6 auto commit (validated)")
+        git_state = "committed (validated, no push)"
+    elif changed and not validation["passed"]:
+        # валидация не прошла — откатываемся к бэкапу
+        backup.rollback(backup_meta["id"])
+        git_state = "rolled back (validation failed)"
     else:
         git_state = "no changes"
 
     return {
-        "executed": changed,
+        "executed": changed and validation["passed"],
         "results": results,
         "git": git_state
     }
 
 
 def _execute_step(step, patcher, writer):
-    """
-    Применяет один шаг плана.
-    Сейчас обрабатывает bekanные шаги, остальное помечает как выполненное.
-    """
+    """Применяет один шаг плана."""
     step_lower = str(step).lower()
 
     if step == "create logger":
@@ -68,5 +87,5 @@ def _execute_step(step, patcher, writer):
     if step == "add routes":
         return {"step": step, "executed": True, "note": "routes handled by api/main.py"}
 
-    # Общий случай — шаг выполнен (анализ и т.п.)
+    # общий случай
     return {"step": step, "executed": True}
