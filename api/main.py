@@ -10,20 +10,28 @@ REST API для AI Runtime Agent.
   GET  /logs              — логи
   GET  /logs/{task_id}    — логи конкретной задачи
   POST /shutdown          — остановка воркера
+
+Security:
+  - API Key через заголовок X-API-Key
+  - HMAC через X-Signature + X-Timestamp
+  - настраивается в configs/.env
 """
 import os
 import sys
 import logging
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # корень проекта в sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from runtime.engine import RuntimeEngine
 from core.task_queue import TaskQueue
+from core.security import check_api_key, check_hmac, is_public_path
 
 # ---- структурированные логи (требование 12) ----
 logging.basicConfig(
@@ -36,20 +44,60 @@ logger = logging.getLogger("ai-runtime")
 app = FastAPI(
     title="AI Runtime Agent",
     description="Сервис для управления проектами через команды",
-    version="0.5",
+    version="0.6",
 )
 
+
+# ---- Security middleware ----
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+
+        # публичные пути пропускаем
+        if is_public_path(path):
+            return await call_next(request)
+
+        # читаем тело (для HMAC нужно)
+        body = await request.body()
+
+        # проверка API Key
+        api_key = request.headers.get("x-api-key", "")
+        if not check_api_key(api_key):
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "invalid or missing API key"},
+            )
+
+        # проверка HMAC (если настроена)
+        signature = request.headers.get("x-signature", "")
+        timestamp = request.headers.get("x-timestamp", "")
+        if signature or timestamp:
+            if not check_hmac(timestamp, signature, body):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "invalid HMAC signature"},
+                )
+
+        # восстанавливаем тело для последующих обработчиков
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+        request._receive = receive
+
+        return await call_next(request)
+
+
+app.add_middleware(AuthMiddleware)
+
+# ---- движок и очередь ----
 engine = RuntimeEngine()
 
 
-# worker-функция для очереди — запускает движок
 def _worker(command: str, project_path: str):
     logger.info("executing task: %s in %s", command, project_path)
     return engine.run(command, project_path)
 
 
 queue = TaskQueue(worker_fn=_worker)
-
 START_TIME = datetime.now()
 
 
