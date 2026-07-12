@@ -53,8 +53,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
 
-        # публичные пути пропускаем
-        if is_public_path(path):
+        # публичные пути + versioned /api/v1 (own auth) пропускаем
+        if is_public_path(path) or path.startswith("/api/v1"):
             return await call_next(request)
 
         # читаем тело (для HMAC нужно)
@@ -87,6 +87,20 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(AuthMiddleware)
+
+# ---- PHASE 13: stable versioned API + persistent jobs ----
+from api.v1 import router as v1_router  # noqa: E402
+from core import job_store  # noqa: E402
+app.include_router(v1_router)
+
+
+@app.on_event("startup")
+def _phase13_startup():
+    job_store.init_db()
+    n = job_store.recover_interrupted()
+    if n:
+        logger.info(f"recovered {n} interrupted job(s) -> waiting_approval")
+
 
 # ---- движок и очередь ----
 engine = RuntimeEngine()

@@ -32,3 +32,5 @@ Thumbs.db
 *.log
 logs/
 .ai-runtime-backups/
+configs/.env
+runtime_jobs.db
