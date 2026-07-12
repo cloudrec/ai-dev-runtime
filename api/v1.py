@@ -11,7 +11,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from core import ai_planner, job_executor, job_store
+from core import ai_planner, deliver as deliver_mod, job_executor, job_store
 
 router = APIRouter(prefix="/api/v1", tags=["runtime-v1"])
 
@@ -176,3 +176,33 @@ async def artifacts(job_id: str, _: bool = Depends(_auth)):
     return {"id": job_id, "plan": j.get("plan"), "changed_files": j.get("changed_files"),
             "tests": j.get("tests"), "git_info": j.get("git_info"), "logs": j.get("logs"),
             "report_path": f"/opt/seo/reports/runtime/{job_id}.md"}
+
+
+# ── PHASE 17: deterministic delivery (merge → test → push), no AI ────────────
+class DeliverReq(BaseModel):
+    project_path: str
+    source_branch: str
+    target_branch: str = "master"
+    test_commands: Optional[list] = None
+    push: bool = False
+
+
+@router.post("/deliver")
+async def deliver(req: DeliverReq, _: bool = Depends(_auth)):
+    pp = _validate_project_path(req.project_path)
+    if _DANGEROUS_RE.search(f"{req.source_branch} {req.target_branch}"):
+        raise HTTPException(status_code=422, detail="dangerous branch name")
+    return deliver_mod.deliver(pp, req.source_branch, req.target_branch, req.test_commands, req.push)
+
+
+class RollbackReq(BaseModel):
+    project_path: str
+    target_branch: str = "master"
+    to_commit: str
+    push: bool = False
+
+
+@router.post("/rollback")
+async def rollback(req: RollbackReq, _: bool = Depends(_auth)):
+    pp = _validate_project_path(req.project_path)
+    return deliver_mod.rollback(pp, req.target_branch, req.to_commit, req.push)
