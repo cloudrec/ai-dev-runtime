@@ -8,6 +8,8 @@ import re
 import time
 from typing import Optional
 
+import asyncio
+
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
@@ -87,6 +89,22 @@ def _view(job: dict) -> dict:
 async def health():
     return {"status": "ok", "provider_available": ai_planner.available(),
             "jobs_total": len(job_store.list_jobs(limit=1000)), "version": "v1"}
+
+
+class SmokeReq(BaseModel):
+    model: Optional[str] = None
+    timeout_seconds: Optional[float] = None
+
+
+@router.post("/smoke")
+async def smoke(req: SmokeReq, _: bool = Depends(_auth)):
+    """PHASE 45 — read-only provider smoke test: one minimal, non-agentic
+    round-trip to the configured provider/model. No project_path, no file or
+    DB writes, no job created, no repository touched. Owner OS's
+    runtime_client.provider_smoke() calls this before ever dispatching a
+    coding job (retry_runtime_job). Blocking work runs in a thread so it
+    can't stall the event loop for the full hard timeout."""
+    return await asyncio.to_thread(ai_planner.smoke, req.model, req.timeout_seconds)
 
 
 class JobCreate(BaseModel):

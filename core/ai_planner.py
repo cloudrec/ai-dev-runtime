@@ -201,6 +201,61 @@ def _classify_failure(stdout: str, stderr: str, envelope: dict | None) -> str:
     return f"claude cli error: {blob.strip()[:300]}"
 
 
+def _invoke_cli(cmd: list[str], prompt: str, timeout: float, heartbeat_cb=None) -> tuple[str, str, bool, int]:
+    """Run the Claude CLI as a stateless, non-agentic subprocess (stdin prompt,
+    JSON envelope out) and return (stdout, stderr, timed_out, returncode).
+    Shared by plan() and smoke() — same isolation/kill/drain semantics for
+    both: `--tools ""` so the CLI can never act, `--setting-sources ""` +
+    `--strict-mcp-config` so the operator's live session state can't leak in,
+    a whole-process-group kill on timeout (start_new_session=True), and a
+    capped drain so a runaway response can't exhaust memory."""
+    try:
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, shell=False, start_new_session=True)
+    except FileNotFoundError:
+        raise PlannerError("provider_not_configured")
+
+    out_holder: dict = {}
+    err_holder: dict = {}
+    t_in = threading.Thread(target=_feed_stdin, args=(proc, prompt), daemon=True)
+    t_out = threading.Thread(target=lambda: out_holder.__setitem__("v", _drain(proc.stdout, _MAX_OUTPUT_BYTES)), daemon=True)
+    t_err = threading.Thread(target=lambda: err_holder.__setitem__("v", _drain(proc.stderr, _MAX_OUTPUT_BYTES)), daemon=True)
+    t_in.start()
+    t_out.start()
+    t_err.start()
+
+    start = time.monotonic()
+    timed_out = False
+    while True:
+        elapsed = time.monotonic() - start
+        remaining = timeout - elapsed
+        if remaining <= 0:
+            timed_out = True
+            _kill_process_group(proc)
+            break
+        try:
+            proc.wait(timeout=min(_HEARTBEAT_SECS, remaining))
+            # Reap the whole process group immediately on exit, not just on
+            # timeout: the CLI could exit cleanly while leaving a detached
+            # grandchild running, and that must not survive the call either
+            # (no leaked child processes). Done right after wait() returns,
+            # before anything else can block, to minimize the window in
+            # which the OS could recycle this pid for an unrelated process.
+            _kill_process_group(proc)
+            break
+        except subprocess.TimeoutExpired:
+            if heartbeat_cb:
+                try:
+                    heartbeat_cb(time.monotonic() - start)
+                except Exception:  # noqa: BLE001
+                    pass
+            continue
+
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+    return out_holder.get("v", ""), err_holder.get("v", ""), timed_out, (proc.returncode or 0)
+
+
 def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
         timeout: int | None = None, heartbeat_cb=None) -> dict:
     """heartbeat_cb(elapsed_seconds), if given, is called roughly every
@@ -235,52 +290,7 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
     cmd += ["--tools", "", "--setting-sources", "", "--strict-mcp-config", "--output-format", "json"]
     effective_timeout = _TIMEOUT if timeout is None else timeout
 
-    try:
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, shell=False, start_new_session=True)
-    except FileNotFoundError:
-        raise PlannerError("provider_not_configured")
-
-    out_holder: dict = {}
-    err_holder: dict = {}
-    t_in = threading.Thread(target=_feed_stdin, args=(proc, prompt), daemon=True)
-    t_out = threading.Thread(target=lambda: out_holder.__setitem__("v", _drain(proc.stdout, _MAX_OUTPUT_BYTES)), daemon=True)
-    t_err = threading.Thread(target=lambda: err_holder.__setitem__("v", _drain(proc.stderr, _MAX_OUTPUT_BYTES)), daemon=True)
-    t_in.start()
-    t_out.start()
-    t_err.start()
-
-    start = time.monotonic()
-    timed_out = False
-    while True:
-        elapsed = time.monotonic() - start
-        remaining = effective_timeout - elapsed
-        if remaining <= 0:
-            timed_out = True
-            _kill_process_group(proc)
-            break
-        try:
-            proc.wait(timeout=min(_HEARTBEAT_SECS, remaining))
-            # Reap the whole process group immediately on exit, not just on
-            # timeout: the CLI could exit cleanly while leaving a detached
-            # grandchild running, and that must not survive the call either
-            # (no leaked child processes). Done right after wait() returns,
-            # before anything else can block, to minimize the window in
-            # which the OS could recycle this pid for an unrelated process.
-            _kill_process_group(proc)
-            break
-        except subprocess.TimeoutExpired:
-            if heartbeat_cb:
-                try:
-                    heartbeat_cb(time.monotonic() - start)
-                except Exception:  # noqa: BLE001
-                    pass
-            continue
-
-    t_out.join(timeout=5)
-    t_err.join(timeout=5)
-    stdout = out_holder.get("v", "")
-    stderr = err_holder.get("v", "")
+    stdout, stderr, timed_out, returncode = _invoke_cli(cmd, prompt, effective_timeout, heartbeat_cb)
 
     if timed_out:
         raise PlannerError("planner timed out")
@@ -290,7 +300,7 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
     except json.JSONDecodeError:
         envelope = None
 
-    if proc.returncode != 0 or (envelope is not None and envelope.get("is_error")):
+    if returncode != 0 or (envelope is not None and envelope.get("is_error")):
         raise PlannerError(_classify_failure(stdout, stderr, envelope))
     if not stdout.strip():
         raise PlannerError("planner produced empty output")
@@ -298,3 +308,66 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
     plan_text = envelope["result"] if envelope is not None and "result" in envelope else stdout
     plan_obj = _extract_json(plan_text)
     return _validate(plan_obj, allowed_paths)
+
+
+# ── PHASE 45 — provider smoke test: one minimal, read-only, non-agentic call ──
+_SMOKE_PROMPT = "Reply with exactly one word: pong"
+_SMOKE_TIMEOUT_CAP = 60.0
+# Defense in depth on top of _classify_failure's short, non-secret error classes:
+# never let a raw provider key/token pattern reach the response, even truncated.
+_SECRET_LEAK_RE = re.compile(r"(sk-ant-[a-zA-Z0-9_-]+)|(Bearer\s+[a-zA-Z0-9._-]+)|(api[_-]?key\S*)", re.IGNORECASE)
+
+
+def _redact(text: str) -> str:
+    return _SECRET_LEAK_RE.sub("[redacted]", text or "")
+
+
+def smoke(model: str | None = None, timeout_seconds: float | None = None) -> dict:
+    """Minimal real round-trip to the configured provider. Read-only: no
+    project_path, no file/db writes, no plan, no coding job — just proves the
+    provider answers. Exactly one subprocess call, hard-capped timeout, never
+    retried internally (a caller-side retry loop is the caller's decision, not
+    this function's)."""
+    started = time.monotonic()
+    hard_timeout = min(float(timeout_seconds) if timeout_seconds else _SMOKE_TIMEOUT_CAP, _SMOKE_TIMEOUT_CAP)
+    use_model = model or _MODEL or None
+    if not available():
+        return {"ok": False, "provider": "claude-cli", "model": use_model, "latency_seconds": 0.0,
+                "tokens": None, "cost_usd": None, "error": "provider_not_configured"}
+
+    cmd = [_CLAUDE, "-p"]
+    if use_model:
+        cmd += ["--model", use_model]
+    cmd += ["--tools", "", "--setting-sources", "", "--strict-mcp-config", "--output-format", "json"]
+
+    try:
+        stdout, stderr, timed_out, returncode = _invoke_cli(cmd, _SMOKE_PROMPT, hard_timeout)
+    except PlannerError as e:
+        return {"ok": False, "provider": "claude-cli", "model": use_model,
+                "latency_seconds": round(time.monotonic() - started, 3),
+                "tokens": None, "cost_usd": None, "error": _redact(str(e))[:300]}
+
+    latency = round(time.monotonic() - started, 3)
+    if timed_out:
+        return {"ok": False, "provider": "claude-cli", "model": use_model, "latency_seconds": latency,
+                "tokens": None, "cost_usd": None, "error": f"provider smoke test timed out after {hard_timeout}s"}
+
+    try:
+        envelope = json.loads(stdout) if stdout.strip() else None
+    except json.JSONDecodeError:
+        envelope = None
+
+    if returncode != 0 or (envelope is not None and envelope.get("is_error")) or not stdout.strip():
+        return {"ok": False, "provider": "claude-cli", "model": use_model, "latency_seconds": latency,
+                "tokens": None, "cost_usd": None, "error": _redact(_classify_failure(stdout, stderr, envelope))[:300]}
+
+    usage = (envelope or {}).get("usage") or {}
+    model_usage = (envelope or {}).get("modelUsage") or {}
+    resolved_model = use_model
+    if not resolved_model and model_usage:
+        resolved_model = max(model_usage.items(), key=lambda kv: kv[1].get("outputTokens", 0))[0]
+    return {
+        "ok": True, "provider": "claude-cli", "model": resolved_model, "latency_seconds": latency,
+        "tokens": {"input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens")},
+        "cost_usd": (envelope or {}).get("total_cost_usd"), "error": None,
+    }
