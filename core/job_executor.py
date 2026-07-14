@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shlex
 import subprocess
 import threading
 
@@ -31,22 +32,41 @@ def _hash(path: str) -> str:
         return "absent"
 
 
+def _run_step(project_path: str, step: str) -> tuple[bool, str]:
+    parts = shlex.split(step)
+    if not parts:
+        return True, ""
+    p = subprocess.run(parts, cwd=project_path, capture_output=True, text=True,
+                       timeout=_TEST_TIMEOUT, shell=False)
+    return p.returncode == 0, (p.stdout + p.stderr)
+
+
 def _run_tests(project_path: str, commands: list[str]) -> dict:
+    """Each entry in `commands` may be a single command OR a `&&`-chained
+    sequence (planner-produced validation like `test -s foo && echo OK` is
+    common). Still never shell=True — each step is tokenized with shlex and
+    run as its own argv, chained steps short-circuit on the first failure
+    exactly like a real `&&` would, without ever invoking an actual shell."""
     results = []
     ok = True
     for cmd in commands[:5]:
-        parts = cmd.split()
-        if not parts:
+        steps = [s.strip() for s in cmd.split("&&") if s.strip()]
+        if not steps:
             continue
+        step_ok = True
+        output = ""
         try:
-            p = subprocess.run(parts, cwd=project_path, capture_output=True, text=True,
-                               timeout=_TEST_TIMEOUT, shell=False)
-            passed = p.returncode == 0
-            results.append({"cmd": cmd, "passed": passed, "output": (p.stdout + p.stderr)[-1500:]})
-            ok = ok and passed
+            for step in steps:
+                passed, out = _run_step(project_path, step)
+                output += out
+                if not passed:
+                    step_ok = False
+                    break
         except Exception as e:  # noqa: BLE001
-            results.append({"cmd": cmd, "passed": False, "output": str(e)[:400]})
-            ok = False
+            step_ok = False
+            output += str(e)[:400]
+        results.append({"cmd": cmd, "passed": step_ok, "output": output[-1500:]})
+        ok = ok and step_ok
     return {"ok": ok, "results": results}
 
 
