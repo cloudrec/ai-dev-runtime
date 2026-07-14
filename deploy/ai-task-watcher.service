@@ -1,0 +1,10 @@
+[Unit]
+Description=AI-task GitHub watcher (cloudrec/ai-dev-runtime, label ai-task)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/bin/python3 /usr/local/bin/ai_task_watcher.py
+Nice=10

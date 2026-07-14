@@ -121,8 +121,12 @@ def execute(job_id: str) -> None:
     # 1) PLAN
     job_store.update_job(job_id, status="planning")
     job_store.append_log(job_id, "info", "planning via AI provider")
+    def _heartbeat(elapsed: float) -> None:
+        job_store.append_log(job_id, "info", f"planning… still running ({int(elapsed)}s elapsed)")
+
     try:
-        plan = ai_planner.plan(job["goal"] or "", job["instructions"] or "", pp, job.get("allowed_paths") or [])
+        plan = ai_planner.plan(job["goal"] or "", job["instructions"] or "", pp, job.get("allowed_paths") or [],
+                               heartbeat_cb=_heartbeat)
     except ai_planner.PlannerError as e:
         if "provider_not_configured" in str(e):
             job_store.append_log(job_id, "warn", "AI provider not configured — job blocked")
@@ -191,7 +195,7 @@ def execute(job_id: str) -> None:
             fails = "\n".join(r["output"][-500:] for r in tests["results"] if not r["passed"])
             repair = ai_planner.plan(job["goal"] or "", (job["instructions"] or "") +
                                      f"\n\nThe previous attempt FAILED tests:\n{fails}\nFix it.",
-                                     pp, job.get("allowed_paths") or [])
+                                     pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat)
             _apply_files(pp, repair["files"])
         except Exception as e:  # noqa: BLE001
             job_store.append_log(job_id, "error", f"repair failed: {e}")

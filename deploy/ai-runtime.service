@@ -1,0 +1,18 @@
+[Unit]
+Description=AI Runtime Agent (FastAPI daemon)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ai-dev-runtime
+Environment="PATH=/root/ai-dev-runtime/venv/bin:/usr/local/bin:/usr/bin:/bin"
+EnvironmentFile=/root/ai-dev-runtime/configs/.env
+ExecStart=/root/ai-dev-runtime/venv/bin/uvicorn api.main:app --host 172.17.0.1 --port 8199
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/var/log/ai-runtime/service.log
+StandardError=append:/var/log/ai-runtime/service.log
+
+[Install]
+WantedBy=multi-user.target
