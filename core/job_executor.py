@@ -237,7 +237,12 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
             repair = ai_planner.plan(job["goal"] or "", (job["instructions"] or "") +
                                      f"\n\nThe previous attempt FAILED tests:\n{fails}\nFix it.",
                                      pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat)
-            _apply_files(pp, repair["files"])
+            repair_changed = _apply_files(pp, repair["files"])
+            by_path = {c["path"]: c for c in changed}
+            by_path.update({c["path"]: c for c in repair_changed})
+            changed = list(by_path.values())
+            job_store.update_job(job_id, changed_files=changed)
+            job_store.append_log(job_id, "info", f"repair applied {len(repair_changed)} file operation(s)")
         except Exception as e:  # noqa: BLE001
             job_store.append_log(job_id, "error", f"repair failed: {e}")
             break

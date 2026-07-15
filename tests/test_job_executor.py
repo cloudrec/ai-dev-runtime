@@ -1,10 +1,23 @@
 """job_executor._run_tests: `&&`-chained validation commands (issue #10 —
 planner-produced `test -s file && echo OK` was silently failing because the
 old code passed the literal string "&&" as an argv token to `test`)."""
-import tempfile
+import importlib
 import os
+import stat
+import subprocess
+import tempfile
 
-from core import job_executor
+os.environ.setdefault("RUNTIME_DB", os.path.join(tempfile.gettempdir(), "rt_test_jobs.db"))
+
+from core import ai_planner, job_executor, job_store  # noqa: E402
+
+
+def setup_module(_m):
+    try:
+        os.remove(os.environ["RUNTIME_DB"])
+    except FileNotFoundError:
+        pass
+    job_store.init_db()
 
 
 def test_single_command_still_works(tmp_path):
@@ -49,3 +62,64 @@ def test_multiple_test_commands_each_independently_chained(tmp_path):
     assert out["ok"] is False
     assert out["results"][0]["passed"] is True
     assert out["results"][1]["passed"] is False
+
+
+def _git(path, *args):
+    subprocess.run(["git", "-C", str(path)] + list(args), check=True,
+                    capture_output=True, text=True)
+
+
+def _fake_cli(tmp_path, body):
+    p = tmp_path / "fake_claude.py"
+    p.write_text("#!/usr/bin/env python3\n" + body)
+    p.chmod(p.stat().st_mode | stat.S_IEXEC)
+    return str(p)
+
+
+def test_repair_attempt_touching_a_different_file_still_gets_committed(tmp_path, monkeypatch):
+    """The initial plan creates a.txt with a test that requires b.txt, which
+    doesn't exist yet -> tests fail -> repair attempt creates b.txt (a file
+    outside the original plan). Before the fix, _apply_files()'s return value
+    for the repair attempt was discarded, so only a.txt got `git add`-ed and
+    b.txt was left as an uncommitted stray file on disk forever."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit",
+         "--allow-empty", "-m", "init")
+
+    counter = tmp_path / "calls.count"
+    cli = _fake_cli(tmp_path, f"""
+import json, os, sys
+counter = {str(counter)!r}
+n = int(open(counter).read()) if os.path.exists(counter) else 0
+n += 1
+open(counter, "w").write(str(n))
+if n == 1:
+    files = [{{"path": "a.txt", "operation": "create", "content": "A"}}]
+    test_commands = ["test -s b.txt"]
+else:
+    files = [{{"path": "b.txt", "operation": "create", "content": "B"}}]
+    test_commands = []
+result = json.dumps({{"summary": "s", "files": files, "test_commands": test_commands}})
+envelope = {{"type": "result", "subtype": "success", "is_error": False, "result": result}}
+sys.stdout.write(json.dumps(envelope))
+""")
+    monkeypatch.setenv("RUNTIME_CLAUDE_BIN", cli)
+    monkeypatch.setenv("RUNTIME_PLAN_TIMEOUT", "15")
+    importlib.reload(ai_planner)
+
+    job = job_store.create_job(project_path=str(repo), goal="g", instructions="i",
+                               autonomy_level="execute_safe", auto_commit=True, auto_push=False)
+    job_executor.execute(job["id"])
+
+    final = job_store.get_job(job["id"])
+    assert final["status"] == "completed", final.get("error")
+    assert {c["path"] for c in final["changed_files"]} == {"a.txt", "b.txt"}
+
+    branch = final["git_info"]["branch"]
+    committed = subprocess.run(["git", "-C", str(repo), "show", "--stat", branch],
+                               capture_output=True, text=True, check=True).stdout
+    assert "a.txt" in committed and "b.txt" in committed
+    from core import git_write
+    assert not any(p.endswith("a.txt") or p.endswith("b.txt") for p in git_write.dirty_files(str(repo)))
