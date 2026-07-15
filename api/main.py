@@ -94,12 +94,36 @@ from core import job_store  # noqa: E402
 app.include_router(v1_router)
 
 
+import os as _os  # noqa: E402
+import threading as _threading  # noqa: E402
+import time as _time  # noqa: E402
+
+_REAP_INTERVAL_SECS = int(_os.getenv("RUNTIME_REAP_INTERVAL_SECS", "30"))
+
+
+def _reaper_loop():
+    """Periodically reap orphaned jobs (worker died mid-stage, heartbeat stale).
+    Boot-time recover_interrupted() alone cannot catch a job orphaned WITHOUT a
+    restart — this loop guarantees no job stays indefinitely in `backing_up`
+    (or any interruptible stage)."""
+    while True:
+        _time.sleep(_REAP_INTERVAL_SECS)
+        try:
+            n = job_store.reap_orphaned()
+            if n:
+                logger.warning(f"reaped {n} orphaned job(s) -> failed (stale heartbeat)")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"reaper error: {e}")
+
+
 @app.on_event("startup")
 def _phase13_startup():
     job_store.init_db()
     n = job_store.recover_interrupted()
     if n:
         logger.info(f"recovered {n} interrupted job(s) -> waiting_approval")
+    _threading.Thread(target=_reaper_loop, name="job-reaper", daemon=True).start()
+    logger.info(f"orphan reaper started (every {_REAP_INTERVAL_SECS}s)")
 
 
 # ---- движок и очередь ----
