@@ -18,6 +18,9 @@ from core.file_engine import FileEngine
 AUTONOMY_ORDER = ["observe", "suggest", "prepare", "execute_safe", "execute_full", "deploy"]
 _MAX_REPAIRS = int(os.getenv("RUNTIME_MAX_REPAIRS", "1"))
 _TEST_TIMEOUT = int(os.getenv("RUNTIME_TEST_TIMEOUT", "300"))
+# comfortably under job_store._HEARTBEAT_STALE_SECS (20s) so a live job never
+# looks orphaned to recover_interrupted(), even during a long silent test run.
+_HEARTBEAT_INTERVAL_SECS = int(os.getenv("RUNTIME_HEARTBEAT_INTERVAL_SECS", "5"))
 
 
 def _idx(level: str) -> int:
@@ -138,6 +141,22 @@ def execute(job_id: str) -> None:
     pp = job["project_path"]
     job_store.update_job(job_id, started_at=job_store._now())
 
+    stop_heartbeat = threading.Event()
+
+    def _pulse() -> None:
+        while not stop_heartbeat.wait(_HEARTBEAT_INTERVAL_SECS):
+            job_store.touch_heartbeat(job_id)
+    hb_thread = threading.Thread(target=_pulse, daemon=True)
+    job_store.touch_heartbeat(job_id)
+    hb_thread.start()
+    try:
+        _run_pipeline(job_id, job, pp)
+    finally:
+        stop_heartbeat.set()
+        hb_thread.join(timeout=2)
+
+
+def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     # 1) PLAN
     job_store.update_job(job_id, status="planning")
     job_store.append_log(job_id, "info", "planning via AI provider")

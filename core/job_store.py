@@ -6,10 +6,14 @@ import os
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 _DB = os.getenv("RUNTIME_DB", os.path.join(os.path.dirname(os.path.dirname(__file__)), "runtime_jobs.db"))
 _LOCK = threading.RLock()
+# a job with a heartbeat newer than this is still being actively executed by
+# *some* process (this one or another) and must not be reaped as orphaned —
+# see recover_interrupted().
+_HEARTBEAT_STALE_SECS = int(os.getenv("RUNTIME_HEARTBEAT_STALE_SECS", "20"))
 
 # statuses (spec §3)
 STATUSES = ["draft", "waiting_approval", "queued", "planning", "backing_up", "branching",
@@ -46,8 +50,13 @@ def init_db() -> None:
             status TEXT DEFAULT 'draft', risk_level TEXT DEFAULT 'medium', dangerous INTEGER DEFAULT 0,
             plan TEXT, changed_files TEXT, validation TEXT, tests TEXT, git_info TEXT,
             logs TEXT, error TEXT, artifacts TEXT,
-            created_at TEXT, started_at TEXT, finished_at TEXT, updated_at TEXT
+            created_at TEXT, started_at TEXT, finished_at TEXT, updated_at TEXT,
+            heartbeat_at TEXT
         )""")
+        try:
+            c.execute("ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT")
+        except sqlite3.OperationalError:
+            pass  # already migrated
 
 
 def _row_to_dict(r: sqlite3.Row) -> dict:
@@ -136,13 +145,31 @@ def append_log(job_id: str, level: str, msg: str) -> None:
         c.execute("UPDATE jobs SET logs=?, updated_at=? WHERE id=?", (json.dumps(logs[-500:]), _now(), job_id))
 
 
-def recover_interrupted() -> int:
-    """On boot: any job left mid-execution is interrupted -> require re-approval,
-    never silently resume a destructive step (spec §4)."""
-    n = 0
+def touch_heartbeat(job_id: str) -> None:
+    """Called every few seconds by the executor thread for as long as a job is
+    actively running, so recover_interrupted() (which can fire from *any*
+    process that boots this same app, e.g. a planner-generated test spinning
+    up its own FastAPI TestClient against the shared DB) can tell a live job
+    apart from one truly orphaned by a crash."""
     with _LOCK, _conn() as c:
-        rows = c.execute("SELECT id, status FROM jobs WHERE status IN (%s)" %
-                         ",".join("?" * len(_INTERRUPTIBLE)), tuple(_INTERRUPTIBLE)).fetchall()
+        c.execute("UPDATE jobs SET heartbeat_at=? WHERE id=?", (_now(), job_id))
+
+
+def recover_interrupted() -> int:
+    """On boot: any job left mid-execution with no recent heartbeat is truly
+    orphaned (its process crashed or was killed) -> require re-approval, never
+    silently resume a destructive step (spec §4). A job whose heartbeat is
+    still fresh is left alone — it is still being actively executed somewhere,
+    not orphaned, even if this sweep runs in a different process than the one
+    driving it."""
+    n = 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_HEARTBEAT_STALE_SECS)).isoformat()
+    with _LOCK, _conn() as c:
+        rows = c.execute(
+            ("SELECT id, status FROM jobs WHERE status IN (%s) "
+             "AND (heartbeat_at IS NULL OR heartbeat_at < ?)") %
+            ",".join("?" * len(_INTERRUPTIBLE)),
+            tuple(_INTERRUPTIBLE) + (cutoff,)).fetchall()
         for r in rows:
             c.execute("UPDATE jobs SET status='waiting_approval', error=?, updated_at=? WHERE id=?",
                       (f"interrupted during '{r['status']}' by service restart — re-approval required", _now(), r["id"]))
