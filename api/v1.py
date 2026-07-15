@@ -119,7 +119,7 @@ class JobCreate(BaseModel):
     autonomy_level: Optional[str] = None
     allowed_paths: Optional[list] = None
     forbidden_paths: Optional[list] = None
-    base_branch: str = "master"
+    base_branch: Optional[str] = None
     auto_commit: bool = True
     auto_push: bool = False
     approval_required: Optional[bool] = None

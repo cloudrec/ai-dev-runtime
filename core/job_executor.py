@@ -187,7 +187,9 @@ def execute(job_id: str) -> None:
         job_store.update_job(job_id, status="branching")
         try:
             git_write.fetch(pp)
-            branch = git_write.create_work_branch(pp, job.get("task_id"), job["goal"] or "", job["base_branch"] or "master")
+            base = git_write.resolve_base_branch(pp, job["base_branch"])
+            job_store.append_log(job_id, "info", f"base branch resolved: {base}")
+            branch = git_write.create_work_branch(pp, job.get("task_id"), job["goal"] or "", base)
             job_store.append_log(job_id, "info", f"work branch: {branch}")
         except git_write.GitWriteError as e:
             _finish(job_id, "failed", error=f"branch failed: {e}")
