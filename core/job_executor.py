@@ -163,18 +163,52 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     def _heartbeat(elapsed: float) -> None:
         job_store.append_log(job_id, "info", f"planning… still running ({int(elapsed)}s elapsed)")
 
+    fallback_used = False
     try:
         plan = ai_planner.plan(job["goal"] or "", job["instructions"] or "", pp, job.get("allowed_paths") or [],
                                heartbeat_cb=_heartbeat)
     except ai_planner.PlannerError as e:
-        if "provider_not_configured" in str(e):
+        reason = str(e)
+        # No provider at all -> genuinely cannot proceed; stay blocked (a
+        # deterministic fallback would mask a misconfigured host, not repair it).
+        if "provider_not_configured" in reason:
             job_store.append_log(job_id, "warn", "AI provider not configured — job blocked")
             _finish(job_id, "blocked", error="provider_not_configured")
-        else:
-            job_store.append_log(job_id, "error", f"planning failed: {e}")
-            _finish(job_id, "failed", error=str(e)[:800])
-        return
+            return
+        # Any other planner failure (timeout / empty / malformed / non-JSON /
+        # plain-text / provider error): do NOT kill the job. Record sanitized
+        # diagnostics and continue on ONE deterministic local fallback plan.
+        # This is not retried in a loop — a single fallback, then execute.
+        diag = {
+            "reason": reason,
+            "raw": getattr(e, "raw", "") or "",
+            "tokens": getattr(e, "tokens", None),
+            "cost_usd": getattr(e, "cost_usd", None),
+            "duration_ms": getattr(e, "duration_ms", None),
+            "timed_out": bool(getattr(e, "timed_out", False)),
+        }
+        job_store.append_log(job_id, "warn",
+                             f"planner failed ({reason[:120]}) — building deterministic fallback plan")
+        try:
+            plan = ai_planner.build_fallback_plan(
+                job["goal"] or "", job["instructions"] or "", pp,
+                job.get("allowed_paths") or [], task_id=job.get("task_id"), diagnostics=diag)
+        except Exception as fe:  # noqa: BLE001
+            job_store.append_log(job_id, "error", f"fallback planning failed: {fe}")
+            _finish(job_id, "failed", error=f"planner and fallback both failed: {reason[:300]}")
+            return
+        fallback_used = True
+        # Mark in job metadata that fallback planning was used + preserve accounting.
+        job_store.update_job(job_id, artifacts=(job.get("artifacts") or []) + [{
+            "fallback_planning": True, "reason": reason[:200],
+            "timed_out": diag["timed_out"], "tokens": diag["tokens"],
+            "cost_usd": diag["cost_usd"], "duration_ms": diag["duration_ms"],
+        }])
+        job_store.append_log(job_id, "info",
+                             "fallback plan generated — continuing to execution (no planner retry)")
     job_store.update_job(job_id, plan=plan, risk_level=plan.get("risk_level", job["risk_level"]))
+    if fallback_used:
+        job_store.append_log(job_id, "info", f"FALLBACK PLAN in use ({len(plan['files'])} safe file op)")
     job_store.append_log(job_id, "info", f"plan: {plan.get('summary','')[:120]} ({len(plan['files'])} file ops)")
 
     # observe/suggest -> plan only, stop here
@@ -229,7 +263,10 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     job_store.update_job(job_id, status="testing")
     tests = _run_tests(pp, plan.get("test_commands") or [])
     attempt = 0
-    while not tests["ok"] and attempt < _MAX_REPAIRS:
+    # When a fallback plan is in use the provider planner is known-broken —
+    # re-invoking it for a repair attempt would just fail/time out again, so skip
+    # the planner-based repair loop entirely (never retry a broken planner).
+    while not tests["ok"] and attempt < _MAX_REPAIRS and not fallback_used:
         attempt += 1
         job_store.append_log(job_id, "warn", f"tests failed — repair attempt {attempt}")
         try:

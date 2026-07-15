@@ -39,7 +39,20 @@ _INTERACTIVE_PAT = re.compile(r"\(y/n\)|press enter|interactive terminal|tty req
 
 
 class PlannerError(RuntimeError):
-    pass
+    """Carries structured, non-secret diagnostics alongside the message so the
+    caller can build a fallback plan (raw sanitized response, token/cost/timing
+    when the provider returned an envelope, whether it was a hard timeout)
+    without re-parsing free text or losing accounting."""
+
+    def __init__(self, message: str, *, raw: str = "", tokens=None,
+                 cost_usd=None, duration_ms=None, timed_out: bool = False):
+        super().__init__(message)
+        self.reason = message
+        self.raw = raw
+        self.tokens = tokens
+        self.cost_usd = cost_usd
+        self.duration_ms = duration_ms
+        self.timed_out = timed_out
 
 
 def available() -> bool:
@@ -74,15 +87,74 @@ Rules: use relative paths only; never touch .env, keys, secrets, credentials, or
 Prefer small, isolated, well-tested changes. For create/replace include the COMPLETE file content."""
 
 
+def _first_json_object(text: str) -> dict | None:
+    """Return the first *balanced, parseable* top-level JSON object in `text`,
+    or None. Brace-matches while respecting string literals/escapes so braces
+    inside string values don't throw off the depth count, and tries json.loads
+    on each complete top-level {...} — tolerating leading/trailing prose without
+    a greedy `\\{.*\\}` grabbing an unparseable span from first '{' to last '}'."""
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    try:
+                        obj = json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        start = -1
+                        continue
+                    if isinstance(obj, dict):
+                        return obj
+                    start = -1
+    return None
+
+
 def _extract_json(text: str) -> dict:
-    text = text.strip()
-    # strip code fences if any
-    text = re.sub(r"^```(json)?", "", text).strip()
-    text = re.sub(r"```$", "", text).strip()
-    m = re.search(r"\{.*\}", text, re.DOTALL)
-    if not m:
-        raise PlannerError("model did not return JSON")
-    return json.loads(m.group(0))
+    """Recover a plan object from a range of provider output shapes:
+    bare JSON, JSON in a ```json fence, or JSON embedded in prose. Distinguishes
+    'malformed planner JSON' (braces present but nothing parses) from
+    'model did not return JSON' (no JSON object at all) so the caller/fallback
+    can record the specific failure mode."""
+    text = (text or "").strip()
+    if not text:
+        raise PlannerError("planner produced empty output")
+    # 1) the whole payload is a JSON object
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    # 2) fenced code block(s) — try each fence's body first
+    for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE):
+        obj = _first_json_object(m.group(1))
+        if obj is not None:
+            return obj
+    # 3) first balanced JSON object anywhere in surrounding prose
+    obj = _first_json_object(text)
+    if obj is not None:
+        return obj
+    if "{" in text and "}" in text:
+        raise PlannerError("malformed planner JSON")
+    raise PlannerError("model did not return JSON")
 
 
 def _validate(plan: dict, allowed_paths: list) -> dict:
@@ -256,6 +328,27 @@ def _invoke_cli(cmd: list[str], prompt: str, timeout: float, heartbeat_cb=None) 
     return out_holder.get("v", ""), err_holder.get("v", ""), timed_out, (proc.returncode or 0)
 
 
+def _accounting(envelope: dict | None) -> dict:
+    """Pull token/cost/timing out of the provider JSON envelope when present, so
+    it survives onto the raised PlannerError and into fallback job metadata even
+    on a failed plan (requirement: preserve token/cost/timing when available)."""
+    if not envelope:
+        return {"tokens": None, "cost_usd": None, "duration_ms": None}
+    usage = envelope.get("usage") or {}
+    tokens = None
+    if usage:
+        tokens = {"input_tokens": usage.get("input_tokens"),
+                  "output_tokens": usage.get("output_tokens")}
+    return {"tokens": tokens, "cost_usd": envelope.get("total_cost_usd"),
+            "duration_ms": envelope.get("duration_ms")}
+
+
+def _sanitize_raw(text: str, cap: int = 4000) -> str:
+    """Redact provider keys/bearer tokens and cap length before the raw planner
+    response is ever stored as a diagnostic — never persist secrets."""
+    return _redact(text or "")[:cap]
+
+
 def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
         timeout: int | None = None, heartbeat_cb=None) -> dict:
     """heartbeat_cb(elapsed_seconds), if given, is called roughly every
@@ -293,21 +386,28 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
     stdout, stderr, timed_out, returncode = _invoke_cli(cmd, prompt, effective_timeout, heartbeat_cb)
 
     if timed_out:
-        raise PlannerError("planner timed out")
+        raise PlannerError("planner timed out", timed_out=True)
 
     try:
         envelope = json.loads(stdout) if stdout.strip() else None
     except json.JSONDecodeError:
         envelope = None
+    acct = _accounting(envelope)
 
     if returncode != 0 or (envelope is not None and envelope.get("is_error")):
-        raise PlannerError(_classify_failure(stdout, stderr, envelope))
+        raise PlannerError(_classify_failure(stdout, stderr, envelope), **acct)
     if not stdout.strip():
-        raise PlannerError("planner produced empty output")
+        raise PlannerError("planner produced empty output", **acct)
 
     plan_text = envelope["result"] if envelope is not None and "result" in envelope else stdout
-    plan_obj = _extract_json(plan_text)
-    return _validate(plan_obj, allowed_paths)
+    raw = _sanitize_raw(plan_text)
+    try:
+        plan_obj = _extract_json(plan_text)
+        return _validate(plan_obj, allowed_paths)
+    except PlannerError as e:
+        # Re-raise with the sanitized raw response + accounting attached so the
+        # caller can record diagnostics and fall back deterministically.
+        raise PlannerError(str(e), raw=raw, **acct) from e
 
 
 # ── PHASE 45 — provider smoke test: one minimal, read-only, non-agentic call ──
@@ -371,3 +471,168 @@ def smoke(model: str | None = None, timeout_seconds: float | None = None) -> dic
         "tokens": {"input_tokens": usage.get("input_tokens"), "output_tokens": usage.get("output_tokens")},
         "cost_usd": (envelope or {}).get("total_cost_usd"), "error": None,
     }
+
+
+# ── Deterministic local fallback plan ────────────────────────────────────────
+# Used when the provider planner fails (timeout / empty / malformed / non-JSON /
+# plain-text / provider error) so a planner failure never terminates the Runtime
+# job. Fully deterministic: no provider call, no randomness — same inputs always
+# yield the same plan. Conservative and safe by construction (one recorded
+# planning artifact + the repo's own test suite; no fabricated code changes),
+# and it stops short of any dangerous/irreversible action (never merges, never
+# force-pushes, never deletes).
+
+# The conservative workflow the fallback commits the runtime to — recorded in
+# the plan and the artifact doc so downstream execution and any human reviewer
+# see exactly what a fallback run does and does not do.
+FALLBACK_STAGES = [
+    "inspect repository",
+    "create or preserve the correct task branch",
+    "implement the requested change",
+    "run focused tests",
+    "run the relevant full suite",
+    "commit",
+    "push",
+    "open or update a draft PR (never merge)",
+    "stop on any dangerous or irreversible action",
+]
+
+_TEST_CONFIG_HINTS = ("pytest.ini", "tox.ini", "setup.cfg", "pyproject.toml", "Makefile")
+
+
+def _slugify(text: str, n: int = 48) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "").strip().lower()).strip("-")
+    return (s[:n].strip("-")) or "task"
+
+
+def repo_metadata(project_path: str) -> dict:
+    """Best-effort, read-only repo facts for the fallback plan. Never raises."""
+    meta = {"path": project_path, "is_git": False, "branch": None,
+            "head": None, "remote": None, "has_tests_dir": False}
+    try:
+        meta["has_tests_dir"] = os.path.isdir(os.path.join(project_path, "tests"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from core import git_write
+        if git_write.is_repo(project_path):
+            meta["is_git"] = True
+            meta["branch"] = git_write.current_branch(project_path)
+            meta["head"] = git_write.rev_parse_short(project_path)
+            meta["remote"] = git_write.remote_url(project_path)
+    except Exception:  # noqa: BLE001
+        pass
+    return meta
+
+
+def default_test_commands(project_path: str) -> list[str]:
+    """Derive a safe full-suite command from repository metadata alone. Returns
+    [] when nothing recognizable is present rather than inventing a command."""
+    try:
+        has_tests = os.path.isdir(os.path.join(project_path, "tests"))
+        has_cfg = any(os.path.exists(os.path.join(project_path, h)) for h in _TEST_CONFIG_HINTS)
+        if has_tests or has_cfg:
+            return ["python3 -m pytest -q"]
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
+def _render_fallback_doc(goal: str, instructions: str, meta: dict,
+                         test_commands: list, diag: dict) -> str:
+    tokens = diag.get("tokens")
+    lines = [
+        "# Runtime fallback plan (deterministic, provider planner unavailable)",
+        "",
+        "The AI provider planner did not return a usable plan, so this Runtime",
+        "job proceeded on a deterministic local fallback plan instead of failing.",
+        "",
+        f"- **Goal:** {goal or '(none)'}",
+        f"- **Planner failure:** {diag.get('reason', 'unknown')}",
+        f"- **Timed out:** {bool(diag.get('timed_out'))}",
+        "",
+        "## Task instructions (verbatim)",
+        "",
+        (instructions or "(none)").strip(),
+        "",
+        "## Repository metadata",
+        "",
+        f"- git repo: {meta.get('is_git')}",
+        f"- branch at planning time: {meta.get('branch')}",
+        f"- head: {meta.get('head')}",
+        f"- remote: {meta.get('remote')}",
+        f"- tests/ dir present: {meta.get('has_tests_dir')}",
+        "",
+        "## Conservative execution stages",
+        "",
+        *[f"{i+1}. {s}" for i, s in enumerate(FALLBACK_STAGES)],
+        "",
+        "## Test commands",
+        "",
+        *([f"- `{c}`" for c in test_commands] or ["- (none derived)"]),
+        "",
+        "## Planner accounting (preserved when available)",
+        "",
+        f"- output tokens: {tokens.get('output_tokens') if tokens else None}",
+        f"- input tokens: {tokens.get('input_tokens') if tokens else None}",
+        f"- cost_usd: {diag.get('cost_usd')}",
+        f"- duration_ms: {diag.get('duration_ms')}",
+        "",
+        "## Sanitized raw planner response (secrets redacted, truncated)",
+        "",
+        "```",
+        (diag.get("raw") or "(empty)"),
+        "```",
+        "",
+        "> Fallback runs never merge, never force-push, and never delete. Any",
+        "> dangerous or irreversible action is left for a human.",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def build_fallback_plan(goal: str, instructions: str, project_path: str,
+                        allowed_paths: list, test_commands: list | None = None,
+                        task_id=None, diagnostics: dict | None = None) -> dict:
+    """Build the deterministic fallback plan object. Shaped exactly like a real
+    plan (passes _validate, so the normal pipeline applies/tests/commits it) but
+    carries fallback markers + preserved planner diagnostics. The single file op
+    records the plan under a safe in-repo path; combined with the repo's own test
+    suite this reaches the coding/execution stage without fabricating code."""
+    diag = dict(diagnostics or {})
+    diag.setdefault("reason", "planner_failed")
+    diag.setdefault("raw", "")
+    meta = repo_metadata(project_path)
+    tcmds = list(test_commands) if test_commands else default_test_commands(project_path)
+
+    rel = f"reports/runtime/fallback/PLAN-{task_id or 'task'}-{_slugify(goal or instructions)}.md"
+    # honour an explicit allow-list if the caller set one
+    if allowed_paths and not any(
+            rel == a or rel.startswith(a.rstrip("/") + "/") for a in allowed_paths):
+        rel = allowed_paths[0].rstrip("/") + "/RUNTIME_FALLBACK_PLAN.md"
+
+    # idempotent: replace if it already exists (safe re-run / update draft PR),
+    # else create. Never errors on a pre-existing artifact.
+    try:
+        op = "replace" if os.path.exists(os.path.join(project_path, rel)) else "create"
+    except Exception:  # noqa: BLE001
+        op = "create"
+
+    content = _render_fallback_doc(goal or "", instructions or "", meta, tcmds, diag)
+    plan_obj = {
+        "summary": f"[fallback] deterministic local plan for: {(goal or 'task')[:80]}",
+        "risk_level": "low",
+        "files": [{"path": rel, "operation": op, "content": content}],
+        "test_commands": tcmds,
+        "expected_result": "fallback plan recorded; tests run; draft PR (never merged)",
+        # fallback markers / preserved diagnostics (persisted with the plan)
+        "fallback": True,
+        "fallback_reason": diag.get("reason"),
+        "fallback_timed_out": bool(diag.get("timed_out")),
+        "stages": list(FALLBACK_STAGES),
+        "raw_planner_response": diag.get("raw", ""),
+        "planner_tokens": diag.get("tokens"),
+        "planner_cost_usd": diag.get("cost_usd"),
+        "planner_duration_ms": diag.get("duration_ms"),
+        "repo_metadata": meta,
+    }
+    return _validate(plan_obj, allowed_paths)
