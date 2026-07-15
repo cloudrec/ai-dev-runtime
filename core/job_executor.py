@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shlex
 import subprocess
 import threading
@@ -18,6 +19,12 @@ from core.file_engine import FileEngine
 AUTONOMY_ORDER = ["observe", "suggest", "prepare", "execute_safe", "execute_full", "deploy"]
 _MAX_REPAIRS = int(os.getenv("RUNTIME_MAX_REPAIRS", "1"))
 _TEST_TIMEOUT = int(os.getenv("RUNTIME_TEST_TIMEOUT", "300"))
+_BACKUP_TIMEOUT = int(os.getenv("RUNTIME_BACKUP_TIMEOUT", "120"))
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "blocked", "rolled_back"}
+# goals/instructions that describe read-only inventory/report/audit work -> a
+# full migration-grade archive is wasteful and risky; take a light snapshot.
+_READ_ONLY_RE = re.compile(
+    r"\b(inventory|report|reconcile|audit|inspect|read[-\s]?only|survey|summar|list|analy[sz]e|review)\b", re.I)
 # comfortably under job_store._HEARTBEAT_STALE_SECS (20s) so a live job never
 # looks orphaned to recover_interrupted(), even during a long silent test run.
 _HEARTBEAT_INTERVAL_SECS = int(os.getenv("RUNTIME_HEARTBEAT_INTERVAL_SECS", "5"))
@@ -25,6 +32,21 @@ _HEARTBEAT_INTERVAL_SECS = int(os.getenv("RUNTIME_HEARTBEAT_INTERVAL_SECS", "5")
 
 def _idx(level: str) -> int:
     return AUTONOMY_ORDER.index(level) if level in AUTONOMY_ORDER else 0
+
+
+def _is_read_only_plan(job: dict, plan: dict) -> bool:
+    """A task is read-only enough for a light snapshot when the plan does not
+    modify or delete any existing file (all ops are create/mkdir) OR the goal /
+    instructions describe inventory/report/audit-style work. Conservative: any
+    replace/patch/delete of an existing path forces a full snapshot."""
+    files = (plan or {}).get("files") or []
+    for f in files:
+        if f.get("operation") in ("replace", "patch", "delete"):
+            return False
+    if files and all(f.get("operation") in ("create", "mkdir") for f in files):
+        return True
+    text = f"{job.get('goal') or ''} {job.get('instructions') or ''}"
+    return bool(_READ_ONLY_RE.search(text))
 
 
 def _hash(path: str) -> str:
@@ -151,6 +173,22 @@ def execute(job_id: str) -> None:
     hb_thread.start()
     try:
         _run_pipeline(job_id, job, pp)
+    except BaseException as e:  # noqa: BLE001
+        # Any unhandled crash in a pipeline stage (e.g. a backup worker dying)
+        # must NOT leave the job frozen in a non-terminal status forever with no
+        # error — that is exactly how a job gets stuck in `backing_up`. Record a
+        # precise terminal failure unless the pipeline already reached a terminal
+        # state itself.
+        try:
+            cur = job_store.get_job(job_id)
+            if cur and cur["status"] not in _TERMINAL_STATUSES:
+                stage = cur["status"]
+                job_store.append_log(job_id, "error", f"worker crashed during '{stage}': {str(e)[:300]}")
+                _finish(job_id, "failed", error=f"worker crashed during '{stage}': {str(e)[:300]}")
+        except Exception:  # noqa: BLE001
+            pass
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
     finally:
         stop_heartbeat.set()
         hb_thread.join(timeout=2)
@@ -217,14 +255,29 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         job_store.append_log(job_id, "info", "plan-only (autonomy suggest/observe) — no changes applied")
         return
 
-    # 2) BACKUP
+    # 2) BACKUP — bounded, progress-emitting, atomic; a read-only inventory/report
+    # task takes the smallest safe (light) snapshot rather than a full archive.
     job_store.update_job(job_id, status="backing_up")
+    light = _is_read_only_plan(job, plan)
+
+    def _backup_progress(p: dict) -> None:
+        # keep the job demonstrably alive AND record measurable progress so it can
+        # never look silently frozen in `backing_up`
+        job_store.touch_heartbeat(job_id)
+        job_store.append_log(job_id, "info",
+                             f"backing up… {p.get('files', 0)} files, "
+                             f"{p.get('bytes', 0)} bytes ({p.get('elapsed', 0)}s)")
+
     try:
         backup = BackupEngine(pp)
-        backup_meta = backup.snapshot(reason=f"pre-runtime-job {job_id}")
-        job_store.append_log(job_id, "info", f"backup created: {backup_meta.get('id')}")
-    except Exception as e:  # noqa: BLE001
-        _finish(job_id, "failed", error=f"backup failed: {e}")
+        backup_meta = backup.snapshot(reason=f"pre-runtime-job {job_id}",
+                                      timeout=_BACKUP_TIMEOUT, progress_cb=_backup_progress, light=light)
+        job_store.append_log(job_id, "info",
+                             f"backup created: {backup_meta.get('id')} "
+                             f"({'light' if light else 'full'}, {backup_meta.get('files')} files, "
+                             f"{backup_meta.get('size')} bytes)")
+    except Exception as e:  # noqa: BLE001 — BackupError or any tar/os failure -> terminal, precise
+        _finish(job_id, "failed", error=f"backup failed: {str(e)[:400]}")
         return
 
     def _rollback(reason: str):

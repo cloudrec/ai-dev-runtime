@@ -155,6 +155,30 @@ def touch_heartbeat(job_id: str) -> None:
         c.execute("UPDATE jobs SET heartbeat_at=? WHERE id=?", (_now(), job_id))
 
 
+def reap_orphaned() -> int:
+    """Periodic (not boot-only) sweep: a job in an interruptible stage whose
+    heartbeat has gone stale is orphaned — its worker thread/process died without
+    recording a terminal status (the 'stuck in backing_up forever' bug). Mark it
+    `failed` with a precise terminal error so it can never remain indefinitely in
+    a non-terminal stage. A live job heartbeats every few seconds (well under the
+    stale window), so this never touches a genuinely running job."""
+    n = 0
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=_HEARTBEAT_STALE_SECS)).isoformat()
+    with _LOCK, _conn() as c:
+        rows = c.execute(
+            ("SELECT id, status, heartbeat_at FROM jobs WHERE status IN (%s) "
+             "AND (heartbeat_at IS NULL OR heartbeat_at < ?)") %
+            ",".join("?" * len(_INTERRUPTIBLE)),
+            tuple(_INTERRUPTIBLE) + (cutoff,)).fetchall()
+        for r in rows:
+            err = (f"orphaned: no heartbeat for >{_HEARTBEAT_STALE_SECS}s during "
+                   f"'{r['status']}' — worker died; reaped to a terminal state")
+            c.execute("UPDATE jobs SET status='failed', error=?, finished_at=?, updated_at=? WHERE id=?",
+                      (err, _now(), _now(), r["id"]))
+            n += 1
+    return n
+
+
 def recover_interrupted() -> int:
     """On boot: any job left mid-execution with no recent heartbeat is truly
     orphaned (its process crashed or was killed) -> require re-approval, never
