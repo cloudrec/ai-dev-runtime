@@ -15,6 +15,11 @@ def _git(path, *args):
                     capture_output=True, text=True)
 
 
+def _run_out(path, *args):
+    return subprocess.run(["git", "-C", str(path)] + list(args), check=True,
+                           capture_output=True, text=True).stdout.strip()
+
+
 def _init_repo(path, branch="main"):
     path.mkdir(exist_ok=True)
     _git(path, "init", "-q", "-b", branch)
@@ -69,3 +74,47 @@ def test_create_work_branch_never_hardcodes_master(tmp_path):
     assert base == "main"
     branch = git_write.create_work_branch(str(repo), 88, "fix planner timeout", base)
     assert git_write.current_branch(str(repo)) == branch
+
+
+def test_master_only_repo_resolves_to_master(tmp_path):
+    """No 'main' anywhere, only legacy 'master' -> last real fallback still works."""
+    repo = _init_repo(tmp_path / "r5", branch="master")
+    assert git_write.resolve_base_branch(str(repo), None) == "master"
+
+
+def test_explicit_repair_branch_preserved(tmp_path):
+    """Explicit task/retry branch (e.g. an in-flight repair branch) always
+    wins over origin/HEAD and 'main', and must never be reset/rewritten."""
+    repo = _init_repo(tmp_path / "r6", branch="main")
+    repair = "repair/owner-os-runtime-e2e-20260714"
+    _git(repo, "branch", repair)
+    _git(repo, "checkout", "-q", repair)
+    _git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit",
+         "--allow-empty", "-m", "in-flight repair work")
+    before = _run_out(repo, "rev-parse", repair)
+    assert git_write.resolve_base_branch(str(repo), repair) == repair
+    # resolution must be read-only: no reset/checkout/clean side effects
+    assert _run_out(repo, "rev-parse", repair) == before
+
+
+def test_origin_remote_present_but_head_missing_falls_back_to_current(tmp_path):
+    """origin remote configured but refs/remotes/origin/HEAD never set
+    (common right after a shallow/partial clone or manual remote add)."""
+    other = _init_repo(tmp_path / "other", branch="main")
+    repo = _init_repo(tmp_path / "r7", branch="my-workspace-branch")
+    _git(repo, "remote", "add", "origin", str(other))
+    _git(repo, "fetch", "-q", "origin")  # fetches branches, not origin/HEAD
+    assert git_write.resolve_base_branch(str(repo), None) == "my-workspace-branch"
+
+
+def test_dirty_workspace_does_not_block_resolution_or_touch_files(tmp_path):
+    """Uncommitted changes in the workspace must not be reset/cleaned and
+    must not prevent base-branch resolution."""
+    repo = _init_repo(tmp_path / "r8", branch="main")
+    dirty_file = repo / "untracked.txt"
+    dirty_file.write_text("work in progress\n")
+    (repo / "README.md").write_text("locally edited\n")
+    _git(repo, "add", "README.md")  # tracked-but-uncommitted change too
+    assert git_write.resolve_base_branch(str(repo), None) == "main"
+    assert dirty_file.exists() and dirty_file.read_text() == "work in progress\n"
+    assert git_write.dirty_files(str(repo))  # still dirty -> nothing was reset/cleaned
