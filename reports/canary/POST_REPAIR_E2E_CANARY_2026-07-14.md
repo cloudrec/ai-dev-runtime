@@ -209,3 +209,63 @@ was created or executed, so no job-level plan call occurred. Smoke-test cost:
 $0.0015675, 9 output tokens billed against `claude-opus-4-8[1m]` (cache-read
 input tokens: 2665, from repeated identical-prefix diagnostic calls in this
 same session).
+
+---
+
+## 11. Follow-up (2026-07-15) — planner fallback fix + replacement job executed
+
+The §9 block ("replacement job BLOCKED, not created") was resolved by a second
+repair on the same branch. The gap was not only orchestration: even with the
+`--tools ""` fix, the provider planner still sometimes returns prose instead of
+JSON, and `job_executor` turned *any* `PlannerError` straight into a `failed`
+job — so the coding stage never ran. OwnerTask 92 / Runtime job 25 died exactly
+this way with `model did not return JSON`.
+
+### Fix (`core/ai_planner.py`, `core/job_executor.py`) — commit `64696a6`
+
+- `_extract_json` rewritten: accepts bare JSON, ```json-fenced JSON, and JSON
+  embedded in prose (string-aware brace matcher); distinguishes `malformed
+  planner JSON` from `model did not return JSON`.
+- `PlannerError` now carries sanitized raw response (`_redact`), token/cost/
+  timing (`_accounting`), and a `timed_out` flag — accounting survives a failed
+  plan.
+- `build_fallback_plan()`: deterministic, conservative local plan from task
+  title/description, repo metadata, and derived test commands. Records one safe
+  in-repo artifact + the repo's own suite, marks `fallback=True`, encodes the
+  conservative stages (inspect → branch → implement → focused tests → full
+  suite → commit → push → draft PR, never merge, stop on dangerous actions).
+- `job_executor`: on any `PlannerError` except `provider_not_configured`,
+  record diagnostics, build ONE fallback plan, mark `artifacts[].fallback_
+  planning`, continue to execution. Never retried in a loop; the planner-based
+  repair loop is skipped while a fallback plan is in use.
+- New `tests/test_planner_fallback.py` (16 tests). Full suite: **91 passed**
+  (was 75). Service restarted; `GET /health` → `ok`.
+
+### Replacement Runtime job — created and completed
+
+A replacement Runtime job was dispatched for OwnerTask 82's successor task 92
+(no new OwnerTask created), retried exactly once, `base_branch` = this repair
+branch so the fallback ran against the fixed code:
+
+| field | value |
+| --- | --- |
+| Runtime job (external UUID) | `0093273a-d0b5-4be1-88f3-e63a71046fd9` (SQLite row 36) |
+| OwnerTask | 92 (unchanged, none created) |
+| planner outcome | `model did not return JSON` — the same failure that killed the original job |
+| fallback exercised | **yes** |
+| preserved accounting | input 2 / output 1381 tokens, cost $0.085283, duration 18631 ms |
+| tests | `python3 -m pytest -q` → passed (91) on the work branch |
+| work branch | `ai-runtime/92-implement-planner-timeout-fallba` |
+| commit | `8d6bf53` (pushed to origin over the SSH remote) |
+| status | **completed** |
+| draft PR | https://github.com/cloudrec/ai-dev-runtime/pull/14 (draft, base = repair branch, **not merged**) |
+
+This proves end-to-end that a planner failure no longer terminates the Runtime
+job: planning is passed via the deterministic fallback and execution reaches the
+coding/commit/push stage. The original failed job (`0a079853…`, task 92) and the
+prior planner-timeout jobs (SQLite rows 12–18) were left untouched. Live checkout
+restored to `repair/owner-os-runtime-e2e-20260714` (clean).
+
+Backup for this second repair:
+`/root/ai-dev-runtime/.ai-runtime-backups/repair_planner_fallback_20260715T113350Z/`
+(full tree + `runtime_jobs.db.bak`, sha256-verified identical to the live DB).
