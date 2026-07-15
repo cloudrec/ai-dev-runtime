@@ -1,0 +1,109 @@
+{
+  "generated_at": "2026-07-15T13:07:02Z",
+  "overall_status": "semi-autonomous — core runtime execution reliable; dispatch, PR creation, external notification, and Owner OS sync of out-of-band jobs are manual or broken",
+  "readiness_percent": 60,
+  "working": [
+    "ai-runtime.service active, enabled, NRestarts=0, /health ok",
+    "worker heartbeat during execution",
+    "crash recovery: recover_interrupted -> waiting_approval",
+    "base-branch resolution (no hardcoded master)",
+    "planner non-agentic (--tools '' --setting-sources '' --strict-mcp-config --output-format json)",
+    "planner timeout handling (process-group kill; no 'planner timed out' since 8ac76f2)",
+    "planner non-JSON/malformed handling via improved _extract_json (fix 64696a6)",
+    "deterministic fallback planning, marked in job metadata, no retry loop (exercised live on 0093273a)",
+    "test execution (argv, no shell=True, && chains) — 91 pytest passed on 0093273a",
+    "git commit and push -u origin (0093273a -> 8d6bf53 pushed)",
+    "Owner OS + Postgres healthy; RUNTIME_URL correct; RUNTIME_POLL_ENABLED=true",
+    "runtime poller (advisory-locked) syncs Owner-OS-created jobs and emits owner_events on terminal",
+    "approval flow (requires_approval)",
+    "in-app 'local' notifications delivered (status=sent)"
+  ],
+  "partial": [
+    "coding agent: no distinct agent — planner emits files; fallback writes only a plan doc",
+    "push: works but not all jobs push (task 88 committed d0400fb, pushed=False)",
+    "GitHub event ingestion: bus_events populated via webhook/command_bus, but ai-task-watcher.service dead",
+    "task->runtime dispatch: machinery exists but tasks 82-92 dispatched manually via MCP",
+    "Owner OS synchronization: poller only tracks jobs with external_job_id it created; replacement 0093273a invisible",
+    "retry synchronization: runtime_retry creates tracked rows but only via endpoint/MCP; out-of-band retries untracked",
+    "status detection: queued/planning/running/blocked/failed/completed detectable for tracked jobs; waiting_input has no representation",
+    "ChatGPT visibility: MCP pull-only, no server->ChatGPT push"
+  ],
+  "broken": [
+    "automated draft-PR creation in runtime pipeline (none; PR #14 opened manually)",
+    "automatic next-task advancement (no chaining; task 91 backlog, no job)",
+    "external push notifications: telegram/email/webhook channel_kind = not_configured; TELEGRAM_* env unset",
+    "ai-task-watcher.service dead since 2026-07-14 (last run HTTP 500)",
+    "no waiting_input status anywhere in runtime or Owner OS",
+    "no server->owner and no server->ChatGPT immediate push path"
+  ],
+  "unverified": [
+    "exact liveness cadence of the runtime poller loop (enabled=true and past terminal syncs observed, but no active jobs to poll at audit time)",
+    "whether any non-Owner-OS component reads ~/.claude/projects/*.jsonl transcripts (none found; assumed none)",
+    "full behavior of dormant dispatch loops (autopilot/ai_cto/dev_manager) under load — code present, not exercised during audit"
+  ],
+  "active_jobs": [
+    {"owner_os_runtime_job_id": 21, "owner_task_id": 87, "status": "waiting_approval", "external_job_id": "dde9cd25-2fe9-403d-aa02-dad0ba86b9bf"},
+    {"owner_os_runtime_job_id": 10, "owner_task_id": 57, "status": "waiting_approval", "external_job_id": "02f5e8a9-22f6-4b21-9062-48165893fd1a"},
+    {"runtime_side_only": true, "external_job_id": "0093273a-d0b5-4be1-88f3-e63a71046fd9", "owner_task_id": 92, "status": "completed", "commit": "8d6bf53", "branch": "ai-runtime/92-implement-planner-timeout-fallba", "note": "out-of-band replacement; NOT recorded in Owner OS"}
+  ],
+  "failed_jobs": [
+    {"owner_os_runtime_job_id": 17, "owner_task_id": 83, "external_job_id": "c12411f3-02e5-4513-8299-eddb270d7c59", "error": "planner timed out"},
+    {"owner_os_runtime_job_id": 18, "owner_task_id": 84, "external_job_id": "43b32aeb-30ce-40dd-9b4a-c9b966463d15", "error": "planner timed out"},
+    {"owner_os_runtime_job_id": 19, "owner_task_id": 85, "external_job_id": "b9b17b46-667c-4584-b742-236baa5ce0b2", "error": "planner timed out"},
+    {"owner_os_runtime_job_id": 20, "owner_task_id": 86, "external_job_id": "7cc48c98-2e94-44d8-bb4f-6c465f2663a3", "error": "planner timed out"},
+    {"owner_os_runtime_job_id": 25, "owner_task_id": 92, "external_job_id": "0a079853-c677-49c1-a0fc-f485089fd94c", "error": "model did not return JSON", "note": "STALE — successful replacement 0093273a exists but is untracked; coding agent never started for this job"}
+  ],
+  "waiting_approval_jobs": [
+    {"owner_os_runtime_job_id": 21, "owner_task_id": 87, "external_job_id": "dde9cd25-2fe9-403d-aa02-dad0ba86b9bf"},
+    {"owner_os_runtime_job_id": 10, "owner_task_id": 57, "external_job_id": "02f5e8a9-22f6-4b21-9062-48165893fd1a"}
+  ],
+  "manual_intervention_points": [
+    "Reconcile/retry OwnerTask 92 through Owner OS so replacement 0093273a (commit 8d6bf53) is recorded and task 92 leaves 'blocked'",
+    "Push job-24/task-88 branch (commit d0400fb, pushed=False) and open its PR",
+    "Decide approve-or-cancel for waiting_approval RJ21/task87 and RJ10/task57",
+    "OwnerTask 91 has no runtime job — dispatch manually if it should proceed",
+    "Draft PRs must be opened by hand (runtime does not create them)",
+    "External notification (Telegram/webhook) must be configured for owner to be alerted",
+    "ai-task-watcher.service dead — GitHub->task dispatch is manual"
+  ],
+  "blind_spots": [
+    "Manual Claude/tmux sessions invisible to Owner OS (no bridge; transcripts only in ~/.claude/projects/*.jsonl)",
+    "Owner OS cannot see Claude questions and Claude cannot report waiting_input",
+    "Claude completion does not reach Owner OS automatically",
+    "No component auto-answers safe Claude questions",
+    "ChatGPT receives no immediate/push events (MCP pull only)",
+    "Out-of-band runtime jobs (created by direct POST to the runtime) are untracked by the poller",
+    "No external push notification path reaches the owner immediately (all channels poll-based; only 'local' delivers)",
+    "No 'waiting_input' status exists end-to-end"
+  ],
+  "next_safe_action": "Officially reconcile/retry OwnerTask 92 through Owner OS (runtime_retry via POST /api/owner/runtime/jobs/{id}/reconcile or the MCP retry tool) so the successful replacement job 0093273a / commit 8d6bf53 is recorded and task 92 moves out of 'blocked'. No direct database write.",
+  "do_not_touch": [
+    "ai-runtime.service (no restart)",
+    "seo-postgres-1 / traffic_os database rows (no writes)",
+    "owner_tasks and runtime_jobs records",
+    "Runtime jobs 17-21",
+    "replacement job 0093273a (completed)",
+    "tmux session runtime-repair-ACTIVE-DONT-TOUCH",
+    "tmux session runtime-planner-fix",
+    "other live claude CLI sessions/processes"
+  ],
+  "evidence": [
+    "git: branch repair/owner-os-runtime-e2e-20260714, HEAD ebe818d, status clean",
+    "remote: git@github-ai-dev-runtime:cloudrec/ai-dev-runtime.git",
+    "systemctl: ai-runtime.service active running, MainPID 2312717, NRestarts=0, since 2026-07-15 13:40:49 CEST",
+    "GET http://172.17.0.1:8199/health -> {status: ok}",
+    "runtime SQLite: rows 17/18 failed 'planner timed out'; row 35 (task 92) failed 'model did not return JSON'; row 36 (0093273a) completed, commit 8d6bf53, pushed",
+    "owner_tasks: 88=review, 91=backlog, 92=blocked",
+    "Owner OS runtime_jobs: id17->task83, id18->84, id19->85, id20->86 all failed; id25->task92 failed external 0a079853; no row for 0093273a",
+    "ai-task-watcher.service: inactive/dead, last exec 2026-07-14 14:46, prior run HTTP 500",
+    "seo-backend env: RUNTIME_URL=http://host.docker.internal:8199, RUNTIME_POLL_ENABLED=true, interval=10; TELEGRAM_* unset",
+    "runtime_poller.py: polls external_job_id-set jobs in ACTIVE set; _on_terminal updates OwnerTask + emits OwnerEvent",
+    "owner_events: latest runtime.job.failed 2026-07-15 11:25:16 (job 25); manual_reconciliation 07:54; none after 11:25 for runtime",
+    "notifications: channel_kind local=21 sent; telegram/email/webhook = not_configured; latest id24 runtime.job.failed 11:27",
+    "bus_events: issues/issue_comment ingested, latest issue_comment 2026-07-15 12:26",
+    "dispatch code: ai_cto._create_and_submit, autopilot, dev_manager, command_bus(github-bus), ai_bridge, runtime_retry all call rc.submit",
+    "main.py: 10 asyncio polling loops (runtime-poll, scheduler, media, studio, publish, pipeline, calendar, notif, budget, health)",
+    "tmux ls: 10 sessions incl runtime-repair-ACTIVE-DONT-TOUCH, runtime-planner-fix; multiple claude processes running",
+    "open PRs: #12 draft, #13 draft (repair, ->main), #14 ready (task92 fallback, ->repair branch)"
+  ]
+}
