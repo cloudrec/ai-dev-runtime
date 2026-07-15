@@ -1,0 +1,18 @@
+version: "3.8"
+
+services:
+  ai-runtime:
+    build: .
+    container_name: ai-runtime
+    restart: unless-stopped
+    ports:
+      - "8199:8199"
+    volumes:
+      # монтируем проект, чтобы агент мог менять файлы
+      - /root/ai-dev-runtime:/workspace
+    environment:
+      - PROJECT_ROOT=/workspace
+      - AI_RUNTIME_API_KEY=${AI_RUNTIME_API_KEY:-}
+      - AI_RUNTIME_HMAC_SECRET=${AI_RUNTIME_HMAC_SECRET:-}
+    env_file:
+      - configs/.env
