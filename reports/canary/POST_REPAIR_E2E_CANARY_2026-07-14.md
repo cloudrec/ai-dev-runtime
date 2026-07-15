@@ -17,7 +17,7 @@ GitHub -> OwnerTask -> Runtime -> GitHub.
 - Branch name: ai-runtime/82-retry-retry-mcp-post-repair-e2e- (branched from
   repair/owner-os-runtime-e2e-20260714 @ c4ceebd)
 - Commit SHA: 10d0ce8
-- Draft PR number: (filled in the follow-up commit once the PR is opened)
+- Draft PR number: #12 (https://github.com/cloudrec/ai-dev-runtime/pull/12)
 
 ## Chain evidence
 
@@ -28,7 +28,7 @@ GitHub -> OwnerTask -> Runtime -> GitHub.
 5. Working branch created: ai-runtime/82-retry-retry-mcp-post-repair-e2e-.
 6. This report file authored at reports/canary/POST_REPAIR_E2E_CANARY_2026-07-14.md.
 7. Commit 10d0ce8 created and pushed.
-8. Draft PR opened (not auto-merged) — number recorded in the follow-up commit.
+8. Draft PR #12 opened (not auto-merged): https://github.com/cloudrec/ai-dev-runtime/pull/12
 
 ## Validation
 
