@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
+import shlex
 import subprocess
 import threading
 
@@ -17,10 +19,34 @@ from core.file_engine import FileEngine
 AUTONOMY_ORDER = ["observe", "suggest", "prepare", "execute_safe", "execute_full", "deploy"]
 _MAX_REPAIRS = int(os.getenv("RUNTIME_MAX_REPAIRS", "1"))
 _TEST_TIMEOUT = int(os.getenv("RUNTIME_TEST_TIMEOUT", "300"))
+_BACKUP_TIMEOUT = int(os.getenv("RUNTIME_BACKUP_TIMEOUT", "120"))
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "blocked", "rolled_back"}
+# goals/instructions that describe read-only inventory/report/audit work -> a
+# full migration-grade archive is wasteful and risky; take a light snapshot.
+_READ_ONLY_RE = re.compile(
+    r"\b(inventory|report|reconcile|audit|inspect|read[-\s]?only|survey|summar|list|analy[sz]e|review)\b", re.I)
+# comfortably under job_store._HEARTBEAT_STALE_SECS (20s) so a live job never
+# looks orphaned to recover_interrupted(), even during a long silent test run.
+_HEARTBEAT_INTERVAL_SECS = int(os.getenv("RUNTIME_HEARTBEAT_INTERVAL_SECS", "5"))
 
 
 def _idx(level: str) -> int:
     return AUTONOMY_ORDER.index(level) if level in AUTONOMY_ORDER else 0
+
+
+def _is_read_only_plan(job: dict, plan: dict) -> bool:
+    """A task is read-only enough for a light snapshot when the plan does not
+    modify or delete any existing file (all ops are create/mkdir) OR the goal /
+    instructions describe inventory/report/audit-style work. Conservative: any
+    replace/patch/delete of an existing path forces a full snapshot."""
+    files = (plan or {}).get("files") or []
+    for f in files:
+        if f.get("operation") in ("replace", "patch", "delete"):
+            return False
+    if files and all(f.get("operation") in ("create", "mkdir") for f in files):
+        return True
+    text = f"{job.get('goal') or ''} {job.get('instructions') or ''}"
+    return bool(_READ_ONLY_RE.search(text))
 
 
 def _hash(path: str) -> str:
@@ -31,22 +57,41 @@ def _hash(path: str) -> str:
         return "absent"
 
 
+def _run_step(project_path: str, step: str) -> tuple[bool, str]:
+    parts = shlex.split(step)
+    if not parts:
+        return True, ""
+    p = subprocess.run(parts, cwd=project_path, capture_output=True, text=True,
+                       timeout=_TEST_TIMEOUT, shell=False)
+    return p.returncode == 0, (p.stdout + p.stderr)
+
+
 def _run_tests(project_path: str, commands: list[str]) -> dict:
+    """Each entry in `commands` may be a single command OR a `&&`-chained
+    sequence (planner-produced validation like `test -s foo && echo OK` is
+    common). Still never shell=True — each step is tokenized with shlex and
+    run as its own argv, chained steps short-circuit on the first failure
+    exactly like a real `&&` would, without ever invoking an actual shell."""
     results = []
     ok = True
     for cmd in commands[:5]:
-        parts = cmd.split()
-        if not parts:
+        steps = [s.strip() for s in cmd.split("&&") if s.strip()]
+        if not steps:
             continue
+        step_ok = True
+        output = ""
         try:
-            p = subprocess.run(parts, cwd=project_path, capture_output=True, text=True,
-                               timeout=_TEST_TIMEOUT, shell=False)
-            passed = p.returncode == 0
-            results.append({"cmd": cmd, "passed": passed, "output": (p.stdout + p.stderr)[-1500:]})
-            ok = ok and passed
+            for step in steps:
+                passed, out = _run_step(project_path, step)
+                output += out
+                if not passed:
+                    step_ok = False
+                    break
         except Exception as e:  # noqa: BLE001
-            results.append({"cmd": cmd, "passed": False, "output": str(e)[:400]})
-            ok = False
+            step_ok = False
+            output += str(e)[:400]
+        results.append({"cmd": cmd, "passed": step_ok, "output": output[-1500:]})
+        ok = ok and step_ok
     return {"ok": ok, "results": results}
 
 
@@ -118,20 +163,90 @@ def execute(job_id: str) -> None:
     pp = job["project_path"]
     job_store.update_job(job_id, started_at=job_store._now())
 
+    stop_heartbeat = threading.Event()
+
+    def _pulse() -> None:
+        while not stop_heartbeat.wait(_HEARTBEAT_INTERVAL_SECS):
+            job_store.touch_heartbeat(job_id)
+    hb_thread = threading.Thread(target=_pulse, daemon=True)
+    job_store.touch_heartbeat(job_id)
+    hb_thread.start()
+    try:
+        _run_pipeline(job_id, job, pp)
+    except BaseException as e:  # noqa: BLE001
+        # Any unhandled crash in a pipeline stage (e.g. a backup worker dying)
+        # must NOT leave the job frozen in a non-terminal status forever with no
+        # error — that is exactly how a job gets stuck in `backing_up`. Record a
+        # precise terminal failure unless the pipeline already reached a terminal
+        # state itself.
+        try:
+            cur = job_store.get_job(job_id)
+            if cur and cur["status"] not in _TERMINAL_STATUSES:
+                stage = cur["status"]
+                job_store.append_log(job_id, "error", f"worker crashed during '{stage}': {str(e)[:300]}")
+                _finish(job_id, "failed", error=f"worker crashed during '{stage}': {str(e)[:300]}")
+        except Exception:  # noqa: BLE001
+            pass
+        if isinstance(e, (KeyboardInterrupt, SystemExit)):
+            raise
+    finally:
+        stop_heartbeat.set()
+        hb_thread.join(timeout=2)
+
+
+def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     # 1) PLAN
     job_store.update_job(job_id, status="planning")
     job_store.append_log(job_id, "info", "planning via AI provider")
+    def _heartbeat(elapsed: float) -> None:
+        job_store.append_log(job_id, "info", f"planning… still running ({int(elapsed)}s elapsed)")
+
+    fallback_used = False
     try:
-        plan = ai_planner.plan(job["goal"] or "", job["instructions"] or "", pp, job.get("allowed_paths") or [])
+        plan = ai_planner.plan(job["goal"] or "", job["instructions"] or "", pp, job.get("allowed_paths") or [],
+                               heartbeat_cb=_heartbeat)
     except ai_planner.PlannerError as e:
-        if "provider_not_configured" in str(e):
+        reason = str(e)
+        # No provider at all -> genuinely cannot proceed; stay blocked (a
+        # deterministic fallback would mask a misconfigured host, not repair it).
+        if "provider_not_configured" in reason:
             job_store.append_log(job_id, "warn", "AI provider not configured — job blocked")
             _finish(job_id, "blocked", error="provider_not_configured")
-        else:
-            job_store.append_log(job_id, "error", f"planning failed: {e}")
-            _finish(job_id, "failed", error=str(e)[:800])
-        return
+            return
+        # Any other planner failure (timeout / empty / malformed / non-JSON /
+        # plain-text / provider error): do NOT kill the job. Record sanitized
+        # diagnostics and continue on ONE deterministic local fallback plan.
+        # This is not retried in a loop — a single fallback, then execute.
+        diag = {
+            "reason": reason,
+            "raw": getattr(e, "raw", "") or "",
+            "tokens": getattr(e, "tokens", None),
+            "cost_usd": getattr(e, "cost_usd", None),
+            "duration_ms": getattr(e, "duration_ms", None),
+            "timed_out": bool(getattr(e, "timed_out", False)),
+        }
+        job_store.append_log(job_id, "warn",
+                             f"planner failed ({reason[:120]}) — building deterministic fallback plan")
+        try:
+            plan = ai_planner.build_fallback_plan(
+                job["goal"] or "", job["instructions"] or "", pp,
+                job.get("allowed_paths") or [], task_id=job.get("task_id"), diagnostics=diag)
+        except Exception as fe:  # noqa: BLE001
+            job_store.append_log(job_id, "error", f"fallback planning failed: {fe}")
+            _finish(job_id, "failed", error=f"planner and fallback both failed: {reason[:300]}")
+            return
+        fallback_used = True
+        # Mark in job metadata that fallback planning was used + preserve accounting.
+        job_store.update_job(job_id, artifacts=(job.get("artifacts") or []) + [{
+            "fallback_planning": True, "reason": reason[:200],
+            "timed_out": diag["timed_out"], "tokens": diag["tokens"],
+            "cost_usd": diag["cost_usd"], "duration_ms": diag["duration_ms"],
+        }])
+        job_store.append_log(job_id, "info",
+                             "fallback plan generated — continuing to execution (no planner retry)")
     job_store.update_job(job_id, plan=plan, risk_level=plan.get("risk_level", job["risk_level"]))
+    if fallback_used:
+        job_store.append_log(job_id, "info", f"FALLBACK PLAN in use ({len(plan['files'])} safe file op)")
     job_store.append_log(job_id, "info", f"plan: {plan.get('summary','')[:120]} ({len(plan['files'])} file ops)")
 
     # observe/suggest -> plan only, stop here
@@ -140,14 +255,29 @@ def execute(job_id: str) -> None:
         job_store.append_log(job_id, "info", "plan-only (autonomy suggest/observe) — no changes applied")
         return
 
-    # 2) BACKUP
+    # 2) BACKUP — bounded, progress-emitting, atomic; a read-only inventory/report
+    # task takes the smallest safe (light) snapshot rather than a full archive.
     job_store.update_job(job_id, status="backing_up")
+    light = _is_read_only_plan(job, plan)
+
+    def _backup_progress(p: dict) -> None:
+        # keep the job demonstrably alive AND record measurable progress so it can
+        # never look silently frozen in `backing_up`
+        job_store.touch_heartbeat(job_id)
+        job_store.append_log(job_id, "info",
+                             f"backing up… {p.get('files', 0)} files, "
+                             f"{p.get('bytes', 0)} bytes ({p.get('elapsed', 0)}s)")
+
     try:
         backup = BackupEngine(pp)
-        backup_meta = backup.snapshot(reason=f"pre-runtime-job {job_id}")
-        job_store.append_log(job_id, "info", f"backup created: {backup_meta.get('id')}")
-    except Exception as e:  # noqa: BLE001
-        _finish(job_id, "failed", error=f"backup failed: {e}")
+        backup_meta = backup.snapshot(reason=f"pre-runtime-job {job_id}",
+                                      timeout=_BACKUP_TIMEOUT, progress_cb=_backup_progress, light=light)
+        job_store.append_log(job_id, "info",
+                             f"backup created: {backup_meta.get('id')} "
+                             f"({'light' if light else 'full'}, {backup_meta.get('files')} files, "
+                             f"{backup_meta.get('size')} bytes)")
+    except Exception as e:  # noqa: BLE001 — BackupError or any tar/os failure -> terminal, precise
+        _finish(job_id, "failed", error=f"backup failed: {str(e)[:400]}")
         return
 
     def _rollback(reason: str):
@@ -163,7 +293,9 @@ def execute(job_id: str) -> None:
         job_store.update_job(job_id, status="branching")
         try:
             git_write.fetch(pp)
-            branch = git_write.create_work_branch(pp, job.get("task_id"), job["goal"] or "", job["base_branch"] or "master")
+            base = git_write.resolve_base_branch(pp, job["base_branch"])
+            job_store.append_log(job_id, "info", f"base branch resolved: {base}")
+            branch = git_write.create_work_branch(pp, job.get("task_id"), job["goal"] or "", base)
             job_store.append_log(job_id, "info", f"work branch: {branch}")
         except git_write.GitWriteError as e:
             _finish(job_id, "failed", error=f"branch failed: {e}")
@@ -184,15 +316,23 @@ def execute(job_id: str) -> None:
     job_store.update_job(job_id, status="testing")
     tests = _run_tests(pp, plan.get("test_commands") or [])
     attempt = 0
-    while not tests["ok"] and attempt < _MAX_REPAIRS:
+    # When a fallback plan is in use the provider planner is known-broken —
+    # re-invoking it for a repair attempt would just fail/time out again, so skip
+    # the planner-based repair loop entirely (never retry a broken planner).
+    while not tests["ok"] and attempt < _MAX_REPAIRS and not fallback_used:
         attempt += 1
         job_store.append_log(job_id, "warn", f"tests failed — repair attempt {attempt}")
         try:
             fails = "\n".join(r["output"][-500:] for r in tests["results"] if not r["passed"])
             repair = ai_planner.plan(job["goal"] or "", (job["instructions"] or "") +
                                      f"\n\nThe previous attempt FAILED tests:\n{fails}\nFix it.",
-                                     pp, job.get("allowed_paths") or [])
-            _apply_files(pp, repair["files"])
+                                     pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat)
+            repair_changed = _apply_files(pp, repair["files"])
+            by_path = {c["path"]: c for c in changed}
+            by_path.update({c["path"]: c for c in repair_changed})
+            changed = list(by_path.values())
+            job_store.update_job(job_id, changed_files=changed)
+            job_store.append_log(job_id, "info", f"repair applied {len(repair_changed)} file operation(s)")
         except Exception as e:  # noqa: BLE001
             job_store.append_log(job_id, "error", f"repair failed: {e}")
             break

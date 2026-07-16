@@ -64,6 +64,48 @@ def fetch(project_path: str) -> None:
         pass  # offline / no remote is acceptable for local-only repos
 
 
+def _rev_ok(project_path: str, ref: str) -> bool:
+    try:
+        _run(project_path, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"])
+        return True
+    except GitWriteError:
+        return False
+
+
+def _origin_default_branch(project_path: str) -> str | None:
+    try:
+        ref = _run(project_path, ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"]).strip()
+    except GitWriteError:
+        return None
+    return ref.rsplit("/", 1)[-1] if ref else None
+
+
+def resolve_base_branch(project_path: str, explicit: str | None = None) -> str:
+    """Never hardcode 'master'. Priority: explicit task/retry branch ->
+    origin/HEAD default branch -> current workspace branch -> 'main' ->
+    'master' -> fail closed (GitWriteError) if none resolve to a real commit."""
+    candidates: list[str] = [explicit, _origin_default_branch(project_path)]
+    try:
+        cur = current_branch(project_path)
+        candidates.append(cur if cur != "HEAD" else None)
+    except GitWriteError:
+        pass
+    candidates += ["main", "master"]
+
+    seen: set[str] = set()
+    tried: list[str] = []
+    for name in candidates:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        tried.append(name)
+        if _rev_ok(project_path, name):
+            return name
+        if _rev_ok(project_path, f"origin/{name}"):
+            return f"origin/{name}"
+    raise GitWriteError(f"no valid base branch found (tried: {', '.join(tried)})")
+
+
 def create_work_branch(project_path: str, task_id, goal: str, base: str) -> str:
     name = f"ai-runtime/{task_id or 'job'}-{slug(goal)}"
     # if branch exists, append a short suffix
