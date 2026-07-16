@@ -1,0 +1,26 @@
+# Registry of protected project agent contexts.
+#
+# This file is DESCRIPTIVE ONLY. It is consumed by core/agent_context_recovery.py,
+# which is strictly read-only with respect to every path listed here. The recovery
+# tool never writes, deploys, messages, or mutates anything under `root`.
+#
+# protected: true  -> context must be restored/reconstructed if missing
+# protected: false -> context is only verified and reported
+version: 1
+projects:
+  - name: acap
+    root: /root/acap
+    protected: true
+    tmux_session: acap
+  - name: mess
+    root: /root/mess
+    protected: true
+    tmux_session: mess
+  - name: email
+    root: /root/email
+    protected: false
+    tmux_session: email
+  - name: JobHunter
+    root: /root/JobHunter
+    protected: false
+    tmux_session: jobhunter
