@@ -95,6 +95,33 @@ def _run_tests(project_path: str, commands: list[str]) -> dict:
     return {"ok": ok, "results": results}
 
 
+def _remove_created_paths(project_path: str, changed: list) -> list[str]:
+    """Delete files a failed job created, so its debris cannot leak into the
+    shared workspace (and into the next job's test run). Never touches a path
+    that already existed before the job: those are restored from the backup
+    archive instead. `changed` entries record `before == 'absent'` exactly when
+    the job created the path.
+    """
+    removed: list[str] = []
+    for c in changed or []:
+        if c.get("before") != "absent" or c.get("operation") not in ("create", "patch", "replace"):
+            continue
+        rel = c.get("path")
+        if not rel:
+            continue
+        target = os.path.realpath(os.path.join(project_path, rel))
+        # never escape the project directory
+        if not target.startswith(os.path.realpath(project_path) + os.sep):
+            continue
+        try:
+            if os.path.isfile(target):
+                os.remove(target)
+                removed.append(rel)
+        except OSError:
+            pass
+    return removed
+
+
 def _apply_files(project_path: str, files: list[dict]) -> list[dict]:
     fe = FileEngine(project_path)
     changed = []
@@ -300,12 +327,26 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         _finish(job_id, "failed", error=f"backup failed: {str(e)[:400]}")
         return
 
+    # Paths this job brought into existence, tracked so a rollback can undo them.
+    created_paths: list[str] = []
+
     def _rollback(reason: str):
         try:
             backup.rollback(backup_meta["id"])
             job_store.append_log(job_id, "warn", f"rolled back ({reason})")
         except Exception as e:  # noqa: BLE001
             job_store.append_log(job_id, "error", f"rollback error: {e}")
+        # BackupEngine.rollback() restores archived files (tar extract) but cannot
+        # remove files that did not exist when the snapshot was taken. Without
+        # this sweep a failed job leaves its new, untracked files in the shared
+        # workspace forever — exactly how OWNER-113's broken module and its
+        # failing test survived its own rollback and then failed the repo-suite
+        # gate of every later job. Only paths this job itself created are removed.
+        removed = _remove_created_paths(pp, created_paths)
+        if removed:
+            job_store.append_log(job_id, "warn",
+                                 f"workspace hygiene: removed {len(removed)} file(s) created by this "
+                                 f"job so they cannot poison later jobs: {removed}")
 
     # 3) BRANCH
     branch = None
@@ -325,6 +366,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     job_store.update_job(job_id, status="editing")
     try:
         changed = _apply_files(pp, plan["files"])
+        created_paths.extend(changed)
         job_store.update_job(job_id, changed_files=changed)
         job_store.append_log(job_id, "info", f"applied {len(changed)} file operation(s)")
     except Exception as e:  # noqa: BLE001
@@ -376,6 +418,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
                                          f"\n\nThe previous attempt FAILED tests:\n{fails}\nFix it.",
                                          pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat)
                 repair_changed = _apply_files(pp, repair["files"])
+                created_paths.extend(repair_changed)
                 by_path = {c["path"]: c for c in changed}
                 by_path.update({c["path"]: c for c in repair_changed})
                 changed = list(by_path.values())

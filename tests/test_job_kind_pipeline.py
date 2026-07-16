@@ -138,6 +138,22 @@ def test_code_change_job_is_still_gated_on_the_repo_suite(repo, tmp_path, monkey
     assert "tests failed" in (final["error"] or "")
 
 
+def test_failed_code_job_leaves_no_untracked_debris(repo, tmp_path, monkeypatch):
+    """A failed job's created files must not survive to poison the next job."""
+    cli = _planner_cli(tmp_path, {
+        "summary": "add a broken module",
+        "files": [{"path": "tests_leftover.py", "operation": "create", "content": "assert False\n"},
+                  {"path": "check.py", "operation": "create", "content": "raise SystemExit(1)\n"}],
+        "test_commands": ["python3 check.py"],
+    })
+    final = _run(repo, monkeypatch, cli, "Implement something broken")
+
+    assert final["status"] == "failed"
+    assert not (repo / "tests_leftover.py").exists(), \
+        "failed job's created file must be removed from the shared workspace"
+    assert not (repo / "check.py").exists()
+
+
 def test_operational_job_with_no_code_changes_is_not_an_error(repo, tmp_path, monkeypatch):
     """No code change is a normal result for an operational job, and it must not
     fabricate a commit to look successful."""

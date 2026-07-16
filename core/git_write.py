@@ -80,14 +80,35 @@ def _origin_default_branch(project_path: str) -> str | None:
     return ref.rsplit("/", 1)[-1] if ref else None
 
 
+#: Branches created by the runtime itself. One job's work branch must never
+#: become another job's base: that is how OWNER-111/113..118/120 all ended up
+#: pinned to the same fallback commit (5e3ec9e). A previous job's branch is only
+#: acceptable as a base when the caller names it explicitly (e.g. a retry that
+#: intends to continue that exact work).
+_WORK_BRANCH_RE = re.compile(r"^(ai-runtime|repair)/")
+
+
+def is_work_branch(name: str) -> bool:
+    return bool(_WORK_BRANCH_RE.match((name or "").strip()))
+
+
 def resolve_base_branch(project_path: str, explicit: str | None = None) -> str:
     """Never hardcode 'master'. Priority: explicit task/retry branch ->
-    origin/HEAD default branch -> current workspace branch -> 'main' ->
-    'master' -> fail closed (GitWriteError) if none resolve to a real commit."""
+    origin/HEAD default branch -> current workspace branch (only when it is not
+    itself a runtime work branch) -> 'main' -> 'master' -> fail closed
+    (GitWriteError) if none resolve to a real commit.
+
+    The current-branch candidate is deliberately skipped for runtime work
+    branches. Previously `base_branch='master'` (a branch that does not exist in
+    this repository) fell through to the current workspace branch, so every job
+    branched off whichever branch the previous job happened to leave checked
+    out — stacking unrelated work and giving many branches an identical HEAD.
+    """
     candidates: list[str] = [explicit, _origin_default_branch(project_path)]
     try:
         cur = current_branch(project_path)
-        candidates.append(cur if cur != "HEAD" else None)
+        if cur != "HEAD" and not is_work_branch(cur):
+            candidates.append(cur)
     except GitWriteError:
         pass
     candidates += ["main", "master"]
