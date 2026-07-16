@@ -8,6 +8,8 @@ import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from core import job_kinds
+
 _DB = os.getenv("RUNTIME_DB", os.path.join(os.path.dirname(os.path.dirname(__file__)), "runtime_jobs.db"))
 _LOCK = threading.RLock()
 # a job with a heartbeat newer than this is still being actively executed by
@@ -15,7 +17,7 @@ _LOCK = threading.RLock()
 # see recover_interrupted().
 _HEARTBEAT_STALE_SECS = int(os.getenv("RUNTIME_HEARTBEAT_STALE_SECS", "20"))
 
-# statuses (spec §3)
+# statuses (spec §3) — lifecycle position, NOT the result of the work.
 STATUSES = ["draft", "waiting_approval", "queued", "planning", "backing_up", "branching",
             "editing", "validating", "testing", "committing", "pushing", "deploying",
             "completed", "failed", "cancelled", "rolled_back", "blocked"]
@@ -51,12 +53,17 @@ def init_db() -> None:
             plan TEXT, changed_files TEXT, validation TEXT, tests TEXT, git_info TEXT,
             logs TEXT, error TEXT, artifacts TEXT,
             created_at TEXT, started_at TEXT, finished_at TEXT, updated_at TEXT,
-            heartbeat_at TEXT
+            heartbeat_at TEXT, kind TEXT, outcome TEXT
         )""")
-        try:
-            c.execute("ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT")
-        except sqlite3.OperationalError:
-            pass  # already migrated
+        # Additive migrations: each guarded independently so a partially migrated
+        # database converges rather than aborting on the first existing column.
+        for ddl in ("ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT",
+                    "ALTER TABLE jobs ADD COLUMN kind TEXT",
+                    "ALTER TABLE jobs ADD COLUMN outcome TEXT"):
+            try:
+                c.execute(ddl)
+            except sqlite3.OperationalError:
+                pass  # already migrated
 
 
 def _row_to_dict(r: sqlite3.Row) -> dict:
@@ -92,6 +99,8 @@ def create_job(**kw) -> dict:
         "target_branch": kw.get("target_branch"), "base_branch": kw.get("base_branch"),
         "status": kw.get("status", "draft"), "risk_level": kw.get("risk_level", "medium"),
         "dangerous": int(kw.get("dangerous", 0)),
+        "kind": job_kinds.classify(kw.get("goal") or "", kw.get("instructions") or "", kw.get("kind")),
+        "outcome": None,
         "plan": None, "changed_files": json.dumps([]), "validation": None, "tests": None,
         "git_info": None, "logs": json.dumps([]), "error": None, "artifacts": json.dumps([]),
         "created_at": now, "started_at": None, "finished_at": None, "updated_at": now,

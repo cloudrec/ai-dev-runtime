@@ -157,10 +157,14 @@ def _extract_json(text: str) -> dict:
     raise PlannerError("model did not return JSON")
 
 
-def _validate(plan: dict, allowed_paths: list) -> dict:
+def _validate(plan: dict, allowed_paths: list, allow_empty_files: bool = False) -> dict:
     if not isinstance(plan, dict) or "files" not in plan or not isinstance(plan["files"], list):
         raise PlannerError("plan missing 'files' list")
-    if not plan["files"]:
+    if not plan["files"] and not allow_empty_files:
+        # A code change that touches no file is a non-plan. For operational /
+        # content / deployment work the opposite is true — the work happens
+        # outside the repository — so those kinds pass allow_empty_files=True
+        # rather than being forced to invent a file just to produce a valid plan.
         raise PlannerError("plan has no file operations")
     for f in plan["files"]:
         path = (f.get("path") or "").strip()
@@ -350,11 +354,15 @@ def _sanitize_raw(text: str, cap: int = 4000) -> str:
 
 
 def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
-        timeout: int | None = None, heartbeat_cb=None) -> dict:
+        timeout: int | None = None, heartbeat_cb=None, kind: str | None = None) -> dict:
     """heartbeat_cb(elapsed_seconds), if given, is called roughly every
     RUNTIME_PLAN_HEARTBEAT_SECS while the provider call is still running, so
     long-running plans surface progress instead of going silent until they
-    finish or hit the timeout."""
+    finish or hit the timeout.
+
+    `kind` is the job kind (see core.job_kinds). A non-code kind is allowed to
+    produce a plan with no file operations; code changes still must touch a file.
+    """
     if not available():
         raise PlannerError("provider_not_configured")
     listing = ""
@@ -403,7 +411,9 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
     raw = _sanitize_raw(plan_text)
     try:
         plan_obj = _extract_json(plan_text)
-        return _validate(plan_obj, allowed_paths)
+        from core import job_kinds
+        return _validate(plan_obj, allowed_paths,
+                         allow_empty_files=kind is not None and not job_kinds.requires_code_changes(kind))
     except PlannerError as e:
         # Re-raise with the sanitized raw response + accounting attached so the
         # caller can record diagnostics and fall back deterministically.

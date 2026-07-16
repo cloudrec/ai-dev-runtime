@@ -12,7 +12,7 @@ import shlex
 import subprocess
 import threading
 
-from core import ai_planner, git_write, job_store
+from core import ai_planner, git_write, job_kinds, job_store, job_validation
 from core.backup_engine import BackupEngine
 from core.file_engine import FileEngine
 
@@ -150,6 +150,11 @@ def _write_report(job: dict) -> None:
 
 
 def _finish(job_id: str, status: str, **extra):
+    # Every terminal state carries an explicit outcome: a job that ends without
+    # one is exactly the ambiguity this model removes. Failure paths default to
+    # the `failed` outcome unless the caller states a more specific one.
+    if status == "failed":
+        extra.setdefault("outcome", job_kinds.FAILED)
     job = job_store.update_job(job_id, status=status, finished_at=job_store._now(), **extra)
     if job:
         _write_report(job)
@@ -194,7 +199,21 @@ def execute(job_id: str) -> None:
         hb_thread.join(timeout=2)
 
 
+def _first_failure(validation: dict) -> str:
+    for c in validation.get("results", []):
+        if not c.get("passed"):
+            return f"{c.get('check')} ({c.get('detail', '')[:160]})"
+    return "unknown validation failure"
+
+
 def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
+    # 0) KIND — decides how this job is validated and what a success means.
+    kind = job.get("kind") or job_kinds.classify(job.get("goal") or "", job.get("instructions") or "")
+    if job.get("kind") != kind:
+        job_store.update_job(job_id, kind=kind)
+    job_store.append_log(job_id, "info",
+                         f"job kind: {kind} — validated by {job_kinds.validation_kind_for(kind)}")
+
     # 1) PLAN
     job_store.update_job(job_id, status="planning")
     job_store.append_log(job_id, "info", "planning via AI provider")
@@ -204,7 +223,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     fallback_used = False
     try:
         plan = ai_planner.plan(job["goal"] or "", job["instructions"] or "", pp, job.get("allowed_paths") or [],
-                               heartbeat_cb=_heartbeat)
+                               heartbeat_cb=_heartbeat, kind=kind)
     except ai_planner.PlannerError as e:
         reason = str(e)
         # No provider at all -> genuinely cannot proceed; stay blocked (a
@@ -249,9 +268,10 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         job_store.append_log(job_id, "info", f"FALLBACK PLAN in use ({len(plan['files'])} safe file op)")
     job_store.append_log(job_id, "info", f"plan: {plan.get('summary','')[:120]} ({len(plan['files'])} file ops)")
 
-    # observe/suggest -> plan only, stop here
+    # observe/suggest -> plan only, stop here. A plan is not an implementation,
+    # so this reports `fallback_plan_only` rather than a success outcome.
     if _idx(job["autonomy_level"]) <= _idx("suggest"):
-        _finish(job_id, "completed")
+        _finish(job_id, "completed", outcome=job_kinds.FALLBACK_PLAN_ONLY)
         job_store.append_log(job_id, "info", "plan-only (autonomy suggest/observe) — no changes applied")
         return
 
@@ -309,44 +329,87 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         job_store.append_log(job_id, "info", f"applied {len(changed)} file operation(s)")
     except Exception as e:  # noqa: BLE001
         _rollback("edit error")
-        _finish(job_id, "failed", error=f"edit failed: {e}")
+        _finish(job_id, "failed", outcome=job_kinds.FAILED, error=f"edit failed: {e}")
         return
 
     # 5) VALIDATE / TEST (bounded repair)
+    #
+    # Routing by kind. Only a `code_change` job is gated on the repository test
+    # suite; every other kind is validated against evidence of its own work.
+    # Gating a content/operational job on repo-wide pytest is what made
+    # OWNER-114..120 fail on a defect left behind by OWNER-113.
     job_store.update_job(job_id, status="testing")
-    tests = _run_tests(pp, plan.get("test_commands") or [])
-    attempt = 0
-    # When a fallback plan is in use the provider planner is known-broken —
-    # re-invoking it for a repair attempt would just fail/time out again, so skip
-    # the planner-based repair loop entirely (never retry a broken planner).
-    while not tests["ok"] and attempt < _MAX_REPAIRS and not fallback_used:
-        attempt += 1
-        job_store.append_log(job_id, "warn", f"tests failed — repair attempt {attempt}")
-        try:
-            fails = "\n".join(r["output"][-500:] for r in tests["results"] if not r["passed"])
-            repair = ai_planner.plan(job["goal"] or "", (job["instructions"] or "") +
-                                     f"\n\nThe previous attempt FAILED tests:\n{fails}\nFix it.",
-                                     pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat)
-            repair_changed = _apply_files(pp, repair["files"])
-            by_path = {c["path"]: c for c in changed}
-            by_path.update({c["path"]: c for c in repair_changed})
-            changed = list(by_path.values())
-            job_store.update_job(job_id, changed_files=changed)
-            job_store.append_log(job_id, "info", f"repair applied {len(repair_changed)} file operation(s)")
-        except Exception as e:  # noqa: BLE001
-            job_store.append_log(job_id, "error", f"repair failed: {e}")
-            break
+
+    if not job_kinds.requires_repo_tests(kind):
+        validation = job_validation.validate(kind, pp, plan, changed, run_commands=_run_tests)
+        job_store.update_job(job_id, validation=validation, tests={
+            "ok": validation["ok"], "results": [], "skipped_repo_suite": True,
+            "reason": f"kind={kind} is validated by {validation['validation_kind']}",
+        })
+        for c in validation["results"]:
+            job_store.append_log(job_id, "info" if c["passed"] else "warn",
+                                 f"validation {'PASS' if c['passed'] else 'FAIL'}: {c['check']}")
+        if validation.get("dropped_repo_suite_commands"):
+            job_store.append_log(job_id, "info",
+                                 f"repo suite command(s) not used as validation for kind={kind}: "
+                                 f"{validation['dropped_repo_suite_commands']}")
+        if not validation["ok"]:
+            _rollback("task validation failed")
+            _finish(job_id, "failed", outcome=job_kinds.FAILED,
+                    error=f"task validation failed for kind={kind}: "
+                          f"{_first_failure(validation)}")
+            return
+        job_store.append_log(job_id, "info", f"task validation passed ({validation['validation_kind']})")
+        tests = {"ok": True, "results": [], "skipped_repo_suite": True}
+    else:
         tests = _run_tests(pp, plan.get("test_commands") or [])
-    job_store.update_job(job_id, tests=tests)
-    if not tests["ok"] and (plan.get("test_commands")):
-        _rollback("tests failed")
-        _finish(job_id, "failed", error="tests failed after repair attempts")
-        return
-    job_store.append_log(job_id, "info", "tests passed" if tests["ok"] else "no tests specified")
+        attempt = 0
+        # When a fallback plan is in use the provider planner is known-broken —
+        # re-invoking it for a repair attempt would just fail/time out again, so skip
+        # the planner-based repair loop entirely (never retry a broken planner).
+        while not tests["ok"] and attempt < _MAX_REPAIRS and not fallback_used:
+            attempt += 1
+            job_store.append_log(job_id, "warn", f"tests failed — repair attempt {attempt}")
+            try:
+                fails = "\n".join(r["output"][-500:] for r in tests["results"] if not r["passed"])
+                repair = ai_planner.plan(job["goal"] or "", (job["instructions"] or "") +
+                                         f"\n\nThe previous attempt FAILED tests:\n{fails}\nFix it.",
+                                         pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat)
+                repair_changed = _apply_files(pp, repair["files"])
+                by_path = {c["path"]: c for c in changed}
+                by_path.update({c["path"]: c for c in repair_changed})
+                changed = list(by_path.values())
+                job_store.update_job(job_id, changed_files=changed)
+                job_store.append_log(job_id, "info", f"repair applied {len(repair_changed)} file operation(s)")
+            except Exception as e:  # noqa: BLE001
+                job_store.append_log(job_id, "error", f"repair failed: {e}")
+                break
+            tests = _run_tests(pp, plan.get("test_commands") or [])
+        job_store.update_job(job_id, tests=tests, validation={
+            "ok": tests["ok"], "validation_kind": job_kinds.validation_kind_for(kind),
+            "repo_suite_used": True,
+            "results": [{"check": f"repo suite: {r.get('cmd')}", "passed": bool(r.get("passed")),
+                         "detail": (r.get("output") or "")[-500:]} for r in tests.get("results", [])],
+        })
+        if not tests["ok"] and (plan.get("test_commands")):
+            _rollback("tests failed")
+            _finish(job_id, "failed", outcome=job_kinds.FAILED,
+                    error="tests failed after repair attempts")
+            return
+        job_store.append_log(job_id, "info", "tests passed" if tests["ok"] else "no tests specified")
 
     # 6) COMMIT
+    #
+    # A job with no file changes does not commit. For a non-code kind that is a
+    # perfectly normal result — the work happened outside the repository — and
+    # fabricating an empty commit purely to look successful is forbidden
+    # (job_kinds.allows_empty_commit is False for every kind).
     git_info = {"branch": branch}
-    if branch and job.get("auto_commit", True):
+    if branch and job.get("auto_commit", True) and not changed:
+        job_store.append_log(job_id, "info",
+                             f"no file changes to commit (kind={kind}) — not creating a commit; "
+                             f"this is not an error for a {kind} job")
+    elif branch and job.get("auto_commit", True):
         job_store.update_job(job_id, status="committing")
         try:
             git_write.add_paths(pp, [c["path"] for c in changed if c["operation"] != "delete"] +
@@ -382,8 +445,19 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         git_info["pushed"] = False
 
     job_store.update_job(job_id, git_info=git_info)
-    _finish(job_id, "completed")
-    job_store.append_log(job_id, "info", "job completed")
+
+    # 8) OUTCOME — what was actually achieved, distinct from lifecycle status.
+    # A fallback plan is a document describing work, not the work: it is never
+    # reported as a completed implementation and never feeds a release.
+    if fallback_used:
+        outcome = job_kinds.FALLBACK_PLAN_ONLY
+        job_store.append_log(job_id, "warn",
+                             "outcome=fallback_plan_only — a PLAN was recorded, the task is NOT "
+                             "implemented; requeue it for real implementation")
+    else:
+        outcome = job_kinds.success_outcome_for(kind)
+    _finish(job_id, "completed", outcome=outcome)
+    job_store.append_log(job_id, "info", f"job completed (outcome={outcome})")
 
 
 def execute_async(job_id: str) -> None:
