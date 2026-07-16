@@ -218,3 +218,15 @@ def test_fallback_plan_reports_plan_only_never_implemented(repo, tmp_path, monke
     assert not job_kinds.is_releasable(final["outcome"])
     # the plan document itself is preserved as a plan
     assert any("fallback" in c["path"] for c in final["changed_files"]), final["changed_files"]
+
+
+def test_a_fallback_plan_job_cannot_feed_a_release(repo, tmp_path, monkeypatch):
+    from core import release_controller
+
+    cli = _failing_planner_cli(tmp_path)
+    final = _run(repo, monkeypatch, cli, "Build Release Controller")
+    branch = final["git_info"]["branch"]
+
+    with pytest.raises(release_controller.ReleaseError, match="not releasable"):
+        release_controller.create_candidate(str(repo), branch, "main",
+                                            job_outcome=final["outcome"])
