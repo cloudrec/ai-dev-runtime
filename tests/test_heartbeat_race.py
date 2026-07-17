@@ -102,9 +102,14 @@ def test_execute_pulses_heartbeat_and_survives_concurrent_recover_sweep(tmp_path
     assert job_store.get_job(job["id"])["status"] == "planning"
 
     deadline = time.monotonic() + 10
-    while job_store.get_job(job["id"])["status"] not in ("completed", "failed", "blocked") \
+    while job_store.get_job(job["id"])["status"] not in (
+            "completed", "failed", "blocked", "fallback_plan_only") \
             and time.monotonic() < deadline:
         time.sleep(0.1)
     final = job_store.get_job(job["id"])
-    assert final["status"] == "completed"
+    # This job runs at autonomy `suggest`, so it legitimately stops at a plan and
+    # ends in the plan-only terminal status. What this test pins is the
+    # heartbeat: the job survived the concurrent sweep and finished on its own
+    # terms rather than being reaped with an error.
+    assert final["status"] == "fallback_plan_only"
     assert final["error"] is None

@@ -202,7 +202,9 @@ def test_timeout_falls_back_and_reaches_coding_stage(tmp_path, monkeypatch):
                                auto_commit=True, auto_push=False)
     job_executor.execute(job["id"])
     final = job_store.get_job(job["id"])
-    assert final["status"] == "completed", final.get("error")
+    # A fallback plan is not an implementation: it ends in its own terminal
+    # status, never `completed`. See core.job_kinds.terminal_status_for.
+    assert final["status"] == "fallback_plan_only", final.get("error")
     # fallback markers
     assert final["plan"]["fallback"] is True
     assert final["plan"]["fallback_timed_out"] is True
@@ -225,7 +227,9 @@ def test_empty_response_falls_back(tmp_path, monkeypatch):
                                auto_commit=True, auto_push=False)
     job_executor.execute(job["id"])
     final = job_store.get_job(job["id"])
-    assert final["status"] == "completed", final.get("error")
+    # A fallback plan is not an implementation: it ends in its own terminal
+    # status, never `completed`. See core.job_kinds.terminal_status_for.
+    assert final["status"] == "fallback_plan_only", final.get("error")
     assert final["plan"]["fallback"] is True
     assert int(open(counter).read()) == 1
 
@@ -245,7 +249,9 @@ def test_plain_text_response_falls_back(tmp_path, monkeypatch):
                                auto_commit=True, auto_push=False)
     job_executor.execute(job["id"])
     final = job_store.get_job(job["id"])
-    assert final["status"] == "completed", final.get("error")
+    # A fallback plan is not an implementation: it ends in its own terminal
+    # status, never `completed`. See core.job_kinds.terminal_status_for.
+    assert final["status"] == "fallback_plan_only", final.get("error")
     assert final["plan"]["fallback"] is True
     assert "did not return JSON" in final["plan"]["fallback_reason"]
     assert int(open(counter).read()) == 1
@@ -266,7 +272,9 @@ def test_malformed_json_falls_back(tmp_path, monkeypatch):
                                auto_commit=True, auto_push=False)
     job_executor.execute(job["id"])
     final = job_store.get_job(job["id"])
-    assert final["status"] == "completed", final.get("error")
+    # A fallback plan is not an implementation: it ends in its own terminal
+    # status, never `completed`. See core.job_kinds.terminal_status_for.
+    assert final["status"] == "fallback_plan_only", final.get("error")
     assert final["plan"]["fallback"] is True
     assert "malformed planner JSON" in final["plan"]["fallback_reason"]
 
@@ -287,7 +295,9 @@ def test_no_secrets_in_stored_diagnostics(tmp_path, monkeypatch):
                                auto_commit=True, auto_push=False)
     job_executor.execute(job["id"])
     final = job_store.get_job(job["id"])
-    assert final["status"] == "completed", final.get("error")
+    # A fallback plan is not an implementation: it ends in its own terminal
+    # status, never `completed`. See core.job_kinds.terminal_status_for.
+    assert final["status"] == "fallback_plan_only", final.get("error")
     blob = str(final["plan"]) + str(final["artifacts"]) + str(final["logs"])
     assert "sk-ant-SUPERSECRET_TOKEN" not in blob
     # and the committed fallback doc on disk must be clean too
@@ -310,6 +320,8 @@ def test_existing_dirty_workspace_preserved(tmp_path, monkeypatch):
                                auto_commit=True, auto_push=False)
     job_executor.execute(job["id"])
     final = job_store.get_job(job["id"])
-    assert final["status"] == "completed", final.get("error")
+    # A fallback plan is not an implementation: it ends in its own terminal
+    # status, never `completed`. See core.job_kinds.terminal_status_for.
+    assert final["status"] == "fallback_plan_only", final.get("error")
     assert stray.exists()
     assert stray.read_text() == "operator work in progress\n"

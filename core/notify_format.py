@@ -11,6 +11,11 @@ from __future__ import annotations
 from typing import Any, Dict, Mapping, Optional
 
 COMPLETED_EVENT = "runtime.job.completed"
+#: A plan-only run gets its own event type. Emitting `runtime.job.completed` for
+#: it is what made jobs 59/60/61 look done to every downstream consumer, so the
+#: distinction is carried by the event type itself rather than by a field the
+#: reader has to remember to check.
+FALLBACK_PLAN_ONLY_EVENT = "runtime.job.fallback_plan_only"
 
 # Ordered (label, payload key) pairs rendered for a completed event.
 _COMPLETED_FIELDS = (
@@ -101,6 +106,68 @@ def _value_for(key: str, payload: Mapping[str, Any]) -> Optional[str]:
     return _clean(payload.get(key))
 
 
+def event_type_for(outcome: Optional[str]) -> str:
+    """The event type an outcome may be published under.
+
+    A plan-only outcome never gets `runtime.job.completed`. Emitters must route
+    through this rather than hardcoding the completed event.
+    """
+    if _clean(outcome) in _NOT_IMPLEMENTED_OUTCOMES:
+        return FALLBACK_PLAN_ONLY_EVENT
+    return COMPLETED_EVENT
+
+
+def _fact(value: Any) -> Optional[bool]:
+    """Tri-state read of a claim: True / False / unknown (None)."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("true", "yes", "ok", "passed", "pass", "green", "1"):
+        return True
+    if text in ("false", "no", "failed", "fail", "red", "0"):
+        return False
+    return None
+
+
+def render_facts(payload: Mapping[str, Any]) -> list[str]:
+    """The four claims an operator conflated when reading "completed".
+
+    Each is reported independently and only when the payload actually says
+    something about it: "tests passed" is not implied by "implementation
+    completed", and neither implies "released to production".
+    """
+    outcome = _clean(payload.get("outcome"))
+    implemented = outcome in ("implemented",) if outcome else None
+    if outcome in _NOT_IMPLEMENTED_OUTCOMES:
+        implemented = False
+
+    tests = _fact(payload.get("tests_passed"))
+    if tests is None:
+        tests = _fact(payload.get("tests_result") or payload.get("tests"))
+    branch = _clean(payload.get("branch"))
+    # Explicit presence check: `payload.get("released") or payload.get(...)` would
+    # turn a truthful `released: False` into "unknown".
+    released = _fact(payload["released"]) if "released" in payload else \
+        _fact(payload.get("production_released"))
+
+    def mark(value: Optional[bool], yes: str, no: str) -> str:
+        if value is None:
+            return f"❔ {no} (unknown)"
+        return f"✅ {yes}" if value else f"❌ {no}"
+
+    lines = [
+        mark(implemented, "Implementation completed", "Implementation NOT completed"),
+        mark(tests, "Tests passed", "Tests not passed"),
+        (f"✅ Branch created: {branch}" if branch else "❌ No branch created"),
+        mark(released, "Released to production", "Not released to production"),
+    ]
+    if outcome in _NOT_IMPLEMENTED_OUTCOMES:
+        lines.append("⚠️ Fallback plan only — a document, not an implementation")
+    return lines
+
+
 def render_completed(payload: Mapping[str, Any]) -> str:
     """Render a ``runtime.job.completed`` payload into Telegram message text.
 
@@ -121,6 +188,8 @@ def render_completed(payload: Mapping[str, Any]) -> str:
         value = _value_for(key, payload)
         if value is not None:
             lines.append(f"{label}: {value}")
+    lines.append("")
+    lines.extend(render_facts(payload))
     if outcome in _NOT_IMPLEMENTED_OUTCOMES:
         lines.append("This task is NOT done: a plan was recorded, no implementation was made. "
                      "It must be requeued for real implementation and must not be released.")
@@ -137,7 +206,10 @@ def render_event(event: Mapping[str, Any]) -> Optional[str]:
     payload = event.get("payload")
     if not isinstance(payload, Mapping):
         payload = event
-    if event_type == COMPLETED_EVENT:
+    if event_type in (COMPLETED_EVENT, FALLBACK_PLAN_ONLY_EVENT):
+        # A `runtime.job.completed` event carrying a plan-only outcome is a
+        # mislabelled emitter. Render it truthfully rather than propagating the
+        # claim: the headline comes from the outcome, never from the event type.
         return render_completed(payload)
     # Preserve existing wording for warning / decision / any other event.
     for key in ("text", "message", "body"):
