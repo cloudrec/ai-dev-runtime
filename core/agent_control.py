@@ -459,13 +459,18 @@ def agent_read(target: str, lines: Any = DEFAULT_CAPTURE_LINES) -> dict:
         raise AgentControlError(f"cannot read {target!r}: {err.strip()[:200]}")
     text = redact(out)
     captured = text.splitlines()
-    audit("agent_read", target, ok=True, lines=len(captured))
+    # `capture-pane -S -N` starts N lines above the visible pane, so it returns
+    # the pane *plus* N — not N lines. The slice is the real bound, and
+    # lines_returned must describe what the caller actually got.
+    returned = captured[-n:]
+    audit("agent_read", target, ok=True, lines=len(returned))
     return {
         "target": target,
         "lines_requested": n,
-        "lines_returned": len(captured),
-        "truncated": len(captured) >= n,
-        "output": "\n".join(captured[-n:]),
+        "lines_returned": len(returned),
+        "lines_available": len(captured),
+        "truncated": len(captured) > len(returned),
+        "output": "\n".join(returned),
         "captured_at": _now(),
     }
 

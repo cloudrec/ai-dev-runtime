@@ -175,12 +175,26 @@ def test_read_bounds_line_count_to_ceiling(tmux):
 
 
 def test_read_returns_at_most_requested_lines(monkeypatch):
+    """tmux hands back more than asked (-S -N starts N lines above the pane), so
+    the slice is the real bound and the reported count must match the output."""
     fake = FakeTmux()
     fake.capture_seq = ["\n".join(f"line{i}" for i in range(50))]
     monkeypatch.setattr(ac, "_tmux", fake)
     result = ac.agent_read("safeguard", lines=10)
-    assert result["lines_returned"] <= 50
     assert len(result["output"].splitlines()) == 10
+    assert result["lines_returned"] == 10
+    assert result["lines_available"] == 50
+    assert result["truncated"] is True
+    assert result["output"].splitlines()[-1] == "line49"
+
+
+def test_read_not_truncated_when_everything_fits(monkeypatch):
+    fake = FakeTmux()
+    fake.capture_seq = ["a\nb\nc"]
+    monkeypatch.setattr(ac, "_tmux", fake)
+    result = ac.agent_read("safeguard", lines=10)
+    assert result["lines_returned"] == 3
+    assert result["truncated"] is False
 
 
 def test_read_rejects_bad_line_count(tmux):
