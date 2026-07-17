@@ -206,3 +206,82 @@ class RollbackReq(BaseModel):
 async def rollback(req: RollbackReq, _: bool = Depends(_auth)):
     pp = _validate_project_path(req.project_path)
     return deliver_mod.rollback(pp, req.target_branch, req.to_commit, req.push)
+
+
+# ── Direct Agent Control Plane: manage the Claude agents already in tmux ─────
+# The Owner OS MCP server runs in a container with no tmux socket and no host
+# PID namespace, so it cannot address these agents itself. It proxies here.
+# There is deliberately no arbitrary-command endpoint: every route below maps to
+# one bounded, validated, audited operation in core.agent_control.
+from core import agent_control  # noqa: E402
+
+
+def _agent_call(fn, *args, **kwargs):
+    """Map control-plane refusals to 400s and keep tmux failures off the wire."""
+    try:
+        return fn(*args, **kwargs)
+    except agent_control.AgentControlError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/agents")
+async def agents_list(_: bool = Depends(_auth)):
+    return _agent_call(agent_control.agent_list)
+
+
+@router.get("/agents/status")
+async def agents_status(target: str, _: bool = Depends(_auth)):
+    return _agent_call(agent_control.agent_status, target)
+
+
+@router.get("/agents/read")
+async def agents_read(target: str, lines: int = agent_control.DEFAULT_CAPTURE_LINES,
+                      _: bool = Depends(_auth)):
+    return _agent_call(agent_control.agent_read, target, lines)
+
+
+class AgentSendReq(BaseModel):
+    target: str
+    text: str
+    idempotency_key: Optional[str] = None
+
+
+@router.post("/agents/send")
+async def agents_send(req: AgentSendReq, _: bool = Depends(_auth)):
+    return _agent_call(agent_control.agent_send, req.target, req.text, req.idempotency_key)
+
+
+@router.post("/agents/answer")
+async def agents_answer(req: AgentSendReq, _: bool = Depends(_auth)):
+    return _agent_call(agent_control.agent_answer, req.target, req.text, req.idempotency_key)
+
+
+class AgentResumeReq(BaseModel):
+    project_dir: str
+    conversation_id: Optional[str] = None
+    session_name: Optional[str] = None
+
+
+@router.post("/agents/resume")
+async def agents_resume(req: AgentResumeReq, _: bool = Depends(_auth)):
+    return _agent_call(agent_control.agent_resume, req.project_dir,
+                       req.conversation_id, req.session_name)
+
+
+@router.get("/agents/report")
+async def agents_report(project_dir: str, limit: int = 20, path: Optional[str] = None,
+                        _: bool = Depends(_auth)):
+    if path:
+        return _agent_call(agent_control.agent_report_read, project_dir, path)
+    return _agent_call(agent_control.agent_report, project_dir, limit)
+
+
+class AgentStopReq(BaseModel):
+    target: str
+    confirm: bool = False
+    idempotency_key: Optional[str] = None
+
+
+@router.post("/agents/stop")
+async def agents_stop(req: AgentStopReq, _: bool = Depends(_auth)):
+    return _agent_call(agent_control.agent_stop, req.target, req.confirm, req.idempotency_key)

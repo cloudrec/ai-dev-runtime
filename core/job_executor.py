@@ -20,7 +20,8 @@ AUTONOMY_ORDER = ["observe", "suggest", "prepare", "execute_safe", "execute_full
 _MAX_REPAIRS = int(os.getenv("RUNTIME_MAX_REPAIRS", "1"))
 _TEST_TIMEOUT = int(os.getenv("RUNTIME_TEST_TIMEOUT", "300"))
 _BACKUP_TIMEOUT = int(os.getenv("RUNTIME_BACKUP_TIMEOUT", "120"))
-_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "blocked", "rolled_back"}
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled", "blocked", "rolled_back",
+                      "fallback_plan_only"}
 # goals/instructions that describe read-only inventory/report/audit work -> a
 # full migration-grade archive is wasteful and risky; take a light snapshot.
 _READ_ONLY_RE = re.compile(
@@ -182,6 +183,11 @@ def _finish(job_id: str, status: str, **extra):
     # the `failed` outcome unless the caller states a more specific one.
     if status == "failed":
         extra.setdefault("outcome", job_kinds.FAILED)
+    # Fail-closed truthfulness gate: a plan-only outcome may not be recorded as
+    # `completed`, no matter what the caller passed. Jobs 59/60/61 reported a
+    # fallback PLAN as a completed implementation; this is the one chokepoint
+    # every terminal transition goes through, so that cannot recur.
+    status = job_kinds.terminal_status_for(extra.get("outcome"), status)
     job = job_store.update_job(job_id, status=status, finished_at=job_store._now(), **extra)
     if job:
         _write_report(job)
@@ -298,7 +304,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     # observe/suggest -> plan only, stop here. A plan is not an implementation,
     # so this reports `fallback_plan_only` rather than a success outcome.
     if _idx(job["autonomy_level"]) <= _idx("suggest"):
-        _finish(job_id, "completed", outcome=job_kinds.FALLBACK_PLAN_ONLY)
+        _finish(job_id, job_kinds.STATUS_FALLBACK_PLAN_ONLY, outcome=job_kinds.FALLBACK_PLAN_ONLY)
         job_store.append_log(job_id, "info", "plan-only (autonomy suggest/observe) — no changes applied")
         return
 
@@ -499,8 +505,11 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
                              "implemented; requeue it for real implementation")
     else:
         outcome = job_kinds.success_outcome_for(kind)
-    _finish(job_id, "completed", outcome=outcome)
-    job_store.append_log(job_id, "info", f"job completed (outcome={outcome})")
+    # `terminal_status_for` downgrades a plan-only run to its own terminal
+    # status; a real implementation keeps `completed`.
+    status = job_kinds.terminal_status_for(outcome, job_kinds.STATUS_COMPLETED)
+    _finish(job_id, status, outcome=outcome)
+    job_store.append_log(job_id, "info", f"job finished (status={status} outcome={outcome})")
 
 
 def execute_async(job_id: str) -> None:

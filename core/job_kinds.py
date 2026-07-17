@@ -58,6 +58,42 @@ OUTCOMES = (IMPLEMENTED, FALLBACK_PLAN_ONLY, OPERATIONAL_COMPLETE, CONTENT_COMPL
 #: change. Deliberately excludes `fallback_plan_only`: a plan is not a change.
 IMPLEMENTATION_OUTCOMES = frozenset({IMPLEMENTED})
 
+# --------------------------------------------------------------------------
+# Terminal statuses
+# --------------------------------------------------------------------------
+# `outcome` alone was not enough. Jobs 59/60/61 carried `outcome=fallback_plan_only`
+# *and* `status=completed`, and every consumer that filtered on status — the
+# poller, the notifier, the owner's job list — read them as done. A plan-only
+# run therefore gets its own terminal status, so a truthful result no longer
+# depends on a reader remembering to check a second field.
+STATUS_COMPLETED = "completed"
+STATUS_FAILED = "failed"
+STATUS_BLOCKED = "blocked"
+STATUS_FALLBACK_PLAN_ONLY = "fallback_plan_only"
+
+#: Statuses a plan-only run may legally end in. `completed` is not among them.
+PLAN_ONLY_TERMINAL_STATUSES = frozenset({STATUS_FAILED, STATUS_BLOCKED, STATUS_FALLBACK_PLAN_ONLY})
+
+
+def terminal_status_for(outcome: Optional[str], proposed: str = STATUS_COMPLETED) -> str:
+    """The terminal status an outcome is allowed to end in.
+
+    Fail-closed: a `fallback_plan_only` outcome can never resolve to `completed`,
+    whatever the caller proposes. This is the single chokepoint the executor's
+    `_finish` runs through, so a future code path cannot reintroduce the lie by
+    passing "completed" directly.
+    """
+    if outcome == FALLBACK_PLAN_ONLY:
+        return proposed if proposed in PLAN_ONLY_TERMINAL_STATUSES else STATUS_FALLBACK_PLAN_ONLY
+    return proposed
+
+
+def is_truthful_terminal(status: str, outcome: Optional[str]) -> bool:
+    """Whether a (status, outcome) pair is self-consistent."""
+    if outcome == FALLBACK_PLAN_ONLY:
+        return status in PLAN_ONLY_TERMINAL_STATUSES
+    return True
+
 #: Outcomes that may feed a release/deployment workflow. A plan never can.
 RELEASABLE_OUTCOMES = frozenset({IMPLEMENTED})
 

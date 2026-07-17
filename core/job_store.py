@@ -20,7 +20,10 @@ _HEARTBEAT_STALE_SECS = int(os.getenv("RUNTIME_HEARTBEAT_STALE_SECS", "20"))
 # statuses (spec §3) — lifecycle position, NOT the result of the work.
 STATUSES = ["draft", "waiting_approval", "queued", "planning", "backing_up", "branching",
             "editing", "validating", "testing", "committing", "pushing", "deploying",
-            "completed", "failed", "cancelled", "rolled_back", "blocked"]
+            "completed", "failed", "cancelled", "rolled_back", "blocked",
+            # A run that produced only a deterministic fallback PLAN. Terminal,
+            # and deliberately NOT "completed" — see core.job_kinds.
+            "fallback_plan_only"]
 _INTERRUPTIBLE = {"planning", "backing_up", "branching", "editing", "validating",
                   "testing", "committing", "pushing", "deploying"}
 _JSON_FIELDS = {"constraints", "allowed_paths", "forbidden_paths", "plan", "changed_files",

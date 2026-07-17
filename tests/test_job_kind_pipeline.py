@@ -212,8 +212,12 @@ def test_fallback_plan_reports_plan_only_never_implemented(repo, tmp_path, monke
     cli = _failing_planner_cli(tmp_path)
     final = _run(repo, monkeypatch, cli, "Build Release Controller")
 
-    assert final["status"] == "completed"
+    # The status must agree with the outcome. Asserting `completed` here is what
+    # let jobs 59/60/61 through: `outcome` told the truth while every consumer
+    # filtered on `status`, which still said the work was done.
+    assert final["status"] == "fallback_plan_only"
     assert final["outcome"] == job_kinds.FALLBACK_PLAN_ONLY
+    assert job_kinds.is_truthful_terminal(final["status"], final["outcome"])
     assert not job_kinds.is_implementation(final["outcome"])
     assert not job_kinds.is_releasable(final["outcome"])
     # the plan document itself is preserved as a plan
