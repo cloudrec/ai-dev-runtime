@@ -340,6 +340,52 @@ def audit(action: str, target: str, idempotency_key: Optional[str] = None, **fie
 
 
 # ══════════════════════════════ TOOLS ═══════════════════════════════════════
+# ── observable agent-state classification ───────────────────────────────────
+# Distinguishing "a tmux pane is alive" from "an agent is doing real work". A
+# Claude sitting at an idle prompt, one that finished, and one blocked on the
+# owner are all "alive" — but only one is working. Classification is conservative:
+# "working" requires positive evidence of activity; absent that, the agent is
+# idle/waiting/completed, never assumed to be working.
+AGENT_STATES = ("working", "idle", "waiting_owner", "waiting_external", "completed", "dead", "stale")
+
+_STATE_WAIT_OWNER_RE = re.compile(
+    r"(\(y/n\)|\[y/n\]|do you want|proceed\?|continue\?|approve\b|confirm\b|"
+    r"permission to|authorize|press enter|choose an option|\b1\.\s|need your (input|approval|decision))", re.I)
+_STATE_WAIT_EXTERNAL_RE = re.compile(
+    r"(waiting for|awaiting|retry(ing)?|rate.?limit|quota|network error|timed? ?out|"
+    r"reconnect|502|503|429|vendor|verification key|upstream|api error)", re.I)
+_STATE_WORKING_RE = re.compile(
+    r"(esc to interrupt|✻|✶|✳|·\s|churn|running|executing|tool|editing|writing|"
+    r"searching|thinking|tokens|working|building|testing)", re.I)
+_STATE_COMPLETE_RE = re.compile(
+    r"(✓|completed|finished|done\b|all set|success|task complete|/clear to save)", re.I)
+
+
+def classify_state(alive: bool, is_agent: bool, output_tail: str) -> str:
+    """Observable state of an agent pane. Conservative: no positive activity
+    evidence ⇒ not 'working'."""
+    if not alive:
+        return "dead"
+    if not is_agent:
+        # An alive pane with no live Claude process is a stale shell, not an agent.
+        return "stale"
+    tail = (output_tail or "")[-800:]
+    if _STATE_WAIT_OWNER_RE.search(tail):
+        return "waiting_owner"
+    if _STATE_WAIT_EXTERNAL_RE.search(tail):
+        return "waiting_external"
+    if _STATE_WORKING_RE.search(tail):
+        return "working"
+    if _STATE_COMPLETE_RE.search(tail):
+        return "completed"
+    return "idle"
+
+
+def _pane_tail(target: str, lines: int = 25) -> str:
+    rc, out, _ = _tmux(["capture-pane", "-p", "-t", target, "-S", f"-{lines}"])
+    return redact(out) if rc == 0 else ""
+
+
 def agent_list() -> dict:
     """Inventory every tmux pane and the Claude agents running in them."""
     rc, out, err = _tmux(["list-panes", "-a", "-F", _PANE_FORMAT])
@@ -352,13 +398,18 @@ def agent_list() -> dict:
     agents = []
     for pane in parse_panes(out):
         claude = find_claude_in_pane(pane["pid"])
+        is_agent = bool(claude)
+        # Classify only real agents from a short pane tail; a dead pane needs no
+        # capture. This is what tells "working" apart from "alive but idle".
+        tail = _pane_tail(pane["target"]) if (is_agent and pane["alive"]) else ""
         agents.append({
             **pane,
             "command": redact(pane["command"]),
             "claude": claude,
-            "is_agent": bool(claude),
+            "is_agent": is_agent,
             "claude_pid": claude["pid"] if claude else None,
             "claude_cwd": claude["cwd"] if claude else None,
+            "state": classify_state(pane["alive"], is_agent, tail),
         })
 
     # Duplicate agents = more than one live Claude on the same working directory.
@@ -409,6 +460,7 @@ def agent_status(target: str) -> dict:
         "command": agent["command"],
         "claude_cmdline": (agent["claude"] or {}).get("cmdline"),
         "conversation": evidence,
+        "state": classify_state(agent["alive"], agent["is_agent"], recent),
         "recent_activity": recent[-4000:],
         "checked_at": _now(),
     }

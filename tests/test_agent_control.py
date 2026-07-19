@@ -239,6 +239,9 @@ def test_send_proves_delivery_with_pane_diff(monkeypatch):
     fake = FakeTmux()
     fake.capture_seq = ["before state", "before state\n> my message"]
     monkeypatch.setattr(ac, "_tmux", fake)
+    # Stub the state-classification capture so it doesn't consume the delivery
+    # before/after sequence this test asserts on.
+    monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k: "idle")
     monkeypatch.setattr(ac, "find_claude_in_pane", lambda pid: {"pid": 2001, "cmdline": "claude", "cwd": "/opt/safeguard"})
     result = ac.agent_send("safeguard", "my message")
     assert result["pane_changed"] is True
@@ -467,3 +470,38 @@ def test_tmux_transport_never_uses_a_shell():
     source = open(ac.__file__).read()
     assert "shell=True" not in source
     assert "os.system" not in source
+
+
+# ── observable state classification ─────────────────────────────────────────
+def test_classify_state_dead_and_stale():
+    assert ac.classify_state(alive=False, is_agent=True, output_tail="anything") == "dead"
+    assert ac.classify_state(alive=True, is_agent=False, output_tail="$ ") == "stale"
+
+
+def test_classify_state_waiting_owner_beats_working():
+    # An interactive prompt is waiting_owner even if a spinner is above it.
+    out = "Running tool...\n\nDo you want to proceed? (y/n)"
+    assert ac.classify_state(True, True, out) == "waiting_owner"
+
+
+def test_classify_state_waiting_external():
+    assert ac.classify_state(True, True, "Waiting for API... retrying (429 rate limit)") == "waiting_external"
+
+
+def test_classify_state_working_requires_activity():
+    assert ac.classify_state(True, True, "✻ Churning... esc to interrupt") == "working"
+
+
+def test_classify_state_completed():
+    assert ac.classify_state(True, True, "All done. Task complete ✓") == "completed"
+
+
+def test_classify_state_idle_is_conservative_default():
+    # Alive agent, empty prompt, no activity evidence → idle, never 'working'.
+    assert ac.classify_state(True, True, "❯ ") == "idle"
+    assert ac.classify_state(True, True, "") == "idle"
+
+
+def test_agent_states_vocabulary_is_stable():
+    assert set(ac.AGENT_STATES) == {"working", "idle", "waiting_owner", "waiting_external",
+                                    "completed", "dead", "stale"}
