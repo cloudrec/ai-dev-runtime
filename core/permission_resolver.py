@@ -28,9 +28,15 @@ import shlex
 from typing import Optional
 
 # ── shell constructs that defeat static safety analysis → always unsafe ─────
+# Note: '&&' is a safe command chain (split into segments) — only a lone '&'
+# (backgrounding) or a redirection is unsafe. '$' covers $VAR and $(...).
 _UNSAFE_CONSTRUCTS = (
-    ">", ">>", "<", "`", "$(", "${", "$(", "<(", ">(", "&", "$", "\\\n",
+    ">", ">>", "<", "`", "$(", "${", "<(", ">(", "$", "\\\n",
 )
+_BACKGROUND_RE = re.compile(r"(?<!&)&(?!&)")   # a single '&' not part of '&&'
+# Harmless redirects that discard/merge streams (write no real file): remove
+# them before construct analysis so `2>/dev/null` / `2>&1` don't read as writes.
+_SAFE_REDIRECT_RE = re.compile(r"(?:\d*>&\d+|\d*>\s*/dev/null|&>\s*/dev/null|<\s*/dev/null)")
 # Segment separators that chain commands (each side must be independently safe).
 _SEGMENT_SPLIT_RE = re.compile(r"\|\||&&|\||;")
 
@@ -47,6 +53,8 @@ _SAFE_PROGRAMS = {
     # harmless
     "echo", "printf", "true", "false", "date", "whoami", "id", "hostname", "uname",
     "uptime", "which", "type", "command", "test", "[",
+    # directory change — no side effect; the sensitive-path checks still apply.
+    "cd", "pushd", "popd",
     # process / service status
     "ps", "pgrep", "pstree", "top", "htop", "free", "vmstat", "lsof", "who", "w",
     "systemctl", "journalctl", "service",
@@ -105,6 +113,8 @@ def _has_unsafe_construct(command: str) -> Optional[str]:
     for token in _UNSAFE_CONSTRUCTS:
         if token in command:
             return token
+    if _BACKGROUND_RE.search(command):
+        return "&"
     return None
 
 
@@ -344,7 +354,7 @@ def _classify_segment(segment: str) -> str:
 # Absolute paths under these system roots are off-limits even to read tools
 # (host secrets/config), independent of the secret-name regex.
 _SENSITIVE_ABS_RE = re.compile(
-    r"(^|[\s'\"=])(/etc/|/root/\.ssh|/root/\.aws|/proc/\d+/environ|/sys/|/boot/|"
+    r"(^|[\s'\"=])(/etc(/|\b)|/root/\.ssh|/root/\.aws|/proc/\d+/environ|/sys(/|\b)|/boot(/|\b)|"
     r"/var/lib/docker|/home/[^/]+/\.ssh|/\.ssh)", re.I)
 
 
@@ -365,18 +375,20 @@ def classify_command(command: str, cwd: str | None = None,
     if not cmd:
         result["reason"] = "empty command"
         return result
-    bad = _has_unsafe_construct(cmd)
+    # Strip harmless /dev/null and stderr-merge redirects before analysis.
+    scan = _SAFE_REDIRECT_RE.sub(" ", cmd)
+    bad = _has_unsafe_construct(scan)
     if bad:
         result["reason"] = f"unsafe shell construct: {bad!r}"
         result["category"] = "shell_construct"
         return result
-    segments = [s.strip() for s in _SEGMENT_SPLIT_RE.split(cmd) if s.strip()]
+    segments = [s.strip() for s in _SEGMENT_SPLIT_RE.split(scan) if s.strip()]
     if not segments:
         result["reason"] = "no command"
         return result
     progs = []
     try:
-        _check_sensitive_abs_paths(cmd)
+        _check_sensitive_abs_paths(scan)
         for seg in segments:
             progs.append(_classify_segment(seg))
     except _Unsafe as e:

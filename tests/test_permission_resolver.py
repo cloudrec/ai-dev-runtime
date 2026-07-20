@@ -267,3 +267,23 @@ def test_cwd_project_validation():
     # Safe command with cwd inside an approved root → safe.
     r2 = pr.classify_command("git status", cwd="/opt/seo/backend", project_roots=["/opt/seo"])
     assert r2["safe"] is True and r2["cwd_ok"] is True
+
+
+# ── cd is a harmless builtin; the real seo-audit prompt pattern ─────────────
+@pytest.mark.parametrize("cmd", [
+    "cd /opt/seo; ls",
+    "cd /opt/seo; ls backend/agents/ 2>/dev/null | head -40",
+    "cd /opt/seo && git status",
+    "cd backend; pytest -q",
+])
+def test_cd_prefixed_readonly_is_safe(cmd):
+    _safe(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "cd /etc; cat passwd",           # sensitive path
+    "cd /opt/seo && docker restart x",
+    "cd /opt/seo; rm x",
+])
+def test_cd_prefixed_unsafe_tail_denied(cmd):
+    _unsafe(cmd)
