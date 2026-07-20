@@ -310,3 +310,19 @@ async def agents_resolve(req: AgentResolveReq, _: bool = Depends(_auth)):
 async def agents_supervise(_: bool = Depends(_auth)):
     """Run one supervision sweep now (dry-run over allowlisted sessions)."""
     return agent_supervisor.poll_once(approve=False)
+
+
+# ── Autonomous Agent Orchestrator ───────────────────────────────────────────
+from core import agent_orchestrator  # noqa: E402
+
+
+@router.get("/agents/orchestrator")
+async def agents_orchestrator_status(_: bool = Depends(_auth)):
+    """Read-only orchestrator status: per-agent records, states, budget gate."""
+    return agent_orchestrator.status()
+
+
+@router.post("/agents/orchestrator/tick")
+async def agents_orchestrator_tick(approve: bool = False, _: bool = Depends(_auth)):
+    """Run one orchestration sweep. approve=false is a dry-run (no keystroke)."""
+    return agent_orchestrator.refresh_and_resolve(approve=approve)

@@ -200,3 +200,70 @@ def test_no_prompt_returns_none():
 def test_hash_is_stable_and_scoped_to_command():
     assert pr.command_hash("docker compose ps") == pr.command_hash("docker compose ps ")
     assert pr.command_hash("docker ps") != pr.command_hash("docker compose ps")
+
+
+# ── structured safe-resolution policy extensions ────────────────────────────
+@pytest.mark.parametrize("cmd", [
+    "docker compose run --rm backend pytest tests/ -q",
+    "docker compose run --rm backend python -m pytest -q",
+    "docker compose exec backend pytest -q",
+    "docker exec seo-backend-1 pytest tests/test_x.py -q",
+    "docker compose -f docker-compose.yml run --rm backend npm test",
+])
+def test_local_container_test_execution_is_safe(cmd):
+    _safe(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "docker compose run --rm backend rm -rf /",
+    "docker exec seo-backend-1 sh -c 'rm x'",
+    "docker compose run --rm backend bash",
+    "docker exec c1 python manage.py migrate",
+    "docker compose run backend",                 # no explicit command → default entrypoint
+    "docker exec c1 curl http://x",
+])
+def test_container_exec_of_unsafe_inner_is_denied(cmd):
+    _unsafe(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout -b feat/seo-stage-4",
+    "git switch -c feat/jobhunter-monetization-v1",
+    "git branch feat/new-thing",
+    "git branch",                                  # list = read
+])
+def test_safe_feature_branch_creation_is_safe(cmd):
+    _safe(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "git checkout main",                           # switch existing → worktree change
+    "git switch main",
+    "git checkout -B main",                        # force-create
+    "git branch -D main",
+    "git branch -m old new",
+    "git checkout -b '../evil'",
+    "git checkout -f -b x",
+])
+def test_unsafe_branch_ops_stay_waiting(cmd):
+    _unsafe(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "cat /etc/passwd",
+    "grep root /etc/shadow",
+    "cat /root/.ssh/id_rsa",
+    "head /proc/1/environ",
+    "ls /var/lib/docker",
+])
+def test_sensitive_system_paths_denied(cmd):
+    _unsafe(cmd)
+
+
+def test_cwd_project_validation():
+    # Safe command, but cwd outside approved roots → not safe (context).
+    r = pr.classify_command("git status", cwd="/tmp/rogue", project_roots=["/opt/seo"])
+    assert r["safe"] is False and r["category"] == "context"
+    # Safe command with cwd inside an approved root → safe.
+    r2 = pr.classify_command("git status", cwd="/opt/seo/backend", project_roots=["/opt/seo"])
+    assert r2["safe"] is True and r2["cwd_ok"] is True

@@ -132,26 +132,81 @@ def _check_secret_paths(args: list[str]) -> None:
             raise _Unsafe(f"secret path: {a}")
 
 
+# A valid new git branch name (no refspecs, options, or path traversal).
+_BRANCH_NAME_RE = re.compile(r"^(?!-)(?!.*\.\.)[A-Za-z0-9._/\-]{1,100}$")
+_GIT_FORCE_FLAGS = {"-f", "--force", "-B", "-C", "-M", "-D", "-d", "-m", "-r",
+                    "--delete", "--move", "--force-create"}
+
+
 def _check_git(args):
     sub = next((a for a in args if not a.startswith("-")), None)
+    # Safe feature-branch CREATION (after worktree checks by the caller):
+    # `git checkout -b NAME` / `git switch -c NAME` / `git branch NAME`.
+    if sub in ("checkout", "switch"):
+        if any(f in args for f in _GIT_FORCE_FLAGS):
+            raise _Unsafe("git checkout/switch with force/delete flag")
+        if not ("-b" in args or "-c" in args):
+            raise _Unsafe("git checkout/switch without -b/-c changes the worktree")
+        flag = "-b" if "-b" in args else "-c"
+        name = args[args.index(flag) + 1] if args.index(flag) + 1 < len(args) else ""
+        if not _BRANCH_NAME_RE.match(name):
+            raise _Unsafe(f"invalid new branch name: {name!r}")
+        return  # create-and-switch to a fresh branch — no file/remote change
+    if sub == "branch":
+        if any(f in args for f in _GIT_FORCE_FLAGS):
+            raise _Unsafe("git branch delete/move/force")
+        names = [a for a in args[args.index("branch") + 1:] if not a.startswith("-")]
+        if names and not all(_BRANCH_NAME_RE.match(n) for n in names):
+            raise _Unsafe("git branch: invalid name")
+        return  # `git branch` (list = read) or `git branch NAME` (create)
     if sub in _GIT_WRITE or sub not in _GIT_READ:
         raise _Unsafe(f"git {sub or '?'} not read-only")
     if sub == "config" and any(not a.startswith("-") and "=" in a for a in args[args.index(sub) + 1:]):
         raise _Unsafe("git config write")
 
 
+# Docker subcommands that run a command inside a container. Safe only when the
+# INNER command is itself provably safe (recursive classification) — this is
+# "local container test execution".
+def _inner_command_safe(inner_tokens: list[str]) -> None:
+    if not inner_tokens:
+        raise _Unsafe("container run/exec with no explicit command (runs default entrypoint)")
+    inner = " ".join(inner_tokens)
+    verdict = classify_command(inner)
+    if not verdict["safe"]:
+        raise _Unsafe(f"container inner command not safe: {verdict['reason']}")
+
+
 def _check_docker(args):
     sub = next((a for a in args if not a.startswith("-")), None)
     if sub == "compose":
         rest = args[args.index("compose") + 1:]
-        # A read subcommand token must be present and no write subcommand (skip
-        # flag values like `-f docker-compose.yml` by testing membership).
-        if any(a in _DOCKER_WRITE or a in ("up", "down", "restart", "start", "stop",
-                                           "kill", "rm", "build", "run", "exec", "pull",
-                                           "push", "create") for a in rest):
-            raise _Unsafe("docker compose write subcommand")
-        if not any(a in _DOCKER_COMPOSE_READ for a in rest):
-            raise _Unsafe("docker compose: no read subcommand")
+        # find the compose subcommand (first bareword that is a known verb)
+        verbs_read = _DOCKER_COMPOSE_READ
+        verbs_exec = {"run", "exec"}
+        csub = next((a for a in rest if a in verbs_read or a in verbs_exec
+                     or a in ("up", "down", "restart", "start", "stop", "kill", "rm",
+                              "build", "pull", "push", "create")), None)
+        if csub in verbs_exec:
+            # docker compose run [--rm] SERVICE CMD...  /  exec SERVICE CMD...
+            after = rest[rest.index(csub) + 1:]
+            # drop run/exec flags and their values, then service name, keep CMD.
+            i = 0
+            while i < len(after) and after[i].startswith("-"):
+                i += 2 if after[i] in ("-e", "--env", "-w", "--workdir", "-u", "--user", "-p") else 1
+            svc_and_cmd = after[i:]
+            _inner_command_safe(svc_and_cmd[1:])   # svc_and_cmd[0] is the service
+            return
+        if csub in verbs_read:
+            return
+        raise _Unsafe(f"docker compose {csub or '?'} not read/test")
+    if sub == "exec":
+        after = args[args.index("exec") + 1:]
+        i = 0
+        while i < len(after) and after[i].startswith("-"):
+            i += 2 if after[i] in ("-e", "--env", "-w", "--workdir", "-u", "--user") else 1
+        cont_and_cmd = after[i:]
+        _inner_command_safe(cont_and_cmd[1:])       # cont_and_cmd[0] is the container
         return
     if sub in _DOCKER_WRITE or sub not in _DOCKER_READ:
         raise _Unsafe(f"docker {sub or '?'} not read-only")
@@ -286,11 +341,27 @@ def _classify_segment(segment: str) -> str:
     return prog
 
 
-def classify_command(command: str) -> dict:
-    """Return {safe, category, reason, hash} for a shell command. Fail-closed."""
+# Absolute paths under these system roots are off-limits even to read tools
+# (host secrets/config), independent of the secret-name regex.
+_SENSITIVE_ABS_RE = re.compile(
+    r"(^|[\s'\"=])(/etc/|/root/\.ssh|/root/\.aws|/proc/\d+/environ|/sys/|/boot/|"
+    r"/var/lib/docker|/home/[^/]+/\.ssh|/\.ssh)", re.I)
+
+
+def _check_sensitive_abs_paths(command: str) -> None:
+    if _SENSITIVE_ABS_RE.search(command):
+        raise _Unsafe("references a sensitive system path")
+
+
+def classify_command(command: str, cwd: str | None = None,
+                     project_roots: list[str] | None = None) -> dict:
+    """Classify a shell command. Fail-closed. Optionally validate the agent's
+    cwd/project context (not keywords): the working directory must sit inside an
+    approved project root, and the command must not reference sensitive system
+    paths. Returns {safe, category, reason, hash, cwd_ok}."""
     cmd = (command or "").strip()
     result = {"command": cmd, "hash": command_hash(cmd), "safe": False,
-              "category": "unknown", "reason": ""}
+              "category": "unknown", "reason": "", "cwd_ok": None}
     if not cmd:
         result["reason"] = "empty command"
         return result
@@ -305,12 +376,25 @@ def classify_command(command: str) -> dict:
         return result
     progs = []
     try:
+        _check_sensitive_abs_paths(cmd)
         for seg in segments:
             progs.append(_classify_segment(seg))
     except _Unsafe as e:
         result["reason"] = str(e)
         result["category"] = "denied"
         return result
+
+    # Context validation: the agent must be operating inside an approved project.
+    if project_roots is not None:
+        import os
+        real = os.path.realpath(cwd) if cwd else ""
+        roots = [os.path.realpath(r) for r in project_roots]
+        result["cwd_ok"] = bool(real) and any(real == r or real.startswith(r + os.sep) for r in roots)
+        if not result["cwd_ok"]:
+            result["reason"] = f"cwd {cwd!r} is not inside an approved project root"
+            result["category"] = "context"
+            return result
+
     result["safe"] = True
     result["category"] = "read_only:" + ",".join(sorted(set(progs)))
     result["reason"] = "all segments are allowlisted read-only programs"

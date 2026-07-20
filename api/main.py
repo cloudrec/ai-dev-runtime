@@ -115,6 +115,19 @@ async def _start_agent_supervisor():
         logger.warning(f"agent supervisor not started: {e}")
 
 
+@app.on_event("startup")
+async def _start_agent_orchestrator():
+    # Autonomous Agent Orchestrator: supervises EXISTING agents only, auto-continues
+    # provably-safe prompts for `auto` sessions, holds Safe Guard/Polyinput, and
+    # records persistent per-agent state. Gated by AGENT_ORCHESTRATOR_ENABLED.
+    import asyncio
+    try:
+        from core.agent_orchestrator import run_loop as _orch_loop
+        asyncio.create_task(_orch_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"agent orchestrator not started: {e}")
+
+
 # ---- движок и очередь ----
 engine = RuntimeEngine()
 

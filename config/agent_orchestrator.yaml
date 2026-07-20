@@ -1,0 +1,52 @@
+# Autonomous Agent Orchestrator V1 — session policy.
+#
+# DESCRIPTIVE + POLICY. The orchestrator only ever supervises EXISTING tmux
+# agents; it never creates a session or a duplicate. `mode` controls autonomy:
+#   auto    — auto-continue provably-safe local prompts (structured policy);
+#             leave unknown/consequential prompts for the owner.
+#   hold    — monitor only; never auto-resolve or advance (owner-driven).
+#   monitor — observe + record state; no resolution (default for unlisted).
+#
+# Rollout: SEO + JobHunter first (auto). Others stay monitor/hold until canaries
+# pass. `advance_phases` (auto task dispatch across approved phases) is OFF by
+# default — the orchestrator continues an agent by unblocking safe prompts, not
+# by inventing or auto-sending new task text.
+version: 1
+allowed_roots:
+  - /opt
+  - /root/ai-dev-runtime
+  - /root/safeguard-remote-agent
+
+sessions:
+  seo-audit:
+    project: seo
+    root: /opt/seo
+    approved_goal: "SEO Stage 4 — AI Marketing Distribution OS (Telegram + WordPress distribution)"
+    mode: auto
+    advance_phases: false
+    phases:
+      - id: stage-4
+        title: "Telegram + WordPress distribution"
+      - id: stage-5
+        title: "LinkedIn + Pinterest"
+
+  job:
+    project: jobhunter-ai
+    root: /opt/jobhunter-ai
+    approved_goal: "JobHunter Monetization V1"
+    mode: auto
+    advance_phases: false
+
+  safeguard:
+    project: safeguard
+    root: /root/safeguard-remote-agent
+    mode: hold
+    hold_state: externally_blocked
+    note: "Externally blocked on vendor verification key — monitor only, never advance."
+
+  polyinput:
+    project: polyinput
+    root: /opt/polyinput
+    mode: hold
+    hold_state: waiting_owner
+    note: "Waiting for owner testing — monitor only, never advance."

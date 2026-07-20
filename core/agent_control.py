@@ -516,6 +516,7 @@ def agent_status(target: str) -> dict:
     evidence = conversation_evidence(agent.get("claude_cwd") or agent.get("cwd") or "")
     rc, out, _ = _tmux(["capture-pane", "-p", "-t", agent["target"], "-S", "-40"])
     recent = redact(out) if rc == 0 else ""
+    state = classify_state(agent["alive"], agent["is_agent"], recent)
     audit("agent_status", agent["target"], found=True, alive=agent["alive"], is_agent=agent["is_agent"])
     return {
         "target": agent["target"],
@@ -528,10 +529,27 @@ def agent_status(target: str) -> dict:
         "command": agent["command"],
         "claude_cmdline": (agent["claude"] or {}).get("cmdline"),
         "conversation": evidence,
-        "state": classify_state(agent["alive"], agent["is_agent"], recent),
+        "state": state,
+        "pending": _pending_prompt_info(recent) if state == "waiting_owner" else None,
         "recent_activity": recent[-4000:],
         "checked_at": _now(),
     }
+
+
+def _pending_prompt_info(pane_tail: str) -> Optional[dict]:
+    """For a waiting_owner pane, surface the pending command + its structured
+    safety verdict so callers can render an owner decision or auto-continue."""
+    try:
+        from core import permission_resolver as _pr
+    except Exception:  # noqa: BLE001
+        return None
+    command = _pr.extract_pending_command(pane_tail)
+    if not command:
+        return {"command": None, "safe": False, "category": "unextractable",
+                "hash": _pr.command_hash((pane_tail or "")[-200:])}
+    v = _pr.classify_command(command)
+    return {"command": command, "safe": v["safe"], "category": v["category"],
+            "reason": v["reason"], "hash": v["hash"]}
 
 
 def conversation_evidence(cwd: str) -> dict:
