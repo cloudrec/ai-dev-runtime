@@ -36,3 +36,4 @@ configs/.env
 runtime_jobs.db
 runtime_jobs.db.corrupt-*
 runtime_releases.db
+agent_control.db

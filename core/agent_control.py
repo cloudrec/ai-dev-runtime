@@ -303,8 +303,55 @@ def _db() -> sqlite3.Connection:
     # tell "output progressed since last look" (working) from "unchanged" (idle).
     conn.execute("""CREATE TABLE IF NOT EXISTS pane_tail_cache (
         target TEXT PRIMARY KEY, norm_tail TEXT, updated_ts REAL)""")
+    # Supervisor decisions per (target, prompt hash) — persisted so the same
+    # prompt is never re-processed or re-alerted after a service restart.
+    conn.execute("""CREATE TABLE IF NOT EXISTS supervisor_prompts (
+        target TEXT, prompt_hash TEXT, decision TEXT, category TEXT, reason TEXT,
+        latency REAL, updated_at TEXT, updated_ts REAL,
+        PRIMARY KEY (target, prompt_hash))""")
     conn.commit()
     return conn
+
+
+def get_prompt_decision(target: str, prompt_hash: str) -> Optional[dict]:
+    conn = _db()
+    try:
+        row = conn.execute("SELECT decision, category, reason, latency, updated_ts FROM "
+                           "supervisor_prompts WHERE target=? AND prompt_hash=?",
+                           (target, prompt_hash)).fetchone()
+        if not row:
+            return None
+        return {"decision": row[0], "category": row[1], "reason": row[2],
+                "latency": row[3], "updated_ts": row[4]}
+    finally:
+        conn.close()
+
+
+def record_prompt_decision(target: str, prompt_hash: str, decision: str,
+                           category: str = "", reason: str = "", latency: float | None = None) -> None:
+    conn = _db()
+    try:
+        conn.execute("INSERT OR REPLACE INTO supervisor_prompts VALUES (?,?,?,?,?,?,?,?)",
+                     (target, prompt_hash, decision, category, reason, latency, _now(), time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def approve_prompt(target: str) -> bool:
+    """Send the approval key for a Claude Code permission dialog.
+
+    Sends exactly the digit '1' — "Yes" for THIS command only. It deliberately
+    never sends '2' ("Yes, and don't ask again"), so every future command is
+    re-evaluated by the classifier. Read-only w.r.t. everything except this one
+    keystroke to the named pane.
+    """
+    validate_target(target)
+    rc, _, err = _tmux(["send-keys", "-t", target, "1"])
+    audit("approve_prompt", target, sent=(rc == 0))
+    if rc != 0:
+        raise AgentControlError(f"failed to send approval to {target!r}: {err.strip()[:200]}")
+    return True
 
 
 # Progression is only meaningful within a bounded window; a match older than this

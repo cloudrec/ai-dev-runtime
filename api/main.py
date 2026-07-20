@@ -102,6 +102,19 @@ def _phase13_startup():
         logger.info(f"recovered {n} interrupted job(s) -> waiting_approval")
 
 
+@app.on_event("startup")
+async def _start_agent_supervisor():
+    # Always-on supervisor: auto-resolves provably-safe permission prompts for
+    # owner-approved sessions. Independent of any MCP/ChatGPT client. Gated by
+    # AGENT_SUPERVISOR_ENABLED + AGENT_AUTORESOLVE_SESSIONS (deny-by-default).
+    import asyncio
+    try:
+        from core.agent_supervisor import run_loop
+        asyncio.create_task(run_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"agent supervisor not started: {e}")
+
+
 # ---- движок и очередь ----
 engine = RuntimeEngine()
 

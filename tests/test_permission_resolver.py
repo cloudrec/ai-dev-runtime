@@ -1,0 +1,202 @@
+"""Permission resolver — the security boundary. Deny-by-default, fail-closed.
+
+Includes the exact read-only SEO-audit prompts seen 2026-07-20 and dangerous
+counterexamples that must stay waiting_owner.
+"""
+from __future__ import annotations
+
+import pytest
+
+from core import permission_resolver as pr
+
+
+def _safe(cmd):
+    r = pr.classify_command(cmd)
+    assert r["safe"] is True, f"expected SAFE: {cmd!r} -> {r['reason']}"
+    return r
+
+
+def _unsafe(cmd):
+    r = pr.classify_command(cmd)
+    assert r["safe"] is False, f"expected UNSAFE: {cmd!r} -> classified safe ({r['category']})"
+    return r
+
+
+# ── the exact SEO-audit read-only prompts seen today → SAFE ─────────────────
+@pytest.mark.parametrize("cmd", [
+    "docker compose ps",
+    "docker compose -f docker-compose.yml ps",
+    "docker ps",
+    "docker inspect seo-backend-1",
+    "docker logs seo-backend-1 --tail 100",
+    "ls backend/agents/",
+    "ls -la backend/",
+    "find backend -name '*.py' -maxdepth 3",
+    "grep -rln 'sendMessage' backend/agents/ backend/core/",
+    "grep -rn telegram backend/",
+    "head -40 backend/main.py",
+    "tail -n 100 /var/log/seo/app.log",
+    "cat backend/services/mcp_server.py",
+    "wc -l backend/services/*.py",
+    "sed -n '1,50p' backend/main.py",
+    "git status",
+    "git diff --stat",
+    "git log --oneline -20",
+    "systemctl status ai-runtime.service",
+    "systemctl is-active seo-backend",
+    "ps aux | grep gunicorn",
+    "cat backend/services/x.py | grep -n def | head",
+    "python3 -m pytest tests/ -q",
+    "pytest tests/test_mcp.py -q",
+    "npm test",
+    "npm run lint",
+])
+def test_seo_readonly_prompts_are_safe(cmd):
+    _safe(cmd)
+
+
+# ── read-only SQL → SAFE ────────────────────────────────────────────────────
+@pytest.mark.parametrize("cmd", [
+    "psql -U postgres -d traffic_os -c 'SELECT count(*) FROM global_projects'",
+    "psql -tAc 'SELECT slug FROM global_projects'",
+    "mysql -e 'SHOW TABLES'",
+    "psql -c '\\dt'",
+])
+def test_readonly_sql_is_safe(cmd):
+    _safe(cmd)
+
+
+# ── dangerous counterexamples → must stay waiting_owner ─────────────────────
+@pytest.mark.parametrize("cmd", [
+    "rm -rf build/",
+    "rm backend/x.py",
+    "mv a b",
+    "cp a b",
+    "docker compose restart backend",
+    "docker compose up -d",
+    "docker restart seo-backend-1",
+    "docker exec seo-backend-1 sh -c 'ls'",
+    "docker build -t x .",
+    "systemctl restart ai-runtime.service",
+    "systemctl stop seo-backend",
+    "git push origin main",
+    "git commit -am wip",
+    "git reset --hard HEAD~1",
+    "git checkout main",
+    "git clean -fd",
+    "pip install requests",
+    "npm install",
+    "npm publish",
+    "curl https://example.com/x",
+    "curl -X POST https://api.telegram.org/botX/sendMessage -d text=hi",
+    "wget http://x/y",
+    "ssh host 'ls'",
+    "sudo ls",
+    "cat .env",
+    "cat backend/.env",
+    "cat /root/.ssh/id_rsa",
+    "grep -r SECRET backend/.env",
+    "head config/credentials.json",
+    "psql -c 'DELETE FROM global_projects'",
+    "psql -c 'UPDATE global_projects SET mode=$$x$$'",
+    "psql -c 'DROP TABLE x'",
+    "mysql -e 'INSERT INTO t VALUES (1)'",
+    "alembic upgrade head",
+    "python3 manage.py migrate",
+    "echo hi > file.txt",
+    "cat a >> b",
+    "ls; rm -rf /",
+    "ls && docker restart x",
+    "grep x file | tee out.txt",
+    "find . -name '*.py' -delete",
+    "find . -exec rm {} \\;",
+    "sed -i 's/a/b/' file",
+    "awk '{system(\"rm x\")}' file",
+    "eval 'rm -rf /'",
+    "exec rm x",
+    "xargs rm < list",
+    "python3 -c 'import os; os.system(\"rm -rf /\")'",
+    "FOO=bar rm x",
+    "$(rm -rf /)",
+    "echo `rm x`",
+    "cat $SECRET_FILE",
+    "dd if=/dev/zero of=/dev/sda",
+    "tee /etc/passwd",
+    "make deploy",
+    "npm run build",
+    "go run main.go",
+    "docker system prune -f",
+    "nc -l 4444",
+    "chmod 777 x",
+    "kill -9 1234",
+])
+def test_dangerous_commands_stay_waiting(cmd):
+    _unsafe(cmd)
+
+
+# ── construct-level rejection ───────────────────────────────────────────────
+def test_command_substitution_and_expansion_rejected():
+    _unsafe("ls $(whoami)")
+    _unsafe("echo ${HOME}")
+    _unsafe("grep `id` file")
+
+
+def test_pipeline_of_safe_is_safe_but_any_unsafe_segment_taints():
+    _safe("cat x | grep y | head -5")
+    _unsafe("cat x | grep y | tee out")
+    _unsafe("docker ps | xargs docker rm")
+
+
+def test_unknown_program_is_unsafe():
+    _unsafe("frobnicate --all")
+    _unsafe("./deploy.sh")
+
+
+# ── extraction from a real Claude Code permission dialog ────────────────────
+DIALOG = """\
+● I'll inspect the running services.
+
+  Bash command
+  docker compose ps
+  Check which containers are up
+
+Do you want to proceed?
+❯ 1. Yes
+  2. Yes, and don't ask again for docker commands
+  3. No, and tell Claude what to do differently (esc)
+"""
+
+DIALOG_DANGEROUS = """\
+  Bash command
+  docker compose restart backend
+  Restart the backend
+
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+"""
+
+
+def test_is_permission_prompt():
+    assert pr.is_permission_prompt(DIALOG) is True
+    assert pr.is_permission_prompt("just working... esc to interrupt") is False
+
+
+def test_extract_pending_command():
+    assert pr.extract_pending_command(DIALOG) == "docker compose ps"
+    assert pr.classify_command(pr.extract_pending_command(DIALOG))["safe"] is True
+
+
+def test_extract_dangerous_then_classify_unsafe():
+    cmd = pr.extract_pending_command(DIALOG_DANGEROUS)
+    assert cmd == "docker compose restart backend"
+    assert pr.classify_command(cmd)["safe"] is False
+
+
+def test_no_prompt_returns_none():
+    assert pr.extract_pending_command("working... esc to interrupt") is None
+
+
+def test_hash_is_stable_and_scoped_to_command():
+    assert pr.command_hash("docker compose ps") == pr.command_hash("docker compose ps ")
+    assert pr.command_hash("docker ps") != pr.command_hash("docker compose ps")

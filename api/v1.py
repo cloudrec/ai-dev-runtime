@@ -285,3 +285,28 @@ class AgentStopReq(BaseModel):
 @router.post("/agents/stop")
 async def agents_stop(req: AgentStopReq, _: bool = Depends(_auth)):
     return _agent_call(agent_control.agent_stop, req.target, req.confirm, req.idempotency_key)
+
+
+# ── Agent Supervisor: auto-resolve provably-safe permission prompts ─────────
+from core import agent_supervisor  # noqa: E402
+
+
+class AgentResolveReq(BaseModel):
+    target: str
+    approve: bool = False        # default is a dry-run classification, no keystroke
+
+
+@router.post("/agents/resolve")
+async def agents_resolve(req: AgentResolveReq, _: bool = Depends(_auth)):
+    """Classify (and optionally confirm) one agent's pending permission prompt.
+    approve=false is a dry-run: it reports the decision without sending anything."""
+    try:
+        return agent_supervisor.resolve_target(req.target, approve=req.approve)
+    except agent_control.AgentControlError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/agents/supervise")
+async def agents_supervise(_: bool = Depends(_auth)):
+    """Run one supervision sweep now (dry-run over allowlisted sessions)."""
+    return agent_supervisor.poll_once(approve=False)
