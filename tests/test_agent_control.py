@@ -522,11 +522,33 @@ def test_stale_spinner_glyph_alone_is_not_working():
     assert ac.classify_state(True, True, "some old output · 12k tokens saved\nnew task?") == "idle"
 
 
-def test_progression_counts_as_working_when_not_idle(monkeypatch):
-    # No idle prompt, output changed since last look → working.
-    assert ac.classify_state(True, True, "line A\nline B\nline C", prev_tail="line A") == "working"
-    # Unchanged output → not working.
+def test_output_difference_alone_is_not_working():
+    # A changed/stale-cache tail with NO active-execution indicator must not read
+    # as working — regression for the false security idle→working transition.
+    assert ac.classify_state(True, True, "line A\nline B\nline C", prev_tail="line A") == "idle"
     assert ac.classify_state(True, True, "line A", prev_tail="line A") == "idle"
+    assert ac.classify_state(True, True, "totally new text", prev_tail="old cached text") == "idle"
+
+
+# Exact live capture (2026-07-20): security finished its report and parked at an
+# empty "❯" prompt — a PAST-tense "Brewed for 11m 24s" spinner, no "new task?"
+# line, no active indicator. This was falsely classified "working" via the old
+# progression-vs-stale-cache path.
+SECURITY_DONE_REPORT = (
+    "  Коммиты (локальный master, remote нет)\n\n"
+    "  ee8fc1b Report: identity meta-layer for\n  \"who are you?\"\n"
+    "  Другие проекты не трогал. Дерево чистое.\n  Отчёт:\n"
+    "  reports/IDENTITY_META_LAYER_20260720.md.\n\n"
+    "✻ Brewed for 11m 24s\n\n"
+    "──────────────────────────────────────────\n❯\xa0\n"
+    "──────────────────────────────────────────\n"
+    "  [CAVEMAN]\n  ⏵⏵ auto mode on (shift+tab to cycle) ·")
+
+
+def test_finished_report_empty_prompt_is_idle_not_working():
+    assert ac.classify_state(True, True, SECURITY_DONE_REPORT) == "idle"
+    # Even with a stale differing prior sample, it stays idle (never "working").
+    assert ac.classify_state(True, True, SECURITY_DONE_REPORT, prev_tail="some older pane text") == "idle"
 
 
 def test_waiting_owner_when_claude_asks():
