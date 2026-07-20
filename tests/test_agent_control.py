@@ -473,35 +473,66 @@ def test_tmux_transport_never_uses_a_shell():
 
 
 # ── observable state classification ─────────────────────────────────────────
+# Real idle tails captured from live panes (2026-07-20). Each ends at the
+# "new task?" rest prompt with a PAST-tense spinner — the exact shapes the old
+# classifier mislabelled as working.
+IDLE_MESS = ("Копирование в веб-папку добавил.\n\n✻ Worked for 1m 47s\n"
+             "                          new task? /clear to save 490.5k tokens\n"
+             "❯ глянул, всё ок\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 5 agents")
+IDLE_JOB = ("Отчёт reports/2026-07-17_b8.md. Дальше в очереди: B9.\n\n✻ Brewed for 50m 59s\n"
+            "                          new task? /clear to save 339.6k tokens\n"
+            "❯ гоу B9\n  ⏵⏵ auto mode on (shift+tab to cycle) · ← 5 agents")
+IDLE_SAFEGUARD = ("E_GUARD_REAL_AGENT_INPUT_REQUIRED.\n\n✻ Cogitated for 14m 15s\n"
+                  "                          new task? /clear to save 194.5k tokens\n"
+                  "❯ Запроси у вендора ключ fbe97a3db1a4cba0\n  ⏵⏵ auto mode on")
+ACTIVE = ("● Editing core/foo.py\n\n* Nesting… (1m 2s · ↓ 2.4k tokens)\n"
+          "  ⎿  Tip: Use /btw to ask a side question\n  esc to interrupt")
+
+
 def test_classify_state_dead_and_stale():
     assert ac.classify_state(alive=False, is_agent=True, output_tail="anything") == "dead"
     assert ac.classify_state(alive=True, is_agent=False, output_tail="$ ") == "stale"
 
 
-def test_classify_state_waiting_owner_beats_working():
-    # An interactive prompt is waiting_owner even if a spinner is above it.
-    out = "Running tool...\n\nDo you want to proceed? (y/n)"
-    assert ac.classify_state(True, True, out) == "waiting_owner"
+def test_idle_new_task_prompt_is_not_working():
+    # THE defect: a past-tense spinner + "new task?" is idle, not working.
+    assert ac.classify_state(True, True, IDLE_MESS) == "idle"
+    assert ac.classify_state(True, True, IDLE_JOB) == "idle"
 
 
-def test_classify_state_waiting_external():
-    assert ac.classify_state(True, True, "Waiting for API... retrying (429 rate limit)") == "waiting_external"
+def test_queued_owner_prompt_is_not_working():
+    # A queued "❯ гоу B9" line with no fresh execution evidence is idle.
+    assert ac.classify_state(True, True, IDLE_JOB) == "idle"
 
 
-def test_classify_state_working_requires_activity():
-    assert ac.classify_state(True, True, "✻ Churning... esc to interrupt") == "working"
+def test_externally_blocked_from_input_required():
+    assert ac.classify_state(True, True, IDLE_SAFEGUARD) == "externally_blocked"
+    assert ac.classify_state(True, True, "Waiting for API... retry (429 rate limit)\nnew task?") == "externally_blocked"
 
 
-def test_classify_state_completed():
-    assert ac.classify_state(True, True, "All done. Task complete ✓") == "completed"
+def test_working_requires_active_execution_evidence():
+    assert ac.classify_state(True, True, ACTIVE) == "working"                       # live spinner + esc to interrupt
+    assert ac.classify_state(True, True, "streaming ↓ 5.1k tokens") == "working"     # streaming counter
+    assert ac.classify_state(True, True, "esc to interrupt") == "working"
 
 
-def test_classify_state_idle_is_conservative_default():
-    # Alive agent, empty prompt, no activity evidence → idle, never 'working'.
-    assert ac.classify_state(True, True, "❯ ") == "idle"
-    assert ac.classify_state(True, True, "") == "idle"
+def test_stale_spinner_glyph_alone_is_not_working():
+    # A bare ✻ glyph or past-tense "Worked for" must not read as working.
+    assert ac.classify_state(True, True, "✻ Worked for 3m\nnew task?") == "idle"
+    assert ac.classify_state(True, True, "some old output · 12k tokens saved\nnew task?") == "idle"
+
+
+def test_progression_counts_as_working_when_not_idle(monkeypatch):
+    # No idle prompt, output changed since last look → working.
+    assert ac.classify_state(True, True, "line A\nline B\nline C", prev_tail="line A") == "working"
+    # Unchanged output → not working.
+    assert ac.classify_state(True, True, "line A", prev_tail="line A") == "idle"
+
+
+def test_waiting_owner_when_claude_asks():
+    assert ac.classify_state(True, True, "Do you want me to proceed? (y/n)") == "waiting_owner"
 
 
 def test_agent_states_vocabulary_is_stable():
-    assert set(ac.AGENT_STATES) == {"working", "idle", "waiting_owner", "waiting_external",
+    assert set(ac.AGENT_STATES) == {"working", "idle", "waiting_owner", "externally_blocked",
                                     "completed", "dead", "stale"}

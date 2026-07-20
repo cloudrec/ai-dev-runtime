@@ -299,8 +299,39 @@ def _db() -> sqlite3.Connection:
     conn.execute("""CREATE TABLE IF NOT EXISTS deliveries (
         idempotency_key TEXT PRIMARY KEY, target TEXT, action TEXT,
         result TEXT, created_at TEXT, created_ts REAL)""")
+    # Per-target last observed (normalised) pane tail, so state classification can
+    # tell "output progressed since last look" (working) from "unchanged" (idle).
+    conn.execute("""CREATE TABLE IF NOT EXISTS pane_tail_cache (
+        target TEXT PRIMARY KEY, norm_tail TEXT, updated_ts REAL)""")
     conn.commit()
     return conn
+
+
+# Progression is only meaningful within a bounded window; a match older than this
+# is treated as "no prior sample" so a long-idle pane never looks like progress.
+_TAIL_STALE_SECS = int(os.getenv("AGENT_CONTROL_TAIL_STALE_SECS", "300"))
+
+
+def _prev_tail(target: str) -> Optional[str]:
+    conn = _db()
+    try:
+        row = conn.execute("SELECT norm_tail, updated_ts FROM pane_tail_cache WHERE target=?",
+                           (target,)).fetchone()
+        if not row or (time.time() - (row[1] or 0)) > _TAIL_STALE_SECS:
+            return None
+        return row[0]
+    finally:
+        conn.close()
+
+
+def _store_tail(target: str, tail: str) -> None:
+    conn = _db()
+    try:
+        conn.execute("INSERT OR REPLACE INTO pane_tail_cache VALUES (?,?,?)",
+                     (target, _norm_tail(tail), time.time()))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _seen_delivery(key: str) -> Optional[dict]:
@@ -341,43 +372,68 @@ def audit(action: str, target: str, idempotency_key: Optional[str] = None, **fie
 
 # ══════════════════════════════ TOOLS ═══════════════════════════════════════
 # ── observable agent-state classification ───────────────────────────────────
-# Distinguishing "a tmux pane is alive" from "an agent is doing real work". A
-# Claude sitting at an idle prompt, one that finished, and one blocked on the
-# owner are all "alive" — but only one is working. Classification is conservative:
-# "working" requires positive evidence of activity; absent that, the agent is
-# idle/waiting/completed, never assumed to be working.
-AGENT_STATES = ("working", "idle", "waiting_owner", "waiting_external", "completed", "dead", "stale")
+# Distinguishing "a tmux pane is alive" from "an agent is doing real work".
+#
+# The hard-won lesson: a live Claude process, a queued owner prompt, an old
+# spinner glyph, or prior output are NOT evidence of work. Claude Code parks at a
+# "new task? /clear to save …" prompt when idle, and its spinner lines turn
+# PAST-tense there ("Worked for 1m 47s", "Brewed for 50m"). Only three things
+# prove an agent is executing RIGHT NOW:
+#   1. an "esc to interrupt" hint (Claude is mid-turn),
+#   2. a live spinner with a running timer: "…​ (12s" / "…​ (1m 2s",
+#   3. a streaming token counter with an arrow: "↓ 2.4k tokens" / "↑ …".
+# Absent that — and especially when the idle prompt is showing — the agent is
+# idle / waiting / externally_blocked, never "working". Progression across two
+# observations (output actually changed) is accepted as a fallback work signal.
+AGENT_STATES = ("working", "idle", "waiting_owner", "externally_blocked", "completed", "dead", "stale")
 
+# Active-execution evidence — the ONLY positive proof of "working".
+_STATE_ACTIVE_RUN_RE = re.compile(
+    r"(esc to interrupt|…\s*\(\d+\s*m?s\b|[↑↓]\s*[\d.]+\s*k?\s*tokens\b)", re.I)
+# The idle rest prompt: Claude has finished and is waiting for a new task.
+_STATE_IDLE_PROMPT_RE = re.compile(r"(new task\?|/clear to save|press up to edit)", re.I)
+# Blocked on something outside the agent's control (vendor key, network, quota).
+_STATE_EXTERNAL_RE = re.compile(
+    r"(input[_ ]required|verification key|awaiting vendor|\bvendor\b|waiting for|awaiting|"
+    r"rate.?limit|quota|429|502|503|network error|timed? ?out|reconnect|upstream)", re.I)
+# Claude is asking the owner a question (not the owner's own queued input line).
 _STATE_WAIT_OWNER_RE = re.compile(
-    r"(\(y/n\)|\[y/n\]|do you want|proceed\?|continue\?|approve\b|confirm\b|"
-    r"permission to|authorize|press enter|choose an option|\b1\.\s|need your (input|approval|decision))", re.I)
-_STATE_WAIT_EXTERNAL_RE = re.compile(
-    r"(waiting for|awaiting|retry(ing)?|rate.?limit|quota|network error|timed? ?out|"
-    r"reconnect|502|503|429|vendor|verification key|upstream|api error)", re.I)
-_STATE_WORKING_RE = re.compile(
-    r"(esc to interrupt|✻|✶|✳|·\s|churn|running|executing|tool|editing|writing|"
-    r"searching|thinking|tokens|working|building|testing)", re.I)
-_STATE_COMPLETE_RE = re.compile(
-    r"(✓|completed|finished|done\b|all set|success|task complete|/clear to save)", re.I)
+    r"(\(y/n\)|\[y/n\]|do you want (me )?to|shall i\b|proceed\?|may i\b|"
+    r"which (option|approach)|choose an option|awaiting your (approval|decision|confirmation))", re.I)
 
 
-def classify_state(alive: bool, is_agent: bool, output_tail: str) -> str:
-    """Observable state of an agent pane. Conservative: no positive activity
-    evidence ⇒ not 'working'."""
+def _norm_tail(s: str) -> str:
+    """Normalise a pane tail for progression comparison: drop live timers, token
+    counters and bare numbers so only real content differences count as change."""
+    s = re.sub(r"\(\s*\d+\s*m?s[^)]*\)", "", s or "")   # (12s · ↓ 2.4k tokens)
+    s = re.sub(r"[↑↓]\s*[\d.]+\s*k?\s*tokens", "", s)
+    s = re.sub(r"\d+", "", s)
+    return " ".join(s.split())[-2000:]
+
+
+def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str | None = None) -> str:
+    """Observable state of an agent pane. `working` requires concrete active-
+    execution evidence (or proven output progression vs `prev_tail`); it is never
+    inferred from a live process, a queued prompt, or stale spinner text."""
     if not alive:
         return "dead"
     if not is_agent:
-        # An alive pane with no live Claude process is a stale shell, not an agent.
-        return "stale"
-    tail = (output_tail or "")[-800:]
+        return "stale"          # alive pane, no live Claude process
+    tail = (output_tail or "")[-1500:]
+    idle_prompt = bool(_STATE_IDLE_PROMPT_RE.search(tail))
+
+    # 1) concrete active-execution evidence wins outright.
+    if _STATE_ACTIVE_RUN_RE.search(tail):
+        return "working"
+    # 2) progression fallback: output changed since last look AND not parked at the
+    #    idle prompt. Bounded — needs a prior sample to compare against.
+    if prev_tail is not None and not idle_prompt and _norm_tail(tail) != _norm_tail(prev_tail):
+        return "working"
+    # 3) at rest — classify what it is resting on.
+    if _STATE_EXTERNAL_RE.search(tail):
+        return "externally_blocked"
     if _STATE_WAIT_OWNER_RE.search(tail):
         return "waiting_owner"
-    if _STATE_WAIT_EXTERNAL_RE.search(tail):
-        return "waiting_external"
-    if _STATE_WORKING_RE.search(tail):
-        return "working"
-    if _STATE_COMPLETE_RE.search(tail):
-        return "completed"
     return "idle"
 
 
@@ -400,8 +456,13 @@ def agent_list() -> dict:
         claude = find_claude_in_pane(pane["pid"])
         is_agent = bool(claude)
         # Classify only real agents from a short pane tail; a dead pane needs no
-        # capture. This is what tells "working" apart from "alive but idle".
+        # capture. Compare against the previous sample so unchanged output reads as
+        # idle, not working.
         tail = _pane_tail(pane["target"]) if (is_agent and pane["alive"]) else ""
+        state = classify_state(pane["alive"], is_agent, tail,
+                               prev_tail=_prev_tail(pane["target"]) if is_agent else None)
+        if is_agent and pane["alive"]:
+            _store_tail(pane["target"], tail)
         agents.append({
             **pane,
             "command": redact(pane["command"]),
@@ -409,7 +470,7 @@ def agent_list() -> dict:
             "is_agent": is_agent,
             "claude_pid": claude["pid"] if claude else None,
             "claude_cwd": claude["cwd"] if claude else None,
-            "state": classify_state(pane["alive"], is_agent, tail),
+            "state": state,
         })
 
     # Duplicate agents = more than one live Claude on the same working directory.
@@ -460,7 +521,8 @@ def agent_status(target: str) -> dict:
         "command": agent["command"],
         "claude_cmdline": (agent["claude"] or {}).get("cmdline"),
         "conversation": evidence,
-        "state": classify_state(agent["alive"], agent["is_agent"], recent),
+        "state": classify_state(agent["alive"], agent["is_agent"], recent,
+                                prev_tail=_prev_tail(agent["target"]) if agent["is_agent"] else None),
         "recent_activity": recent[-4000:],
         "checked_at": _now(),
     }
