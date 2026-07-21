@@ -158,3 +158,41 @@ def test_refresh_creates_no_agents(monkeypatch):
     monkeypatch.setattr(orch.ac, "agent_list", lambda: {"agents": []})
     res = orch.refresh_and_resolve(approve=True)
     assert res["agents"] == 0 and res["resolved"] == []
+
+
+# ── V2 supervision: completed phases must not sit unattended ────────────────
+def test_describe_next_phase_is_honest():
+    assert "awaiting owner-approved text" in orch._describe_next_phase({"id": "p2", "title": "P2"})
+    assert "ready to auto-advance" in orch._describe_next_phase(
+        {"id": "p2", "title": "P2", "approved_task_text": "do it"})
+    assert orch._describe_next_phase(None) is None
+
+
+def test_supervise_completed_without_next_text_escalates_once():
+    cfg = {"mode": "auto", "advance_phases": True, "project": "seo",
+           "phases": [{"id": "s4", "title": "s4"}, {"id": "s5", "title": "s5"}]}
+    rec = {"agent_key": "seo-audit:0.0", "project": "seo", "report_path": "reports/DONE.md"}
+    nxt = orch._next_phase(cfg)
+    sup = orch._supervise_completed("seo-audit", cfg, rec, {}, nxt)
+    assert sup["notification_state"] == "phase_complete_needs_owner"
+    assert sup["escalation"]["decision"]["reply_choices"]
+    # already asked (same report) → no re-escalation
+    sup2 = orch._supervise_completed("seo-audit", cfg, rec,
+                                     {"notification_state": "phase_complete_needs_owner",
+                                      "report_path": "reports/DONE.md"}, nxt)
+    assert "escalation" not in sup2
+
+
+def test_supervise_completed_with_next_text_is_advancing():
+    cfg = {"mode": "auto", "advance_phases": True, "project": "seo",
+           "phases": [{"id": "s4", "title": "s4"},
+                      {"id": "s5", "title": "s5", "approved_task_text": "do s5"}]}
+    rec = {"agent_key": "seo-audit:0.0", "project": "seo", "report_path": "r"}
+    sup = orch._supervise_completed("seo-audit", cfg, rec, {}, orch._next_phase(cfg))
+    assert sup["notification_state"] == "advancing" and "escalation" not in sup
+
+
+def test_supervise_final_phase_no_escalation():
+    cfg = {"mode": "auto", "advance_phases": True, "phases": [{"id": "only", "title": "only"}]}
+    sup = orch._supervise_completed("x", cfg, {"agent_key": "x:0"}, {}, orch._next_phase(cfg))
+    assert sup["notification_state"] == "phase_complete_final" and "escalation" not in sup

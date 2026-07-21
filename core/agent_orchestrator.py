@@ -299,12 +299,13 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         state = d["state"]
         fresh = d.get("fresh")
 
+        nxt = _next_phase(cfg)
         rec = {
             "agent_key": key, "session": session,
             "project": cfg.get("project", prev.get("project")),
             "approved_goal": cfg.get("approved_goal", prev.get("approved_goal")),
             "current_task": prev.get("current_task"),
-            "phase": prev.get("phase"),
+            "phase": prev.get("phase") or (_phases(cfg)[0]["id"] if _phases(cfg) else None),
             "state": state,
             "last_fresh_activity_ts": (_now_ts() if fresh else prev.get("last_fresh_activity_ts")),
             "prompt_hash": d.get("prompt_hash", prev.get("prompt_hash")),
@@ -312,8 +313,10 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             "completion_evidence": (json.dumps(d["completion_evidence"]) if d.get("completion_evidence")
                                     else prev.get("completion_evidence")),
             "report_path": d.get("report_path", prev.get("report_path")),
-            "approved_next_task": _next_phase_task(cfg, prev),
-            "notification_state": prev.get("notification_state"),
+            "approved_next_task": _describe_next_phase(nxt),
+            # Recompute notification_state from the CURRENT state each tick — never
+            # carry a stale value (a completed agent must not stay 'needs_escalation').
+            "notification_state": None,
             "retry_count": prev.get("retry_count") or 0,
             "decision": d.get("decision"),
         }
@@ -326,10 +329,18 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         elif state == "waiting_owner":
             # dedup escalation by prompt hash
             if prev.get("prompt_hash") == rec["prompt_hash"] and prev.get("notification_state") == "escalated":
-                rec["notification_state"] = "escalated"      # already alerted; stay quiet
+                rec["notification_state"] = "escalated"
             else:
                 rec["notification_state"] = "needs_escalation"
                 escalations.append({"agent": key, "project": rec["project"], "decision": rec["decision"]})
+        elif state == "completed" and cfg.get("mode") == "auto" and cfg.get("advance_phases"):
+            # Supervision: a completed phase must never sit unattended. If the next
+            # phase can auto-advance (has exact approved text) the sweep handles it;
+            # otherwise the owner is asked ONCE to record the text / decide.
+            sup = _supervise_completed(session, cfg, rec, prev, nxt)
+            rec["notification_state"] = sup["notification_state"]
+            if sup.get("escalation"):
+                escalations.append(sup["escalation"])
 
         _upsert(rec)
         results.append({"agent": key, "state": state, "project": rec["project"]})
@@ -347,15 +358,58 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             "resolved": resolved, "escalations": escalations, "phase_advances": advances}
 
 
-def _next_phase_task(cfg: dict, prev: dict) -> Optional[str]:
-    """The next already-approved phase title for the project (config only — never
-    invented). Used to record `approved_next_task`; auto-dispatch is gated by
-    `advance_phases` and off by default."""
-    phases = cfg.get("phases") or []
-    if not phases:
-        return prev.get("approved_next_task")
-    # Simple V1: the second listed phase is "next" after the first.
-    return phases[1]["title"] if len(phases) > 1 else None
+def _phases(cfg: dict) -> list:
+    return cfg.get("phases") or []
+
+
+def _next_phase(cfg: dict) -> Optional[dict]:
+    """The next phase after the current one (config only — never invented)."""
+    phases = _phases(cfg)
+    return phases[1] if len(phases) > 1 else None
+
+
+def _describe_next_phase(nxt: Optional[dict]) -> Optional[str]:
+    """Human label that is HONEST about whether the phase can actually progress."""
+    if not nxt:
+        return None
+    title = nxt.get("title") or nxt.get("id")
+    if (nxt.get("approved_task_text") or "").strip():
+        return f"{title} (ready to auto-advance)"
+    return f"{title} (awaiting owner-approved text)"
+
+
+def _supervise_completed(session: str, cfg: dict, rec: dict, prev: dict, nxt: Optional[dict]) -> dict:
+    """A completed phase must not sit unattended. Returns notification_state and an
+    optional one-time owner escalation."""
+    if nxt is None:
+        return {"notification_state": "phase_complete_final"}   # nothing more approved
+    if (nxt.get("approved_task_text") or "").strip():
+        # The phase-advance sweep will dispatch + verify this; not an owner decision.
+        return {"notification_state": "advancing"}
+    # Unattended: next phase has no exact approved text. Ask the owner ONCE.
+    report = rec.get("report_path") or ""
+    already = (prev.get("notification_state") == "phase_complete_needs_owner"
+               and prev.get("report_path") == report)
+    if already:
+        return {"notification_state": "phase_complete_needs_owner"}   # already asked; quiet
+    decision = {
+        "project": rec.get("project") or session,
+        "action": f"record exact approved next-phase text for '{nxt.get('title') or nxt.get('id')}' (or decide to stop)",
+        "why_blocked": "phase complete, but the next approved phase has no exact owner-approved task text — "
+                       "the orchestrator will not invent product direction",
+        "risk": "none (nothing is auto-dispatched without recorded text)",
+        "recommended": "record the exact non-publishing/non-premium next-phase text, or mark the project done",
+        "alternatives": ["record next-phase text (auto-advances)", "mark project complete", "leave paused"],
+        "reply_choices": ["1 = record next text", "2 = mark done", "3 = leave"],
+        "prompt_hash": _hash_report(session, report),
+    }
+    return {"notification_state": "phase_complete_needs_owner",
+            "escalation": {"agent": rec["agent_key"], "project": decision["project"], "decision": decision}}
+
+
+def _hash_report(session: str, report: str) -> str:
+    import hashlib
+    return hashlib.sha256(f"{session}\x1f{report}".encode()).hexdigest()[:16]
 
 
 def _resolve_safe(key: str, command: str, rec: dict) -> dict:
