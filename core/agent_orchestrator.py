@@ -71,7 +71,18 @@ def load_config() -> dict:
 
 def _session_cfg(session: str) -> dict:
     cfg = _config_cache or load_config()
-    return (cfg.get("sessions") or {}).get(session, {"mode": "monitor"})
+    sc = dict((cfg.get("sessions") or {}).get(session, {"mode": "monitor"}))
+    # Overlay owner-submitted exact next-phase text onto the config phases, so the
+    # owner can enable auto-advance for a phase from the admin screen without a
+    # config edit. Owner-recorded text is authoritative for that phase.
+    phases = sc.get("phases")
+    if phases:
+        merged = []
+        for p in phases:
+            pt = get_phase_text(session, p.get("id"))
+            merged.append({**p, "approved_task_text": pt} if pt else dict(p))
+        sc["phases"] = merged
+    return sc
 
 
 def _allowed_roots() -> list[str]:
@@ -135,6 +146,71 @@ def _upsert(rec: dict) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _phase_text_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"), timeout=10)
+    conn.execute("""CREATE TABLE IF NOT EXISTS agent_phase_text (
+        session TEXT, phase_id TEXT, approved_task_text TEXT, updated_at TEXT,
+        PRIMARY KEY (session, phase_id))""")
+    conn.commit()
+    return conn
+
+
+def get_phase_text(session: str, phase_id: str) -> Optional[str]:
+    conn = _phase_text_db()
+    try:
+        row = conn.execute("SELECT approved_task_text FROM agent_phase_text WHERE session=? AND phase_id=?",
+                           (session, phase_id)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+_MAX_PHASE_TEXT = 8000
+# Owner-submitted phase text must not silently authorise external side effects.
+_PHASE_TEXT_FORBIDDEN = ("publish", "premium", "payment", "charge", "send email",
+                         "sendmail", "credential", "rotate secret", "api key")
+
+
+def set_phase_text(session: str, phase_id: str, text: str) -> dict:
+    """Record the owner's exact approved next-phase text for a session/phase.
+
+    Validates the session exists in config and the phase id is defined. Rejects
+    text that would authorise external publishing / payments / email / credential
+    changes (defence in depth — the safe-resolution policy still gates any command
+    the agent then tries to run)."""
+    load_config()
+    scfg = (_config_cache.get("sessions") or {}).get(session)
+    if not scfg:
+        raise ValueError(f"unknown session: {session!r}")
+    phase_ids = {p.get("id") for p in (scfg.get("phases") or [])}
+    if phase_id not in phase_ids:
+        raise ValueError(f"unknown phase {phase_id!r} for session {session!r}; defined: {sorted(phase_ids)}")
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("approved_task_text is required")
+    if len(text.encode()) > _MAX_PHASE_TEXT:
+        raise ValueError(f"text too large (> {_MAX_PHASE_TEXT} bytes)")
+    low = text.lower()
+    hit = next((w for w in _PHASE_TEXT_FORBIDDEN if w in low), None)
+    if hit:
+        raise ValueError(f"text mentions a forbidden external action ({hit!r}); "
+                         "V3 canary/records must not authorise publishing/payments/email/credentials")
+    conn = _phase_text_db()
+    try:
+        conn.execute("INSERT OR REPLACE INTO agent_phase_text VALUES (?,?,?,?)",
+                     (session, phase_id, text, _now_iso()))
+        conn.commit()
+    finally:
+        conn.close()
+    ac_audit_phase_text(session, phase_id, len(text))
+    return {"session": session, "phase_id": phase_id, "recorded": True, "bytes": len(text.encode())}
+
+
+def ac_audit_phase_text(session, phase_id, size):
+    from core import agent_control as _ac
+    _ac.audit("phase_text_set", f"{session}:{phase_id}", bytes=size)
 
 
 def all_records() -> list[dict]:

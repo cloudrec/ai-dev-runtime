@@ -196,3 +196,41 @@ def test_supervise_final_phase_no_escalation():
     cfg = {"mode": "auto", "advance_phases": True, "phases": [{"id": "only", "title": "only"}]}
     sup = orch._supervise_completed("x", cfg, {"agent_key": "x:0"}, {}, orch._next_phase(cfg))
     assert sup["notification_state"] == "phase_complete_final" and "escalation" not in sup
+
+
+# ── V3: owner-submitted exact next-phase text ───────────────────────────────
+def test_set_phase_text_records_and_merges(monkeypatch):
+    orch._config_cache = {"sessions": {"seo-audit": {"mode": "auto", "phases": [
+        {"id": "stage-4", "title": "s4"}, {"id": "stage-5", "title": "s5"}]}}}
+    out = orch.set_phase_text("seo-audit", "stage-5", "Prepare a dry-run plan; do not release.")
+    assert out["recorded"] is True
+    assert orch.get_phase_text("seo-audit", "stage-5").startswith("Prepare")
+    # _session_cfg overlays the recorded text onto the phase
+    cfg = orch._session_cfg("seo-audit")
+    s5 = next(p for p in cfg["phases"] if p["id"] == "stage-5")
+    assert s5["approved_task_text"].startswith("Prepare")
+
+
+def test_set_phase_text_rejects_unknown_session():
+    orch._config_cache = {"sessions": {}}
+    with pytest.raises(ValueError):
+        orch.set_phase_text("ghost", "p", "text")
+
+
+def test_set_phase_text_rejects_unknown_phase():
+    orch._config_cache = {"sessions": {"seo-audit": {"phases": [{"id": "stage-4"}]}}}
+    with pytest.raises(ValueError):
+        orch.set_phase_text("seo-audit", "stage-99", "text")
+
+
+@pytest.mark.parametrize("bad", [
+    "Publish to LinkedIn now",
+    "activate premium plan",
+    "send email to users",
+    "rotate secret and update credential",
+    "charge the customer payment",
+])
+def test_set_phase_text_rejects_external_side_effects(bad):
+    orch._config_cache = {"sessions": {"seo-audit": {"phases": [{"id": "stage-5"}]}}}
+    with pytest.raises(ValueError):
+        orch.set_phase_text("seo-audit", "stage-5", bad)

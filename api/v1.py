@@ -328,6 +328,28 @@ async def agents_orchestrator_tick(approve: bool = False, _: bool = Depends(_aut
     return agent_orchestrator.refresh_and_resolve(approve=approve)
 
 
+class PhaseTextReq(BaseModel):
+    session: str
+    phase_id: str
+    approved_task_text: str
+
+
+@router.post("/agents/orchestrator/phase-text")
+async def agents_set_phase_text(req: PhaseTextReq, _: bool = Depends(_auth)):
+    """Record the owner's exact approved next-phase text (enables auto-advance for
+    that phase). Rejects text authorising external publish/payment/email/credential."""
+    try:
+        return agent_orchestrator.set_phase_text(req.session, req.phase_id, req.approved_task_text)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/agents/orchestrator/phase-text")
+async def agents_get_phase_text(session: str, phase_id: str, _: bool = Depends(_auth)):
+    return {"session": session, "phase_id": phase_id,
+            "approved_task_text": agent_orchestrator.get_phase_text(session, phase_id)}
+
+
 class PhaseRollbackReq(BaseModel):
     session: str
     phase_id: str
