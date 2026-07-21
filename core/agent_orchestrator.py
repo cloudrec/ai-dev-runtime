@@ -282,7 +282,7 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         inv = ac.agent_list()
     except ac.AgentControlError as e:
         return {"ok": False, "error": str(e)[:200], "agents": 0}
-    results, resolved, escalations = [], [], []
+    results, resolved, escalations, full_records = [], [], [], []
     for agent in inv.get("agents", []):
         if not (agent.get("is_agent") and agent.get("alive")):
             continue
@@ -333,9 +333,18 @@ def refresh_and_resolve(approve: bool = True) -> dict:
 
         _upsert(rec)
         results.append({"agent": key, "state": state, "project": rec["project"]})
+        full_records.append(rec)
+
+    # Cross-phase auto-progress (guarded, exact-approved-text-only, idempotent).
+    advances = {"enabled": False, "results": []}
+    try:
+        from core import agent_phase_advance
+        advances = agent_phase_advance.sweep(full_records, _session_cfg, dispatch=approve)
+    except Exception as e:  # noqa: BLE001
+        advances = {"enabled": True, "error": str(e)[:200], "results": []}
 
     return {"ok": True, "agents": len(results), "records": results,
-            "resolved": resolved, "escalations": escalations}
+            "resolved": resolved, "escalations": escalations, "phase_advances": advances}
 
 
 def _next_phase_task(cfg: dict, prev: dict) -> Optional[str]:

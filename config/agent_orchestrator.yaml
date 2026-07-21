@@ -23,19 +23,34 @@ sessions:
     root: /opt/seo
     approved_goal: "SEO Stage 4 — AI Marketing Distribution OS (Telegram + WordPress distribution)"
     mode: auto
-    advance_phases: false
+    # Cross-phase auto-progress is ENABLED, but a phase is dispatched ONLY when its
+    # exact owner-approved text is recorded below (approved_task_text). No text ⇒
+    # no dispatch (never invent direction). acceptance markers additionally block
+    # advancement past a failed/duplicate phase.
+    advance_phases: true
     phases:
       - id: stage-4
         title: "Telegram + WordPress distribution"
+        acceptance:
+          must_not_contain: ["FAILED", "acceptance failed", "duplicate_created=true"]
+        # approved_task_text: "<owner records exact next-phase text here to enable dispatch>"
       - id: stage-5
         title: "LinkedIn + Pinterest"
+        # approved_task_text intentionally absent — must be owner-recorded, and must
+        # NOT trigger external publication or premium activation.
 
   job:
     project: jobhunter-ai
     root: /opt/jobhunter-ai
     approved_goal: "JobHunter Monetization V1"
     mode: auto
-    advance_phases: false
+    advance_phases: true
+    phases:
+      - id: monetization-v1
+        title: "JobHunter Monetization V1"
+        acceptance:
+          must_not_contain: ["FAILED", "acceptance failed"]
+        # approved_task_text intentionally absent — owner-recorded only; no premium activation.
 
   safeguard:
     project: safeguard

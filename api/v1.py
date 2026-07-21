@@ -326,3 +326,16 @@ async def agents_orchestrator_status(_: bool = Depends(_auth)):
 async def agents_orchestrator_tick(approve: bool = False, _: bool = Depends(_auth)):
     """Run one orchestration sweep. approve=false is a dry-run (no keystroke)."""
     return agent_orchestrator.refresh_and_resolve(approve=approve)
+
+
+class PhaseRollbackReq(BaseModel):
+    session: str
+    phase_id: str
+
+
+@router.post("/agents/orchestrator/phase-rollback")
+async def agents_phase_rollback(req: PhaseRollbackReq, _: bool = Depends(_auth)):
+    """Roll back a dispatched phase advance (audited; text already sent cannot be
+    un-sent, but the phase is no longer treated as dispatched)."""
+    from core import agent_phase_advance
+    return agent_phase_advance.rollback(req.session, req.phase_id)
