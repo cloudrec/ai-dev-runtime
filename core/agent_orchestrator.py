@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re as _re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -109,6 +110,12 @@ def _db() -> sqlite3.Connection:
         prompt_hash TEXT, blocker_category TEXT, completion_evidence TEXT,
         report_path TEXT, approved_next_task TEXT, notification_state TEXT,
         retry_count INTEGER DEFAULT 0, decision TEXT, updated_at TEXT)""")
+    # Additive columns (exact blocker text + decision type) — older rows get NULL.
+    for col in ("blocker_text TEXT", "decision_type TEXT"):
+        try:
+            conn.execute(f"ALTER TABLE agent_orchestrator ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     return conn
 
@@ -116,7 +123,8 @@ def _db() -> sqlite3.Connection:
 _FIELDS = ("agent_key", "session", "project", "approved_goal", "current_task", "phase",
            "state", "last_fresh_activity_ts", "prompt_hash", "blocker_category",
            "completion_evidence", "report_path", "approved_next_task",
-           "notification_state", "retry_count", "decision", "updated_at")
+           "notification_state", "retry_count", "decision", "updated_at",
+           "blocker_text", "decision_type")
 
 
 def get_record(agent_key: str) -> Optional[dict]:
@@ -263,9 +271,25 @@ def _map_base_state(observed: str) -> str:
     return observed
 
 
+# Markers that prove the agent is still executing (Claude Code shows these while a
+# turn/tool is running). If present, an "idle" base classification is a lag artefact
+# and MUST NOT be read as completion, however fresh a report looks.
+_ACTIVE_EXEC_RE = _re.compile(
+    r"(esc to interrupt|\bthinking…|\bthinking\.\.\.|\brunning…|\brunning\.\.\.|"
+    r"\bcompacting|\btool call|\bexecuting\b|✻|✽)", _re.I)
+
+
 def _completion_evidence(session: str, root: str, agent) -> Optional[dict]:
-    """A recently-written report in the project is completion evidence."""
+    """Completion requires THREE things, so a stray recent report cannot fake it:
+      1. the agent is genuinely idle (no active-execution markers in the pane),
+      2. a report exists AND was written inside the completion window (freshness),
+      3. the report was written at/after the agent's last observed fresh activity
+         (so an unrelated OLD report re-touched by something else is not evidence)."""
     if not root:
+        return None
+    # 1. mid-run guard — a spinner / "esc to interrupt" means still working.
+    tail = agent.get("recent_activity") or agent.get("_tail") or ""
+    if _ACTIVE_EXEC_RE.search(tail):
         return None
     try:
         rep = ac.agent_report(root, limit=5)
@@ -279,20 +303,61 @@ def _completion_evidence(session: str, root: str, agent) -> Optional[dict]:
         mt = datetime.fromisoformat(latest["modified_at"]).timestamp()
     except Exception:  # noqa: BLE001
         return None
-    if (_now_ts() - mt) <= _COMPLETION_WINDOW_SECS:
-        return {"report_path": latest["path"], "modified_at": latest["modified_at"]}
-    return None
+    # 2. freshness window.
+    if (_now_ts() - mt) > _COMPLETION_WINDOW_SECS:
+        return None
+    # 3. ordering — the report must not predate the agent's last real activity.
+    prev = get_record(agent.get("target", f"{session}:")) or {}
+    last_activity = prev.get("last_fresh_activity_ts")
+    if last_activity and mt + 1 < float(last_activity):
+        return None
+    return {"report_path": latest["path"], "modified_at": latest["modified_at"]}
+
+
+# Real external / product / financial actions that genuinely need the owner. An
+# internal-but-unrecognised command is NOT one of these — it is left for the owner
+# WITHOUT a Telegram alert (visible in the dashboard/brief only).
+_EXTERNAL_FINANCIAL_RE = _re.compile(
+    r"(curl|wget|http|ssh|scp|rsync\s+[^ ]+:|publish|deploy|release|npm\s+publish|"
+    r"docker\s+push|git\s+push|payment|charge|stripe|invoice|billing|premium|subscribe|"
+    r"send\s*mail|sendmail|smtp|email|outreach|dm\b|credential|secret|token|api[_-]?key|"
+    r"rotate|\.env|prod(uction)?|"
+    # consequential operations (destructive / service-affecting) also need the owner
+    r"restart|reload|\bstop\b|\bkill\b|\bdown\b|\brm\b|\bdelete\b|\bdrop\b|truncate|"
+    r"migrate|alembic\s+(up|down)|reset\s+--hard|force[- ]?push|chmod|chown)", _re.I)
+
+
+def decision_type(command: str, category: str) -> str:
+    """external | financial | internal. Only external/financial escalate to the owner."""
+    c = command or ""
+    if _re.search(r"(payment|charge|stripe|invoice|billing|premium|subscribe|refund|payout)", c, _re.I):
+        return "financial"
+    if _EXTERNAL_FINANCIAL_RE.search(c):
+        return "external"
+    return "internal"
+
+
+def _exact_blocker_text(command: str, verdict: dict) -> str:
+    """The EXACT blocker — the real command + concrete reason, never a bare category."""
+    cmd = (command or "(unreadable prompt)").strip()
+    reason = verdict.get("reason") or verdict.get("category") or "requires owner judgement"
+    return f"{cmd} — {reason}"
 
 
 def _build_decision(project: str, command: str, verdict: dict) -> dict:
-    """Rich owner-decision object for a genuine (non-safe) prompt."""
+    """Rich owner-decision object for a genuine (non-safe) prompt. Carries the
+    EXACT blocker text and a decision type so escalation can be reserved for real
+    external/product/financial decisions."""
+    dtype = decision_type(command, verdict.get("category", ""))
     return {
         "project": project,
         "action": command,
-        "why_blocked": f"not auto-continuable: {verdict['reason']}",
-        "risk": ("external or consequential effect" if verdict["category"] in ("denied", "shell_construct")
-                 else "unverified effect"),
-        "recommended": "review the command and approve only if intended",
+        "blocker_text": _exact_blocker_text(command, verdict),
+        "decision_type": dtype,
+        "why_blocked": f"not auto-continuable: {verdict.get('reason')}",
+        "risk": ("external / product / financial effect" if dtype in ("external", "financial")
+                 else "internal — review; no external effect"),
+        "recommended": "review the exact command and approve only if intended",
         "alternatives": ["approve (owner)", "reject and instruct the agent", "leave paused"],
         "reply_choices": ["1 = approve", "2 = reject", "3 = leave for later"],
         "prompt_hash": verdict["hash"],
@@ -325,17 +390,26 @@ def derive(agent: dict, cfg: dict) -> dict:
             if verdict["safe"] and mode == "auto":
                 return {"state": "waiting_safe_approval", "command": command,
                         "prompt_hash": verdict["hash"], "fresh": True, "verdict": verdict}
-            # genuine owner decision
+            # genuine owner decision — carry the EXACT blocker text + decision type
+            dec = _build_decision(cfg.get("project", session), command, verdict)
             return {"state": "waiting_owner", "command": command, "prompt_hash": verdict["hash"],
-                    "blocker_category": verdict["category"], "fresh": False,
-                    "decision": _build_decision(cfg.get("project", session), command, verdict)}
-        return {"state": "waiting_owner", "blocker_category": "unextractable", "fresh": False,
-                "decision": _build_decision(cfg.get("project", session), "(unreadable prompt)",
-                                            {"reason": "prompt not machine-readable", "category": "unknown",
-                                             "hash": pr.command_hash(tail[-200:])})}
+                    "blocker_category": verdict["category"], "blocker_text": dec["blocker_text"],
+                    "decision_type": dec["decision_type"], "fresh": False, "decision": dec}
+        dec = _build_decision(cfg.get("project", session), "(unreadable prompt)",
+                              {"reason": "prompt not machine-readable", "category": "unknown",
+                               "hash": pr.command_hash(tail[-200:])})
+        return {"state": "waiting_owner", "blocker_category": "unextractable",
+                "blocker_text": dec["blocker_text"], "decision_type": "internal",
+                "fresh": False, "decision": dec}
 
     if observed == "externally_blocked":
-        return {"state": "externally_blocked", "blocker_category": "external", "fresh": False}
+        # Exact blocker from the pane, not a bare "external" category.
+        tail = agent.get("recent_activity") or agent.get("_tail") or ""
+        m = _re.search(r"(input[_ ]required|verification key|waiting for [^\n]{0,80}|"
+                       r"rate.?limit|quota|vendor[^\n]{0,60})", tail, _re.I)
+        btext = m.group(0).strip() if m else "blocked on an external dependency"
+        return {"state": "externally_blocked", "blocker_category": "external",
+                "blocker_text": btext, "decision_type": "external", "fresh": False}
 
     if observed == "idle":
         ev = _completion_evidence(session, root, agent)
@@ -395,20 +469,40 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             "notification_state": None,
             "retry_count": prev.get("retry_count") or 0,
             "decision": d.get("decision"),
+            "blocker_text": d.get("blocker_text"),
+            "decision_type": d.get("decision_type"),
         }
+
+        # A previously budget-paused agent whose limits have now reset. Verify it
+        # actually resumed; never re-dispatch (that would duplicate in-flight work).
+        budget_reset = (prev.get("state") == "paused_by_budget" and not budget_locked())
 
         # auto-continue a provably-safe prompt
         if state == "waiting_safe_approval" and cfg.get("mode") == "auto" and approve and not budget_locked():
             outcome = _resolve_safe(key, d.get("command"), rec)
             rec.update(outcome["rec_updates"])
             resolved.append(outcome["summary"])
+        elif budget_reset and state in ("working", "idle"):
+            res = _verify_after_budget_reset(state, rec, prev)
+            rec["notification_state"] = res["notification_state"]
+            if res.get("escalation"):
+                escalations.append(res["escalation"])
         elif state == "waiting_owner":
-            # dedup escalation by prompt hash
-            if prev.get("prompt_hash") == rec["prompt_hash"] and prev.get("notification_state") == "escalated":
-                rec["notification_state"] = "escalated"
+            # Escalate to the owner ONLY for a real external/product/financial
+            # decision. An internal, merely-unrecognised prompt is left for the
+            # owner but does NOT raise a Telegram alert (visible in dashboard/brief).
+            dtype = d.get("decision_type") or "internal"
+            if dtype in ("external", "financial"):
+                already_escalated = (prev.get("prompt_hash") == rec["prompt_hash"]
+                                     and prev.get("notification_state") in ("needs_escalation", "escalated"))
+                if already_escalated:
+                    rec["notification_state"] = prev.get("notification_state")
+                else:
+                    rec["notification_state"] = "needs_escalation"
+                    escalations.append({"agent": key, "project": rec["project"],
+                                        "decision": rec["decision"], "decision_type": dtype})
             else:
-                rec["notification_state"] = "needs_escalation"
-                escalations.append({"agent": key, "project": rec["project"], "decision": rec["decision"]})
+                rec["notification_state"] = "owner_review_internal"   # no Telegram; shown in UI/brief
         elif state == "completed" and cfg.get("mode") == "auto" and cfg.get("advance_phases"):
             # Supervision: a completed phase must never sit unattended. If the next
             # phase can auto-advance (has exact approved text) the sweep handles it;
@@ -452,6 +546,25 @@ def _describe_next_phase(nxt: Optional[dict]) -> Optional[str]:
     if (nxt.get("approved_task_text") or "").strip():
         return f"{title} (ready to auto-advance)"
     return f"{title} (awaiting owner-approved text)"
+
+
+def _verify_after_budget_reset(state: str, rec: dict, prev: dict) -> dict:
+    """A budget/rate-limit pause has cleared. Verify the previously-approved work
+    continued on its own; do NOT re-issue any command (that would duplicate the
+    in-flight phase). Only report status.
+      * working → confirmed self-resumed (informational, no owner alert);
+      * idle    → did NOT resume; ask the owner ONCE (internal, not a paid action)."""
+    if state == "working":
+        # clear any stale retry bookkeeping from the pause.
+        rec["retry_count"] = 0
+        return {"notification_state": "resumed_after_budget"}
+    # idle: did NOT resume on its own. This is operational/internal, so per the
+    # escalation rule it is surfaced in the dashboard/brief (blocker_text) WITHOUT a
+    # Telegram alert. No command is re-issued — that would duplicate approved work.
+    rec["blocker_text"] = ("paused_by_budget cleared but the agent stayed idle — "
+                           "previously-approved work needs a manual nudge (no auto re-dispatch)")
+    rec["decision_type"] = "internal"
+    return {"notification_state": "stalled_after_budget"}
 
 
 def _supervise_completed(session: str, cfg: dict, rec: dict, prev: dict, nxt: Optional[dict]) -> dict:

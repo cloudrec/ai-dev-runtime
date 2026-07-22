@@ -234,3 +234,111 @@ def test_set_phase_text_rejects_external_side_effects(bad):
     orch._config_cache = {"sessions": {"seo-audit": {"phases": [{"id": "stage-5"}]}}}
     with pytest.raises(ValueError):
         orch.set_phase_text("seo-audit", "stage-5", bad)
+
+
+# ── Commander hardening: decision_type / exact blocker text ─────────────────
+def test_decision_type_financial():
+    assert orch.decision_type("charge the customer 20 usd via stripe", "denied") == "financial"
+
+
+def test_decision_type_external():
+    assert orch.decision_type("git push origin main", "denied") == "external"
+    assert orch.decision_type("docker compose restart backend", "denied") == "external"
+
+
+def test_decision_type_internal():
+    # a non-external, non-financial, merely-unrecognised local command.
+    assert orch.decision_type("frobnicate --local ./data", "denied") == "internal"
+
+
+def test_waiting_owner_carries_exact_blocker_text_not_just_category():
+    d = orch.derive(_agent(state="waiting_owner", tail=DANGEROUS_PROMPT), AUTO)
+    assert d["decision_type"] == "external"
+    # exact command must appear in the blocker text, not just the generic category.
+    assert "docker compose restart backend" in d["blocker_text"]
+    assert d["blocker_text"] != d["blocker_category"]
+
+
+def test_internal_waiting_owner_does_not_escalate(monkeypatch):
+    INTERNAL_PROMPT = ("  Bash command\n  frobnicate --local ./data\n  Do a local thing\n\n"
+                       "Do you want to proceed?\n❯ 1. Yes\n  2. No")
+    agent = _agent(state="waiting_owner", tail=INTERNAL_PROMPT)
+    monkeypatch.setattr(orch.ac, "agent_list", lambda: {"agents": [agent]})
+    monkeypatch.setattr(orch.ac, "_pane_tail", lambda *a, **k: INTERNAL_PROMPT)
+    monkeypatch.setattr(orch, "_session_cfg", lambda s: AUTO)
+    out = orch.refresh_and_resolve(approve=True)
+    assert out["escalations"] == []           # internal → no Telegram escalation
+    rec = orch.get_record("seo-audit:0.0")
+    assert rec["notification_state"] == "owner_review_internal"
+
+
+def test_external_waiting_owner_escalates_once(monkeypatch):
+    agent = _agent(state="waiting_owner", tail=DANGEROUS_PROMPT)
+    monkeypatch.setattr(orch.ac, "agent_list", lambda: {"agents": [agent]})
+    monkeypatch.setattr(orch.ac, "_pane_tail", lambda *a, **k: DANGEROUS_PROMPT)
+    monkeypatch.setattr(orch, "_session_cfg", lambda s: AUTO)
+    out = orch.refresh_and_resolve(approve=True)
+    assert len(out["escalations"]) == 1
+    assert out["escalations"][0]["decision_type"] == "external"
+    # second sweep on the same prompt does not re-escalate.
+    out2 = orch.refresh_and_resolve(approve=True)
+    assert out2["escalations"] == []
+
+
+# ── Commander hardening: reliable completion detection ──────────────────────
+def test_active_exec_markers_block_false_completion(monkeypatch):
+    monkeypatch.setattr(orch.ac, "agent_report",
+                        lambda *a, **k: {"reports": [{"path": "reports/DONE.md",
+                                                      "modified_at": orch.datetime.now(orch.timezone.utc).isoformat()}]})
+    # agent looks idle but the pane still shows it executing → NOT completed.
+    a = _agent(state="idle", tail="… esc to interrupt")
+    assert orch._completion_evidence("seo-audit", "/opt/seo", a) is None
+
+
+def test_completion_when_idle_and_fresh_report(monkeypatch):
+    now = orch.datetime.now(orch.timezone.utc).isoformat()
+    monkeypatch.setattr(orch.ac, "agent_report",
+                        lambda *a, **k: {"reports": [{"path": "reports/DONE.md", "modified_at": now}]})
+    a = _agent(state="idle", tail="done. summary written.")
+    ev = orch._completion_evidence("seo-audit", "/opt/seo", a)
+    assert ev and ev["report_path"] == "reports/DONE.md"
+
+
+def test_stale_report_before_last_activity_is_not_completion(monkeypatch):
+    # report is fresh-within-window but PREDATES the agent's last real activity.
+    old = orch.datetime.now(orch.timezone.utc).isoformat()
+    monkeypatch.setattr(orch.ac, "agent_report",
+                        lambda *a, **k: {"reports": [{"path": "reports/OLD.md", "modified_at": old}]})
+    orch._upsert({"agent_key": "seo-audit:0.0", "session": "seo-audit", "project": "seo",
+                  "state": "working", "last_fresh_activity_ts": orch._now_ts() + 60})
+    a = _agent(state="idle", tail="")
+    assert orch._completion_evidence("seo-audit", "/opt/seo", a) is None
+
+
+# ── Commander hardening: verified continuation after limits reset ───────────
+def test_budget_reset_working_marks_resumed(monkeypatch):
+    agent = _agent(state="working")
+    monkeypatch.setattr(orch.ac, "agent_list", lambda: {"agents": [agent]})
+    monkeypatch.setattr(orch.ac, "_pane_tail", lambda *a, **k: "")
+    monkeypatch.setattr(orch, "_session_cfg", lambda s: AUTO)
+    orch._upsert({"agent_key": "seo-audit:0.0", "session": "seo-audit", "project": "seo",
+                  "state": "paused_by_budget"})
+    out = orch.refresh_and_resolve(approve=True)
+    rec = orch.get_record("seo-audit:0.0")
+    assert rec["notification_state"] == "resumed_after_budget"
+    assert out["escalations"] == []           # self-resumed → no alert
+
+
+def test_budget_reset_idle_marks_stalled_without_escalation(monkeypatch):
+    agent = _agent(state="idle")
+    monkeypatch.setattr(orch.ac, "agent_list", lambda: {"agents": [agent]})
+    monkeypatch.setattr(orch.ac, "_pane_tail", lambda *a, **k: "")
+    monkeypatch.setattr(orch, "_session_cfg", lambda s: AUTO)
+    monkeypatch.setattr(orch, "_completion_evidence", lambda *a, **k: None)
+    orch._upsert({"agent_key": "seo-audit:0.0", "session": "seo-audit", "project": "seo",
+                  "state": "paused_by_budget"})
+    out = orch.refresh_and_resolve(approve=True)
+    rec = orch.get_record("seo-audit:0.0")
+    assert rec["notification_state"] == "stalled_after_budget"
+    assert "no auto re-dispatch" in (rec["blocker_text"] or "")
+    assert out["escalations"] == []           # internal → surfaced, not alerted
