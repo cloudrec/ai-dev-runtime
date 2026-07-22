@@ -188,6 +188,15 @@ def test_resume_prefers_agent_authored_handoff(monkeypatch, tmp_path):
     assert "reports/CONTEXT_HANDOFF.md" in resume
 
 
+def test_active_task_text_is_work_remaining_to_continue():
+    cfg = {"active_task_id": "part-d", "active_task_text": "Continue Part D: source intake pipeline"}
+    cls, rem = cb.completion_class(_rec(), cfg, "idle")
+    assert cls == "work_remaining"
+    assert rem["id"] == "part-d" and "source intake" in rem["text"]
+    # cleared active task + no next-phase text → no remaining work (surface completion).
+    assert cb.completion_class(_rec(), {"active_task_text": "  "}, "done")[0] == "task_completed_no_remaining_work"
+
+
 def test_completion_class_three_way(tmp_path):
     wr = {"phases": [{"id": "a"}, {"id": "b", "approved_task_text": "do exact task X"}]}
     assert cb.completion_class(_rec(), wr, "done")[0] == "work_remaining"

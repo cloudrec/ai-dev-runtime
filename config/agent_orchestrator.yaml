@@ -23,6 +23,22 @@ sessions:
     root: /opt/seo
     approved_goal: "SEO Stage 4 — AI Marketing Distribution OS (Telegram + WordPress distribution)"
     mode: auto
+    # Live context-rotation acceptance (2026-07-22): scoped opt-in for THIS agent
+    # only. The autonomous /clear fires solely when context reaches threshold AND
+    # the agent is stably idle at a verified safe boundary with a fresh exact
+    # handoff and this exact approved task still remaining.
+    context_rotate: true
+    handoff_path: /opt/seo/reports/CONTEXT_HANDOFF.md
+    active_task_id: part-d
+    active_task_title: "Part D — source intake + async transcription pipeline"
+    active_task_text: >-
+      Extend the Part B Source-to-Content Factory: implement source intake
+      (content_intake, routes_source_factory.py) and the async transcription JOBS
+      pipeline — INTERNAL code only. Audio without a provider key stays
+      'awaiting_transcription'; pasted transcripts work. Do NOT call paid
+      transcription, do NOT touch provider credentials, social sends, schedules,
+      emails, account creation, force-push, or tags. Continue from
+      /opt/seo/reports/CONTEXT_HANDOFF.md.
     # Cross-phase auto-progress is ENABLED, but a phase is dispatched ONLY when its
     # exact owner-approved text is recorded below (approved_task_text). No text ⇒
     # no dispatch (never invent direction). acceptance markers additionally block

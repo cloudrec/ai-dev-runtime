@@ -556,7 +556,12 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             # rotation stays OFF behind its own flag until a dry-run + live canary
             # prove it never clears unexpectedly — separate from safe-approval.
             ctx_rotate_enabled = os.getenv("AGENT_CONTEXT_ROTATE_ENABLED", "0") not in ("0", "false", "no", "")
-            ctx_dispatch = (ctx_act and approve and not budget_locked() and ctx_rotate_enabled)
+            # Per-session opt-in scopes the autonomous /clear risk: dispatch fires
+            # ONLY for a managed-auto session that explicitly sets `context_rotate:
+            # true` in config (so a rollout can be limited to one agent at a time).
+            session_rotate_opt_in = bool(cfg.get("context_rotate"))
+            ctx_dispatch = (ctx_act and approve and not budget_locked()
+                            and ctx_rotate_enabled and session_rotate_opt_in)
             cres = ctxb.evaluate(agent, cfg, rec, prev, act=ctx_act, dispatch=ctx_dispatch)
             rec["context_pct"] = cres.get("context_pct")
             rec["context_tier"] = cres.get("context_tier")

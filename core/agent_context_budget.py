@@ -193,12 +193,17 @@ def _next_phase_title(cfg: dict) -> Optional[str]:
 
 
 def remaining_approved_subphase(cfg: dict) -> Optional[dict]:
-    """The EXACT owner-approved remaining subphase, or None. A next phase counts as
-    genuine remaining work ONLY when the owner recorded its exact text
-    (`approved_task_text`, merged from get_phase_text) — a bare config placeholder
-    (stage-4/stage-5 with no text) is NOT remaining work and must never cause a
-    'continue the task' resume (2026-07-22: a fully-completed task was falsely
-    resumed off a phase-count heuristic)."""
+    """The EXACT owner-approved remaining work, or None. Two sources, both exact
+    (never a bare config placeholder — the 2026-07-22 false-resume root cause):
+      1. `active_task_text` — the CURRENT approved task to CONTINUE after a /clear
+         (e.g. Part D, in progress); preferred.
+      2. an owner-approved NEXT phase (`approved_task_text`, merged from get_phase_text).
+    Cleared by the owner when the task completes → then classification falls to
+    task_completed_* and nothing is resumed."""
+    active = ((cfg or {}).get("active_task_text") or "").strip()
+    if active:
+        return {"id": (cfg.get("active_task_id") or "active"),
+                "title": cfg.get("active_task_title") or "active approved task", "text": active}
     phases = (cfg or {}).get("phases") or []
     if len(phases) > 1:
         txt = (phases[1].get("approved_task_text") or "").strip()
