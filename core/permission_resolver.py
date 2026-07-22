@@ -34,6 +34,12 @@ _UNSAFE_CONSTRUCTS = (
     ">", ">>", "<", "`", "$(", "${", "<(", ">(", "$", "\\\n",
 )
 _BACKGROUND_RE = re.compile(r"(?<!&)&(?!&)")   # a single '&' not part of '&&'
+# Provably-inert expansions: a pipeline/last-command EXIT CODE (an integer). These
+# cannot inject a command or a path, so they are neutralised BEFORE the construct
+# scan. NOTHING else is exempted — `$(…)`, backticks, `${VAR}`, `$VAR` stay unsafe.
+# `${PIPESTATUS[N]}` requires a literal digit index, so `${PIPESTATUS[$(evil)]}`
+# does NOT match and is still rejected as a command substitution.
+_SAFE_EXPANSION_RE = re.compile(r"\$\{PIPESTATUS\[\d+\]\}|\$PIPESTATUS\b|\$\?")
 # Harmless redirects that discard/merge streams (write no real file): remove
 # them before construct analysis so `2>/dev/null` / `2>&1` don't read as writes.
 _SAFE_REDIRECT_RE = re.compile(r"(?:\d*>&\d+|\d*>\s*/dev/null|&>\s*/dev/null|<\s*/dev/null)")
@@ -587,10 +593,14 @@ def classify_command(command: str, cwd: str | None = None,
         result["reason"] = "empty command"
         return result
     try:
-        # Quote-aware analysis: mask quoted spans (length-preserving) so the
-        # construct/segment regexes only ever see UNQUOTED shell operators, then
-        # blank the harmless /dev/null and stderr-merge redirects.
-        masked = _mask_quotes(cmd)
+        # Quote-aware analysis: neutralise provably-inert exit-code expansions
+        # (length-preserving), mask quoted spans so the construct/segment regexes
+        # only ever see UNQUOTED shell operators, then blank the harmless
+        # /dev/null and stderr-merge redirects. Segments are still sliced from the
+        # ORIGINAL command, so the real `${PIPESTATUS[0]}` reaches classification
+        # (shlex keeps it as a literal token → a plain string arg to echo).
+        neutral = _SAFE_EXPANSION_RE.sub(lambda m: "0" * len(m.group(0)), cmd)
+        masked = _mask_quotes(neutral)
         scan = _SAFE_REDIRECT_RE.sub(lambda m: " " * len(m.group(0)), masked)
     except _Unsafe as e:
         result["reason"] = str(e)

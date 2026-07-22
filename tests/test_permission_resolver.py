@@ -377,7 +377,6 @@ def test_hardening_readonly_wrapped_is_safe(cmd):
     "timeout 30 rm -rf /tmp/x",
     "timeout 300 alembic upgrade head",
     "timeout 5m git push",
-    'echo "exit=${PIPESTATUS[0]}"',                # expansion → denied
 ])
 def test_hardening_writes_and_external_fail_closed(cmd):
     _unsafe(cmd)
@@ -385,6 +384,35 @@ def test_hardening_writes_and_external_fail_closed(cmd):
 
 def test_unbalanced_quote_is_denied():
     _unsafe("grep 'unterminated file")
+
+
+# ── safe exit-code expansions (the 2026-07-22 failed canary) — SAFE ─────────
+# `${PIPESTATUS[n]}` / `$?` expand to an integer exit code and cannot inject; a
+# read-only/test command that reports its exit status must not stay blocked.
+@pytest.mark.parametrize("cmd", [
+    'cd /opt/seo; timeout 300 npx tsc --noEmit -p tsconfig.json 2>&1 '
+    "| grep -E 'error TS' | head -30; echo \"typecheck_done exit=${PIPESTATUS[0]}\"",
+    'pytest -q; echo "exit=${PIPESTATUS[0]}"',
+    "grep -n foo bar.py | head; echo ${PIPESTATUS[1]}",
+    "alembic heads; echo $?",
+    "docker exec c sh -c 'pytest -q; echo exit=${PIPESTATUS[0]}'",
+    "npx tsc --noEmit 2>&1 | tail -20; echo $PIPESTATUS",
+])
+def test_safe_exitcode_expansions_are_safe(cmd):
+    _safe(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo $(rm -rf /)",                 # command substitution
+    "echo `whoami`",                    # backtick substitution
+    "echo ${HOME}",                     # arbitrary parameter expansion
+    "echo $USER",                       # arbitrary variable
+    "echo ${PATH}",
+    "echo ${PIPESTATUS[$(id)]}",        # non-literal index → real substitution
+    "cat ${SECRET_FILE}",
+])
+def test_arbitrary_expansion_still_denied(cmd):
+    _unsafe(cmd)
 
 
 # ── wrapped-command extraction (narrow pane) — the 2nd half of the live bug ──
