@@ -196,16 +196,64 @@ def test_detect_surfaceable_event_independent_of_dispatch(monkeypatch, tmp_path)
     a = _agent(tail="done, clean boundary ❯ ")            # NO context% figure
     cfg = {"root": str(tmp_path), "project": "seo",
            "active_task_id": "part-e", "active_task_text": "Continue Part E readiness center"}
-    ev = cb.detect_surfaceable_event(a, _rec(state="idle"), cfg, a["_tail"])
+    ev = cb.detect_surfaceable_event(a, _rec(state="idle"), cfg, a["_tail"], prev=_settled_prev())
     assert ev["event_type"] == "checkpoint_completed_work_remaining"
     assert ev["remaining_id"] == "part-e" and "Part E" in ev["remaining"]
     assert ev["handoff_path"] == str(reports / "CONTEXT_HANDOFF.md")
     # a working agent surfaces nothing.
-    assert cb.detect_surfaceable_event(_agent(tail="… esc to interrupt"), _rec(state="working"), cfg, "") is None
+    assert cb.detect_surfaceable_event(_agent(tail="… esc to interrupt"), _rec(state="working"), cfg, "", prev=_settled_prev()) is None
     # completed with no remaining work → completion event, not a resume.
     done_cfg = {"root": str(tmp_path), "project": "seo"}
-    ev2 = cb.detect_surfaceable_event(a, _rec(state="idle"), done_cfg, "all done")
+    ev2 = cb.detect_surfaceable_event(a, _rec(state="idle"), done_cfg, "all done", prev=_settled_prev())
     assert ev2["event_type"] == "task_completed_no_remaining_work"
+
+
+def test_no_false_completion_when_thinking_or_active(tmp_path):
+    # The 2026-07-22 job false-completion: state read `idle` but the pane shows an
+    # active thinking/spinner marker → must surface NOTHING.
+    cfg = {"root": str(tmp_path), "project": "jobhunter-ai"}
+    for tail in ["✶ Shenaniganing… (5m 29s · ↓ 16.4k tokens · thinking)",
+                 "Combobulating… (22s · thinking)",
+                 "curl -sI https://x | grep\n↓ 16.4k tokens",
+                 "running the migration now"]:
+        a = _agent(tail=tail, target="job:0.0")
+        assert cb.detect_surfaceable_event(a, _rec(state="idle"), cfg, tail, prev=_settled_prev()) is None
+
+
+def test_no_false_completion_when_not_stably_idle(tmp_path):
+    # A momentary idle read of an agent that was working last sweep → no event.
+    import time as _t
+    cfg = {"root": str(tmp_path), "project": "jobhunter-ai"}
+    a = _agent(tail="quiet ❯ ", target="job:0.0")
+    rec = _rec(state="idle", last_fresh_activity_ts=_t.time() - 3)
+    assert cb.detect_surfaceable_event(a, rec, cfg, "quiet ❯ ", prev={"state": "working"}) is None
+
+
+def test_project_identity_cross_project_from_command(tmp_path):
+    # Session is jobhunter but the agent cd'd into another project → cross_project,
+    # never mislabelled jobhunter-ai.
+    cfg = {"root": "/opt/jobhunter-ai", "project": "jobhunter-ai"}
+    tail = "cd /opt/clients-help-landing\n  inspect biona.html\n done ❯ "
+    ident = cb.resolve_active_project(_agent(tail=tail, target="job:0.0"), _rec(), cfg, tail)
+    assert ident["cross_project"] is True and ident["project"] == "cross_project_task"
+    assert ident["command_path"] == "/opt/clients-help-landing"
+    # same-project cd is not cross-project.
+    ident2 = cb.resolve_active_project(_agent(), _rec(), {"root": "/opt/seo", "project": "seo"},
+                                       "cd /opt/seo/backend && git status")
+    assert ident2["cross_project"] is False and ident2["project"] == "seo"
+
+
+def test_completion_dedup_survives_ack(monkeypatch, tmp_path):
+    # A delayed/duplicate stale completion payload must NOT re-deliver after the
+    # first was acked (the repeated job false completions).
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    from core import agent_control as ac
+    assert ac.record_commander_event("job:0.0", "jobhunter-ai", "task_completed_no_remaining_work",
+                                     {}, dedup_key="done:report-x") is True
+    ac.ack_commander_events([e["id"] for e in ac.list_commander_events(unacked_only=True)])
+    # same completion key again (even after ack) → deduped, not re-emitted.
+    assert ac.record_commander_event("job:0.0", "jobhunter-ai", "task_completed_no_remaining_work",
+                                     {}, dedup_key="done:report-x") is False
 
 
 def test_context_detection_extra_forms():
@@ -302,7 +350,7 @@ def test_surfacing_without_context_but_no_clear(monkeypatch, tmp_path):
     wr_cfg = {"root": str(tmp_path), "project": "seo",
               "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery (read-only)"}]}
     # SURFACING fires (independent of context):
-    ev = cb.detect_surfaceable_event(a, rec, wr_cfg, a["_tail"])
+    ev = cb.detect_surfaceable_event(a, rec, wr_cfg, a["_tail"], prev=_settled_prev())
     assert ev["event_type"] == "checkpoint_completed_work_remaining"
     assert ev["remaining"] == "run remote discovery (read-only)"
     # but evaluate does NOT /clear without a context signal:

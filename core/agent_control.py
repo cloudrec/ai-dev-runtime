@@ -324,9 +324,12 @@ def record_commander_event(agent: str, project: str, event_type: str, payload: d
     True when a NEW event was written."""
     conn = _db()
     try:
+        # Dedup against ALL recent events (acked OR not) — acking must not let the
+        # same event re-emit + re-deliver moments later (the 2026-07-22 repeated
+        # false job completion). A genuinely new event carries a distinct dedup_key.
         row = conn.execute(
             "SELECT ts_epoch FROM commander_events WHERE agent=? AND event_type=? AND "
-            "dedup_key=? AND acknowledged=0 ORDER BY ts_epoch DESC LIMIT 1",
+            "dedup_key=? ORDER BY ts_epoch DESC LIMIT 1",
             (agent, event_type, dedup_key)).fetchone()
         if row and (time.time() - float(row[0])) < dedup_window_secs:
             return False
@@ -359,6 +362,21 @@ def list_commander_events(since_epoch: float = 0.0, limit: int = 50,
                         "project": r[4], "event_type": r[5],
                         "payload": json.loads(r[6]) if r[6] else {}, "acknowledged": bool(r[7])})
         return out
+    finally:
+        conn.close()
+
+
+def latest_commander_event(agent: str, within_secs: float = 900) -> Optional[dict]:
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT id,ts_epoch,event_type,payload FROM commander_events WHERE agent=? "
+            "AND ts_epoch >= ? ORDER BY ts_epoch DESC LIMIT 1",
+            (agent, time.time() - within_secs)).fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "ts_epoch": row[1], "event_type": row[2],
+                "payload": json.loads(row[3]) if row[3] else {}}
     finally:
         conn.close()
 

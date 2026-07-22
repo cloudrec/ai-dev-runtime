@@ -247,35 +247,79 @@ def completion_class(rec: dict, cfg: dict, tail: str) -> tuple[str, Optional[dic
     return "task_completed_no_remaining_work", None
 
 
-def detect_surfaceable_event(agent: dict, rec: dict, cfg: dict, tail: str) -> Optional[dict]:
-    """The checkpoint / completion event to SURFACE to Owner OS / ChatGPT — computed
-    on DETECTION, independent of the context-threshold, dwell, cooldown, and
-    dispatch gates. So the event is visible within one sweep even when the /clear
-    is deferred or autonomous rotation is disabled (the 2026-07-22 delivery
-    failure). None unless the agent is at a resting safe boundary."""
+# A `cd <path>` / `git -C <path>` / docker `-w <path>` inside the pane's recent
+# commands — the agent may be operating on ANOTHER project than its tmux session.
+_CWD_CHANGE_RE = re.compile(r"(?:\bcd\s+|\bgit\s+-C\s+|--workdir[=\s]+|-w\s+)(/[^\s'\";|&]+)")
+# Active-thinking / running markers that must override a stale state=idle.
+_THINKING_RE = re.compile(r"(\bthinking\b|…\s*\(\d+\s*m?s|[↑↓]\s*[\d.]+\s*k?\s*tokens|esc to interrupt|"
+                          r"\b\w+ing…|Shenaniganing|Combobulating|Cerebrating|Ruminating)", re.I)
+
+
+def resolve_active_project(agent: dict, rec: dict, cfg: dict, tail: str) -> dict:
+    """Authoritative project/task identity — NOT merely the tmux session name or a
+    stale pane cwd. Prefers the recorded active approved task; detects a `cd`/
+    `git -C`/docker-workdir into a DIFFERENT path in the recent commands and flags
+    `cross_project_task` rather than mislabelling."""
+    canonical = cfg.get("project") or rec.get("project")
+    root = os.path.realpath(cfg.get("root") or "") if cfg.get("root") else ""
+    out = {"project": canonical, "active_task_id": cfg.get("active_task_id"),
+           "cross_project": False, "command_path": None}
+    paths = _CWD_CHANGE_RE.findall(tail or "")
+    for p in paths:
+        rp = os.path.realpath(p)
+        if root and rp != root and not rp.startswith(root + os.sep):
+            out["command_path"] = p
+            out["project"] = "cross_project_task"
+            out["cross_project"] = True
+            break
+    return out
+
+
+def detect_surfaceable_event(agent: dict, rec: dict, cfg: dict, tail: str,
+                             prev: Optional[dict] = None) -> Optional[dict]:
+    """The checkpoint / completion event to SURFACE — computed on DETECTION,
+    independent of the context / dwell / dispatch gates for ROTATION, but STILL
+    guarded so a false completion of an actively-working agent can never be emitted
+    (the 2026-07-22 job false-completion):
+      * recent ACTIVE evidence (running command / thinking / spinner / streaming
+        tokens) overrides a stale state=idle — never surface;
+      * require STABLE idle (at rest last sweep + a dwell) so a momentary lull of a
+        working agent never surfaces;
+      * a completed event additionally needs genuine completion evidence.
+    Project identity comes from the active-task record / command context."""
     state = rec.get("state")
     if state not in ("idle", "completed"):
         return None
+    # Active-evidence override — a running command / thinking marker beats a stale idle.
+    if _ACTIVE_EXEC_RE.search(tail or "") or _THINKING_RE.search(tail or ""):
+        return None
     if not at_safe_boundary(agent, "idle"):
+        return None
+    # Stable-idle: must have been at rest last sweep AND idle for a real dwell.
+    if not stably_idle(rec, prev or {}, _DEFAULTS["min_idle_dwell_secs"]):
         return None
     root = cfg.get("root") or agent.get("claude_cwd") or agent.get("cwd") or ""
     handoff = resolve_handoff_path(root, cfg, {}, _DEFAULTS["handoff_fresh_secs"])
-    # A surfaceable event needs genuine completion EVIDENCE (a fresh checkpoint
-    # handoff or a completion report) — a merely-idle agent surfaces nothing.
     if not (rec.get("completion_evidence") or handoff):
         return None
+    ident = resolve_active_project(agent, rec, cfg, tail)
+    base = {"project": ident["project"], "active_task_id": ident["active_task_id"],
+            "cross_project": ident["cross_project"], "command_path": ident["command_path"],
+            "handoff_path": handoff, "context_pct": detect_context_pct(tail)}
     cls, remaining = completion_class(rec, cfg, tail)
     if cls == "work_remaining":
-        return {"event_type": "checkpoint_completed_work_remaining",
+        return {**base, "event_type": "checkpoint_completed_work_remaining",
                 "completion_class": cls, "remaining": (remaining or {}).get("text"),
-                "remaining_id": (remaining or {}).get("id"), "handoff_path": handoff,
-                "context_pct": detect_context_pct(tail), "dedup_key": (remaining or {}).get("id", "active")}
+                "remaining_id": (remaining or {}).get("id"),
+                "dedup_key": (remaining or {}).get("id", "active")}
     if cls == "task_completed_waiting_external":
-        return {"event_type": "task_completed_waiting_external_action", "completion_class": cls,
-                "handoff_path": handoff, "context_pct": detect_context_pct(tail),
-                "dedup_key": "waiting_external"}
-    return {"event_type": "task_completed_no_remaining_work", "completion_class": cls,
-            "handoff_path": handoff, "context_pct": detect_context_pct(tail), "dedup_key": "done"}
+        return {**base, "event_type": "task_completed_waiting_external_action",
+                "completion_class": cls, "dedup_key": "waiting_external"}
+    # completion dedup keyed to the specific completion evidence (report/handoff),
+    # so a genuine NEW completion is distinct but a re-touch is not re-emitted.
+    ce = rec.get("completion_evidence") or handoff or "done"
+    return {**base, "event_type": "task_completed_no_remaining_work",
+            "completion_class": cls, "dedup_key": f"done:{str(ce)[:80]}"}
 
 
 def resolve_handoff_path(root: str, cfg: dict, rotation_row: dict, max_age: int) -> Optional[str]:

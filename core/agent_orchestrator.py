@@ -568,16 +568,32 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             # deferred or disabled. Deduped so it is not re-emitted every 45s.
             if ctx_act:
                 try:
-                    sev = ctxb.detect_surfaceable_event(agent, rec, cfg, agent.get("_tail") or "")
+                    sev = ctxb.detect_surfaceable_event(agent, rec, cfg, agent.get("_tail") or "", prev=prev)
                     if sev:
-                        payload = {**sev, "project": rec.get("project"), "exec_mode": rec.get("exec_mode"),
+                        # Project identity comes from the resolved active-task/command
+                        # context (sev["project"]), NOT the stale session/record project.
+                        ev_project = sev.get("project") or rec.get("project") or session
+                        payload = {**sev, "project": ev_project, "exec_mode": rec.get("exec_mode"),
                                    "state": state, "detected_at": _now_iso()}
-                        is_new = ac.record_commander_event(key, rec.get("project") or session,
+                        is_new = ac.record_commander_event(key, ev_project,
                                                            sev["event_type"], payload,
                                                            dedup_key=sev.get("dedup_key", ""))
                         if is_new:
-                            escalations.append({"agent": key, "project": rec.get("project"),
+                            escalations.append({"agent": key, "project": ev_project,
                                                 "event": sev["event_type"], "commander_event": payload})
+                    # RETRACTION: a completion was surfaced but the agent is active
+                    # again → emit a correction so a false completion is walked back.
+                    elif fresh and state == "working":
+                        last = ac.latest_commander_event(key, within_secs=900)
+                        if last and last["event_type"].startswith("task_completed"):
+                            corr = {"corrects_event_id": last["id"], "corrected_event": last["event_type"],
+                                    "reason": "agent is active again — prior completion was premature/false",
+                                    "project": (last.get("payload") or {}).get("project"), "detected_at": _now_iso()}
+                            if ac.record_commander_event(key, corr.get("project") or session,
+                                                         "completion_retracted", corr,
+                                                         dedup_key=f"retract:{last['id']}"):
+                                escalations.append({"agent": key, "event": "completion_retracted",
+                                                    "commander_event": corr})
                 except Exception:  # noqa: BLE001
                     pass
             cres = ctxb.evaluate(agent, cfg, rec, prev, act=ctx_act, dispatch=ctx_dispatch)
