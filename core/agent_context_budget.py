@@ -287,39 +287,55 @@ def detect_surfaceable_event(agent: dict, rec: dict, cfg: dict, tail: str,
         working agent never surfaces;
       * a completed event additionally needs genuine completion evidence.
     Project identity comes from the active-task record / command context."""
+    # TRACKED tasks only: the Commander surfaces checkpoint/completion events ONLY
+    # for an agent with a recorded canonical task (`active_task_id`). An agent doing
+    # untracked / ad-hoc / cross-project work (e.g. `job` reusing its pane for a
+    # clients-help-landing CSS task) never gets a completion event tied to its stale
+    # session project (the 2026-07-22 repeated `job → jobhunter-ai` false completions).
+    active_id = cfg.get("active_task_id")
+    _next = remaining_approved_subphase(cfg)
+    if not (active_id or _next):
+        return None                                   # untracked agent → no completion event
+    active_id = active_id or (_next or {}).get("id")
     state = rec.get("state")
-    if state not in ("idle", "completed"):
+    if state not in ("idle", "completed", "externally_blocked"):
         return None
     # Active-evidence override — a running command / thinking marker beats a stale idle.
     if _ACTIVE_EXEC_RE.search(tail or "") or _THINKING_RE.search(tail or ""):
         return None
-    if not at_safe_boundary(agent, "idle"):
+    ident = resolve_active_project(agent, rec, cfg, tail)
+    base = {"project": ident["project"], "canonical_task_id": active_id,
+            "active_task_id": active_id, "cross_project": ident["cross_project"],
+            "command_path": ident["command_path"], "context_pct": detect_context_pct(tail)}
+
+    # OWNER-DECLARED completion of the tracked task (authoritative). Surface exactly
+    # once, keyed to the canonical task id.
+    if cfg.get("active_task_completed"):
+        et = ("task_completed_waiting_external_action" if cfg.get("external_inputs_only")
+              else "task_completed_no_remaining_work")
+        return {**base, "event_type": et,
+                "completion_class": ("task_completed_waiting_external" if cfg.get("external_inputs_only")
+                                     else "task_completed_no_remaining_work"),
+                "result": cfg.get("active_task_result") or "completed",
+                "dedup_key": f"complete:{active_id}"}
+
+    # In-progress: a checkpoint requires stable idle + a fresh handoff (a momentary
+    # lull of a working agent never surfaces).
+    if _ACTIVE_EXEC_RE.search(tail or "") or not at_safe_boundary(agent, "idle"):
         return None
-    # Stable-idle: must have been at rest last sweep AND idle for a real dwell.
     if not stably_idle(rec, prev or {}, _DEFAULTS["min_idle_dwell_secs"]):
         return None
     root = cfg.get("root") or agent.get("claude_cwd") or agent.get("cwd") or ""
     handoff = resolve_handoff_path(root, cfg, {}, _DEFAULTS["handoff_fresh_secs"])
     if not (rec.get("completion_evidence") or handoff):
         return None
-    ident = resolve_active_project(agent, rec, cfg, tail)
-    base = {"project": ident["project"], "active_task_id": ident["active_task_id"],
-            "cross_project": ident["cross_project"], "command_path": ident["command_path"],
-            "handoff_path": handoff, "context_pct": detect_context_pct(tail)}
     cls, remaining = completion_class(rec, cfg, tail)
     if cls == "work_remaining":
         return {**base, "event_type": "checkpoint_completed_work_remaining",
                 "completion_class": cls, "remaining": (remaining or {}).get("text"),
-                "remaining_id": (remaining or {}).get("id"),
+                "remaining_id": (remaining or {}).get("id"), "handoff_path": handoff,
                 "dedup_key": (remaining or {}).get("id", "active")}
-    if cls == "task_completed_waiting_external":
-        return {**base, "event_type": "task_completed_waiting_external_action",
-                "completion_class": cls, "dedup_key": "waiting_external"}
-    # completion dedup keyed to the specific completion evidence (report/handoff),
-    # so a genuine NEW completion is distinct but a re-touch is not re-emitted.
-    ce = rec.get("completion_evidence") or handoff or "done"
-    return {**base, "event_type": "task_completed_no_remaining_work",
-            "completion_class": cls, "dedup_key": f"done:{str(ce)[:80]}"}
+    return None
 
 
 def resolve_handoff_path(root: str, cfg: dict, rotation_row: dict, max_age: int) -> Optional[str]:

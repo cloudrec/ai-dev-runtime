@@ -202,10 +202,15 @@ def test_detect_surfaceable_event_independent_of_dispatch(monkeypatch, tmp_path)
     assert ev["handoff_path"] == str(reports / "CONTEXT_HANDOFF.md")
     # a working agent surfaces nothing.
     assert cb.detect_surfaceable_event(_agent(tail="… esc to interrupt"), _rec(state="working"), cfg, "", prev=_settled_prev()) is None
-    # completed with no remaining work → completion event, not a resume.
-    done_cfg = {"root": str(tmp_path), "project": "seo"}
+    # owner-declared completion of a TRACKED task → completion event, not a resume.
+    done_cfg = {"root": str(tmp_path), "project": "seo", "active_task_id": "part-x",
+                "active_task_completed": True}
     ev2 = cb.detect_surfaceable_event(a, _rec(state="idle"), done_cfg, "all done", prev=_settled_prev())
     assert ev2["event_type"] == "task_completed_no_remaining_work"
+    assert ev2["canonical_task_id"] == "part-x"
+    # an UNTRACKED agent (no active task) surfaces nothing (job cross-project case).
+    assert cb.detect_surfaceable_event(a, _rec(state="idle"), {"root": str(tmp_path)}, "all done",
+                                       prev=_settled_prev()) is None
 
 
 def test_no_false_completion_when_thinking_or_active(tmp_path):
@@ -254,6 +259,29 @@ def test_completion_dedup_survives_ack(monkeypatch, tmp_path):
     # same completion key again (even after ack) → deduped, not re-emitted.
     assert ac.record_commander_event("job:0.0", "jobhunter-ai", "task_completed_no_remaining_work",
                                      {}, dedup_key="done:report-x") is False
+
+
+def test_untracked_agent_never_surfaces_completion(tmp_path):
+    # job has NO active_task_id and is doing untracked/cross-project work → the
+    # Commander must never emit a completion tied to its stale session project.
+    cfg = {"root": "/opt/jobhunter-ai", "project": "jobhunter-ai"}   # no active_task_id
+    a = _agent(tail="done ❯ ", target="job:0.0")
+    assert cb.detect_surfaceable_event(a, _rec(state="idle"), cfg, "done ❯ ", prev=_settled_prev()) is None
+
+
+def test_owner_declared_completion_surfaces_once(tmp_path):
+    # seo Part F: owner-declared complete, external inputs only → exactly the
+    # genuine completion event with canonical task id + result.
+    cfg = {"root": str(tmp_path), "project": "seo", "active_task_id": "part-f-paid-growth-os",
+           "active_task_completed": True, "external_inputs_only": True,
+           "active_task_result": "completed, deployed, pushed"}
+    a = _agent(tail="externally blocked on inputs ❯ ")
+    for st in ("idle", "externally_blocked"):
+        ev = cb.detect_surfaceable_event(a, _rec(state=st), cfg, a["_tail"], prev=_settled_prev())
+        assert ev["event_type"] == "task_completed_waiting_external_action"
+        assert ev["canonical_task_id"] == "part-f-paid-growth-os"
+        assert ev["result"] == "completed, deployed, pushed"
+        assert ev["dedup_key"] == "complete:part-f-paid-growth-os"
 
 
 def test_context_detection_extra_forms():

@@ -36,15 +36,14 @@ sessions:
     auto_push: true
     push_repo: github.com/cloudrec/seo
     protected_branches: [main, master]
-    active_task_id: part-f
+    active_task_id: part-f-paid-growth-os
     active_task_title: "Part F — Paid Growth OS foundation + campaign studio"
-    active_task_text: >-
-      Continue Part F: Paid Growth OS foundation and campaign studio (INTERNAL
-      code only) per /opt/seo/reports/CONTEXT_HANDOFF.md. Do NOT call any external
-      provider or paid ad API, do NOT touch provider credentials, social sends,
-      schedules, emails, account creation, force-push, or tags. Resume exactly
-      from the handoff; do not re-run full test suites unless the exact remaining
-      Part F step requires it.
+    # Owner-declared COMPLETE (2026-07-22): completed/deployed/pushed at a clean
+    # boundary; no remaining approved INTERNAL work — external inputs only. Surfaces
+    # the genuine SEO Part F completion exactly once (task_completed_waiting_external).
+    active_task_completed: true
+    external_inputs_only: true
+    active_task_result: "completed, deployed, pushed; no remaining approved internal work; external inputs only"
     # Cross-phase auto-progress is ENABLED, but a phase is dispatched ONLY when its
     # exact owner-approved text is recorded below (approved_task_text). No text ⇒
     # no dispatch (never invent direction). acceptance markers additionally block
