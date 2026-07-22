@@ -23,8 +23,10 @@ from __future__ import annotations
 
 import os
 import time
+from typing import Optional
 
 from core import agent_control as ac
+from core import git_push_policy as gp
 from core import permission_resolver as pr
 
 POLL_INTERVAL = int(os.getenv("AGENT_SUPERVISOR_INTERVAL_SECS", "45"))
@@ -57,6 +59,23 @@ def _session_of(target: str) -> str:
     return target.split(":", 1)[0]
 
 
+def _push_project_record(session: str) -> Optional[dict]:
+    """The project push-record for a session that OPTED IN to routine-push
+    auto-approval (`auto_push: true` + `push_repo`), else None. Never inferred —
+    a project must explicitly enable it in config."""
+    try:
+        from core import agent_orchestrator as _orch
+        cfg = _orch.load_config()
+        sc = (cfg.get("sessions") or {}).get(session)
+        if isinstance(sc, dict) and sc.get("auto_push") and sc.get("push_repo"):
+            return {"project": sc.get("project"), "root": sc.get("root"),
+                    "push_repo": sc.get("push_repo"),
+                    "protected_branches": sc.get("protected_branches")}
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def resolve_target(target: str, approve: bool = True, _sleep=time.sleep) -> dict:
     """Inspect one agent and, if it is waiting on a provably-safe prompt in an
     allowlisted session, confirm it. Returns a structured decision."""
@@ -77,11 +96,23 @@ def resolve_target(target: str, approve: bool = True, _sleep=time.sleep) -> dict
     session = _session_of(status["target"])
     allowlisted = session in _allowlisted_sessions()
 
-    if not cls["safe"]:
-        ac.record_prompt_decision(status["target"], phash, "left_for_owner", cls["category"], cls["reason"])
+    # Narrow routine-push exception: a `git push` is unsafe by default, but a
+    # ROUTINE current-branch push to its existing upstream in an opted-in managed
+    # project may be auto-approved. Deny-by-default; any unusual form surfaces the
+    # exact reason. Never broadens to `git *`.
+    push_verdict = None
+    if not cls["safe"] and gp.is_push_command(command):
+        proj = _push_project_record(session)
+        if proj is not None:
+            cwd = status.get("claude_cwd") or status.get("cwd") or proj.get("root") or ""
+            push_verdict = gp.evaluate_push(command, cwd, proj)
+
+    if not cls["safe"] and not (push_verdict and push_verdict.get("allowed")):
+        reason = push_verdict["reason"] if push_verdict else cls["reason"]
+        category = "routine_push_denied" if push_verdict else cls["category"]
+        ac.record_prompt_decision(status["target"], phash, "left_for_owner", category, reason)
         return {"target": status["target"], "action": "left_for_owner", "safe": False,
-                "command": command, "category": cls["category"], "reason": cls["reason"],
-                "hash": phash}
+                "command": command, "category": category, "reason": reason, "hash": phash}
     if not allowlisted:
         ac.record_prompt_decision(status["target"], phash, "left_not_allowlisted", cls["category"], cls["reason"])
         return {"target": status["target"], "action": "left_for_owner", "safe": True,
@@ -120,17 +151,41 @@ def resolve_target(target: str, approve: bool = True, _sleep=time.sleep) -> dict
             break
     latency = round(time.time() - t_decision, 2)
     decision = "approved" if resumed else "approved_no_resume"
-    ac.record_prompt_decision(status["target"], phash, decision, cls["category"], cls["reason"], latency)
+    eff_category = "routine_push" if (push_verdict and push_verdict.get("allowed")) else cls["category"]
+    eff_reason = (push_verdict["reason"] if (push_verdict and push_verdict.get("allowed")) else cls["reason"])
+    ac.record_prompt_decision(status["target"], phash, decision, eff_category, eff_reason, latency)
+
+    # Post-push verification: for an approved routine push, the remote branch SHA
+    # must equal the local HEAD we approved. A mismatch is surfaced as a durable
+    # Commander event (the push happened, but not as expected).
+    push_check = None
+    if push_verdict and push_verdict.get("allowed") and resumed:
+        cwd = status.get("claude_cwd") or status.get("cwd") or ""
+        branch = push_verdict["checks"].get("branch")
+        head = push_verdict["checks"].get("head")
+        for _ in range(6):                               # allow the push a few seconds
+            _sleep(2)
+            push_check = gp.verify_push(cwd, branch, head)
+            if push_check.get("ok"):
+                break
+        if push_check and not push_check.get("ok"):
+            try:
+                ac.record_commander_event(status["target"], session, "routine_push_verify_mismatch",
+                                          {"command": command, **push_check}, dedup_key=head or "")
+            except Exception:  # noqa: BLE001
+                pass
+
     # First-class evidence trail: detection → decision → delivery → resumed.
     ac.audit("supervisor_resolved", status["target"], hash=phash, command=command,
-             category=cls["category"], decision=decision, resumed=resumed,
+             category=eff_category, decision=decision, resumed=resumed,
              detect_ts=round(t_detect, 3), decision_ts=round(t_decision, 3),
              delivered_ts=round(t_delivered, 3),
              resumed_ts=round(t_resumed, 3) if t_resumed else None,
              reaction_s=round((t_resumed - t_detect), 2) if t_resumed else None,
-             latency_s=latency)
+             latency_s=latency, push_verified=(push_check.get("ok") if push_check else None))
     return {"target": status["target"], "action": decision, "safe": True, "resumed": resumed,
-            "command": command, "category": cls["category"], "latency_s": latency,
+            "command": command, "category": eff_category, "latency_s": latency,
+            "push_verify": push_check,
             "new_state": new_state, "hash": phash,
             "detect_ts": t_detect, "decision_ts": t_decision, "resumed_ts": t_resumed}
 

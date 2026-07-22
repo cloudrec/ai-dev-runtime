@@ -29,15 +29,22 @@ sessions:
     # handoff and this exact approved task still remaining.
     context_rotate: true
     handoff_path: /opt/seo/reports/CONTEXT_HANDOFF.md
-    active_task_id: part-e
-    active_task_title: "Part E — first-run rehearsal + production readiness center"
+    # Narrow routine-push auto-approval (managed approved project): a routine
+    # current-branch push to this exact existing upstream is auto-approved; any
+    # unusual form (force/tags/delete/other-branch/protected/mismatch/…) stops for
+    # the owner with the exact reason. Never broadens to `git *`.
+    auto_push: true
+    push_repo: github.com/cloudrec/seo
+    protected_branches: [main, master]
+    active_task_id: part-f
+    active_task_title: "Part F — Paid Growth OS foundation + campaign studio"
     active_task_text: >-
-      Continue Part E: first-run rehearsal and production readiness center
-      (INTERNAL code only) per /opt/seo/reports/CONTEXT_HANDOFF.md. Do NOT call
-      paid transcription or any external provider, do NOT touch provider
-      credentials, social sends, schedules, emails, account creation, force-push,
-      or tags. Resume exactly from the handoff; do not re-run full test suites
-      unless the exact remaining Part E step requires it.
+      Continue Part F: Paid Growth OS foundation and campaign studio (INTERNAL
+      code only) per /opt/seo/reports/CONTEXT_HANDOFF.md. Do NOT call any external
+      provider or paid ad API, do NOT touch provider credentials, social sends,
+      schedules, emails, account creation, force-push, or tags. Resume exactly
+      from the handoff; do not re-run full test suites unless the exact remaining
+      Part F step requires it.
     # Cross-phase auto-progress is ENABLED, but a phase is dispatched ONLY when its
     # exact owner-approved text is recorded below (approved_task_text). No text ⇒
     # no dispatch (never invent direction). acceptance markers additionally block

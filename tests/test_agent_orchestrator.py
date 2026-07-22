@@ -335,6 +335,8 @@ def test_budget_reset_idle_marks_stalled_without_escalation(monkeypatch):
     monkeypatch.setattr(orch.ac, "_pane_tail", lambda *a, **k: "")
     monkeypatch.setattr(orch, "_session_cfg", lambda s: AUTO)
     monkeypatch.setattr(orch, "_completion_evidence", lambda *a, **k: None)
+    from core import agent_context_budget as _ctxb        # isolate from the real /opt/seo handoff
+    monkeypatch.setattr(_ctxb, "detect_surfaceable_event", lambda *a, **k: None)
     orch._upsert({"agent_key": "seo-audit:0.0", "session": "seo-audit", "project": "seo",
                   "state": "paused_by_budget"})
     out = orch.refresh_and_resolve(approve=True)

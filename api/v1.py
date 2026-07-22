@@ -328,6 +328,25 @@ async def agents_orchestrator_tick(approve: bool = False, _: bool = Depends(_aut
     return agent_orchestrator.refresh_and_resolve(approve=approve)
 
 
+@router.get("/agents/commander/events")
+async def agents_commander_events(unacked: bool = True, limit: int = 50, _: bool = Depends(_auth)):
+    """Durable Commander events (checkpoint/completion/waiting-external/…) for
+    proactive delivery by Owner OS — no polling of the raw record needed."""
+    from core import agent_control as _ac
+    return {"events": _ac.list_commander_events(limit=limit, unacked_only=unacked)}
+
+
+class AckReq(BaseModel):
+    ids: list[int]
+
+
+@router.post("/agents/commander/events/ack")
+async def agents_commander_events_ack(req: AckReq, _: bool = Depends(_auth)):
+    """Acknowledge delivered Commander events so they are not re-delivered."""
+    from core import agent_control as _ac
+    return {"acked": _ac.ack_commander_events(req.ids)}
+
+
 class PhaseTextReq(BaseModel):
     session: str
     phase_id: str
