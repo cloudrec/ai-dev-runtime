@@ -110,8 +110,8 @@ def _db() -> sqlite3.Connection:
         prompt_hash TEXT, blocker_category TEXT, completion_evidence TEXT,
         report_path TEXT, approved_next_task TEXT, notification_state TEXT,
         retry_count INTEGER DEFAULT 0, decision TEXT, updated_at TEXT)""")
-    # Additive columns (exact blocker text + decision type) — older rows get NULL.
-    for col in ("blocker_text TEXT", "decision_type TEXT"):
+    # Additive columns (exact blocker text + decision type + context budget) — older rows get NULL.
+    for col in ("blocker_text TEXT", "decision_type TEXT", "context_pct REAL", "context_tier TEXT"):
         try:
             conn.execute(f"ALTER TABLE agent_orchestrator ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -124,7 +124,7 @@ _FIELDS = ("agent_key", "session", "project", "approved_goal", "current_task", "
            "state", "last_fresh_activity_ts", "prompt_hash", "blocker_category",
            "completion_evidence", "report_path", "approved_next_task",
            "notification_state", "retry_count", "decision", "updated_at",
-           "blocker_text", "decision_type")
+           "blocker_text", "decision_type", "context_pct", "context_tier")
 
 
 def get_record(agent_key: str) -> Optional[dict]:
@@ -471,6 +471,8 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             "decision": d.get("decision"),
             "blocker_text": d.get("blocker_text"),
             "decision_type": d.get("decision_type"),
+            "context_pct": None,
+            "context_tier": None,
         }
 
         # A previously budget-paused agent whose limits have now reset. Verify it
@@ -511,6 +513,29 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             rec["notification_state"] = sup["notification_state"]
             if sup.get("escalation"):
                 escalations.append(sup["escalation"])
+
+        # Context-budget control (Commander hardening). Detection + tiering runs for
+        # every agent (visibility); the actual /clear rotation only dispatches for an
+        # `auto` session at a safe boundary — held/monitor agents are never rotated.
+        try:
+            from core import agent_context_budget as ctxb
+            ctx_act = (cfg.get("mode") == "auto")          # monitor/hold = detection-only
+            ctx_dispatch = (ctx_act and approve and not budget_locked())
+            cres = ctxb.evaluate(agent, cfg, rec, prev, act=ctx_act, dispatch=ctx_dispatch)
+            rec["context_pct"] = cres.get("context_pct")
+            rec["context_tier"] = cres.get("context_tier")
+            # Only fill notification_state if the state-machine left it empty, so a
+            # waiting_owner / completed / budget-reset signal always wins.
+            if cres.get("notification_state") and not rec.get("notification_state"):
+                rec["notification_state"] = cres["notification_state"]
+            if cres.get("notification_state", "").startswith("context_rot") \
+                    and cres["notification_state"] not in ("context_rotate_deferred",):
+                resolved.append({"agent": key, "context_tier": rec["context_tier"],
+                                 "context_pct": rec["context_pct"],
+                                 "action": cres["notification_state"],
+                                 "handoff_path": cres.get("handoff_path")})
+        except Exception as e:  # noqa: BLE001
+            rec["context_tier"] = f"error:{str(e)[:60]}"
 
         _upsert(rec)
         results.append({"agent": key, "state": state, "project": rec["project"]})
