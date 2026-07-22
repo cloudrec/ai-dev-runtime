@@ -510,6 +510,18 @@ def test_externally_blocked_from_input_required():
     assert ac.classify_state(True, True, "Waiting for API... retry (429 rate limit)\nnew task?") == "externally_blocked"
 
 
+def test_permission_dialog_with_external_word_in_command_is_waiting_owner():
+    # A permission dialog whose COMMAND contains an external-looking word must be
+    # waiting_owner, never mis-escalated as externally_blocked (the 2026-07-22 bug:
+    # `timeout 300 npx tsc` matched the external heuristic → false escalation).
+    pane = (" Bash command\n   cd /opt/seo; timeout 300 npx tsc --noEmit\n"
+            "   TypeScript typecheck\n\n Do you want to proceed?\n ❯ 1. Yes\n   2. No")
+    assert ac.classify_state(True, True, pane) == "waiting_owner"
+    # the bare `timeout` command is not the phrase "timed out"
+    assert ac.classify_state(True, True, "running timeout 300 pytest\nesc to interrupt") == "working"
+    assert ac.classify_state(True, True, "job timed out after 30s\nnew task?") == "externally_blocked"
+
+
 def test_working_requires_active_execution_evidence():
     assert ac.classify_state(True, True, ACTIVE) == "working"                       # live spinner + esc to interrupt
     assert ac.classify_state(True, True, "streaming ↓ 5.1k tokens") == "working"     # streaming counter

@@ -416,7 +416,7 @@ _STATE_ACTIVE_RUN_RE = re.compile(
 # Blocked on something outside the agent's control (vendor key, network, quota).
 _STATE_EXTERNAL_RE = re.compile(
     r"(input[_ ]required|verification key|awaiting vendor|\bvendor\b|waiting for|awaiting|"
-    r"rate.?limit|quota|429|502|503|network error|timed? ?out|reconnect|upstream)", re.I)
+    r"rate.?limit|quota|429|502|503|network error|timed[ -]out|reconnect|upstream)", re.I)
 # Claude is asking the owner a question (not the owner's own queued input line).
 _STATE_WAIT_OWNER_RE = re.compile(
     r"(\(y/n\)|\[y/n\]|do you want (me )?to|shall i\b|proceed\?|may i\b|"
@@ -438,12 +438,16 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
     # 1) concrete active-execution evidence — the only path to "working".
     if _STATE_ACTIVE_RUN_RE.search(tail):
         return "working"
-    # 2) at rest — classify what it is resting on. A finished report + empty
+    # 2) an ACTIVE permission dialog is waiting_owner even if the command it shows
+    #    contains an external-looking word (e.g. `timeout`, `curl`, `waiting for`);
+    #    the command text is not evidence of a real external block. Checked BEFORE
+    #    the external heuristic so a prompt is never mis-escalated as external.
+    if _STATE_WAIT_OWNER_RE.search(tail):
+        return "waiting_owner"
+    # 3) at rest — classify what it is resting on. A finished report + empty
     #    prompt falls through to idle.
     if _STATE_EXTERNAL_RE.search(tail):
         return "externally_blocked"
-    if _STATE_WAIT_OWNER_RE.search(tail):
-        return "waiting_owner"
     return "idle"
 
 
