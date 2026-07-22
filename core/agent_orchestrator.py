@@ -565,19 +565,21 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             if cres.get("notification_state") and not rec.get("notification_state"):
                 rec["notification_state"] = cres["notification_state"]
             cns = cres.get("notification_state", "")
-            # A completed-subphase rotation checkpoint is a FIRST-CLASS owner/ChatGPT
-            # event — surface it (project, completed checkpoint, remaining subphase,
-            # handoff, context, action) whether or not the /clear actually fired.
-            if cns in ("safe_rotation_due", "context_rotated_checkpoint") and cres.get("rotation"):
+            # Rotation / completion events are FIRST-CLASS owner/ChatGPT events —
+            # surface them (project, completion_class, remaining subphase, handoff,
+            # context, action) whether or not a /clear fired.
+            _ROT_EVENTS = ("safe_rotation_due", "context_rotated_checkpoint",
+                           "task_completed_waiting_external_action",
+                           "task_completed_no_remaining_work")
+            if cns in _ROT_EVENTS and cres.get("rotation"):
                 r = dict(cres["rotation"])
                 r.update({"agent": key, "event": cns,
-                          "action_taken": r.get("action", "surfaced (dispatch gated off)"
-                                                 if cns == "safe_rotation_due" else "rotated"),
+                          "action_taken": r.get("action", "surfaced (dispatch gated off)"),
                           "exec_mode": rec.get("exec_mode")})
                 escalations.append({"agent": key, "project": rec["project"],
                                     "event": cns, "rotation": r})
-            if cns.startswith("context_rot") or cns in ("safe_rotation_due",):
-                if cns not in ("context_rotate_deferred",):
+            if cns.startswith("context_rot") or cns in _ROT_EVENTS:
+                if cns not in ("context_rotate_deferred", "context_rotate_deferred_unsettled"):
                     resolved.append({"agent": key, "context_tier": rec["context_tier"],
                                      "context_pct": rec["context_pct"],
                                      "action": cns, "handoff_path": cres.get("handoff_path"),

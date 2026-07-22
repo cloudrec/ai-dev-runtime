@@ -159,7 +159,7 @@ def test_no_clear_when_unsettled_even_at_safe_boundary(monkeypatch, tmp_path):
     a = _agent(tail="done. ❯ ")
     rec = _rec(state="idle", approved_next_task="Phase 8d", last_fresh_activity_ts=_t.time() - 5)
     prev = {"state": "working"}                         # was mid-turn last sweep
-    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}]},
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery (read-only)"}]},
                       rec, prev, act=True, dispatch=True)
     assert out["notification_state"] == "context_rotate_deferred_unsettled"
     assert sent == []                                   # NEVER cleared a just-working agent
@@ -180,12 +180,79 @@ def test_resume_prefers_agent_authored_handoff(monkeypatch, tmp_path):
     rec = _rec(state="idle", approved_next_task="Phase 8d",
                last_fresh_activity_ts=_t.time() - 999)
     prev = {"state": "idle", "last_fresh_activity_ts": _t.time() - 999}
-    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}]},
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery (read-only)"}]},
                       rec, prev, act=True, dispatch=True)
     assert out["notification_state"] == "context_rotated_checkpoint"
     # resume message points at the AGENT's reports/ handoff, not the module's root one.
     resume = next(t for t in sent if "Read" in t)
     assert "reports/CONTEXT_HANDOFF.md" in resume
+
+
+def test_completion_class_three_way(tmp_path):
+    wr = {"phases": [{"id": "a"}, {"id": "b", "approved_task_text": "do exact task X"}]}
+    assert cb.completion_class(_rec(), wr, "done")[0] == "work_remaining"
+    assert cb.completion_class(_rec(), wr, "done")[1]["text"] == "do exact task X"
+    # no owner text + waiting on owner/external → waiting_external (never invent work)
+    none_cfg = {"phases": [{"id": "a"}, {"id": "b"}]}     # bare placeholder, no text
+    assert cb.completion_class(_rec(), none_cfg, "task complete, waiting for owner credentials")[0] \
+        == "task_completed_waiting_external"
+    # no text + nothing pending → no remaining work
+    assert cb.completion_class(_rec(), none_cfg, "all done, nothing left")[0] \
+        == "task_completed_no_remaining_work"
+
+
+def test_completed_task_is_not_falsely_resumed(monkeypatch, tmp_path):
+    # THE 2026-07-22 failure: the approved task was fully complete (no owner-recorded
+    # next-phase text — only a config placeholder). Rotation must NOT tell the agent
+    # to "continue the task", and must NOT trigger a full test run.
+    sent = []
+    monkeypatch.setattr(cb.ac, "agent_send", lambda key, text, **k: sent.append(text))
+    monkeypatch.setattr(cb.ac, "ensure_auto_mode", lambda *a, **k: None)
+    a = _agent(tail="all committed, deployed, verified. ❯ /clear to save 900k tokens")  # 90% used
+    rec = _rec(state="idle")
+    cfg = {"root": str(tmp_path), "project": "seo", "phases": [{"id": "done"}, {"id": "stage-5"}]}  # NO approved_task_text
+    out = cb.evaluate(a, cfg, rec, _settled_prev(), act=True, dispatch=True)
+    assert out["notification_state"] == "task_completed_no_remaining_work"
+    assert out["rotation"]["action"] == "rotated_idle"
+    # a /clear may fire to save tokens, but NO "continue the task" resume is sent.
+    assert not any("resume" in t.lower() or "continue" in t.lower() or "subphase" in t.lower() for t in sent)
+
+
+def test_resume_uses_resolved_path_never_hardcoded_root(monkeypatch, tmp_path):
+    # missing root/CONTEXT_HANDOFF.md but a real reports/ one → resume must point at
+    # the resolved reports/ path, never the hardcoded root path.
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "CONTEXT_HANDOFF.md").write_text("agent handoff: 8a-8c done → 8d")
+    sent = []
+    monkeypatch.setattr(cb.ac, "agent_send", lambda key, text, **k: sent.append(text))
+    monkeypatch.setattr(cb.ac, "ensure_auto_mode", lambda *a, **k: None)
+    a = _agent(tail="idle · /clear to save 900k tokens\n❯ ")
+    rec = _rec(state="idle")
+    cfg = {"root": str(tmp_path), "project": "seo",
+           "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery"}]}
+    out = cb.evaluate(a, cfg, rec, _settled_prev(), act=True, dispatch=True)
+    assert out["notification_state"] in ("context_rotated", "context_rotated_checkpoint")
+    resume = next(t for t in sent if "run remote discovery" in t)
+    assert str(reports / "CONTEXT_HANDOFF.md") in resume        # resolved reports/ path
+    assert not resume.endswith(str(tmp_path / "CONTEXT_HANDOFF.md"))   # not the hardcoded root path
+
+
+def test_resume_message_carries_exact_remaining_text(monkeypatch, tmp_path):
+    reports = tmp_path / "reports"; reports.mkdir()
+    (reports / "CONTEXT_HANDOFF.md").write_text("h")
+    sent = []
+    monkeypatch.setattr(cb.ac, "agent_send", lambda key, text, **k: sent.append(text))
+    monkeypatch.setattr(cb.ac, "ensure_auto_mode", lambda *a, **k: None)
+    a = _agent(tail="idle · /clear to save 900k tokens\n❯ ")
+    cfg = {"root": str(tmp_path), "phases": [{"id": "8c"},
+           {"id": "8d", "approved_task_text": "read-only remote discovery of cloudrec/seo"}]}
+    out = cb.evaluate(a, cfg, _rec(state="idle"), _settled_prev(), act=True, dispatch=True)
+    resume = next(t for t in sent if "Read" in t)
+    assert "read-only remote discovery of cloudrec/seo" in resume    # exact text, not generic
+    assert "[8d]" in resume                                          # exact id
+    assert "next subphase" not in resume.lower()                     # no generic language
+    assert "full test" in resume.lower()                            # explicit no-auto-test guard
 
 
 def test_completion_checkpoint_due_fires_without_context_signal(monkeypatch, tmp_path):
@@ -195,12 +262,13 @@ def test_completion_checkpoint_due_fires_without_context_signal(monkeypatch, tmp
                         lambda root, max_age: str(tmp_path / "reports" / "CONTEXT_HANDOFF.md"))
     a = _agent(tail="done 8a-8c. ❯ ")                    # no context% signal
     rec = _rec(state="idle", approved_next_task="Phase 8d")
-    assert cb.completion_checkpoint_due(a, rec, AUTO, a["_tail"], cb._DEFAULTS) is True
-    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}],
-                          "project": "seo"}, rec, _settled_prev(), act=True, dispatch=False)
+    wr_cfg = {"root": str(tmp_path), "project": "seo",
+              "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery (read-only)"}]}
+    assert cb.completion_checkpoint_due(a, rec, wr_cfg, a["_tail"], cb._DEFAULTS) is True
+    out = cb.evaluate(a, wr_cfg, rec, _settled_prev(), act=True, dispatch=False)
     assert out["notification_state"] == "safe_rotation_due"
     assert out["rotation"]["reason"] == "checkpoint_completed_work_remaining"
-    assert out["rotation"]["remaining"] in ("Phase 8d", "8d")
+    assert out["rotation"]["remaining"] == "run remote discovery (read-only)"
 
 
 def test_checkpoint_rotation_submits_agents_own_clear(monkeypatch, tmp_path):
@@ -215,7 +283,7 @@ def test_checkpoint_rotation_submits_agents_own_clear(monkeypatch, tmp_path):
     monkeypatch.setattr(cb.ac, "ensure_auto_mode", lambda key, **k: ensured.append(key))
     a = _agent(tail="done. ❯ /clear")
     rec = _rec(state="idle", approved_next_task="Phase 8d")
-    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}]},
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery (read-only)"}]},
                       rec, _settled_prev(), act=True, dispatch=True)
     assert out["notification_state"] == "context_rotated_checkpoint"
     assert submitted == ["seo-audit:0.0"]                # submitted the agent's own /clear
@@ -232,7 +300,7 @@ def test_checkpoint_refuses_when_nonclear_instruction_queued(monkeypatch, tmp_pa
     monkeypatch.setattr(cb.ac, "agent_send", lambda *a, **k: sent.append(a))
     a = _agent(tail="done. ❯ enable premium and charge")
     rec = _rec(state="idle", approved_next_task="Phase 8d")
-    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}]},
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery (read-only)"}]},
                       rec, _settled_prev(), act=True, dispatch=True)
     assert out["notification_state"] == "context_rotate_deferred_pending_input"
     assert sent == []                                    # never cleared/submitted
@@ -245,7 +313,7 @@ def test_rotation_restores_auto_mode_after_clear(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
     a = _agent(tail="quiet /clear to save 700k tokens\n──────\n❯ \n──────")   # 70%, empty input
     rec = _rec(state="idle", agent_key="seo-audit:0.0", approved_next_task="phase 2")
-    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "1"}, {"id": "2"}]},
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "1"}, {"id": "2", "approved_task_text": "finish phase 2"}]},
                       rec, _settled_prev(), act=True, dispatch=True)
     assert out["notification_state"] == "context_rotated"
     assert any(t == "/clear" for _, t in sent)
@@ -333,7 +401,7 @@ def test_mid_tier_rotates_when_substantial_and_safe(monkeypatch, tmp_path):
     sent = []
     monkeypatch.setattr(cb.ac, "agent_send", lambda tgt, text, **k: sent.append((tgt, text)))
     cfg = {"mode": "auto", "root": str(tmp_path), "project": "seo",
-           "phases": [{"id": "stage-4"}, {"id": "stage-5"}], "approved_goal": "SEO Stage 4"}
+           "phases": [{"id": "stage-4"}, {"id": "stage-5", "approved_task_text": "finish stage-5"}], "approved_goal": "SEO Stage 4"}
     a = _agent(tail="/clear to save 600k tokens")        # 60% used
     rec = _rec(state="idle", approved_next_task="stage-5 (ready)")
     out = cb.evaluate(a, cfg, rec, _settled_prev(), dispatch=True)

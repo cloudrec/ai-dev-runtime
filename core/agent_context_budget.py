@@ -192,6 +192,59 @@ def _next_phase_title(cfg: dict) -> Optional[str]:
     return None
 
 
+def remaining_approved_subphase(cfg: dict) -> Optional[dict]:
+    """The EXACT owner-approved remaining subphase, or None. A next phase counts as
+    genuine remaining work ONLY when the owner recorded its exact text
+    (`approved_task_text`, merged from get_phase_text) — a bare config placeholder
+    (stage-4/stage-5 with no text) is NOT remaining work and must never cause a
+    'continue the task' resume (2026-07-22: a fully-completed task was falsely
+    resumed off a phase-count heuristic)."""
+    phases = (cfg or {}).get("phases") or []
+    if len(phases) > 1:
+        txt = (phases[1].get("approved_task_text") or "").strip()
+        if txt:
+            return {"id": phases[1].get("id"), "title": phases[1].get("title"), "text": txt}
+    return None
+
+
+# The report/pane says the task is done but blocked on an OWNER/external action
+# (credentials, publish, verification) — surface it; never invent a next subphase.
+_EXTERNAL_WAIT_RE = re.compile(
+    r"(waiting (?:for|on) (?:owner|you|external|credential|approval|verification|publish)|"
+    r"external action required|needs? (?:owner|external|credential|publish|deploy) |"
+    r"awaiting (?:owner|credentials?|approval|verification)|"
+    r"blocked on (?:owner|external|credential))", re.I)
+
+
+def completion_class(rec: dict, cfg: dict, tail: str) -> tuple[str, Optional[dict]]:
+    """Distinguish three completion states so a completed task is never falsely
+    resumed:
+      * work_remaining               → exact owner-approved remaining subphase exists
+      * task_completed_waiting_external → done, blocked on an owner/external action
+      * task_completed_no_remaining_work → done, nothing left to do
+    Returns (state, remaining_subphase_or_None)."""
+    nxt = remaining_approved_subphase(cfg)
+    if nxt:
+        return "work_remaining", nxt
+    if _EXTERNAL_WAIT_RE.search(tail or ""):
+        return "task_completed_waiting_external", None
+    return "task_completed_no_remaining_work", None
+
+
+def resolve_handoff_path(root: str, cfg: dict, rotation_row: dict, max_age: int) -> Optional[str]:
+    """The AUTHORITATIVE handoff path — NEVER a hardcoded root/CONTEXT_HANDOFF.md.
+    Priority: explicit per-project config → the path persisted from a prior
+    rotation → the agent's own fresh reports/ handoff → any discovered fresh
+    handoff. None when nothing exists (caller must not resume without one)."""
+    p = (cfg or {}).get("handoff_path")
+    if p and os.path.exists(p):
+        return p
+    p = (rotation_row or {}).get("handoff_path")
+    if p and os.path.exists(p):
+        return p
+    return agent_authored_handoff(root, max_age) or existing_fresh_handoff(root, max_age)
+
+
 def substantial_work_remains(rec: dict, cfg: dict) -> bool:
     """Substantial work remains when there is a queued next approved phase or the
     current phase is not the final one — used to gate the 55–65% tier."""
@@ -370,33 +423,35 @@ def agent_authored_handoff(root: str, max_age: int) -> Optional[str]:
 
 
 def completion_checkpoint_due(agent: dict, rec: dict, cfg: dict, tail: str, t: dict) -> bool:
-    """A coherent subphase completed with substantial approved work remaining, at a
-    safe idle boundary — a first-class rotation event that must fire even when the
-    pane prints NO context% figure. Evidence: a FRESH handoff/checkpoint (the
-    agent's own reports/CONTEXT_HANDOFF.md or a fresh completion report) or the
-    agent explicitly requesting /clear, while idle and safe."""
+    """A coherent subphase completed with an EXACT owner-approved remaining subphase,
+    at a safe idle boundary — a first-class rotation-and-resume event that fires even
+    with NO context% figure. Requires `work_remaining` (genuine approved next text):
+    a completed task with nothing left, or one waiting on an external action, is NOT
+    a checkpoint-to-resume (it is surfaced separately, never falsely resumed)."""
     state = rec.get("state")
     if state not in ("idle", "completed"):
         return False
     if not at_safe_boundary(agent, "idle"):
         return False
-    if not substantial_work_remains(rec, cfg):
+    cls, _nxt = completion_class(rec, cfg, tail)
+    if cls != "work_remaining":
         return False
     root = cfg.get("root") or agent.get("claude_cwd") or agent.get("cwd") or ""
-    if rec.get("completion_evidence"):
+    if rec.get("completion_evidence") or existing_fresh_handoff(root, t["handoff_fresh_secs"]):
         return True
-    if existing_fresh_handoff(root, t["handoff_fresh_secs"]):
-        return True
-    # the agent parked a bare /clear request in its input line.
     return bool(re.match(r"^/(clear|compact)\b", (agent.get("_pending_input") or "").strip()))
 
 
 # ── rotation ────────────────────────────────────────────────────────────────
-def _resume_instruction(root: str, handoff_path: Optional[str] = None) -> str:
-    where = handoff_path or os.path.join(root, HANDOFF_FILENAME)
-    return (f"Your context was rotated to stay cheap and reliable. Read {where} and continue "
-            "the SAME approved task (the next subphase) from where it left off. "
-            "Do not start a new task; re-verify tests before changing code.")
+def _resume_instruction(handoff_path: str, remaining: dict) -> str:
+    """Resume message: the EXACT remaining approved subphase text/id from the
+    pre-clear state — never generic 'next subphase' language, and explicitly NOT a
+    request to re-run full test suites."""
+    ident = remaining.get("id") or remaining.get("title") or "the approved subphase"
+    return (f"Context was rotated to stay cheap. Read {handoff_path} and resume ONLY this exact "
+            f"remaining approved subphase [{ident}]:\n{remaining['text']}\n"
+            "Do NOT invent a new task, do NOT repeat completed work, and do NOT run full test "
+            "suites unless that exact remaining task requires it.")
 
 
 def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True, dispatch: bool) -> dict:
@@ -482,7 +537,8 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
         out["notification_state"] = "context_rotate_deferred_unsettled"
         return out
 
-    reason = "checkpoint_completed_work_remaining" if checkpoint_due else "context_budget"
+    # Classify the completion so a DONE task is never falsely resumed.
+    cls, remaining = completion_class(rec, cfg, tail)
 
     # /clear input-line safety: an empty line is safe; a bare `/clear` the agent
     # itself queued is the rotation request (submitted as-is); ANY other queued
@@ -503,22 +559,22 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
     if not handoff_is_fresh(path, t["handoff_fresh_secs"]):
         out["notification_state"] = "context_handoff_failed"     # abort — never /clear without it
         return out
-    resume_handoff = agent_handoff or path       # resume from the agent's detailed handoff
+    # AUTHORITATIVE resume handoff — resolved/persisted, never a hardcoded root path.
+    resume_handoff = resolve_handoff_path(root, cfg, row, t["handoff_fresh_secs"]) or agent_handoff or path
     out["handoff_path"] = path
     out["rotation"] = {
         "project": rec.get("project") or cfg.get("project"),
-        "reason": reason,
-        "completed_checkpoint": resume_handoff,
-        "remaining": rec.get("approved_next_task") or _next_phase_title(cfg),
+        "reason": ("checkpoint_completed_work_remaining" if cls == "work_remaining" else cls),
+        "completion_class": cls,
+        "resume_handoff": resume_handoff,
+        "remaining": (remaining.get("text") if remaining else None),
+        "remaining_id": (remaining.get("id") if remaining else None),
         "handoff_path": path,
         "context_pct": pct,
     }
     _save_rotation(key, phase, pct or 0.0, "handoff_written", path, chash, None)
 
     if not dispatch:
-        # Surface the event even when the autonomous /clear is gated off. A
-        # completed-subphase checkpoint is the first-class `safe_rotation_due`
-        # event; a pure budget-tier rotation stays `context_rotate_pending`.
         out["notification_state"] = "safe_rotation_due" if checkpoint_due else "context_rotate_pending"
         return out
 
@@ -529,7 +585,13 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
         else:
             ac.agent_send(key, "/clear", idempotency_key=f"{idem}:clear")
         time.sleep(0.6)
-        ac.agent_send(key, _resume_instruction(root, resume_handoff), idempotency_key=f"{idem}:resume")
+        # Resume WORK only when there is an exact owner-approved remaining subphase.
+        # A completed task (nothing left, or waiting on an external action) is
+        # rotated to save tokens but NOT told to continue — it stays idle and the
+        # completion/external event is surfaced.
+        if cls == "work_remaining" and remaining:
+            ac.agent_send(key, _resume_instruction(resume_handoff, remaining),
+                          idempotency_key=f"{idem}:resume")
         try:
             ac.ensure_auto_mode(key)                    # /clear can reset mode → restore
         except Exception:  # noqa: BLE001 — best-effort; the sweep also re-enforces
@@ -539,6 +601,11 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
         out["error"] = str(e)[:160]
         return out
     _save_rotation(key, phase, pct or 0.0, "cleared", path, chash, _now_ts())
-    out["rotation"]["action"] = "rotated"
-    out["notification_state"] = "context_rotated_checkpoint" if checkpoint_due else "context_rotated"
+    out["rotation"]["action"] = "rotated_and_resumed" if cls == "work_remaining" else "rotated_idle"
+    if cls == "work_remaining":
+        out["notification_state"] = "context_rotated_checkpoint" if checkpoint_due else "context_rotated"
+    elif cls == "task_completed_waiting_external":
+        out["notification_state"] = "task_completed_waiting_external_action"
+    else:
+        out["notification_state"] = "task_completed_no_remaining_work"
     return out
