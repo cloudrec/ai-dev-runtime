@@ -638,8 +638,54 @@ def refresh_and_resolve(approve: bool = True) -> dict:
     except Exception as e:  # noqa: BLE001
         advances = {"enabled": True, "error": str(e)[:200], "results": []}
 
+    # THE ORCHESTRATOR: own the durable goal → plan → task queue; detect completion
+    # and dispatch the next dependency-satisfied task to its assigned EXISTING agent.
+    plan_tick = {}
+    try:
+        plan_tick = _orchestrate(full_records, approve)
+        for c in plan_tick.get("completions", []):
+            ac.record_commander_event(c.get("task_id") and f"task#{c['task_id']}" or "orchestrator",
+                                      c.get("project"), "orchestrator_task_completed",
+                                      c, dedup_key=f"orchtask:{c.get('task_id')}")
+        for d in plan_tick.get("dispatches", []):
+            escalations.append({"event": "orchestrator_dispatch", "commander_event": d})
+    except Exception as e:  # noqa: BLE001
+        plan_tick = {"error": str(e)[:200]}
+
     return {"ok": True, "agents": len(results), "records": results,
-            "resolved": resolved, "escalations": escalations, "phase_advances": advances}
+            "resolved": resolved, "escalations": escalations, "phase_advances": advances,
+            "orchestrator": plan_tick}
+
+
+def _orchestrate(full_records: list, approve: bool) -> dict:
+    """Run one goal/plan/queue tick. Dispatch = send the exact approved task text to
+    the ASSIGNED existing agent (never creates one) at a safe boundary."""
+    from core import orchestrator_plan as plan
+    by_session = {r["session"]: r for r in full_records}
+
+    def agent_available(agent_ref: str) -> bool:
+        # agent_ref is a session name (or session:pane). It must be an EXISTING,
+        # at-rest agent (idle/completed) — never dispatch onto a working/waiting one.
+        sess = agent_ref.split(":", 1)[0]
+        rec = by_session.get(sess)
+        return bool(rec) and rec.get("state") in ("idle", "completed")
+
+    def send(agent_ref: str, task_text: str):
+        if not approve:
+            return None
+        sess = agent_ref.split(":", 1)[0]
+        target = agent_ref if ":" in agent_ref else f"{sess}:0.0"
+        rec = by_session.get(sess)
+        if not rec or rec.get("state") not in ("idle", "completed"):
+            return None
+        try:
+            import hashlib
+            key = "orchdispatch:" + hashlib.sha256(f"{target}\x1f{task_text}".encode()).hexdigest()[:20]
+            return ac.agent_send(target, task_text, idempotency_key=key)
+        except Exception:  # noqa: BLE001
+            return None
+
+    return plan.tick(dispatch=approve, agent_available=agent_available, send=send)
 
 
 def _phases(cfg: dict) -> list:
@@ -740,10 +786,15 @@ def status() -> dict:
         events = ac.list_commander_events(since_epoch=_now_ts() - 86400, limit=50)
     except Exception:  # noqa: BLE001
         events = []
+    try:
+        from core import orchestrator_plan as _plan
+        plan_status = _plan.status()
+    except Exception as e:  # noqa: BLE001
+        plan_status = {"state": "error", "error": str(e)[:120]}
     return {"states": ORCH_STATES, "budget_locked": budget_locked(),
             "records": all_records(), "commander_events": events,
             "unacked_events": [e for e in events if not e["acknowledged"]],
-            "checked_at": _now_iso()}
+            "orchestrator": plan_status, "checked_at": _now_iso()}
 
 
 # ── always-on loop ──────────────────────────────────────────────────────────

@@ -328,6 +328,68 @@ async def agents_orchestrator_tick(approve: bool = False, _: bool = Depends(_aut
     return agent_orchestrator.refresh_and_resolve(approve=approve)
 
 
+@router.get("/agents/orchestrator/plan")
+async def agents_orchestrator_plan(_: bool = Depends(_auth)):
+    """Read-only orchestrator plan: goal, queue, assignments, ticks, dispatches."""
+    from core import orchestrator_plan as plan
+    return plan.status()
+
+
+class GoalReq(BaseModel):
+    text: str
+
+
+@router.post("/agents/orchestrator/goal")
+async def agents_set_goal(req: GoalReq, _: bool = Depends(_auth)):
+    from core import orchestrator_plan as plan
+    return plan.set_goal(req.text)
+
+
+class TaskReq(BaseModel):
+    project: str
+    title: str
+    task_text: str
+    agent: str = ""
+    order_index: int = 0
+    priority: int = 0
+    depends_on: list[int] = []
+    status: str = "pending"
+    handoff_path: str = ""
+    approved_scope: str = ""
+    completion_marker: str = ""
+    note: str = ""
+
+
+@router.post("/agents/orchestrator/task")
+async def agents_add_task(req: TaskReq, _: bool = Depends(_auth)):
+    from core import orchestrator_plan as plan
+    goal = plan.get_active_goal()
+    if not goal:
+        raise HTTPException(status_code=400, detail="no active goal")
+    tid = plan.add_task(goal["id"], req.project, req.title, req.task_text, agent=req.agent,
+                        order_index=req.order_index, priority=req.priority, depends_on=req.depends_on,
+                        status=req.status, handoff_path=req.handoff_path,
+                        approved_scope=req.approved_scope, completion_marker=req.completion_marker,
+                        note=req.note)
+    return {"task_id": tid}
+
+
+class TaskStatusReq(BaseModel):
+    task_id: int
+    status: str
+    note: str = ""
+
+
+@router.post("/agents/orchestrator/task-status")
+async def agents_task_status(req: TaskStatusReq, _: bool = Depends(_auth)):
+    from core import orchestrator_plan as plan
+    if req.status == "completed":
+        plan.mark_completed(req.task_id, next_action=req.note)
+    else:
+        plan.mark_status(req.task_id, req.status, req.note)
+    return {"task_id": req.task_id, "status": req.status}
+
+
 @router.get("/agents/commander/events")
 async def agents_commander_events(unacked: bool = True, limit: int = 50, _: bool = Depends(_auth)):
     """Durable Commander events (checkpoint/completion/waiting-external/…) for
