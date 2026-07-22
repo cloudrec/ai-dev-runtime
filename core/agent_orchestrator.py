@@ -45,6 +45,10 @@ _CONFIG_PATH = os.getenv("AGENT_ORCHESTRATOR_CONFIG",
                                       "config", "agent_orchestrator.yaml"))
 _COMPLETION_WINDOW_SECS = int(os.getenv("ORCH_COMPLETION_WINDOW_SECS", "1800"))
 ENABLED = os.getenv("AGENT_ORCHESTRATOR_ENABLED", "0") not in ("0", "false", "no", "")
+# Keep managed-auto agents in a non-stalling execution mode (`auto mode on`) so
+# routine work does not stall on a permission prompt. Enforced ONLY for auto
+# sessions and only at a task boundary (not mid-dialog); held/monitor untouched.
+AUTO_MODE_ENFORCE = os.getenv("AGENT_AUTO_MODE_ENFORCE", "1") not in ("0", "false", "no", "")
 
 
 def _now_ts() -> float:
@@ -113,8 +117,9 @@ def _db() -> sqlite3.Connection:
         prompt_hash TEXT, blocker_category TEXT, completion_evidence TEXT,
         report_path TEXT, approved_next_task TEXT, notification_state TEXT,
         retry_count INTEGER DEFAULT 0, decision TEXT, updated_at TEXT)""")
-    # Additive columns (exact blocker text + decision type + context budget) — older rows get NULL.
-    for col in ("blocker_text TEXT", "decision_type TEXT", "context_pct REAL", "context_tier TEXT"):
+    # Additive columns (exact blocker text + decision type + context budget + exec mode) — older rows get NULL.
+    for col in ("blocker_text TEXT", "decision_type TEXT", "context_pct REAL",
+                "context_tier TEXT", "exec_mode TEXT"):
         try:
             conn.execute(f"ALTER TABLE agent_orchestrator ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -127,7 +132,7 @@ _FIELDS = ("agent_key", "session", "project", "approved_goal", "current_task", "
            "state", "last_fresh_activity_ts", "prompt_hash", "blocker_category",
            "completion_evidence", "report_path", "approved_next_task",
            "notification_state", "retry_count", "decision", "updated_at",
-           "blocker_text", "decision_type", "context_pct", "context_tier")
+           "blocker_text", "decision_type", "context_pct", "context_tier", "exec_mode")
 
 
 def get_record(agent_key: str) -> Optional[dict]:
@@ -481,7 +486,26 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             "decision_type": d.get("decision_type"),
             "context_pct": None,
             "context_tier": None,
+            "exec_mode": ac.detect_exec_mode(agent.get("_tail") or ""),
         }
+
+        # Execution-mode control: keep a MANAGED-AUTO agent in `auto mode on` so
+        # routine work never stalls on a permission prompt. Detection is recorded
+        # for EVERY agent (above); the Shift+Tab restore fires only for an auto
+        # session, only at a task boundary (working/idle — never mid-dialog so a
+        # pending owner decision is untouched), and never for held/monitor. A mode
+        # toggle is not a command approval — all resolver/owner gates still apply.
+        if (AUTO_MODE_ENFORCE and cfg.get("mode") == "auto" and approve
+                and state in ("working", "idle")
+                and rec["exec_mode"] not in ac.NONSTALL_MODES + ("unknown",)):
+            try:
+                res = ac.ensure_auto_mode(key)
+                rec["exec_mode"] = res.get("mode", rec["exec_mode"])
+                if res.get("action") == "restored":
+                    resolved.append({"agent": key, "action": "auto_mode_restored",
+                                     "mode": res["mode"], "presses": res.get("presses")})
+            except Exception as e:  # noqa: BLE001
+                rec["exec_mode"] = f"error:{str(e)[:40]}"
 
         # A previously budget-paused agent whose limits have now reset. Verify it
         # actually resumed; never re-dispatch (that would duplicate in-flight work).

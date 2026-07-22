@@ -510,6 +510,39 @@ def test_externally_blocked_from_input_required():
     assert ac.classify_state(True, True, "Waiting for API... retry (429 rate limit)\nnew task?") == "externally_blocked"
 
 
+def test_detect_exec_mode():
+    assert ac.detect_exec_mode("⏵⏵ auto mode on (shift+tab to cycle) · ← 3 agents") == "auto"
+    assert ac.detect_exec_mode("⏵⏵ accept edits on (shift+tab to cycle)") == "accept_edits"
+    assert ac.detect_exec_mode("⏸ plan mode on (shift+tab to cycle)") == "plan"
+    assert ac.detect_exec_mode("normal footer · shift+tab to cycle") == "normal"
+    assert ac.detect_exec_mode("some unrelated pane text") == "unknown"
+
+
+def test_ensure_auto_mode_noop_when_already_auto(monkeypatch):
+    sent = []
+    monkeypatch.setattr(ac, "_tmux", lambda a: sent.append(a) or (0, "", ""))
+    r = ac.ensure_auto_mode("seo-audit:0.0", tail_fn=lambda: "⏵⏵ auto mode on")
+    assert r["action"] == "none" and r["already"] is True
+    assert sent == []                                   # no keystroke when already auto
+
+
+def test_ensure_auto_mode_restores_from_normal(monkeypatch):
+    sent = []
+    monkeypatch.setattr(ac, "_tmux", lambda a: sent.append(a[-1]) or (0, "", ""))
+    # first read = normal; after one BTab the footer reads auto mode on.
+    reads = iter(["normal footer · shift+tab to cycle", "⏵⏵ auto mode on"])
+    r = ac.ensure_auto_mode("seo-audit:0.0", tail_fn=lambda: next(reads))
+    assert r["action"] == "restored" and r["mode"] == "auto"
+    assert sent == ["BTab"]                             # exactly one Shift+Tab
+
+
+def test_ensure_auto_mode_unknown_is_left(monkeypatch):
+    sent = []
+    monkeypatch.setattr(ac, "_tmux", lambda a: sent.append(a) or (0, "", ""))
+    r = ac.ensure_auto_mode("seo-audit:0.0", tail_fn=lambda: "unreadable")
+    assert r["action"] == "none" and sent == []        # never guess an unknown mode
+
+
 def test_permission_dialog_with_external_word_in_command_is_waiting_owner():
     # A permission dialog whose COMMAND contains an external-looking word must be
     # waiting_owner, never mis-escalated as externally_blocked (the 2026-07-22 bug:

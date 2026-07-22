@@ -350,6 +350,66 @@ def approve_prompt(target: str) -> bool:
     return True
 
 
+# ── execution-mode (Shift+Tab cycle) detection + enforcement ────────────────
+# Claude Code shows the active permission mode in the footer. `auto mode on` /
+# `accept edits on` auto-approve routine work so it does not stall on prompts;
+# `plan mode` blocks edits; normal prompts for everything. Shift+Tab cycles them.
+_MODE_AUTO_RE = re.compile(r"\bauto[- ]?mode on\b", re.I)
+_MODE_ACCEPT_RE = re.compile(r"\baccept edits on\b", re.I)
+_MODE_PLAN_RE = re.compile(r"\bplan mode on\b", re.I)
+
+# Modes in which routine work does NOT stall on a permission prompt.
+NONSTALL_MODES = ("auto", "accept_edits")
+
+
+def detect_exec_mode(pane_tail: str) -> str:
+    """Visible Claude Code permission mode: 'auto' | 'accept_edits' | 'plan' |
+    'normal'. 'unknown' when the footer is not present in the captured tail."""
+    tail = pane_tail or ""
+    if not (_MODE_AUTO_RE.search(tail) or _MODE_ACCEPT_RE.search(tail)
+            or _MODE_PLAN_RE.search(tail) or "shift+tab to cycle" in tail.lower()):
+        return "unknown"
+    if _MODE_AUTO_RE.search(tail):
+        return "auto"
+    if _MODE_ACCEPT_RE.search(tail):
+        return "accept_edits"
+    if _MODE_PLAN_RE.search(tail):
+        return "plan"
+    return "normal"
+
+
+def ensure_auto_mode(target: str, tail_fn=None, max_cycles: int = 3) -> dict:
+    """Bring a MANAGED-AUTO agent into a non-stalling mode (`auto mode on`).
+
+    Caller MUST gate this to managed-auto sessions only. Sends Shift+Tab (BTab)
+    and re-reads the footer after each press, stopping as soon as a non-stalling
+    mode is visible; never presses more than one full cycle, so it cannot land the
+    pane somewhere worse than it started. A mode toggle is NOT a command approval:
+    every command still passes the resolver/owner gates. No-op when already
+    non-stalling or when the mode cannot be read (unknown → never guess)."""
+    validate_target(target)
+    tail_fn = tail_fn or (lambda: _pane_tail(target, 6))
+    mode = detect_exec_mode(tail_fn())
+    if mode in NONSTALL_MODES:
+        return {"target": target, "mode": mode, "action": "none", "already": True}
+    if mode == "unknown":
+        return {"target": target, "mode": mode, "action": "none", "reason": "mode not visible"}
+    presses = 0
+    for _ in range(max_cycles):
+        rc, _out, err = _tmux(["send-keys", "-t", target, "BTab"])
+        presses += 1
+        if rc != 0:
+            audit("ensure_auto_mode", target, sent=False, error=err.strip()[:120])
+            return {"target": target, "mode": mode, "action": "error", "error": err.strip()[:120]}
+        time.sleep(0.4)
+        mode = detect_exec_mode(tail_fn())
+        if mode in NONSTALL_MODES:
+            audit("ensure_auto_mode", target, restored_to=mode, presses=presses)
+            return {"target": target, "mode": mode, "action": "restored", "presses": presses}
+    audit("ensure_auto_mode", target, restored_to=mode, presses=presses, incomplete=True)
+    return {"target": target, "mode": mode, "action": "incomplete", "presses": presses}
+
+
 def _seen_delivery(key: str) -> Optional[dict]:
     """Return a prior delivery for this key, or None. Expired rows are dropped."""
     conn = _db()
