@@ -18,8 +18,8 @@ Do you want to proceed?
 """
 DANGEROUS_DIALOG = """\
   Bash command
-  docker compose restart backend
-  Restart the backend
+  docker compose down --volumes
+  Tear down the stack
 
 Do you want to proceed?
 ❯ 1. Yes
@@ -82,7 +82,7 @@ def test_dangerous_prompt_stays_waiting_and_is_not_approved(monkeypatch):
     r = sup.resolve_target("seo-audit:0.0", approve=True, _sleep=lambda s: None)
     assert r["action"] == "left_for_owner"
     assert r["safe"] is False
-    assert r["command"] == "docker compose restart backend"
+    assert r["command"] == "docker compose down --volumes"
     assert calls["approve"] == 0                       # NEVER approved
 
 

@@ -36,6 +36,14 @@ sessions:
     auto_push: true
     push_repo: github.com/cloudrec/seo
     protected_branches: [main, master]
+    # Narrow service-ops auto-approval (owner opt-in 2026-07-22): systemctl RESTART
+    # of allowlisted services only + task-scoped docker compose build/up/create/
+    # restart. Never stop/disable/down/prune/rm. Rollback evidence + health check.
+    service_ops: true
+    services: [ai-runtime.service, seo-backend, seo-frontend]
+    compose_file: /opt/seo/docker-compose.yml
+    task_scoped_services: [backend, frontend]
+    container_names: {backend: seo-backend-1, frontend: seo-frontend-1}
     active_task_id: part-f-paid-growth-os
     active_task_title: "Part F — Paid Growth OS foundation + campaign studio"
     # Owner-declared COMPLETE (2026-07-22): completed/deployed/pushed at a clean

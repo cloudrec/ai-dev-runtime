@@ -28,6 +28,7 @@ from typing import Optional
 from core import agent_control as ac
 from core import git_push_policy as gp
 from core import permission_resolver as pr
+from core import service_ops_policy as sop
 
 POLL_INTERVAL = int(os.getenv("AGENT_SUPERVISOR_INTERVAL_SECS", "45"))
 RESUME_TIMEOUT = int(os.getenv("AGENT_SUPERVISOR_RESUME_TIMEOUT_SECS", "8"))
@@ -76,6 +77,21 @@ def _push_project_record(session: str) -> Optional[dict]:
     return None
 
 
+def _service_project_record(session: str) -> Optional[dict]:
+    """The project service-ops record for a session that OPTED IN (`service_ops:
+    true`), else None. Never inferred."""
+    try:
+        from core import agent_orchestrator as _orch
+        cfg = _orch.load_config()
+        sc = (cfg.get("sessions") or {}).get(session)
+        if isinstance(sc, dict) and sc.get("service_ops"):
+            return {k: sc.get(k) for k in ("project", "root", "service_ops", "services",
+                                           "compose_file", "task_scoped_services", "container_names")}
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
 def resolve_target(target: str, approve: bool = True, _sleep=time.sleep) -> dict:
     """Inspect one agent and, if it is waiting on a provably-safe prompt in an
     allowlisted session, confirm it. Returns a structured decision."""
@@ -107,9 +123,25 @@ def resolve_target(target: str, approve: bool = True, _sleep=time.sleep) -> dict
             cwd = status.get("claude_cwd") or status.get("cwd") or proj.get("root") or ""
             push_verdict = gp.evaluate_push(command, cwd, proj)
 
-    if not cls["safe"] and not (push_verdict and push_verdict.get("allowed")):
-        reason = push_verdict["reason"] if push_verdict else cls["reason"]
-        category = "routine_push_denied" if push_verdict else cls["category"]
+    # Narrow service-ops exception (owner opt-in): `systemctl restart <allowlisted>`
+    # and task-scoped `docker compose build/up/create/restart`. Deny-by-default;
+    # never stop/disable/down/prune/rm. Rollback evidence captured; health checked
+    # after. Never broadens to arbitrary systemctl/docker.
+    service_verdict = None
+    if not cls["safe"] and not (push_verdict and push_verdict.get("allowed")) \
+            and sop.is_service_op(command):
+        sproj = _service_project_record(session)
+        if sproj is not None:
+            cwd = status.get("claude_cwd") or status.get("cwd") or sproj.get("root") or ""
+            service_verdict = sop.evaluate_service_op(command, cwd, sproj)
+
+    _auto_ok = (push_verdict and push_verdict.get("allowed")) or \
+               (service_verdict and service_verdict.get("allowed"))
+    if not cls["safe"] and not _auto_ok:
+        reason = (service_verdict["reason"] if service_verdict else
+                  push_verdict["reason"] if push_verdict else cls["reason"])
+        category = ("service_op_denied" if service_verdict else
+                    "routine_push_denied" if push_verdict else cls["category"])
         ac.record_prompt_decision(status["target"], phash, "left_for_owner", category, reason)
         return {"target": status["target"], "action": "left_for_owner", "safe": False,
                 "command": command, "category": category, "reason": reason, "hash": phash}
@@ -151,9 +183,34 @@ def resolve_target(target: str, approve: bool = True, _sleep=time.sleep) -> dict
             break
     latency = round(time.time() - t_decision, 2)
     decision = "approved" if resumed else "approved_no_resume"
-    eff_category = "routine_push" if (push_verdict and push_verdict.get("allowed")) else cls["category"]
-    eff_reason = (push_verdict["reason"] if (push_verdict and push_verdict.get("allowed")) else cls["reason"])
+    if service_verdict and service_verdict.get("allowed"):
+        eff_category, eff_reason = "service_op", service_verdict["reason"]
+    elif push_verdict and push_verdict.get("allowed"):
+        eff_category, eff_reason = "routine_push", push_verdict["reason"]
+    else:
+        eff_category, eff_reason = cls["category"], cls["reason"]
     ac.record_prompt_decision(status["target"], phash, decision, eff_category, eff_reason, latency)
+
+    # Post-op HEALTH check for an approved service op. On failure → durable event
+    # (safe stop-and-surface) carrying the rollback evidence; success is audited.
+    service_health = None
+    if service_verdict and service_verdict.get("allowed") and resumed:
+        sproj = _service_project_record(session) or {}
+        for _ in range(8):                               # allow the op to complete
+            _sleep(2)
+            service_health = sop.health_check(sproj, service_verdict)
+            if service_health.get("healthy"):
+                break
+        if service_health and not service_health.get("healthy"):
+            try:
+                ac.record_commander_event(status["target"], sproj.get("project") or session,
+                                          "service_op_health_failed",
+                                          {"command": command, "health": service_health,
+                                           "rollback": service_verdict.get("rollback"),
+                                           "action": "surfaced for owner — restore rollback image/restart"},
+                                          dedup_key=f"svcfail:{phash}")
+            except Exception:  # noqa: BLE001
+                pass
 
     # Post-push verification: for an approved routine push, the remote branch SHA
     # must equal the local HEAD we approved. A mismatch is surfaced as a durable
@@ -182,10 +239,11 @@ def resolve_target(target: str, approve: bool = True, _sleep=time.sleep) -> dict
              delivered_ts=round(t_delivered, 3),
              resumed_ts=round(t_resumed, 3) if t_resumed else None,
              reaction_s=round((t_resumed - t_detect), 2) if t_resumed else None,
-             latency_s=latency, push_verified=(push_check.get("ok") if push_check else None))
+             latency_s=latency, push_verified=(push_check.get("ok") if push_check else None),
+             service_healthy=(service_health.get("healthy") if service_health else None))
     return {"target": status["target"], "action": decision, "safe": True, "resumed": resumed,
             "command": command, "category": eff_category, "latency_s": latency,
-            "push_verify": push_check,
+            "push_verify": push_check, "service_health": service_health,
             "new_state": new_state, "hash": phash,
             "detect_ts": t_detect, "decision_ts": t_decision, "resumed_ts": t_resumed}
 
