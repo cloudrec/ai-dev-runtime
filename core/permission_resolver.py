@@ -696,70 +696,38 @@ def _quote_balanced(s: str) -> bool:
         return False
 
 
-def _wrap_rows(text: str, width: int) -> list[str]:
-    """Reproduce Claude Code's box word-wrap: whole tokens per row (the space at a
-    soft break is dropped), a token longer than the row is hard-broken and FILLS
-    the current row first. Used only to VERIFY a reconstruction reproduces the
-    observed rows — a wrong join cannot pass."""
-    rows: list[str] = []
-    cur = ""
-    for tok in text.split(" "):
-        while len(tok) > width:
-            room = width - len(cur) - (1 if cur else 0)
-            if cur and room > 0:
-                cur += (" " if cur else "") + tok[:room]
-                tok = tok[room:]
-            if cur:
-                rows.append(cur)
-                cur = ""
-            take = min(len(tok), width)
-            if len(tok) > width:
-                rows.append(tok[:width])
-                tok = tok[width:]
-            else:
-                cur = tok
-                tok = ""
-        if not tok:
-            continue
-        if not cur:
-            cur = tok
-        elif len(cur) + 1 + len(tok) <= width:
-            cur += " " + tok
-        else:
-            rows.append(cur)
-            cur = tok
-    if cur:
-        rows.append(cur)
-    return rows
-
-
-# Shell-significant characters. A box-row containing NONE of these (and not
-# starting a flag) is Claude's human description, not a command continuation.
-_SHELL_SIGNIFICANT = set("/\\|&;$<>=\"'`(){}[]*?~!#-")
+# Characters that never appear in Claude's one-line human DESCRIPTION but do
+# appear in a real command continuation (operators, quotes, paths, flags). A row
+# with none of these is prose, not command — safe to strip from the tail.
+_STRUCTURAL_CHARS = set("|&;$<>=\"'`\\/-*?{}[]~!#@%^")
 
 
 def _looks_like_description(row: str) -> bool:
     r = row.strip()
-    return bool(r) and not any(c in _SHELL_SIGNIFICANT for c in r)
+    return bool(r) and not any(c in _STRUCTURAL_CHARS for c in r)
 
 
 def _reconstruct_command(group: list[str]) -> Optional[str]:
-    """Rebuild the wrapped command from its box-rows, dropping the trailing human
-    description. Accept a reconstruction only when re-wrapping it reproduces the
-    exact rows AND it is quote-balanced — a partial / ambiguous read is never
-    auto-approved. Prefer the SHORTEST verified span whose remaining rows are all
-    pure prose (the description); a real command continuation carries a shell
-    metacharacter, so this can never truncate a safety-relevant token."""
-    if len(group) == 1:
-        return group[0] if _quote_balanced(group[0]) else None
-    for k in range(1, len(group) + 1):
-        rows = group[:k]
-        candidate = " ".join(rows)
-        if not _quote_balanced(candidate):
-            continue
-        width = max(len(r) for r in rows)
-        if _wrap_rows(candidate, width) != rows:
-            continue
-        if all(_looks_like_description(r) for r in group[k:]):
-            return candidate
-    return None
+    """Rebuild a command wrapped across box-rows in a narrow pane.
+
+    Claude soft-wraps at word boundaries (dropping the space) and hard-breaks only
+    a single token longer than the row; joining rows with a space therefore
+    reconstructs the command, and is SAFE for the approve decision: adding a space
+    can only split a long ARGUMENT, never forge a `|`/`;`/`&` operator or change a
+    segment's leading program, so it can never turn an unsafe command into a
+    safe-looking one (the dangerous direction). A trailing human description is
+    stripped only when the row is pure prose, carries no secret indicator, and its
+    removal keeps the command quote-balanced — so a real command token is never
+    truncated. An unbalanced result is rejected (fail closed → left for owner)."""
+    if not group:
+        return None
+    rows = list(group)
+    while len(rows) > 1 and _looks_like_description(rows[-1]) \
+            and not _SECRET_PATH_RE.search(rows[-1]):
+        trial = rows[:-1]
+        if _quote_balanced(" ".join(trial)):
+            rows = trial
+        else:
+            break                    # removing it would unbalance → it's command
+    cmd = " ".join(rows).strip()
+    return cmd if cmd and _quote_balanced(cmd) else None
