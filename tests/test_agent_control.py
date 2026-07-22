@@ -510,6 +510,17 @@ def test_externally_blocked_from_input_required():
     assert ac.classify_state(True, True, "Waiting for API... retry (429 rate limit)\nnew task?") == "externally_blocked"
 
 
+def test_pending_input_text_detects_queued_instruction():
+    # non-empty input line = queued instruction → /clear must refuse.
+    pane = ("──────\n❯ enable premium for the canary account and test one charge\n──────\n"
+            "  ⏵⏵ auto mode on")
+    assert ac.pending_input_text("x:0.0", tail=pane) == "enable premium for the canary account and test one charge"
+    # empty input line → safe.
+    assert ac.pending_input_text("x:0.0", tail="──────\n❯ \n──────\n auto mode on") == ""
+    # a numbered menu selection is NOT input-line text.
+    assert ac.pending_input_text("x:0.0", tail="Do you want to proceed?\n❯ 1. Yes\n  2. No") == ""
+
+
 def test_detect_exec_mode():
     assert ac.detect_exec_mode("⏵⏵ auto mode on (shift+tab to cycle) · ← 3 agents") == "auto"
     assert ac.detect_exec_mode("⏵⏵ accept edits on (shift+tab to cycle)") == "accept_edits"

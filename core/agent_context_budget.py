@@ -382,6 +382,13 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
     if state == "completed":
         return out                                     # never rotate an idle completed agent
 
+    # NEVER /clear while the agent has queued-but-unsubmitted input: agent_send
+    # pastes then hits Enter, so a `/clear` would concatenate and SUBMIT that
+    # queued text — possibly an owner-queued external/financial/production action.
+    if ac.pending_input_text(key, tail=tail):
+        out["notification_state"] = "context_rotate_deferred_pending_input"
+        return out
+
     content, chash = build_handoff(rec, cfg, root, pct or t["rotate_pct"], t["handoff_max_bytes"])
     if not can_rotate_again(key, chash, t["cooldown_secs"]):
         out["notification_state"] = "context_rotate_cooldown"    # cooldown or unchanged-hash

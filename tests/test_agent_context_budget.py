@@ -107,12 +107,28 @@ def test_active_subagent_migration_deploy_block_clear(tail):
     assert cb.at_safe_boundary(_agent(tail=tail), "idle") is False
 
 
+def test_no_clear_when_input_line_has_queued_instruction(monkeypatch, tmp_path):
+    # An owner-queued instruction in the input line must block /clear (else
+    # agent_send would concatenate and SUBMIT it — e.g. a financial action).
+    sent = []
+    monkeypatch.setattr(cb.ac, "agent_send", lambda *a, **k: sent.append(a))
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    tail = ("idle · /clear to save 700k tokens\n──────\n"
+            "❯ enable premium and test one charge\n──────")
+    a = _agent(tail=tail)
+    rec = _rec(state="idle", agent_key="job:0.0", approved_next_task="phase 2")
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "1"}, {"id": "2"}]},
+                      rec, {}, act=True, dispatch=True)
+    assert out["notification_state"] == "context_rotate_deferred_pending_input"
+    assert sent == []                                   # NEVER cleared
+
+
 def test_rotation_restores_auto_mode_after_clear(monkeypatch, tmp_path):
     sent, ensured = [], []
     monkeypatch.setattr(cb.ac, "agent_send", lambda tgt, text, **k: sent.append((tgt, text)))
     monkeypatch.setattr(cb.ac, "ensure_auto_mode", lambda key, **k: ensured.append(key) or {"action": "restored"})
     monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
-    a = _agent(tail="idle ❯ · /clear to save 700k tokens")   # 70% used, safe boundary
+    a = _agent(tail="quiet /clear to save 700k tokens\n──────\n❯ \n──────")   # 70%, empty input
     rec = _rec(state="idle", agent_key="seo-audit:0.0", approved_next_task="phase 2")
     out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "1"}, {"id": "2"}]},
                       rec, {}, act=True, dispatch=True)

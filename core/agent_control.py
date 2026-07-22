@@ -362,6 +362,25 @@ _MODE_PLAN_RE = re.compile(r"\bplan mode on\b", re.I)
 NONSTALL_MODES = ("auto", "accept_edits")
 
 
+def pending_input_text(target: str, tail: str | None = None) -> str:
+    """Text typed into the agent's input line but NOT yet submitted (e.g. an
+    owner/ChatGPT-queued instruction). CRITICAL for /clear safety: agent_send
+    pastes then hits Enter WITHOUT clearing the line, so sending `/clear` while
+    this is non-empty would concatenate and SUBMIT the queued text — possibly an
+    external/financial/production action. A context rotation must refuse when this
+    is non-empty. A numbered menu selection (`❯ 1. Yes`) is not input-line text."""
+    text = tail if tail is not None else _pane_tail(target, 10)
+    for line in reversed((text or "").splitlines()):
+        m = re.search(r"❯\s?(.*)$", line.rstrip())
+        if not m:
+            continue
+        content = m.group(1).strip()
+        if re.match(r"^\d+\.", content):        # menu option, not the input line
+            return ""
+        return content
+    return ""
+
+
 def detect_exec_mode(pane_tail: str) -> str:
     """Visible Claude Code permission mode: 'auto' | 'accept_edits' | 'plan' |
     'normal'. 'unknown' when the footer is not present in the captured tail."""
