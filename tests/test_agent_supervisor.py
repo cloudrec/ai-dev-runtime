@@ -86,7 +86,13 @@ def test_dangerous_prompt_stays_waiting_and_is_not_approved(monkeypatch):
     assert calls["approve"] == 0                       # NEVER approved
 
 
-def test_safe_prompt_not_allowlisted_is_left(monkeypatch):
+def test_safe_prompt_not_allowlisted_is_left(monkeypatch, tmp_path):
+    # Isolate the config so seo-audit is NOT discovered as an auto session.
+    empty = tmp_path / "empty.yaml"
+    empty.write_text("sessions: {}\n")
+    monkeypatch.setenv("AGENT_ORCHESTRATOR_CONFIG", str(empty))
+    from core import agent_orchestrator as orch
+    orch._config_cache = {}
     monkeypatch.setenv("AGENT_AUTORESOLVE_SESSIONS", "other")
     calls = _wire(monkeypatch, [_status("waiting_owner", SAFE_DIALOG)])
     r = sup.resolve_target("seo-audit:0.0", approve=True, _sleep=lambda s: None)
@@ -123,6 +129,25 @@ def test_approved_but_no_resume_is_flagged(monkeypatch):
     assert r["resumed"] is False
     assert calls["approve"] == 1
     importlib.reload(sup)   # restore default timeout for other tests
+
+
+def test_allowlist_is_discovered_dynamically_from_config(monkeypatch, tmp_path):
+    # No hard-coded names: mode==auto sessions in the orchestrator config are
+    # covered automatically; hold/monitor are not. Env is an additive override.
+    cfg = tmp_path / "orch.yaml"
+    cfg.write_text(
+        "sessions:\n"
+        "  alpha:\n    mode: auto\n"
+        "  bravo:\n    mode: auto\n"
+        "  charlie:\n    mode: hold\n"
+        "  delta:\n    mode: monitor\n")
+    monkeypatch.setenv("AGENT_ORCHESTRATOR_CONFIG", str(cfg))
+    monkeypatch.setenv("AGENT_AUTORESOLVE_SESSIONS", "")
+    from core import agent_orchestrator as orch
+    orch._config_cache = {}
+    assert sup._allowlisted_sessions() == {"alpha", "bravo"}      # only auto
+    monkeypatch.setenv("AGENT_AUTORESOLVE_SESSIONS", "echo-override")
+    assert sup._allowlisted_sessions() == {"alpha", "bravo", "echo-override"}
 
 
 def test_persistence_survives_restart_semantics(monkeypatch):

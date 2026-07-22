@@ -61,9 +61,12 @@ _config_cache: dict = {}
 
 def load_config() -> dict:
     global _config_cache
+    # Re-read the path from the env each call so a runtime/test config change is
+    # honoured (the module-level default is only the fallback).
+    path = os.getenv("AGENT_ORCHESTRATOR_CONFIG", _CONFIG_PATH)
     try:
         import yaml
-        with open(_CONFIG_PATH) as fh:
+        with open(path) as fh:
             _config_cache = yaml.safe_load(fh) or {}
     except Exception:  # noqa: BLE001
         _config_cache = {}

@@ -36,8 +36,21 @@ ENABLED = os.getenv("AGENT_SUPERVISOR_ENABLED", "0") not in ("0", "false", "no",
 
 
 def _allowlisted_sessions() -> set[str]:
+    """Sessions eligible for unattended safe-resolution, discovered DYNAMICALLY:
+    every `mode: auto` session in the orchestrator config (the managed-auto set),
+    plus any explicit `AGENT_AUTORESOLVE_SESSIONS` override. No project name is
+    hard-coded — adding an `auto` session to the config covers it automatically;
+    `hold`/`monitor`/unlisted sessions are never eligible (detection-only)."""
     raw = os.getenv("AGENT_AUTORESOLVE_SESSIONS", "").strip()
-    return {s.strip() for s in raw.split(",") if s.strip()}
+    sessions = {s.strip() for s in raw.split(",") if s.strip()}
+    try:
+        from core import agent_orchestrator as _orch
+        cfg = _orch.load_config()
+        sessions |= {name for name, sc in (cfg.get("sessions") or {}).items()
+                     if isinstance(sc, dict) and sc.get("mode") == "auto"}
+    except Exception:  # noqa: BLE001 — config unavailable → fall back to env only
+        pass
+    return sessions
 
 
 def _session_of(target: str) -> str:
