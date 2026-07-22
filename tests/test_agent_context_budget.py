@@ -94,6 +94,33 @@ def test_idle_quiet_is_safe_boundary():
     assert cb.at_safe_boundary(_agent(tail="done. ❯"), "idle") is True
 
 
+@pytest.mark.parametrize("tail", [
+    "Exploring the codebase…",
+    "dispatching subagent to map the module",
+    "running the migration now",
+    "deploying backend",
+    "building frontend",
+    "installing dependencies",
+])
+def test_active_subagent_migration_deploy_block_clear(tail):
+    # The owner's exclusion list: never a safe boundary while these run.
+    assert cb.at_safe_boundary(_agent(tail=tail), "idle") is False
+
+
+def test_rotation_restores_auto_mode_after_clear(monkeypatch, tmp_path):
+    sent, ensured = [], []
+    monkeypatch.setattr(cb.ac, "agent_send", lambda tgt, text, **k: sent.append((tgt, text)))
+    monkeypatch.setattr(cb.ac, "ensure_auto_mode", lambda key, **k: ensured.append(key) or {"action": "restored"})
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    a = _agent(tail="idle ❯ · /clear to save 700k tokens")   # 70% used, safe boundary
+    rec = _rec(state="idle", agent_key="seo-audit:0.0", approved_next_task="phase 2")
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "1"}, {"id": "2"}]},
+                      rec, {}, act=True, dispatch=True)
+    assert out["notification_state"] == "context_rotated"
+    assert any(t == "/clear" for _, t in sent)
+    assert ensured == ["seo-audit:0.0"]                 # auto mode restored after clear
+
+
 # ── finish-soon suppression ─────────────────────────────────────────────────
 def test_finish_soon_from_pane_cue():
     assert cb.finish_soon(_agent(tail="almost done, one more commit"), _rec()) is True

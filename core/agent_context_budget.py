@@ -53,11 +53,16 @@ _DEFAULTS = {
 }
 HANDOFF_FILENAME = "CONTEXT_HANDOFF.md"
 
-# Active-execution markers: their presence means a command/tool/edit/test/build is
-# still running, so the pane is NOT a safe boundary.
+# Active-execution markers: their presence means a command/tool/edit/test/build/
+# subagent/migration/deploy is still running, so the pane is NOT a safe boundary.
+# Deliberately broad — every term only ADDS suppression (biases toward NOT
+# clearing), never toward an unsafe clear.
 _ACTIVE_EXEC_RE = re.compile(
     r"(esc to interrupt|\bthinking…|\bthinking\.\.\.|\brunning…|\brunning\.\.\.|"
-    r"\bcompacting|\btool call|\bexecuting\b|✻|✽)", re.I)
+    r"\bcompacting|\btool call|\bexecuting\b|✻|✽|"
+    r"\bexploring\b|\bsub-?agent\b|\bdispatching\b|\bmigrat(?:e|ing)\b|"
+    r"\bdeploy(?:ing)?\b|\bbuilding\b|\binstalling\b|\bprovisioning\b|"
+    r"\bupgrading\b|\brestarting\b|running (?:the )?(?:tests?|build|migration))", re.I)
 
 # Finish-soon cues: the agent is one or two steps from done → finish, don't clear.
 _FINISH_SOON_RE = re.compile(
@@ -398,6 +403,12 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
         ac.agent_send(key, "/clear", idempotency_key=f"{idem}:clear")
         time.sleep(0.6)
         ac.agent_send(key, _resume_instruction(root), idempotency_key=f"{idem}:resume")
+        # /clear can reset the permission mode → restore `auto mode on` so the
+        # resumed approved task does not stall on routine prompts.
+        try:
+            ac.ensure_auto_mode(key)
+        except Exception:  # noqa: BLE001 — best-effort; the sweep also re-enforces
+            pass
     except ac.AgentControlError as e:
         out["notification_state"] = "context_rotate_dispatch_failed"
         out["error"] = str(e)[:160]
