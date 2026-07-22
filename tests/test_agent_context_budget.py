@@ -15,6 +15,9 @@ def _isolated(monkeypatch, tmp_path):
     monkeypatch.setattr(cb, "git_facts",
                         lambda root: {"branch": "feat/x", "commit": "abc1234",
                                       "dirty": ["core/a.py", "core/b.py"]})
+    # isolate from any real on-disk handoff (tests that need one override this).
+    monkeypatch.setattr(cb, "existing_fresh_handoff", lambda root, max_age: None)
+    monkeypatch.setattr(cb.ac, "pending_input_text", lambda key, tail=None: "")
 
 
 def _agent(tail="", target="seo-audit:0.0"):
@@ -112,6 +115,7 @@ def test_no_clear_when_input_line_has_queued_instruction(monkeypatch, tmp_path):
     # agent_send would concatenate and SUBMIT it — e.g. a financial action).
     sent = []
     monkeypatch.setattr(cb.ac, "agent_send", lambda *a, **k: sent.append(a))
+    monkeypatch.setattr(cb.ac, "pending_input_text", lambda key, tail=None: "enable premium and test one charge")
     monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
     tail = ("idle · /clear to save 700k tokens\n──────\n"
             "❯ enable premium and test one charge\n──────")
@@ -121,6 +125,56 @@ def test_no_clear_when_input_line_has_queued_instruction(monkeypatch, tmp_path):
                       rec, {}, act=True, dispatch=True)
     assert out["notification_state"] == "context_rotate_deferred_pending_input"
     assert sent == []                                   # NEVER cleared
+
+
+def test_completion_checkpoint_due_fires_without_context_signal(monkeypatch, tmp_path):
+    # A coherent subphase completed (fresh handoff) + work remaining, idle+safe,
+    # NO context% figure in the pane → still a first-class rotation event.
+    monkeypatch.setattr(cb, "existing_fresh_handoff",
+                        lambda root, max_age: str(tmp_path / "reports" / "CONTEXT_HANDOFF.md"))
+    a = _agent(tail="done 8a-8c. ❯ ")                    # no context% signal
+    rec = _rec(state="idle", approved_next_task="Phase 8d")
+    assert cb.completion_checkpoint_due(a, rec, AUTO, a["_tail"], cb._DEFAULTS) is True
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}],
+                          "project": "seo"}, rec, {}, act=True, dispatch=False)
+    assert out["notification_state"] == "safe_rotation_due"
+    assert out["rotation"]["reason"] == "checkpoint_completed_work_remaining"
+    assert out["rotation"]["remaining"] in ("Phase 8d", "8d")
+
+
+def test_checkpoint_rotation_submits_agents_own_clear(monkeypatch, tmp_path):
+    # When the agent already typed a bare /clear, submit it (Enter) rather than
+    # pasting again; then restore auto mode and resume from the handoff.
+    submitted, sent, ensured = [], [], []
+    monkeypatch.setattr(cb, "existing_fresh_handoff",
+                        lambda root, max_age: str(tmp_path / "reports" / "CONTEXT_HANDOFF.md"))
+    monkeypatch.setattr(cb.ac, "pending_input_text", lambda key, tail=None: "/clear")
+    monkeypatch.setattr(cb.ac, "submit_clear", lambda key, **k: submitted.append(key) or True)
+    monkeypatch.setattr(cb.ac, "agent_send", lambda key, text, **k: sent.append(text))
+    monkeypatch.setattr(cb.ac, "ensure_auto_mode", lambda key, **k: ensured.append(key))
+    a = _agent(tail="done. ❯ /clear")
+    rec = _rec(state="idle", approved_next_task="Phase 8d")
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}]},
+                      rec, {}, act=True, dispatch=True)
+    assert out["notification_state"] == "context_rotated_checkpoint"
+    assert submitted == ["seo-audit:0.0"]                # submitted the agent's own /clear
+    assert not any(t == "/clear" for t in sent)          # never pasted a second /clear
+    assert any("Read" in t for t in sent)                # resume-from-handoff sent
+    assert ensured == ["seo-audit:0.0"]                  # auto mode restored
+
+
+def test_checkpoint_refuses_when_nonclear_instruction_queued(monkeypatch, tmp_path):
+    sent = []
+    monkeypatch.setattr(cb, "existing_fresh_handoff",
+                        lambda root, max_age: str(tmp_path / "CONTEXT_HANDOFF.md"))
+    monkeypatch.setattr(cb.ac, "pending_input_text", lambda key, tail=None: "enable premium and charge")
+    monkeypatch.setattr(cb.ac, "agent_send", lambda *a, **k: sent.append(a))
+    a = _agent(tail="done. ❯ enable premium and charge")
+    rec = _rec(state="idle", approved_next_task="Phase 8d")
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}]},
+                      rec, {}, act=True, dispatch=True)
+    assert out["notification_state"] == "context_rotate_deferred_pending_input"
+    assert sent == []                                    # never cleared/submitted
 
 
 def test_rotation_restores_auto_mode_after_clear(monkeypatch, tmp_path):

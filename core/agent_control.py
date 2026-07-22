@@ -381,6 +381,23 @@ def pending_input_text(target: str, tail: str | None = None) -> str:
     return ""
 
 
+def submit_clear(target: str, idempotency_key: Optional[str] = None) -> bool:
+    """Submit an EXISTING bare `/clear` (or `/compact`) the agent already typed in
+    its input line, by pressing Enter. RE-VERIFIES at submit time that the input
+    line is exactly a clear command — never submits an arbitrary queued
+    instruction (defends against a race between check and submit)."""
+    validate_target(target)
+    pending = pending_input_text(target)
+    if not re.match(r"^/(clear|compact)\s*$", pending):
+        raise AgentControlError(
+            f"refusing to submit: input line is not a bare clear command: {pending!r}")
+    rc, _, err = _tmux(["send-keys", "-t", target, "Enter"])
+    audit("submit_clear", target, idempotency_key, submitted=(rc == 0), pending=pending[:40])
+    if rc != 0:
+        raise AgentControlError(f"failed to submit clear to {target!r}: {err.strip()[:200]}")
+    return True
+
+
 def detect_exec_mode(pane_tail: str) -> str:
     """Visible Claude Code permission mode: 'auto' | 'accept_edits' | 'plan' |
     'normal'. 'unknown' when the footer is not present in the captured tail."""

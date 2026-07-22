@@ -53,16 +53,18 @@ _DEFAULTS = {
 }
 HANDOFF_FILENAME = "CONTEXT_HANDOFF.md"
 
-# Active-execution markers: their presence means a command/tool/edit/test/build/
-# subagent/migration/deploy is still running, so the pane is NOT a safe boundary.
-# Deliberately broad — every term only ADDS suppression (biases toward NOT
-# clearing), never toward an unsafe clear.
+# Active-execution markers: RELIABLE live-run evidence only (aligned with
+# classify_state) — a live "esc to interrupt", a spinner WITH a running timer, or a
+# streaming token counter. A bare ✻/✽ glyph or a past-tense "Crunched/Baked for …"
+# is NOT active (it appears at rest) and must not falsely block a safe rotation.
+# The explicit run phrases add belt-and-suspenders for the owner's exclusion list;
+# when any of these truly run, classify_state already reports `working` (not idle).
 _ACTIVE_EXEC_RE = re.compile(
-    r"(esc to interrupt|\bthinking…|\bthinking\.\.\.|\brunning…|\brunning\.\.\.|"
-    r"\bcompacting|\btool call|\bexecuting\b|✻|✽|"
-    r"\bexploring\b|\bsub-?agent\b|\bdispatching\b|\bmigrat(?:e|ing)\b|"
-    r"\bdeploy(?:ing)?\b|\bbuilding\b|\binstalling\b|\bprovisioning\b|"
-    r"\bupgrading\b|\brestarting\b|running (?:the )?(?:tests?|build|migration))", re.I)
+    r"(esc to interrupt|…\s*\(\d+\s*m?s\b|[↑↓]\s*[\d.]+\s*k?\s*tokens\b|\bcompacting\b|"
+    r"\btool call\b|\bexecuting\b|\bexploring\b|\bsub-?agent\b|\bdispatching\b|"
+    r"\bmigrat(?:e|ing)\b|\bdeploy(?:ing)?\b|\bbuilding\b|\binstalling\b|"
+    r"\bprovisioning\b|\bupgrading\b|\brestarting\b|running (?:the )?(?:tests?|build|migration))",
+    re.I)
 
 # Finish-soon cues: the agent is one or two steps from done → finish, don't clear.
 _FINISH_SOON_RE = re.compile(
@@ -158,6 +160,13 @@ def finish_soon(agent: dict, rec: dict) -> bool:
         return True
     tail = agent.get("recent_activity") or agent.get("_tail") or ""
     return bool(_FINISH_SOON_RE.search(tail))
+
+
+def _next_phase_title(cfg: dict) -> Optional[str]:
+    phases = (cfg or {}).get("phases") or []
+    if len(phases) > 1:
+        return phases[1].get("title") or phases[1].get("id")
+    return None
 
 
 def substantial_work_remains(rec: dict, cfg: dict) -> bool:
@@ -308,10 +317,50 @@ def handoff_is_fresh(path: Optional[str], max_age: int) -> bool:
         return False
 
 
+def _handoff_candidates(root: str) -> list[str]:
+    """Where a coherent-checkpoint handoff may live: the module's own file at the
+    project root, or one the AGENT wrote under reports/."""
+    if not root:
+        return []
+    return [os.path.join(root, HANDOFF_FILENAME),
+            os.path.join(root, "reports", HANDOFF_FILENAME)]
+
+
+def existing_fresh_handoff(root: str, max_age: int) -> Optional[str]:
+    """The freshest existing handoff (module's or the agent's own) within the
+    freshness window — the 'coherent completed checkpoint' evidence."""
+    fresh = [(os.path.getmtime(p), p) for p in _handoff_candidates(root)
+             if os.path.exists(p) and (_now_ts() - os.path.getmtime(p)) <= max_age]
+    return max(fresh)[1] if fresh else None
+
+
+def completion_checkpoint_due(agent: dict, rec: dict, cfg: dict, tail: str, t: dict) -> bool:
+    """A coherent subphase completed with substantial approved work remaining, at a
+    safe idle boundary — a first-class rotation event that must fire even when the
+    pane prints NO context% figure. Evidence: a FRESH handoff/checkpoint (the
+    agent's own reports/CONTEXT_HANDOFF.md or a fresh completion report) or the
+    agent explicitly requesting /clear, while idle and safe."""
+    state = rec.get("state")
+    if state not in ("idle", "completed"):
+        return False
+    if not at_safe_boundary(agent, "idle"):
+        return False
+    if not substantial_work_remains(rec, cfg):
+        return False
+    root = cfg.get("root") or agent.get("claude_cwd") or agent.get("cwd") or ""
+    if rec.get("completion_evidence"):
+        return True
+    if existing_fresh_handoff(root, t["handoff_fresh_secs"]):
+        return True
+    # the agent parked a bare /clear request in its input line.
+    return bool(re.match(r"^/(clear|compact)\b", (agent.get("_pending_input") or "").strip()))
+
+
 # ── rotation ────────────────────────────────────────────────────────────────
-def _resume_instruction(root: str) -> str:
-    return (f"Your context was rotated to stay cheap and reliable. Read {HANDOFF_FILENAME} in "
-            f"{root} and continue the SAME approved task from where it left off. "
+def _resume_instruction(root: str, handoff_path: Optional[str] = None) -> str:
+    where = handoff_path or os.path.join(root, HANDOFF_FILENAME)
+    return (f"Your context was rotated to stay cheap and reliable. Read {where} and continue "
+            "the SAME approved task (the next subphase) from where it left off. "
             "Do not start a new task; re-verify tests before changing code.")
 
 
@@ -352,16 +401,25 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
             out["notification_state"] = "rotated_awaiting_resume"
         return out
 
-    if tier in ("ok", "unknown"):
+    # Pending-input snapshot (for checkpoint detection AND /clear safety).
+    pending = ac.pending_input_text(key, tail=tail)
+    agent["_pending_input"] = pending
+
+    # First-class event: a coherent subphase completed with substantial work
+    # remaining, at a safe idle boundary — fires even with NO context% figure.
+    checkpoint_due = completion_checkpoint_due(agent, rec, cfg, tail, t)
+
+    if tier in ("ok", "unknown") and not checkpoint_due:
         return out
 
-    # Finish-soon: never spend a rotation on work that is about to complete.
-    if finish_soon(agent, rec):
+    # Finish-soon suppression — but a COMPLETED coherent checkpoint IS the moment
+    # to rotate, so it is not suppressed.
+    if finish_soon(agent, rec) and not checkpoint_due:
         out["notification_state"] = "context_finish_soon_suppressed"
         return out
 
-    if tier == "checkpoint":
-        # Prepare/update a compact handoff at the boundary; do NOT /clear yet.
+    # 45–55% with no completed checkpoint: prepare a compact handoff only, no clear.
+    if tier == "checkpoint" and not checkpoint_due:
         if at_safe_boundary(agent, state):
             content, _h = build_handoff(rec, cfg, root, pct or t["checkpoint_pct"], t["handoff_max_bytes"])
             path = write_handoff(root, content)
@@ -371,49 +429,67 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
             out["notification_state"] = "context_checkpoint_pending"
         return out
 
-    # 55–65% rotates only when substantial work remains; >=65% rotates regardless.
-    if tier == "rotate_substantial" and not substantial_work_remains(rec, cfg):
+    # 55–65% rotates only when substantial work remains; >=65% and the completion
+    # checkpoint both rotate.
+    if tier == "rotate_substantial" and not substantial_work_remains(rec, cfg) and not checkpoint_due:
         out["notification_state"] = "context_rotate_skipped_finishing"
         return out
 
     if not at_safe_boundary(agent, state):
         out["notification_state"] = "context_rotate_deferred"
         return out
-    if state == "completed":
-        return out                                     # never rotate an idle completed agent
+    if state == "completed" and not checkpoint_due:
+        return out                                     # idle+done, no remaining work
 
-    # NEVER /clear while the agent has queued-but-unsubmitted input: agent_send
-    # pastes then hits Enter, so a `/clear` would concatenate and SUBMIT that
-    # queued text — possibly an owner-queued external/financial/production action.
-    if ac.pending_input_text(key, tail=tail):
+    reason = "checkpoint_completed_work_remaining" if checkpoint_due else "context_budget"
+
+    # /clear input-line safety: an empty line is safe; a bare `/clear` the agent
+    # itself queued is the rotation request (submitted as-is); ANY other queued
+    # instruction would be SUBMITTED by a paste → refuse.
+    clear_only = bool(re.match(r"^/(clear|compact)\s*$", pending))
+    if pending and not clear_only:
         out["notification_state"] = "context_rotate_deferred_pending_input"
         return out
 
+    # Build + verify the compact delta handoff; prefer the agent's own fresh
+    # checkpoint handoff as the resume pointer when present.
     content, chash = build_handoff(rec, cfg, root, pct or t["rotate_pct"], t["handoff_max_bytes"])
     if not can_rotate_again(key, chash, t["cooldown_secs"]):
-        out["notification_state"] = "context_rotate_cooldown"    # cooldown or unchanged-hash
+        out["notification_state"] = "context_rotate_cooldown"
         return out
-
     path = write_handoff(root, content)
     if not handoff_is_fresh(path, t["handoff_fresh_secs"]):
         out["notification_state"] = "context_handoff_failed"     # abort — never /clear without it
         return out
+    resume_handoff = existing_fresh_handoff(root, t["handoff_fresh_secs"]) or path
     out["handoff_path"] = path
+    out["rotation"] = {
+        "project": rec.get("project") or cfg.get("project"),
+        "reason": reason,
+        "completed_checkpoint": resume_handoff,
+        "remaining": rec.get("approved_next_task") or _next_phase_title(cfg),
+        "handoff_path": path,
+        "context_pct": pct,
+    }
     _save_rotation(key, phase, pct or 0.0, "handoff_written", path, chash, None)
 
     if not dispatch:
-        out["notification_state"] = "context_rotate_pending"     # dry-run: would rotate
+        # Surface the event even when the autonomous /clear is gated off. A
+        # completed-subphase checkpoint is the first-class `safe_rotation_due`
+        # event; a pure budget-tier rotation stays `context_rotate_pending`.
+        out["notification_state"] = "safe_rotation_due" if checkpoint_due else "context_rotate_pending"
         return out
 
     idem = f"ctxrot:{key}:{chash}"
     try:
-        ac.agent_send(key, "/clear", idempotency_key=f"{idem}:clear")
+        if clear_only:
+            ac.submit_clear(key, idempotency_key=f"{idem}:clear")   # submit the agent's own /clear
+        else:
+            ac.agent_send(key, "/clear", idempotency_key=f"{idem}:clear")
         time.sleep(0.6)
-        ac.agent_send(key, _resume_instruction(root), idempotency_key=f"{idem}:resume")
-        # /clear can reset the permission mode → restore `auto mode on` so the
-        # resumed approved task does not stall on routine prompts.
+        ac.agent_send(key, _resume_instruction(root, resume_handoff), idempotency_key=f"{idem}:resume")
         try:
-            ac.ensure_auto_mode(key)
+            ac.ensure_auto_mode(key)                    # /clear can reset mode → restore
         except Exception:  # noqa: BLE001 — best-effort; the sweep also re-enforces
             pass
     except ac.AgentControlError as e:
@@ -421,5 +497,6 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
         out["error"] = str(e)[:160]
         return out
     _save_rotation(key, phase, pct or 0.0, "cleared", path, chash, _now_ts())
-    out["notification_state"] = "context_rotated"
+    out["rotation"]["action"] = "rotated"
+    out["notification_state"] = "context_rotated_checkpoint" if checkpoint_due else "context_rotated"
     return out

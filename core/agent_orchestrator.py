@@ -564,12 +564,24 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             # waiting_owner / completed / budget-reset signal always wins.
             if cres.get("notification_state") and not rec.get("notification_state"):
                 rec["notification_state"] = cres["notification_state"]
-            if cres.get("notification_state", "").startswith("context_rot") \
-                    and cres["notification_state"] not in ("context_rotate_deferred",):
-                resolved.append({"agent": key, "context_tier": rec["context_tier"],
-                                 "context_pct": rec["context_pct"],
-                                 "action": cres["notification_state"],
-                                 "handoff_path": cres.get("handoff_path")})
+            cns = cres.get("notification_state", "")
+            # A completed-subphase rotation checkpoint is a FIRST-CLASS owner/ChatGPT
+            # event — surface it (project, completed checkpoint, remaining subphase,
+            # handoff, context, action) whether or not the /clear actually fired.
+            if cns in ("safe_rotation_due", "context_rotated_checkpoint") and cres.get("rotation"):
+                r = dict(cres["rotation"])
+                r.update({"agent": key, "event": cns,
+                          "action_taken": r.get("action", "surfaced (dispatch gated off)"
+                                                 if cns == "safe_rotation_due" else "rotated"),
+                          "exec_mode": rec.get("exec_mode")})
+                escalations.append({"agent": key, "project": rec["project"],
+                                    "event": cns, "rotation": r})
+            if cns.startswith("context_rot") or cns in ("safe_rotation_due",):
+                if cns not in ("context_rotate_deferred",):
+                    resolved.append({"agent": key, "context_tier": rec["context_tier"],
+                                     "context_pct": rec["context_pct"],
+                                     "action": cns, "handoff_path": cres.get("handoff_path"),
+                                     "rotation": cres.get("rotation")})
         except Exception as e:  # noqa: BLE001
             rec["context_tier"] = f"error:{str(e)[:60]}"
 
