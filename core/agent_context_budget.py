@@ -50,6 +50,11 @@ _DEFAULTS = {
     "cooldown_secs": int(os.getenv("CONTEXT_ROTATE_COOLDOWN_SECS", "2700")),   # 45 min
     "handoff_fresh_secs": int(os.getenv("CONTEXT_HANDOFF_FRESH_SECS", "900")),
     "handoff_max_bytes": int(os.getenv("CONTEXT_HANDOFF_MAX_BYTES", "2048")),  # ~2 KB
+    # An agent must be STABLY at rest — at rest last sweep AND no fresh activity for
+    # this many seconds — before any /clear. A single-instant idle read of an agent
+    # that is actually mid-turn must never trigger a rotation (2026-07-22 regression:
+    # a momentary lull on the first post-restart sweep cleared a working agent).
+    "min_idle_dwell_secs": int(os.getenv("CONTEXT_MIN_IDLE_DWELL_SECS", "150")),
 }
 HANDOFF_FILENAME = "CONTEXT_HANDOFF.md"
 
@@ -150,6 +155,24 @@ def at_safe_boundary(agent: dict, state: str) -> bool:
     if _ACTIVE_EXEC_RE.search(tail):
         return False
     return state == "idle"
+
+
+def stably_idle(rec: dict, prev: dict, min_dwell: int) -> bool:
+    """True only when the agent is SETTLED, not momentarily quiet: it was already
+    at rest on the PREVIOUS sweep (so a single-instant idle read of a mid-turn
+    agent cannot trigger anything), and no fresh activity has been observed for at
+    least `min_dwell` seconds. A brand-new record (no prior sweep) is never
+    'settled' — the first post-restart sweep must not rotate."""
+    prev_state = (prev or {}).get("state")
+    if prev_state not in ("idle", "completed"):
+        return False
+    lfa = rec.get("last_fresh_activity_ts") or (prev or {}).get("last_fresh_activity_ts")
+    if not lfa:
+        return False
+    try:
+        return (_now_ts() - float(lfa)) >= min_dwell
+    except (TypeError, ValueError):
+        return False
 
 
 def finish_soon(agent: dict, rec: dict) -> bool:
@@ -334,6 +357,18 @@ def existing_fresh_handoff(root: str, max_age: int) -> Optional[str]:
     return max(fresh)[1] if fresh else None
 
 
+def agent_authored_handoff(root: str, max_age: int) -> Optional[str]:
+    """The AGENT's own fresh checkpoint handoff under reports/, if present. This is
+    the authoritative, detailed one to RESUME from — preferred over the module's
+    compact root/ handoff so the agent picks up its real subphase detail."""
+    if not root:
+        return None
+    p = os.path.join(root, "reports", HANDOFF_FILENAME)
+    if os.path.exists(p) and (_now_ts() - os.path.getmtime(p)) <= max_age:
+        return p
+    return None
+
+
 def completion_checkpoint_due(agent: dict, rec: dict, cfg: dict, tail: str, t: dict) -> bool:
     """A coherent subphase completed with substantial approved work remaining, at a
     safe idle boundary — a first-class rotation event that must fire even when the
@@ -441,6 +476,12 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
     if state == "completed" and not checkpoint_due:
         return out                                     # idle+done, no remaining work
 
+    # STABLE-IDLE gate — the agent must have been at rest across sweeps + a dwell,
+    # so a single-instant idle read of a mid-turn agent can never clear live work.
+    if not stably_idle(rec, prev, t["min_idle_dwell_secs"]):
+        out["notification_state"] = "context_rotate_deferred_unsettled"
+        return out
+
     reason = "checkpoint_completed_work_remaining" if checkpoint_due else "context_budget"
 
     # /clear input-line safety: an empty line is safe; a bare `/clear` the agent
@@ -451,8 +492,9 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
         out["notification_state"] = "context_rotate_deferred_pending_input"
         return out
 
-    # Build + verify the compact delta handoff; prefer the agent's own fresh
-    # checkpoint handoff as the resume pointer when present.
+    # Capture the AGENT's own detailed handoff BEFORE writing the module's compact
+    # one (write_handoff would otherwise become the freshest and shadow it).
+    agent_handoff = agent_authored_handoff(root, t["handoff_fresh_secs"])
     content, chash = build_handoff(rec, cfg, root, pct or t["rotate_pct"], t["handoff_max_bytes"])
     if not can_rotate_again(key, chash, t["cooldown_secs"]):
         out["notification_state"] = "context_rotate_cooldown"
@@ -461,7 +503,7 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
     if not handoff_is_fresh(path, t["handoff_fresh_secs"]):
         out["notification_state"] = "context_handoff_failed"     # abort — never /clear without it
         return out
-    resume_handoff = existing_fresh_handoff(root, t["handoff_fresh_secs"]) or path
+    resume_handoff = agent_handoff or path       # resume from the agent's detailed handoff
     out["handoff_path"] = path
     out["rotation"] = {
         "project": rec.get("project") or cfg.get("project"),

@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 
 from core import agent_context_budget as cb
+
+
+def _settled_prev():
+    """A prior sweep that was at rest long enough to satisfy the stable-idle gate."""
+    return {"state": "idle", "last_fresh_activity_ts": time.time() - 999}
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +34,7 @@ def _agent(tail="", target="seo-audit:0.0"):
 def _rec(state="idle", **kw):
     base = {"agent_key": "seo-audit:0.0", "session": "seo-audit", "project": "seo",
             "phase": "stage-4", "state": state, "approved_goal": "SEO Stage 4",
-            "report_path": "reports/SEO.md"}
+            "report_path": "reports/SEO.md", "last_fresh_activity_ts": time.time() - 999}
     base.update(kw)
     return base
 
@@ -122,9 +128,64 @@ def test_no_clear_when_input_line_has_queued_instruction(monkeypatch, tmp_path):
     a = _agent(tail=tail)
     rec = _rec(state="idle", agent_key="job:0.0", approved_next_task="phase 2")
     out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "1"}, {"id": "2"}]},
-                      rec, {}, act=True, dispatch=True)
+                      rec, _settled_prev(), act=True, dispatch=True)
     assert out["notification_state"] == "context_rotate_deferred_pending_input"
     assert sent == []                                   # NEVER cleared
+
+
+def test_stably_idle_gate():
+    import time as _t
+    now = _t.time()
+    T = cb._DEFAULTS
+    # prev was working → never settled (a momentary idle read cannot rotate).
+    assert cb.stably_idle({"last_fresh_activity_ts": now - 999}, {"state": "working"}, T["min_idle_dwell_secs"]) is False
+    # prev at rest but activity too recent → not settled.
+    assert cb.stably_idle({"last_fresh_activity_ts": now - 10}, {"state": "idle"}, T["min_idle_dwell_secs"]) is False
+    # prev at rest AND activity older than the dwell → settled.
+    assert cb.stably_idle({"last_fresh_activity_ts": now - 999}, {"state": "idle"}, T["min_idle_dwell_secs"]) is True
+    # no prior sweep → never settled (first post-restart sweep must not rotate).
+    assert cb.stably_idle({"last_fresh_activity_ts": now - 999}, {}, T["min_idle_dwell_secs"]) is False
+
+
+def test_no_clear_when_unsettled_even_at_safe_boundary(monkeypatch, tmp_path):
+    # The 2026-07-22 live regression: a working agent momentarily read idle on the
+    # first post-restart sweep and got cleared. Now blocked by the stable-idle gate.
+    import time as _t
+    sent = []
+    monkeypatch.setattr(cb, "existing_fresh_handoff",
+                        lambda root, max_age: str(tmp_path / "reports" / "CONTEXT_HANDOFF.md"))
+    monkeypatch.setattr(cb.ac, "agent_send", lambda *a, **k: sent.append(a))
+    monkeypatch.setattr(cb.ac, "submit_clear", lambda *a, **k: sent.append(("submit",) + a))
+    a = _agent(tail="done. ❯ ")
+    rec = _rec(state="idle", approved_next_task="Phase 8d", last_fresh_activity_ts=_t.time() - 5)
+    prev = {"state": "working"}                         # was mid-turn last sweep
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}]},
+                      rec, prev, act=True, dispatch=True)
+    assert out["notification_state"] == "context_rotate_deferred_unsettled"
+    assert sent == []                                   # NEVER cleared a just-working agent
+
+
+def test_resume_prefers_agent_authored_handoff(monkeypatch, tmp_path):
+    import time as _t
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    (reports / "CONTEXT_HANDOFF.md").write_text("agent detailed handoff 8a-8c → 8d")
+    sent = []
+    monkeypatch.setattr(cb, "existing_fresh_handoff",
+                        lambda root, max_age: str(reports / "CONTEXT_HANDOFF.md"))
+    monkeypatch.setattr(cb.ac, "pending_input_text", lambda key, tail=None: "")
+    monkeypatch.setattr(cb.ac, "agent_send", lambda key, text, **k: sent.append(text))
+    monkeypatch.setattr(cb.ac, "ensure_auto_mode", lambda *a, **k: None)
+    a = _agent(tail="done. ❯ ")
+    rec = _rec(state="idle", approved_next_task="Phase 8d",
+               last_fresh_activity_ts=_t.time() - 999)
+    prev = {"state": "idle", "last_fresh_activity_ts": _t.time() - 999}
+    out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}]},
+                      rec, prev, act=True, dispatch=True)
+    assert out["notification_state"] == "context_rotated_checkpoint"
+    # resume message points at the AGENT's reports/ handoff, not the module's root one.
+    resume = next(t for t in sent if "Read" in t)
+    assert "reports/CONTEXT_HANDOFF.md" in resume
 
 
 def test_completion_checkpoint_due_fires_without_context_signal(monkeypatch, tmp_path):
@@ -136,7 +197,7 @@ def test_completion_checkpoint_due_fires_without_context_signal(monkeypatch, tmp
     rec = _rec(state="idle", approved_next_task="Phase 8d")
     assert cb.completion_checkpoint_due(a, rec, AUTO, a["_tail"], cb._DEFAULTS) is True
     out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}],
-                          "project": "seo"}, rec, {}, act=True, dispatch=False)
+                          "project": "seo"}, rec, _settled_prev(), act=True, dispatch=False)
     assert out["notification_state"] == "safe_rotation_due"
     assert out["rotation"]["reason"] == "checkpoint_completed_work_remaining"
     assert out["rotation"]["remaining"] in ("Phase 8d", "8d")
@@ -155,7 +216,7 @@ def test_checkpoint_rotation_submits_agents_own_clear(monkeypatch, tmp_path):
     a = _agent(tail="done. ❯ /clear")
     rec = _rec(state="idle", approved_next_task="Phase 8d")
     out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}]},
-                      rec, {}, act=True, dispatch=True)
+                      rec, _settled_prev(), act=True, dispatch=True)
     assert out["notification_state"] == "context_rotated_checkpoint"
     assert submitted == ["seo-audit:0.0"]                # submitted the agent's own /clear
     assert not any(t == "/clear" for t in sent)          # never pasted a second /clear
@@ -172,7 +233,7 @@ def test_checkpoint_refuses_when_nonclear_instruction_queued(monkeypatch, tmp_pa
     a = _agent(tail="done. ❯ enable premium and charge")
     rec = _rec(state="idle", approved_next_task="Phase 8d")
     out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d"}]},
-                      rec, {}, act=True, dispatch=True)
+                      rec, _settled_prev(), act=True, dispatch=True)
     assert out["notification_state"] == "context_rotate_deferred_pending_input"
     assert sent == []                                    # never cleared/submitted
 
@@ -185,7 +246,7 @@ def test_rotation_restores_auto_mode_after_clear(monkeypatch, tmp_path):
     a = _agent(tail="quiet /clear to save 700k tokens\n──────\n❯ \n──────")   # 70%, empty input
     rec = _rec(state="idle", agent_key="seo-audit:0.0", approved_next_task="phase 2")
     out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "1"}, {"id": "2"}]},
-                      rec, {}, act=True, dispatch=True)
+                      rec, _settled_prev(), act=True, dispatch=True)
     assert out["notification_state"] == "context_rotated"
     assert any(t == "/clear" for _, t in sent)
     assert ensured == ["seo-audit:0.0"]                 # auto mode restored after clear
@@ -275,7 +336,7 @@ def test_mid_tier_rotates_when_substantial_and_safe(monkeypatch, tmp_path):
            "phases": [{"id": "stage-4"}, {"id": "stage-5"}], "approved_goal": "SEO Stage 4"}
     a = _agent(tail="/clear to save 600k tokens")        # 60% used
     rec = _rec(state="idle", approved_next_task="stage-5 (ready)")
-    out = cb.evaluate(a, cfg, rec, {}, dispatch=True)
+    out = cb.evaluate(a, cfg, rec, _settled_prev(), dispatch=True)
     assert out["notification_state"] == "context_rotated"
     assert os.path.exists(os.path.join(str(tmp_path), cb.HANDOFF_FILENAME))
     assert [t for t, _ in sent] == [a["target"], a["target"]]     # /clear then resume
@@ -302,7 +363,7 @@ def test_dry_run_writes_handoff_but_does_not_clear(monkeypatch, tmp_path):
     cfg = {"mode": "auto", "root": str(tmp_path), "project": "seo",
            "phases": [{"id": "a"}, {"id": "b"}], "approved_goal": "g"}
     a = _agent(tail="/clear to save 900k tokens")
-    out = cb.evaluate(a, cfg, _rec(state="idle", approved_next_task="b"), {}, dispatch=False)
+    out = cb.evaluate(a, cfg, _rec(state="idle", approved_next_task="b"), _settled_prev(), dispatch=False)
     assert out["notification_state"] == "context_rotate_pending"
     assert sent == []
     assert os.path.exists(os.path.join(str(tmp_path), cb.HANDOFF_FILENAME))
