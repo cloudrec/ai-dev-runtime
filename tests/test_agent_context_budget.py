@@ -156,7 +156,7 @@ def test_no_clear_when_unsettled_even_at_safe_boundary(monkeypatch, tmp_path):
                         lambda root, max_age: str(tmp_path / "reports" / "CONTEXT_HANDOFF.md"))
     monkeypatch.setattr(cb.ac, "agent_send", lambda *a, **k: sent.append(a))
     monkeypatch.setattr(cb.ac, "submit_clear", lambda *a, **k: sent.append(("submit",) + a))
-    a = _agent(tail="done. ❯ ")
+    a = _agent(tail="done · /clear to save 900k tokens\n❯ ")
     rec = _rec(state="idle", approved_next_task="Phase 8d", last_fresh_activity_ts=_t.time() - 5)
     prev = {"state": "working"}                         # was mid-turn last sweep
     out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery (read-only)"}]},
@@ -176,7 +176,7 @@ def test_resume_prefers_agent_authored_handoff(monkeypatch, tmp_path):
     monkeypatch.setattr(cb.ac, "pending_input_text", lambda key, tail=None: "")
     monkeypatch.setattr(cb.ac, "agent_send", lambda key, text, **k: sent.append(text))
     monkeypatch.setattr(cb.ac, "ensure_auto_mode", lambda *a, **k: None)
-    a = _agent(tail="done. ❯ ")
+    a = _agent(tail="done · /clear to save 900k tokens\n❯ ")   # high context
     rec = _rec(state="idle", approved_next_task="Phase 8d",
                last_fresh_activity_ts=_t.time() - 999)
     prev = {"state": "idle", "last_fresh_activity_ts": _t.time() - 999}
@@ -290,20 +290,24 @@ def test_resume_message_carries_exact_remaining_text(monkeypatch, tmp_path):
     assert "full test" in resume.lower()                            # explicit no-auto-test guard
 
 
-def test_completion_checkpoint_due_fires_without_context_signal(monkeypatch, tmp_path):
-    # A coherent subphase completed (fresh handoff) + work remaining, idle+safe,
-    # NO context% figure in the pane → still a first-class rotation event.
+def test_surfacing_without_context_but_no_clear(monkeypatch, tmp_path):
+    # Owner policy: a completed checkpoint SURFACES even with NO context% figure,
+    # but the /clear itself must NOT fire until context reaches threshold.
     monkeypatch.setattr(cb, "existing_fresh_handoff",
                         lambda root, max_age: str(tmp_path / "reports" / "CONTEXT_HANDOFF.md"))
-    a = _agent(tail="done 8a-8c. ❯ ")                    # no context% signal
+    sent = []
+    monkeypatch.setattr(cb.ac, "agent_send", lambda *a, **k: sent.append(a))
+    a = _agent(tail="done 8a-8c. ❯ ")                    # NO context% signal
     rec = _rec(state="idle", approved_next_task="Phase 8d")
     wr_cfg = {"root": str(tmp_path), "project": "seo",
               "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery (read-only)"}]}
-    assert cb.completion_checkpoint_due(a, rec, wr_cfg, a["_tail"], cb._DEFAULTS) is True
-    out = cb.evaluate(a, wr_cfg, rec, _settled_prev(), act=True, dispatch=False)
-    assert out["notification_state"] == "safe_rotation_due"
-    assert out["rotation"]["reason"] == "checkpoint_completed_work_remaining"
-    assert out["rotation"]["remaining"] == "run remote discovery (read-only)"
+    # SURFACING fires (independent of context):
+    ev = cb.detect_surfaceable_event(a, rec, wr_cfg, a["_tail"])
+    assert ev["event_type"] == "checkpoint_completed_work_remaining"
+    assert ev["remaining"] == "run remote discovery (read-only)"
+    # but evaluate does NOT /clear without a context signal:
+    out = cb.evaluate(a, wr_cfg, rec, _settled_prev(), act=True, dispatch=True)
+    assert out.get("notification_state") is None and sent == []
 
 
 def test_checkpoint_rotation_submits_agents_own_clear(monkeypatch, tmp_path):
@@ -316,7 +320,7 @@ def test_checkpoint_rotation_submits_agents_own_clear(monkeypatch, tmp_path):
     monkeypatch.setattr(cb.ac, "submit_clear", lambda key, **k: submitted.append(key) or True)
     monkeypatch.setattr(cb.ac, "agent_send", lambda key, text, **k: sent.append(text))
     monkeypatch.setattr(cb.ac, "ensure_auto_mode", lambda key, **k: ensured.append(key))
-    a = _agent(tail="done. ❯ /clear")
+    a = _agent(tail="done · /clear to save 900k tokens\n❯ /clear")
     rec = _rec(state="idle", approved_next_task="Phase 8d")
     out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery (read-only)"}]},
                       rec, _settled_prev(), act=True, dispatch=True)
@@ -333,7 +337,7 @@ def test_checkpoint_refuses_when_nonclear_instruction_queued(monkeypatch, tmp_pa
                         lambda root, max_age: str(tmp_path / "CONTEXT_HANDOFF.md"))
     monkeypatch.setattr(cb.ac, "pending_input_text", lambda key, tail=None: "enable premium and charge")
     monkeypatch.setattr(cb.ac, "agent_send", lambda *a, **k: sent.append(a))
-    a = _agent(tail="done. ❯ enable premium and charge")
+    a = _agent(tail="done · /clear to save 900k tokens\n❯ enable premium and charge")
     rec = _rec(state="idle", approved_next_task="Phase 8d")
     out = cb.evaluate(a, {"root": str(tmp_path), "phases": [{"id": "8c"}, {"id": "8d", "approved_task_text": "run remote discovery (read-only)"}]},
                       rec, _settled_prev(), act=True, dispatch=True)

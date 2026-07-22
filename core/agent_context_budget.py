@@ -538,25 +538,27 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
             out["notification_state"] = "rotated_awaiting_resume"
         return out
 
-    # Pending-input snapshot (for checkpoint detection AND /clear safety).
+    # Pending-input snapshot (for /clear safety) + completion class (drives resume).
     pending = ac.pending_input_text(key, tail=tail)
     agent["_pending_input"] = pending
+    cls, _rem_early = completion_class(rec, cfg, tail)
 
-    # First-class event: a coherent subphase completed with substantial work
-    # remaining, at a safe idle boundary — fires even with NO context% figure.
+    # The actual /clear is ALWAYS gated on a real context-threshold signal (owner
+    # policy: "only when context reaches policy threshold"). A completed/checkpoint
+    # event at LOW context is SURFACED separately (durable commander_event) but must
+    # NOT trigger a /clear. checkpoint_due is retained only for the notification name.
     checkpoint_due = completion_checkpoint_due(agent, rec, cfg, tail, t)
 
-    if tier in ("ok", "unknown") and not checkpoint_due:
+    if tier in ("ok", "unknown"):
         return out
 
-    # Finish-soon suppression — but a COMPLETED coherent checkpoint IS the moment
-    # to rotate, so it is not suppressed.
-    if finish_soon(agent, rec) and not checkpoint_due:
+    # Finish-soon suppression — unless there is genuine work_remaining to rotate INTO.
+    if finish_soon(agent, rec) and cls != "work_remaining":
         out["notification_state"] = "context_finish_soon_suppressed"
         return out
 
-    # 45–55% with no completed checkpoint: prepare a compact handoff only, no clear.
-    if tier == "checkpoint" and not checkpoint_due:
+    # 45–55%: prepare a compact handoff only, no clear.
+    if tier == "checkpoint":
         if at_safe_boundary(agent, state):
             content, _h = build_handoff(rec, cfg, root, pct or t["checkpoint_pct"], t["handoff_max_bytes"])
             path = write_handoff(root, content)
@@ -566,17 +568,15 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
             out["notification_state"] = "context_checkpoint_pending"
         return out
 
-    # 55–65% rotates only when substantial work remains; >=65% and the completion
-    # checkpoint both rotate.
-    if tier == "rotate_substantial" and not substantial_work_remains(rec, cfg) and not checkpoint_due:
+    # 55–65% rotates only when genuine work remains to rotate INTO; >=65% rotates.
+    if tier == "rotate_substantial" and cls != "work_remaining" \
+            and not substantial_work_remains(rec, cfg):
         out["notification_state"] = "context_rotate_skipped_finishing"
         return out
 
     if not at_safe_boundary(agent, state):
         out["notification_state"] = "context_rotate_deferred"
         return out
-    if state == "completed" and not checkpoint_due:
-        return out                                     # idle+done, no remaining work
 
     # STABLE-IDLE gate — the agent must have been at rest across sweeps + a dwell,
     # so a single-instant idle read of a mid-turn agent can never clear live work.
