@@ -95,9 +95,14 @@ _SECRET_PATH_RE = re.compile(
 _GIT_READ = {"status", "diff", "log", "show", "branch", "rev-parse", "ls-files",
              "remote", "config", "describe", "blame", "shortlog", "cat-file",
              "rev-list", "for-each-ref", "reflog", "tag", "stash", "grep", "whatchanged"}
-_GIT_WRITE = {"push", "commit", "reset", "rebase", "checkout", "switch", "merge",
-              "clean", "rm", "mv", "add", "restore", "cherry-pick", "revert",
+_GIT_WRITE = {"push", "reset", "rebase", "checkout", "switch", "merge",
+              "clean", "rm", "mv", "restore", "cherry-pick", "revert",
               "fetch", "pull", "clone", "init", "gc", "prune", "am", "apply", "worktree"}
+# Local, reversible writes safe to auto-approve inside an approved task repo:
+# `git add` (secret-named paths already blocked upstream) and `git commit` (NOT
+# --amend, which rewrites history). Push stays out — the stateful push policy
+# gates it separately.
+_GIT_LOCAL_WRITE = {"add", "commit"}
 _DOCKER_READ = {"ps", "inspect", "logs", "images", "image", "version", "info",
                 "top", "stats", "port", "diff", "history", "events", "system",
                 "context", "network", "volume", "container", "compose", "stack"}
@@ -217,7 +222,15 @@ def _check_git(args):
         if names and not all(_BRANCH_NAME_RE.match(n) for n in names):
             raise _Unsafe("git branch: invalid name")
         return  # `git branch` (list = read) or `git branch NAME` (create)
-    if sub in _GIT_WRITE or sub not in _GIT_READ:
+    if sub == "add":
+        return                       # local staging; secret paths already blocked upstream
+    if sub == "commit":
+        if "--amend" in args:
+            raise _Unsafe("git commit --amend rewrites history")
+        if "--no-verify" in args or "-n" in args:
+            raise _Unsafe("git commit --no-verify skips hooks")
+        return                       # local, reversible commit
+    if sub in _GIT_WRITE or (sub not in _GIT_READ and sub not in _GIT_LOCAL_WRITE):
         raise _Unsafe(f"git {sub or '?'} not read-only")
     if sub == "config" and any(not a.startswith("-") and "=" in a for a in args[args.index(sub) + 1:]):
         raise _Unsafe("git config write")

@@ -79,7 +79,6 @@ def test_readonly_sql_is_safe(cmd):
     "systemctl restart ai-runtime.service",
     "systemctl stop seo-backend",
     "git push origin main",
-    "git commit -am wip",
     "git reset --hard HEAD~1",
     "git checkout main",
     "git clean -fd",
@@ -384,6 +383,27 @@ def test_hardening_writes_and_external_fail_closed(cmd):
 
 def test_unbalanced_quote_is_denied():
     _unsafe("grep 'unterminated file")
+
+
+# ── local git add/commit auto-approve (owner: routine work, no manual Yes) ───
+@pytest.mark.parametrize("cmd", [
+    "git add -A", "git add .", "git add backend/x.py file2.py",
+    "git commit -m 'wip'", "git commit -am 'feat: x'", "git commit -a -m x",
+    "cd /opt/seo && git add -A && git commit -m done",
+])
+def test_local_git_add_commit_safe(cmd):
+    _safe(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "git commit --amend -m x",              # history rewrite
+    "git commit --no-verify -m x",          # skips hooks
+    "git add .env", "git add backend/.env", "git add config/credentials.json",
+    "git push", "git push origin main",     # push stays out of the static policy
+    "git reset --hard HEAD~1", "git rebase -i main", "git rm -rf .",
+])
+def test_git_writes_and_rewrites_still_denied(cmd):
+    _unsafe(cmd)
 
 
 # ── safe exit-code expansions (the 2026-07-22 failed canary) — SAFE ─────────
