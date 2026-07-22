@@ -298,10 +298,9 @@ def detect_surfaceable_event(agent: dict, rec: dict, cfg: dict, tail: str,
         return None                                   # untracked agent → no completion event
     active_id = active_id or (_next or {}).get("id")
     state = rec.get("state")
-    if state not in ("idle", "completed", "externally_blocked"):
-        return None
-    # Active-evidence override — a running command / thinking marker beats a stale idle.
-    if _ACTIVE_EXEC_RE.search(tail or "") or _THINKING_RE.search(tail or ""):
+    # Active-evidence override — a running command / thinking marker (or state=working)
+    # beats everything: never surface while the agent is executing.
+    if state == "working" or _ACTIVE_EXEC_RE.search(tail or "") or _THINKING_RE.search(tail or ""):
         return None
     ident = resolve_active_project(agent, rec, cfg, tail)
     base = {"project": ident["project"], "canonical_task_id": active_id,
@@ -309,7 +308,7 @@ def detect_surfaceable_event(agent: dict, rec: dict, cfg: dict, tail: str,
             "command_path": ident["command_path"], "context_pct": detect_context_pct(tail)}
 
     # OWNER-DECLARED completion of the tracked task (authoritative). Surface exactly
-    # once, keyed to the canonical task id.
+    # once regardless of the momentary rest state (idle / completed / waiting).
     if cfg.get("active_task_completed"):
         et = ("task_completed_waiting_external_action" if cfg.get("external_inputs_only")
               else "task_completed_no_remaining_work")
@@ -319,9 +318,11 @@ def detect_surfaceable_event(agent: dict, rec: dict, cfg: dict, tail: str,
                 "result": cfg.get("active_task_result") or "completed",
                 "dedup_key": f"complete:{active_id}"}
 
-    # In-progress: a checkpoint requires stable idle + a fresh handoff (a momentary
-    # lull of a working agent never surfaces).
-    if _ACTIVE_EXEC_RE.search(tail or "") or not at_safe_boundary(agent, "idle"):
+    # In-progress checkpoint: at-rest state + stable idle + a fresh handoff (a
+    # momentary lull of a working agent never surfaces).
+    if state not in ("idle", "completed", "externally_blocked"):
+        return None
+    if not at_safe_boundary(agent, "idle"):
         return None
     if not stably_idle(rec, prev or {}, _DEFAULTS["min_idle_dwell_secs"]):
         return None
