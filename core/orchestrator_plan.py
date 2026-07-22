@@ -255,13 +255,15 @@ def tick(*, dispatch: bool = True,
     pending = [t for t in tasks if t["status"] in ("pending", "dispatched", "in_progress", "blocked")]
     waiting_ext = [t for t in tasks if t["status"] == "waiting_external"]
     done = [t for t in tasks if t["status"] == "completed"]
-    if not pending:
-        state = "ORCHESTRATOR_ALL_DISPATCHED_WAITING" if waiting_ext and not done else \
-                ("GOAL_COMPLETE" if not waiting_ext else "GOAL_COMPLETE_WAITING_EXTERNAL")
-        if state.startswith("GOAL_COMPLETE"):
-            complete_goal(goal["id"])
-    else:
+    if pending:
         state = "ORCHESTRATING"
+    elif waiting_ext:
+        # internal work done, but a task waits on EXTERNAL inputs → keep the goal
+        # active + visible (never IDLE_NO_GOAL, never invent work, never restart it).
+        state = "GOAL_COMPLETE_WAITING_EXTERNAL"
+    else:
+        state = "GOAL_COMPLETE"
+        complete_goal(goal["id"])
     return {
         "state": state, "goal": goal,
         "queue_size": len(pending),
@@ -279,15 +281,29 @@ def tick(*, dispatch: bool = True,
     }
 
 
+def _latest_goal() -> Optional[dict]:
+    conn = _db()
+    try:
+        row = conn.execute("SELECT id,text,status,created_at,updated_at FROM orchestrator_goal "
+                           "ORDER BY id DESC LIMIT 1").fetchone()
+        return dict(zip(("id", "text", "status", "created_at", "updated_at"), row)) if row else None
+    finally:
+        conn.close()
+
+
 def status() -> dict:
-    """Read-only orchestrator plan state for Owner OS mission control (no mutation)."""
-    goal = get_active_goal()
+    """Read-only orchestrator plan state for Owner OS mission control (no mutation).
+    A completed goal is still shown honestly — ORCHESTRATOR_IDLE_NO_GOAL means NO
+    goal was ever set, not that work finished."""
+    goal = get_active_goal() or _latest_goal()
     if not goal:
         return {"state": "ORCHESTRATOR_IDLE_NO_GOAL", "goal": None, "queue_size": 0,
                 "last_tick": _state_get("last_tick")}
     tasks = list_tasks(goal["id"])
     pending = [t for t in tasks if t["status"] in ("pending", "dispatched", "in_progress", "blocked")]
-    return {"state": "ORCHESTRATING" if pending else "GOAL_COMPLETE", "goal": goal,
+    wext = [t for t in tasks if t["status"] == "waiting_external"]
+    state = "ORCHESTRATING" if pending else ("GOAL_COMPLETE_WAITING_EXTERNAL" if wext else "GOAL_COMPLETE")
+    return {"state": state, "goal": goal,
             "queue_size": len(pending),
             "assignments": [{"task_id": t["id"], "agent": t["agent"], "title": t["title"],
                              "project": t["project"], "status": t["status"]} for t in tasks],
