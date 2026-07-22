@@ -385,3 +385,57 @@ def test_hardening_writes_and_external_fail_closed(cmd):
 
 def test_unbalanced_quote_is_denied():
     _unsafe("grep 'unterminated file")
+
+
+# ── wrapped-command extraction (narrow pane) — the 2nd half of the live bug ──
+# In a narrow pane Claude wraps a long command across box-rows and drops the
+# space at each soft break; the first row alone is a TRUNCATED, unbalanced read.
+WRAPPED_DIALOG = """\
+● Running 1 shell command…
+
+ Bash command
+
+   docker exec seo-backend-1 sh -c 'cd
+   /opt/seo/backend && alembic heads'
+   Run alembic heads as requested
+
+ This command requires approval
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for: docker exec seo-backend-1 *
+   3. No
+"""
+
+WRAPPED_MULTIROW = """\
+ Bash command
+
+   git log --oneline -5 | grep -iE
+   'fix|feat' | head -20
+   Search recent commits
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+"""
+
+
+def test_wrapped_command_is_reassembled_and_classified():
+    cmd = pr.extract_pending_command(WRAPPED_DIALOG)
+    assert cmd == "docker exec seo-backend-1 sh -c 'cd /opt/seo/backend && alembic heads'"
+    assert pr.classify_command(cmd)["safe"] is True     # the exact live canary
+
+
+def test_wrapped_command_drops_the_description_row():
+    cmd = pr.extract_pending_command(WRAPPED_MULTIROW)
+    assert cmd == "git log --oneline -5 | grep -iE 'fix|feat' | head -20"
+    assert "Search recent commits" not in cmd
+    assert pr.classify_command(cmd)["safe"] is True
+
+
+def test_truncated_first_row_alone_is_never_returned():
+    # The pre-fix bug: returning just `docker … sh -c 'cd` (unbalanced) → the
+    # reassembly must yield the full balanced command, not the truncated prefix.
+    cmd = pr.extract_pending_command(WRAPPED_DIALOG)
+    assert cmd.count("'") % 2 == 0                       # balanced quotes
+    assert cmd.endswith("alembic heads'")

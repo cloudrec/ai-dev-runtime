@@ -669,10 +669,97 @@ def extract_pending_command(pane_tail: str) -> Optional[str]:
             break
     if header_idx is None:
         return None
-    # The command is the FIRST non-empty line after the header; any following
-    # line is the human description and must be ignored.
+    # Collect the command group: consecutive non-blank lines after the header
+    # (skipping the leading blank) up to the next blank line. In a narrow pane the
+    # command WRAPS across several box-rows and a one-line human description
+    # follows it — so the command is NOT simply the first row.
+    group: list[str] = []
+    started = False
     for j in range(header_idx + 1, proceed_idx):
-        cmd = lines[j].strip(" │╭╮╰╯─⎿●>").strip()
-        if cmd:
-            return cmd
+        cell = lines[j].strip(" │╭╮╰╯─⎿●>").strip()
+        if not cell:
+            if started:
+                break            # blank after content ends the group
+            continue             # skip the blank right after the header
+        started = True
+        group.append(cell)
+    if not group:
+        return None
+    return _reconstruct_command(group)
+
+
+def _quote_balanced(s: str) -> bool:
+    try:
+        shlex.split(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _wrap_rows(text: str, width: int) -> list[str]:
+    """Reproduce Claude Code's box word-wrap: whole tokens per row (the space at a
+    soft break is dropped), a token longer than the row is hard-broken and FILLS
+    the current row first. Used only to VERIFY a reconstruction reproduces the
+    observed rows — a wrong join cannot pass."""
+    rows: list[str] = []
+    cur = ""
+    for tok in text.split(" "):
+        while len(tok) > width:
+            room = width - len(cur) - (1 if cur else 0)
+            if cur and room > 0:
+                cur += (" " if cur else "") + tok[:room]
+                tok = tok[room:]
+            if cur:
+                rows.append(cur)
+                cur = ""
+            take = min(len(tok), width)
+            if len(tok) > width:
+                rows.append(tok[:width])
+                tok = tok[width:]
+            else:
+                cur = tok
+                tok = ""
+        if not tok:
+            continue
+        if not cur:
+            cur = tok
+        elif len(cur) + 1 + len(tok) <= width:
+            cur += " " + tok
+        else:
+            rows.append(cur)
+            cur = tok
+    if cur:
+        rows.append(cur)
+    return rows
+
+
+# Shell-significant characters. A box-row containing NONE of these (and not
+# starting a flag) is Claude's human description, not a command continuation.
+_SHELL_SIGNIFICANT = set("/\\|&;$<>=\"'`(){}[]*?~!#-")
+
+
+def _looks_like_description(row: str) -> bool:
+    r = row.strip()
+    return bool(r) and not any(c in _SHELL_SIGNIFICANT for c in r)
+
+
+def _reconstruct_command(group: list[str]) -> Optional[str]:
+    """Rebuild the wrapped command from its box-rows, dropping the trailing human
+    description. Accept a reconstruction only when re-wrapping it reproduces the
+    exact rows AND it is quote-balanced — a partial / ambiguous read is never
+    auto-approved. Prefer the SHORTEST verified span whose remaining rows are all
+    pure prose (the description); a real command continuation carries a shell
+    metacharacter, so this can never truncate a safety-relevant token."""
+    if len(group) == 1:
+        return group[0] if _quote_balanced(group[0]) else None
+    for k in range(1, len(group) + 1):
+        rows = group[:k]
+        candidate = " ".join(rows)
+        if not _quote_balanced(candidate):
+            continue
+        width = max(len(r) for r in rows)
+        if _wrap_rows(candidate, width) != rows:
+            continue
+        if all(_looks_like_description(r) for r in group[k:]):
+            return candidate
     return None
