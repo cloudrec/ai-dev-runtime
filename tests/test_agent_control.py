@@ -510,6 +510,23 @@ def test_externally_blocked_from_input_required():
     assert ac.classify_state(True, True, "Waiting for API... retry (429 rate limit)\nnew task?") == "externally_blocked"
 
 
+def test_commander_events_durable_and_deduped(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("AGENT_CONTROL_AUDIT", str(tmp_path / "audit.jsonl"))
+    assert ac.record_commander_event("seo-audit:0.0", "seo", "checkpoint_completed_work_remaining",
+                                     {"remaining_id": "part-e"}, dedup_key="part-e") is True
+    # identical unacked event within the window → deduped (not re-emitted every sweep).
+    assert ac.record_commander_event("seo-audit:0.0", "seo", "checkpoint_completed_work_remaining",
+                                     {"remaining_id": "part-e"}, dedup_key="part-e") is False
+    # a different task id → a new event.
+    assert ac.record_commander_event("seo-audit:0.0", "seo", "checkpoint_completed_work_remaining",
+                                     {"remaining_id": "part-f"}, dedup_key="part-f") is True
+    evs = ac.list_commander_events(unacked_only=True)
+    assert len(evs) == 2 and evs[0]["event_type"] == "checkpoint_completed_work_remaining"
+    ac.ack_commander_events([e["id"] for e in evs])
+    assert ac.list_commander_events(unacked_only=True) == []
+
+
 def test_pending_input_text_detects_queued_instruction():
     # non-empty input line = queued instruction → /clear must refuse.
     pane = ("──────\n❯ enable premium for the canary account and test one charge\n──────\n"

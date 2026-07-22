@@ -305,8 +305,75 @@ def _db() -> sqlite3.Connection:
         target TEXT, prompt_hash TEXT, decision TEXT, category TEXT, reason TEXT,
         latency REAL, updated_at TEXT, updated_ts REAL,
         PRIMARY KEY (target, prompt_hash))""")
+    # Durable Commander event log — checkpoint / completion / waiting-external /
+    # owner-decision events survive between polls and a 45s record overwrite, so
+    # Owner OS / ChatGPT can SEE them (the 2026-07-22 failure: events were computed
+    # then discarded by the loop). Deduped by (agent,event_type,dedup_key).
+    conn.execute("""CREATE TABLE IF NOT EXISTS commander_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ts_epoch REAL, agent TEXT,
+        project TEXT, event_type TEXT, payload TEXT, dedup_key TEXT,
+        acknowledged INTEGER DEFAULT 0)""")
     conn.commit()
     return conn
+
+
+def record_commander_event(agent: str, project: str, event_type: str, payload: dict,
+                           dedup_key: str = "", dedup_window_secs: int = 1800) -> bool:
+    """Append a durable Commander event unless an identical unacknowledged one
+    (same agent, event_type, dedup_key) was recorded within the window. Returns
+    True when a NEW event was written."""
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT ts_epoch FROM commander_events WHERE agent=? AND event_type=? AND "
+            "dedup_key=? AND acknowledged=0 ORDER BY ts_epoch DESC LIMIT 1",
+            (agent, event_type, dedup_key)).fetchone()
+        if row and (time.time() - float(row[0])) < dedup_window_secs:
+            return False
+        conn.execute(
+            "INSERT INTO commander_events(ts,ts_epoch,agent,project,event_type,payload,dedup_key) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (_now(), time.time(), agent, project, event_type,
+             json.dumps(payload, default=str), dedup_key))
+        conn.commit()
+        audit("commander_event", agent, event_type=event_type, project=project,
+              payload=payload, dedup_key=dedup_key)
+        return True
+    finally:
+        conn.close()
+
+
+def list_commander_events(since_epoch: float = 0.0, limit: int = 50,
+                          unacked_only: bool = False) -> list:
+    conn = _db()
+    try:
+        q = ("SELECT id,ts,ts_epoch,agent,project,event_type,payload,acknowledged "
+             "FROM commander_events WHERE ts_epoch >= ?")
+        if unacked_only:
+            q += " AND acknowledged=0"
+        q += " ORDER BY ts_epoch DESC LIMIT ?"
+        rows = conn.execute(q, (since_epoch, limit)).fetchall()
+        out = []
+        for r in rows:
+            out.append({"id": r[0], "ts": r[1], "ts_epoch": r[2], "agent": r[3],
+                        "project": r[4], "event_type": r[5],
+                        "payload": json.loads(r[6]) if r[6] else {}, "acknowledged": bool(r[7])})
+        return out
+    finally:
+        conn.close()
+
+
+def ack_commander_events(ids: list) -> int:
+    if not ids:
+        return 0
+    conn = _db()
+    try:
+        conn.executemany("UPDATE commander_events SET acknowledged=1 WHERE id=?",
+                         [(i,) for i in ids])
+        conn.commit()
+        return conn.total_changes
+    finally:
+        conn.close()
 
 
 def get_prompt_decision(target: str, prompt_hash: str) -> Optional[dict]:

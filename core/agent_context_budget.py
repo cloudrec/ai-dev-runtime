@@ -77,10 +77,16 @@ _FINISH_SOON_RE = re.compile(
     r"about to (?:commit|finish)|just need to|running the (?:tests?|build)|one (?:test|build) run)",
     re.I)
 
-# Context signal printed in the pane.
-_PCT_LEFT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%\s*(?:left|remaining|until auto-?compact)", re.I)
-_PCT_USED_RE = re.compile(r"context(?:\s+window)?\s+(?:used|full)[:\s]+(\d{1,3}(?:\.\d+)?)\s*%", re.I)
-_TOKENS_RE = re.compile(r"/clear to save\s+([\d.]+)\s*([km])?\s*tokens", re.I)
+# Context signal printed in the pane (several Claude Code footer forms).
+_PCT_LEFT_RE = re.compile(r"(\d{1,3}(?:\.\d+)?)\s*%\s*(?:context\s+)?(?:left|remaining|until auto-?compact)", re.I)
+_PCT_USED_RE = re.compile(
+    r"(?:context(?:\s+window)?\s+(?:used|full)[:\s]+(\d{1,3}(?:\.\d+)?)\s*%|"
+    r"(\d{1,3}(?:\.\d+)?)\s*%\s*(?:context\s+)?(?:used|full))", re.I)
+# `/clear to save N tokens`, or a raw context total `N k/M tokens` / `N.NN MB`
+# (MB → assume ~4 chars/token vs the window is unreliable, so only the token forms
+# yield a percentage; MB is treated as "near/over" the compact bound → 90%).
+_TOKENS_RE = re.compile(r"(?:/clear to save|context[:\s]+)\s*([\d.]+)\s*([kmKM])?\s*tokens", re.I)
+_MB_CONTEXT_RE = re.compile(r"context[^\n]{0,20}?([\d.]+)\s*MB|([\d.]+)\s*MB[^\n]{0,12}context", re.I)
 
 
 def _now_ts() -> float:
@@ -116,7 +122,7 @@ def detect_context_pct(tail: str, window_tokens: int = _DEFAULTS["window_tokens"
         return None
     m = _PCT_USED_RE.search(tail)
     if m:
-        return _clamp(float(m.group(1)))
+        return _clamp(float(m.group(1) or m.group(2)))
     m = _PCT_LEFT_RE.search(tail)
     if m:
         return _clamp(100.0 - float(m.group(1)))
@@ -126,6 +132,11 @@ def detect_context_pct(tail: str, window_tokens: int = _DEFAULTS["window_tokens"
         unit = (m.group(2) or "").lower()
         tokens = val * 1000 if unit == "k" else val * 1_000_000 if unit == "m" else val
         return _clamp(100.0 * tokens / window_tokens)
+    # A raw conversation size in MB near/over the auto-compact bound → treat as
+    # high (>=rotate). Claude prints this only when context is large.
+    m = _MB_CONTEXT_RE.search(tail)
+    if m:
+        return 90.0
     return None
 
 
@@ -234,6 +245,37 @@ def completion_class(rec: dict, cfg: dict, tail: str) -> tuple[str, Optional[dic
     if _EXTERNAL_WAIT_RE.search(tail or ""):
         return "task_completed_waiting_external", None
     return "task_completed_no_remaining_work", None
+
+
+def detect_surfaceable_event(agent: dict, rec: dict, cfg: dict, tail: str) -> Optional[dict]:
+    """The checkpoint / completion event to SURFACE to Owner OS / ChatGPT — computed
+    on DETECTION, independent of the context-threshold, dwell, cooldown, and
+    dispatch gates. So the event is visible within one sweep even when the /clear
+    is deferred or autonomous rotation is disabled (the 2026-07-22 delivery
+    failure). None unless the agent is at a resting safe boundary."""
+    state = rec.get("state")
+    if state not in ("idle", "completed"):
+        return None
+    if not at_safe_boundary(agent, "idle"):
+        return None
+    root = cfg.get("root") or agent.get("claude_cwd") or agent.get("cwd") or ""
+    handoff = resolve_handoff_path(root, cfg, {}, _DEFAULTS["handoff_fresh_secs"])
+    # A surfaceable event needs genuine completion EVIDENCE (a fresh checkpoint
+    # handoff or a completion report) — a merely-idle agent surfaces nothing.
+    if not (rec.get("completion_evidence") or handoff):
+        return None
+    cls, remaining = completion_class(rec, cfg, tail)
+    if cls == "work_remaining":
+        return {"event_type": "checkpoint_completed_work_remaining",
+                "completion_class": cls, "remaining": (remaining or {}).get("text"),
+                "remaining_id": (remaining or {}).get("id"), "handoff_path": handoff,
+                "context_pct": detect_context_pct(tail), "dedup_key": (remaining or {}).get("id", "active")}
+    if cls == "task_completed_waiting_external":
+        return {"event_type": "task_completed_waiting_external_action", "completion_class": cls,
+                "handoff_path": handoff, "context_pct": detect_context_pct(tail),
+                "dedup_key": "waiting_external"}
+    return {"event_type": "task_completed_no_remaining_work", "completion_class": cls,
+            "handoff_path": handoff, "context_pct": detect_context_pct(tail), "dedup_key": "done"}
 
 
 def resolve_handoff_path(root: str, cfg: dict, rotation_row: dict, max_age: int) -> Optional[str]:

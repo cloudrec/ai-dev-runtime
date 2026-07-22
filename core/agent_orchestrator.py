@@ -562,6 +562,24 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             session_rotate_opt_in = bool(cfg.get("context_rotate"))
             ctx_dispatch = (ctx_act and approve and not budget_locked()
                             and ctx_rotate_enabled and session_rotate_opt_in)
+            # DELIVERY: surface the checkpoint/completion/waiting-external event on
+            # DETECTION (independent of dispatch gates) into the durable event log,
+            # so Owner OS/ChatGPT see it within one sweep even when /clear is
+            # deferred or disabled. Deduped so it is not re-emitted every 45s.
+            if ctx_act:
+                try:
+                    sev = ctxb.detect_surfaceable_event(agent, rec, cfg, agent.get("_tail") or "")
+                    if sev:
+                        payload = {**sev, "project": rec.get("project"), "exec_mode": rec.get("exec_mode"),
+                                   "state": state, "detected_at": _now_iso()}
+                        is_new = ac.record_commander_event(key, rec.get("project") or session,
+                                                           sev["event_type"], payload,
+                                                           dedup_key=sev.get("dedup_key", ""))
+                        if is_new:
+                            escalations.append({"agent": key, "project": rec.get("project"),
+                                                "event": sev["event_type"], "commander_event": payload})
+                except Exception:  # noqa: BLE001
+                    pass
             cres = ctxb.evaluate(agent, cfg, rec, prev, act=ctx_act, dispatch=ctx_dispatch)
             rec["context_pct"] = cres.get("context_pct")
             rec["context_tier"] = cres.get("context_tier")
@@ -699,9 +717,17 @@ def _resolve_safe(key: str, command: str, rec: dict) -> dict:
 
 
 def status() -> dict:
-    """Read-only orchestrator status for all tracked agents."""
+    """Read-only orchestrator status for all tracked agents, plus recent durable
+    Commander events (checkpoint / completion / waiting-external / owner-decision)
+    so Owner OS / ChatGPT can SEE them without missing a transient sweep."""
+    try:
+        events = ac.list_commander_events(since_epoch=_now_ts() - 86400, limit=50)
+    except Exception:  # noqa: BLE001
+        events = []
     return {"states": ORCH_STATES, "budget_locked": budget_locked(),
-            "records": all_records(), "checked_at": _now_iso()}
+            "records": all_records(), "commander_events": events,
+            "unacked_events": [e for e in events if not e["acknowledged"]],
+            "checked_at": _now_iso()}
 
 
 # ── always-on loop ──────────────────────────────────────────────────────────

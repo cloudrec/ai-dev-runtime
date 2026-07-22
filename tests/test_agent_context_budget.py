@@ -188,6 +188,32 @@ def test_resume_prefers_agent_authored_handoff(monkeypatch, tmp_path):
     assert "reports/CONTEXT_HANDOFF.md" in resume
 
 
+def test_detect_surfaceable_event_independent_of_dispatch(monkeypatch, tmp_path):
+    # A checkpoint/completion event surfaces on DETECTION (idle+safe+handoff),
+    # regardless of context %, dwell, or dispatch — the 2026-07-22 delivery fix.
+    reports = tmp_path / "reports"; reports.mkdir()
+    (reports / "CONTEXT_HANDOFF.md").write_text("h")
+    a = _agent(tail="done, clean boundary ❯ ")            # NO context% figure
+    cfg = {"root": str(tmp_path), "project": "seo",
+           "active_task_id": "part-e", "active_task_text": "Continue Part E readiness center"}
+    ev = cb.detect_surfaceable_event(a, _rec(state="idle"), cfg, a["_tail"])
+    assert ev["event_type"] == "checkpoint_completed_work_remaining"
+    assert ev["remaining_id"] == "part-e" and "Part E" in ev["remaining"]
+    assert ev["handoff_path"] == str(reports / "CONTEXT_HANDOFF.md")
+    # a working agent surfaces nothing.
+    assert cb.detect_surfaceable_event(_agent(tail="… esc to interrupt"), _rec(state="working"), cfg, "") is None
+    # completed with no remaining work → completion event, not a resume.
+    done_cfg = {"root": str(tmp_path), "project": "seo"}
+    ev2 = cb.detect_surfaceable_event(a, _rec(state="idle"), done_cfg, "all done")
+    assert ev2["event_type"] == "task_completed_no_remaining_work"
+
+
+def test_context_detection_extra_forms():
+    assert cb.detect_context_pct("72% context used") == 72.0
+    assert cb.detect_context_pct("context: 1.29 MB") == 90.0
+    assert cb.detect_context_pct("context: 700k tokens") == pytest.approx(70.0, abs=0.1)
+
+
 def test_active_task_text_is_work_remaining_to_continue():
     cfg = {"active_task_id": "part-d", "active_task_text": "Continue Part D: source intake pipeline"}
     cls, rem = cb.completion_class(_rec(), cfg, "idle")
