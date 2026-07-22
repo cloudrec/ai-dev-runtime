@@ -67,8 +67,19 @@ _SAFE_PROGRAMS = {
     # language / tooling read + tests
     "python", "python3", "pytest", "node", "npm", "npx", "pnpm", "yarn", "go",
     "cargo", "make", "tox", "ruff", "mypy", "flake8", "black", "eslint", "tsc",
-    "curl",  # gated hard below (only --version / help); real curl denied
+    "alembic",  # gated by _check_alembic (heads/history/current/check + upgrade --sql only)
+    "timeout",  # gated by _check_timeout: `timeout DURATION <safe-cmd>` bounds a read-only check
+    "curl", "wget",  # gated hard below (--version/help or a loopback health check only)
+    # POSIX shells — gated by _check_shell_c: only `-c <script>` unwraps to a
+    # recursive safe classification; a script FILE or stdin stays unsafe.
+    "sh", "bash", "zsh", "dash", "ash", "ksh", "mksh",
 }
+
+# Shells whose `-c <script>` argument we recursively re-classify.
+_SHELLS = {"sh", "bash", "zsh", "dash", "ash", "ksh", "mksh"}
+# Wrappers that hide the real command / escalate — always unsafe.
+_HARD_WRAPPERS = {"sudo", "eval", "exec", "xargs", "env", "source", ".",
+                  "nohup", "setsid", "watch", "time", "nice"}
 
 # Path fragments that indicate secrets — reading them is never auto-approved.
 _SECRET_PATH_RE = re.compile(
@@ -92,6 +103,19 @@ _SYSTEMCTL_READ = {"status", "is-active", "is-enabled", "is-failed", "show",
                    "list-units", "list-unit-files", "list-timers", "cat", "show-environment"}
 _SYSTEMCTL_WRITE = {"start", "stop", "restart", "reload", "enable", "disable",
                     "mask", "unmask", "kill", "set-property", "daemon-reload", "isolate"}
+
+# Alembic subcommands that never touch the DB or write a file.
+_ALEMBIC_READ = {"heads", "history", "current", "check", "show", "branches"}
+# A URL whose host is the local machine / docker host bridge — a health check,
+# not an external send. Anything else is external network I/O (fail closed).
+_LOOPBACK_RE = re.compile(
+    r"^https?://(localhost|127(\.\d+){1,3}|\[::1\]|0\.0\.0\.0|"
+    r"172\.17\.0\.1|host\.docker\.internal)(:\d+)?(/|$|\?)", re.I)
+# Env-var names that can alter execution / inject code — never auto-approved as
+# an assignment prefix (LD_PRELOAD, BASH_ENV, PYTHONSTARTUP, NODE_OPTIONS, …).
+_UNSAFE_ENV_NAME_RE = re.compile(
+    r"^(LD_|BASH_ENV$|ENV$|SHELLOPTS$|BASHOPTS$|PS4$|PROMPT_COMMAND$|IFS$|PATH$|"
+    r"GLOBIGNORE$|PERL5OPT$|PYTHONSTARTUP$|PYTHONPATH$|NODE_OPTIONS$)", re.I)
 
 # SQL that is read-only. Any write/DDL keyword disqualifies.
 _SQL_WRITE_RE = re.compile(
@@ -125,15 +149,33 @@ def _tokens(segment: str) -> list[str]:
         raise _Unsafe("unparseable quoting")
 
 
+def _check_safe_assignment(tok: str) -> None:
+    """A leading `NAME=value` assignment is safe only when NAME cannot alter
+    execution (no LD_*/BASH_ENV/PATH/PYTHONPATH/…), is not secret-looking, and the
+    value carries no shell expansion."""
+    name, _, val = tok.partition("=")
+    if _UNSAFE_ENV_NAME_RE.match(name):
+        raise _Unsafe(f"unsafe env assignment: {name}")
+    if re.search(r"(password|passwd|token|secret|api[_-]?key|private[_-]?key)", name, re.I):
+        raise _Unsafe(f"secret env assignment: {name}")
+    if re.search(r"[$`]", val):
+        raise _Unsafe("env-assignment value has an expansion")
+
+
 def _leading_program(tokens: list[str]) -> tuple[str, list[str]]:
-    """Strip leading VAR=val assignments and return (program, args). An env
-    assignment prefix is itself unsafe (it can set anything), so reject it."""
+    """Strip any leading provably-safe `VAR=val` assignments and return
+    (program, args). An assignment that could alter execution or leak a secret
+    makes the whole segment unsafe."""
     if not tokens:
         raise _Unsafe("empty segment")
-    if "=" in tokens[0] and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[0]):
-        raise _Unsafe("env-assignment prefix")
-    prog = tokens[0].rsplit("/", 1)[-1]     # /usr/bin/grep → grep
-    return prog, tokens[1:]
+    i = 0
+    while i < len(tokens) and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[i]):
+        _check_safe_assignment(tokens[i])
+        i += 1
+    if i >= len(tokens):
+        raise _Unsafe("env assignments with no command")
+    prog = tokens[i].rsplit("/", 1)[-1]     # /usr/bin/grep → grep
+    return prog, tokens[i + 1:]
 
 
 def _check_secret_paths(args: list[str]) -> None:
@@ -179,12 +221,15 @@ def _check_git(args):
 # INNER command is itself provably safe (recursive classification) — this is
 # "local container test execution".
 def _inner_command_safe(inner_tokens: list[str]) -> None:
+    # Classify the ALREADY-TOKENIZED inner command as one segment. Never re-join
+    # into a string (that would corrupt quoted metacharacters like `grep 'a|b'`);
+    # a `sh -c '<pipeline>'` inner is unwrapped recursively by _classify_tokens.
     if not inner_tokens:
         raise _Unsafe("container run/exec with no explicit command (runs default entrypoint)")
-    inner = " ".join(inner_tokens)
-    verdict = classify_command(inner)
-    if not verdict["safe"]:
-        raise _Unsafe(f"container inner command not safe: {verdict['reason']}")
+    try:
+        _classify_tokens(inner_tokens)
+    except _Unsafe as e:
+        raise _Unsafe(f"container inner command not safe: {e}")
 
 
 def _check_docker(args):
@@ -310,21 +355,117 @@ def _check_test_runner(prog, args):
             raise _Unsafe(f"make {target} not a test/lint target")
 
 
+def _check_alembic(args):
+    """Read-only alembic only: heads/history/current/check/show/branches, plus
+    `upgrade|downgrade … --sql` (offline SQL render to stdout — no DB write). A
+    real migration (no `--sql`), revision, stamp, or merge is a WRITE → unsafe."""
+    sub = next((a for a in args if not a.startswith("-")), None)
+    if sub in _ALEMBIC_READ:
+        return
+    if sub in ("upgrade", "downgrade"):
+        if "--sql" in args:
+            return                       # offline SQL render — prints, never writes
+        raise _Unsafe(f"alembic {sub} without --sql runs a live migration")
+    raise _Unsafe(f"alembic {sub or '?'} is not a read-only check")
+
+
+def _check_timeout(args):
+    """`timeout [opts] DURATION <cmd>` bounds a command's runtime — it adds no
+    write capability, so it is safe iff <cmd> is safe. Classify the inner command
+    (no re-join: the tokens are already split)."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] in ("-s", "--signal", "-k", "--kill-after"):
+            i += 2                                   # option consumes a value
+        else:
+            i += 1
+    if i >= len(args) or not re.match(r"^\d+(\.\d+)?[smhd]?$", args[i]):
+        raise _Unsafe("timeout without a numeric duration")
+    inner = args[i + 1:]
+    if not inner:
+        raise _Unsafe("timeout with no command")
+    _classify_tokens(inner)
+
+
+def _check_shell_c(prog, args):
+    """`sh -c <script>` / `bash -lc <script>` unwrap to a recursive classification
+    of <script>; that is a common, safe wrapper for a read-only pipeline. Any
+    other form (a script FILE, reading stdin, a login shell running a file) hides
+    the real command and stays unsafe."""
+    ci = args.index("-c") if "-c" in args else next(
+        (i for i, a in enumerate(args) if re.match(r"^-[A-Za-z]*c$", a)), None)
+    if ci is None:
+        raise _Unsafe(f"{prog} without -c runs a script/stdin, not a read-only check")
+    # Nothing but flags may precede -c (a bareword before it would be a script file).
+    if any(not a.startswith("-") for a in args[:ci]):
+        raise _Unsafe(f"{prog} with a script argument before -c")
+    script = args[ci + 1] if ci + 1 < len(args) else ""
+    if not script.strip():
+        raise _Unsafe(f"{prog} -c with an empty script")
+    verdict = classify_command(script)
+    if not verdict["safe"]:
+        raise _Unsafe(f"{prog} -c inner command not safe: {verdict['reason']}")
+
+
+_CURL_WRITE_FLAGS = {"-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+                     "-F", "--form", "-T", "--upload-file", "-o", "--output",
+                     "-O", "--remote-name", "--data-ascii"}
+
+
 def _check_curl(args):
-    # Real curl performs network I/O → deny. Only `--version`/`--help` allowed.
-    if not any(a in ("--version", "-V", "--help", "-h", "--manual") for a in args):
-        raise _Unsafe("curl performs network I/O")
+    """`--version`/`--help`, or a read-only HTTP health check against a LOOPBACK
+    host (GET/HEAD, no body, no upload, no output-to-file). Any non-loopback host
+    is external network I/O → unsafe (fail closed)."""
+    if any(a in ("--version", "-V", "--help", "-h", "--manual") for a in args):
+        return
+    urls = [a for a in args if re.match(r"^https?://", a, re.I)]
+    if not urls:
+        raise _Unsafe("curl without an explicit loopback health-check URL")
+    for u in urls:
+        if not _LOOPBACK_RE.match(u):
+            raise _Unsafe(f"curl to a non-loopback host (external network I/O): {u}")
+    for i, a in enumerate(args):
+        if a in _CURL_WRITE_FLAGS or a.startswith("--data"):
+            raise _Unsafe(f"curl {a} is a write/upload/output — not a read-only check")
+        if a in ("-X", "--request"):
+            method = (args[i + 1] if i + 1 < len(args) else "").upper()
+            if method not in ("GET", "HEAD", ""):
+                raise _Unsafe(f"curl -X {method} is not a read-only method")
+
+
+def _check_wget(args):
+    """wget writes a file by default → allow only a loopback `--spider` (no body)
+    or stdout render (`-O-`/`-qO-`)."""
+    if any(a in ("--version", "--help") for a in args):
+        return
+    urls = [a for a in args if re.match(r"^https?://", a, re.I)]
+    if not urls or any(not _LOOPBACK_RE.match(u) for u in urls):
+        raise _Unsafe("wget without a loopback URL is external network I/O")
+    if "--spider" in args:
+        return
+    if any(a in ("-O-", "-qO-") or a == "-" for a in args) or (
+            "-O" in args and args[args.index("-O") + 1: args.index("-O") + 2] == ["-"]):
+        return
+    raise _Unsafe("wget writes a file (use --spider or -O- for a read-only check)")
 
 
 def _classify_segment(segment: str) -> str:
-    tokens = _tokens(segment)
+    return _classify_tokens(_tokens(segment))
+
+
+def _classify_tokens(tokens: list[str]) -> str:
+    """Classify one already-tokenized pipeline segment. Returns the program name
+    or raises _Unsafe. Shells unwrap `-c <script>` recursively."""
     if not tokens:
         raise _Unsafe("empty")
     prog, args = _leading_program(tokens)
-    if prog in ("sudo", "eval", "exec", "xargs", "env", "source", ".", "bash", "sh",
-                "zsh", "nohup", "setsid", "watch", "time", "timeout", "nice"):
+    if prog in _HARD_WRAPPERS:
         # env/eval/exec/sudo/xargs/subshell wrappers hide the real command.
         raise _Unsafe(f"wrapper/privilege: {prog}")
+    if prog in _SHELLS:
+        _check_secret_paths(args)
+        _check_shell_c(prog, args)      # only `-c <script>` → recursive classify
+        return prog
     if prog not in _SAFE_PROGRAMS:
         raise _Unsafe(f"unknown program: {prog}")
     _check_secret_paths(args)
@@ -344,8 +485,14 @@ def _classify_segment(segment: str) -> str:
         _check_awk(args)
     elif prog in ("python", "python3", "npm", "pnpm", "yarn", "go", "cargo", "make", "pytest", "node", "npx"):
         _check_test_runner(prog, args)
+    elif prog == "alembic":
+        _check_alembic(args)
+    elif prog == "timeout":
+        _check_timeout(args)
     elif prog == "curl":
         _check_curl(args)
+    elif prog == "wget":
+        _check_wget(args)
     elif prog in ("tee", "dd"):
         raise _Unsafe(f"{prog} writes")
     return prog
@@ -363,6 +510,70 @@ def _check_sensitive_abs_paths(command: str) -> None:
         raise _Unsafe("references a sensitive system path")
 
 
+def _mask_quotes(s: str) -> str:
+    """Return `s` with the CONTENTS of every quoted span replaced by 'x',
+    preserving length and the quote/operator characters that sit OUTSIDE quotes.
+    This lets the quote-blind construct/segment regexes see only real (unquoted)
+    shell operators — so `grep 'A|B'` or `sh -c '… && …'` are no longer split or
+    flagged on metacharacters that live inside quotes. Raises on unbalanced
+    quotes (which we then treat as unsafe rather than guessing)."""
+    out: list[str] = []
+    i, n, quote = 0, len(s), None
+    while i < n:
+        c = s[i]
+        if quote is None:
+            if c in ("'", '"'):
+                quote = c
+                out.append(c)
+            elif c == "\\":
+                out.append(c)
+                if i + 1 < n:
+                    out.append("x")
+                    i += 2
+                    continue
+            else:
+                out.append(c)
+        elif quote == "'":                    # single quotes: literal, end only on '
+            if c == "'":
+                quote = None
+                out.append(c)
+            else:
+                out.append("x")
+        else:                                 # double quotes
+            # Double quotes do NOT suppress `$`/backtick expansion, so those stay
+            # visible to the construct scan; a backslash escapes the next char
+            # (masked as literal); every other char is inert and masked.
+            if c == "\\":
+                out.append(c)
+                if i + 1 < n:
+                    out.append("x")
+                    i += 2
+                    continue
+            elif c == '"':
+                quote = None
+                out.append(c)
+            elif c in ("$", "`"):
+                out.append(c)                 # expansion/substitution still active
+            else:
+                out.append("x")
+        i += 1
+    if quote is not None:
+        raise _Unsafe("unbalanced quote")
+    return "".join(out)
+
+
+def _split_segments(original: str, scan: str) -> list[str]:
+    """Split `original` into pipeline/chain segments using separator positions
+    found in the index-aligned quote-masked `scan` (so separators inside quotes
+    are ignored). Returns the ORIGINAL substrings (real quoting intact)."""
+    segs, last = [], 0
+    for m in _SEGMENT_SPLIT_RE.finditer(scan):
+        segs.append(original[last:m.start()])
+        last = m.end()
+    segs.append(original[last:])
+    return [s.strip() for s in segs if s.strip()]
+
+
 def classify_command(command: str, cwd: str | None = None,
                      project_roots: list[str] | None = None) -> dict:
     """Classify a shell command. Fail-closed. Optionally validate the agent's
@@ -375,20 +586,30 @@ def classify_command(command: str, cwd: str | None = None,
     if not cmd:
         result["reason"] = "empty command"
         return result
-    # Strip harmless /dev/null and stderr-merge redirects before analysis.
-    scan = _SAFE_REDIRECT_RE.sub(" ", cmd)
+    try:
+        # Quote-aware analysis: mask quoted spans (length-preserving) so the
+        # construct/segment regexes only ever see UNQUOTED shell operators, then
+        # blank the harmless /dev/null and stderr-merge redirects.
+        masked = _mask_quotes(cmd)
+        scan = _SAFE_REDIRECT_RE.sub(lambda m: " " * len(m.group(0)), masked)
+    except _Unsafe as e:
+        result["reason"] = str(e)
+        result["category"] = "denied"
+        return result
     bad = _has_unsafe_construct(scan)
     if bad:
         result["reason"] = f"unsafe shell construct: {bad!r}"
         result["category"] = "shell_construct"
         return result
-    segments = [s.strip() for s in _SEGMENT_SPLIT_RE.split(scan) if s.strip()]
+    segments = _split_segments(cmd, scan)
     if not segments:
         result["reason"] = "no command"
         return result
     progs = []
     try:
-        _check_sensitive_abs_paths(scan)
+        # Sensitive absolute paths are checked on the ORIGINAL command (a secret
+        # path is sensitive whether or not it is quoted).
+        _check_sensitive_abs_paths(cmd)
         for seg in segments:
             progs.append(_classify_segment(seg))
     except _Unsafe as e:

@@ -131,3 +131,24 @@ def test_persistence_survives_restart_semantics(monkeypatch):
     ac.record_prompt_decision("seo-audit:0.0", "abc123", "left_for_owner", "denied", "docker restart")
     got = ac.get_prompt_decision("seo-audit:0.0", "abc123")
     assert got["decision"] == "left_for_owner" and got["category"] == "denied"
+
+
+def test_safe_prompt_resolved_exactly_once_even_if_still_waiting(monkeypatch):
+    # If the same safe prompt is still present on a later poll (or the orchestrator
+    # loop races the supervisor loop), it must NOT be answered a second time.
+    calls = _wire(monkeypatch, [
+        _status("waiting_owner", SAFE_DIALOG),
+        _status("working", "…(1s · ↓ 2k tokens)"),
+    ])
+    first = sup.resolve_target("seo-audit:0.0", approve=True, _sleep=lambda s: None)
+    assert first["action"] == "approved" and calls["approve"] == 1
+    # Same prompt appears again — persisted decision makes this idempotent.
+    _wire(monkeypatch, [_status("waiting_owner", SAFE_DIALOG)])
+    # re-wire resets the approve counter; re-attach a shared counter instead.
+    calls2 = {"approve": 0}
+    monkeypatch.setattr(ac, "approve_prompt",
+                        lambda t: calls2.__setitem__("approve", calls2["approve"] + 1) or True)
+    second = sup.resolve_target("seo-audit:0.0", approve=True, _sleep=lambda s: None)
+    assert second["action"] == "already_resolved"
+    assert calls2["approve"] == 0                       # never re-sent the key
+    assert second["prior_decision"] == "approved"

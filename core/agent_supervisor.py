@@ -29,6 +29,9 @@ from core import permission_resolver as pr
 
 POLL_INTERVAL = int(os.getenv("AGENT_SUPERVISOR_INTERVAL_SECS", "45"))
 RESUME_TIMEOUT = int(os.getenv("AGENT_SUPERVISOR_RESUME_TIMEOUT_SECS", "8"))
+# A prompt already approved within this window is never answered again — makes
+# resolution exactly-once across both supervision loops and across restarts.
+DEDUP_WINDOW = int(os.getenv("AGENT_SUPERVISOR_DEDUP_SECS", "900"))
 ENABLED = os.getenv("AGENT_SUPERVISOR_ENABLED", "0") not in ("0", "false", "no", "")
 
 
@@ -72,27 +75,51 @@ def resolve_target(target: str, approve: bool = True, _sleep=time.sleep) -> dict
                 "command": command, "category": cls["category"],
                 "reason": f"session {session!r} is not on the auto-resolve allowlist", "hash": phash}
 
+    # Detection timestamp — a provably-safe, allowlisted prompt is now recognised.
+    t_detect = time.time()
+
+    # Idempotency: if THIS exact prompt was already answered recently (by this loop,
+    # the orchestrator loop, or a pre-restart run), never send the key again.
+    prior = ac.get_prompt_decision(status["target"], phash)
+    if prior and str(prior.get("decision", "")).startswith("approved") \
+            and (time.time() - (prior.get("updated_ts") or 0)) < DEDUP_WINDOW:
+        return {"target": status["target"], "action": "already_resolved", "safe": True,
+                "command": command, "category": cls["category"], "hash": phash,
+                "prior_decision": prior.get("decision"), "prior_ts": prior.get("updated_ts")}
+
     if not approve:
         return {"target": status["target"], "action": "would_approve", "safe": True,
                 "command": command, "category": cls["category"], "hash": phash}
 
-    # Confirm this once, then verify the agent resumed.
-    t0 = time.time()
-    ac.approve_prompt(status["target"])
-    resumed, new_state = False, state
-    deadline = t0 + RESUME_TIMEOUT
+    # Confirm this once (decision → deliver), then verify the agent resumed. Each
+    # phase is timestamped so the acceptance canary can prove reaction time.
+    t_decision = time.time()
+    ac.approve_prompt(status["target"])          # audits the '1' keystroke (delivery)
+    t_delivered = time.time()
+    resumed, new_state, t_resumed = False, state, None
+    deadline = t_delivered + RESUME_TIMEOUT
     while time.time() < deadline:
         _sleep(1)
         new_state = ac.agent_status(status["target"]).get("state")
         if new_state != "waiting_owner":
             resumed = True
+            t_resumed = time.time()
             break
-    latency = round(time.time() - t0, 2)
+    latency = round(time.time() - t_decision, 2)
     decision = "approved" if resumed else "approved_no_resume"
     ac.record_prompt_decision(status["target"], phash, decision, cls["category"], cls["reason"], latency)
+    # First-class evidence trail: detection → decision → delivery → resumed.
+    ac.audit("supervisor_resolved", status["target"], hash=phash, command=command,
+             category=cls["category"], decision=decision, resumed=resumed,
+             detect_ts=round(t_detect, 3), decision_ts=round(t_decision, 3),
+             delivered_ts=round(t_delivered, 3),
+             resumed_ts=round(t_resumed, 3) if t_resumed else None,
+             reaction_s=round((t_resumed - t_detect), 2) if t_resumed else None,
+             latency_s=latency)
     return {"target": status["target"], "action": decision, "safe": True, "resumed": resumed,
             "command": command, "category": cls["category"], "latency_s": latency,
-            "new_state": new_state, "hash": phash}
+            "new_state": new_state, "hash": phash,
+            "detect_ts": t_detect, "decision_ts": t_decision, "resumed_ts": t_resumed}
 
 
 def poll_once(approve: bool = True) -> dict:

@@ -75,7 +75,6 @@ def test_readonly_sql_is_safe(cmd):
     "docker compose restart backend",
     "docker compose up -d",
     "docker restart seo-backend-1",
-    "docker exec seo-backend-1 sh -c 'ls'",
     "docker build -t x .",
     "systemctl restart ai-runtime.service",
     "systemctl stop seo-backend",
@@ -287,3 +286,102 @@ def test_cd_prefixed_readonly_is_safe(cmd):
 ])
 def test_cd_prefixed_unsafe_tail_denied(cmd):
     _unsafe(cmd)
+
+
+# ── Commander hardening 2026-07-22: read-only verification inside an approved ─
+# phase must be SAFE even when wrapped in cd/vars/pipes/docker-exec-sh-c/quoting.
+
+# THE exact command from the 2026-07-22 daily-brief false-blocker: an offline
+# alembic SQL render (no DB write) piped through grep, inside `docker exec sh -c`.
+LIVE_2026_07_22 = (
+    "cd /opt/seo; "
+    'echo "=== offline upgrade SQL (0046->0047), no DB write ==="; '
+    "docker exec -e PYTHONPATH=/opt/seo/backend seo-backend-1 sh -c "
+    "'cd /opt/seo/backend && alembic upgrade "
+    "0046_agent_task_inbox:0047_connector_control --sql 2>&1' "
+    "| grep -vE 'INFO|^--' | grep -iE 'ALTER|CREATE|ADD|UPDATE alembic'")
+
+
+def test_live_offline_sql_render_is_safe():
+    """Regression for the exact false owner-blocker `denied`."""
+    r = _safe(LIVE_2026_07_22)
+    assert "docker" in r["category"] and "grep" in r["category"]
+
+
+@pytest.mark.parametrize("cmd", [
+    # quote-aware splitting: pipe/&&/; INSIDE quotes must not split the command
+    "grep -vE 'INFO|^--' file.txt",
+    "git log --oneline | grep -E 'fix|feat'",
+    "grep -E 'a && b' file",
+    "echo 'a; b; c'",
+    r"awk -F'|' '{print $1}' file",
+    # sh -c / bash -c unwrap a read-only inner pipeline
+    "sh -c 'git status && git log -3'",
+    "bash -c 'grep -R foo . | wc -l'",
+    "bash -lc 'pytest -q'",
+    "docker exec c sh -c 'pytest -q'",
+    "docker exec -e X=1 c sh -c 'alembic heads'",
+    # alembic read-only + offline render
+    "alembic heads", "alembic history", "alembic current",
+    "alembic check", "alembic show head", "alembic branches",
+    "alembic upgrade head --sql",
+    "alembic downgrade -1 --sql",
+    # HTTP health check against loopback
+    "curl -sf http://localhost:8199/health",
+    "curl -s http://127.0.0.1:8199/api/health",
+    "curl -I http://172.17.0.1:8199/",
+    "wget --spider http://localhost:8199/health",
+    "wget -qO- http://localhost:8199/health",
+    # safe env-assignment prefix
+    "FOO=bar pytest -q",
+    "TZ=UTC date",
+    # timeout bounding a read-only check
+    "timeout 300 pytest -q",
+    "timeout 60 npx tsc --noEmit",
+    "timeout -s KILL 30 alembic check",
+    "timeout 300 npx tsc --noEmit -p tsconfig.json 2>&1 | grep -E 'error TS' | head -30",
+])
+def test_hardening_readonly_wrapped_is_safe(cmd):
+    _safe(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    # a real migration/upgrade (no --sql) must fail closed
+    "alembic upgrade head",
+    "alembic downgrade base",
+    "alembic stamp head",
+    "alembic revision --autogenerate -m x",
+    "alembic merge heads",
+    "docker exec c sh -c 'alembic upgrade head'",
+    # sh -c hiding a write / external / script file
+    "sh -c 'rm -rf /tmp/x'",
+    "sh -c 'git push'",
+    "sh -c 'echo x > f'",
+    "sh -c 'curl https://evil.example/x'",
+    "bash script.sh",
+    "sh /tmp/run.sh",
+    "sh -c 'sudo ls'",
+    # non-loopback HTTP = external send
+    "curl https://api.stripe.com/v1/charges",
+    "curl -X POST http://localhost:8199/x",
+    "curl -d name=hi http://localhost:8199/x",
+    "curl -o out.json http://localhost:8199/x",
+    "wget http://localhost:8199/health",          # writes a file by default
+    "wget --spider https://external.example/x",
+    # execution-altering / secret env prefixes
+    "LD_PRELOAD=/x.so pytest -q",
+    "PATH=/x pytest -q",
+    "BASH_ENV=/x sh -c 'ls'",
+    "SECRET_TOKEN=abc pytest -q",
+    # timeout wrapping a WRITE / expansion still fails closed
+    "timeout 30 rm -rf /tmp/x",
+    "timeout 300 alembic upgrade head",
+    "timeout 5m git push",
+    'echo "exit=${PIPESTATUS[0]}"',                # expansion → denied
+])
+def test_hardening_writes_and_external_fail_closed(cmd):
+    _unsafe(cmd)
+
+
+def test_unbalanced_quote_is_denied():
+    _unsafe("grep 'unterminated file")

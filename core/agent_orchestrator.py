@@ -388,8 +388,13 @@ def derive(agent: dict, cfg: dict) -> dict:
             roots = [cfg["root"]] if cfg.get("root") else _allowed_roots()
             verdict = review_command(command, agent_cwd, roots)
             if verdict["safe"] and mode == "auto":
+                # A proven read-only internal wait — NOT an owner blocker. Carry the
+                # EXACT command so the brief's `waiting_safe_internal` section can
+                # show it (never `denied` / category-only), and mark it internal.
                 return {"state": "waiting_safe_approval", "command": command,
-                        "prompt_hash": verdict["hash"], "fresh": True, "verdict": verdict}
+                        "prompt_hash": verdict["hash"], "fresh": True, "verdict": verdict,
+                        "decision_type": "internal",
+                        "blocker_text": f"{command} — proven read-only; auto-resolving (no owner action)"}
             # genuine owner decision — carry the EXACT blocker text + decision type
             dec = _build_decision(cfg.get("project", session), command, verdict)
             return {"state": "waiting_owner", "command": command, "prompt_hash": verdict["hash"],
@@ -520,7 +525,11 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         try:
             from core import agent_context_budget as ctxb
             ctx_act = (cfg.get("mode") == "auto")          # monitor/hold = detection-only
-            ctx_dispatch = (ctx_act and approve and not budget_locked())
+            # Detection/tiering always runs (visibility). The actual `/clear`
+            # rotation stays OFF behind its own flag until a dry-run + live canary
+            # prove it never clears unexpectedly — separate from safe-approval.
+            ctx_rotate_enabled = os.getenv("AGENT_CONTEXT_ROTATE_ENABLED", "0") not in ("0", "false", "no", "")
+            ctx_dispatch = (ctx_act and approve and not budget_locked() and ctx_rotate_enabled)
             cres = ctxb.evaluate(agent, cfg, rec, prev, act=ctx_act, dispatch=ctx_dispatch)
             rec["context_pct"] = cres.get("context_pct")
             rec["context_tier"] = cres.get("context_tier")
