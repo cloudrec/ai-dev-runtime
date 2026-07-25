@@ -626,9 +626,83 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         except Exception as e:  # noqa: BLE001
             rec["context_tier"] = f"error:{str(e)[:60]}"
 
+        # Watcher / stuchalka: an idle agent sitting on an UNFINISHED assigned task
+        # is safely resumed on the SAME pane (never duplicated), or — if resume is
+        # not permitted / retries are exhausted — raised as ONE owner blocker.
+        # Deduped by (agent, condition, evidence_hash) with a long window, so an
+        # unchanged stall never re-alerts; any real change makes a new key.
+        try:
+            from core import agent_watcher as _watch
+            from core import orchestrator_plan as _wplan
+            assigned = _wplan.assigned_unfinished_task(key)
+            stall = _watch.detect(agent_key=key, alive=True, state=state,
+                                  assigned_task=assigned, now_ts=_now_ts(),
+                                  pane_tail=agent.get("_tail") or "",
+                                  resume_count=rec.get("retry_count") or 0)
+            if stall:
+                decision = _watch.decide(stall, mode=cfg.get("mode") or "monitor",
+                                         approve=approve, budget_locked=budget_locked())
+                dk = _watch.dedup_key(stall)
+                if decision["action"] == "resume":
+                    if approve:
+                        skey = f"watch-resume:{stall['task_id']}:{decision['resume_count']}"
+                        try:
+                            ac.agent_send(key, stall["task_text"] or "", idempotency_key=skey)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        rec["retry_count"] = decision["resume_count"]
+                    if ac.record_commander_event(key, rec["project"], "agent_resumed_same_conversation",
+                                                 {**stall, **decision, "detected_at": _now_iso()},
+                                                 dedup_key=dk, dedup_window_secs=86400):
+                        resolved.append({"agent": key, "action": "watch_resume_same_conversation",
+                                         "task_id": stall["task_id"], "attempt": decision["resume_count"]})
+                else:
+                    rec["notification_state"] = rec.get("notification_state") or "agent_recovery_failure"
+                    ev_type = _watch.event_type(decision)   # agent_recovery_failure (NOT owner decision)
+                    if ac.record_commander_event(key, rec["project"], ev_type,
+                                                 {**stall, **decision, "classification": "agent_recovery_failure",
+                                                  "detected_at": _now_iso()},
+                                                 dedup_key=dk, dedup_window_secs=86400):
+                        escalations.append({"agent": key, "project": rec["project"],
+                                            "event": ev_type, "classification": "agent_recovery_failure",
+                                            "condition": stall["condition"], "reason": decision["reason"]})
+        except Exception:  # noqa: BLE001
+            pass
+
         _upsert(rec)
         results.append({"agent": key, "state": state, "project": rec["project"]})
         full_records.append(rec)
+
+    # Watcher / stuchalka (dead agents): the live sweep skips exited panes. If one
+    # died with an UNFINISHED assigned task, raise ONE owner blocker — never recreate
+    # it (that would duplicate the agent). Deduped by evidence like the live path.
+    try:
+        from core import agent_watcher as _watch
+        from core import orchestrator_plan as _wplan
+        for agent in inv.get("agents", []):
+            if not agent.get("is_agent") or agent.get("alive"):
+                continue
+            dkey = agent["target"]
+            dsession = dkey.split(":", 1)[0]
+            assigned = _wplan.assigned_unfinished_task(dkey)
+            stall = _watch.detect(agent_key=dkey, alive=False, state="exited",
+                                  assigned_task=assigned, now_ts=_now_ts())
+            if not stall:
+                continue
+            dcfg = _session_cfg(dsession)
+            decision = _watch.decide(stall, mode=dcfg.get("mode") or "monitor",
+                                     approve=approve, budget_locked=budget_locked())
+            if ac.record_commander_event(dkey, dcfg.get("project") or dsession,
+                                         _watch.EVENT_RECOVERY_FAILURE,
+                                         {**stall, **decision, "classification": "agent_recovery_failure",
+                                          "detected_at": _now_iso()},
+                                         dedup_key=_watch.dedup_key(stall), dedup_window_secs=86400):
+                escalations.append({"agent": dkey, "project": dcfg.get("project") or dsession,
+                                    "event": _watch.EVENT_RECOVERY_FAILURE,
+                                    "classification": "agent_recovery_failure",
+                                    "condition": "exited_unfinished", "reason": decision["reason"]})
+    except Exception:  # noqa: BLE001
+        pass
 
     # Cross-phase auto-progress (guarded, exact-approved-text-only, idempotent).
     advances = {"enabled": False, "results": []}

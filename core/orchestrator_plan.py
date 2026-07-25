@@ -132,6 +132,23 @@ def list_tasks(goal_id: int) -> list:
         conn.close()
 
 
+def assigned_unfinished_task(agent_ref: str) -> Optional[dict]:
+    """The dispatched/in-progress task assigned to `agent_ref` under the active
+    goal, or None. Session-scoped match (agent field may be 'sess' or 'sess:pane').
+    Used by the watcher to detect an agent that stalled on unfinished work."""
+    goal = get_active_goal()
+    if not goal:
+        return None
+    sess = (agent_ref or "").split(":", 1)[0]
+    for t in list_tasks(goal["id"]):
+        if t["status"] not in ("dispatched", "in_progress"):
+            continue
+        tagent = (t.get("agent") or "").split(":", 1)[0]
+        if tagent and tagent == sess:
+            return t
+    return None
+
+
 def _update_task(task_id: int, **fields) -> None:
     fields["updated_at"] = _now()
     conn = _db()
