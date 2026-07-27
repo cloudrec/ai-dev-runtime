@@ -53,7 +53,15 @@ destructive registry cleanup; no ChatGPT async delivery claimed.
 - `cd /opt/seo && git revert e26dbfb && docker compose build backend && docker compose up -d backend`.
   Resolved rows keep their audit (external_ref / delivery proof).
 
-## Next safe reliability defect (continuing)
-- Orphaned-agent blocker cleanup: when the runtime reaper marks an agent VANISHED (no
-  recovery event will ever come), resolve that agent's still-open blocker alerts by
-  subject_key — the direct symmetric gap to worker-orphan reconciliation.
+## Next safe reliability defect — DONE (`acd3e91`)
+Orphaned-agent blocker cleanup: `agent.commander.agent_vanished_unfinished` (reaper)
+now triggers the same exact-keyed blocker resolution — a vanished agent's blockers no
+longer linger current. **Live:** injected `agent_process_failed` for `_vanX` then a
+vanished event → its blocker `resolved`. Test added.
+
+## Next after that (queued)
+- The commander-event notifier revalidates completion events against current pane
+  evidence before delivery (suppresses if the agent is active again); extend that same
+  pre-delivery revalidation to genuine-blocker events (suppress a blocker alert if the
+  agent is already working again by the time it would be delivered), closing the last
+  emit→deliver staleness window.
