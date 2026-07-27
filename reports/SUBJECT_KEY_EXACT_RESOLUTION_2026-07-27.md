@@ -48,7 +48,14 @@ burst digest are unchanged (digest spans multiple agents → no single subject_k
   The `subject_key` column is additive and harmless if unused; resolved rows stay
   resolved (audit kept). No data lost.
 
-## Next safe notification/orchestration defect (continuing)
-- Aggregate `health.worker_*` bursts (a batch of workers going stale/recovering in
-  one monitor pass) into a single owner digest — same treatment the commander events
-  already get — so a mass restart cannot fan out N separate Telegram messages.
+## Next safe notification/orchestration defect — DONE (`2636deb`)
+Aggregated `health.worker_*` bursts into one owner digest (`_dispatch_aggregate_health`),
+deduping identical (worker, event) rows; a delivery-worker `worker_down`
+(agent_notifier/notification) stays CRITICAL and delivers individually. **Live:** a
+6-worker burst → ONE `health.worker_digest` telegram/sent
+("🩺 6 worker health events (recovered×3, stale×3)") instead of 6 messages. Tests:
+mixed burst keeps delivery-down separate; digest aggregation + dedup.
+
+## Next after that (queued)
+- Persist a monitor "last full sweep" timestamp so the health digest can note "N of M
+  workers" and an owner can tell a partial monitor pass from a genuine mass event.
