@@ -164,7 +164,16 @@ def transition_event(prev_state, cur_state, *, agent: str, evidence: str = "") -
             event = "agent_recovered"
     if event is None:
         return None
-    eh = evidence_hash(agent, event, f"{prev_state}->{cur_state}|{(evidence or '')[-160:]}")
+    # Anti-spam: a flapping agent (working↔idle) would make a NEW evidence hash every
+    # poll if the volatile pane tail were folded in, spamming Telegram. For the flappy
+    # stall/recovery events, key ONLY on the transition (coarse) so repeated flaps
+    # collapse to one alert per window. Completion / blocker / waiting_input keep the
+    # pane evidence so genuinely distinct events (a new report, a new blocker) each
+    # deliver.
+    _COARSE = {"agent_unexpected_idle", "agent_recovered"}
+    material = (f"{prev_state}->{cur_state}" if event in _COARSE
+               else f"{prev_state}->{cur_state}|{(evidence or '')[-160:]}")
+    eh = evidence_hash(agent, event, material)
     return {"event_type": event, "from_state": prev_state, "to_state": cur_state,
             "agent": agent, "evidence_hash": eh, "notify": event in NOTIFY_EVENTS,
             "dedup_key": f"transition:{event}:{eh}"}

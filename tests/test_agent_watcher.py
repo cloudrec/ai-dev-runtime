@@ -126,6 +126,18 @@ def test_transition_unexpected_idle_and_recovery():
     assert w.transition_event("externally_blocked", "shell_running", agent="a")["event_type"] == "agent_recovered"
 
 
+def test_stall_flap_collapses_but_completion_stays_fine_grained():
+    # a flapping agent: working->idle twice with different volatile pane tails must
+    # COLLAPSE (coarse) so it does not spam; completion with different evidence must
+    # each deliver (fine-grained).
+    s1 = w.transition_event("working", "idle", agent="a", evidence="pane tail v1")
+    s2 = w.transition_event("working", "idle", agent="a", evidence="pane tail v2 changed")
+    assert s1["dedup_key"] == s2["dedup_key"]                 # stall flaps collapse
+    c1 = w.transition_event("working", "completed", agent="a", evidence="report A")
+    c2 = w.transition_event("working", "completed", agent="a", evidence="report B")
+    assert c1["dedup_key"] != c2["dedup_key"]                 # distinct completions deliver
+
+
 def test_transition_none_when_unchanged_or_uninteresting():
     assert w.transition_event("idle", "idle", agent="a") is None
     assert w.transition_event(None, "working", agent="a") is None          # no prior state
