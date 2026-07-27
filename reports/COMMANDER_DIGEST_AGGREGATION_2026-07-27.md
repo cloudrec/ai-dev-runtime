@@ -43,8 +43,15 @@ destructive/external-credential actions.
   docker compose up -d backend` — reverts only the aggregate path; individual
   delivery (prior `8e33964`) still works.
 
-## Next safe watcher/orchestration defect (continuing)
-- Verify the notification worker loop actually invokes `poll_once` +
-  `process_new_events` on a live cadence (delivery only reaches Telegram if the loop
-  runs); add a heartbeat/last-run timestamp to the status surface so a stalled
-  notifier worker is itself detectable.
+## Next safe watcher/orchestration defect — DONE (`648e8cf`)
+Verified the delivery cadence runs automatically: `agent_notifier.run_loop`
+(ENABLED, 60s) pulls runtime commander_events → `agent.*` OwnerEvents, and
+`notification_worker` → `process_new_events` → Telegram. `agent_notifier` had NO
+heartbeat (a stall would go silent invisibly); it now beats `health('agent_notifier')`
+each tick — verified a heartbeat row is recorded + advancing (tick_count 2→…),
+alongside the existing `notification` beat.
+
+## Next after that (queued)
+- Surface both worker heartbeats (`agent_notifier`, `notification`) with a staleness
+  threshold in the daily brief / mission-control health card, so a stopped delivery
+  pipeline raises an owner-visible alert (not just a silent DB row).
