@@ -239,9 +239,10 @@ def test_send_proves_delivery_with_pane_diff(monkeypatch):
     fake = FakeTmux()
     fake.capture_seq = ["before state", "before state\n> my message"]
     monkeypatch.setattr(ac, "_tmux", fake)
-    # Stub the state-classification capture so it doesn't consume the delivery
+    # Stub the state-classification captures so they don't consume the delivery
     # before/after sequence this test asserts on.
     monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k: "idle")
+    monkeypatch.setattr(ac, "_pane_pending_input", lambda *a, **k: "")
     monkeypatch.setattr(ac, "find_claude_in_pane", lambda pid: {"pid": 2001, "cmdline": "claude", "cwd": "/opt/safeguard"})
     result = ac.agent_send("safeguard", "my message")
     assert result["pane_changed"] is True
@@ -580,7 +581,12 @@ def test_permission_dialog_with_external_word_in_command_is_waiting_owner():
     assert ac.classify_state(True, True, pane) == "waiting_owner"
     # the bare `timeout` command is not the phrase "timed out"
     assert ac.classify_state(True, True, "running timeout 300 pytest\nesc to interrupt") == "working"
-    assert ac.classify_state(True, True, "job timed out after 30s\nnew task?") == "externally_blocked"
+    # benign shell output ("timed out", "network error") is NOT an external block —
+    # that mis-classified a capacity agent running a live shell (owner-confirmed).
+    assert ac.classify_state(True, True, "job timed out after 30s\nnew task?") == "idle"
+    assert ac.classify_state(True, True, "curl: network error\n❯ ") == "idle"
+    # a real agent-level external block still classifies as externally_blocked.
+    assert ac.classify_state(True, True, "Blocked: vendor key required to continue\n❯ ") == "externally_blocked"
 
 
 def test_working_requires_active_execution_evidence():
@@ -629,5 +635,17 @@ def test_waiting_owner_when_claude_asks():
 
 
 def test_agent_states_vocabulary_is_stable():
-    assert set(ac.AGENT_STATES) == {"working", "idle", "waiting_owner", "externally_blocked",
-                                    "completed", "dead", "stale"}
+    assert set(ac.AGENT_STATES) == {"working", "shell_running", "waiting_input", "idle",
+                                    "waiting_owner", "externally_blocked", "completed",
+                                    "dead", "stale"}
+
+
+def test_shell_running_and_waiting_input_and_no_false_external():
+    # a live shell command in the pane → shell_running (work), not idle/blocked.
+    assert ac.classify_state(True, True, "some scrollback\n❯ ", shell_running=True) == "shell_running"
+    # a typed/pasted but unsubmitted command → waiting_input (never lost as idle).
+    assert ac.classify_state(True, True, "prev output\n", pending_input="[Pasted text #1 +9 lines]") == "waiting_input"
+    assert ac.classify_state(True, True, "prev output\n", pending_input="  ") == "idle"   # empty/ghost
+    # active run beats the new signals.
+    assert ac.classify_state(True, True, "esc to interrupt", shell_running=True,
+                             pending_input="x") == "working"

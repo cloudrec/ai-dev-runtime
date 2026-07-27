@@ -431,8 +431,9 @@ def derive(agent: dict, cfg: dict) -> dict:
                     "fresh": True}
         return {"state": "idle", "fresh": False}
 
-    # working / failed
-    return {"state": observed, "fresh": observed == "working"}
+    # working / shell_running / waiting_input / failed. A live shell command is
+    # active work (fresh); waiting_input is at-rest (owner must submit).
+    return {"state": observed, "fresh": observed in ("working", "shell_running")}
 
 
 # ── tick ────────────────────────────────────────────────────────────────────

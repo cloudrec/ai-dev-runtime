@@ -584,7 +584,8 @@ def audit(action: str, target: str, idempotency_key: Optional[str] = None, **fie
 # rest — even when it carries no "new task?" line and its text differs from a
 # stale cached sample. Output progression alone is NOT accepted as work: a
 # scrollback shift or a stale cache diff must never read as "working".
-AGENT_STATES = ("working", "idle", "waiting_owner", "externally_blocked", "completed", "dead", "stale")
+AGENT_STATES = ("working", "shell_running", "waiting_input", "idle", "waiting_owner",
+                "externally_blocked", "completed", "dead", "stale")
 
 # Active-execution evidence — the ONLY positive proof of "working". A live agent
 # ALWAYS shows one of these while a turn is running; at rest it shows none.
@@ -594,22 +595,34 @@ AGENT_STATES = ("working", "idle", "waiting_owner", "externally_blocked", "compl
 # Past-tense spinners ("Worked for", "Brewed for 11m 24s") are NOT active.
 _STATE_ACTIVE_RUN_RE = re.compile(
     r"(esc to interrupt|…\s*\(\d+\s*m?s\b|[↑↓]\s*[\d.]+\s*k?\s*tokens\b)", re.I)
-# Blocked on something outside the agent's control (vendor key, network, quota).
+# Blocked on something outside the agent's control (vendor key, credentials, quota).
+# NARROW on purpose: generic words like "waiting for", "timed out", "network error",
+# "reconnect", "502/503" appear constantly in benign SHELL/tool output and must NOT
+# read as an external block (that mis-classified a capacity agent running a live
+# shell as externally_blocked). Only strong, agent-level block phrases qualify, and
+# only near the END of the pane (current status), never deep scrollback.
 _STATE_EXTERNAL_RE = re.compile(
-    r"(input[_ ]required|verification key|awaiting vendor|\bvendor\b|waiting for|awaiting|"
-    r"rate.?limit|quota|429|502|503|network error|timed[ -]out|reconnect|upstream)", re.I)
+    r"(verification key|awaiting vendor|vendor key|input[_ ]required|"
+    r"api key required|credentials? required|quota exceeded|rate.?limit(ed|ing)?\b|"
+    r"429 too many|externally blocked|blocked on (an? )?external)", re.I)
 # Claude is asking the owner a question (not the owner's own queued input line).
 _STATE_WAIT_OWNER_RE = re.compile(
     r"(\(y/n\)|\[y/n\]|do you want (me )?to|shall i\b|proceed\?|may i\b|"
     r"which (option|approach)|choose an option|awaiting your (approval|decision|confirmation))", re.I)
 
 
-def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str | None = None) -> str:
-    """Observable state of an agent pane. `working` requires concrete active-
-    execution evidence — a live spinner timer, streaming tokens, or an
-    "esc to interrupt" hint. It is NEVER inferred from a live process, a queued
-    prompt, stale spinner text, or a mere output/cache difference. `prev_tail` is
-    accepted for signature compatibility but no longer influences `working`."""
+def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str | None = None,
+                   *, pending_input: str = "", shell_running: bool = False) -> str:
+    """Observable state of an agent pane.
+
+    `working` requires concrete active-execution evidence — a live spinner timer,
+    streaming tokens, or "esc to interrupt". `shell_running` (a live non-Claude
+    foreground command in the pane) is also real work, not idle/blocked.
+    `pending_input` (a real, non-empty, non-ghost `❯` line the caller extracted)
+    means a command was typed/pasted but NOT submitted → `waiting_input`, so such
+    an agent is never lost as plain idle. `prev_tail` is accepted for signature
+    compatibility but does not influence `working`. New signals default off so the
+    behaviour is unchanged for callers that do not pass them."""
     if not alive:
         return "dead"
     if not is_agent:
@@ -619,15 +632,23 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
     # 1) concrete active-execution evidence — the only path to "working".
     if _STATE_ACTIVE_RUN_RE.search(tail):
         return "working"
+    # 1b) a live shell command running in the pane is work in progress (shell-
+    #     running), NOT idle and NOT an external block.
+    if shell_running:
+        return "shell_running"
     # 2) an ACTIVE permission dialog is waiting_owner even if the command it shows
-    #    contains an external-looking word (e.g. `timeout`, `curl`, `waiting for`);
-    #    the command text is not evidence of a real external block. Checked BEFORE
-    #    the external heuristic so a prompt is never mis-escalated as external.
+    #    contains an external-looking word; the command text is not evidence of a
+    #    real external block. Checked BEFORE the external heuristic.
     if _STATE_WAIT_OWNER_RE.search(tail):
         return "waiting_owner"
-    # 3) at rest — classify what it is resting on. A finished report + empty
-    #    prompt falls through to idle.
-    if _STATE_EXTERNAL_RE.search(tail):
+    # 3) a typed/pasted but unsubmitted command → waiting_input (owner must submit).
+    #    Recovers idle agents with a staged command that were previously lost.
+    if pending_input and pending_input.strip():
+        return "waiting_input"
+    # 4) at rest — classify what it is resting on. An external block must appear in
+    #    the CURRENT status (last ~500 chars), never in deep scrollback, so shell
+    #    output higher up cannot trip it.
+    if _STATE_EXTERNAL_RE.search(tail[-500:]):
         return "externally_blocked"
     return "idle"
 
@@ -635,6 +656,36 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
 def _pane_tail(target: str, lines: int = 25) -> str:
     rc, out, _ = _tmux(["capture-pane", "-p", "-t", target, "-S", f"-{lines}"])
     return redact(out) if rc == 0 else ""
+
+
+# Foreground commands that mean the pane is at rest (an interactive shell or the
+# Claude/node process itself), NOT running a shell command.
+_IDLE_FG_COMMANDS = {"bash", "-bash", "zsh", "-zsh", "sh", "-sh", "fish", "node",
+                     "claude", "tmux", "login", "starship"}
+_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _pane_shell_running(pane: dict) -> bool:
+    """A live, non-idle foreground command in the pane = a shell command running.
+    An idle interactive shell or the Claude/node process is not 'running'."""
+    cmd = (pane.get("command") or "").strip().lower()
+    return bool(cmd) and cmd not in _IDLE_FG_COMMANDS
+
+
+def _pane_pending_input(target: str) -> str:
+    """Real, non-empty text typed/pasted at the `❯` prompt but NOT submitted.
+    Returns '' for an empty prompt or a dim RECALL GHOST (SGR 2), so a ghost is
+    never mistaken for a staged command."""
+    rc, out, _ = _tmux(["capture-pane", "-e", "-p", "-t", target, "-S", "-6"])
+    if rc != 0:
+        return ""
+    prompt_lines = [ln for ln in out.splitlines() if "❯" in ln]
+    if not prompt_lines:
+        return ""
+    after = prompt_lines[-1].split("❯", 1)[1]
+    if "\x1b[2m" in after:                 # dim ghost = recall hint, not staged input
+        return ""
+    return _SGR_RE.sub("", after).replace("\xa0", " ").strip()
 
 
 def agent_list() -> dict:
@@ -654,7 +705,15 @@ def agent_list() -> dict:
         # capture. `working` is decided solely from active-execution evidence in
         # the tail — no cached-tail comparison.
         tail = _pane_tail(pane["target"]) if (is_agent and pane["alive"]) else ""
-        state = classify_state(pane["alive"], is_agent, tail)
+        # Extra signals only for an at-rest agent (skip when already active/working)
+        # so an active agent costs no extra tmux capture.
+        shell_running, pending = False, ""
+        if is_agent and pane["alive"] and not _STATE_ACTIVE_RUN_RE.search(tail[-1500:]):
+            shell_running = _pane_shell_running(pane)
+            if not shell_running:
+                pending = _pane_pending_input(pane["target"])
+        state = classify_state(pane["alive"], is_agent, tail,
+                               pending_input=pending, shell_running=shell_running)
         agents.append({
             **pane,
             "command": redact(pane["command"]),
@@ -701,7 +760,13 @@ def agent_status(target: str) -> dict:
     evidence = conversation_evidence(agent.get("claude_cwd") or agent.get("cwd") or "")
     rc, out, _ = _tmux(["capture-pane", "-p", "-t", agent["target"], "-S", "-40"])
     recent = redact(out) if rc == 0 else ""
-    state = classify_state(agent["alive"], agent["is_agent"], recent)
+    shell_running, pending = False, ""
+    if agent["alive"] and agent["is_agent"] and not _STATE_ACTIVE_RUN_RE.search(recent[-1500:]):
+        shell_running = _pane_shell_running(agent)
+        if not shell_running:
+            pending = _pane_pending_input(agent["target"])
+    state = classify_state(agent["alive"], agent["is_agent"], recent,
+                           pending_input=pending, shell_running=shell_running)
     audit("agent_status", agent["target"], found=True, alive=agent["alive"], is_agent=agent["is_agent"])
     return {
         "target": agent["target"],
