@@ -39,7 +39,13 @@ own message.
   Reconcile still clears (returns count); only the summary event is dropped. Resolved
   rows keep their audit.
 
-## Next safe notification/orchestration defect (continuing)
-- The reconcile summary currently lists raw subject_keys; render it human-friendly in
-  the Telegram body ("cleared 3 stale worker alerts: media, budget (recovered), _orphanX
-  (orphaned)") via notify_render, so the owner reads the outcome without parsing JSON.
+## Next safe defect — DONE (`7c3ef7d`)
+`_fmt` renders `health.worker_reconciliation_cleared` human-friendly. **Live:**
+"🧹 Auto-cleared 1 stale worker alert(s)" / "worker:_orphanY (1 orphaned) — No owner
+action needed" → telegram/sent. Test added.
+
+## Next after that (queued)
+- `mission_control.workers.sweep` exposes last_full_sweep + expected/seen; add a
+  staleness threshold on the sweep itself (health_monitor loop not running → no sweep
+  in N minutes) and surface it as a single owner alert, so a dead monitor loop (which
+  would silence all worker alerting) is itself detectable.
