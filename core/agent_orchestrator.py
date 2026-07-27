@@ -670,6 +670,25 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         except Exception:  # noqa: BLE001
             pass
 
+        # Transition events: ONE deduped owner event when the agent enters a
+        # notable state (completed / waiting_input / genuine blocker / stall /
+        # process death / recovery), carrying pane evidence. Fires for EVERY agent
+        # incl. those outside the orchestrator plan (ACAP / Mess), keyed by
+        # (agent, event, evidence_hash) so an unchanged state never re-notifies.
+        try:
+            from core import agent_watcher as _watch
+            _tev = _watch.transition_event(prev.get("state"), state, agent=key,
+                                           evidence=agent.get("_tail") or "")
+            if _tev and ac.record_commander_event(
+                    key, rec["project"] or session, _tev["event_type"],
+                    {**_tev, "detected_at": _now_iso(), "evidence": (agent.get("_tail") or "")[-300:]},
+                    dedup_key=_tev["dedup_key"], dedup_window_secs=86400):
+                (escalations if _tev.get("notify") else resolved).append(
+                    {"agent": key, "project": rec["project"] or session,
+                     "event": _tev["event_type"], "transition": _tev})
+        except Exception:  # noqa: BLE001
+            pass
+
         _upsert(rec)
         results.append({"agent": key, "state": state, "project": rec["project"]})
         full_records.append(rec)
@@ -866,10 +885,24 @@ def status() -> dict:
         plan_status = _plan.status()
     except Exception as e:  # noqa: BLE001
         plan_status = {"state": "error", "error": str(e)[:120]}
+    recs = all_records()
+    # Direct-agent truth: existing tmux agents actively working OUTSIDE the plan
+    # (e.g. ACAP/Capacity, Mess) so status/portfolio never reads running=0 /
+    # queue=0 while a direct agent is working. Never dispatched to, never touched.
+    _ACTIVE = {"working", "shell_running", "waiting_input"}
+    direct_active = [{"session": r.get("session"), "state": r.get("state"),
+                      "project": r.get("project"), "cwd": r.get("claude_cwd") or r.get("cwd")}
+                     for r in recs if r.get("state") in _ACTIVE]
+    if isinstance(plan_status, dict):
+        plan_status["direct_active_count"] = len(direct_active)
+        plan_status["direct_active"] = direct_active
     return {"states": ORCH_STATES, "budget_locked": budget_locked(),
-            "records": all_records(), "commander_events": events,
+            "records": recs, "commander_events": events,
             "unacked_events": [e for e in events if not e["acknowledged"]],
-            "orchestrator": plan_status, "checked_at": _now_iso()}
+            "orchestrator": plan_status,
+            "direct_active_agents": direct_active,
+            "direct_active_count": len(direct_active),
+            "checked_at": _now_iso()}
 
 
 # ── always-on loop ──────────────────────────────────────────────────────────

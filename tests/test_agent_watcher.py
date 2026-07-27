@@ -107,6 +107,41 @@ def test_successful_resume_classifies_as_recovered_not_failure():
     assert w.event_type(d) == w.EVENT_RESUMED == "agent_resumed_same_conversation"
 
 
+def test_transition_events_for_notable_states():
+    assert w.transition_event("working", "completed", agent="a")["event_type"] == "agent_completed"
+    assert w.transition_event("idle", "waiting_input", agent="a")["event_type"] == "agent_waiting_input"
+    assert w.transition_event("idle", "externally_blocked", agent="a")["event_type"] == "agent_externally_blocked"
+    assert w.transition_event("idle", "waiting_owner", agent="a")["event_type"] == "agent_owner_decision"
+    # process death (test process killed / exited) → agent_process_failed
+    assert w.transition_event("working", "dead", agent="a")["event_type"] == "agent_process_failed"
+    assert w.transition_event("shell_running", "failed", agent="a")["event_type"] == "agent_process_failed"
+
+
+def test_transition_unexpected_idle_and_recovery():
+    # active → idle with no completion = a stall
+    assert w.transition_event("working", "idle", agent="a")["event_type"] == "agent_unexpected_idle"
+    assert w.transition_event("shell_running", "idle", agent="a")["event_type"] == "agent_unexpected_idle"
+    # stuck → active = recovery
+    assert w.transition_event("failed", "working", agent="a")["event_type"] == "agent_recovered"
+    assert w.transition_event("externally_blocked", "shell_running", agent="a")["event_type"] == "agent_recovered"
+
+
+def test_transition_none_when_unchanged_or_uninteresting():
+    assert w.transition_event("idle", "idle", agent="a") is None
+    assert w.transition_event(None, "working", agent="a") is None          # no prior state
+    assert w.transition_event("idle", "working", agent="a") is None        # plain start, not recovery
+    assert w.transition_event("completed", "idle", agent="a") is None      # settling after done
+
+
+def test_transition_notify_and_dedup_key():
+    e = w.transition_event("working", "completed", agent="a", evidence="report written")
+    assert e["notify"] is True and e["dedup_key"].startswith("transition:agent_completed:")
+    # same transition + same evidence → same key (suppressed); changed evidence → new key
+    e2 = w.transition_event("working", "completed", agent="a", evidence="report written")
+    e3 = w.transition_event("working", "completed", agent="a", evidence="different report")
+    assert e["dedup_key"] == e2["dedup_key"] != e3["dedup_key"]
+
+
 def test_dedup_key_changes_when_evidence_changes():
     a = w.detect(agent_key="e:0.0", alive=True, state="idle",
                  assigned_task=_task(), now_ts=NOW, pane_tail="before")

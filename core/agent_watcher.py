@@ -123,3 +123,48 @@ def decide(stall: dict, *, mode: str, approve: bool, budget_locked: bool) -> dic
 def dedup_key(stall: dict) -> str:
     """Alert key: same (condition, evidence_hash) → suppressed; any change → new."""
     return f"watch:{stall['condition']}:{stall['evidence_hash']}"
+
+
+# ── state-transition events ──────────────────────────────────────────────────
+# A transition INTO one of these states is one deduped owner event (with evidence).
+_ENTER_EVENTS = {
+    "completed": "agent_completed",
+    "waiting_input": "agent_waiting_input",
+    "externally_blocked": "agent_externally_blocked",   # genuine blocker
+    "waiting_owner": "agent_owner_decision",             # genuine blocker
+    "failed": "agent_process_failed",                    # dead/exited/test process killed
+    "dead": "agent_process_failed",
+}
+_ACTIVE_STATES = {"working", "shell_running"}
+_STUCK_STATES = {"failed", "dead", "externally_blocked", "waiting_owner", "waiting_input"}
+
+# Which transition events warrant an owner NOTIFICATION (not just a durable log).
+# Recovery + completion + genuine blockers + stalls + process death all do;
+# waiting_input does too (a staged command needs the owner to act).
+NOTIFY_EVENTS = {
+    "agent_completed", "agent_waiting_input", "agent_externally_blocked",
+    "agent_owner_decision", "agent_process_failed", "agent_unexpected_idle",
+    "agent_recovered",
+}
+
+
+def transition_event(prev_state, cur_state, *, agent: str, evidence: str = "") -> Optional[dict]:
+    """Return a deduped transition-event descriptor when the agent moved into a
+    notable state, else None. Handles: entering completed / waiting_input /
+    genuine blocker / process-death; a stall (active → idle with no completion);
+    and recovery (stuck → active). Keyed by (agent, event, evidence_hash) so an
+    unchanged state never re-notifies and any real change makes a new key."""
+    if not prev_state or prev_state == cur_state:
+        return None
+    event = _ENTER_EVENTS.get(cur_state)
+    if event is None:
+        if cur_state == "idle" and prev_state in _ACTIVE_STATES:
+            event = "agent_unexpected_idle"          # active → idle, no completion = stall
+        elif cur_state in _ACTIVE_STATES and prev_state in _STUCK_STATES:
+            event = "agent_recovered"
+    if event is None:
+        return None
+    eh = evidence_hash(agent, event, f"{prev_state}->{cur_state}|{(evidence or '')[-160:]}")
+    return {"event_type": event, "from_state": prev_state, "to_state": cur_state,
+            "agent": agent, "evidence_hash": eh, "notify": event in NOTIFY_EVENTS,
+            "dedup_key": f"transition:{event}:{eh}"}
