@@ -48,7 +48,14 @@ Root cause:
 - `cd /opt/seo && git revert 772e457 && docker compose build backend && docker compose up -d backend`.
   `monitor_state` table is additive/harmless; resolved rows keep their audit.
 
-## Next safe notification/orchestration defect (continuing)
-- Backfill subject_key for the 2 legacy NULL-subject worker_down rows (body carries no
-  worker) — either from the OwnerEvent that spawned them (join on event_id) or resolve
-  them as un-attributable legacy, so no worker_down can ever be un-reconcilable.
+## Next safe defect — DONE (`8a769ec`)
+`backfill_subject_keys` now falls back to the linked OwnerEvent payload (join on
+event_id) for legacy rows whose body has no worker; `reconcile_worker_alerts` also
+resolves OLD (>24h) NULL-subject worker_down/stale as un-attributable legacy. **Live:**
+OPEN worker_down/stale = **0** — no worker alert can be stuck un-reconcilable. Recent
+NULL-subject rows are left (may still be live). Test added.
+
+## Next after that (queued)
+- Emit ONE deduped owner event when a reconciliation actually resolves stale alerts
+  (currently silent) — so the owner sees "3 stale worker alerts auto-cleared", closing
+  the loop between a silent self-heal and the alert surface.
