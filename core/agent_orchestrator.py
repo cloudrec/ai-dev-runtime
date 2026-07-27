@@ -244,6 +244,53 @@ def all_records() -> list[dict]:
         conn.close()
 
 
+_REAPED_STATES = ("vanished", "ended")
+
+
+def reap_vanished(live_sessions, emit=None) -> list:
+    """Reconcile records whose tmux session has VANISHED (no live pane).
+
+    Atomically transitions each such record to `vanished` (guarded so a concurrent
+    sweep / restart can never double-process it) and, ONLY when it carried approved
+    unfinished work, invokes `emit(agent_key, session, info)` exactly once. Never
+    recreates an agent and never touches a live pane. `live_sessions` is the set of
+    sessions that currently have a live agent pane.
+    """
+    live = set(live_sessions or [])
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT agent_key,session,state,approved_goal,current_task FROM agent_orchestrator"
+        ).fetchall()
+        reaped = []
+        for agent_key, session, state, goal, task in rows:
+            if session in live or state in _REAPED_STATES:
+                continue
+            # approved unfinished work = had a goal/task and was not already finished.
+            had_work = bool(goal or task) and state not in ("completed", "failed")
+            # ATOMIC + race/restart-safe: only the writer that flips it away from a
+            # non-reaped state proceeds; a loser sees rowcount 0 and emits nothing.
+            cur = conn.execute(
+                "UPDATE agent_orchestrator SET state='vanished', notification_state='vanished', "
+                "updated_at=? WHERE agent_key=? AND state NOT IN ('vanished','ended')",
+                (_now_iso(), agent_key))
+            conn.commit()
+            if cur.rowcount == 0:
+                continue
+            info = {"agent": agent_key, "session": session, "prev_state": state,
+                    "had_approved_unfinished_work": had_work,
+                    "approved_goal": goal, "current_task": task}
+            reaped.append(info)
+            if had_work and emit:
+                try:
+                    emit(agent_key, session, info)
+                except Exception:  # noqa: BLE001
+                    pass
+        return reaped
+    finally:
+        conn.close()
+
+
 # ── review ladder (local → cheap model → strong model) ──────────────────────
 def review_command(command: str, cwd: str, roots: list[str]) -> dict:
     """Tier 1 local structured policy. Returns a verdict with recommendation,
@@ -721,6 +768,33 @@ def refresh_and_resolve(approve: bool = True) -> dict:
                                     "event": _watch.EVENT_RECOVERY_FAILURE,
                                     "classification": "agent_recovery_failure",
                                     "condition": "exited_unfinished", "reason": decision["reason"]})
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Reaper: reconcile records whose tmux session VANISHED (pane gone, stale record).
+    # Atomically mark them vanished; emit ONE deduped owner event only if the record
+    # carried approved unfinished work. Never recreates an agent or touches a pane.
+    try:
+        live_agents = inv.get("agents") or []
+        # Derive live sessions from the actual panes; only reconcile when we have a
+        # real inventory (never mass-reap on a transient empty/failed read).
+        live_sessions = {a.get("session") for a in live_agents if a.get("session")}
+        if not live_agents:
+            raise RuntimeError("empty inventory — skip reaping")
+
+        def _emit_vanished(agent_key, session, info):
+            cfg = _session_cfg(session)
+            ac.record_commander_event(
+                agent_key, cfg.get("project") or session, "agent_vanished_unfinished",
+                {**info, "classification": "vanished_unfinished", "detected_at": _now_iso()},
+                dedup_key=f"vanished:{session}", dedup_window_secs=604800)
+            escalations.append({"agent": agent_key, "project": cfg.get("project") or session,
+                                "event": "agent_vanished_unfinished", "reason": info})
+
+        reaped = reap_vanished(live_sessions, emit=_emit_vanished)
+        if reaped:
+            resolved.append({"event": "sessions_reaped", "count": len(reaped),
+                             "sessions": [r["session"] for r in reaped]})
     except Exception:  # noqa: BLE001
         pass
 
