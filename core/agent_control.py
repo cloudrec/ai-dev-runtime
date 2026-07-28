@@ -756,6 +756,13 @@ def agent_list() -> dict:
                 pending = _pane_pending_input(pane["target"])
         state = classify_state(pane["alive"], is_agent, tail,
                                pending_input=pending, shell_running=shell_running)
+        # Last non-blank pane line as a short activity snippet + a redacted queued-input
+        # preview (a typed/pasted-but-unsubmitted command). Both secret-redacted.
+        last_line = ""
+        for _ln in reversed(tail.splitlines()):
+            if _ln.strip():
+                last_line = redact(_ln.strip())[:160]
+                break
         agents.append({
             **pane,
             "command": redact(pane["command"]),
@@ -764,6 +771,8 @@ def agent_list() -> dict:
             "claude_pid": claude["pid"] if claude else None,
             "claude_cwd": claude["cwd"] if claude else None,
             "state": state,
+            "queued_input": redact(pending)[:200] if pending else "",
+            "last_pane_line": last_line,
         })
 
     # Duplicate agents = more than one live Claude on the same working directory.

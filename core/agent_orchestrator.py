@@ -246,6 +246,61 @@ def all_records() -> list[dict]:
 
 _REAPED_STATES = ("vanished", "ended")
 
+# Display bucket for the owner-facing DIRECT AGENTS block (never conflate idle with
+# working). externally_blocked / waiting_owner are OWNER-ACTION, NOT stalled.
+_DIRECT_BUCKET = {"working": "working", "shell_running": "working",
+                  "waiting_input": "waiting", "externally_blocked": "waiting",
+                  "waiting_owner": "waiting", "idle": "idle", "completed": "idle",
+                  "dead": "dead", "stale": "dead", "failed": "dead", "vanished": "dead"}
+_OWNER_ACTION_STATES = {"externally_blocked", "waiting_owner"}
+
+
+def build_direct_agents(agents: list, records: dict, now_ts: float, redact=lambda s: s) -> list:
+    """Truthful DIRECT AGENTS snapshot from LIVE evidence: live tmux panes (agents) +
+    stored per-agent records (task/blocker/last-activity). Pure + testable. Never
+    presents an idle session as active; marks owner-action vs stalled; flags duplicate
+    cwd and queued input; text fields are secret-redacted by `redact`."""
+    from collections import Counter
+    import json as _json
+    live = [a for a in agents if a.get("is_agent") and a.get("alive")]
+    cwd_counts = Counter((a.get("claude_cwd") or a.get("cwd")) for a in live if (a.get("claude_cwd") or a.get("cwd")))
+    out = []
+    for a in agents:
+        if not a.get("is_agent"):
+            continue                                    # not a Claude agent → skip
+        target = a.get("target") or ""
+        session = target.split(":", 1)[0]
+        rec = records.get(target) or records.get(f"{session}:0.0") or {}
+        state = a.get("state") or ("dead" if not a.get("alive") else "idle")
+        cwd = a.get("claude_cwd") or a.get("cwd")
+        lfa = rec.get("last_fresh_activity_ts")
+        age = round(now_ts - lfa) if isinstance(lfa, (int, float)) else None
+        task = rec.get("current_task") or rec.get("approved_goal")
+        last_result = None
+        ce = rec.get("completion_evidence")
+        if ce:
+            try:
+                d = _json.loads(ce) if isinstance(ce, str) else ce
+                last_result = (d or {}).get("report_path")
+            except Exception:  # noqa: BLE001
+                last_result = None
+        has_conv = bool(task or last_result or rec.get("phase"))
+        out.append({
+            "target": target, "session": session, "cwd": cwd,
+            "state": state, "bucket": _DIRECT_BUCKET.get(state, "idle"),
+            "alive": bool(a.get("alive")),
+            "current_task": redact(task)[:200] if task else None,
+            "last_result": redact(last_result)[:200] if last_result else None,
+            "blocker": redact(rec.get("blocker_text"))[:200] if rec.get("blocker_text") else None,
+            "last_activity_age_s": age,
+            "queued_input": a.get("queued_input") or "",       # already redacted upstream
+            "last_pane_line": a.get("last_pane_line") or "",   # already redacted upstream
+            "has_conversation": has_conv,
+            "duplicate_cwd": (cwd_counts.get(cwd, 0) > 1) if cwd else False,
+            "owner_action": state in _OWNER_ACTION_STATES,     # NOT stalled — owner must act
+        })
+    return out
+
 
 def reap_vanished(live_sessions, emit=None) -> list:
     """Reconcile records whose tmux session has VANISHED (no live pane).
@@ -981,12 +1036,24 @@ def status() -> dict:
     if isinstance(plan_status, dict):
         plan_status["direct_active_count"] = len(direct_active)
         plan_status["direct_active"] = direct_active
+    # Full truthful DIRECT AGENTS snapshot from live tmux + records (state, cwd, task,
+    # blocker, activity age, queued input, duplicate cwd, owner-action). Redacted.
+    direct_agents, duplicates = [], []
+    try:
+        inv = ac.agent_list()
+        rec_by_key = {r.get("agent_key"): r for r in recs}
+        direct_agents = build_direct_agents(inv.get("agents", []), rec_by_key, _now_ts(), redact=ac.redact)
+        duplicates = inv.get("duplicates", [])
+    except Exception:  # noqa: BLE001
+        direct_agents = []
     return {"states": ORCH_STATES, "budget_locked": budget_locked(),
             "records": recs, "commander_events": events,
             "unacked_events": [e for e in events if not e["acknowledged"]],
             "orchestrator": plan_status,
             "direct_active_agents": direct_active,
             "direct_active_count": len(direct_active),
+            "direct_agents": direct_agents,
+            "direct_agent_duplicates": duplicates,
             "checked_at": _now_iso()}
 
 
