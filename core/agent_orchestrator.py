@@ -255,11 +255,28 @@ _DIRECT_BUCKET = {"working": "working", "shell_running": "working",
 _OWNER_ACTION_STATES = {"externally_blocked", "waiting_owner"}
 
 
-def build_direct_agents(agents: list, records: dict, now_ts: float, redact=lambda s: s) -> list:
+def build_direct_agents(agents: list, records: dict, now_ts: float, redact=lambda s: s,
+                        task_lookup=None) -> list:
     """Truthful DIRECT AGENTS snapshot from LIVE evidence: live tmux panes (agents) +
     stored per-agent records (task/blocker/last-activity). Pure + testable. Never
     presents an idle session as active; marks owner-action vs stalled; flags duplicate
-    cwd and queued input; text fields are secret-redacted by `redact`."""
+    cwd and queued input; text fields are secret-redacted by `redact`.
+
+    `task_lookup(cwd) -> str|None` supplies the current task from fresh transcript
+    evidence for a direct/non-orchestrator agent whose record has none — called ONLY
+    when the record lacks a task, and the result is truth (last real user instruction),
+    never a guess. Cached per cwd within one build."""
+    _task_cache: dict = {}
+
+    def _lookup(cwd):
+        if not task_lookup or not cwd:
+            return None
+        if cwd not in _task_cache:
+            try:
+                _task_cache[cwd] = task_lookup(cwd)
+            except Exception:  # noqa: BLE001
+                _task_cache[cwd] = None
+        return _task_cache[cwd]
     from collections import Counter
     import json as _json
     live = [a for a in agents if a.get("is_agent") and a.get("alive")]
@@ -276,6 +293,11 @@ def build_direct_agents(agents: list, records: dict, now_ts: float, redact=lambd
         lfa = rec.get("last_fresh_activity_ts")
         age = round(now_ts - lfa) if isinstance(lfa, (int, float)) else None
         task = rec.get("current_task") or rec.get("approved_goal")
+        task_source = "record" if task else None
+        if not task:                                    # direct/non-orchestrator agent
+            t = _lookup(cwd)
+            if t:
+                task, task_source = t, "transcript"
         last_result = None
         ce = rec.get("completion_evidence")
         if ce:
@@ -290,6 +312,7 @@ def build_direct_agents(agents: list, records: dict, now_ts: float, redact=lambd
             "state": state, "bucket": _DIRECT_BUCKET.get(state, "idle"),
             "alive": bool(a.get("alive")),
             "current_task": redact(task)[:200] if task else None,
+            "task_source": task_source,                        # record | transcript | None
             "last_result": redact(last_result)[:200] if last_result else None,
             "blocker": redact(rec.get("blocker_text"))[:200] if rec.get("blocker_text") else None,
             "last_activity_age_s": age,
@@ -300,6 +323,94 @@ def build_direct_agents(agents: list, records: dict, now_ts: float, redact=lambd
             "owner_action": state in _OWNER_ACTION_STATES,     # NOT stalled — owner must act
         })
     return out
+
+
+# ── current-task from fresh transcript (direct/non-orchestrator agents) ──────
+_META_PREFIXES = ("<", "[", "This session is being continued", "Caveat:", "tool_result")
+
+
+def transcript_current_task(cwd: str, redact=lambda s: s, max_tail: int = 65536) -> Optional[str]:
+    """The LAST real user instruction from the agent's newest transcript = its current
+    task. TRUTH, not a guess: only genuine user-authored text (tool-results, system
+    continuations, command wrappers skipped). Reads only the file TAIL (bounded I/O);
+    secret-redacted, single line, capped. Returns None if nothing reliable."""
+    if not cwd:
+        return None
+    import glob
+    proj = os.path.expanduser("~/.claude/projects/") + cwd.replace("/", "-")
+    try:
+        files = glob.glob(proj + "/*.jsonl")
+        if not files:
+            return None
+        newest = max(files, key=os.path.getmtime)
+        size = os.path.getsize(newest)
+        with open(newest, "rb") as f:
+            if size > max_tail:
+                f.seek(size - max_tail)
+                f.readline()                            # drop partial first line
+            chunk = f.read().decode("utf-8", "ignore")
+        last = None
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if d.get("type") != "user" or d.get("isMeta") or d.get("isSidechain"):
+                continue
+            content = (d.get("message") or {}).get("content")
+            text = None
+            if isinstance(content, str):
+                text = content
+            elif isinstance(content, list):
+                parts = [b.get("text") for b in content
+                         if isinstance(b, dict) and b.get("type") == "text" and b.get("text")]
+                text = " ".join(parts) if parts else None      # tool_result blocks → no text → skip
+            if not text:
+                continue
+            t = text.strip()
+            if not t or any(t.startswith(p) for p in _META_PREFIXES):
+                continue
+            last = t
+        if not last:
+            return None
+        return (redact(last.splitlines()[0].strip())[:160]) or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# ── bounded cache for the DIRECT AGENTS snapshot (avoid repeated pane captures) ──
+_DIRECT_TTL = float(os.getenv("DIRECT_AGENTS_TTL_SECS", "15"))
+_DIRECT_HARD_STALE = float(os.getenv("DIRECT_AGENTS_HARD_STALE_SECS", "120"))
+_DIRECT_CACHE = {"data": None, "duplicates": [], "ts": 0.0}
+
+
+def direct_agents_snapshot(force: bool = False) -> tuple:
+    """Return (agents, duplicates, meta). Serves a fresh live read at most once per
+    `_DIRECT_TTL`; within TTL returns the cached snapshot. FAIL-OPEN: if a live read
+    errors, returns the last cached snapshot (marked stale) while it is younger than
+    the hard-stale limit. meta = {cached, age_s, stale, ttl_s}."""
+    now = _now_ts()
+    age = now - _DIRECT_CACHE["ts"]
+    if not force and _DIRECT_CACHE["data"] is not None and age < _DIRECT_TTL:
+        return _DIRECT_CACHE["data"], _DIRECT_CACHE["duplicates"], {
+            "cached": True, "age_s": round(age, 1), "stale": False, "ttl_s": _DIRECT_TTL}
+    try:
+        inv = ac.agent_list()
+        rec_by_key = {r.get("agent_key"): r for r in all_records()}
+        data = build_direct_agents(inv.get("agents", []), rec_by_key, now, redact=ac.redact,
+                                   task_lookup=lambda c: transcript_current_task(c, ac.redact))
+        _DIRECT_CACHE.update({"data": data, "duplicates": inv.get("duplicates", []), "ts": now})
+        return data, inv.get("duplicates", []), {"cached": False, "age_s": 0.0, "stale": False,
+                                                 "ttl_s": _DIRECT_TTL}
+    except Exception as e:  # noqa: BLE001
+        if _DIRECT_CACHE["data"] is not None and age < _DIRECT_HARD_STALE:
+            return _DIRECT_CACHE["data"], _DIRECT_CACHE["duplicates"], {
+                "cached": True, "age_s": round(age, 1), "stale": True, "fail_open": True,
+                "error": str(e)[:80], "ttl_s": _DIRECT_TTL}
+        return [], [], {"cached": False, "stale": True, "error": str(e)[:80], "ttl_s": _DIRECT_TTL}
 
 
 def reap_vanished(live_sessions, emit=None) -> list:
@@ -1036,14 +1147,11 @@ def status() -> dict:
     if isinstance(plan_status, dict):
         plan_status["direct_active_count"] = len(direct_active)
         plan_status["direct_active"] = direct_active
-    # Full truthful DIRECT AGENTS snapshot from live tmux + records (state, cwd, task,
-    # blocker, activity age, queued input, duplicate cwd, owner-action). Redacted.
-    direct_agents, duplicates = [], []
+    # Full truthful DIRECT AGENTS snapshot — bounded TTL cache (avoids repeated pane
+    # captures on every status poll); fail-open to the last snapshot on a live-read error.
+    direct_agents, duplicates, direct_meta = [], [], {}
     try:
-        inv = ac.agent_list()
-        rec_by_key = {r.get("agent_key"): r for r in recs}
-        direct_agents = build_direct_agents(inv.get("agents", []), rec_by_key, _now_ts(), redact=ac.redact)
-        duplicates = inv.get("duplicates", [])
+        direct_agents, duplicates, direct_meta = direct_agents_snapshot()
     except Exception:  # noqa: BLE001
         direct_agents = []
     return {"states": ORCH_STATES, "budget_locked": budget_locked(),
@@ -1054,6 +1162,7 @@ def status() -> dict:
             "direct_active_count": len(direct_active),
             "direct_agents": direct_agents,
             "direct_agent_duplicates": duplicates,
+            "direct_agents_meta": direct_meta,
             "checked_at": _now_iso()}
 
 
