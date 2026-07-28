@@ -394,6 +394,48 @@ def ack_commander_events(ids: list) -> int:
         conn.close()
 
 
+# Condition events that a later ACTIVE/COMPLETED state contradicts (a stale
+# blocker/stall/waiting/test-killed still sitting UNDELIVERED in the queue).
+_CONDITION_EVENT_TYPES = ("agent_externally_blocked", "agent_owner_decision", "agent_waiting_input",
+                          "agent_unexpected_idle", "agent_process_failed", "agent_recovery_failure")
+_ACTIVE_OR_DONE = ("working", "shell_running", "completed")
+
+
+def retract_stale_condition_events(agent: str, current_state: str, reason: str = "") -> list:
+    """SOURCE-SIDE retraction: when the orchestrator sees `agent` ACTIVE/COMPLETED
+    again, retract its still-UNACKED condition events (blocker/stall/waiting/
+    test-killed) so the notifier never delivers a contradicted alert. Atomic +
+    idempotent + restart-safe: only rows still `acknowledged=0` are acked (race-safe
+    against the notifier's own ack), and a per-event lineage marker
+    (`commander_event_retracted`, dedup_key `retract-src:<id>`) is recorded once.
+    Returns the retracted event ids. No-op unless the state is active/completed."""
+    if current_state not in _ACTIVE_OR_DONE:
+        return []
+    conn = _db()
+    try:
+        ph = ",".join("?" for _ in _CONDITION_EVENT_TYPES)
+        rows = conn.execute(
+            f"SELECT id,event_type,project FROM commander_events WHERE agent=? AND acknowledged=0 "
+            f"AND event_type IN ({ph}) ORDER BY id", (agent, *_CONDITION_EVENT_TYPES)).fetchall()
+        if not rows:
+            return []
+        conn.executemany("UPDATE commander_events SET acknowledged=1 WHERE id=? AND acknowledged=0",
+                         [(r[0],) for r in rows])
+        conn.commit()
+    finally:
+        conn.close()
+    retracted = []
+    for eid, etype, project in rows:
+        record_commander_event(
+            agent, project or "", "commander_event_retracted",
+            {"retracted_event_id": eid, "retracted_event_type": etype, "agent": agent,
+             "subject_key": f"agent:{agent}", "current_state": current_state,
+             "reason": reason or f"agent {current_state} again — event stale"},
+            dedup_key=f"retract-src:{eid}", dedup_window_secs=604800)
+        retracted.append(eid)
+    return retracted
+
+
 def get_prompt_decision(target: str, prompt_hash: str) -> Optional[dict]:
     conn = _db()
     try:

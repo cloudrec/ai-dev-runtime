@@ -736,6 +736,17 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         except Exception:  # noqa: BLE001
             pass
 
+        # Source-side retraction: an agent ACTIVE/COMPLETED again → retract its still-
+        # unacked stale condition events so the notifier never delivers a contradicted
+        # alert (the notifier's pre-delivery revalidation stays as a second barrier).
+        try:
+            _rids = ac.retract_stale_condition_events(key, state, reason=f"agent {state} again")
+            if _rids:
+                resolved.append({"agent": key, "action": "retracted_stale_events",
+                                 "count": len(_rids), "ids": _rids})
+        except Exception:  # noqa: BLE001
+            pass
+
         _upsert(rec)
         results.append({"agent": key, "state": state, "project": rec["project"]})
         full_records.append(rec)
