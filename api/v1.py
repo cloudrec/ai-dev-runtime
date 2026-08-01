@@ -398,6 +398,15 @@ async def agents_commander_events(unacked: bool = True, limit: int = 50, _: bool
     return {"events": _ac.list_commander_events(limit=limit, unacked_only=unacked)}
 
 
+@router.get("/agents/direct-lifecycle/metrics")
+async def agents_direct_lifecycle_metrics(_: bool = Depends(_auth)):
+    """Direct-agent lifecycle counters (agents observed, completion/dead
+    candidates, emitted events, duplicate + insufficient-evidence suppressions,
+    delivery outcomes). Read-only."""
+    from core import direct_agent_lifecycle as _dal
+    return {"enabled": _dal.ENABLED, "metrics": _dal.metrics()}
+
+
 class AckReq(BaseModel):
     ids: list[int]
 

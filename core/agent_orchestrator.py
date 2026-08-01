@@ -1009,4 +1009,18 @@ async def run_loop() -> None:
                          f"escalations={len(res.get('escalations', []))}")
         except Exception as e:  # noqa: BLE001
             log.warning(f"orchestrator tick error: {e}")
+        # Direct-agent lifecycle: reliable completion / interruption events for
+        # tmux agents OUTSIDE the plan (the inline path structurally cannot cover
+        # baseline completion or dead panes). Additive + best-effort — a failure
+        # here never breaks the orchestrator sweep.
+        try:
+            from core import direct_agent_lifecycle as _dal
+            if _dal.ENABLED:
+                inv = await asyncio.to_thread(ac.agent_list)
+                dres = await asyncio.to_thread(_dal.sweep, inv)
+                if dres.get("events"):
+                    log.info(f"direct lifecycle: emitted={len(dres['events'])} "
+                             f"{[e['event_type'] for e in dres['events']]}")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"direct lifecycle sweep error: {e}")
         await asyncio.sleep(interval)
