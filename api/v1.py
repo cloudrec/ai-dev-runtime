@@ -407,6 +407,14 @@ async def agents_direct_lifecycle_metrics(_: bool = Depends(_auth)):
     return {"enabled": _dal.ENABLED, "metrics": _dal.metrics()}
 
 
+@router.get("/agents/continuation-watchdog/health")
+async def agents_continuation_watchdog_health(_: bool = Depends(_auth)):
+    """Continuation-watchdog health + last action (last run, agents checked,
+    submitted / verified / retried / blocked / errors). Read-only."""
+    from core import agent_continuation_watchdog as _cw
+    return _cw.health()
+
+
 class AckReq(BaseModel):
     ids: list[int]
 

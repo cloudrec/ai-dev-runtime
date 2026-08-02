@@ -981,12 +981,18 @@ def status() -> dict:
     if isinstance(plan_status, dict):
         plan_status["direct_active_count"] = len(direct_active)
         plan_status["direct_active"] = direct_active
+    try:
+        from core import agent_continuation_watchdog as _cw
+        cw_health = _cw.health()
+    except Exception:  # noqa: BLE001
+        cw_health = {"enabled": None}
     return {"states": ORCH_STATES, "budget_locked": budget_locked(),
             "records": recs, "commander_events": events,
             "unacked_events": [e for e in events if not e["acknowledged"]],
             "orchestrator": plan_status,
             "direct_active_agents": direct_active,
             "direct_active_count": len(direct_active),
+            "continuation_watchdog": cw_health,
             "checked_at": _now_iso()}
 
 

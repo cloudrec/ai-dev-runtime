@@ -128,6 +128,21 @@ async def _start_agent_orchestrator():
         logger.warning(f"agent orchestrator not started: {e}")
 
 
+@app.on_event("startup")
+async def _start_continuation_watchdog():
+    # Server-side direct-agent continuation watchdog: submits a documented SAFE next
+    # step for an approved idle agent and PROVES the submission (submitted + pane
+    # changed + prompt consumed + conversation modified + state transitioned),
+    # retrying Enter once and raising a blocker if it will not submit. Independent of
+    # any external/hourly automation. Gated by CONTINUATION_WATCHDOG_ENABLED.
+    import asyncio
+    try:
+        from core.agent_continuation_watchdog import run_loop as _cw_loop
+        asyncio.create_task(_cw_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"continuation watchdog not started: {e}")
+
+
 # ---- движок и очередь ----
 engine = RuntimeEngine()
 
