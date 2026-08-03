@@ -315,3 +315,41 @@ owner stops receiving same-chat messages with no signal.
 The dead-letter backlog clears only by enabling owner-push (**G4**, secret-bearing); the 6
 open owner gates need owner decisions; a durable CTO consumer cursor requires the ChatGPT
 side to adopt the ack contract. All owner-side — no autonomous action taken.
+
+---
+
+# ADDENDUM 5 — control-loop heartbeat liveness (stall detection, read-only)
+
+## Gap
+
+Only the discovery ENGINE had a liveness signal (registry `updated_at`). The other Owner OS
+control loops — continuation watchdog, orchestrator, direct-agent-lifecycle — had **no stall
+detection**, despite a silently stalled loop being the known health_monitor-stall failure
+class (a loop that stops ticking with no signal).
+
+## Added (read-only)
+
+`loop_liveness_report` — per-loop heartbeat via each loop's own last-activity marker (a fresh
+row every tick): `cw_health.last_run_at` (watchdog), `max(agent_orchestrator.updated_at)`
+(orchestrator), `max(direct_agent_lifecycle.updated_at)` (lifecycle),
+`max(control_plane.agent.updated_at)` (engine). A loop older than **3× its interval** is
+`stalled` (red); a loop with no marker yet is `unknown` (informational). The **supervisor**
+is reported separately as `no_heartbeat_marker` — its only marker (`supervisor_prompts`) is
+written on a decision, not every tick, so its liveness is not assessable here. Reads each DB
+`mode=ro`, tolerant of a missing table. `observability_summary` now goes red if any loop is
+stalled.
+
+## Live (read-only) result
+
+All four measurable loops **alive**: continuation_watchdog (age 19s / 30s), orchestrator
+(37s / 45s), direct_agent_lifecycle (36s / 45s), control_plane_engine (19s / 30s).
+`stalled_loops=0`, summary `status=green, all_clear=true`. A future silent stall of any of
+these now flips the summary red.
+
+## Tests / commit
+
+- Tests: **+4** (all-alive, stalled-watchdog detected, missing-marker=unknown, summary
+  red-on-stall). `test_control_plane_diagnostics.py` total **27**. Full suite: see run.
+- Commit: local only; read-only (SELECT / `mode=ro`). Endpoint `/observability` now includes
+  `loop_liveness`. No defect found (all loops ticking); the diagnostic closes the
+  stall-detection blind spot.

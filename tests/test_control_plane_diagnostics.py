@@ -295,6 +295,59 @@ def test_commander_recent_ack_means_not_stalled_despite_unacked(tmp_path):
     assert r["unacked"] == 1 and r["drain_alive"] is True and r["status"] == "green"
 
 
+# ── loop liveness (heartbeat stall detection) ────────────────────────────────
+import os as _os
+
+
+def _loop_markers(cw_ts=None, orch_ts=None, dal_ts=None):
+    ac = _os.environ["AGENT_CONTROL_DB"]
+    c = sqlite3.connect(ac)
+    c.execute("CREATE TABLE IF NOT EXISTS cw_health(id INTEGER PRIMARY KEY, last_run_at TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS agent_orchestrator(agent_key TEXT, updated_at TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS direct_agent_lifecycle(target TEXT, updated_at TEXT)")
+    if cw_ts is not None:
+        c.execute("INSERT OR REPLACE INTO cw_health(id,last_run_at) VALUES(1,?)", (_iso(cw_ts),))
+    if orch_ts is not None:
+        c.execute("INSERT INTO agent_orchestrator(agent_key,updated_at) VALUES('a',?)", (_iso(orch_ts),))
+    if dal_ts is not None:
+        c.execute("INSERT INTO direct_agent_lifecycle(target,updated_at) VALUES('a',?)", (_iso(dal_ts),))
+    c.commit(); c.close()
+
+
+def test_loop_liveness_all_alive():
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 10, dal_ts=NOW - 10)
+    _agent_row("cp:0.0", NOW - 5, "managed")   # control-plane engine marker
+    r = diag.loop_liveness_report(now=NOW)
+    by = {l["loop"]: l["state"] for l in r["loops"]}
+    assert by["continuation_watchdog"] == "alive" and by["orchestrator"] == "alive"
+    assert by["control_plane_engine"] == "alive" and r["stalled_loops"] == 0 and r["status"] == "green"
+
+
+def test_loop_liveness_detects_stalled_watchdog():
+    _loop_markers(cw_ts=NOW - 5000, orch_ts=NOW - 10, dal_ts=NOW - 10)   # watchdog old
+    _agent_row("cp:0.0", NOW - 5, "managed")
+    r = diag.loop_liveness_report(now=NOW, stall_multiplier=3.0)
+    by = {l["loop"]: l["state"] for l in r["loops"]}
+    assert by["continuation_watchdog"] == "stalled" and r["stalled_loops"] == 1 and r["status"] == "red"
+
+
+def test_loop_liveness_missing_marker_is_unknown_not_red():
+    # no marker tables/rows → unknown, not a failure
+    r = diag.loop_liveness_report(now=NOW)
+    states = {l["state"] for l in r["loops"]}
+    assert states <= {"unknown"} and r["stalled_loops"] == 0 and r["status"] == "green"
+
+
+def test_summary_red_when_a_loop_is_stalled(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty.db"))
+    sqlite3.connect(str(tmp_path / "empty.db")).execute(
+        "CREATE TABLE jobs(id TEXT,status TEXT,created_at TEXT,updated_at TEXT,finished_at TEXT)")
+    _agent_row("cp:0.0", NOW - 5, "managed")            # engine alive
+    _loop_markers(cw_ts=NOW - 5000, orch_ts=NOW - 10)   # watchdog stalled
+    s = diag.observability_summary(now=NOW)
+    assert s["stalled_loops"] == 1 and s["all_clear"] is False and s["status"] == "red"
+
+
 # ── summary: engine stall makes it RED even with zero active failures ────────
 def test_summary_red_when_engine_stalled_no_active_failures(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty_jobs.db"))

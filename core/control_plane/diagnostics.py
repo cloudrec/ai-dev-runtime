@@ -318,6 +318,71 @@ def commander_delivery_report(*, now: Optional[float] = None, stall_after_secs: 
     }
 
 
+def _read_marker(db_path: str, query: str):
+    """Read a single scalar heartbeat marker read-only; None on any error/missing table."""
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.OperationalError:
+        return None
+    try:
+        r = conn.execute(query).fetchone()
+        return r[0] if r else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+
+
+def _loop_specs() -> list:
+    """Per-loop heartbeat markers (a fresh row each tick). The supervisor is intentionally
+    absent — its only marker (`supervisor_prompts`) is written on a decision, not every tick,
+    so it has NO reliable heartbeat and cannot be assessed here (reported separately)."""
+    from core.control_plane.store import db_path as _cp_path
+    ac = _ac_db()
+    return [
+        {"name": "continuation_watchdog", "db": ac,
+         "query": "SELECT last_run_at FROM cw_health WHERE id=1", "interval": 30},
+        {"name": "orchestrator", "db": ac,
+         "query": "SELECT max(updated_at) FROM agent_orchestrator", "interval": 45},
+        {"name": "direct_agent_lifecycle", "db": ac,
+         "query": "SELECT max(updated_at) FROM direct_agent_lifecycle", "interval": 45},
+        {"name": "control_plane_engine", "db": _cp_path(),
+         "query": "SELECT max(updated_at) FROM agent", "interval": 30},
+    ]
+
+
+def loop_liveness_report(*, now: Optional[float] = None, stall_multiplier: float = 3.0) -> dict:
+    """Heartbeat liveness for the Owner OS control loops. A loop whose last-activity marker is
+    older than `stall_multiplier` × its interval is STALLED (the health_monitor-stall class,
+    generalized). A loop with no marker yet is `unknown` (informational, not a failure).
+    Read-only."""
+    now = now if now is not None else time.time()
+    loops = []
+    stalled = 0
+    for spec in _loop_specs():
+        ts = _read_marker(spec["db"], spec["query"])
+        age = (now - _epoch(ts)) if _epoch(ts) is not None else None
+        if age is None:
+            state = "unknown"
+        elif age < spec["interval"] * stall_multiplier:
+            state = "alive"
+        else:
+            state = "stalled"
+            stalled += 1
+        loops.append({"loop": spec["name"], "interval_secs": spec["interval"],
+                      "last_activity_age_secs": (round(age) if age is not None else None),
+                      "state": state})
+    return {
+        "metric": "loop_liveness",
+        "loops": loops,
+        "stalled_loops": stalled,
+        "supervisor": "no_heartbeat_marker (decision-only; liveness not assessable here)",
+        "status": "red" if stalled else "green",
+        "note": ("a control loop is STALLED — no recent tick" if stalled
+                 else "all measurable control loops ticking"),
+    }
+
+
 def observability_summary(*, now: Optional[float] = None) -> dict:
     """Combined read-only view. `all_clear` is true when there are no ACTIVE failures,
     regardless of historical totals — so a green system is not flagged by stale counters."""
@@ -330,10 +395,11 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     leases = lease_report(now=now)
     cto = cto_cursor_report(now=now)
     commander = commander_delivery_report(now=now)
+    loops = loop_liveness_report(now=now)
     active = notif["active"] + jobs["active"]
-    # overall red if there are ACTIVE failures, the discovery engine looks stalled, the
-    # same-chat drain stalled, or a CTO consumer cursor is stale (stopped reading).
-    healthy = (active == 0 and registry["engine_alive"]
+    # overall red if there are ACTIVE failures, the discovery engine looks stalled, a control
+    # loop stalled, the same-chat drain stalled, or a CTO consumer cursor is stale.
+    healthy = (active == 0 and registry["engine_alive"] and loops["stalled_loops"] == 0
                and commander["drain_alive"] and cto["stale_consumers"] == 0)
     return {
         "notifications": notif,
@@ -344,6 +410,8 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         "resource_leases": leases,
         "cto_cursor": cto,
         "commander_same_chat_delivery": commander,
+        "loop_liveness": loops,
+        "stalled_loops": loops["stalled_loops"],
         "active_failures_total": active,
         "historical_failures_total": notif["historical"] + jobs["historical"],
         "engine_alive": registry["engine_alive"],
