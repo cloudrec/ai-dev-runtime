@@ -277,6 +277,45 @@ def test_health_surface_reports_last_action():
     agents = [_agent(pending="continue with the next safe step")]
     ctrl = FakeCtrl(agents, {"proj": {"mode": "auto"}}, {"proj:0.0": {"will_submit": True}})
     _run_twice(ctrl)
-    h = cw.health()
+    h = cw.health(load_config=lambda: ctrl.cfg)
     assert h["enabled"] is True and h["last_run_at"] is not None
     assert "continued" in (h["last_action"] or "")
+
+
+# ── configured real-session eligibility + zero-eligible misconfiguration ─────
+def _cfg(sessions):
+    return {"sessions": sessions}
+
+
+def test_configured_real_session_eligibility():
+    # arbitrage2-opus configured managed-auto → eligible; hold/monitor → not.
+    cfg = _cfg({
+        "arbitrage2-opus": {"mode": "auto", "root": "/opt/arbitrage2",
+                            "proactive_continue": True},
+        "polyinput": {"mode": "hold"},
+        "safeguard": {"mode": "hold"},
+    })
+    elig = cw.eligible_sessions(lambda: cfg)
+    assert "arbitrage2-opus" in elig
+    assert "polyinput" not in elig and "safeguard" not in elig
+
+
+def test_real_config_file_makes_arbitrage2_opus_eligible():
+    # the actual shipped orchestrator config must make arbitrage2-opus actionable
+    from core import agent_orchestrator as orch
+    elig = cw.eligible_sessions(orch.load_config)
+    assert "arbitrage2-opus" in elig
+
+
+def test_health_flags_zero_eligible_as_misconfiguration():
+    # enabled watchdog with NO managed-auto session must NOT look healthy
+    h = cw.health(load_config=lambda: _cfg({"polyinput": {"mode": "hold"}}))
+    assert h["status"] == "warning"
+    assert "no_eligible_sessions" in h["warning"]
+    assert h["eligible_count"] == 0
+
+
+def test_health_ok_when_eligible_session_present():
+    h = cw.health(load_config=lambda: _cfg({"arbitrage2-opus": {"mode": "auto"}}))
+    assert h["status"] == "ok" and h["eligible_count"] >= 1
+    assert "arbitrage2-opus" in h["eligible_sessions"]

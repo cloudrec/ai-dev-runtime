@@ -162,16 +162,37 @@ def _save_health(conn, h: dict) -> None:
     conn.commit()
 
 
-def health() -> dict:
+def health(load_config: Optional[Callable] = None) -> dict:
+    """Watchdog health + last action. Flags MISCONFIGURATION when zero eligible
+    (managed-auto) sessions are configured — otherwise a watchdog that can never
+    act would falsely look healthy (the arbitrage2-opus incident)."""
+    if load_config is None:
+        try:
+            from core import agent_orchestrator as _orch
+            load_config = _orch.load_config
+        except Exception:  # noqa: BLE001
+            load_config = lambda: {}
+    elig = sorted(eligible_sessions(load_config))
     conn = _db()
     try:
         r = conn.execute("SELECT last_run_at,last_action,agents_checked,submitted,verified,"
                          "retried,blocked,errors FROM cw_health WHERE id=1").fetchone()
+        base = {"enabled": ENABLED, "eligible_sessions": elig,
+                "eligible_count": len(elig)}
         if not r:
-            return {"enabled": ENABLED, "last_run_at": None, "last_action": None}
-        return {"enabled": ENABLED, "last_run_at": r[0], "last_action": r[1],
-                "agents_checked": r[2], "submitted": r[3], "verified": r[4],
-                "retried": r[5], "blocked": r[6], "errors": r[7]}
+            base.update({"last_run_at": None, "last_action": None})
+        else:
+            base.update({"last_run_at": r[0], "last_action": r[1], "agents_checked": r[2],
+                         "submitted": r[3], "verified": r[4], "retried": r[5],
+                         "blocked": r[6], "errors": r[7]})
+        # Misconfiguration: enabled but nothing it is allowed to act on.
+        if ENABLED and len(elig) == 0:
+            base["status"] = "warning"
+            base["warning"] = "no_eligible_sessions: watchdog enabled but no managed-auto " \
+                              "session is configured — it can never act (misconfiguration)"
+        else:
+            base["status"] = "ok"
+        return base
     finally:
         conn.close()
 
