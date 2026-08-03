@@ -222,3 +222,49 @@ The 6 open owner gates (scope classifications, arbitrage2 unverified-decision, c
 selection) are **pending owner decisions** — surfaced as backlog, resolvable only by the
 owner. Not auto-resolved (provenance invariant). This is the genuine owner gate; no further
 autonomous action taken on them.
+
+---
+
+# ADDENDUM 3 — counter reconciliation: current STATE vs monotonic HISTORY (read-only)
+
+## `runtime.failed = 15` vs current 19 — reconciled
+
+Every current lens over `runtime_jobs.db` yields **19** failed (not 15). `failed` is a
+TERMINAL status: a failed job never un-fails, so the total only grows **monotonically**. The
+external "15" is therefore a **stale earlier snapshot** of the same series, not a discrepancy.
+`runtime_job_failure_report` now carries `monotonic_terminal=true` +
+`reconcile_note` ("current authoritative total=19, active=0"). Newest failure 2026-07-28 →
+**active (24h) = 0**. Reconciled: 15 (stale) → 19 (current historical) / 0 active.
+
+## Notifier dead-letter — STATE vs HISTORY separated
+
+A raw "history" counter conflated three different things:
+
+| Counter | Value | Kind |
+|---|---:|---|
+| `dead_letter` rows (current STATE) | **17** | terminal state now |
+| active (recent-window) dead-letter | **0** | current health |
+| cumulative failure ATTEMPTS | **85** | monotonic history (17 × ~5 retries) |
+| `notification_dead_letter` events logged | **17** | monotonic history |
+| `notifications_red` events logged | **8** | monotonic history |
+
+New `notification_history_report` separates the current STATE (`current_state` by state +
+`current_dead_letter`) from the cumulative HISTORY (`cumulative_failure_attempts`,
+`dead_letter_events_logged`, `notifications_red_events`) and the ACTIVE window. **Active = 0**
+→ status green; the 85/17/8 history counters are monotonic and informational, not active
+failures. Root remains owner-push RED (gate G4), owner-gated.
+
+## Combined verdict (live, read-only)
+
+`observability_summary` now includes `notification_history`. Overall: **active_failures_total
+= 0, engine_alive = true, status = green.** All non-green raw counters (15/19 failed jobs,
+17 dead-letter, 85 attempts) are historical/monotonic; **zero active failures**.
+
+## Tests / commit
+
+- Tests: **+3** (notification history STATE-vs-HISTORY split, active-when-recent,
+  runtime monotonic reconciliation). `test_control_plane_diagnostics.py` total **16**.
+  Full suite: see run.
+- Commit: local only; read-only diagnostics only (SELECT / `mode=ro`). No live behavior
+  changed. Endpoint `GET /api/v1/control-plane/observability` now includes
+  `notification_history`.

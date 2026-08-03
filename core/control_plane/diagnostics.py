@@ -84,9 +84,60 @@ def runtime_job_failure_report(*, now: Optional[float] = None,
         conn.close()
     rep = _split([r[0] for r in rows], now, active_window_secs)
     rep["metric"] = "runtime_job_failed"
+    # `failed` is a TERMINAL status — a failed job never un-fails, so the total only grows
+    # monotonically. Any external snapshot (e.g. a stale "15") is therefore an earlier point
+    # in the same series and reconciles to the current authoritative total; only the ACTIVE
+    # (recent) count reflects current health.
+    rep["monotonic_terminal"] = True
+    rep["reconcile_note"] = ("total is a monotonic terminal series; a smaller external "
+                             f"snapshot is stale — current authoritative total={rep['total']}, "
+                             f"active={rep['active']}")
     rep["note"] = ("no active job failures — all failed jobs are historical/stale"
                    if rep["active"] == 0 else "ACTIVE job failures in window")
     return rep
+
+
+def notification_history_report(*, now: Optional[float] = None,
+                                active_window_secs: float = 3600, conn=None) -> dict:
+    """Distinguish current failure STATE from cumulative failure HISTORY. A raw history
+    counter (retry attempts, logged dead-letter/red events) is cumulative and grows; it does
+    NOT mean the system is currently failing. Read-only."""
+    now = now if now is not None else time.time()
+    own = conn is None
+    if conn is None:
+        from core.control_plane.store import connect, init_db
+        conn = connect()
+        init_db(conn)
+    try:
+        by_state = {r[0]: r[1] for r in
+                    conn.execute("SELECT state,count(*) FROM notification GROUP BY state").fetchall()}
+        cumulative_attempts = conn.execute("SELECT coalesce(sum(attempts),0) FROM notification").fetchone()[0]
+        dl_events = conn.execute(
+            "SELECT count(*) FROM event WHERE type='notification_dead_letter'").fetchone()[0]
+        red_events = conn.execute(
+            "SELECT count(*) FROM event WHERE type='notifications_red'").fetchone()[0]
+        dl_created = [r[0] for r in conn.execute(
+            "SELECT created_at FROM notification WHERE state='dead_letter'").fetchall()]
+    finally:
+        if own:
+            conn.close()
+    split = _split(dl_created, now, active_window_secs)
+    return {
+        "metric": "notification_history",
+        "current_state": by_state,
+        "current_dead_letter": by_state.get("dead_letter", 0),
+        "active_dead_letter": split["active"],
+        "historical_dead_letter": split["historical"],
+        "newest_dead_letter_age_secs": split["newest_age_secs"],
+        # cumulative HISTORY (monotonic) — informational, not a current-failure signal
+        "cumulative_failure_attempts": cumulative_attempts,
+        "dead_letter_events_logged": dl_events,
+        "notifications_red_events": red_events,
+        "status": "green" if split["active"] == 0 else "red",
+        "note": ("current dead-letters are historical (owner-push RED, gate G4); the "
+                 "cumulative attempt/event counters are monotonic history, not active failures"
+                 if split["active"] == 0 else "ACTIVE notification failures in window"),
+    }
 
 
 def registry_health_report(*, now: Optional[float] = None, fresh_within_secs: float = 120,
@@ -183,6 +234,7 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     regardless of historical totals — so a green system is not flagged by stale counters."""
     now = now if now is not None else time.time()
     notif = notification_failure_report(now=now)
+    notif_hist = notification_history_report(now=now)
     jobs = runtime_job_failure_report(now=now)
     registry = registry_health_report(now=now)
     gates = owner_gate_report(now=now)
@@ -192,6 +244,7 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     healthy = (active == 0) and registry["engine_alive"]
     return {
         "notifications": notif,
+        "notification_history": notif_hist,
         "runtime_jobs": jobs,
         "registry_health": registry,
         "open_owner_gates": gates,

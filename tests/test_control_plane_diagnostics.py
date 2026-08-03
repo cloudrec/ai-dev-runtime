@@ -59,6 +59,41 @@ def test_notification_none_is_clean():
     assert r["total"] == 0 and r["status"] == "green" and r["classification"] == "clean"
 
 
+# ── notification history: current STATE vs cumulative HISTORY ────────────────
+def _notif(state, created_ts, attempts=0):
+    from core.control_plane.store import connect, init_db
+    c = connect(); init_db(c)
+    c.execute("INSERT INTO notification(channel,dedup_key,state,attempts,created_at) "
+              "VALUES('owner_push',?,?,?,?)", (f"k{state}{created_ts}{attempts}", state, attempts, _iso(created_ts)))
+    c.commit(); c.close()
+
+
+def _event(etype):
+    from core.control_plane.store import connect, init_db
+    from core.control_plane.api import append_event
+    append_event("test", etype)
+
+
+def test_notification_history_separates_state_from_history():
+    _notif("dead_letter", NOW - 7200, attempts=5)   # historical terminal
+    _notif("dead_letter", NOW - 8000, attempts=5)
+    _notif("sent", NOW - 100, attempts=0)
+    _event("notification_dead_letter"); _event("notification_dead_letter")
+    _event("notifications_red")
+    r = diag.notification_history_report(now=NOW, active_window_secs=3600)
+    assert r["current_dead_letter"] == 2 and r["active_dead_letter"] == 0
+    assert r["historical_dead_letter"] == 2 and r["status"] == "green"
+    assert r["cumulative_failure_attempts"] == 10          # 2 x 5 retries (monotonic history)
+    assert r["dead_letter_events_logged"] == 2 and r["notifications_red_events"] == 1
+    assert r["current_state"]["sent"] == 1
+
+
+def test_notification_history_active_when_recent_dead_letter():
+    _notif("dead_letter", NOW - 100, attempts=5)     # within window
+    r = diag.notification_history_report(now=NOW, active_window_secs=3600)
+    assert r["active_dead_letter"] == 1 and r["status"] == "red"
+
+
 # ── runtime job failure classification ───────────────────────────────────────
 def _jobs_db(path, rows):
     c = sqlite3.connect(path)
@@ -82,6 +117,15 @@ def test_runtime_jobs_recent_failure_is_active_red(tmp_path):
     _jobs_db(p, [("failed", NOW - 3600), ("failed", NOW - 9 * 86400)])   # one recent
     r = diag.runtime_job_failure_report(now=NOW, active_window_secs=86400, jobs_db=p)
     assert r["active"] == 1 and r["status"] == "red" and r["classification"] == "active"
+
+
+def test_runtime_failed_is_monotonic_series_reconciles_stale_snapshot(tmp_path):
+    # a stale external "15" reconciles to the current authoritative total (monotonic terminal).
+    p = str(tmp_path / "jobs.db")
+    _jobs_db(p, [("failed", NOW - 8 * 86400) for _ in range(19)])
+    r = diag.runtime_job_failure_report(now=NOW, jobs_db=p)
+    assert r["total"] == 19 and r["monotonic_terminal"] is True
+    assert "total=19" in r["reconcile_note"] and "active=0" in r["reconcile_note"]
 
 
 # ── combined summary: stale counters do not flag a healthy system ────────────
