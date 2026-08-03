@@ -148,3 +148,62 @@ lease-gated Actuator service behind a flag and prove restart no-duplicate on a l
 
 Suite after this addendum: see final line of the progress run (control-plane + recovery +
 provenance tests all green).
+
+---
+
+# ADDENDUM 2026-08-03 (2) — P2 Actuator/Leases + P3 Notifier outbox
+
+## P2 — single lease-gated Actuator (`a4cebdd`)
+
+`core/control_plane/actuator.py` — the ONE canonical path that may command a pane, gated
+`CONTROL_PLANE_ACTUATOR_ENABLED` (**default OFF**; shadow/canary, not the P4 cutover):
+- **Lease + monotonic fence guard** — caller must hold the current lease for
+  `agent:<target>` at the current fence; a stale fence (a queued/retried action from before
+  a restart, after which the controller re-acquired higher) is rejected. Fence re-asserted
+  AFTER delivery (a mid-action re-lease does not record our success).
+- **Policy gate (deny-by-default)** — `autonomous_safe` is NARROW (a documented
+  continuation meta-instruction only); prohibited (destructive/live/payment/credential/
+  publication) and owner_approval (any other free-form text) are blocked + raise a
+  correlated owner gate.
+- **Idempotency** — `cp_action` ledger (store v4), keyed by (target, conversation, action);
+  a verified action is never re-issued.
+- **Verified delivery folded** from the accepted continuation watchdog (5 proofs + one
+  robust retry, else blocker + gate); on success advances the agent SoT to working + evidence.
+- tests: disabled no-op; stale/no lease rejected; prohibited + owner-approval blocked with
+  gate and no delivery; safe+lease verified; idempotent; restart stale-fence rejected while
+  re-leased fence proceeds; verify-fail → blocker+gate.
+- **Live restart-no-duplicate canary (synthetic target, no real pane touched):** across a
+  fence1→fence2 restart + idempotent replay, **exactly ONE delivery** — stale fence rejected
+  (0 sends), current fence verified (1), replay `already_verified` (0). The running service
+  keeps the actuator DISABLED (verified live: env unset; `cp_action` holds only the synthetic
+  canary row — no real agent actuated).
+
+## P3 — notifier outbox drain (`<this commit>`)
+
+`core/control_plane/notifier.py` — drains pending/failed notifications through the
+fail-closed delivery matrix, records receipts, bounded retry, then dead-letters + raises a
+critical event (a stuck/disabled channel is never silent). `cto.emit(push=False)` makes
+channel-health meta-events (notifications_red, dead_letter) inbox-only so they cannot
+recurse through the down channel. Wired into the shadow engine tick (sends notifications
+only; touches no pane).
+- **Live evidence:** shadow loop draining; owner-decision pushes for the observe_only
+  agents are correctly `failed` (owner_push channel disabled = RED) — visible, not silent;
+  `notifications_red` deduped + inbox-only; no recursion storm.
+
+## Cumulative
+
+- Commits (local, branch `owner-os/control-plane-v2`): architecture `d0b72ab`; P0 `5822bac`;
+  P1 `e713433`; progress `1afdf8b`; recovery fix `918db00`; provenance `6d56cc7`; addendum
+  `2f01fd8`; P2 `a4cebdd`; P3 (this).
+- Full suite: **874 passed** (control-plane P0–P3 + discovery/CTO/delivery/provenance/
+  actuator/notifier + recovery).
+- Deployed: shadow engine (observe-only) + notifier drain live; **actuator DISABLED**;
+  legacy controllers untouched.
+- Rollback: `CONTROL_PLANE_ENABLED=0` (stop shadow) / `CONTROL_PLANE_ACTUATOR_ENABLED` stays
+  unset; drop `control_plane.db`; `git revert` the phase commits. Legacy DBs backed up.
+
+## Genuine owner gates (unchanged, blocking only cutover)
+
+G1 P4 actuation cutover on live agents · G3 push/PR/publication · G4 Telegram/credential
+channel config · G5 same-chat proactive wake trigger. P2/P3 shipped without hitting any
+(actuator proven via synthetic canary; no live pane actuated).
