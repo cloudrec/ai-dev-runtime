@@ -26,9 +26,12 @@ Stop at any owner gate.
 `cto_cursor_report` (lag/stale), `commander_delivery_report` (same-chat drain),
 `loop_liveness_report` (5 loops incl. supervisor heartbeat), `actuation_scope_report`
 (canary-confinement breach), `consistency_report` (cursor/notification-state/fence invariants),
-`observability_summary` (aggregate). Endpoint `GET /api/v1/control-plane/observability`.
-Tests: `tests/test_control_plane_diagnostics.py` (39). Supervisor heartbeat in
-`core/agent_supervisor.py::heartbeat()` → `supervisor_heartbeat` table.
+`restart_consistency_report` (durable in-flight state a restart could strand: orphaned/stale
+notifications, abandoned in-flight actions, cursor-ahead, supervisor-heartbeat freshness),
+`observability_summary` (aggregate, incl. `red_reasons` + `restart_safe`). Endpoint
+`GET /api/v1/control-plane/observability`. Tests: `tests/test_control_plane_diagnostics.py`
+(55). Supervisor heartbeat in `core/agent_supervisor.py::heartbeat()` → `supervisor_heartbeat`
+table.
 
 ## Current live health (last check)
 
@@ -49,14 +52,16 @@ publish task without owner reconfirmation.
 
 ## Candidate NEXT read-only gaps (not yet built)
 
-- `red_reasons` aggregation in `observability_summary` (which checks failed) — small, useful.
 - Owner-gate SLA (unanswered > N hours → escalate flag).
 - Event-log growth/retention (unbounded `event` table size + rate).
 - Discovery churn (lifecycle-flip rate per agent).
 - Notification receipt latency for `sent` (n/a while owner-push RED).
+- (done) `red_reasons` aggregation; (done) restart-consistency report.
 
 ## Recent commits (HEAD-ward)
 
-`872c9e3` consistency invariants · `b579d2c` actuation scope · `df6711a`/`3bd853b` supervisor
-heartbeat · `75cc28c` loop liveness · earlier: cursor/drain, counter STATE-vs-HISTORY,
-registry/gate/lease, historical-vs-active. Full suite last: **946 passed**.
+restart consistency (`restart_consistency_report` + false-idle-after-restart) · `7176679`
+`red_reasons` + context-state · `872c9e3` consistency invariants · `b579d2c` actuation scope ·
+`df6711a`/`3bd853b` supervisor heartbeat · `75cc28c` loop liveness · earlier: cursor/drain,
+counter STATE-vs-HISTORY, registry/gate/lease, historical-vs-active. Full suite last:
+**963 passed**.

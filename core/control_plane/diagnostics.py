@@ -491,6 +491,90 @@ def consistency_report(*, now: Optional[float] = None, conn=None) -> dict:
     }
 
 
+# terminal notification states — anything else a restart could leave orphaned or mid-flight.
+_TERMINAL_NOTIF_STATES = ("sent", "acked", "dead_letter", "resolved")
+# reclaimable by the notifier drain — api.pending_notifications() selects EXACTLY these.
+_RECLAIMABLE_NOTIF_STATES = ("pending", "failed")
+
+
+def restart_consistency_report(*, now: Optional[float] = None, stale_secs: float = 900.0,
+                               supervisor_interval: int = 45, stall_multiplier: float = 3.0,
+                               conn=None) -> dict:
+    """RESTART DURABILITY: after a process restart every piece of in-flight durable state must
+    be either terminal or reclaimable by a running loop, and no cursor may have moved past the
+    log. Read-only. Flags, per store:
+
+      * notification OUTBOX — a row in a non-terminal state the drain will NOT reclaim
+        (`api.pending_notifications` selects only pending/failed) is restart-ORPHANED
+        (e.g. stuck 'sending'); a reclaimable row (pending/failed) older than `stale_secs`
+        means the drain loop isn't running.
+      * continuation LEASE / action LEDGER — a cp_action submitted but neither verified nor
+        blocked, last touched > `stale_secs` ago, is an actuation abandoned mid-flight (a
+        restart landed between submit and verify); it must be re-verified, never re-issued.
+      * CTO CURSOR — a cursor past the latest event id would re-deliver or skip after a
+        restart (dup/loss); it must stay ≤ the log head.
+      * SUPERVISOR HEARTBEAT — must resume ticking after a restart; a marker older than
+        `supervisor_interval × stall_multiplier` means the supervisor loop didn't come back.
+        No marker at all is `unknown` (informational), not unsafe.
+
+    `restart_safe` is true only when every check is clean."""
+    now = now if now is not None else time.time()
+    own = conn is None
+    if conn is None:
+        from core.control_plane.store import connect, init_db
+        conn = connect()
+        init_db(conn)
+    try:
+        latest_event = conn.execute("SELECT coalesce(max(id),0) FROM event").fetchone()[0]
+        orphaned_notifications = []
+        stale_reclaimable = []
+        for nid, state, created in conn.execute(
+                "SELECT id,state,created_at FROM notification").fetchall():
+            if state in _TERMINAL_NOTIF_STATES:
+                continue
+            age = (now - _epoch(created)) if _epoch(created) is not None else None
+            if state not in _RECLAIMABLE_NOTIF_STATES:
+                orphaned_notifications.append(
+                    {"id": nid, "state": state, "age_secs": round(age) if age is not None else None})
+            elif age is not None and age > stale_secs:
+                stale_reclaimable.append({"id": nid, "state": state, "age_secs": round(age)})
+        abandoned_actions = []
+        for idkey, target, updated in conn.execute(
+                "SELECT idkey,target,updated_at FROM cp_action "
+                "WHERE submitted=1 AND verified=0 AND blocked=0").fetchall():
+            age = (now - _epoch(updated)) if _epoch(updated) is not None else None
+            if age is not None and age > stale_secs:
+                abandoned_actions.append({"idkey": idkey, "target": target, "age_secs": round(age)})
+        cursor_ahead = [{"consumer": r[0], "last_event_id": r[1], "latest": latest_event}
+                        for r in conn.execute("SELECT consumer,last_event_id FROM cto_cursor").fetchall()
+                        if (r[1] or 0) > latest_event]
+    finally:
+        if own:
+            conn.close()
+    hb_ts = _read_marker(_ac_db(), "SELECT last_run_at FROM supervisor_heartbeat WHERE id=1")
+    hb_age = (now - _epoch(hb_ts)) if _epoch(hb_ts) is not None else None
+    supervisor_stalled = hb_age is not None and hb_age > supervisor_interval * stall_multiplier
+    supervisor_state = ("unknown" if hb_age is None
+                        else "stalled" if supervisor_stalled else "alive")
+    unsafe = bool(orphaned_notifications or stale_reclaimable or abandoned_actions
+                  or cursor_ahead or supervisor_stalled)
+    return {
+        "metric": "restart_consistency",
+        "latest_event_id": latest_event,
+        "orphaned_notifications": orphaned_notifications,
+        "stale_reclaimable_notifications": stale_reclaimable,
+        "abandoned_inflight_actions": abandoned_actions,
+        "cursors_ahead_of_log": cursor_ahead,
+        "supervisor_heartbeat_age_secs": (round(hb_age) if hb_age is not None else None),
+        "supervisor_state": supervisor_state,
+        "stale_secs": stale_secs,
+        "restart_safe": not unsafe,
+        "status": "red" if unsafe else "green",
+        "note": ("restart-unsafe durable state present — see fields" if unsafe
+                 else "all in-flight durable state is terminal, reclaimable, or fresh"),
+    }
+
+
 def observability_summary(*, now: Optional[float] = None) -> dict:
     """Combined read-only view. `all_clear` is true when there are no ACTIVE failures,
     regardless of historical totals — so a green system is not flagged by stale counters."""
@@ -506,6 +590,7 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     loops = loop_liveness_report(now=now)
     scope = actuation_scope_report(now=now)
     consistency = consistency_report(now=now)
+    restartc = restart_consistency_report(now=now)
     active = notif["active"] + jobs["active"]
     # consolidated reasons the aggregate is red (empty ⇒ green) — so a consumer sees WHICH
     # check failed without parsing every sub-report.
@@ -524,6 +609,8 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         red_reasons.append(f"actuation_scope_breach={scope['unexpected_actuated']}")
     if not consistency["consistent"]:
         red_reasons.append("consistency_violation")
+    if not restartc["restart_safe"]:
+        red_reasons.append("restart_unsafe")
     healthy = not red_reasons
     return {
         "notifications": notif,
@@ -540,6 +627,8 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         "actuation_scope_breach": bool(scope["unexpected_actuated"]),
         "consistency": consistency,
         "consistent": consistency["consistent"],
+        "restart_consistency": restartc,
+        "restart_safe": restartc["restart_safe"],
         "red_reasons": red_reasons,
         "active_failures_total": active,
         "historical_failures_total": notif["historical"] + jobs["historical"],

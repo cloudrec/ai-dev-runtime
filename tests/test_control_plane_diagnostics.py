@@ -512,3 +512,122 @@ def test_summary_red_when_engine_stalled_no_active_failures(tmp_path, monkeypatc
     s = diag.observability_summary(now=NOW)
     assert s["active_failures_total"] == 0 and s["engine_alive"] is False
     assert s["all_clear"] is False and s["status"] == "red"
+
+
+# ── restart consistency: durable in-flight state must survive a restart ───────
+def _cp_action_inflight(target, updated_ts, *, submitted=1, verified=0, blocked=0):
+    c = _conn()
+    c.execute("INSERT OR REPLACE INTO cp_action(idkey,target,fence_token,submitted,verified,"
+              "blocked,updated_at) VALUES(?,?,?,?,?,?,?)",
+              (f"{target}|{updated_ts}", target, 1, submitted, verified, blocked, _iso(updated_ts)))
+    c.commit(); c.close()
+
+
+def test_restart_clean_state_is_safe():
+    _events(3)
+    _cursor("chatgpt", 3, NOW - 10)
+    r = diag.restart_consistency_report(now=NOW)
+    assert r["restart_safe"] is True and r["status"] == "green"
+    assert r["orphaned_notifications"] == [] and r["abandoned_inflight_actions"] == []
+
+
+def test_restart_orphaned_sending_notification_is_red():
+    # 'sending' is a valid state but pending_notifications() reclaims only pending/failed,
+    # so a restart that crashed mid-deliver leaves it orphaned forever.
+    _notif("sending", NOW - 30)
+    r = diag.restart_consistency_report(now=NOW)
+    assert len(r["orphaned_notifications"]) == 1 and r["orphaned_notifications"][0]["state"] == "sending"
+    assert r["restart_safe"] is False and r["status"] == "red"
+
+
+def test_restart_terminal_notifications_are_safe():
+    for st in ("sent", "acked", "dead_letter", "resolved"):
+        _notif(st, NOW - 30)
+    r = diag.restart_consistency_report(now=NOW)
+    assert r["restart_safe"] is True and r["orphaned_notifications"] == []
+
+
+def test_restart_fresh_reclaimable_notification_is_safe():
+    _notif("pending", NOW - 60)      # reclaimable + recent → drain will get it
+    _notif("failed", NOW - 60)
+    r = diag.restart_consistency_report(now=NOW, stale_secs=900)
+    assert r["restart_safe"] is True and r["stale_reclaimable_notifications"] == []
+
+
+def test_restart_stale_reclaimable_notification_is_red():
+    _notif("pending", NOW - 5000)    # reclaimable but not drained in >stale_secs → drain down
+    r = diag.restart_consistency_report(now=NOW, stale_secs=900)
+    assert len(r["stale_reclaimable_notifications"]) == 1
+    assert r["restart_safe"] is False and r["status"] == "red"
+
+
+def test_restart_abandoned_inflight_action_is_red():
+    _cp_action_inflight("cp-canary:0.0", NOW - 5000)   # submitted, never verified/blocked, old
+    r = diag.restart_consistency_report(now=NOW, stale_secs=900)
+    assert r["abandoned_inflight_actions"] and r["abandoned_inflight_actions"][0]["target"] == "cp-canary:0.0"
+    assert r["restart_safe"] is False and r["status"] == "red"
+
+
+def test_restart_verified_or_blocked_or_fresh_actions_are_safe():
+    _cp_action_inflight("a:0.0", NOW - 5000, verified=1)   # completed → not in-flight
+    _cp_action_inflight("b:0.0", NOW - 5000, blocked=1)    # blocked → owner-gated, not dangling
+    _cp_action_inflight("c:0.0", NOW - 60)                 # in-flight but fresh → still verifying
+    r = diag.restart_consistency_report(now=NOW, stale_secs=900)
+    assert r["abandoned_inflight_actions"] == [] and r["restart_safe"] is True
+
+
+def test_restart_cursor_ahead_of_log_is_red():
+    _events(3)
+    _cursor("chatgpt", 99, NOW - 10)   # cursor past log head → re-deliver/skip after restart
+    r = diag.restart_consistency_report(now=NOW)
+    assert r["cursors_ahead_of_log"] and r["restart_safe"] is False and r["status"] == "red"
+
+
+def test_restart_supervisor_heartbeat_fresh_is_alive():
+    _loop_markers(sup_ts=NOW - 10)
+    r = diag.restart_consistency_report(now=NOW)
+    assert r["supervisor_state"] == "alive" and r["restart_safe"] is True
+
+
+def test_restart_supervisor_heartbeat_stale_is_red():
+    _loop_markers(sup_ts=NOW - 5000)   # supervisor didn't resume ticking after restart
+    r = diag.restart_consistency_report(now=NOW, supervisor_interval=45)
+    assert r["supervisor_state"] == "stalled" and r["restart_safe"] is False and r["status"] == "red"
+
+
+def test_restart_supervisor_no_marker_is_unknown_not_unsafe():
+    r = diag.restart_consistency_report(now=NOW)   # no heartbeat row at all
+    assert r["supervisor_state"] == "unknown" and r["restart_safe"] is True
+
+
+def test_restart_lease_fence_is_monotonic_across_reacquire():
+    # simulate a restart re-acquiring the same resource: fence must strictly increase and the
+    # pre-restart fence must no longer be current → the restart-no-duplicate guarantee.
+    l1 = cp.acquire_lease("agent:cp-canary:0.0", "ctrlA", ttl_secs=100, now=NOW)
+    l2 = cp.acquire_lease("agent:cp-canary:0.0", "ctrlB", ttl_secs=100, now=NOW + 200)
+    assert l2["fence_token"] == l1["fence_token"] + 1
+    assert cp.lease_is_current("agent:cp-canary:0.0", l2["lease_id"], l2["fence_token"]) is True
+    assert cp.lease_is_current("agent:cp-canary:0.0", l1["lease_id"], l1["fence_token"]) is False
+
+
+def test_restart_cursor_and_lease_persist_across_fresh_connection():
+    # write via one connection, read via a fresh one (== a process restart on the same DB).
+    from core.control_plane import cto
+    _events(4)
+    cto.set_cursor("chatgpt", 4)
+    lease = cp.acquire_lease("agent:cp-canary:0.0", "ctrl", ttl_secs=100, now=NOW)
+    # fresh reads
+    assert cto.get_cursor("chatgpt") == 4
+    held = cp.lease_holder("agent:cp-canary:0.0")
+    assert held["lease_id"] == lease["lease_id"] and held["fence_token"] == lease["fence_token"]
+
+
+def test_summary_includes_restart_safety_and_red_reason(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty.db"))
+    sqlite3.connect(str(tmp_path / "empty.db")).execute(
+        "CREATE TABLE jobs(id TEXT,status TEXT,created_at TEXT,updated_at TEXT,finished_at TEXT)")
+    _agent_row("cp:0.0", NOW - 5, "managed")
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 5, dal_ts=NOW - 5, sup_ts=NOW - 5)
+    _notif("sending", NOW - 30)        # restart-orphaned
+    s = diag.observability_summary(now=NOW)
+    assert s["restart_safe"] is False and "restart_unsafe" in s["red_reasons"] and s["status"] == "red"

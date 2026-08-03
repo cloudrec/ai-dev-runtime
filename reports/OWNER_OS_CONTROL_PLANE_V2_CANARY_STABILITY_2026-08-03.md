@@ -521,3 +521,48 @@ window). A future RED now self-explains via `red_reasons`.
 - Tests: **+2** (red_reasons empty when green; names the failing check on a violation).
   `test_control_plane_diagnostics.py` total **41**. Full suite: see run.
 - Commit: local only; read-only. Canary scope + owner gates preserved; no defect.
+
+# ADDENDUM 10 — restart consistency (durable in-flight state) + false-idle after restart
+
+**Scope.** Read-only/internal. New diagnostic + regression tests. No actuation change, no
+credentials, no publish/push, no payment/trading/live/destructive action, no agent create/resume.
+
+**Gap.** Existing `consistency_report` checks point-in-time invariants (cursor ≤ log, valid
+notif states, action-fence ≤ lease-fence). It does NOT flag durable state a *restart* can
+strand: a notification stuck in a non-terminal state the drain won't reclaim, a continuation
+action submitted-but-never-verified, a cursor moved past the log, or a supervisor that never
+resumed ticking.
+
+**Added — `restart_consistency_report()`** (`core/control_plane/diagnostics.py`, read-only):
+- **notification OUTBOX** — `api.pending_notifications()` reclaims ONLY `pending`/`failed`.
+  A non-terminal row outside that set (e.g. stuck `sending`) is restart-**orphaned**
+  (unreclaimable) → red. A reclaimable row older than `stale_secs` (default 900s) means the
+  drain loop isn't running → red. Terminal states (`sent`/`acked`/`dead_letter`/`resolved`)
+  are clean.
+- **continuation LEASE / action LEDGER** — a `cp_action` with `submitted=1, verified=0,
+  blocked=0` last touched > `stale_secs` ago is an actuation **abandoned mid-flight** (restart
+  landed between submit and verify) → must be re-verified, never re-issued → red.
+- **CTO CURSOR** — a cursor past `max(event.id)` would re-deliver or skip after restart → red.
+- **SUPERVISOR HEARTBEAT** — marker older than `supervisor_interval × stall_multiplier`
+  (45s × 3) → the supervisor loop didn't come back → red. No marker at all = `unknown`
+  (informational), not unsafe.
+- `restart_safe` true only when every check is clean. Wired into `observability_summary`
+  (`restart_safe` field + `restart_unsafe` red-reason).
+
+**Restart-safety already proven, now regression-locked.** The lease fence is monotonic across
+re-acquire (fence strictly increments; the pre-restart fence is no longer current →
+restart-no-duplicate), and cursor/lease persist across a fresh connection (== a process
+restart on the same durable SQLite DB). The **false-idle guard is re-derived from the LIVE
+pane each process**, so a working target under a freshly re-acquired lease is still suppressed
+(`reason=target_working`, no command delivered, correlated `false_idle_corrected` event) —
+new actuator test proves it survives restart.
+
+**Tests.** +14 in `tests/test_control_plane_diagnostics.py` (clean-safe; orphaned `sending`;
+terminal-safe; fresh-reclaimable-safe; stale-reclaimable-red; abandoned-inflight-red;
+verified/blocked/fresh-safe; cursor-ahead-red; heartbeat fresh/stale/unknown; fence-monotonic;
+cursor+lease persist across fresh connection; summary surfaces `restart_unsafe`). +1 in
+`tests/test_control_plane_actuator.py` (false-idle working target suppressed after restart).
+
+**Result.** Focused: 65 passed. **Full suite: 963 passed, 0 failed.** Live read-only:
+`restart_safe=True, supervisor=alive`; `observability_summary` green, `red_reasons=[]`. No
+restart-orphaned durable state present. Owner gates unchanged; canary scope unchanged.

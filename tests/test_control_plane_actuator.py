@@ -145,3 +145,21 @@ def test_verify_failure_blocks_with_gate():
                     conversation_id="cv1", lease=_lease(), cwd="/opt/x", ctrl=ctrl, sleep=_no_sleep)
     assert r["acted"] is False and r["reason"] == "not_verified" and r["blocked"] is True
     assert any(g["kind"] == "actuation_failed" for g in cp.get_open_gates())
+
+
+def test_false_idle_working_target_suppressed_after_restart():
+    # After a restart the guard is re-derived from the LIVE pane, not persisted state: a
+    # target that is actually working must never be handed a continuation, even under a
+    # freshly re-acquired lease. Proves false-idle handling survives restart.
+    l1 = _lease(now=1000)
+    l2 = _lease(now=1010)                # restart re-leases → fence 2 (current)
+    assert l2["fence_token"] == l1["fence_token"] + 1
+    ctrl = FakeCtrl()
+    ctrl.s["state"] = "working"          # live pane shows the agent actively working
+    r = act.actuate(target="proj:0.0", action_text="continue with the next safe step",
+                    controller="c", conversation_id="cv1", lease=l2, cwd="/opt/x",
+                    ctrl=ctrl, sleep=_no_sleep)
+    assert r["acted"] is False and r["reason"] == "target_working"
+    assert r["false_idle_corrected"] is True and ctrl.sends == 0    # no command delivered
+    # a correlated correction event is recorded (the honest "suppressed" signal)
+    assert cp.get_events(type="false_idle_corrected", limit=20)
