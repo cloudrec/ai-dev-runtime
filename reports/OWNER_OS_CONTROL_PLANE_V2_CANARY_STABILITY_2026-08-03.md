@@ -353,3 +353,57 @@ these now flips the summary red.
 - Commit: local only; read-only (SELECT / `mode=ro`). Endpoint `/observability` now includes
   `loop_liveness`. No defect found (all loops ticking); the diagnostic closes the
   stall-detection blind spot.
+
+---
+
+# ADDENDUM 6 — supervisor heartbeat (loop liveness now measurable) + re-check
+
+## Gap closed
+
+The supervisor only wrote `supervisor_prompts` on a decision (sparse), so its loop liveness
+was not measurable. Added `agent_supervisor.heartbeat()` — a minimal **non-sensitive** per-tick
+marker (timestamp + monotonic tick counter ONLY; no decision data / agent content / secrets)
+into a new `supervisor_heartbeat` table, called at the start of each `run_loop` iteration
+(best-effort; a heartbeat failure never affects supervision). `loop_liveness_report` now
+includes the supervisor (interval 45s, stalled >3×); the "no_heartbeat_marker" special-case is
+removed. Commit **`3bd853b`**.
+
+- **Live proof:** after restart (PID 2163517), `supervisor_heartbeat` populated (ticks
+  incrementing); `loop_liveness` shows **supervisor alive (age ~1s)**. All 5 loops alive:
+  continuation_watchdog / orchestrator / direct_agent_lifecycle / control_plane_engine /
+  supervisor — `stalled_loops=0`.
+
+## Re-check (read-only) of the requested items
+
+- **Loop liveness:** all 5 loops **alive**, no stall.
+- **Notification drain:** same-chat via agent_notifier **alive** (drain keeping up). Owner-push
+  posture **RED (gate G4)** — and now **1 ACTIVE dead-letter**: notification #20
+  `newagent:payment:0.0` @10:58Z (within the 1h window), from the shadow loop discovering the
+  `payment:0.0` agent (observe_only) → owner-action event → owner-push failed (channel
+  disabled). This is the diagnostic **correctly** surfacing a real recent owner-push failure,
+  not a new defect; same owner-gated root (G4). It reclassifies to historical after 1h.
+- **Duplicate-agent inventory:** `cp-canary-dup` remains `dead`/flagged (historical); **1**
+  live `claude` on the canary cwd (no live duplicate). `duplicates_flagged=1` (the dead one).
+- **Flags:** `CONTROL_PLANE_ACTUATOR_ENABLED=1`, `CONTINUATION_VIA_ACTUATOR=1`,
+  `CONTROL_PLANE_CANARY_AGENTS=cp-canary:0.0` — unchanged, scoped to the one canary.
+- **Owner gates:** now **7** open (new: `classify_scope` for `payment:0.0` @10:58Z — the
+  discovered payment agent's one unknown-scope decision). All owner-side.
+
+## Summary status = RED (correct, owner-gated)
+
+`observability_summary`: `status=red, active_failures_total=1, stalled_loops=0,
+same_chat_drain_alive=true`. The single active failure is the payment-discovery owner-push
+dead-letter above — a **real, recent owner-push delivery failure** the diagnostic is designed
+to catch. It clears only by enabling owner-push (**G4**, secret-bearing, owner-gated) — no
+autonomous action taken.
+
+## Tests
+
+- Touched suites green: `test_control_plane_diagnostics.py` (29) + `test_agent_supervisor.py`
+  (10) = **39 passed**.
+- Full suite: **935 passed + 1** pre-existing environment-fragile failure
+  (`test_phase13::test_planner_hanging_child_survives_parent_exit_but_group_is_reaped`, which
+  asserts on a global `pgrep -af "sleep 30"` and collided with unrelated host processes). It
+  **passes in a clean environment** (verified: `1 passed` once the foreign `sleep 30`
+  processes cleared) → clean-env total **936**. Unrelated to this change (which adds only a DB
+  timestamp write + read-only diagnostics; no process/subprocess code).
