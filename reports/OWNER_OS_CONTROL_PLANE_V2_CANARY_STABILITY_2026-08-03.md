@@ -132,3 +132,43 @@ Stability completion commander_event **#469** (acked). Canary control-plane even
 (#44 discovery, #46/#48 verified, #50 duplicate; max id 48). State-fix commit `d1d20cb`.
 
 ## Failures: none.
+
+---
+
+# ADDENDUM — observability counter reconciliation (read-only)
+
+Two non-green internal counters investigated read-only; both are **HISTORICAL/stale, not
+active failures**. New read-only diagnostics (`core/control_plane/diagnostics.py`) split each
+metric into historical vs active so current health is not flagged by old failures.
+
+## runtime job `failed` — HISTORICAL
+
+- `runtime_jobs.db` `jobs` status=failed: **19 total** (the reported `15` was a stale/subset
+  snapshot). Newest failed = **2026-07-28T09:57Z** (~6 days ago); **0** failures in the last
+  24h (or 6 days). `runtime_job_failure_report` → `active=0, status=green,
+  classification=historical`.
+- Actionable: **none** — all stale. Failed job kinds: 16 unknown, 2 code_change, 1
+  data_handoff (all pre-2026-07-29).
+
+## notifier `dead_letter` — HISTORICAL
+
+- `control_plane.db` notification state=dead_letter: **17 total**, all created 2026-08-03
+  02:00–06:17Z; newest **06:17Z** (~2.2h before check); **0** in the last hour, and the two
+  stability windows (07:22–08:07Z) showed **no growth**. `notification_failure_report` →
+  `active=0, status=green, classification=historical`.
+- Root: proactive owner-push channel disabled (RED, gate **G4**) → observe_only agents'
+  one-time discovery owner-decision events dead-lettered. Not recurring (discovery gates are
+  deduped). Actionable only by enabling an owner-push channel (owner-gated; **not** done here).
+
+## Combined verdict (live, read-only)
+
+`observability_summary` → `active_failures_total=0`, `historical_failures_total=36`,
+**`all_clear=true`, status=green**. The 15/19 failed jobs and 17 dead-letters are stale; there
+are **zero active failures**. New read-only endpoint: `GET /api/v1/control-plane/observability`.
+
+## Tests / commits (this addendum)
+
+- Tests: `test_control_plane_diagnostics.py` (**7**): notification/job historical→green,
+  recent→active-red, none→clean, combined summary all_clear-with-historical vs red-when-active.
+- Commit: `core/control_plane/diagnostics.py` + endpoint + tests (local only). No live
+  behavior changed; strictly read-only (SELECT / `mode=ro`).

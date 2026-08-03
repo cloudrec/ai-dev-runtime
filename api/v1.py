@@ -452,6 +452,15 @@ async def control_plane_notifications_status(_: bool = Depends(_auth)):
     return delivery.notifications_status()
 
 
+@router.get("/control-plane/observability")
+async def control_plane_observability(_: bool = Depends(_auth)):
+    """Read-only observability: failed runtime jobs + dead-lettered notifications split
+    into HISTORICAL vs ACTIVE. `all_clear` is true when there are no ACTIVE (recent)
+    failures, so stale historical counters do not flag a healthy system."""
+    from core.control_plane import diagnostics
+    return diagnostics.observability_summary()
+
+
 class AckReq(BaseModel):
     ids: list[int]
 

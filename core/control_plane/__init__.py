@@ -34,6 +34,7 @@ from core.control_plane import resolutions as resolutions  # noqa: F401
 from core.control_plane import notifier as notifier  # noqa: F401
 from core.control_plane import state_estimator as state_estimator  # noqa: F401
 from core.control_plane import canary_sim as canary_sim  # noqa: F401
+from core.control_plane import diagnostics as diagnostics  # noqa: F401
 from core.control_plane.api import close_gates  # noqa: F401
 
 SCHEMA_VERSION = store.SCHEMA_VERSION
