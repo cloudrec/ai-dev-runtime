@@ -99,9 +99,46 @@ recovery all proven.
 untouched. The new Actuator did not command any agent (flags OFF; selection gated). No
 cutover performed.
 
+## Simulated canary (offline, deterministic) — PASS
+
+To close the gate as far as possible without a real agent, a deterministic in-process
+harness proves the FULL path with a fake pane and NO live flag change:
+
+- `core/control_plane/canary_sim.py` — `SimulatedPane` (models idle → deliver → consume →
+  working, conversation-mtime advance) + `run_canary()` which ARMS the actuator
+  (`ENABLED` + single-agent allowlist) only for the duration of one in-process run and
+  RESTORES the globals afterwards. The deployed service (separate process) is unaffected;
+  `actuator.ENABLED` is verified `False` before and after.
+- `tests/test_control_plane_canary_sim.py` — **8 tests**:
+  - **full path** lease → deliver → consume → verify (all five proofs) → `action_verified`
+    CTO event, `cp_action` ledger `verified`, lease held, agent SoT `working`, exactly one
+    delivery;
+  - **false-idle** pane (active marker) → suppressed (`target_working`, `false_idle_corrected`),
+    zero delivery;
+  - **exclusion** — an agent not on the canary allowlist → `not_canary`, zero delivery;
+  - **restart** — stale fence rejected, re-leased fence proceeds, exactly one delivery;
+  - **dedup** — a verified action is not re-issued (`already_verified`, zero delivery);
+  - **retry-once** — first attempt does not consume → robust retry → verified;
+  - flags OFF before/after the harness.
+
+This is **SIMULATED PASS** — the pipeline is proven end-to-end deterministically. It is
+explicitly NOT the real-agent proof.
+
+## Simulated PASS vs still-gated real-agent proof
+
+| Path | Status | Evidence |
+|---|---|---|
+| lease → deliver → consume → verify → CTO event | **SIMULATED PASS** | `test_control_plane_canary_sim.py` (8) |
+| false-idle / exclusion / restart / dedup negatives | **SIMULATED PASS** | same |
+| same-chat delivery via agent_notifier | **REAL PASS** | commander_event #443 acked |
+| forced notification failure → retry → restore | **REAL PASS** | live notifier drain |
+| state-estimation false-idle fix | **REAL PASS** | live on arbitrage2 + polyinput |
+| verified continuation on a REAL live agent | **STILL GATED** | gate `6521774525664e49` — no confidently-idle non-excluded agent |
+
 ## Stop point
 
-Per instruction: stop before multi-agent/full cutover. The single-agent continuation is
-**gated** on a safe agent-selection decision (`6521774525664e49`); every other acceptance
-item (state fix, scoping, same-chat delivery, forced-failure) is proven. Infrastructure is
-committed, tested, and reversible.
+Per instruction: stop before multi-agent/full cutover. The full actuation pipeline is now
+proven **offline (simulated PASS)**; the remaining **real-agent** continuation stays gated on
+a safe agent-selection decision (`6521774525664e49`). Every other acceptance item is proven.
+All actuator/canary flags remain OFF; legacy actuation untouched. Infrastructure committed,
+tested, reversible.
