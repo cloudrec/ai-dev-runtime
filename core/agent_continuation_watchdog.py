@@ -49,13 +49,19 @@ INTERVAL = int(os.getenv("CONTINUATION_WATCHDOG_INTERVAL_SECS", "30"))
 # The agent must have been idle at least this long before we act — debounces a
 # false idle while Claude is between tool calls / thinking.
 IDLE_CONFIRM_SECS = int(os.getenv("CONTINUATION_WATCHDOG_IDLE_CONFIRM_SECS", "20"))
-# How long to wait for the submission to prove itself.
-VERIFY_TIMEOUT = int(os.getenv("CONTINUATION_WATCHDOG_VERIFY_TIMEOUT_SECS", "8"))
+# How long to wait for the submission to prove itself (Claude can take several
+# seconds to consume the line and start streaming).
+VERIFY_TIMEOUT = int(os.getenv("CONTINUATION_WATCHDOG_VERIFY_TIMEOUT_SECS", "12"))
 # Documented default safe next step (a meta-instruction, not a command).
 DEFAULT_CONTINUATION = os.getenv(
     "CONTINUATION_WATCHDOG_DEFAULT_STEP", "continue with the next safe step")
 # Max proactive deliveries per conversation (only for opt-in proactive sessions).
 MAX_CONTINUATIONS = int(os.getenv("CONTINUATION_WATCHDOG_MAX_PER_CONV", "25"))
+# A BLOCKED step is not permanent — it may be re-attempted after this cooldown
+# (conditions / code may have changed), up to a hard attempt cap. A VERIFIED step is
+# never repeated.
+BLOCKED_RETRY_COOLDOWN_SECS = int(os.getenv("CONTINUATION_WATCHDOG_BLOCK_COOLDOWN_SECS", "600"))
+MAX_STEP_ATTEMPTS = int(os.getenv("CONTINUATION_WATCHDOG_MAX_STEP_ATTEMPTS", "6"))
 
 # A continuation must be benign prose. Anything that looks like a destructive /
 # live / payment / credential / publication action is NEVER auto-submitted — it is
@@ -109,12 +115,36 @@ def _db() -> sqlite3.Connection:
 
 
 def _step_row(conn, idkey: str) -> Optional[dict]:
-    r = conn.execute("SELECT attempts,submitted,verified,blocked,last_outcome FROM cw_step "
-                     "WHERE idkey=?", (idkey,)).fetchone()
+    r = conn.execute("SELECT attempts,submitted,verified,blocked,last_outcome,updated_at "
+                     "FROM cw_step WHERE idkey=?", (idkey,)).fetchone()
     if not r:
         return None
     return {"attempts": r[0], "submitted": bool(r[1]), "verified": bool(r[2]),
-            "blocked": bool(r[3]), "last_outcome": r[4]}
+            "blocked": bool(r[3]), "last_outcome": r[4], "updated_at": r[5]}
+
+
+def _iso_epoch(s: Optional[str]) -> Optional[float]:
+    try:
+        return datetime.fromisoformat(s).timestamp() if s else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def should_skip_prior(prior: Optional[dict], now_ts: float) -> bool:
+    """A verified step is never repeated. A blocked step is re-attemptable after a
+    cooldown, up to a hard attempt cap — so a fixed watchdog can self-heal a stale
+    blocker rather than leaving the agent stuck forever."""
+    if not prior:
+        return False
+    if prior.get("verified"):
+        return True
+    if prior.get("blocked"):
+        if (prior.get("attempts") or 0) >= MAX_STEP_ATTEMPTS:
+            return True                                    # give up permanently
+        last = _iso_epoch(prior.get("updated_at"))
+        if last is not None and (now_ts - last) < BLOCKED_RETRY_COOLDOWN_SECS:
+            return True                                    # still cooling down
+    return False
 
 
 def _save_step(conn, idkey, target, conv, step_hash, *, attempts, submitted, verified,
@@ -325,6 +355,18 @@ class Controller:
         rc, _, _ = self._ac._tmux(["send-keys", "-t", target, "Enter"])
         return rc
 
+    def robust_submit(self, target, text):
+        """Reliable submission for a line a bare Enter would not send (the live
+        "missed Enter" failure): clear the input line, then re-deliver the exact
+        text via the proven multiline-safe buffer-paste + Enter path (agent_send).
+        Same safety-classified text, so no new content is introduced."""
+        try:
+            self._ac._tmux(["send-keys", "-t", target, "C-u"])       # clear partial line
+        except Exception:  # noqa: BLE001
+            pass
+        res = self._ac.agent_send(target, text)                      # fresh uuid → delivers
+        return bool(res.get("submitted"))
+
     def emit(self, target, project, event_type, payload, dedup_key):
         return self._ac.record_commander_event(target, project, event_type, payload,
                                                 dedup_key=dedup_key, dedup_window_secs=86400)
@@ -355,9 +397,11 @@ def deliver_and_verify(ctrl, *, target: str, cwd: str, action: str, step_text: s
     v, after = _poll_verify()
     retried = False
     if not (v and v["ok"]) and v and not v["prompt_consumed"]:
-        # Text is still sitting unsubmitted — press Enter once more, safely.
+        # Text is still sitting unsubmitted (the live "missed Enter" failure) —
+        # retry ONCE with the reliable clear + paste + Enter path rather than a bare
+        # Enter that already did not land.
         retried = True
-        enter_rc = ctrl.enter(target)
+        enter_rc = 0 if ctrl.robust_submit(target, step_text) else 1
         v, after = _poll_verify()
     return {"verify": v or {}, "retried": retried, "enter_rc": enter_rc,
             "after": after}
@@ -427,8 +471,8 @@ def run_once(ctrl=None, *, now_ts: Optional[float] = None, sleep=time.sleep) -> 
                 sh = step_hash(conv_id, step_text)
                 ik = idkey(target, conv_id, sh)
                 prior = _step_row(conn, ik)
-                if prior and (prior["verified"] or prior["blocked"]):
-                    continue                          # never repeat a done/blocked step
+                if should_skip_prior(prior, now_ts):
+                    continue      # verified → never repeat; blocked → cooling down / capped
 
                 if d["action"] == "blocker":
                     _emit_blocker(ctrl, conn, target, session, cfg, ik, conv_id, sh,

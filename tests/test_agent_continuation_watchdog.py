@@ -123,6 +123,31 @@ def test_decide_proactive_deliver_only_when_opted_in_and_capped():
     assert _d(_agent(), "", "idle", proactive=True, conv_count=cw.MAX_CONTINUATIONS)["action"] == "skip"
 
 
+# ── blocked-step cooldown re-attempt (verified stays permanent) ──────────────
+def _iso(ts):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def test_verified_step_is_never_repeated():
+    assert cw.should_skip_prior({"verified": True, "blocked": False, "attempts": 3}, NOW) is True
+
+
+def test_blocked_step_skipped_within_cooldown_reattempted_after():
+    within = {"verified": False, "blocked": True, "attempts": 2,
+              "updated_at": _iso(NOW - 10)}
+    after = {"verified": False, "blocked": True, "attempts": 2,
+             "updated_at": _iso(NOW - cw.BLOCKED_RETRY_COOLDOWN_SECS - 5)}
+    assert cw.should_skip_prior(within, NOW) is True            # cooling down
+    assert cw.should_skip_prior(after, NOW) is False            # re-attempt allowed
+
+
+def test_blocked_step_gives_up_after_attempt_cap():
+    capped = {"verified": False, "blocked": True, "attempts": cw.MAX_STEP_ATTEMPTS,
+              "updated_at": _iso(NOW - cw.BLOCKED_RETRY_COOLDOWN_SECS - 100)}
+    assert cw.should_skip_prior(capped, NOW) is True            # permanent
+
+
 # ── fake controller for deliver_and_verify / run_once ────────────────────────
 class FakeCtrl:
     def __init__(self, agents, sessions, behavior):
@@ -161,6 +186,12 @@ class FakeCtrl:
     def enter(self, target):
         return self._try_submit(target)
 
+    def robust_submit(self, target, text):
+        s = self.state[target]
+        s["pending"] = text
+        s["tail"] = s["tail"] + " [rs]"
+        return self._try_submit(target) == 0
+
     def send(self, target, text, idem):
         s = self.state[target]
         s["pending"] = text; s["tail"] = s["tail"] + " [pasted]"
@@ -191,6 +222,17 @@ def test_deliver_and_verify_retries_enter_once_then_succeeds():
     out = cw.deliver_and_verify(ctrl, target="proj:0.0", cwd="/opt/proj", action="submit",
                                 step_text="continue", expected_pending="continue", sleep=_no_sleep)
     assert out["verify"]["ok"] is True and out["retried"] is True
+
+
+def test_missed_enter_is_recovered_by_robust_resubmit():
+    # Live failure mode: a bare Enter does NOT land (submit_on_enter=2). The retry
+    # must use the reliable clear+paste+Enter path and land the submission.
+    ctrl = FakeCtrl([_agent(pending="continue")], {},
+                    {"proj:0.0": {"will_submit": True, "submit_on_enter": 2}})
+    out = cw.deliver_and_verify(ctrl, target="proj:0.0", cwd="/opt/proj", action="submit",
+                                step_text="continue", expected_pending="continue", sleep=_no_sleep)
+    assert out["retried"] is True and out["verify"]["ok"] is True
+    assert ctrl.state["proj:0.0"]["pending"] == ""     # line consumed
 
 
 def test_deliver_and_verify_gives_up_when_never_submits():
