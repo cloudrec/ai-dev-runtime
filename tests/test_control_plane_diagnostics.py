@@ -90,6 +90,7 @@ def test_observability_summary_all_clear_with_only_historical(tmp_path, monkeypa
     _jobs_db(p, [("failed", NOW - 8 * 86400)])
     monkeypatch.setenv("RUNTIME_JOBS_DB", p)
     _dead_letter(NOW - 7200)
+    _agent_row("a:0.0", NOW - 10, "managed")     # engine alive (recent observation)
     s = diag.observability_summary(now=NOW)
     assert s["active_failures_total"] == 0 and s["all_clear"] is True and s["status"] == "green"
     assert s["historical_failures_total"] == 2   # 1 job + 1 notification, both historical
@@ -99,5 +100,89 @@ def test_observability_summary_red_when_active(tmp_path, monkeypatch):
     p = str(tmp_path / "jobs.db")
     _jobs_db(p, [("failed", NOW - 100)])
     monkeypatch.setenv("RUNTIME_JOBS_DB", p)
+    _agent_row("a:0.0", NOW - 10, "managed")     # fresh → engine alive
     s = diag.observability_summary(now=NOW)
     assert s["active_failures_total"] >= 1 and s["all_clear"] is False and s["status"] == "red"
+
+
+# ── registry freshness / engine liveness (via updated_at, not evidence) ──────
+def _conn():
+    from core.control_plane.store import connect, init_db
+    c = connect(); init_db(c); return c
+
+
+def _agent_row(target, updated_ts, lifecycle, duplicate_of=None):
+    c = _conn()
+    c.execute("INSERT INTO agent(id,target,actual_state,lifecycle_state,duplicate_of,updated_at) "
+              "VALUES(?,?,?,?,?,?)", (target, target, "unknown", lifecycle, duplicate_of, _iso(updated_ts)))
+    c.commit(); c.close()
+
+
+def _gate_row(gid, kind, opened_ts, agent_id="x:0.0"):
+    c = _conn()
+    c.execute("INSERT INTO owner_gate(id,kind,agent_id,state,opened_at) VALUES(?,?,?,'open',?)",
+              (gid, kind, agent_id, _iso(opened_ts)))
+    c.commit(); c.close()
+
+
+def _lease_row(resource, expires_ts, holder="ctrl"):
+    c = _conn()
+    c.execute("INSERT INTO resource_lease(resource,holder_controller,fence_token,expires_ts) "
+              "VALUES(?,?,1,?)", (resource, holder, expires_ts))
+    c.commit(); c.close()
+
+
+def test_registry_engine_alive_when_recently_observed():
+    _agent_row("arb:0.0", NOW - 10, "managed")           # observed 10s ago
+    _agent_row("obs:0.0", NOW - 40, "observe_only")
+    _agent_row("gone:0.0", NOW - 9000, "dead")           # old
+    r = diag.registry_health_report(now=NOW, fresh_within_secs=120)
+    assert r["agents_total"] == 3 and r["observed_fresh"] == 2
+    assert r["engine_alive"] is True and r["status"] == "green"
+    assert r["by_lifecycle"]["managed"] == 1 and r["dead"] == 1
+
+
+def test_registry_engine_stalled_when_all_observations_old():
+    _agent_row("arb:0.0", NOW - 5000, "managed")
+    _agent_row("obs:0.0", NOW - 6000, "observe_only")
+    r = diag.registry_health_report(now=NOW, fresh_within_secs=120)
+    assert r["observed_fresh"] == 0 and r["engine_alive"] is False and r["status"] == "red"
+    assert "stalled" in r["note"]
+
+
+def test_registry_counts_duplicates():
+    _agent_row("p:0.0", NOW - 10, "managed")
+    _agent_row("p-dup:0.0", NOW - 10, "managed", duplicate_of="p:0.0")
+    r = diag.registry_health_report(now=NOW)
+    assert r["duplicates_flagged"] == 1
+
+
+# ── owner-gate aging ─────────────────────────────────────────────────────────
+def test_owner_gate_aging_and_kinds():
+    _gate_row("g1", "classify_scope", NOW - 3600)
+    _gate_row("g2", "classify_scope", NOW - 7200)          # oldest
+    _gate_row("g3", "unverified_owner_decision", NOW - 600)
+    r = diag.owner_gate_report(now=NOW)
+    assert r["open_total"] == 3 and r["by_kind"]["classify_scope"] == 2
+    assert r["oldest_gate_id"] == "g2" and r["oldest_age_secs"] == 7200
+    assert r["status"] == "green"          # backlog, not a failure
+
+
+# ── leases live vs expired ───────────────────────────────────────────────────
+def test_lease_live_vs_expired():
+    _lease_row("agent:a:0.0", NOW + 100)      # live
+    _lease_row("agent:b:0.0", NOW - 100)      # expired
+    r = diag.lease_report(now=NOW)
+    assert r["total"] == 2 and r["live"] == 1 and r["expired_stale"] == 1
+    assert r["live_holders"][0]["resource"] == "agent:a:0.0"
+
+
+# ── summary: engine stall makes it RED even with zero active failures ────────
+def test_summary_red_when_engine_stalled_no_active_failures(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty_jobs.db"))
+    sqlite3.connect(str(tmp_path / "empty_jobs.db")).execute(
+        "CREATE TABLE jobs(id TEXT,status TEXT,created_at TEXT,updated_at TEXT,finished_at TEXT)")
+    _agent_row("stale:0.0", NOW - 9000, "managed")     # engine looks stalled
+    s = diag.observability_summary(now=NOW)
+    assert s["active_failures_total"] == 0 and s["engine_alive"] is False
+    assert s["all_clear"] is False and s["status"] == "red"

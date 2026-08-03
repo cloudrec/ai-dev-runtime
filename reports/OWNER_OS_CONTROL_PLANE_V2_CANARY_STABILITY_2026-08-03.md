@@ -172,3 +172,53 @@ are **zero active failures**. New read-only endpoint: `GET /api/v1/control-plane
   recent→active-red, none→clean, combined summary all_clear-with-historical vs red-when-active.
 - Commit: `core/control_plane/diagnostics.py` + endpoint + tests (local only). No live
   behavior changed; strictly read-only (SELECT / `mode=ro`).
+
+---
+
+# ADDENDUM 2 — registry freshness / engine liveness + gate-aging + lease diagnostics (read-only)
+
+## Gap found
+
+`is_stale` keys on `agent.evidence_fresh_at`, which ONLY the actuator refreshes (on a
+verified action). Discovery observes every agent each ~30s tick but refreshes
+`agent.updated_at`, not `evidence_fresh_at`. So `is_stale` reads **9/9 agents stale** even
+while discovery is actively seeing them — a misleading liveness signal for observe-only
+agents, and no aggregate view of engine liveness, gate backlog, or expired leases existed.
+
+## Added (read-only; no discovery behavior changed)
+
+- `registry_health_report` — agent freshness by **observation recency (`updated_at`)**:
+  total, observed_fresh vs observed_stale, by_lifecycle, duplicates, dead,
+  `newest_observation_age_secs`, and **`engine_alive`** (an agent observed within
+  2×`fresh_within`). If nothing observed recently → the discovery engine is likely stalled →
+  red (the health_monitor-stall class, now surfaced for the control plane).
+- `owner_gate_report` — open owner gates by kind + `oldest_age_secs` (pending-decision
+  backlog; green, never a failure).
+- `lease_report` — resource leases live vs `expired_stale` (surfaces expired-but-present rows
+  so they are not mistaken for active ownership).
+- `observability_summary` now folds these in: overall **red** if there are ACTIVE failures OR
+  the engine looks stalled; gates/leases are informational.
+
+## Live (read-only) result
+
+`status=green, all_clear=true, engine_alive=true`. Registry: 9 agents, **7 observed_fresh**
+(newest observation age 0s), 2 stale = the dead/retired `canary-synthetic-restart` +
+`cp-canary-dup` (correct) — the misleading "9/9 stale-by-evidence" is resolved. Lifecycle:
+managed 2 / observe_only 5 / dead 2; duplicates_flagged 1. Open-gate backlog: 6
+(classify_scope 4, unverified_owner_decision 1, canary_agent_selection 1; oldest ~7.3h).
+Leases: 2 total, 0 live, 2 expired_stale (harmless).
+
+## Tests / commit
+
+- Tests: **+6** in `test_control_plane_diagnostics.py` (engine alive vs stalled, duplicates,
+  gate aging/kinds, lease live-vs-expired, summary red-on-engine-stall). Diagnostics file
+  total **13**. Full suite: see run.
+- Commit: local only. Endpoint `GET /api/v1/control-plane/observability` now includes
+  registry_health / open_owner_gates / resource_leases.
+
+## Genuine owner gates (unchanged)
+
+The 6 open owner gates (scope classifications, arbitrage2 unverified-decision, canary
+selection) are **pending owner decisions** — surfaced as backlog, resolvable only by the
+owner. Not auto-resolved (provenance invariant). This is the genuine owner gate; no further
+autonomous action taken on them.
