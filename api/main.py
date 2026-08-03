@@ -172,6 +172,21 @@ async def _start_commander_autopilot():
         logger.warning(f"commander autopilot not started: {e}")
 
 
+@app.on_event("startup")
+async def _start_context_budget():
+    # Context budget / checkpoint / rotation: tracks conversation size + phase for every
+    # registered critical agent (read-only, durable), writes an ATOMIC verified checkpoint
+    # at a safe boundary over the soft threshold, and rotates (clear + resume from the
+    # checkpoint) over the hard threshold — actuation confined to CANARY_AGENTS via the
+    # lease-gated Actuator; a non-canary agent over budget raises an owner-gated event.
+    import asyncio
+    try:
+        from core.context_budget import run_loop as _cb_loop
+        asyncio.create_task(_cb_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"context budget not started: {e}")
+
+
 # ---- движок и очередь ----
 engine = RuntimeEngine()
 

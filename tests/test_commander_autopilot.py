@@ -105,10 +105,16 @@ def test_active_exec_marker_not_poked():
     assert ev["decision"] == "skip_progressing"
 
 
-def test_no_unfinished_work_skip():
+def test_no_unfinished_work_is_end_state_met():
+    # a footer with ZERO unfinished work is the documented end-state, reported as such
     tail = "4 tasks (4 done, 0 in progress, 0 open)"
     assert ap.evaluate("cp-canary:0.0", state="idle", tail=tail, registry=REG)["decision"] \
-        == "skip_no_work"
+        == "end_state_met"
+
+
+def test_no_footer_and_no_step_is_skip_no_work():
+    reg = {"x:0.0": {"root": "/tmp", "next_step": ""}}
+    assert ap.evaluate("x:0.0", state="idle", tail="", registry=reg)["decision"] == "skip_no_work"
 
 
 # ── safety boundaries ────────────────────────────────────────────────────────

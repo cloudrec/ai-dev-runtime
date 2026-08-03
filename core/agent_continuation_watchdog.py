@@ -412,7 +412,14 @@ def deliver_and_verify(ctrl, *, target: str, cwd: str, action: str, step_text: s
     retry Enter exactly once if the prompt was not consumed."""
     before = ctrl.snapshot(target, cwd)
     if action == "deliver":
-        res = ctrl.send(target, step_text, f"cw:{step_hash(None, step_text)}")
+        # transport idempotency key is UNIQUE PER ATTEMPT. 2026-08-03 live failure:
+        # the old constant key f"cw:{step_hash(None, step_text)}" meant the SECOND
+        # legitimate delivery of the same text EVER (e.g. the bare /clear of every
+        # context rotation after the first) was silently dropped by agent_send's
+        # durable dedupe → verify_failed → spurious owner gate. Logical dedupe is
+        # the job of the layered ledgers (cw_step / cp_action), not the transport.
+        idem = f"cw:{step_hash(None, step_text)}:{int(_now_ts() * 1000)}"
+        res = ctrl.send(target, step_text, idem)
         enter_rc = 0 if res.get("submitted") else 1
     else:                                    # submit an already-typed line
         enter_rc = ctrl.enter(target)
@@ -433,10 +440,24 @@ def deliver_and_verify(ctrl, *, target: str, cwd: str, action: str, step_text: s
     if not (v and v["ok"]) and v and not v["prompt_consumed"]:
         # Text is still sitting unsubmitted (the live "missed Enter" failure) —
         # retry ONCE with the reliable clear + paste + Enter path rather than a bare
-        # Enter that already did not land.
-        retried = True
-        enter_rc = 0 if ctrl.robust_submit(target, step_text) else 1
-        v, after = _poll_verify()
+        # Enter that already did not land. 2026-08-03 live race fix: re-check the
+        # input line IMMEDIATELY before the re-paste — if the first Enter was merely
+        # slow and the line was consumed between polls, a blind robust_submit pastes
+        # a DUPLICATE copy of the step; and if DIFFERENT text has appeared meanwhile,
+        # C-u would destroy someone else's queued input and paste ours over it.
+        fresh = ctrl.snapshot(target, cwd)
+        fresh_pending = _norm(fresh.get("pending") or "")
+        if fresh_pending == _norm(step_text):
+            retried = True
+            enter_rc = 0 if ctrl.robust_submit(target, step_text) else 1
+            v, after = _poll_verify()
+        elif not fresh_pending:
+            # line already consumed (slow Enter landed) — treat the keystroke as
+            # delivered and re-verify; never paste a second copy.
+            enter_rc = 0
+            v, after = _poll_verify()
+        # else: foreign text now occupies the line — do NOT clear or overwrite it;
+        # fall through with the failed verify (caller records a blocker/owner gate).
     return {"verify": v or {}, "retried": retried, "enter_rc": enter_rc,
             "after": after}
 

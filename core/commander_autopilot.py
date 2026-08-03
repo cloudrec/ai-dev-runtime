@@ -33,7 +33,10 @@ _CFG_PATH = os.getenv("COMMANDER_AUTOPILOT_CONFIG",
                       "/root/ai-dev-runtime/config/commander_autopilot.yaml")
 
 # an agent in one of these observable states, with unfinished work, is a poke candidate.
-POKE_STATES = ("idle", "waiting_input", "waiting_owner")
+# waiting_owner is EXCLUDED (2026-08-03 fix): that pane may be showing a tool-permission
+# dialog, and delivering text onto a dialog is exactly the forbidden interaction — an
+# owner question is the supervisor's/owner's job, never an autopilot poke.
+POKE_STATES = ("idle", "waiting_input")
 # these observable states mean the agent is already making progress → never poke.
 PROGRESS_STATES = ("working", "shell_running")
 
@@ -42,6 +45,9 @@ _SUBAGENT_RUNNING_RE = re.compile(
     r"((sub[- ]?agent|fable|background (task|agent|shell|job))\b.{0,40}"
     r"(running|active|in[- ]progress|working|spawned)"
     r"|·\s*\d+\s+agents?\s+(running|working|active)"
+    # the REAL Claude Code render while a Task-tool/Fable subagent runs (live
+    # mess-qa-automation pane 2026-08-03): "✻ Waiting for 1 background agent to finish"
+    r"|waiting for \d+ background agents?\b"
     r"|spawn(ed|ing) \d+ (sub)?agents?)", re.I)
 # Claude Code task footer: "N tasks (X done, Y in progress, Z open)".
 _TASK_FOOTER_RE = re.compile(
@@ -76,15 +82,20 @@ def has_background_subagent(tail: str) -> bool:
 
 def is_progressing(state: str, tail: str) -> bool:
     """True when the agent is already doing real work — including a running background subagent
-    or a live active-execution marker — so it must NOT be poked."""
-    from core.agent_continuation_watchdog import _ACTIVE_EXEC_RE
+    or a live active-execution marker — so it must NOT be poked.
+
+    2026-08-03 fix: uses the canonical live-status-region active markers instead of the
+    watchdog's _ACTIVE_EXEC_RE over the last 400 chars — the bare ✻/✽ glyph there matched
+    PAST-tense spinners ("✻ Baked for 4s"), silently suppressing every legitimate poke
+    whose tail tip retained a finished-spinner line."""
+    from core.agent_control import _STATE_ACTIVE_RUN_RE, live_status_region
     if state in PROGRESS_STATES:
         return True
     if has_background_subagent(tail):
         return True
-    # active-execution markers only count in the CURRENT status (tail tip), never deep
-    # scrollback — a past "running…" line must not read as live work.
-    if _ACTIVE_EXEC_RE.search((tail or "")[-400:]):
+    # live active-execution markers only (last spinner line → end): a past-tense spinner
+    # or a stale marker higher in scrollback must not read as live work.
+    if _STATE_ACTIVE_RUN_RE.search(live_status_region(tail or "")):
         return True
     return False
 
@@ -139,6 +150,11 @@ def evaluate(target: str, *, state: str, tail: str = "", conv_age_secs: Optional
         return {**base, "decision": "skip_progressing"}
     if state not in POKE_STATES:
         return {**base, "decision": "skip_other_state"}
+    # idle/waiting with a task footer showing ZERO unfinished work = the documented
+    # end-state is met — report it as such (registry end-state logic), don't poke.
+    if tf["present"] and tf["has_unfinished"] is False:
+        return {**base, "decision": "end_state_met",
+                "note": "task footer shows no open/in-progress work — end-state met"}
     # idle/waiting — is there unfinished pre-approved work?
     has_work = (tf["has_unfinished"] is True) or (tf["has_unfinished"] is None and bool(step))
     if not has_work:
@@ -149,12 +165,27 @@ def evaluate(target: str, *, state: str, tail: str = "", conv_age_secs: Optional
     return {**base, "decision": "poke"}
 
 
+# unchanged repeated decisions are re-recorded at most once per this window, so the
+# per-minute loop cannot grow the ledger unboundedly (~7200 identical rows/day pre-fix).
+_RECORD_DEDUP_SECS = int(os.getenv("COMMANDER_AUTOPILOT_RECORD_DEDUP_SECS", "3600"))
+
+
 def _record_run(target: str, decision: str, detail: dict, conn=None) -> None:
     conn, own = _c(conn)
     try:
         conn.execute("CREATE TABLE IF NOT EXISTS autopilot_run ("
                      "id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, target TEXT, decision TEXT, "
                      "detail TEXT)")
+        prev = conn.execute("SELECT decision, ts FROM autopilot_run WHERE target=? "
+                            "ORDER BY id DESC LIMIT 1", (target,)).fetchone()
+        if prev and prev[0] == decision:
+            from datetime import datetime
+            try:
+                age = now_ts() - datetime.fromisoformat(prev[1]).timestamp()
+                if age < _RECORD_DEDUP_SECS:
+                    return                       # identical consecutive decision — deduped
+            except Exception:  # noqa: BLE001 — unparsable ts: record rather than drop
+                pass
         import json
         conn.execute("INSERT INTO autopilot_run(ts,target,decision,detail) VALUES(?,?,?,?)",
                      (now_iso(), target, decision, json.dumps(detail, default=str)[:2000]))
@@ -185,32 +216,75 @@ def deliver_next_step(target: str, step_text: str, *, conversation_id: str = "",
                             cwd=cwd, lease=lease, ctrl=ctrl, sleep=sleep)
 
 
+def _real_tail(target: str) -> str:
+    """Live pane tail for a registered agent (read-only, redacted, bounded)."""
+    try:
+        from core import agent_control as ac
+        return ac._pane_tail(target, 40)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _real_conv(cwd: str):
+    """(conversation_id, mtime_epoch) of the latest Claude conversation for `cwd`.
+    Read-only; (None, None) when unknown."""
+    try:
+        from datetime import datetime
+        from core import agent_control as ac
+        latest = (ac.conversation_evidence(cwd) or {}).get("latest") or {}
+        cid = latest.get("conversation_id")
+        mt = latest.get("modified_at")
+        return cid, (datetime.fromisoformat(mt).timestamp() if mt else None)
+    except Exception:  # noqa: BLE001
+        return None, None
+
+
 def tick(*, inventory: Optional[dict] = None, registry: Optional[dict] = None,
          ctrl=None, evaluate_only: bool = False, conv_age_fn=None, now: Optional[float] = None,
-         conn=None) -> dict:
+         tail_fn=None, conv_fn=None, conn=None) -> dict:
     """One autopilot pass over the registry. For each registered agent: evaluate, then (unless
     evaluate_only) deliver the safe next step to a poke candidate via the Actuator. Returns the
     per-agent assessments + actions. Read-only for any agent whose actuation is owner-gated
-    (not in CANARY_AGENTS → actuator returns not_canary)."""
+    (not in CANARY_AGENTS → actuator returns not_canary).
+
+    PRODUCTION CONTRACT (2026-08-03 fix): the real `agent_list()` inventory carries NO
+    `_tail` / `claude_conversation` keys, so the tick FETCHES the live pane tail and the
+    latest conversation id itself (injectable via tail_fn / conv_fn). Pre-fix, every agent
+    evaluated with tail=""/conversation_id="" — background-subagent detection, task-footer
+    logic, per-conversation dedupe and the stuck-shell watchdog were all dead code live."""
     registry = registry if registry is not None else load_registry()
     if inventory is None:
         from core import agent_control as ac
         inventory = ac.agent_list()
+    tail_fn = tail_fn or _real_tail
+    conv_fn = conv_fn or _real_conv
     by_target = {a.get("target"): a for a in (inventory.get("agents") or [])}
     results = []
     for target, entry in registry.items():
         a = by_target.get(target)
         state = (a or {}).get("state") or "dead"        # not present → treat as dead (watchdog)
-        tail = (a or {}).get("_tail") or ""
-        conv_age = conv_age_fn(target) if conv_age_fn else None
+        tail = (a or {}).get("_tail")
+        if tail is None and a is not None and a.get("alive") and a.get("is_agent"):
+            tail = tail_fn(target)
+        tail = tail or ""
+        cwd = (a or {}).get("claude_cwd") or (a or {}).get("cwd") or entry.get("root", "")
+        conv = (a or {}).get("claude_conversation")
+        conv_mtime = None
+        if not conv and a is not None:
+            conv, conv_mtime = conv_fn(cwd)
+        conv = conv or ""
+        if conv_age_fn:
+            conv_age = conv_age_fn(target)
+        elif conv_mtime is not None:
+            conv_age = (now if now is not None else now_ts()) - conv_mtime
+        else:
+            conv_age = None
         ev = evaluate(target, state=state, tail=tail, conv_age_secs=conv_age,
                       registry=registry, now=now)
         action = None
         if ev["decision"] == "poke" and not evaluate_only:
-            cwd = entry.get("root", "")
-            conv = (a or {}).get("claude_conversation") or ""
             action = deliver_next_step(target, ev["next_step"], conversation_id=conv,
-                                       cwd=cwd, ctrl=ctrl)
+                                       cwd=entry.get("root", ""), ctrl=ctrl)
             ev["actuation"] = action
             ev["delivered"] = bool(action.get("acted"))
             ev["actuation_reason"] = action.get("reason")

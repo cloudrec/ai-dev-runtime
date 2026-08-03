@@ -145,9 +145,13 @@ def test_planner_hanging_parent_with_no_children_still_times_out(tmp_path, monke
 def test_planner_hanging_child_survives_parent_exit_but_group_is_reaped(tmp_path, monkeypatch):
     # Parent forks a detached-looking child and exits immediately itself while
     # the child keeps running — the leaked child must still die with the group.
+    # UNIQUE sleep duration: a global `pgrep "sleep 30"` collides with any
+    # unrelated `sleep 30` on the box (2026-08-03: another agent's poll loop made
+    # this test fail while the reap itself worked fine).
+    marker = "30.7391"
     cli = _fake_cli(tmp_path, (
         "import subprocess, sys\n"
-        "subprocess.Popen(['sleep', '30'])\n"
+        f"subprocess.Popen(['sleep', '{marker}'])\n"
         "sys.exit(0)\n"
     ))
     _reload(monkeypatch, cli, timeout=10)
@@ -158,8 +162,8 @@ def test_planner_hanging_child_survives_parent_exit_but_group_is_reaped(tmp_path
 
     import time as _t
     _t.sleep(0.5)
-    ps = subprocess.run(["pgrep", "-af", "sleep 30"], capture_output=True, text=True)
-    assert "sleep 30" not in ps.stdout
+    ps = subprocess.run(["pgrep", "-af", f"sleep {marker}"], capture_output=True, text=True)
+    assert f"sleep {marker}" not in ps.stdout
 
 
 def test_planner_malformed_response_raises(tmp_path, monkeypatch):

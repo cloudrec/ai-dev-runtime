@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 from typing import Optional
 
-from core.agent_control import _STATE_ACTIVE_RUN_RE
+from core.agent_control import _STATE_ACTIVE_RUN_RE, live_status_region
 
 # conversation mtime moving within this window = the model is actively producing output
 ACTIVE_CONV_WINDOW_SECS = int(os.getenv("CP_ACTIVE_CONV_WINDOW_SECS", "10"))
@@ -32,7 +32,9 @@ _KNOWN_NONIDLE = ("waiting_owner", "waiting_input", "externally_blocked", "dead"
 
 
 def has_active_marker(tail: str) -> bool:
-    return bool(_STATE_ACTIVE_RUN_RE.search(tail or ""))
+    """Live active-execution evidence only: markers count in the live status region
+    (last spinner line → end), never in stale scrollback above it."""
+    return bool(_STATE_ACTIVE_RUN_RE.search(live_status_region(tail or "")))
 
 
 def estimate(*, base_state: str, tail: str = "", conv_moved: bool = False,

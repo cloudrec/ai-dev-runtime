@@ -489,13 +489,38 @@ _MODE_PLAN_RE = re.compile(r"\bplan mode on\b", re.I)
 NONSTALL_MODES = ("auto", "accept_edits")
 
 
+def prompt_text_from_styled(after: str) -> str:
+    """Extract REAL staged input from the styled (`capture-pane -e`) text after the
+    last `❯`. Claude Code renders the RECALL GHOST of the last submitted command in
+    DIM (SGR 2) — visually identical to typed text in a plain capture. LIVE
+    2026-08-03 cp-canary: the ghost `continue with the next safe canary note` read
+    as pending input, deferring every poke and blocking rotation indefinitely.
+    Dim ghost → '' ; numbered menu selection (`❯ 1. Yes`) → ''."""
+    if "\x1b[2m" in after:                 # dim ghost = recall hint, not staged input
+        return ""
+    content = _SGR_RE.sub("", after).replace("\xa0", " ").strip()
+    if re.match(r"^\d+\.", content):       # menu option, not the input line
+        return ""
+    return content
+
+
 def pending_input_text(target: str, tail: str | None = None) -> str:
     """Text typed into the agent's input line but NOT yet submitted (e.g. an
     owner/ChatGPT-queued instruction). CRITICAL for /clear safety: agent_send
     pastes then hits Enter WITHOUT clearing the line, so sending `/clear` while
     this is non-empty would concatenate and SUBMIT the queued text — possibly an
     external/financial/production action. A context rotation must refuse when this
-    is non-empty. A numbered menu selection (`❯ 1. Yes`) is not input-line text."""
+    is non-empty. A numbered menu selection (`❯ 1. Yes`) is not input-line text.
+
+    Prefers a STYLED capture (`-e`) so the dim recall ghost of the last submitted
+    command is never mistaken for staged input; falls back to the plain `tail`
+    heuristic (ghost-blind, conservative) only when the styled capture fails."""
+    rc, out, _ = _tmux(["capture-pane", "-e", "-p", "-t", target, "-S", "-10"])
+    if rc == 0:
+        prompt_lines = [ln for ln in out.splitlines() if "❯" in ln]
+        if not prompt_lines:
+            return ""
+        return prompt_text_from_styled(prompt_lines[-1].split("❯", 1)[1])
     text = tail if tail is not None else _pane_tail(target, 10)
     for line in reversed((text or "").splitlines()):
         m = re.search(r"❯\s?(.*)$", line.rstrip())
@@ -649,6 +674,15 @@ _STATE_ACTIVE_RUN_RE = re.compile(
     # `claude`, so the pane-command heuristic misses it — this footer marker means the
     # agent is actively running a shell and must NOT be read as idle.
     r"|·\s*\d+\s+shells?\b"
+    # A RUNNING background subagent (Fable/Task tool) is real work in progress. The live
+    # mess-qa-automation pane (2026-08-03) showed "✻ Waiting for 1 background agent to
+    # finish" yet classified idle — and was then listed as a poke candidate mid-audit.
+    r"|waiting for \d+ background agents?\b"
+    # Context compaction is live work — poking or /clear-ing during it corrupts state.
+    r"|\bcompacting\b"
+    # Live minute-form spinner "(19m 23s ·" — the second-form "(8s ·" pattern above missed
+    # it, so a long turn was only caught when a token counter shared the captured tail.
+    r"|\(\d+m\s+\d+s\s*·"
     r"|[↑↓]\s*[\d.]+\s*k?\s*tokens\b)", re.I)
 # Blocked on something outside the agent's control (vendor key, credentials, quota).
 # NARROW on purpose: generic words like "waiting for", "timed out", "network error",
@@ -664,6 +698,25 @@ _STATE_EXTERNAL_RE = re.compile(
 _STATE_WAIT_OWNER_RE = re.compile(
     r"(\(y/n\)|\[y/n\]|do you want (me )?to|shall i\b|proceed\?|may i\b|"
     r"which (option|approach)|choose an option|awaiting your (approval|decision|confirmation))", re.I)
+
+
+# Spinner glyphs Claude Code uses for the LIVE status line. The live status block is
+# always rendered at the BOTTOM of the pane (last spinner line → input box), so an
+# active-execution marker in an OLDER spinner line is stale scrollback, not live work.
+# The 2026-08-03 cp-canary pane sat 40+ minutes false-"working" on a stale
+# "✻ … · 1 shell still running" line whose shell had already completed two blocks later.
+_SPINNER_GLYPHS = ("✻", "✶", "✽", "✳", "✢", "✷", "✵", "✺")
+
+
+def live_status_region(tail: str) -> str:
+    """The pane text from the LAST spinner-glyph line to the end — the only region where
+    active-execution markers are live. Conservative fallback: no spinner line → the whole
+    tail (absence of a spinner must never hide real evidence like 'esc to interrupt')."""
+    lines = (tail or "").splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].lstrip()[:1] in _SPINNER_GLYPHS:
+            return "\n".join(lines[i:])
+    return tail or ""
 
 
 def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str | None = None,
@@ -684,8 +737,10 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
         return "stale"          # alive pane, no live Claude process
     tail = (output_tail or "")[-1500:]
 
-    # 1) concrete active-execution evidence — the only path to "working".
-    if _STATE_ACTIVE_RUN_RE.search(tail):
+    # 1) concrete active-execution evidence — the only path to "working". Markers count
+    #    only in the LIVE status region (last spinner line → end): a stale spinner line
+    #    higher in scrollback must never read as live work.
+    if _STATE_ACTIVE_RUN_RE.search(live_status_region(tail)):
         return "working"
     # 1b) a live shell command running in the pane is work in progress (shell-
     #     running), NOT idle and NOT an external block.
@@ -737,10 +792,7 @@ def _pane_pending_input(target: str) -> str:
     prompt_lines = [ln for ln in out.splitlines() if "❯" in ln]
     if not prompt_lines:
         return ""
-    after = prompt_lines[-1].split("❯", 1)[1]
-    if "\x1b[2m" in after:                 # dim ghost = recall hint, not staged input
-        return ""
-    return _SGR_RE.sub("", after).replace("\xa0", " ").strip()
+    return prompt_text_from_styled(prompt_lines[-1].split("❯", 1)[1])
 
 
 def agent_list() -> dict:
@@ -763,7 +815,8 @@ def agent_list() -> dict:
         # Extra signals only for an at-rest agent (skip when already active/working)
         # so an active agent costs no extra tmux capture.
         shell_running, pending = False, ""
-        if is_agent and pane["alive"] and not _STATE_ACTIVE_RUN_RE.search(tail[-1500:]):
+        if is_agent and pane["alive"] and not _STATE_ACTIVE_RUN_RE.search(
+                live_status_region(tail[-1500:])):
             shell_running = _pane_shell_running(pane)
             if not shell_running:
                 pending = _pane_pending_input(pane["target"])
@@ -827,7 +880,8 @@ def agent_status(target: str) -> dict:
     rc, out, _ = _tmux(["capture-pane", "-p", "-t", agent["target"], "-S", "-40"])
     recent = redact(out) if rc == 0 else ""
     shell_running, pending = False, ""
-    if agent["alive"] and agent["is_agent"] and not _STATE_ACTIVE_RUN_RE.search(recent[-1500:]):
+    if agent["alive"] and agent["is_agent"] and not _STATE_ACTIVE_RUN_RE.search(
+            live_status_region(recent[-1500:])):
         shell_running = _pane_shell_running(agent)
         if not shell_running:
             pending = _pane_pending_input(agent["target"])

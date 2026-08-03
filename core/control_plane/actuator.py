@@ -58,12 +58,21 @@ _SAFE_CONTINUATION_RE = re.compile(
     r"^\s*(continue|proceed|resume|carry on|keep going|go on|next safe step)\b", re.I)
 
 
+# the exact bare context-management commands — non-destructive w.r.t. the outside world
+# (they only reset/compact the agent's own chat context). Used by the context-budget
+# rotation, which additionally gates on a VERIFIED checkpoint + a safe phase boundary.
+_BARE_CONTEXT_CMD_RE = re.compile(r"^\s*/(clear|compact)\s*$", re.I)
+
+
 def classify_action(action_text: str) -> str:
     """Machine-readable policy class. Deny-by-default: destructive/live/payment/credential/
-    publication → prohibited; a documented safe continuation → autonomous_safe; ANYTHING
-    else → owner_approval_required (never auto-actuated)."""
+    publication → prohibited; a documented safe continuation or an exact bare /clear|/compact
+    (context management) → autonomous_safe; ANYTHING else → owner_approval_required (never
+    auto-actuated)."""
     if cw._FORBIDDEN_RE.search(action_text or ""):
         return PROHIBITED
+    if _BARE_CONTEXT_CMD_RE.match(action_text or ""):
+        return AUTONOMOUS_SAFE
     if cw.is_safe_continuation(action_text) and _SAFE_CONTINUATION_RE.search(action_text or ""):
         return AUTONOMOUS_SAFE
     return OWNER_APPROVAL
@@ -129,8 +138,12 @@ def actuate(*, target: str, action_text: str, controller: str, conversation_id: 
                                             lease.get("fence_token")):
         return {"acted": False, "reason": "stale_or_no_lease", "blocked": True}
 
-    # 2) policy gate (deny-by-default)
-    pc = policy_class or classify_action(action_text)
+    # 2) policy gate (deny-by-default). ALWAYS recomputed from the action text — a
+    # caller-supplied policy_class may only DOWNGRADE (make stricter), never bypass the
+    # classifier (pre-2026-08-03 hole: policy_class="autonomous_safe" skipped the gate).
+    pc = classify_action(action_text)
+    if policy_class and policy_class != AUTONOMOUS_SAFE:
+        pc = policy_class
     ah = action_hash(conversation_id, action_text, kind)
     idkey = f"{target}|{conversation_id}|{ah}"
     if pc != AUTONOMOUS_SAFE:
@@ -163,9 +176,26 @@ def actuate(*, target: str, action_text: str, controller: str, conversation_id: 
              action_taken="suppressed continuation (target working)",
              dedup_key=f"falseidle:{idkey}")
         return {"acted": False, "reason": "target_working", "false_idle_corrected": True}
+    # 3c) PENDING-INPUT GUARD — never paste onto a NON-EMPTY input line. agent_send does
+    # not clear the line, so DIFFERENT queued (never safety-classified) text and this
+    # action would CONCATENATE and submit as one command → refuse. When the pending line
+    # IS this exact action (the original missed-Enter failure), SUBMIT it instead of
+    # pasting a duplicate copy.
+    pending = (pre.get("pending") or "").strip()
+    action_mode = "deliver"
+    if pending:
+        if cw._norm(pending) != cw._norm(action_text):
+            emit("actuator", "action_deferred_pending_input", agent_id=target, severity="info",
+                 payload={"pending_tip": pending[:120],
+                          "note": "input line occupied by different text — paste would "
+                                  "concatenate; deferred"},
+                 action_taken="deferred (pending input present)",
+                 dedup_key=f"pendguard:{idkey}")
+            return {"acted": False, "reason": "pending_input_present"}
+        action_mode = "submit"        # same text already typed — press Enter, don't re-paste
 
     # 4) verified delivery (folded from the continuation watchdog)
-    out = cw.deliver_and_verify(ctrl, target=target, cwd=cwd, action="deliver",
+    out = cw.deliver_and_verify(ctrl, target=target, cwd=cwd, action=action_mode,
                                 step_text=action_text, expected_pending=action_text,
                                 sleep=sleep)
     v = out.get("verify") or {}
