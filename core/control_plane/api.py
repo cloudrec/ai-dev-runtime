@@ -32,14 +32,31 @@ def _c(conn):
 # ── event log ────────────────────────────────────────────────────────────────
 def append_event(source: str, type: str, *, entity_type: str = "", entity_id: str = "",
                  payload: Optional[dict] = None, evidence_ref: str = "",
-                 correlation_id: str = "", conn=None) -> int:
+                 correlation_id: str = "", project_id: str = "", agent_id: str = "",
+                 severity: str = "info", owner_action_required: bool = False,
+                 action_taken: str = "", dedup_key: str = "", supersedes: int = 0,
+                 resolves: int = 0, dedup_window_secs: int = 0, conn=None) -> int:
+    """Append one event to the append-only log / CTO inbox. When `dedup_key` +
+    `dedup_window_secs` are given, an identical recent event is not re-appended
+    (returns the existing id) — so repeated alerts collapse."""
     conn, own = _c(conn)
     try:
+        if dedup_key and dedup_window_secs > 0:
+            r = conn.execute(
+                "SELECT id,ts_epoch FROM event WHERE dedup_key=? ORDER BY id DESC LIMIT 1",
+                (dedup_key,)).fetchone()
+            if r and (now_ts() - float(r[1])) < dedup_window_secs:
+                return r[0]
         cur = conn.execute(
             "INSERT INTO event(ts,ts_epoch,source,type,entity_type,entity_id,payload,"
-            "evidence_ref,correlation_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            "evidence_ref,correlation_id,project_id,agent_id,severity,owner_action_required,"
+            "action_taken,dedup_key,supersedes,resolves) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (now_iso(), now_ts(), source, type, entity_type, entity_id,
-             json.dumps(payload or {}, default=str), evidence_ref, correlation_id))
+             json.dumps(payload or {}, default=str), evidence_ref, correlation_id,
+             project_id, agent_id or (entity_id if entity_type == "agent" else ""),
+             severity, 1 if owner_action_required else 0, action_taken, dedup_key,
+             supersedes or None, resolves or None))
         conn.commit()
         return cur.lastrowid
     finally:
@@ -143,14 +160,80 @@ def upsert_agent(target: str, *, session: str = "", project_id: str = "",
             conn.close()
 
 
+_AGENT_COLS = ("id", "target", "session", "project_id", "conversation_id", "desired_state",
+               "actual_state", "evidence_fresh_at", "responsible_controller", "lease_id",
+               "last_action", "updated_at", "lifecycle_state", "first_seen_at", "pid",
+               "command", "cwd", "duplicate_of")
+
+
 def get_agent(target: str, conn=None) -> Optional[dict]:
     conn, own = _c(conn)
     try:
-        cols = ("id", "target", "session", "project_id", "conversation_id", "desired_state",
-                "actual_state", "evidence_fresh_at", "responsible_controller", "lease_id",
-                "last_action", "updated_at")
-        r = conn.execute(f"SELECT {','.join(cols)} FROM agent WHERE target=?", (target,)).fetchone()
-        return dict(zip(cols, r)) if r else None
+        r = conn.execute(f"SELECT {','.join(_AGENT_COLS)} FROM agent WHERE target=?",
+                         (target,)).fetchone()
+        return dict(zip(_AGENT_COLS, r)) if r else None
+    finally:
+        if own:
+            conn.close()
+
+
+def get_registry(conn=None) -> list:
+    conn, own = _c(conn)
+    try:
+        rows = conn.execute(f"SELECT {','.join(_AGENT_COLS)} FROM agent").fetchall()
+        return [dict(zip(_AGENT_COLS, r)) for r in rows]
+    finally:
+        if own:
+            conn.close()
+
+
+def find_agent_by_conversation(conversation_id: str, conn=None) -> Optional[dict]:
+    if not conversation_id:
+        return None
+    conn, own = _c(conn)
+    try:
+        r = conn.execute(f"SELECT {','.join(_AGENT_COLS)} FROM agent WHERE conversation_id=? "
+                         "ORDER BY updated_at DESC LIMIT 1", (conversation_id,)).fetchone()
+        return dict(zip(_AGENT_COLS, r)) if r else None
+    finally:
+        if own:
+            conn.close()
+
+
+def register_agent(target: str, *, session: str = "", project_id: str = "", cwd: str = "",
+                   pid: Optional[int] = None, command: str = "", conversation_id: str = "",
+                   lifecycle_state: str = "discovered", conn=None) -> dict:
+    """Idempotent AgentRegistry upsert. Sets first_seen_at once; updates volatile
+    fields. Returns {id, is_new}. Visibility does NOT depend on any allowlist."""
+    conn, own = _c(conn)
+    try:
+        existing = get_agent(target, conn=conn)
+        aid = upsert_agent(target, session=session, project_id=project_id,
+                           conversation_id=conversation_id, conn=conn)
+        conn.execute(
+            "UPDATE agent SET pid=?,command=?,cwd=?,"
+            "first_seen_at=COALESCE(first_seen_at,?),"
+            "lifecycle_state=CASE WHEN lifecycle_state IN ('dead') THEN ? ELSE "
+            "COALESCE(lifecycle_state, ?) END, updated_at=? WHERE target=?",
+            (pid, command, cwd, now_iso(), lifecycle_state, lifecycle_state, now_iso(), target))
+        conn.commit()
+        return {"id": aid, "is_new": existing is None}
+    finally:
+        if own:
+            conn.close()
+
+
+def set_lifecycle(target: str, lifecycle_state: str, *, duplicate_of: str = "",
+                  project_id: str = "", responsible_controller: str = "", conn=None) -> None:
+    conn, own = _c(conn)
+    try:
+        conn.execute(
+            "UPDATE agent SET lifecycle_state=?,duplicate_of=COALESCE(NULLIF(?,''),duplicate_of),"
+            "project_id=COALESCE(NULLIF(?,''),project_id),"
+            "responsible_controller=COALESCE(NULLIF(?,''),responsible_controller),updated_at=? "
+            "WHERE target=?",
+            (lifecycle_state, duplicate_of, project_id, responsible_controller, now_iso(), target))
+        conn.commit()
     finally:
         if own:
             conn.close()
@@ -422,6 +505,53 @@ def upsert_budget(scope: str, *, model: str = "", tokens: int = 0, cost_usd: flo
             "disk=excluded.disk,window=excluded.window,updated_at=excluded.updated_at",
             (scope, model, tokens, cost_usd, cpu, ram, disk, window, now_iso()))
         conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def upsert_channel(name: str, *, enabled: bool, kind: str = "", config_ref: str = "",
+                   healthy: Optional[bool] = None, last_error: str = "", conn=None) -> None:
+    conn, own = _c(conn)
+    try:
+        ok_at = now_iso() if healthy else None
+        conn.execute(
+            "INSERT INTO channel(name,enabled,kind,config_ref,healthy,last_ok_at,last_error,"
+            "updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+            "enabled=excluded.enabled,kind=excluded.kind,config_ref=excluded.config_ref,"
+            "healthy=excluded.healthy,last_ok_at=COALESCE(excluded.last_ok_at,channel.last_ok_at),"
+            "last_error=excluded.last_error,updated_at=excluded.updated_at",
+            (name, 1 if enabled else 0, kind, config_ref, 1 if healthy else 0, ok_at,
+             last_error, now_iso()))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def get_channel(name: str, conn=None) -> Optional[dict]:
+    conn, own = _c(conn)
+    try:
+        r = conn.execute("SELECT name,enabled,kind,config_ref,healthy,last_ok_at,last_error,"
+                         "updated_at FROM channel WHERE name=?", (name,)).fetchone()
+        cols = ("name", "enabled", "kind", "config_ref", "healthy", "last_ok_at",
+                "last_error", "updated_at")
+        if not r:
+            return None
+        d = dict(zip(cols, r))
+        d["enabled"] = bool(d["enabled"])
+        d["healthy"] = bool(d["healthy"])
+        return d
+    finally:
+        if own:
+            conn.close()
+
+
+def list_channels(conn=None) -> list:
+    conn, own = _c(conn)
+    try:
+        rows = conn.execute("SELECT name FROM channel").fetchall()
+        return [get_channel(r[0], conn=conn) for r in rows]
     finally:
         if own:
             conn.close()

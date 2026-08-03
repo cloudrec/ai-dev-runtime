@@ -415,6 +415,43 @@ async def agents_continuation_watchdog_health(_: bool = Depends(_auth)):
     return _cw.health()
 
 
+# ── Control Plane V2 (CTO inbox + registry + delivery health) ────────────────
+@router.get("/control-plane/cto/brief")
+async def control_plane_cto_brief(consumer: str = "chatgpt", limit: int = 200,
+                                  ack: bool = False, _: bool = Depends(_auth)):
+    """Verified event deltas since the consumer's durable cursor. Set ack=true only
+    after the batch is durably processed. Never returns cached prose."""
+    from core.control_plane import cto
+    return cto.cto_brief_since(consumer, limit=limit, ack=ack)
+
+
+class CtoAckReq(BaseModel):
+    consumer: str = "chatgpt"
+    through_event_id: int
+
+
+@router.post("/control-plane/cto/ack")
+async def control_plane_cto_ack(req: CtoAckReq, _: bool = Depends(_auth)):
+    """Acknowledge the CTO inbox cursor up to a specific event id (monotonic)."""
+    from core.control_plane import cto
+    return cto.ack_through(req.consumer, req.through_event_id)
+
+
+@router.get("/control-plane/registry")
+async def control_plane_registry(_: bool = Depends(_auth)):
+    """The auto-discovered AgentRegistry (visibility never depends on an allowlist)."""
+    from core.control_plane import api as _cp
+    return {"agents": _cp.get_registry(), "open_gates": _cp.get_open_gates()}
+
+
+@router.get("/control-plane/notifications/status")
+async def control_plane_notifications_status(_: bool = Depends(_auth)):
+    """Fail-closed delivery posture. RED (notifications_enabled=false) is a health
+    error, never healthy; same_chat_wake_complete is true only with a proven E2E turn."""
+    from core.control_plane import delivery
+    return delivery.notifications_status()
+
+
 class AckReq(BaseModel):
     ids: list[int]
 

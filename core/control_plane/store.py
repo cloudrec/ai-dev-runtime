@@ -11,7 +11,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def db_path() -> str:
@@ -30,13 +30,29 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
     id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER, updated_at TEXT);
 
--- append-only event bus/log: the ONE event table
+-- append-only event bus/log = the ONE event table AND the canonical CTO inbox.
+-- (v2) enriched with the CTO push contract fields.
 CREATE TABLE IF NOT EXISTS event (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ts_epoch REAL, source TEXT,
     type TEXT, entity_type TEXT, entity_id TEXT, payload TEXT,
-    evidence_ref TEXT, correlation_id TEXT);
+    evidence_ref TEXT, correlation_id TEXT,
+    project_id TEXT, agent_id TEXT, severity TEXT DEFAULT 'info',
+    owner_action_required INTEGER DEFAULT 0, action_taken TEXT,
+    dedup_key TEXT, supersedes INTEGER, resolves INTEGER);
 CREATE INDEX IF NOT EXISTS ix_event_entity ON event(entity_type, entity_id, id);
 CREATE INDEX IF NOT EXISTS ix_event_corr ON event(correlation_id);
+CREATE INDEX IF NOT EXISTS ix_event_dedup ON event(dedup_key);
+
+-- per-CTO-consumer cursor: what a ChatGPT/CTO consumer has already acknowledged, so
+-- the next invocation reads exactly the deltas since last time (restart-safe).
+CREATE TABLE IF NOT EXISTS cto_cursor (
+    consumer TEXT PRIMARY KEY, last_event_id INTEGER DEFAULT 0, updated_at TEXT);
+
+-- notification channel registry + health (a disabled/failed channel is a BLOCKER,
+-- never a silent healthy state).
+CREATE TABLE IF NOT EXISTS channel (
+    name TEXT PRIMARY KEY, enabled INTEGER DEFAULT 0, kind TEXT, config_ref TEXT,
+    healthy INTEGER DEFAULT 0, last_ok_at TEXT, last_error TEXT, updated_at TEXT);
 
 CREATE TABLE IF NOT EXISTS project (
     id TEXT PRIMARY KEY, name TEXT, root TEXT, priority INTEGER DEFAULT 100,
@@ -52,12 +68,16 @@ CREATE TABLE IF NOT EXISTS work_item (
     next_safe_action TEXT, status TEXT DEFAULT 'planned', depends_on TEXT,
     artifact_refs TEXT, updated_at TEXT);
 
--- one row = authoritative per-agent truth (desired vs actual, EXPLICIT unknown/stale)
+-- one row = authoritative per-agent truth (desired vs actual, EXPLICIT unknown/stale).
+-- (v2) AgentRegistry lifecycle + discovery fields — visibility never depends on a
+-- static allowlist; static policy limits ACTIONS only.
 CREATE TABLE IF NOT EXISTS agent (
     id TEXT PRIMARY KEY, target TEXT UNIQUE, session TEXT, project_id TEXT,
     conversation_id TEXT, desired_state TEXT, actual_state TEXT DEFAULT 'unknown',
     evidence_fresh_at TEXT, responsible_controller TEXT, lease_id TEXT,
-    last_action TEXT, updated_at TEXT);
+    last_action TEXT, updated_at TEXT,
+    lifecycle_state TEXT DEFAULT 'discovered', first_seen_at TEXT, pid INTEGER,
+    command TEXT, cwd TEXT, duplicate_of TEXT);
 
 CREATE TABLE IF NOT EXISTS agent_turn (
     id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT, conversation_id TEXT,
@@ -109,6 +129,21 @@ def init_db(conn: sqlite3.Connection | None = None) -> sqlite3.Connection:
     own = conn is None
     conn = conn or connect()
     conn.executescript(_SCHEMA)
+    # Forward-only additive migrations for a DB created at an earlier version. New
+    # DBs already have every column from _SCHEMA; these ALTERs are no-ops there.
+    _V2_COLS = {
+        "agent": ["lifecycle_state TEXT DEFAULT 'discovered'", "first_seen_at TEXT",
+                  "pid INTEGER", "command TEXT", "cwd TEXT", "duplicate_of TEXT"],
+        "event": ["project_id TEXT", "agent_id TEXT", "severity TEXT DEFAULT 'info'",
+                  "owner_action_required INTEGER DEFAULT 0", "action_taken TEXT",
+                  "dedup_key TEXT", "supersedes INTEGER", "resolves INTEGER"],
+    }
+    for table, cols in _V2_COLS.items():
+        for coldef in cols:
+            try:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
+            except sqlite3.OperationalError:
+                pass                                      # column already exists
     row = conn.execute("SELECT version FROM schema_meta WHERE id=1").fetchone()
     if not row:
         conn.execute("INSERT INTO schema_meta(id,version,updated_at) VALUES(1,?,?)",

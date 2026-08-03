@@ -277,3 +277,96 @@ does not block on them for the safe phases P0–P6:
 - **G4** touching a Telegram/credentialed notification channel config (secret-bearing).
 
 Autonomous work proceeds through P0–P3 (and P4 for already-approved agents only) now.
+
+---
+
+# ADDENDUM 2026-08-03 — auto-discovery, CTO inbox, delivery matrix (non-negotiable)
+
+Three owner requirements folded into V2 as first-class scope (not new watchers).
+
+## R1 — Zero-manual-registration agent discovery
+
+**Visibility never depends on a static YAML allowlist; static policy limits ACTIONS
+only.** The Control Plane engine enumerates live tmux Claude agents every tick and
+reconciles the durable `agent` AgentRegistry:
+
+- lifecycle: `discovered → classifying → {managed | observe_only | blocked_unknown_scope}
+  → dead → recovered`; fields `first_seen_at, pid, command, cwd, conversation_id,
+  duplicate_of`.
+- `classify_scope(cwd, session, config)`: a `mode: auto` session (or a cwd under its
+  root) → **managed** (inherits bounded safe policy); a configured non-auto or
+  allowed-root-but-unconfigured cwd → **observe_only** with an inferred candidate
+  project + **one** correlated owner decision (gate); anything else →
+  **blocked_unknown_scope** + owner decision. Unknown scope is never ignored.
+- reconciliation without duplicates: rename/move/restart matched by `conversation_id`
+  (old target retired, not duplicated); resume preserves `conversation_id`; a dead record
+  whose conversation returns → **recovered**; >1 live agent on one cwd → the oldest
+  first-seen is primary, others flagged `duplicate_of` with **no conflicting command**.
+- Impl: `core/control_plane/discovery.py`. **Live canary (read-only, no config edit):**
+  6 real agents auto-discovered — `arbitrage2-opus`→managed, `email`/`ezetta-video`/
+  `owneros-direct-fix`/`polyinput`/`security`→observe_only, with owner-decision gates for
+  unknown scope; recorded in registry + CTO inbox.
+
+## R2 — CTO event inbox / push contract
+
+The append-only `event` table **is** the durable canonical CTO inbox (v2 fields:
+`project_id, agent_id, severity, owner_action_required, action_taken, dedup_key,
+supersedes, resolves`). Contract (`core/control_plane/cto.py`):
+
+- `emit(...)` records a correlated event and, for `high`/`critical` or
+  `owner_action_required`, enqueues a durable **owner push** (outbox).
+- `cto_brief_since(consumer, ack=)` returns exact **verified deltas** since the consumer's
+  persistent cursor (`cto_cursor`), never cached prose; `ack_through` advances the cursor
+  monotonically. Restart-safe: cursor lives in the DB → no loss / no duplication.
+- Four explicitly-separated concerns (no impossible claims): (a) server-side continuous
+  control; (b) owner push; (c) durable CTO inbox consumed on ChatGPT's **next** invocation;
+  (d) optional scheduled wake. Standard consumer flow: read cursor → live-verify changed/
+  critical items → respond; a stale cursor / failed delivery surfaces as a health error.
+- APIs: `GET /api/v1/control-plane/cto/brief`, `POST .../cto/ack`, `.../registry`,
+  `.../notifications/status`.
+
+## R3 — Delivery capability matrix (fail-closed; same-chat honesty)
+
+The intended behavior is a **proactive new assistant turn in the same ChatGPT chat** — not
+merely server awareness or Telegram. Because that needs a platform inbound trigger that may
+not exist, delivery is a capability matrix (`core/control_plane/delivery.py`), fail-closed:
+
+| Tier | Proactive? | Availability rule | Status now |
+|---|---|---|---|
+| `same_chat_wake` | yes (ideal) | ONLY if a real inbound trigger (`CONTROL_PLANE_SAMECHAT_WAKE_URL`) is configured AND probed healthy | **unavailable / not complete** (no proven inbound trigger) |
+| `owner_push` (Telegram) | yes | `TELEGRAM_BOT_TOKEN`+`CHAT_ID` or `WATCHDOG_TELEGRAM_ENABLED` | disabled → **RED** |
+| `scheduled_chatgpt` | no (hourly) | `CHATGPT_HOURLY_ENABLED` | fallback only; hourly; `notifications_enabled=false` → **not the pinger** |
+| `cto_inbox` | no (pull) | always | durable floor |
+
+- `notifications_status()` is **RED** unless a proactive channel (same-chat wake or a
+  healthy owner push) is enabled. `notifications_enabled=false` is a red health error,
+  **never** "working delivery"; a red posture raises a durable critical blocker event.
+- **Same-chat instant wake is NOT claimed complete** — `same_chat_wake_complete` is true
+  only when a real end-to-end assistant turn is proven with no user turn. Current honest
+  status: **red / not complete** (live canary: `status=red, notifications_enabled=false,
+  same_chat_wake_complete=false, reasons=[owner_push disabled, same_chat_wake unavailable]`).
+  This is a recorded **owner gate G5** (wire a supported inbound trigger or accept
+  push+inbox as the delivery contract).
+
+## Acceptance A–F (mapped)
+
+| # | Requirement | Where proven |
+|---|---|---|
+| A | manual new agent discovered, no config edit → new-agent CTO event | `test_manual_new_agent_discovered...` + live canary (6 agents) |
+| B | known project → managed; unknown → observe_only + one decision | `test_classify...`, `test_unknown_project...` + live canary |
+| C | complete/idle → controller safely continues, verified | accepted emergency repair (continuation watchdog) → migrating into Actuator (P2/P4) |
+| D | event pushed + in inbox; forced failure visible/retried, never silent | `test_control_plane_delivery.py` (RED, fail-closed, retry) |
+| E | CTO consumer cursor: exact deltas, ack, restart no loss/dup | `test_cto_cursor_deltas_ack_and_restart...` |
+| F | two agents same project → duplicate detected/refused, no conflict | `test_duplicate_agents_same_cwd_flagged` |
+
+## Updated genuine owner gates
+
+- **G1** cutover to lease-gated actuation on live agents (P4).
+- **G2** enrolling NEW projects for AUTONOMOUS action (discovery/observe needs no gate).
+- **G3** any push/PR/publication.
+- **G4** Telegram/credentialed channel config (secret-bearing).
+- **G5** same-chat proactive wake: provide a supported inbound trigger, or accept
+  push+durable-inbox as the delivery contract. Until then delivery health is RED by design.
+
+Discovery + CTO inbox + delivery health ship now as **P1 SHADOW (observe-only)** — no pane
+actuation — so they are safe and reversible ahead of the P4 actuation cutover.

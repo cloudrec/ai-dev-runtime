@@ -129,6 +129,20 @@ async def _start_agent_orchestrator():
 
 
 @app.on_event("startup")
+async def _start_control_plane():
+    # Control Plane V2 engine (P1 SHADOW, observe-only): continuous zero-config agent
+    # discovery + classification + durable source-of-truth + CTO inbox + fail-closed
+    # delivery health. Issues NO pane commands (actuation is a later, owner-gated phase).
+    # Gated by CONTROL_PLANE_ENABLED.
+    import asyncio
+    try:
+        from core.control_plane.engine import run_loop as _cp_loop
+        asyncio.create_task(_cp_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"control plane not started: {e}")
+
+
+@app.on_event("startup")
 async def _start_continuation_watchdog():
     # Server-side direct-agent continuation watchdog: submits a documented SAFE next
     # step for an approved idle agent and PROVES the submission (submitted + pane
