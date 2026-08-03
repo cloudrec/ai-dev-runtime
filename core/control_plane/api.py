@@ -490,6 +490,22 @@ def mark_notification(notif_id: int, state: str, *, receipt: str = "", conn=None
             conn.close()
 
 
+def get_notification(notif_id: int, conn=None) -> Optional[dict]:
+    """Read one notification row (state/receipt/attempts) — read-only; None if absent."""
+    conn, own = _c(conn)
+    try:
+        r = conn.execute("SELECT id,event_id,channel,dedup_key,state,attempts,receipt,"
+                         "correlation_id,created_at FROM notification WHERE id=?",
+                         (notif_id,)).fetchone()
+        if not r:
+            return None
+        return {"id": r[0], "event_id": r[1], "channel": r[2], "dedup_key": r[3], "state": r[4],
+                "attempts": r[5], "receipt": r[6], "correlation_id": r[7], "created_at": r[8]}
+    finally:
+        if own:
+            conn.close()
+
+
 def pending_notifications(conn=None) -> list:
     conn, own = _c(conn)
     try:

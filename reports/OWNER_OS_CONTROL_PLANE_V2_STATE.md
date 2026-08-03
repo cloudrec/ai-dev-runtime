@@ -41,6 +41,19 @@ an owner-action event that dead-letters (owner-push disabled = **G4**). This is 
 owner-gated. Loops all alive; drain alive; actuation confined to canary; all consistency
 invariants hold; no live duplicate agents.
 
+## Same-chat pinger (owner's #1 priority)
+
+Producer `core/control_plane/event_pipeline.py::publish_significant_event` — full owner-notify
+contract (correlated CTO event id, agent, project, factual summary, delivery attempt + retry
+once, receipt only on proven proactive send, dedupe, durable CTO inbox + legacy
+`commander_events` mirror) for `completed`/`waiting_owner`/`failure`/`dead`/`blocker`.
+False-idle invariant enforced (live shell/tool run never idle). Emit-only, no actuation.
+Tests: `tests/test_event_pipeline.py` (13). **Blocked on G5** (no
+`CONTROL_PLANE_SAMECHAT_WAKE_URL` inbound trigger → no new turn in this chat) and **G4** (no
+telegram creds) → `notifications_status`=RED. Live floor works: legacy commander drain green
+(499/0 unacked) carries real payment/arb2 events. Full status + staged cutover:
+`reports/SAME_CHAT_PINNER_STATUS.md`. Did NOT inject synthetic live events into owner chat.
+
 ## Open owner gates (do NOT auto-resolve — provenance invariant)
 
 7 open: `classify_scope` for observe_only agents (email/security/ezetta/owneros/payment),
