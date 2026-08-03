@@ -55,6 +55,11 @@ VERIFY_TIMEOUT = int(os.getenv("CONTINUATION_WATCHDOG_VERIFY_TIMEOUT_SECS", "12"
 # Documented default safe next step (a meta-instruction, not a command).
 DEFAULT_CONTINUATION = os.getenv(
     "CONTINUATION_WATCHDOG_DEFAULT_STEP", "continue with the next safe step")
+# P4 PREP (default OFF): route delivery through the canonical Control Plane Actuator under
+# a lease instead of the legacy inline path. Dormant until this flag AND the actuator's own
+# CONTROL_PLANE_ACTUATOR_ENABLED are both on (owner cutover gate G1) — with the actuator
+# disabled, routing is a safe no-op (delivers nothing).
+ROUTE_VIA_ACTUATOR = os.getenv("CONTINUATION_VIA_ACTUATOR", "0") not in ("0", "false", "no", "")
 # Max proactive deliveries per conversation (only for opt-in proactive sessions).
 MAX_CONTINUATIONS = int(os.getenv("CONTINUATION_WATCHDOG_MAX_PER_CONV", "25"))
 # A BLOCKED step is not permanent — it may be re-attempted after this cooldown
@@ -372,6 +377,22 @@ class Controller:
                                                 dedup_key=dedup_key, dedup_window_secs=86400)
 
 
+def _count_route_skip(h: dict, reason: str) -> None:
+    h["last_action"] = f"route_noop:{reason}"
+
+
+def deliver_via_actuator(target: str, step_text: str, conversation_id: str, cwd: str, ctrl):
+    """P4-prep bridge: acquire the agent lease and route delivery through the canonical
+    Control Plane Actuator. Safe no-op when the actuator is disabled. Returns the
+    actuator result verbatim."""
+    from core.control_plane import api as cp
+    from core.control_plane import actuator
+    lease = cp.acquire_lease(f"agent:{target}", "continuation_watchdog", ttl_secs=120)
+    return actuator.actuate(target=target, action_text=step_text,
+                            controller="continuation_watchdog", conversation_id=conversation_id,
+                            cwd=cwd, lease=lease, ctrl=ctrl)
+
+
 def deliver_and_verify(ctrl, *, target: str, cwd: str, action: str, step_text: str,
                        expected_pending: str, sleep=time.sleep) -> dict:
     """Perform the submit/deliver, then poll until the five proofs hold or timeout;
@@ -486,9 +507,21 @@ def run_once(ctrl=None, *, now_ts: Optional[float] = None, sleep=time.sleep) -> 
                 # submit / deliver with verification + one retry. The text expected
                 # to LEAVE the input line is the step itself (the already-typed line
                 # for submit; the just-delivered text for deliver).
-                out = deliver_and_verify(ctrl, target=target, cwd=cwd, action=d["action"],
-                                         step_text=step_text, expected_pending=step_text,
-                                         sleep=sleep)
+                if ROUTE_VIA_ACTUATOR:
+                    # P4-prep path: route through the canonical lease-gated Actuator. If the
+                    # actuator is disabled (or not our lease), this is a safe no-op — nothing
+                    # is delivered and the tick records no change.
+                    bridged = deliver_via_actuator(target, step_text, conv_id, cwd, ctrl)
+                    if bridged.get("reason") in ("actuator_disabled", "stale_or_no_lease",
+                                                 "already_verified", "lease_lost_midaction"):
+                        _count_route_skip(h, bridged.get("reason"))
+                        continue
+                    out = {"verify": bridged.get("verify") or {"ok": bool(bridged.get("verified"))},
+                           "retried": bool(bridged.get("retried"))}
+                else:
+                    out = deliver_and_verify(ctrl, target=target, cwd=cwd, action=d["action"],
+                                             step_text=step_text, expected_pending=step_text,
+                                             sleep=sleep)
                 v = out["verify"]
                 attempts = (prior["attempts"] if prior else 0) + 1 + (1 if out["retried"] else 0)
                 h["submitted"] += 1 if v.get("submitted") else 0

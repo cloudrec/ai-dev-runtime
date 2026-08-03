@@ -420,6 +420,31 @@ def answer_gate(gate_id: str, answer: str, conn=None) -> Optional[dict]:
             conn.close()
 
 
+def close_gates(agent_id: str, kinds, *, state: str = "resolved", conn=None) -> list:
+    """Close OPEN gates for an agent whose kind is in `kinds`. Callers must pass only
+    SYSTEM gate kinds (e.g. actuation_failed) — owner-DECISION gates (scope/business/
+    unverified_owner_decision) are never auto-closed; those require a verified
+    owner_decision (see provenance)."""
+    conn, own = _c(conn)
+    try:
+        kinds = tuple(kinds)
+        if not kinds:
+            return []
+        ph = ",".join("?" for _ in kinds)
+        rows = conn.execute(
+            f"SELECT id FROM owner_gate WHERE agent_id=? AND state IN ('open','notified') "
+            f"AND kind IN ({ph})", (agent_id, *kinds)).fetchall()
+        ids = [r[0] for r in rows]
+        if ids:
+            conn.executemany("UPDATE owner_gate SET state=?, answered_at=? WHERE id=?",
+                             [(state, now_iso(), i) for i in ids])
+            conn.commit()
+        return ids
+    finally:
+        if own:
+            conn.close()
+
+
 def get_open_gates(conn=None) -> list:
     conn, own = _c(conn)
     try:

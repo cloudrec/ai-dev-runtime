@@ -161,9 +161,15 @@ def actuate(*, target: str, action_text: str, controller: str, conversation_id: 
                            evidence_ref=f"actuate:{ah}", conversation_id=conversation_id,
                            last_action=action_text[:120])
         cp.record_decision("agent", target, pc, "actuate", f"verified continuation via {controller}")
-        emit("actuator", "action_verified", agent_id=target, severity="info",
-             payload={"kind": kind, "retried": out.get("retried"), "verify": v},
-             action_taken="delivered + verified", dedup_key=f"actok:{idkey}")
+        ok_ev = emit("actuator", "action_verified", agent_id=target, severity="info",
+                     payload={"kind": kind, "retried": out.get("retried"), "verify": v},
+                     action_taken="delivered + verified", dedup_key=f"actok:{idkey}")
+        # if this action was blocked before and now verifies, clear the blocker + emit a
+        # correlated resolution event (the all-clear, not just the alarm).
+        if prior and prior.get("blocked"):
+            from core.control_plane import resolutions
+            resolutions.resolve_blocker(target, reason="continuation verified after prior block",
+                                        resolves=ok_ev["event_id"], correlation_id=f"act:{idkey}")
         return {"acted": True, "verified": True, "retried": out.get("retried"), "verify": v}
 
     if not still_ours:
