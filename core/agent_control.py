@@ -644,6 +644,11 @@ _STATE_ACTIVE_RUN_RE = re.compile(
     r"|\(\d+\s*m?s(\s+\d+s)?\s*·"
     r"|·\s*thinking\b"
     r"|…\s*\(\d+\s*m?s\b"
+    # Claude Code footer shows "· N shell ·" while a BACKGROUND shell command runs
+    # (e.g. a live monitor launched via the Bash tool). The pane foreground stays
+    # `claude`, so the pane-command heuristic misses it — this footer marker means the
+    # agent is actively running a shell and must NOT be read as idle.
+    r"|·\s*\d+\s+shells?\b"
     r"|[↑↓]\s*[\d.]+\s*k?\s*tokens\b)", re.I)
 # Blocked on something outside the agent's control (vendor key, credentials, quota).
 # NARROW on purpose: generic words like "waiting for", "timed out", "network error",

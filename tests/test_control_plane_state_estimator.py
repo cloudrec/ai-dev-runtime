@@ -31,6 +31,20 @@ def test_plain_idle_prompt_has_no_active_marker():
     assert se.has_active_marker("❯ \n  auto mode on") is False
 
 
+def test_background_shell_footer_is_active():
+    # Claude Code footer while a background shell (e.g. a live monitor) runs → active,
+    # even though the pane foreground command stays `claude`.
+    assert se.has_active_marker("  ⏵⏵ auto mode on (shift+tab to cycle) · 1 shell · ← 3 agents") is True
+    assert se.has_active_marker("  ⏵⏵ auto mode on · 2 shells · ← 3 agents") is True
+    # a footer WITHOUT a running shell is not active ("3 agents" must not trip it)
+    assert se.has_active_marker("  ⏵⏵ auto mode on (shift+tab to cycle) · ← 3 agents") is False
+
+
+def test_shell_footer_overrides_idle_base_in_estimator():
+    out = se.estimate(base_state="idle", tail="  ⏵⏵ auto mode on · 1 shell · ← 3 agents")
+    assert out["state"] == "working" and out["active"] is True
+
+
 # ── estimator precedence ─────────────────────────────────────────────────────
 def test_active_marker_overrides_idle_base():
     # base classifier said idle, but the tail is a live spinner → working
