@@ -1006,6 +1006,38 @@ def find_live_agent_for_dir(project_dir: str) -> Optional[dict]:
     return None
 
 
+def _pid_alive(pid: str) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _session_liveness(name: str) -> dict:
+    """Count panes in a session and how many are LIVE. A pane is live only if tmux
+    does not mark it dead AND its process is still alive (belt + suspenders, so a
+    zombie/remain-on-exit pane is never mistaken for live). Used to prove a session
+    is fully dead before fenced cleanup."""
+    rc, out, _ = _tmux(["list-panes", "-t", name, "-F", "#{pane_dead}\t#{pane_pid}"])
+    if rc != 0:
+        return {"panes": 0, "dead": 0, "live": 0}
+    panes = dead = live = 0
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        is_dead = parts[0] == "1"
+        pid = parts[1] if len(parts) > 1 else ""
+        panes += 1
+        if is_dead or not _pid_alive(pid):
+            dead += 1
+        else:
+            live += 1
+    return {"panes": panes, "dead": dead, "live": live}
+
+
 def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
                  session_name: Optional[str] = None) -> dict:
     """Resume a Claude agent — but only when no matching live one exists.
@@ -1033,14 +1065,28 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
     name = validate_session(session_name or f"agent-{os.path.basename(resolved)[:40]}")
     rc, _, _ = _tmux(["has-session", "-t", name])
     if rc == 0:
-        audit("agent_resume", name, resumed=False, reason="tmux session name already exists")
-        return {
-            "resumed": False,
-            "reason": f"tmux session {name!r} already exists — refusing to create a duplicate session",
-            "existing_session": name,
-            "duplicate_created": False,
-            "agent_created": False,
-        }
+        # The session NAME exists — but it may be a ZOMBIE whose panes are all dead
+        # (e.g. the Claude process was SIGTERMed). A dead session must NOT block a
+        # same-conversation recovery. Prove EVERY pane is dead, then fenced-clean it;
+        # if any pane is still live, refuse (a real duplicate risk).
+        liveness = _session_liveness(name)
+        if liveness["panes"] > 0 and liveness["live"] == 0:
+            _tmux(["kill-session", "-t", name])          # fenced: only after all-dead proof
+            audit("agent_resume", name, cleanup="dead_session",
+                  panes=liveness["panes"], dead=liveness["dead"])
+            # fall through to (re)create the session below
+        else:
+            audit("agent_resume", name, resumed=False,
+                  reason="tmux session name already exists with a LIVE pane", **liveness)
+            return {
+                "resumed": False,
+                "reason": f"tmux session {name!r} already exists with a live pane — "
+                          "refusing to create a duplicate session",
+                "existing_session": name,
+                "session_liveness": liveness,
+                "duplicate_created": False,
+                "agent_created": False,
+            }
 
     argv = ["new-session", "-d", "-s", name, "-c", resolved, "claude"]
     if conversation_id:
