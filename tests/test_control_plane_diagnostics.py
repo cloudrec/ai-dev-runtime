@@ -413,6 +413,74 @@ def test_summary_red_on_actuation_scope_breach(tmp_path, monkeypatch):
     assert s["actuation_scope_breach"] is True and s["status"] == "red"
 
 
+# ── consistency invariants (cursor / notification state / fence) ─────────────
+def _cp_action_fence(target, fence):
+    c = _conn()
+    c.execute("INSERT OR REPLACE INTO cp_action(idkey,target,fence_token,verified) VALUES(?,?,?,1)",
+              (f"{target}|{fence}", target, fence))
+    c.commit(); c.close()
+
+
+def _lease_fence(resource, fence):
+    c = _conn()
+    c.execute("INSERT OR REPLACE INTO resource_lease(resource,holder_controller,fence_token,expires_ts) "
+              "VALUES(?,?,?,?)", (resource, "h", fence, NOW + 100))
+    c.commit(); c.close()
+
+
+def test_consistency_all_invariants_hold_green():
+    _events(5)
+    _cursor("chatgpt", 5, NOW - 10)            # cursor == latest, not ahead
+    _notif("dead_letter", NOW - 100)
+    _cp_action_fence("cp-canary:0.0", 2)
+    _lease_fence("agent:cp-canary:0.0", 3)     # lease fence >= action fence
+    r = diag.consistency_report(now=NOW)
+    assert r["consistent"] is True and r["status"] == "green"
+    assert r["fence_violations"] == [] and r["orphan_actions"] == []
+
+
+def test_consistency_cursor_ahead_of_log_is_red():
+    _events(3)
+    _cursor("chatgpt", 99, NOW - 10)           # cursor points past latest event → corrupt
+    r = diag.consistency_report(now=NOW)
+    assert r["cursors_ahead_of_log"] and r["status"] == "red"
+
+
+def test_consistency_invalid_notification_state_is_red():
+    _events(2)
+    _notif("weird_state", NOW - 10)            # unknown state
+    r = diag.consistency_report(now=NOW)
+    assert "weird_state" in r["invalid_notification_states"] and r["status"] == "red"
+
+
+def test_consistency_fence_violation_is_red():
+    _events(2)
+    _cp_action_fence("cp-canary:0.0", 9)       # action fence > current lease fence
+    _lease_fence("agent:cp-canary:0.0", 3)
+    r = diag.consistency_report(now=NOW)
+    assert r["fence_violations"] and r["fence_violations"][0]["target"] == "cp-canary:0.0"
+    assert r["status"] == "red"
+
+
+def test_consistency_orphan_action_is_informational_not_red():
+    _events(2)
+    _cp_action_fence("orphan:0.0", 1)          # cp_action with NO lease row
+    r = diag.consistency_report(now=NOW)
+    assert r["orphan_actions"] == ["orphan:0.0"] and r["consistent"] is True and r["status"] == "green"
+
+
+def test_summary_red_on_consistency_violation(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty.db"))
+    sqlite3.connect(str(tmp_path / "empty.db")).execute(
+        "CREATE TABLE jobs(id TEXT,status TEXT,created_at TEXT,updated_at TEXT,finished_at TEXT)")
+    _agent_row("cp:0.0", NOW - 5, "managed")
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 5, dal_ts=NOW - 5, sup_ts=NOW - 5)
+    _events(2)
+    _cp_action_fence("cp-canary:0.0", 9); _lease_fence("agent:cp-canary:0.0", 3)  # fence violation
+    s = diag.observability_summary(now=NOW)
+    assert s["consistent"] is False and s["status"] == "red"
+
+
 # ── summary: engine stall makes it RED even with zero active failures ────────
 def test_summary_red_when_engine_stalled_no_active_failures(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty_jobs.db"))

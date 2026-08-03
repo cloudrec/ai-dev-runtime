@@ -435,6 +435,62 @@ def actuation_scope_report(*, now: Optional[float] = None, conn=None, allowlist:
     }
 
 
+_VALID_NOTIF_STATES = ("pending", "sending", "sent", "acked", "failed", "dead_letter", "resolved")
+
+
+def consistency_report(*, now: Optional[float] = None, conn=None) -> dict:
+    """Internal-consistency INVARIANTS (not just measurement). Read-only:
+
+      * a CTO cursor must never point past the latest event (`last_event_id <= max(event.id)`);
+      * every notification `state` must be a known state;
+      * ledger/lease fence integrity: for each agent, `max(cp_action.fence_token) <=` its
+        resource's current `resource_lease.fence_token` (an action recorded under a fence
+        higher than the current lease is impossible — corruption, incl. across restart).
+
+    Any violation → red. Orphan actions (a cp_action target with no lease row) are reported
+    separately (informational — a lease row is never deleted, only expired, so this should be
+    empty)."""
+    own = conn is None
+    if conn is None:
+        from core.control_plane.store import connect, init_db
+        conn = connect()
+        init_db(conn)
+    try:
+        latest = conn.execute("SELECT coalesce(max(id),0) FROM event").fetchone()[0]
+        cursor_ahead = [{"consumer": r[0], "last_event_id": r[1], "latest": latest}
+                        for r in conn.execute("SELECT consumer,last_event_id FROM cto_cursor").fetchall()
+                        if (r[1] or 0) > latest]
+        invalid_states = [r[0] for r in conn.execute(
+            "SELECT DISTINCT state FROM notification").fetchall() if r[0] not in _VALID_NOTIF_STATES]
+        fence_violations = []
+        orphan_actions = []
+        for target, max_fence in conn.execute(
+                "SELECT target, max(fence_token) FROM cp_action GROUP BY target").fetchall():
+            row = conn.execute("SELECT fence_token FROM resource_lease WHERE resource=?",
+                               (f"agent:{target}",)).fetchone()
+            if row is None:
+                orphan_actions.append(target)
+            elif max_fence is not None and row[0] is not None and max_fence > row[0]:
+                fence_violations.append({"target": target, "action_fence": max_fence,
+                                         "lease_fence": row[0]})
+    finally:
+        if own:
+            conn.close()
+    violations = bool(cursor_ahead or invalid_states or fence_violations)
+    return {
+        "metric": "consistency",
+        "latest_event_id": latest,
+        "cursors_ahead_of_log": cursor_ahead,
+        "invalid_notification_states": invalid_states,
+        "fence_violations": fence_violations,
+        "orphan_actions": orphan_actions,
+        "consistent": not violations,
+        "status": "red" if violations else "green",
+        "note": ("INVARIANT VIOLATION — data inconsistency" if violations
+                 else "all consistency invariants hold"),
+    }
+
+
 def observability_summary(*, now: Optional[float] = None) -> dict:
     """Combined read-only view. `all_clear` is true when there are no ACTIVE failures,
     regardless of historical totals — so a green system is not flagged by stale counters."""
@@ -449,13 +505,14 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     commander = commander_delivery_report(now=now)
     loops = loop_liveness_report(now=now)
     scope = actuation_scope_report(now=now)
+    consistency = consistency_report(now=now)
     active = notif["active"] + jobs["active"]
     # overall red if there are ACTIVE failures, the discovery engine looks stalled, a control
-    # loop stalled, the same-chat drain stalled, a CTO cursor is stale, OR the actuator
-    # broadened beyond the canary (scope breach).
+    # loop stalled, the same-chat drain stalled, a CTO cursor is stale, the actuator broadened
+    # beyond the canary (scope breach), OR a consistency invariant is violated.
     healthy = (active == 0 and registry["engine_alive"] and loops["stalled_loops"] == 0
                and commander["drain_alive"] and cto["stale_consumers"] == 0
-               and not scope["unexpected_actuated"])
+               and not scope["unexpected_actuated"] and consistency["consistent"])
     return {
         "notifications": notif,
         "notification_history": notif_hist,
@@ -469,6 +526,8 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         "stalled_loops": loops["stalled_loops"],
         "actuation_scope": scope,
         "actuation_scope_breach": bool(scope["unexpected_actuated"]),
+        "consistency": consistency,
+        "consistent": consistency["consistent"],
         "active_failures_total": active,
         "historical_failures_total": notif["historical"] + jobs["historical"],
         "engine_alive": registry["engine_alive"],

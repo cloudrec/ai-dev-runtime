@@ -444,3 +444,49 @@ actuated target must be on the allowlist or a known synthetic test target
 - Commit: local only; read-only (SELECT / drop-in read, no secrets). Endpoint `/observability`
   now includes `actuation_scope`. Canary scoping + owner gates unchanged; no defect (scope
   intact) — the diagnostic is a continuous safety guard.
+
+---
+
+# ADDENDUM 8 — internal consistency INVARIANTS (read-only) + re-verify of the 3 areas
+
+Prior diagnostics MEASURE freshness/lag/scope; none verified internal-consistency invariants.
+That was the genuine remaining gap. `consistency_report` checks (read-only):
+
+1. **CTO cursor sanity** — no consumer cursor may point past the latest event
+   (`last_event_id <= max(event.id)`).
+2. **Notification state validity** — every `notification.state` is a known state.
+3. **Ledger/lease fence integrity (across restart)** — for each agent,
+   `max(cp_action.fence_token) <= resource_lease.fence_token` (an action recorded under a
+   fence higher than its resource's current lease is impossible → corruption). Orphan actions
+   (a cp_action target with no lease row) are reported informationally.
+
+Any violation → red; `observability_summary` folds it in.
+
+## Live (read-only) result — all invariants hold
+
+`consistency_report` → `consistent=true, status=green`: `cursors_ahead_of_log=[]`,
+`invalid_notification_states=[]`, **`fence_violations=[]`, `orphan_actions=[]`**. The canary
+lease/action ledger is consistent across every restart this session (fences monotonic;
+`cp-canary` action fence ≤ its lease fence; synthetic test target likewise).
+
+## Re-verify of the three requested areas
+
+- **(1) heartbeat freshness + false-idle** — `loop_liveness`: all 5 loops **alive**
+  (continuation_watchdog / orchestrator / direct_agent_lifecycle / control_plane_engine /
+  supervisor), `stalled_loops=0`. False-idle detection covered by `state_estimator` +
+  actuator false-idle guard (unchanged, tested).
+- **(2) notification cursor / outbox ack consistency** — `consistency_report` (cursor sanity +
+  state validity) **green**; `cto_cursor_report` (lag) + `commander_delivery_report` (drain
+  alive, 0 unacked) unchanged.
+- **(3) canary lease/action ledger consistency across restart** — `consistency_report` fence
+  invariant **green** (no violations, no orphans); `actuation_scope_report` confirms actuation
+  confined to `cp-canary` + synthetic.
+
+## Tests / commit
+
+- Tests: **+6** (all-invariants-green, cursor-ahead red, invalid-state red, fence-violation
+  red, orphan informational, summary red-on-violation). `test_control_plane_diagnostics.py`
+  total **39**. Full suite: see run.
+- Commit: local only; read-only. Endpoint `/observability` now includes `consistency`. No
+  defect found (all invariants hold) — the diagnostic is a continuous corruption guard.
+  Canary scope + owner gates preserved.
