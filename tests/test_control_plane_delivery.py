@@ -71,6 +71,43 @@ def test_deliver_sends_via_owner_push_when_available(monkeypatch):
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "y")
     delivery.refresh_channel_health()
     n = cp.enqueue_notification(channel="owner_push", dedup_key="blk:2")
-    out = delivery.deliver(n["id"], severity="critical")
-    assert out["delivered"] is True and out["tier"] == "owner_push" and out["attempts"]
+    # inject a stub adapter → proven receipt, NO network call
+    stub = {"same_chat_wake": lambda m: (False, None, "n/a"),
+            "owner_push": lambda m: (True, "telegram:1", None)}
+    out = delivery.deliver(n["id"], severity="critical", adapters=stub)
+    assert out["delivered"] is True and out["tier"] == "owner_push" and out["receipt"] == "telegram:1"
     assert cp.pending_notifications() == []      # sent → not pending
+
+
+def test_available_channel_that_fails_is_not_fabricated_success(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "y")
+    delivery.refresh_channel_health()
+    n = cp.enqueue_notification(channel="owner_push", dedup_key="blk:3")
+    stub = {"same_chat_wake": lambda m: (False, None, "n/a"),
+            "owner_push": lambda m: (False, None, "telegram 500")}   # available but send fails
+    out = delivery.deliver(n["id"], severity="critical", adapters=stub)
+    assert out["delivered"] is False and out["blocker"]              # NO fabricated success
+    assert n["id"] in [p["id"] for p in cp.pending_notifications()]  # stays retryable
+
+
+def test_same_chat_receipt_flips_verified_complete(monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_SAMECHAT_WAKE_URL", "https://relay.example/inbound")
+    delivery.refresh_channel_health()
+    n = cp.enqueue_notification(channel="same_chat_wake", dedup_key="sc:1")
+    stub = {"same_chat_wake": lambda m: (True, "same_chat_wake:200", None),
+            "owner_push": lambda m: (False, None, "n/a")}
+    out = delivery.deliver(n["id"], severity="high", adapters=stub)
+    assert out["delivered"] is True and out["tier"] == "same_chat_wake"
+    st = delivery.notifications_status()
+    assert st["capabilities"]["same_chat_wake"]["verified"] is True  # proven receipt recorded
+    assert st["same_chat_wake_complete"] is True                     # only after a real E2E turn
+
+
+def test_adapters_make_no_network_call_when_unconfigured(monkeypatch):
+    for v in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "CONTROL_PLANE_SAMECHAT_WAKE_URL"):
+        monkeypatch.delenv(v, raising=False)
+    ok_p, rc_p, err_p = delivery._send_owner_push("hi")
+    ok_s, rc_s, err_s = delivery._send_same_chat("hi")
+    assert ok_p is False and rc_p is None and "credentials unset" in err_p
+    assert ok_s is False and rc_s is None and "no inbound trigger" in err_s

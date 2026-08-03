@@ -19,6 +19,9 @@ def _isolated_db(tmp_path, monkeypatch):
 def test_drain_sends_when_channel_available(monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "y")
+    # real adapter returns a proven receipt (stubbed — no network); delivery marks sent only
+    # on a real receipt now, never on mere availability.
+    monkeypatch.setattr(delivery, "_send_owner_push", lambda m: (True, "telegram:1", None))
     delivery.refresh_channel_health()
     cp.enqueue_notification(channel="owner_push", dedup_key="k1")
     out = notifier.drain()

@@ -114,7 +114,9 @@ def refresh_channel_health(conn=None) -> dict:
                        conn=conn)
     # same-chat wake: enabled only with a real inbound trigger URL.
     sc = bool(os.getenv("CONTROL_PLANE_SAMECHAT_WAKE_URL", "").strip())
-    api.upsert_channel("same_chat_wake", enabled=sc, kind="inbound_trigger", healthy=False,
+    # configured ⇒ presumed reachable (a failed send flips it via the delivery attempt);
+    # unconfigured ⇒ unhealthy. Either way `verified` still requires a real recorded receipt.
+    api.upsert_channel("same_chat_wake", enabled=sc, kind="inbound_trigger", healthy=sc,
                        last_error="" if sc else "no inbound trigger configured", conn=conn)
     status = notifications_status(conn=conn)
     if status["status"] == "red":
@@ -126,27 +128,106 @@ def refresh_channel_health(conn=None) -> dict:
     return status
 
 
-def deliver(notif_id: int, *, severity: str = "info", conn=None) -> dict:
-    """Attempt to deliver a queued notification across the tier matrix, best proactive
-    first. Marks the notification state with a receipt on success, or FAILED (visible,
-    retryable) when no proactive channel is available — never a silent success."""
-    caps = detect_capabilities(conn=conn)
+def _send_owner_push(message: str) -> tuple:
+    """Real Telegram owner-push, HARD-GATED. With no TELEGRAM_BOT_TOKEN/CHAT_ID this returns
+    (False, None, reason) and makes NO network call. When configured, POSTs sendMessage and
+    returns a receipt only on a real 2xx `ok` response — never a fabricated success."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    chat = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+    if not (token and chat):
+        return (False, None, "owner_push credentials unset (TELEGRAM_BOT_TOKEN/CHAT_ID)")
+    try:
+        import json as _json
+        import urllib.parse
+        import urllib.request
+        data = urllib.parse.urlencode({"chat_id": chat, "text": message[:4000]}).encode()
+        req = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+        with urllib.request.urlopen(req, timeout=10) as r:   # noqa: S310 — fixed telegram host
+            status = getattr(r, "status", 200)
+            body = _json.loads(r.read().decode() or "{}")
+        if status // 100 == 2 and body.get("ok"):
+            mid = (body.get("result") or {}).get("message_id")
+            return (True, f"telegram:{mid}", None)
+        return (False, None, f"telegram rejected: {str(body)[:160]}")
+    except Exception as e:  # noqa: BLE001
+        return (False, None, f"telegram send failed: {e}")
+
+
+def _send_same_chat(message: str) -> tuple:
+    """Real same-chat inbound-trigger POST, HARD-GATED. With no CONTROL_PLANE_SAMECHAT_WAKE_URL
+    this returns (False, None, reason) and makes NO network call. When a relay URL is
+    configured, POSTs the event JSON; returns a receipt only on a real 2xx response."""
+    url = os.getenv("CONTROL_PLANE_SAMECHAT_WAKE_URL", "").strip()
+    if not url:
+        return (False, None, "no inbound trigger configured (CONTROL_PLANE_SAMECHAT_WAKE_URL)")
+    try:
+        import json as _json
+        import urllib.request
+        payload = _json.dumps({"text": message[:4000], "source": "owner_os_pinger"}).encode()
+        req = urllib.request.Request(url, data=payload,
+                                     headers={"Content-Type": "application/json"})
+        token = os.getenv("CONTROL_PLANE_SAMECHAT_WAKE_TOKEN", "").strip()
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=10) as r:   # noqa: S310 — owner-supplied relay
+            status = getattr(r, "status", 200)
+            body = (r.read().decode() or "")[:160]
+        if status // 100 == 2:
+            return (True, f"same_chat_wake:{status}", None)
+        return (False, None, f"relay rejected: {status} {body}")
+    except Exception as e:  # noqa: BLE001
+        return (False, None, f"same_chat relay failed: {e}")
+
+
+_ADAPTERS = {"same_chat_wake": _send_same_chat, "owner_push": _send_owner_push}
+
+
+def _message_for(notif_id: int, conn=None) -> str:
+    """Factual message text for a notification — the correlated event's action_taken/summary."""
+    n = api.get_notification(notif_id, conn=conn)
+    if not n:
+        return "(owner-os event)"
+    conn2, own = api._c(conn)
+    try:
+        r = conn2.execute("SELECT action_taken,type,agent_id FROM event WHERE id=?",
+                          (n.get("event_id") or 0,)).fetchone()
+    finally:
+        if own:
+            conn2.close()
+    if r and (r[0] or r[1]):
+        return r[0] or f"{r[2] or ''}: {r[1]}"
+    return "(owner-os event)"
+
+
+def _mark_channel_ok(tier: str, conn=None) -> None:
+    """Record a PROVEN delivery on a channel — sets last_ok_at so `verified` (and, for
+    same_chat_wake, `same_chat_wake_complete`) flips true only after a real receipt."""
+    api.upsert_channel(tier, enabled=True, healthy=True, conn=conn)   # healthy → last_ok_at=now
+
+
+def deliver(notif_id: int, *, severity: str = "info", adapters=None, conn=None) -> dict:
+    """Attempt to deliver a queued notification across the tier matrix, best proactive first.
+    Marks the notification `sent` with a REAL receipt only when an adapter returns a proven
+    2xx receipt; otherwise FAILED (visible, retryable) and it stays in the durable CTO inbox.
+    Never a silent or fabricated success. `adapters` is injectable for tests."""
+    # build at call-time so the module-level adapter funcs can be monkeypatched in tests
+    adapters = adapters or {"same_chat_wake": _send_same_chat, "owner_push": _send_owner_push}
+    message = _message_for(notif_id, conn=conn)
     attempts = []
+    # adapters self-gate on config (no creds/URL → they return unavailable with NO network
+    # call), so a first send can actually be attempted and prove the channel.
     for tier in ("same_chat_wake", "owner_push"):
-        cap = caps[tier]
-        if not cap["available"]:
-            attempts.append({"tier": tier, "result": "unavailable", "detail": cap["detail"]})
-            continue
-        # A real adapter would push here and capture a receipt; absent a proven adapter we
-        # do NOT fabricate success. Availability alone is recorded; a live acceptance run
-        # sets the verified receipt.
-        receipt = f"{tier}:{int(now_ts())}"
-        api.mark_notification(notif_id, "sent", receipt=receipt, conn=conn)
-        attempts.append({"tier": tier, "result": "sent", "receipt": receipt})
-        return {"delivered": True, "tier": tier, "attempts": attempts}
-    # nothing proactive worked → visible failure + remains in the durable inbox (pull)
+        ok, receipt, err = adapters[tier](message)
+        if ok and receipt:
+            api.mark_notification(notif_id, "sent", receipt=receipt, conn=conn)
+            _mark_channel_ok(tier, conn=conn)
+            attempts.append({"tier": tier, "result": "sent", "receipt": receipt})
+            return {"delivered": True, "tier": tier, "receipt": receipt, "attempts": attempts}
+        attempts.append({"tier": tier, "result": ("error" if err else "unavailable"),
+                         "detail": err})
+    # nothing proactive delivered → visible failure + remains in the durable inbox (pull)
     api.mark_notification(notif_id, "failed", conn=conn)
     attempts.append({"tier": "cto_inbox", "result": "queued_pull_only",
-                     "detail": "no proactive channel; event stays in durable CTO inbox"})
+                     "detail": "no proactive channel delivered; event stays in durable CTO inbox"})
     return {"delivered": False, "tier": None, "attempts": attempts,
-            "blocker": "no proactive notification channel available"}
+            "blocker": "no proactive notification channel delivered"}
