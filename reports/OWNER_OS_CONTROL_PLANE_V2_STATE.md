@@ -48,7 +48,12 @@ contract (correlated CTO event id, agent, project, factual summary, delivery att
 once, receipt only on proven proactive send, dedupe, durable CTO inbox + legacy
 `commander_events` mirror) for `completed`/`waiting_owner`/`failure`/`dead`/`blocker`.
 False-idle invariant enforced (live shell/tool run never idle). Emit-only, no actuation.
-Tests: `tests/test_event_pipeline.py` (13). **Blocked on G5** (no
+**Stage 1 wired (code):** `core/control_plane/pinger_shadow.py::shadow_tick` in
+`engine.tick_once`, scope-confined to `CONTROL_PLANE_PINGER_SHADOW_AGENTS`←
+`CONTROL_PLANE_CANARY_AGENTS` (cp-canary only); transition-based, no re-emit
+(durable `pinger_shadow_state`, restart-safe), best-effort. NOT deployed — daemon keeps prior
+code until owner restarts; no live flag changed. Tests: `tests/test_event_pipeline.py` (13) +
+`tests/test_pinger_shadow.py` (10). **Blocked on G5** (no
 `CONTROL_PLANE_SAMECHAT_WAKE_URL` inbound trigger → no new turn in this chat) and **G4** (no
 telegram creds) → `notifications_status`=RED. Live floor works: legacy commander drain green
 (499/0 unacked) carries real payment/arb2 events. Full status + staged cutover:

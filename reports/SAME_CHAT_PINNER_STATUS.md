@@ -76,9 +76,18 @@ producer is emit-only, so stages 1–2 add no risk beyond writing internal event
 1. **Stage 0 (done, this change).** Producer + false-idle guard + full contract, proven by
    deterministic tests. No live wiring for payment/arbitrage2 (no synthetic events injected
    into the owner's real chat).
-2. **Stage 1 — shadow, canary.** Wire `publish_significant_event` into the control loop for
-   `cp-canary:0.0` only; observe CTO inbox + commander mirror for one bounded period. Reversible
-   (single flag). No proactive channel needed — validates classification + dedupe live.
+2. **Stage 1 — shadow, canary. [DONE in code — not yet deployed].**
+   `core/control_plane/pinger_shadow.py::shadow_tick` is wired into `engine.tick_once`
+   (the always-on shadow loop), SCOPE-CONFINED to the allowlist
+   `CONTROL_PLANE_PINGER_SHADOW_AGENTS` (falls back to `CONTROL_PLANE_CANARY_AGENTS` =
+   `cp-canary:0.0`). It emits a pinger event only on a TRANSITION into a significant state
+   (`completed`/`waiting_owner`/`waiting_input`/`externally_blocked`/`dead`), never re-emits the
+   same state (durable `pinger_shadow_state`, restart-safe), applies the false-idle guard on
+   `completed`, and claims NO proactive delivery (honest `cto_inbox` floor). An out-of-scope
+   agent is only counted, never emitted. Best-effort: a pinger failure never breaks the loop.
+   **Confinement + no-actuation are proven by tests; the running daemon keeps the prior code
+   until the owner restarts the service — I did not deploy, restart, or change any live flag.**
+   Verified E2E in tests: `tests/test_pinger_shadow.py` (10) + `tests/test_event_pipeline.py` (13).
 3. **Stage 2 — configure ONE proactive channel (unblocks G4 or G5).** Owner provides EITHER
    an inbound same-chat trigger URL (`CONTROL_PLANE_SAMECHAT_WAKE_URL`, unblocks G5 — the true
    pinger) OR Telegram credentials (unblocks G4 — out-of-band push). Then run a **live
@@ -97,8 +106,11 @@ trading, mainnet, external network, destructive, or actuation-broadening steps a
 ## Files
 
 - `core/control_plane/event_pipeline.py` — the producer (new).
+- `core/control_plane/pinger_shadow.py` — cp-canary scope-confined shadow tick (new).
+- `core/control_plane/engine.py` — shadow loop now calls `pinger_shadow.shadow_tick` (best-effort).
 - `core/control_plane/api.py::get_notification` — read helper for receipt evidence (new).
 - `tests/test_event_pipeline.py` — 13 E2E/contract/false-idle/dedupe/retry tests (new).
+- `tests/test_pinger_shadow.py` — 10 confinement/no-re-emit/false-idle/restart/wiring tests (new).
 - Delivery matrix + honesty: `core/control_plane/delivery.py` (existing, unchanged).
 - Legacy live surface: `core/agent_control.py::record_commander_event` +
   `/opt/seo/backend/services/agent_notifier.py` (existing, unchanged).

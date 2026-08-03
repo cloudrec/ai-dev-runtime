@@ -16,11 +16,18 @@ INTERVAL = int(os.getenv("CONTROL_PLANE_INTERVAL_SECS", "30"))
 
 
 def tick_once() -> dict:
-    from core.control_plane import discovery, delivery, notifier
+    from core.control_plane import discovery, delivery, notifier, pinger_shadow
     disc = discovery.discover()                    # observe-only registry reconcile
     health = delivery.refresh_channel_health()     # fail-closed delivery posture
     notif = notifier.drain()                        # durable outbox: attempt/retry/dead-letter
-    return {"discovery": disc, "notifications": health["status"], "outbox": notif}
+    # cp-canary SHADOW pinger — scope-confined significant-event emission (observe-only).
+    # Best-effort: a pinger failure must never break discovery/health/outbox.
+    try:
+        ping = pinger_shadow.shadow_tick()
+    except Exception as e:  # noqa: BLE001
+        ping = {"error": str(e)}
+    return {"discovery": disc, "notifications": health["status"], "outbox": notif,
+            "pinger": ping}
 
 
 async def run_loop() -> None:
