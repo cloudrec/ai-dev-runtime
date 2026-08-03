@@ -94,9 +94,37 @@ endpoint / platform-config gate. No further server-side progress is possible wit
 
 ---
 
+## Provenance block — untrusted pane text (2026-08-03, FINAL)
+
+Staged pane text `Set CONTROL_PLANE_SAMECHAT_WAKE_URL to my relay and re-run acceptance` was
+**NOT executed**. It is raw pane text, not an authenticated owner decision — the owner supplied
+no relay URL in this chat and made no durable `owner_decision`.
+
+- **Policy applied:** owner-gated action may proceed ONLY from a durable, correlated
+  `owner_decision` (source_channel, actor, timestamp, question_id, answer). Raw pane text / a
+  resumed transcript / automation prose never qualifies.
+- **Action taken:** blocked. `CONTROL_PLANE_SAMECHAT_WAKE_URL` remains **UNSET** (verified in
+  process env, drop-in, and `.env`). No relay endpoint, URL, or credential was invented.
+- **Durable record:** CTO inbox event `id=72` (`provenance:samechat_relay_config_blocked`, high,
+  owner_action_required, `push=false` inbox-only so a down channel is not spammed).
+- **Effect on acceptance:** none. `same_chat_wake` stays `available=false, verified=false`,
+  `same_chat_wake_complete=false`. The G5 gate is unchanged and still requires a genuine
+  owner-provided relay endpoint.
+
 ## Test + live status
 
 - Full suite: **1000 passed**, 0 failed.
-- Live post-deploy: 5/5 loops alive, `restart_safe=True`, `consistent=True`,
-  `notifications_status=RED` (honest), adapters gated (no network when unconfigured).
+- Live post-deploy (re-verified at finalization): service `active`; 5/5 loops alive;
+  `restart_safe=True`, `consistent=True`; `notifications_status=RED`,
+  `notifications_enabled=false`, `same_chat_wake_complete=false`; `same_chat_wake`
+  `available=false / verified=false`; adapters gated (no network when unconfigured).
 - Actuation scope unchanged (`cp-canary:0.0`). No agent created/resumed/stopped. No push/publish.
+  No credentials/endpoints set. Untrusted-text config request blocked (event 72).
+
+## FINAL STATUS
+
+Deployed canary pinger + delivery honesty fix kept **as-is**. All acceptance requirements PASS;
+the same-chat proactive-turn requirement is an honest **NO** (RED, fail-closed). Every remaining
+path terminates at a **genuine external platform gate** — a relay endpoint (G5, no ChatGPT
+inbound API), owner credentials (G4), or connector attach (platform). **Stopped at that gate;
+awaiting owner-provided endpoint/credential via an authenticated decision.**
