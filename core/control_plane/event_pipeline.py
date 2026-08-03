@@ -82,6 +82,23 @@ def publish_significant_event(*, agent: str, project: str = "", kind: str, summa
             return {"ok": False, "reason": "false_idle_suppressed", "false_idle_corrected": True,
                     "event_id": ev["event_id"], "agent": agent, "kind": kind}
 
+        # 1b) ACCESS-RECOVERY RECLASSIFY — a server-access failure by an agent that already has
+        #     installed keys (owner truth) is INTERNAL key-selection/connection-mapping recovery,
+        #     NOT an owner gate. Reclassify + track it; do NOT repeatedly notify the owner. Only
+        #     an exhaustive absence/revocation proof escalates.
+        if kind in ("blocker", "waiting_owner"):
+            from core.control_plane import access_recovery as _ar
+            blob = " ".join(str(x) for x in (summary, tail,
+                            (evidence or {}).get("summary"), (evidence or {}).get("last_line"),
+                            (evidence or {}).get("detail")) if x)
+            _cls = _ar.classify(agent, blob)
+            if _cls["class"] == "internal_recovery":
+                task = _ar.note_recovery(agent, host=_cls.get("host") or "", detail=blob, conn=conn)
+                return {"ok": False, "reason": "reclassified_internal_recovery",
+                        "agent": agent, "kind": kind, "host": _cls.get("host"),
+                        "recovery_task": task, "owner_notified": False}
+            # _cls == 'escalate' (exhaustive proof) falls through → normal owner-actionable event.
+
         # 2) durable CTO inbox record (correlated event id). emit auto-pushes high/critical/owner.
         dk = dedup_key or f"sig:{agent}:{kind}"
         line = _factual_summary(agent, project, kind, summary, evidence)
