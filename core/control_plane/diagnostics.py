@@ -384,6 +384,57 @@ def loop_liveness_report(*, now: Optional[float] = None, stall_multiplier: float
     }
 
 
+def _read_canary_allowlist(dropin_path: str = None) -> set:
+    """Read the LIVE actuation canary allowlist from the systemd drop-in (read-only, no
+    secrets — the value is an agent target). Falls back to the in-process env global."""
+    path = dropin_path or "/etc/systemd/system/ai-runtime.service.d/canary.conf"
+    try:
+        for line in open(path):
+            if "CONTROL_PLANE_CANARY_AGENTS=" in line:
+                val = line.split("CONTROL_PLANE_CANARY_AGENTS=", 1)[1].strip()
+                return {t.strip() for t in val.split(",") if t.strip()}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from core.control_plane import actuator
+        return set(actuator.CANARY_AGENTS)
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def actuation_scope_report(*, now: Optional[float] = None, conn=None, allowlist: set = None,
+                           dropin_path: str = None,
+                           synthetic_prefixes=("canary-synthetic",)) -> dict:
+    """Verify the actuator never broadened beyond the canary: every target that appears in the
+    durable `cp_action` ledger must be on the canary allowlist (or a known synthetic test
+    target). Any REAL non-canary agent that was actuated is a scope BREACH → red. Read-only —
+    the strongest safety check while the actuator is armed."""
+    allow = set(allowlist) if allowlist is not None else _read_canary_allowlist(dropin_path)
+    own = conn is None
+    if conn is None:
+        from core.control_plane.store import connect, init_db
+        conn = connect()
+        init_db(conn)
+    try:
+        actuated = {r[0] for r in conn.execute(
+            "SELECT DISTINCT target FROM cp_action").fetchall()}
+    finally:
+        if own:
+            conn.close()
+    synthetic = {t for t in actuated if any(t.startswith(p) for p in synthetic_prefixes)}
+    unexpected = actuated - allow - synthetic
+    return {
+        "metric": "actuation_scope",
+        "canary_allowlist": sorted(allow),
+        "actuated_targets": sorted(actuated),
+        "synthetic_test_targets": sorted(synthetic),
+        "unexpected_actuated": sorted(unexpected),
+        "status": "red" if unexpected else "green",
+        "note": ("SCOPE BREACH — a non-canary agent was actuated" if unexpected
+                 else "actuation confined to the canary allowlist (+ synthetic tests)"),
+    }
+
+
 def observability_summary(*, now: Optional[float] = None) -> dict:
     """Combined read-only view. `all_clear` is true when there are no ACTIVE failures,
     regardless of historical totals — so a green system is not flagged by stale counters."""
@@ -397,11 +448,14 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     cto = cto_cursor_report(now=now)
     commander = commander_delivery_report(now=now)
     loops = loop_liveness_report(now=now)
+    scope = actuation_scope_report(now=now)
     active = notif["active"] + jobs["active"]
     # overall red if there are ACTIVE failures, the discovery engine looks stalled, a control
-    # loop stalled, the same-chat drain stalled, or a CTO consumer cursor is stale.
+    # loop stalled, the same-chat drain stalled, a CTO cursor is stale, OR the actuator
+    # broadened beyond the canary (scope breach).
     healthy = (active == 0 and registry["engine_alive"] and loops["stalled_loops"] == 0
-               and commander["drain_alive"] and cto["stale_consumers"] == 0)
+               and commander["drain_alive"] and cto["stale_consumers"] == 0
+               and not scope["unexpected_actuated"])
     return {
         "notifications": notif,
         "notification_history": notif_hist,
@@ -413,6 +467,8 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         "commander_same_chat_delivery": commander,
         "loop_liveness": loops,
         "stalled_loops": loops["stalled_loops"],
+        "actuation_scope": scope,
+        "actuation_scope_breach": bool(scope["unexpected_actuated"]),
         "active_failures_total": active,
         "historical_failures_total": notif["historical"] + jobs["historical"],
         "engine_alive": registry["engine_alive"],

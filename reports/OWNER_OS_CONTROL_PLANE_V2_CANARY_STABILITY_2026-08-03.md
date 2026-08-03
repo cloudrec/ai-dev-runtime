@@ -407,3 +407,40 @@ autonomous action taken.
   **passes in a clean environment** (verified: `1 passed` once the foreign `sleep 30`
   processes cleared) → clean-env total **936**. Unrelated to this change (which adds only a DB
   timestamp write + read-only diagnostics; no process/subprocess code).
+
+---
+
+# ADDENDUM 7 — actuation scope integrity (canary-confinement check, read-only)
+
+## Gap
+
+The actuator is armed live (scoped to `cp-canary:0.0`), but nothing continuously verified it
+never broadened — no diagnostic would catch a real non-canary agent being actuated (a scope
+breach / the worst safety failure for a single-agent cutover).
+
+## Added (read-only)
+
+`actuation_scope_report` — cross-checks the durable `cp_action` ledger against the canary
+allowlist (read from the systemd drop-in `CONTROL_PLANE_CANARY_AGENTS`, no secrets). Every
+actuated target must be on the allowlist or a known synthetic test target
+(`canary-synthetic-*`); any REAL non-canary agent in the ledger is a **scope BREACH → red**.
+`observability_summary` now goes red on `actuation_scope_breach`.
+
+## Live (read-only) result — scope INTACT
+
+- allowlist (from drop-in): `[cp-canary:0.0]`.
+- actuated (cp_action distinct targets): `[canary-synthetic-restart:0.0, cp-canary:0.0]`.
+- synthetic test targets: `[canary-synthetic-restart:0.0]`.
+- **unexpected (breach): [] → green.** No real non-canary agent was ever actuated — actuation
+  is confined to the one canary (+ the P2 synthetic test). Canary scoping preserved.
+- Summary: `status=green, actuation_scope_breach=false, active_failures_total=0` (the earlier
+  payment owner-push dead-letter has aged past the 1h active window → historical again).
+
+## Tests / commit
+
+- Tests: **+4** (scope green when confined; breach when a non-canary agent actuated; allowlist
+  parsed from drop-in; summary red on breach). `test_control_plane_diagnostics.py` total
+  **33**. Full suite: see run.
+- Commit: local only; read-only (SELECT / drop-in read, no secrets). Endpoint `/observability`
+  now includes `actuation_scope`. Canary scoping + owner gates unchanged; no defect (scope
+  intact) — the diagnostic is a continuous safety guard.

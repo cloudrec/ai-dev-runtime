@@ -370,6 +370,49 @@ def test_summary_red_when_a_loop_is_stalled(tmp_path, monkeypatch):
     assert s["stalled_loops"] == 1 and s["all_clear"] is False and s["status"] == "red"
 
 
+# ── actuation scope integrity (never broadened beyond the canary) ────────────
+def _cp_action(target):
+    c = _conn()
+    c.execute("INSERT OR REPLACE INTO cp_action(idkey,target,verified) VALUES(?,?,1)",
+              (f"{target}|k", target))
+    c.commit(); c.close()
+
+
+def test_actuation_scope_green_when_confined_to_canary_and_synthetic():
+    _cp_action("cp-canary:0.0")
+    _cp_action("canary-synthetic-restart:0.0")   # synthetic test target
+    r = diag.actuation_scope_report(allowlist={"cp-canary:0.0"})
+    assert r["unexpected_actuated"] == [] and r["status"] == "green"
+    assert r["synthetic_test_targets"] == ["canary-synthetic-restart:0.0"]
+
+
+def test_actuation_scope_breach_when_non_canary_actuated():
+    _cp_action("cp-canary:0.0")
+    _cp_action("arbitrage2-opus:0.0")            # REAL non-canary agent → breach
+    r = diag.actuation_scope_report(allowlist={"cp-canary:0.0"})
+    assert r["unexpected_actuated"] == ["arbitrage2-opus:0.0"] and r["status"] == "red"
+
+
+def test_actuation_scope_reads_allowlist_from_dropin(tmp_path):
+    _cp_action("cp-canary:0.0")
+    dropin = tmp_path / "canary.conf"
+    dropin.write_text("[Service]\nEnvironment=CONTROL_PLANE_CANARY_AGENTS=cp-canary:0.0\n")
+    r = diag.actuation_scope_report(dropin_path=str(dropin))
+    assert r["canary_allowlist"] == ["cp-canary:0.0"] and r["status"] == "green"
+
+
+def test_summary_red_on_actuation_scope_breach(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty.db"))
+    sqlite3.connect(str(tmp_path / "empty.db")).execute(
+        "CREATE TABLE jobs(id TEXT,status TEXT,created_at TEXT,updated_at TEXT,finished_at TEXT)")
+    _agent_row("cp:0.0", NOW - 5, "managed")
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 5, dal_ts=NOW - 5, sup_ts=NOW - 5)
+    # empty drop-in path → allowlist empty → any actuated real target is unexpected
+    _cp_action("some-real-agent:0.0")
+    s = diag.observability_summary(now=NOW)
+    assert s["actuation_scope_breach"] is True and s["status"] == "red"
+
+
 # ── summary: engine stall makes it RED even with zero active failures ────────
 def test_summary_red_when_engine_stalled_no_active_failures(tmp_path, monkeypatch):
     monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty_jobs.db"))
