@@ -79,3 +79,56 @@ unexpected `cw_step` writes, no outbox runaway, watchdog errors 0. Stable for th
 
 G4 owner-push channel unconfigured (notifications RED); G5 same-chat inbound trigger;
 G3 push/publication; multi-agent/full cutover not authorized.
+
+---
+
+# ADDENDUM — extended window (45 min) + delivered completion event + state fix
+
+## Extended read-only window: 18 samples / 45 min — STABLE
+
+Every sample DELTA = none vs baseline. Exact deltas over the window:
+
+| Signal | Delta | Reading |
+|---|---:|---|
+| duplicate continuation (`cp_action` growth) | **0** | no duplicate command |
+| false-idle (`false_idle_corrected`/`action_blocked`/`duplicate` events) | **0** | no false-idle regression |
+| lease churn (`resource_lease` holder/fence change) | **0** | stable ownership (record `rollback_probe/3`, expired, unchanged) |
+| notifier failures — NEW (`dead_letter` growth) | **0** | no notifier runaway / no new delivery failures |
+| `cw_step` growth (legacy) | **0** | legacy retirement holds (frozen at 2 historical) |
+| new canary events (`max_event`) | **0** | max id **48** unchanged |
+| live `cp-canary` panes | **1** | no duplicate agent |
+| `notification` total | 19 (17 dead_letter + 2 sent), unchanged | outbox quiescent |
+
+Combined observed stable window (both runs): **~63 min, 30 samples, zero change.**
+
+## Correlated completion event — DELIVERED via agent_notifier (receipt verified)
+
+- Emitted `canary_stability_completed` (high significance) through the proven
+  `agent_notifier` same-chat path: commander_event **#469**.
+- **Delivery receipt: acknowledged=1** (agent_notifier acks only after delivering to the
+  chat) within ~12s — same-chat message produced without a user prompt. No `delivery_failed`,
+  no retry needed.
+- Payload: monitor windows 18min+45min; duplicate_command_count **0**; false_idle_count
+  **0**; lease_churn **0**; notifier_failures_new **0**; verified_actions **2**;
+  cw_step_growth **0**; test_count **907**; blockers [multi-agent, G4, G5, G3].
+
+## State-estimation fix (`d1d20cb`) — background-shell footer
+
+Root cause of a false-idle on `owneros-direct-fix`: it is the pane where the Bash tool runs;
+a Claude Code BACKGROUND shell (e.g. a live monitor) keeps the pane foreground command
+`claude`, so the pane-command heuristic missed the running shell and, with no visible spinner
+in the tail, it could read idle. `_STATE_ACTIVE_RUN_RE` now matches the footer "· N shell ·"
+indicator → the agent reads active/working, never idle. Live-verified: owneros-direct-fix
+footer `· 1 shell ·` → active match. Tests: shell footer active (`N shell`/`N shells`), plain
+footer (`3 agents`) not active, estimator overrides idle base.
+
+## Test count
+
+Full suite: **907 passed**, 0 failed (was 905; +2 shell-footer tests).
+
+## Event IDs (this addendum)
+
+Stability completion commander_event **#469** (acked). Canary control-plane events unchanged
+(#44 discovery, #46/#48 verified, #50 duplicate; max id 48). State-fix commit `d1d20cb`.
+
+## Failures: none.
