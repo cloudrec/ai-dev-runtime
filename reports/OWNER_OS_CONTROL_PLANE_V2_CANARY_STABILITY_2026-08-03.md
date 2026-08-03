@@ -490,3 +490,34 @@ lease/action ledger is consistent across every restart this session (fences mono
 - Commit: local only; read-only. Endpoint `/observability` now includes `consistency`. No
   defect found (all invariants hold) — the diagnostic is a continuous corruption guard.
   Canary scope + owner gates preserved.
+
+---
+
+# ADDENDUM 9 — summary `red_reasons` aggregation (read-only) + context preservation
+
+Context was at 100%; continuation state captured in `reports/OWNER_OS_CONTROL_PLANE_V2_STATE.md`
+(HEAD, diagnostics inventory, live health, flags, open gates incl. G-PAY-1/2/3, candidate
+next gaps).
+
+## Gap
+
+`observability_summary` returned a top-level `status` but no consolidated reason list — a
+consumer could not see WHICH check failed without parsing every sub-report.
+
+## Added (read-only)
+
+`observability_summary.red_reasons` — a list of the specific failing checks (empty ⇒ green):
+`active_failures=N`, `discovery_engine_stalled`, `stalled_loops=N`, `same_chat_drain_stalled`,
+`stale_cto_cursors=N`, `actuation_scope_breach=[...]`, `consistency_violation`. `all_clear` =
+`red_reasons == []`.
+
+## Live (read-only)
+
+`status=green, red_reasons=[]` (the earlier payment owner-push dead-letter aged out of the 1h
+window). A future RED now self-explains via `red_reasons`.
+
+## Tests / commit
+
+- Tests: **+2** (red_reasons empty when green; names the failing check on a violation).
+  `test_control_plane_diagnostics.py` total **41**. Full suite: see run.
+- Commit: local only; read-only. Canary scope + owner gates preserved; no defect.

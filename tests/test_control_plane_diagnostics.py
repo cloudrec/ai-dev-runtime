@@ -413,6 +413,28 @@ def test_summary_red_on_actuation_scope_breach(tmp_path, monkeypatch):
     assert s["actuation_scope_breach"] is True and s["status"] == "red"
 
 
+# ── summary red_reasons aggregation ──────────────────────────────────────────
+def test_summary_red_reasons_empty_when_all_green(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty.db"))
+    sqlite3.connect(str(tmp_path / "empty.db")).execute(
+        "CREATE TABLE jobs(id TEXT,status TEXT,created_at TEXT,updated_at TEXT,finished_at TEXT)")
+    _agent_row("cp:0.0", NOW - 5, "managed")
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 5, dal_ts=NOW - 5, sup_ts=NOW - 5)
+    s = diag.observability_summary(now=NOW)
+    assert s["red_reasons"] == [] and s["status"] == "green" and s["all_clear"] is True
+
+
+def test_summary_red_reasons_names_the_failing_check(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty.db"))
+    sqlite3.connect(str(tmp_path / "empty.db")).execute(
+        "CREATE TABLE jobs(id TEXT,status TEXT,created_at TEXT,updated_at TEXT,finished_at TEXT)")
+    _agent_row("cp:0.0", NOW - 5, "managed")
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 5, dal_ts=NOW - 5, sup_ts=NOW - 5)
+    _cp_action_fence("cp-canary:0.0", 9); _lease_fence("agent:cp-canary:0.0", 3)  # fence violation
+    s = diag.observability_summary(now=NOW)
+    assert "consistency_violation" in s["red_reasons"] and s["status"] == "red"
+
+
 # ── consistency invariants (cursor / notification state / fence) ─────────────
 def _cp_action_fence(target, fence):
     c = _conn()

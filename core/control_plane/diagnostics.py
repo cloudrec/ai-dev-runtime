@@ -507,12 +507,24 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     scope = actuation_scope_report(now=now)
     consistency = consistency_report(now=now)
     active = notif["active"] + jobs["active"]
-    # overall red if there are ACTIVE failures, the discovery engine looks stalled, a control
-    # loop stalled, the same-chat drain stalled, a CTO cursor is stale, the actuator broadened
-    # beyond the canary (scope breach), OR a consistency invariant is violated.
-    healthy = (active == 0 and registry["engine_alive"] and loops["stalled_loops"] == 0
-               and commander["drain_alive"] and cto["stale_consumers"] == 0
-               and not scope["unexpected_actuated"] and consistency["consistent"])
+    # consolidated reasons the aggregate is red (empty ⇒ green) — so a consumer sees WHICH
+    # check failed without parsing every sub-report.
+    red_reasons = []
+    if active > 0:
+        red_reasons.append(f"active_failures={active}")
+    if not registry["engine_alive"]:
+        red_reasons.append("discovery_engine_stalled")
+    if loops["stalled_loops"]:
+        red_reasons.append(f"stalled_loops={loops['stalled_loops']}")
+    if not commander["drain_alive"]:
+        red_reasons.append("same_chat_drain_stalled")
+    if cto["stale_consumers"]:
+        red_reasons.append(f"stale_cto_cursors={cto['stale_consumers']}")
+    if scope["unexpected_actuated"]:
+        red_reasons.append(f"actuation_scope_breach={scope['unexpected_actuated']}")
+    if not consistency["consistent"]:
+        red_reasons.append("consistency_violation")
+    healthy = not red_reasons
     return {
         "notifications": notif,
         "notification_history": notif_hist,
@@ -528,6 +540,7 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         "actuation_scope_breach": bool(scope["unexpected_actuated"]),
         "consistency": consistency,
         "consistent": consistency["consistent"],
+        "red_reasons": red_reasons,
         "active_failures_total": active,
         "historical_failures_total": notif["historical"] + jobs["historical"],
         "engine_alive": registry["engine_alive"],
