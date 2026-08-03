@@ -669,3 +669,85 @@ def test_summary_gate_sla_breach_is_advisory_not_red(tmp_path, monkeypatch):
     s = diag.observability_summary(now=NOW)
     assert s["owner_gate_sla_breaches"] == 1 and s["owner_gate_escalate"] is True
     assert s["status"] == "green" and s["red_reasons"] == []   # overdue owner action != failure
+
+
+# ── append-only log growth + retention (read-only, advisory) ─────────────────
+def _event_at(ts_epoch, n=1):
+    c = _conn()
+    for _ in range(n):
+        c.execute("INSERT INTO event(ts,ts_epoch,source,type) VALUES('t',?,'x','e')", (ts_epoch,))
+    c.commit(); c.close()
+
+
+def _cp_action_created(target, created_ts):
+    c = _conn()
+    c.execute("INSERT OR REPLACE INTO cp_action(idkey,target,fence_token,created_at) "
+              "VALUES(?,?,1,?)", (f"{target}|{created_ts}", target, _iso(created_ts)))
+    c.commit(); c.close()
+
+
+def _log(r, table):
+    return next(l for l in r["logs"] if l["table"] == table)
+
+
+def test_log_growth_empty_is_green():
+    r = diag.log_growth_report(now=NOW)
+    assert r["total_rows"] == 0 and r["advise"] is False and r["status"] == "green"
+    assert _log(r, "event")["rows"] == 0 and _log(r, "event")["oldest_age_secs"] is None
+
+
+def test_log_growth_counts_and_age_span():
+    _event_at(NOW - 10000)     # oldest
+    _event_at(NOW - 100)       # newest
+    _event_at(NOW - 5000)
+    ev = _log(diag.log_growth_report(now=NOW), "event")
+    assert ev["rows"] == 3 and ev["oldest_age_secs"] == 10000 and ev["newest_age_secs"] == 100
+
+
+def test_log_growth_recent_rate_per_hour():
+    _event_at(NOW - 100, n=5)      # 5 within the last hour
+    _event_at(NOW - 8000, n=3)     # older than the 1h window
+    ev = _log(diag.log_growth_report(now=NOW, rate_window_secs=3600), "event")
+    assert ev["rows"] == 8 and ev["recent_rows"] == 5 and ev["rate_per_hr"] == 5.0
+
+
+def test_log_growth_notification_and_action_use_created_at():
+    _notif("sent", NOW - 200)
+    _notif("pending", NOW - 100)
+    _cp_action_created("cp-canary:0.0", NOW - 300)
+    r = diag.log_growth_report(now=NOW, rate_window_secs=3600)
+    assert _log(r, "notification")["rows"] == 2 and _log(r, "notification")["recent_rows"] == 2
+    assert _log(r, "cp_action")["rows"] == 1 and _log(r, "cp_action")["newest_age_secs"] == 300
+
+
+def test_log_growth_rows_threshold_advises_not_red():
+    _event_at(NOW - 100, n=12)
+    r = diag.log_growth_report(now=NOW, advisory_rows=10)   # 12 > 10 → advise
+    ev = _log(r, "event")
+    assert ev["advise"] is True and "rows>10" in ev["advisory_reasons"]
+    assert r["advise"] is True and "event" in r["advise_tables"]
+    assert r["status"] == "green"           # retention advisory, NOT a correctness failure
+
+
+def test_log_growth_rate_threshold_advises():
+    _event_at(NOW - 60, n=6)
+    r = diag.log_growth_report(now=NOW, rate_window_secs=3600, advisory_rate_per_hr=5)  # 6/hr > 5
+    ev = _log(r, "event")
+    assert ev["advise"] is True and any("rate>" in x for x in ev["advisory_reasons"])
+    assert r["advise"] is True and r["status"] == "green"
+
+
+def test_summary_log_growth_is_advisory_not_red(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty.db"))
+    sqlite3.connect(str(tmp_path / "empty.db")).execute(
+        "CREATE TABLE jobs(id TEXT,status TEXT,created_at TEXT,updated_at TEXT,finished_at TEXT)")
+    _agent_row("cp:0.0", NOW - 5, "managed")
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 5, dal_ts=NOW - 5, sup_ts=NOW - 5)
+    _event_at(NOW - 100, n=12)
+    # force the advisory with a tiny row bound (default 50000 would need too many rows)
+    _real = diag.log_growth_report
+    monkeypatch.setattr(diag, "log_growth_report",
+                        lambda **k: _real(**{**k, "advisory_rows": 10}))
+    s = diag.observability_summary(now=NOW)
+    assert s["log_retention_advise"] is True and s["log_total_rows"] >= 12
+    assert s["status"] == "green" and s["red_reasons"] == []   # growth never flips red

@@ -592,3 +592,32 @@ escalation not failure, oldest-first ordering; breach list capped; summary advis
 gates, oldest ≈12h, **0 past the 24h SLA** → `escalate=False`, `summary=green`,
 `red_reasons=[]`. Correct: system healthy, no owner decision yet overdue. Owner gates + canary
 scope unchanged.
+
+# ADDENDUM 12 — append-only log growth + retention (read-only, advisory)
+
+**Scope.** Read-only/internal. New diagnostic. NO prune/rotate/delete, no flag/scope change,
+no agent create/resume/stop, no push/publish, no credential/payment/trading/mainnet/external/
+destructive/owner-gated action. cp-canary-only scope preserved.
+
+**Gap.** The `event`, `cp_action`, and `notification` tables are append-only (events are the
+CTO inbox; nothing prunes them). No metric reported their size, retained age span, or growth
+rate — unbounded growth was invisible until it became a disk/latency problem.
+
+**Added — `log_growth_report()`** (`core/control_plane/diagnostics.py`, read-only): per log —
+row count, oldest & newest age (retained span), recent creation rate (rows in the last
+`rate_window_secs`, default 1h → per-hour; `event` via numeric `ts_epoch` in SQL, the ISO
+`created_at` logs parsed in Python). Advisory thresholds `advisory_rows` (50000) and
+`advisory_rate_per_hr` (2000) set `advise` + `advisory_reasons` per table + `advise_tables`.
+- **Honesty invariant:** `status` stays **green** even when advising. Unbounded growth is a
+  CAPACITY/retention signal, not a correctness failure, and pruning is an owner-gated
+  destructive action — this only measures and advises, never rotates. `observability_summary`
+  exposes `log_total_rows` + `log_retention_advise` as advisory fields; NOT in `red_reasons`.
+
+**Tests.** +7 in `tests/test_control_plane_diagnostics.py` (empty-green; count+age-span; recent
+rate/hr; notification+action via created_at; rows-threshold advises-not-red; rate-threshold
+advises; summary advisory-not-red).
+
+**Result.** Focused: 66 passed. **Full suite: 974 passed, 0 failed.** Live read-only:
+event 65 rows (span ≈12.5h, ≈1/hr), cp_action 3, notification 20 — total 88, well under
+thresholds → `advise=False`, `summary=green`, `red_reasons=[]`. No retention action needed.
+No blocker. Owner gates + canary scope unchanged.

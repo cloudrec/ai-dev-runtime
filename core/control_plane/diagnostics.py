@@ -591,6 +591,87 @@ def restart_consistency_report(*, now: Optional[float] = None, stale_secs: float
     }
 
 
+def _log_stats(conn, table: str, ts_col: str, is_epoch: bool, now: float, window: float) -> dict:
+    """Size + age-span + recent-rate for one append-only log. Read-only. `is_epoch` uses the
+    numeric ts column directly in SQL (cheap for a big table); otherwise the ISO column is
+    parsed in Python."""
+    total = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+    if total == 0:
+        return {"table": table, "rows": 0, "oldest_age_secs": None, "newest_age_secs": None,
+                "recent_rows": 0, "rate_per_hr": 0.0}
+    if is_epoch:
+        oldest = conn.execute(f"SELECT min({ts_col}) FROM {table}").fetchone()[0]
+        newest = conn.execute(f"SELECT max({ts_col}) FROM {table}").fetchone()[0]
+        recent = conn.execute(f"SELECT count(*) FROM {table} WHERE {ts_col} >= ?",
+                              (now - window,)).fetchone()[0]
+    else:
+        epochs = [_epoch(r[0]) for r in conn.execute(f"SELECT {ts_col} FROM {table}").fetchall()]
+        epochs = [e for e in epochs if e is not None]
+        oldest = min(epochs) if epochs else None
+        newest = max(epochs) if epochs else None
+        recent = sum(1 for e in epochs if e >= now - window)
+    return {
+        "table": table, "rows": total,
+        "oldest_age_secs": (round(now - oldest) if oldest is not None else None),
+        "newest_age_secs": (round(now - newest) if newest is not None else None),
+        "recent_rows": recent,
+        "rate_per_hr": round(recent * 3600.0 / window, 2),
+    }
+
+
+def log_growth_report(*, now: Optional[float] = None, rate_window_secs: float = 3600.0,
+                      advisory_rows: int = 50000, advisory_rate_per_hr: float = 2000.0,
+                      conn=None) -> dict:
+    """Append-only log growth + retention. Read-only — NEVER prunes/rotates. Reports, per
+    durable log (`event` / `cp_action` / `notification`): row count, oldest & newest age (the
+    retained span), and the recent creation rate (rows in the last `rate_window_secs` →
+    per-hour). Advisory thresholds flag a log large enough (`advisory_rows`) or growing fast
+    enough (`advisory_rate_per_hr`) to warrant an owner-approved retention policy.
+
+    `status` stays green: unbounded growth is a CAPACITY/retention signal, not a correctness
+    failure, and pruning is an owner-gated destructive action — this only measures and advises.
+    A log crossing a threshold sets `advise` with the specific `advisory_reasons`."""
+    now = now if now is not None else time.time()
+    own = conn is None
+    if conn is None:
+        from core.control_plane.store import connect, init_db
+        conn = connect()
+        init_db(conn)
+    try:
+        logs = [
+            _log_stats(conn, "event", "ts_epoch", True, now, rate_window_secs),
+            _log_stats(conn, "cp_action", "created_at", False, now, rate_window_secs),
+            _log_stats(conn, "notification", "created_at", False, now, rate_window_secs),
+        ]
+    finally:
+        if own:
+            conn.close()
+    advise_tables = []
+    for l in logs:
+        reasons = []
+        if l["rows"] > advisory_rows:
+            reasons.append(f"rows>{advisory_rows}")
+        if l["rate_per_hr"] > advisory_rate_per_hr:
+            reasons.append(f"rate>{advisory_rate_per_hr}/hr")
+        l["advise"] = bool(reasons)
+        l["advisory_reasons"] = reasons
+        if reasons:
+            advise_tables.append(l["table"])
+    return {
+        "metric": "log_growth",
+        "window_secs": rate_window_secs,
+        "advisory_rows": advisory_rows,
+        "advisory_rate_per_hr": advisory_rate_per_hr,
+        "logs": logs,
+        "total_rows": sum(l["rows"] for l in logs),
+        "advise_tables": advise_tables,
+        "advise": bool(advise_tables),
+        "status": "green",   # capacity/retention advisory, never a correctness failure
+        "note": (f"retention advisable (owner-gated) for: {advise_tables}" if advise_tables
+                 else "log sizes and growth within advisory thresholds"),
+    }
+
+
 def observability_summary(*, now: Optional[float] = None) -> dict:
     """Combined read-only view. `all_clear` is true when there are no ACTIVE failures,
     regardless of historical totals — so a green system is not flagged by stale counters."""
@@ -607,6 +688,7 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     scope = actuation_scope_report(now=now)
     consistency = consistency_report(now=now)
     restartc = restart_consistency_report(now=now)
+    growth = log_growth_report(now=now)
     active = notif["active"] + jobs["active"]
     # consolidated reasons the aggregate is red (empty ⇒ green) — so a consumer sees WHICH
     # check failed without parsing every sub-report.
@@ -645,6 +727,9 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         "consistent": consistency["consistent"],
         "restart_consistency": restartc,
         "restart_safe": restartc["restart_safe"],
+        "log_growth": growth,
+        "log_total_rows": growth["total_rows"],
+        "log_retention_advise": growth["advise"],   # advisory: retention (owner-gated), not red
         "red_reasons": red_reasons,
         "active_failures_total": active,
         "historical_failures_total": notif["historical"] + jobs["historical"],
