@@ -38,6 +38,31 @@ DEDUP_WINDOW = int(os.getenv("AGENT_SUPERVISOR_DEDUP_SECS", "900"))
 ENABLED = os.getenv("AGENT_SUPERVISOR_ENABLED", "0") not in ("0", "false", "no", "")
 
 
+def heartbeat() -> None:
+    """Minimal non-sensitive periodic liveness marker written each supervision tick.
+
+    The supervisor otherwise only writes `supervisor_prompts` on a decision (sparse), so its
+    liveness was not measurable. This writes ONLY a timestamp + a monotonic tick counter — no
+    decision data, no agent content, no secrets — so a stalled supervisor loop is detectable
+    (loop_liveness). Best-effort; a heartbeat failure never affects supervision."""
+    import sqlite3
+    from datetime import datetime, timezone
+    try:
+        conn = sqlite3.connect(os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"),
+                               timeout=5)
+        try:
+            conn.execute("CREATE TABLE IF NOT EXISTS supervisor_heartbeat ("
+                         "id INTEGER PRIMARY KEY CHECK (id=1), last_run_at TEXT, ticks INTEGER DEFAULT 0)")
+            conn.execute("INSERT INTO supervisor_heartbeat(id,last_run_at,ticks) VALUES(1,?,1) "
+                         "ON CONFLICT(id) DO UPDATE SET last_run_at=excluded.last_run_at, ticks=ticks+1",
+                         (datetime.now(timezone.utc).isoformat(),))
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _allowlisted_sessions() -> set[str]:
     """Sessions eligible for unattended safe-resolution, discovered DYNAMICALLY:
     every `mode: auto` session in the orchestrator config (the managed-auto set),
@@ -282,6 +307,7 @@ async def run_loop() -> None:
         return
     log.info(f"agent supervisor started (interval {POLL_INTERVAL}s, sessions={sorted(_allowlisted_sessions())})")
     while True:
+        await asyncio.to_thread(heartbeat)        # observability-only liveness marker
         try:
             res = await asyncio.to_thread(poll_once, True)
             if res.get("approved") or res.get("no_resume"):

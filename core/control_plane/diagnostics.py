@@ -334,9 +334,9 @@ def _read_marker(db_path: str, query: str):
 
 
 def _loop_specs() -> list:
-    """Per-loop heartbeat markers (a fresh row each tick). The supervisor is intentionally
-    absent — its only marker (`supervisor_prompts`) is written on a decision, not every tick,
-    so it has NO reliable heartbeat and cannot be assessed here (reported separately)."""
+    """Per-loop heartbeat markers (a fresh row each tick). The supervisor now has a dedicated
+    periodic `supervisor_heartbeat` (added because its only prior marker, `supervisor_prompts`,
+    is decision-driven, not periodic)."""
     from core.control_plane.store import db_path as _cp_path
     ac = _ac_db()
     return [
@@ -348,6 +348,8 @@ def _loop_specs() -> list:
          "query": "SELECT max(updated_at) FROM direct_agent_lifecycle", "interval": 45},
         {"name": "control_plane_engine", "db": _cp_path(),
          "query": "SELECT max(updated_at) FROM agent", "interval": 30},
+        {"name": "supervisor", "db": ac,
+         "query": "SELECT last_run_at FROM supervisor_heartbeat WHERE id=1", "interval": 45},
     ]
 
 
@@ -376,7 +378,6 @@ def loop_liveness_report(*, now: Optional[float] = None, stall_multiplier: float
         "metric": "loop_liveness",
         "loops": loops,
         "stalled_loops": stalled,
-        "supervisor": "no_heartbeat_marker (decision-only; liveness not assessable here)",
         "status": "red" if stalled else "green",
         "note": ("a control loop is STALLED — no recent tick" if stalled
                  else "all measurable control loops ticking"),

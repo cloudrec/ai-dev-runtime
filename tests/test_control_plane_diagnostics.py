@@ -299,28 +299,50 @@ def test_commander_recent_ack_means_not_stalled_despite_unacked(tmp_path):
 import os as _os
 
 
-def _loop_markers(cw_ts=None, orch_ts=None, dal_ts=None):
+def _loop_markers(cw_ts=None, orch_ts=None, dal_ts=None, sup_ts=None):
     ac = _os.environ["AGENT_CONTROL_DB"]
     c = sqlite3.connect(ac)
     c.execute("CREATE TABLE IF NOT EXISTS cw_health(id INTEGER PRIMARY KEY, last_run_at TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS agent_orchestrator(agent_key TEXT, updated_at TEXT)")
     c.execute("CREATE TABLE IF NOT EXISTS direct_agent_lifecycle(target TEXT, updated_at TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS supervisor_heartbeat(id INTEGER PRIMARY KEY, last_run_at TEXT, ticks INTEGER)")
     if cw_ts is not None:
         c.execute("INSERT OR REPLACE INTO cw_health(id,last_run_at) VALUES(1,?)", (_iso(cw_ts),))
     if orch_ts is not None:
         c.execute("INSERT INTO agent_orchestrator(agent_key,updated_at) VALUES('a',?)", (_iso(orch_ts),))
     if dal_ts is not None:
         c.execute("INSERT INTO direct_agent_lifecycle(target,updated_at) VALUES('a',?)", (_iso(dal_ts),))
+    if sup_ts is not None:
+        c.execute("INSERT OR REPLACE INTO supervisor_heartbeat(id,last_run_at,ticks) VALUES(1,?,1)", (_iso(sup_ts),))
     c.commit(); c.close()
 
 
 def test_loop_liveness_all_alive():
-    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 10, dal_ts=NOW - 10)
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 10, dal_ts=NOW - 10, sup_ts=NOW - 8)
     _agent_row("cp:0.0", NOW - 5, "managed")   # control-plane engine marker
     r = diag.loop_liveness_report(now=NOW)
     by = {l["loop"]: l["state"] for l in r["loops"]}
     assert by["continuation_watchdog"] == "alive" and by["orchestrator"] == "alive"
-    assert by["control_plane_engine"] == "alive" and r["stalled_loops"] == 0 and r["status"] == "green"
+    assert by["control_plane_engine"] == "alive" and by["supervisor"] == "alive"
+    assert r["stalled_loops"] == 0 and r["status"] == "green"
+
+
+def test_loop_liveness_detects_stalled_supervisor():
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 10, dal_ts=NOW - 10, sup_ts=NOW - 5000)
+    _agent_row("cp:0.0", NOW - 5, "managed")
+    r = diag.loop_liveness_report(now=NOW)
+    by = {l["loop"]: l["state"] for l in r["loops"]}
+    assert by["supervisor"] == "stalled" and r["stalled_loops"] == 1 and r["status"] == "red"
+
+
+def test_supervisor_heartbeat_writes_marker(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "hb.db"))
+    from core import agent_supervisor as sup
+    sup.heartbeat(); sup.heartbeat()
+    c = sqlite3.connect(str(tmp_path / "hb.db"))
+    row = c.execute("SELECT last_run_at,ticks FROM supervisor_heartbeat WHERE id=1").fetchone()
+    c.close()
+    assert row is not None and row[1] == 2 and row[0]      # timestamp + monotonic tick count
 
 
 def test_loop_liveness_detects_stalled_watchdog():
