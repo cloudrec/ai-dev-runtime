@@ -19,6 +19,7 @@ from core import agent_continuation_watchdog as cw
 def _isolated_db(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     monkeypatch.setattr(cw, "VERIFY_TIMEOUT", 1)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"proj:0.0"}))
     yield
 
 

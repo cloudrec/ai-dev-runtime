@@ -18,6 +18,7 @@ from core import agent_continuation_watchdog as cw
 def _isolated_db(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"proj:0.0"}))
     monkeypatch.setattr(cw, "VERIFY_TIMEOUT", 1)      # keep failure-path polls short
     yield
 
@@ -67,6 +68,15 @@ def test_disabled_is_noop(monkeypatch):
     r = act.actuate(target="proj:0.0", action_text="continue", controller="c", lease=_lease(),
                     ctrl=FakeCtrl(), sleep=_no_sleep)
     assert r["acted"] is False and r["reason"] == "actuator_disabled"
+
+
+def test_non_canary_agent_never_actuated(monkeypatch):
+    # even ENABLED, an agent NOT on the canary allowlist is refused (single-agent cutover)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"only-canary:0.0"}))
+    ctrl = FakeCtrl()
+    r = act.actuate(target="other:0.0", action_text="continue safe", controller="c",
+                    lease=_lease(target="other:0.0"), ctrl=ctrl, sleep=_no_sleep)
+    assert r["acted"] is False and r["reason"] == "not_canary" and ctrl.sends == 0
 
 
 def test_no_or_stale_lease_rejected():

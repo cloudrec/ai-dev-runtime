@@ -32,6 +32,11 @@ from core.control_plane.store import connect, init_db, now_iso
 from core import agent_continuation_watchdog as cw
 
 ENABLED = os.getenv("CONTROL_PLANE_ACTUATOR_ENABLED", "0") not in ("0", "false", "no", "")
+# Per-agent canary allowlist. Even with ENABLED on, the actuator commands ONLY targets on
+# this explicit list — so a single-agent canary can never actuate any other managed agent.
+# Empty ⇒ actuate NOBODY (opt-in per agent, deny-by-default).
+CANARY_AGENTS = frozenset(t.strip() for t in
+                          os.getenv("CONTROL_PLANE_CANARY_AGENTS", "").split(",") if t.strip())
 
 AUTONOMOUS_SAFE = "autonomous_safe"
 OWNER_APPROVAL = "owner_approval_required"
@@ -114,6 +119,9 @@ def actuate(*, target: str, action_text: str, controller: str, conversation_id: 
     current, and policy is autonomous_safe."""
     if not ENABLED:
         return {"acted": False, "reason": "actuator_disabled"}
+    if target not in CANARY_AGENTS:
+        # deny-by-default: only explicitly allowlisted canary agents may be actuated
+        return {"acted": False, "reason": "not_canary"}
 
     resource = f"agent:{target}"
     # 1) lease + fence guard (restart-safe single-owner)

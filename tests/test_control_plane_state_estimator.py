@@ -88,6 +88,7 @@ class WorkingCtrl:
 def test_actuator_suppresses_continuation_to_working_agent(monkeypatch, tmp_path):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"arb:0.0"}))
     lease = cp.acquire_lease("agent:arb:0.0", "ctrl", now=1000)
     ctrl = WorkingCtrl(tail="✶ Pouncing… (8s · thinking)")     # actively thinking
     r = act.actuate(target="arb:0.0", action_text="continue with the next safe step",
