@@ -11,7 +11,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def db_path() -> str:
@@ -115,6 +115,17 @@ CREATE TABLE IF NOT EXISTS resource_lease (
 CREATE TABLE IF NOT EXISTS policy (
     id INTEGER PRIMARY KEY AUTOINCREMENT, action_pattern TEXT, policy_class TEXT,
     scope TEXT, rationale TEXT);
+
+-- (v3) owner-decision PROVENANCE: an owner-gated action may ONLY proceed from a durable,
+-- authenticated owner_decision — never from raw pane text / UI answer summaries / model
+-- defaults / resumed transcript / automation prose. Records the source channel,
+-- authenticated actor, timestamp, the question/gate it answers, the exact answer, and a
+-- consumption state (so a duplicate answer or an answer to the wrong question is rejected).
+CREATE TABLE IF NOT EXISTS owner_decision (
+    id TEXT PRIMARY KEY, question_id TEXT, gate_id TEXT, source_channel TEXT,
+    actor TEXT, authenticated INTEGER DEFAULT 0, answer TEXT, decided_at TEXT,
+    consumption_state TEXT DEFAULT 'pending', created_at TEXT);
+CREATE INDEX IF NOT EXISTS ix_decision_q ON owner_decision(question_id);
 """
 
 
