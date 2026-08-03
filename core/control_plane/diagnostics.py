@@ -175,15 +175,21 @@ def registry_health_report(*, now: Optional[float] = None, fresh_within_secs: fl
     }
 
 
-def owner_gate_report(*, now: Optional[float] = None, conn=None) -> dict:
-    """Open owner gates (pending decisions) by kind + age. Read-only. Not a failure — a
-    backlog signal; `oldest_age_secs` surfaces a decision left unanswered too long."""
+def owner_gate_report(*, now: Optional[float] = None, sla_secs: float = 86400.0,
+                      breach_limit: int = 20, conn=None) -> dict:
+    """Open owner gates (pending decisions) by kind + age, with an SLA escalation dimension.
+    Read-only. A pending gate is backlog, NOT a system failure — so `status` stays green even
+    when overdue (the honest 'system healthy, owner action overdue' distinction). A gate open
+    longer than `sla_secs` (default 24h) is an SLA BREACH → surfaced in `sla_breaches` with
+    `escalate=True` so the owner/CTO sees a decision that has waited too long, without the
+    system mislabelling itself as broken."""
     now = now if now is not None else time.time()
     from core.control_plane import api as _cp
     gates = _cp.get_open_gates(conn=conn)
     by_kind: dict = {}
     oldest_age = None
     oldest_gate = None
+    breached = []
     for g in gates:
         by_kind[g.get("kind") or "unknown"] = by_kind.get(g.get("kind") or "unknown", 0) + 1
         e = _epoch(g.get("opened_at"))
@@ -191,14 +197,24 @@ def owner_gate_report(*, now: Optional[float] = None, conn=None) -> dict:
             age = now - e
             if oldest_age is None or age > oldest_age:
                 oldest_age, oldest_gate = age, g.get("id")
+            if age > sla_secs:
+                breached.append({"id": g.get("id"), "kind": g.get("kind") or "unknown",
+                                 "age_secs": round(age)})
+    breached.sort(key=lambda b: b["age_secs"], reverse=True)
     return {
         "metric": "open_owner_gates",
         "open_total": len(gates),
         "by_kind": by_kind,
         "oldest_age_secs": (round(oldest_age) if oldest_age is not None else None),
         "oldest_gate_id": oldest_gate,
+        "sla_secs": sla_secs,
+        "breached_count": len(breached),
+        "sla_breaches": breached[:breach_limit],
+        "escalate": bool(breached),
         "status": "green",   # pending decisions are backlog, never a failure
-        "note": "pending owner decisions (backlog); requires owner action, not a system failure",
+        "note": (f"{len(breached)} owner decision(s) past SLA ({round(sla_secs)}s) — escalate "
+                 "to owner (still not a system failure)" if breached
+                 else "pending owner decisions (backlog); requires owner action, not a system failure"),
     }
 
 
@@ -636,6 +652,8 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         "same_chat_drain_alive": commander["drain_alive"],
         "stale_cto_cursors": cto["stale_consumers"],
         "open_gate_backlog": gates["open_total"],
+        "owner_gate_sla_breaches": gates["breached_count"],   # advisory: overdue owner decisions
+        "owner_gate_escalate": gates["escalate"],             # not red — owner action, not a fault
         "all_clear": healthy,
         "status": "green" if healthy else "red",
         "checked_at": (datetime.fromtimestamp(now, timezone.utc).isoformat()),

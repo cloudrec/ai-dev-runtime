@@ -566,3 +566,29 @@ cursor+lease persist across fresh connection; summary surfaces `restart_unsafe`)
 **Result.** Focused: 65 passed. **Full suite: 963 passed, 0 failed.** Live read-only:
 `restart_safe=True, supervisor=alive`; `observability_summary` green, `red_reasons=[]`. No
 restart-orphaned durable state present. Owner gates unchanged; canary scope unchanged.
+
+# ADDENDUM 11 — owner-gate SLA escalation (advisory, read-only)
+
+**Scope.** Read-only/internal. Extends `owner_gate_report`. No actuation change, no credentials,
+no publish/push, no payment/live/destructive, no agent create/resume.
+
+**Gap.** `owner_gate_report` measured `oldest_age_secs` but had no SLA threshold or per-gate
+escalation flag — an owner decision left unanswered for days looked identical to a fresh one.
+
+**Added.** `owner_gate_report(sla_secs=86400, breach_limit=20)`:
+- per-gate age vs SLA → `sla_breaches` (id, kind, age; oldest-first, capped), `breached_count`,
+  `escalate` bool. Default SLA 24h.
+- **Deliberate honesty invariant:** `status` stays **green** even when gates are overdue. A
+  pending gate is an *owner action*, not a *system failure* — flipping the system to red on an
+  unanswered gate would misattribute owner latency to engine health. The breach surfaces as a
+  distinct escalation signal instead.
+- `observability_summary` exposes `owner_gate_sla_breaches` + `owner_gate_escalate` as
+  **advisory** fields; they do NOT enter `red_reasons` (system stays green).
+
+**Tests.** +4 in `tests/test_control_plane_diagnostics.py` (no-breach within window; breach is
+escalation not failure, oldest-first ordering; breach list capped; summary advisory-not-red).
+
+**Result.** Focused: 59 passed. **Full suite: 967 passed, 0 failed.** Live read-only: 7 open
+gates, oldest ≈12h, **0 past the 24h SLA** → `escalate=False`, `summary=green`,
+`red_reasons=[]`. Correct: system healthy, no owner decision yet overdue. Owner gates + canary
+scope unchanged.

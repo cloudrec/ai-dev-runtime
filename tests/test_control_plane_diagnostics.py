@@ -631,3 +631,41 @@ def test_summary_includes_restart_safety_and_red_reason(tmp_path, monkeypatch):
     _notif("sending", NOW - 30)        # restart-orphaned
     s = diag.observability_summary(now=NOW)
     assert s["restart_safe"] is False and "restart_unsafe" in s["red_reasons"] and s["status"] == "red"
+
+
+# ── owner-gate SLA escalation (advisory, never flips system to failure) ───────
+def test_owner_gate_sla_no_breach_within_window():
+    _gate_row("g1", "classify_scope", NOW - 3600)          # 1h old, SLA 24h
+    r = diag.owner_gate_report(now=NOW, sla_secs=86400)
+    assert r["breached_count"] == 0 and r["escalate"] is False
+    assert r["sla_breaches"] == [] and r["status"] == "green"
+
+
+def test_owner_gate_sla_breach_is_escalation_not_failure():
+    _gate_row("g1", "classify_scope", NOW - 100000)        # >24h old → breach
+    _gate_row("g2", "unverified_owner_decision", NOW - 200000)  # older breach
+    _gate_row("g3", "canary_agent_selection", NOW - 600)   # fresh, no breach
+    r = diag.owner_gate_report(now=NOW, sla_secs=86400)
+    assert r["breached_count"] == 2 and r["escalate"] is True
+    assert [b["id"] for b in r["sla_breaches"]] == ["g2", "g1"]   # oldest breach first
+    assert r["status"] == "green"                          # escalation, NOT a system failure
+    assert "escalate" in r["note"]
+
+
+def test_owner_gate_sla_breach_list_is_capped():
+    for i in range(25):
+        _gate_row(f"gg{i}", "classify_scope", NOW - 100000 - i)
+    r = diag.owner_gate_report(now=NOW, sla_secs=86400, breach_limit=20)
+    assert r["breached_count"] == 25 and len(r["sla_breaches"]) == 20
+
+
+def test_summary_gate_sla_breach_is_advisory_not_red(tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty.db"))
+    sqlite3.connect(str(tmp_path / "empty.db")).execute(
+        "CREATE TABLE jobs(id TEXT,status TEXT,created_at TEXT,updated_at TEXT,finished_at TEXT)")
+    _agent_row("cp:0.0", NOW - 5, "managed")
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 5, dal_ts=NOW - 5, sup_ts=NOW - 5)
+    _gate_row("g1", "classify_scope", NOW - 200000)        # long-overdue owner gate
+    s = diag.observability_summary(now=NOW)
+    assert s["owner_gate_sla_breaches"] == 1 and s["owner_gate_escalate"] is True
+    assert s["status"] == "green" and s["red_reasons"] == []   # overdue owner action != failure
