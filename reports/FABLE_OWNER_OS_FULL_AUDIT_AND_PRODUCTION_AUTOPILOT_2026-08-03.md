@@ -218,7 +218,8 @@ live while idle with unfinished work (`autopilot_run` rows 15, 17) — the Actua
   session's four live-found fixes + all new tests).
 - this report is committed on top of `11c4382` (docs commit `b362850`). Nothing pushed.
 - post-report: `45cfb37` — fix(autopilot): delivered-poke ledger dedupe (re-review
-  finding, §10; committed locally, deliberately NOT deployed — see §10), followed by
+  finding, §10; NOW LIVE since the 22:29:37Z restart — see the §10 deployment
+  record, which supersedes the earlier "not deployed" statement), followed by
   this correction pass (docs only).
 
 ## 8. Limitations
@@ -290,12 +291,44 @@ commit `45cfb37` (a delivered poke is always recorded), regression test
 `test_delivered_poke_is_never_deduped_out_of_the_ledger` proven to fail pre-fix;
 suite 1092.
 
-**OWNER DECISION — deliberately NOT deployed:** `45cfb37` is committed locally only.
-The owner chose to leave the running `ai-runtime.service` (started 21:40:27Z) on
-`b362850`, so the LIVE service still carries the ledger-dedupe observability bug: a
-delivered poke following a same-decision row within 1h will not appear in
-`autopilot_run` until a redeploy. Observability-only — delivery, dedupe and
-`cp_action` receipts are unaffected.
+**DEPLOYMENT RECORD (corrected 2026-08-04, final re-review) — the paragraph that
+previously stood here ("OWNER DECISION — deliberately NOT deployed … the LIVE service
+still carries the ledger-dedupe observability bug") is SUPERSEDED. True sequence:**
+
+1. The owner FIRST chose not to deploy `45cfb37`; at the time the correction pass
+   (`2d2ed5d`, 00:32 local) recorded that, the statement was believed current — but it
+   was already stale when committed (see 2).
+2. A subsequent owner follow-up was applied by the interface as "Deploy now", and the
+   coordinator restarted `ai-runtime.service` at **2026-08-04 00:29:37 CEST
+   (22:29:37Z)** — verified from systemd (`ExecMainStartTimestamp=Tue 2026-08-04
+   00:29:37 CEST`, MainPID 4063628; uvicorn startup logged 00:29:41 local). The
+   working tree at start time was `45cfb37`, so the live process runs the ledger-fix
+   code (`2d2ed5d`, committed 00:32:48 local, is docs-only and post-start — inert to
+   the running process).
+3. The owner then sent a STOP after the fact: do not deploy / restart / enable live
+   autopilot; if already started, halt, report exact state, do NOT roll back without
+   verification. Complied: **no rollback was performed and no further service changes
+   were made** — deliberate hold at the owner's instruction. Verified at re-review
+   (~22:40Z): same PID 4063628, same start timestamp, git history intact.
+4. **Live-effectiveness of the `_record_run` delta — latent, not active:** the module
+   is imported at startup, but `_record_run`'s only production caller is
+   `commander_autopilot.tick`, whose only in-process caller is `run_loop`, and the
+   startup log records `commander autopilot disabled (owner gate)` (00:29:41). The
+   context-budget loop imports only `load_registry`/`_real_tail` from that module.
+   So while the autopilot stays dormant, NO code path executes `_record_run`: the fix
+   is loaded but runtime-inert. It becomes effective the moment the owner enables
+   `COMMANDER_AUTOPILOT_ENABLED` (or a tick is invoked manually) — no further deploy
+   needed for it.
+5. Post-restart verification (independent, ~22:40Z): loops 5/5 alive 0 stalled;
+   consistency green (event 114, no violations); `restart_safe=True`; actuation scope
+   green (canary allowlist only); `cp_action` count 11 with newest row 21:52:29Z —
+   **nothing re-issued across the 22:29:37Z restart**; `autopilot_run` max id 18
+   (21:23:49Z) — no autopilot activity since; context budget ticking (22:35:45Z rows
+   for all 5 registry agents, all far under the 8 MB soft threshold). Six
+   `deliveries` rows after the restart are coordinator/owner-keyed manual API sends
+   (human-descriptive idempotency keys, e.g. `owneros-cancel-wrong-deploy-selection-…`),
+   with no corresponding `cp_action`/`cw_step`/`autopilot_run` rows — not from any
+   audited autonomous path.
 
 **Residual risks left open (accepted, documented):**
 - Fix (c)'s per-attempt transport keys narrow but do not eliminate the crash window:
