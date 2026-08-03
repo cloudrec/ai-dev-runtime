@@ -769,6 +769,17 @@ def agent_list() -> dict:
                 pending = _pane_pending_input(pane["target"])
         state = classify_state(pane["alive"], is_agent, tail,
                                pending_input=pending, shell_running=shell_running)
+        # OWNER TRUTH (payment): an externally_blocked caused by a recoverable key/credential/
+        # user selection issue is INTERNAL recovery, not an owner gate — downgrade the REPORTED
+        # state so the seo-backend agent_notifier (which reads this over HTTP) does not
+        # repeatedly notify the owner to install keys. Genuine vendor blocks and exhaustive
+        # absence/revocation are left intact. Pure/no side effects; scoped to recovery agents.
+        if is_agent and state == "externally_blocked":
+            try:
+                from core.control_plane import access_recovery as _ar
+                state, _ = _ar.reported_state(pane["target"], state, tail)
+            except Exception:  # noqa: BLE001 — reporting reclassification must never break inventory
+                pass
         agents.append({
             **pane,
             "command": redact(pane["command"]),

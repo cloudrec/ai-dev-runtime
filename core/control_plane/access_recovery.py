@@ -76,8 +76,36 @@ def classify(agent: str, text: str) -> dict:
     return {"class": "none", "host": host, "reason": "no_access_signal"}
 
 
+# external-block phrases that, FOR A RECOVERY AGENT, are key/credential/user SELECTION issues
+# (recoverable per owner truth — keys already installed), NOT a genuine vendor block. Quota /
+# rate-limit / 429 are deliberately EXCLUDED so a real vendor block still surfaces.
+_SELECTION_EXTERNAL_RE = re.compile(
+    r"(verification key|vendor key|awaiting vendor|api ?key required|credentials? required"
+    r"|input[_ ]required|key required|no identity|identity ?file|ssh|publickey|permission denied"
+    r"|\.ssh|host key|could not resolve|unknown user|invalid user)", re.I)
+
+
 def is_internal_recovery(agent: str, text: str) -> bool:
     return classify(agent, text)["class"] == "internal_recovery"
+
+
+def reported_state(agent: str, state: str, tail: str) -> tuple:
+    """State to REPORT to owner-notification consumers (e.g. the seo-backend agent_notifier,
+    which reads ai-runtime state over HTTP). Read-only/pure. For a recovery agent an
+    `externally_blocked` state whose evidence is a recoverable key/credential/user SELECTION
+    issue is downgraded to `idle` (not news → the owner is not re-notified to 'install keys').
+    A genuine vendor block (quota/rate-limit) is left untouched, and an EXHAUSTIVE
+    absence/revocation is left as `externally_blocked` so it still escalates once.
+
+    Returns (state, reclassified: bool)."""
+    if agent not in RECOVERY_AGENTS or state != "externally_blocked":
+        return state, False
+    t = tail or ""
+    if _ABSENT_REVOKED_RE.search(t):
+        return state, False                       # exhaustive absence/revocation → keep + escalate
+    if _SELECTION_EXTERNAL_RE.search(t):
+        return "idle", True                       # recoverable selection → not a block, not news
+    return state, False                           # other external blocks (quota/rate-limit) unchanged
 
 
 def should_escalate(agent: str, text: str) -> bool:

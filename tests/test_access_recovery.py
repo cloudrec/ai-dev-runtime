@@ -108,6 +108,59 @@ def test_pipeline_non_payment_access_failure_still_owner_event():
     assert r["ok"] is True and r["owner_action_required"] is True   # scoped to payment only
 
 
+# ── reported_state: seo-notifier-facing state downgrade (in-scope fix) ───────
+def test_reported_state_downgrades_recoverable_selection_block():
+    for tail in ("ssh root@ru-prod: Permission denied (publickey)",
+                 "credentials required to reach nl-edge",
+                 "no identity file for ru-prod",
+                 "could not resolve hostname nl-edge"):
+        s, rc = ar.reported_state("payment:0.0", "externally_blocked", tail)
+        assert s == "idle" and rc is True
+
+
+def test_reported_state_keeps_genuine_vendor_block():
+    # quota / rate-limit are NOT key-selection → payment stays externally_blocked (owner sees it)
+    for tail in ("vendor quota exceeded", "rate limited by upstream API", "429 too many requests"):
+        s, rc = ar.reported_state("payment:0.0", "externally_blocked", tail)
+        assert s == "externally_blocked" and rc is False
+
+
+def test_reported_state_keeps_exhaustive_absence_for_escalation():
+    s, rc = ar.reported_state("payment:0.0", "externally_blocked",
+                              "ru-prod: all ssh keys removed, access revoked")
+    assert s == "externally_blocked" and rc is False   # genuine absence still escalates
+
+
+def test_reported_state_only_affects_recovery_agents():
+    s, rc = ar.reported_state("email:0.0", "externally_blocked", "Permission denied (publickey)")
+    assert s == "externally_blocked" and rc is False
+
+
+def test_reported_state_passthrough_for_non_blocked_states():
+    for st in ("working", "idle", "waiting_owner", "shell_running", "completed"):
+        s, rc = ar.reported_state("payment:0.0", st, "Permission denied (publickey)")
+        assert s == st and rc is False
+
+
+def test_agent_list_applies_reported_state_downgrade(monkeypatch):
+    # simulate one payment pane that classify_state would call externally_blocked, prove
+    # agent_list reports it as idle (so the seo notifier never emits a blocked/install-keys event)
+    from core import agent_control as agc
+    monkeypatch.setattr(agc, "_tmux", lambda a: (0, "PANE", ""))
+    monkeypatch.setattr(agc, "parse_panes", lambda out: [
+        {"target": "payment:0.0", "session": "payment", "alive": True, "pid": 1,
+         "command": "claude", "cwd": "/opt/payment-orchestrator"}])
+    monkeypatch.setattr(agc, "find_claude_in_pane", lambda pid: {"pid": pid, "cwd": "/opt/payment-orchestrator"})
+    monkeypatch.setattr(agc, "_pane_tail", lambda *a, **k: "ssh root@ru-prod: credentials required (publickey)")
+    monkeypatch.setattr(agc, "_pane_shell_running", lambda pane: False)
+    monkeypatch.setattr(agc, "_pane_pending_input", lambda t: "")
+    monkeypatch.setattr(agc, "classify_state", lambda *a, **k: "externally_blocked")
+    monkeypatch.setattr(agc, "audit", lambda *a, **k: None)
+    inv = agc.agent_list()
+    st = [x for x in inv["agents"] if x["target"] == "payment:0.0"][0]["state"]
+    assert st == "idle"    # downgraded → not a notifiable blocker on the seo side
+
+
 # ── authenticated owner truth ────────────────────────────────────────────────
 def test_record_owner_truth_is_trusted():
     d = ar.record_owner_truth()
