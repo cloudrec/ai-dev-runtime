@@ -141,9 +141,22 @@ def actuate(*, target: str, action_text: str, controller: str, conversation_id: 
     if prior and prior["verified"]:
         return {"acted": False, "reason": "already_verified", "idempotent": True}
 
-    # 4) verified delivery (folded from the continuation watchdog)
+    # 3b) FALSE-IDLE GUARD — never command a truly-working agent. Re-read the pane and,
+    # if active-execution evidence is present (spinner timer / thinking / tokens / esc), or
+    # the agent is working/shell_running, refuse and record a correlated correction event.
     ctrl = ctrl or cw.Controller()
     cwd = cwd or (cp.get_agent(target) or {}).get("cwd") or ""
+    from core.control_plane import state_estimator as se
+    pre = ctrl.snapshot(target, cwd)
+    if se.has_active_marker(pre.get("tail") or "") or pre.get("state") in ("working", "shell_running"):
+        emit("actuator", "false_idle_corrected", agent_id=target, severity="info",
+             payload={"observed_state": pre.get("state"), "tail_tip": (pre.get("tail") or "")[-120:],
+                      "note": "agent is actively working — continuation suppressed"},
+             action_taken="suppressed continuation (target working)",
+             dedup_key=f"falseidle:{idkey}")
+        return {"acted": False, "reason": "target_working", "false_idle_corrected": True}
+
+    # 4) verified delivery (folded from the continuation watchdog)
     out = cw.deliver_and_verify(ctrl, target=target, cwd=cwd, action="deliver",
                                 step_text=action_text, expected_pending=action_text,
                                 sleep=sleep)

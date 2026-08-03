@@ -32,6 +32,7 @@ from core.control_plane import provenance as provenance  # noqa: F401
 from core.control_plane import actuator as actuator  # noqa: F401
 from core.control_plane import resolutions as resolutions  # noqa: F401
 from core.control_plane import notifier as notifier  # noqa: F401
+from core.control_plane import state_estimator as state_estimator  # noqa: F401
 from core.control_plane.api import close_gates  # noqa: F401
 
 SCHEMA_VERSION = store.SCHEMA_VERSION

@@ -636,7 +636,15 @@ AGENT_STATES = ("working", "shell_running", "waiting_input", "idle", "waiting_ow
 #   * a streaming token counter with an arrow: "↓ 2.4k tokens" / "↑ …".
 # Past-tense spinners ("Worked for", "Brewed for 11m 24s") are NOT active.
 _STATE_ACTIVE_RUN_RE = re.compile(
-    r"(esc to interrupt|…\s*\(\d+\s*m?s\b|[↑↓]\s*[\d.]+\s*k?\s*tokens\b)", re.I)
+    r"(esc to interrupt"
+    # a live spinner timer with the mid-dot separator: "(8s ·" / "(11m 24s ·" — this
+    # form appears ONLY while a turn/tool is running (Pouncing…/Noodling…/Beboppin…/
+    # Hyperspacing…/Osmosing…/Shimmying… all render it), so a whimsical gerund is caught
+    # even when the word itself is unknown.
+    r"|\(\d+\s*m?s(\s+\d+s)?\s*·"
+    r"|·\s*thinking\b"
+    r"|…\s*\(\d+\s*m?s\b"
+    r"|[↑↓]\s*[\d.]+\s*k?\s*tokens\b)", re.I)
 # Blocked on something outside the agent's control (vendor key, credentials, quota).
 # NARROW on purpose: generic words like "waiting for", "timed out", "network error",
 # "reconnect", "502/503" appear constantly in benign SHELL/tool output and must NOT
