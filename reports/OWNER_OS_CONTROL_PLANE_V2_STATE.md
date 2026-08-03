@@ -41,6 +41,21 @@ an owner-action event that dead-letters (owner-push disabled = **G4**). This is 
 owner-gated. Loops all alive; drain alive; actuation confined to canary; all consistency
 invariants hold; no live duplicate agents.
 
+## Same-chat pinger — DEPLOYED (Stage 1 live on cp-canary)
+
+**2026-08-03 owner-authorized deploy DONE.** `ai-runtime` restarted; pinger live, scope-confined
+to cp-canary. Live acceptance PASS on all requirements (service healthy, discovery/continuation
+unaffected, no dup agents/actions, false-idle suppressed during real shell activity, ONE
+controlled cp-canary transition → exactly 1 durable event `id=67` + CTO inbox + commander mirror
+`id=505`, no repeat after 2nd restart, retry/dedupe intact). **Honest negative:** NO proactive
+message reached this ChatGPT conversation — `notifications_status`=RED, push dead-lettered (G4),
+`same_chat_wake_complete=false`. Delivery now uses REAL gated adapters (`_send_owner_push`
+telegram, `_send_same_chat` relay) — no fabricated receipts; both fail-closed (no creds/URL).
+All 3 blockers now terminate at external gates: connector-attach (platform), G5 relay endpoint
+(no ChatGPT inbound API), G4 telegram creds. Backup `/root/owner-os-backups/20260803T153940Z/`;
+rollback + full detail in `reports/OWNER_OS_PRODUCTION_ACCEPTANCE_2026-08-03.md`. Commits
+`1db15a4`→`3346444`→`941b76f`. Full suite 1000.
+
 ## Same-chat pinger (owner's #1 priority)
 
 Producer `core/control_plane/event_pipeline.py::publish_significant_event` — full owner-notify
