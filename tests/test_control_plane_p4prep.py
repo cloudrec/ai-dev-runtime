@@ -64,6 +64,15 @@ def test_bridge_routes_through_actuator_and_verifies(monkeypatch):
     assert h and h["holder"] == "continuation_watchdog"
 
 
+def test_routing_scoped_to_canary_agents_only(monkeypatch):
+    monkeypatch.setattr(cw, "ROUTE_VIA_ACTUATOR", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"canary:0.0"}))
+    assert cw._route_via_actuator("canary:0.0") is True        # canary → actuator
+    assert cw._route_via_actuator("other:0.0") is False        # non-canary → legacy inline
+    monkeypatch.setattr(cw, "ROUTE_VIA_ACTUATOR", False)
+    assert cw._route_via_actuator("canary:0.0") is False        # routing off → legacy
+
+
 def test_routing_is_safe_noop_when_actuator_disabled(monkeypatch):
     monkeypatch.setattr(act, "ENABLED", False)          # default posture
     ctrl = FakeCtrl()
@@ -77,6 +86,7 @@ def test_run_once_route_flag_on_but_actuator_off_delivers_nothing(monkeypatch):
     monkeypatch.setattr(cw, "ENABLED", True)
     monkeypatch.setattr(cw, "ROUTE_VIA_ACTUATOR", True)
     monkeypatch.setattr(act, "ENABLED", False)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"arb:0.0"}))  # route this canary
 
     agents = [{"target": "arb:0.0", "session": "arb", "is_agent": True, "alive": True,
                "state": "idle", "claude_cwd": "/opt/arbitrage2",

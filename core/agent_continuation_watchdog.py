@@ -381,6 +381,19 @@ def _count_route_skip(h: dict, reason: str) -> None:
     h["last_action"] = f"route_noop:{reason}"
 
 
+def _route_via_actuator(target: str) -> bool:
+    """Route to the Actuator ONLY when routing is enabled AND this target is an explicit
+    canary agent. So enabling the routing retires the legacy inline path for the canary
+    alone — all other agents keep the proven legacy path."""
+    if not ROUTE_VIA_ACTUATOR:
+        return False
+    try:
+        from core.control_plane import actuator
+        return target in actuator.CANARY_AGENTS
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def deliver_via_actuator(target: str, step_text: str, conversation_id: str, cwd: str, ctrl):
     """P4-prep bridge: acquire the agent lease and route delivery through the canonical
     Control Plane Actuator. Safe no-op when the actuator is disabled. Returns the
@@ -507,10 +520,11 @@ def run_once(ctrl=None, *, now_ts: Optional[float] = None, sleep=time.sleep) -> 
                 # submit / deliver with verification + one retry. The text expected
                 # to LEAVE the input line is the step itself (the already-typed line
                 # for submit; the just-delivered text for deliver).
-                if ROUTE_VIA_ACTUATOR:
-                    # P4-prep path: route through the canonical lease-gated Actuator. If the
-                    # actuator is disabled (or not our lease), this is a safe no-op — nothing
-                    # is delivered and the tick records no change.
+                if _route_via_actuator(target):
+                    # Route through the canonical lease-gated Actuator, but ONLY for an
+                    # explicitly allowlisted canary agent — so the legacy inline path is
+                    # retired for the canary while every other agent keeps it. If the
+                    # actuator is disabled (or not our lease), this is a safe no-op.
                     bridged = deliver_via_actuator(target, step_text, conv_id, cwd, ctrl)
                     if bridged.get("reason") in ("actuator_disabled", "stale_or_no_lease",
                                                  "already_verified", "lease_lost_midaction"):
