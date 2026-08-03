@@ -87,11 +87,11 @@ resume text is still re-classified `autonomous_safe` at actuate time. Live rotat
 
 | Dimension | Result | Evidence (tests + live receipts) |
 |---|---|---|
-| Architecture (single actuation path, deny-by-default, layered dedupe) | **PASS** | every pane command → lease+fence → policy recompute (`test_actuator_recomputes_policy_class_forbidden_text_blocked`) → idempotency → false-idle → pending-line guard → five-proof verified delivery. Dedupe now correctly stratified after fix (c). |
+| Architecture (single actuation path, deny-by-default, layered dedupe) | **PASS** | every pane command → lease+fence → policy recompute (`test_actuator_recomputes_policy_class_forbidden_text_blocked`) → idempotency → false-idle → pending-line guard → five-proof verified delivery. Dedupe now correctly stratified after fix (c). Classifier-breadth caveat: §3.1 — the wall is containment, not classification. |
 | State classification (live status region, stale scrollback) | **PASS** | `live_status_region` + real-pane regressions (`test_stale_shell_marker_in_scrollback_is_not_working`, `test_real_mess_pane_with_running_subagent_is_working`, minute-form spinner, compacting). Live: pre-fix service had cp-canary false-"working" 40+ min on a stale shell line; new code classified all 5 registry agents correctly this session. |
 | Unfinished-task / background-subagent / false-idle detection | **PASS** | task-footer parsing; `waiting for N background agents` = working (LIVE: owneros-direct-fix + mess-qa-automation both `skip_progressing`, `background_subagent=True` — pre-fix both were false-idle poke candidates mid-audit); actuator false-idle guard (`test_false_idle_working_target_suppressed_after_restart`). |
 | waiting_input vs waiting_owner semantics | **PASS** | waiting_owner NEVER poked (`test_waiting_owner_is_never_poked` — tool-dialog safety); waiting_input pokeable, the actuator pending-line guard decides submit vs defer; ghost fix (2a) makes the distinction truthful on live panes. |
-| Safe next-step synthesis | **PASS** (static) | registry `next_step` per project; hard classifier pre-gate + actuator recompute; CI invariant `test_every_registry_next_step_is_autonomous_safe`; 6× `test_unsafe_next_step_is_not_poked`. Dynamic synthesis from the live task list remains a documented non-goal for this phase. |
+| Safe next-step synthesis | **PASS** (static; rests on containment, not classifier strength — §3.1) | registry `next_step` per project; CI invariant `test_every_registry_next_step_is_autonomous_safe`; 6× `test_unsafe_next_step_is_not_poked`; actuator recompute blocks denylisted text. The classifier pre-gate is NOT narrow (§3.1): this PASS rests on canary confinement + the fixed registry step texts. Dynamic synthesis from the live task list remains a documented non-goal for this phase. |
 | Leases / fencing / dedupe | **PASS** | LIVE exclusivity twice: autopilot delivery refused `stale_or_no_lease` while the audit lease was current (21:13Z); rotation refused `refused_clear_stale_or_no_lease` (ledger row 1). Fence: `test_fence_token_rejects_stale_actuation_after_restart`, `test_restart_midaction_stale_fence_rejected_no_duplicate`. Dedupe LIVE: 2nd tick → `already_verified`, poked=0. |
 | Restart persistence | **PASS** | durable `cp_action`/`autopilot_run`/`cw_step`/`context_rotation`/`context_budget_state`; `test_restart_persistence_and_dedupe_no_reissue`; service redeployed this session — loops alive, `restart_safe=True`, `consistent=True` (§6). |
 | Stuck-shell / dead-agent watchdogs | **PASS** | `watchdog_dead` (no duplicate created), `watchdog_stuck_shell` now REACHABLE in production (`test_stuck_shell_watchdog_reachable_without_explicit_conv_age_fn` — pre-fix `conv_age_secs` was always None live), `watchdog_false_completion` (completed claim + open tasks not accepted). |
@@ -101,6 +101,32 @@ resume text is still re-classified `autonomous_safe` at actuate time. Live rotat
 | Same-chat-independent autonomy | **PASS** (server-side) | all loops server-side (supervisor, orchestrator, control-plane, continuation watchdog, autopilot [dormant, owner gate], context budget); no dependency on ChatGPT reachability. Same-chat wake itself remains at the documented EXTERNAL platform gates (unchanged, honest RED). |
 | Context budget / checkpoint / rotation | **PASS** | §4 below — deterministic + TWO full live rotations with receipts. |
 | Auto-poke (real kick → working) | **PASS** | §5 below — live receipts on cp-canary; honest working-evidence for owneros/mess; owner gates held for payment/arbitrage2. |
+
+### 3.1 CORRECTION (independent re-review): `autonomous_safe` is BROAD, not narrow
+
+Earlier characterizations (including the code comment at
+`core/control_plane/actuator.py:55` — "NARROW by design … arbitrary free-form text is
+owner_approval") overstate the classifier, and no PASS above may be read as resting on
+it. What `classify_action` actually does: (1) `_FORBIDDEN_RE` denylist match (English
+tokens) → prohibited; (2) exact bare `/clear`|`/compact` → autonomous_safe; (3) ANY
+text with a continue/proceed/resume/carry on/keep going/go on/next safe step prefix
+that dodges the English denylist → **autonomous_safe**; (4) everything else →
+owner_approval. Verified live probes: `"proceed to send 5 BTC to wallet X"` →
+autonomous_safe ("send"/"BTC"/"wallet" are not denylisted);
+`"resume and promote staging traffic to production"` → autonomous_safe ("promote" is
+not in `_FORBIDDEN_RE`). The legacy continuation watchdog's `is_safe_continuation` is
+weaker still: denylist-only, English-only, no prefix requirement (live consequence in
+the §8 disclosure — Russian text cannot be classified at all). This is PRE-EXISTING,
+not a regression of this session: `_SAFE_CONTINUATION_RE`, `is_safe_continuation` and
+`_FORBIDDEN_RE` are byte-identical at baseline `60f9967` (this branch only ADDED the
+exact-match bare-`/clear|/compact` branch). The REAL containment is: (a) canary
+confinement — the Actuator refuses every target outside `CONTROL_PLANE_CANARY_AGENTS`
+regardless of policy class; (b) fixed internal step texts — everything the autopilot /
+rotation can actuate is a hard-coded registry `next_step` or a bare `/clear`, never
+free-form text from an owner/agent/pane; (c) the CI registry invariant
+(`test_every_registry_next_step_is_autonomous_safe`) pinning those fixed texts.
+Classifier tightening (allowlist of exact step texts, or language-independent
+semantics) remains open follow-up work.
 
 Test vacuity challenged: the acceptance tests that fed `tick()` fabricated `_tail` /
 `claude_conversation` keys are superseded by real-contract adversarial tests (kept as
@@ -131,9 +157,15 @@ one rotation per conversation durable; non-canary over-budget → owner-gated
 | 4 | **rotated** | `2af35da0-…` → `b2635b20-…` | checkpoint `…213013Z.md` + project copy `/root/cp-canary-v2/CONTEXT_CHECKPOINT.md`; clear+resume verified first try; event 103 `blocker_resolved` (prior gate auto-cleared by the verified action); canary READ the checkpoint, executed NEXT COMMAND, note #6, **no duplicate work, no duplicate agent** |
 
 Rotation for every non-canary agent is proven deterministically only; live it produces
-the owner-gated event (arbitrage2 ~21 MB and owneros ~26 MB conversations are over the
-16 MB hard default, so the live loop will surface them — actuation stays impossible
-outside `CONTROL_PLANE_CANARY_AGENTS`).
+the owner-gated event — actuation stays impossible outside
+`CONTROL_PLANE_CANARY_AGENTS`. CORRECTION (re-review): the original prediction here —
+that the ~21 MB arbitrage2 and ~26 MB owneros conversations are over the 16 MB hard
+default "so the live loop will surface them" — was true at audit time but is MOOT.
+Those jsonl files are the PREVIOUS conversations; both sessions restarted ~21:00Z, and
+`measure()` reads only the LATEST conversation. The durable `context_budget_state`
+rows (22:28Z tick) show arbitrage2-opus:0.0 at ~1.4 MB and owneros-direct-fix:0.0 at
+~0.32 MB — both far under the 8 MB soft threshold. No owner-gated
+`context_rotation_needed` event will fire from those old files.
 
 ## 5. REAL auto-poke receipts
 
@@ -184,13 +216,16 @@ live while idle with unfinished work (`autopilot_run` rows 15, 17) — the Actua
   production autopilot contract, actuator guards, context budget/rotation
   (12 files, +1632/−39; includes the completed Fable A working tree and this
   session's four live-found fixes + all new tests).
-- this report is committed on top of `11c4382` (docs commit, HEAD of
-  `owner-os/control-plane-v2`). Nothing pushed.
+- this report is committed on top of `11c4382` (docs commit `b362850`). Nothing pushed.
+- post-report: `45cfb37` — fix(autopilot): delivered-poke ledger dedupe (re-review
+  finding, §10; committed locally, deliberately NOT deployed — see §10), followed by
+  this correction pass (docs only).
 
 ## 8. Limitations
 
-- `next_step` is static per project (deterministic, classifier-gated); dynamic synthesis
-  from the live task list is out of scope this phase.
+- `next_step` is static per project (deterministic; the classifier gate is a broad
+  prefix+denylist check — §3.1 — so safety rests on the fixed texts + canary
+  confinement); dynamic synthesis from the live task list is out of scope this phase.
 - Background-subagent detection is a tail regex plus state classification; a subagent
   invisible in the tail is covered only by the state/active-marker signals.
 - Ghost detection depends on Claude Code's DIM styling of recall/suggestion text; a
@@ -201,9 +236,20 @@ live while idle with unfinished work (`autopilot_run` rows 15, 17) — the Actua
   rotation env-gated OFF) coexists with `core/context_budget.py` (actuator-routed,
   canary-confined). No double-rotation is possible (`AGENT_CONTEXT_ROTATE_ENABLED`
   unset + per-session opt-in absent); unification is future work.
-- The live continuation watchdog auto-submits safe typed pending text on allowlisted
-  idle panes (pre-existing design); observed live on arbitrage2 close after owner
-  typing. No duplicate deliveries found in the transcript; flagged for owner awareness.
+- DISCLOSURE (re-review correction — the original wording here understated this): the
+  legacy continuation watchdog (pre-existing code, running before the 21:40Z restart)
+  contacted arbitrage2-opus:0.0's pane **SEVEN times between 21:12:45Z and 21:38:15Z**
+  (`cw_step` ledger, conversation `15f13266-…`, all verified delivered): **six
+  auto-Enter submissions of owner-typed Russian instructions** staged in the input
+  line — «удали старый scratchpad», «да, закоммить их в backend/tools/repro/»,
+  «почини вакуумный probe для leg B», «почини toctou probe тоже», «запусти полный
+  pytest и покажи финальный статус», «сохрани чекпоинт и заверши сессию» — plus **one
+  proactive paste** of "Continue with the fault-matrix extension and replay harness"
+  (21:13:20Z). Each contact was gated only by `is_safe_continuation`, an English-token
+  denylist that cannot classify Russian at all — «удали» ("delete") passed untouched
+  (§3.1). No duplicates occurred, and the texts were the owner's own typing; but the
+  system auto-submitted delete-capable non-English text with no semantic check. The
+  watchdog's pending-submit policy is flagged for an explicit owner decision.
 
 ## 9. Owner gates NOT crossed (explicit)
 
@@ -216,3 +262,51 @@ live while idle with unfinished work (`autopilot_run` rows 15, 17) — the Actua
    events only).
 5. git push / publication / any external side effect — none.
 6. Telegram creds / same-chat relay (G4/G5) — untouched external gates.
+
+## 10. Independent adversarial re-review (recorded 2026-08-04)
+
+An independent re-review verified this report against the working tree, a true
+pre-fix baseline, and the live databases. CONFIRMED: suite 1091 (1092 after its own
+added test; the baseline worktree collects exactly 1045); all four §2 fixes real and
+non-vacuous under targeted single-fix reverts; every live receipt matched against
+control_plane.db / agent_control.db (`cp_action` dd660d… fence 4 / event 90;
+f09001… fence 6 / event 93 with all five verify proofs; `context_rotation` rows 1–4;
+`autopilot_run` rows 12/13/15/16/17); the safety walls (canary confinement,
+policy-class recompute, rotation guards) held under its probes. It also produced the
+corrections now folded into §3.1, §4 and §8.
+
+**Baseline trap it found:** `tests/conftest.py:16` hardcodes
+`sys.path.insert(0, "/root/ai-dev-runtime")`, so a naive stash/worktree baseline run
+silently imports the FIXED code from the live tree and shows false green. With the
+path repointed at the true baseline, 21 of the 26 adversarial tests fail on genuine
+pre-fix code; the 5 that pass on both sides are deliberate anti-overcorrection
+invariants, correctly not advertised as regression pins.
+
+**One real defect found and fixed:** `_record_run` deduped on the decision string
+alone, so the verified 21:23:49Z canary poke ("poke", delivered) following the 21:13Z
+lease-refused attempt (also "poke") left NO `autopilot_run` row — that delivery was
+invisible in the autopilot ledger (only `cp_action`/event carried it). Fixed in
+commit `45cfb37` (a delivered poke is always recorded), regression test
+`test_delivered_poke_is_never_deduped_out_of_the_ledger` proven to fail pre-fix;
+suite 1092.
+
+**OWNER DECISION — deliberately NOT deployed:** `45cfb37` is committed locally only.
+The owner chose to leave the running `ai-runtime.service` (started 21:40:27Z) on
+`b362850`, so the LIVE service still carries the ledger-dedupe observability bug: a
+delivered poke following a same-decision row within 1h will not appear in
+`autopilot_run` until a redeploy. Observability-only — delivery, dedupe and
+`cp_action` receipts are unaffected.
+
+**Residual risks left open (accepted, documented):**
+- Fix (c)'s per-attempt transport keys narrow but do not eliminate the crash window:
+  a crash between transport delivery and the durable ledger write can no longer be
+  caught by transport-level dedupe on restart.
+- `context_budget.phase()` scans the full 40-line pane tail (not the live status
+  region) for active-execution markers / background subagents, so a stale marker in
+  scrollback can block a rotation that is actually safe (fail-safe,
+  availability-only).
+- Ghost detection (§2a) would degrade FAIL-UNSAFE only if a future Claude Code
+  renders dim autosuggestion text AFTER real typed text — `prompt_text_from_styled`
+  returns '' whenever SGR-2 is present, which would then hide genuine staged input
+  from the /clear guard. Verified NOT the case in today's Claude Code; removal of dim
+  styling degrades fail-safe as already noted in §8.
