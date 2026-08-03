@@ -29,5 +29,6 @@ from core.control_plane import cto as cto  # noqa: F401
 from core.control_plane import discovery as discovery  # noqa: F401
 from core.control_plane import delivery as delivery  # noqa: F401
 from core.control_plane import provenance as provenance  # noqa: F401
+from core.control_plane import actuator as actuator  # noqa: F401
 
 SCHEMA_VERSION = store.SCHEMA_VERSION

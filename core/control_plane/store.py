@@ -11,7 +11,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def db_path() -> str:
@@ -126,6 +126,16 @@ CREATE TABLE IF NOT EXISTS owner_decision (
     actor TEXT, authenticated INTEGER DEFAULT 0, answer TEXT, decided_at TEXT,
     consumption_state TEXT DEFAULT 'pending', created_at TEXT);
 CREATE INDEX IF NOT EXISTS ix_decision_q ON owner_decision(question_id);
+
+-- (v4) canonical Actuator ledger: idempotency + attempt record for every command, keyed
+-- by (target, conversation, action) and STAMPED with the lease/fence it acted under, so a
+-- stale-fence (post-restart) actuation is rejected and never duplicated.
+CREATE TABLE IF NOT EXISTS cp_action (
+    idkey TEXT PRIMARY KEY, target TEXT, conversation_id TEXT, action_hash TEXT,
+    controller TEXT, lease_id TEXT, fence_token INTEGER, kind TEXT, policy_class TEXT,
+    submitted INTEGER DEFAULT 0, verified INTEGER DEFAULT 0, blocked INTEGER DEFAULT 0,
+    attempts INTEGER DEFAULT 0, outcome TEXT, created_at TEXT, updated_at TEXT);
+CREATE INDEX IF NOT EXISTS ix_cp_action_target ON cp_action(target, action_hash);
 """
 
 
