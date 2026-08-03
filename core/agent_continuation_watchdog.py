@@ -521,21 +521,29 @@ def run_once(ctrl=None, *, now_ts: Optional[float] = None, sleep=time.sleep) -> 
                 # to LEAVE the input line is the step itself (the already-typed line
                 # for submit; the just-delivered text for deliver).
                 if _route_via_actuator(target):
-                    # Route through the canonical lease-gated Actuator, but ONLY for an
-                    # explicitly allowlisted canary agent — so the legacy inline path is
-                    # retired for the canary while every other agent keeps it. If the
-                    # actuator is disabled (or not our lease), this is a safe no-op.
+                    # Route through the canonical lease-gated Actuator for this canary and
+                    # RETIRE the legacy path entirely for it: the Actuator owns the durable
+                    # record (cp_action) and the CTO event (action_verified/blocked), so the
+                    # watchdog writes NO cw_step and emits NO cw-ok here — it fully handles
+                    # the result and continues (no dual bookkeeping / double notification).
                     bridged = deliver_via_actuator(target, step_text, conv_id, cwd, ctrl)
-                    if bridged.get("reason") in ("actuator_disabled", "stale_or_no_lease",
-                                                 "already_verified", "lease_lost_midaction"):
-                        _count_route_skip(h, bridged.get("reason"))
-                        continue
-                    out = {"verify": bridged.get("verify") or {"ok": bool(bridged.get("verified"))},
-                           "retried": bool(bridged.get("retried"))}
-                else:
-                    out = deliver_and_verify(ctrl, target=target, cwd=cwd, action=d["action"],
-                                             step_text=step_text, expected_pending=step_text,
-                                             sleep=sleep)
+                    reason = bridged.get("reason")
+                    if reason in ("actuator_disabled", "stale_or_no_lease", "not_canary",
+                                  "already_verified", "lease_lost_midaction", "target_working"):
+                        _count_route_skip(h, reason)
+                    elif bridged.get("verified"):
+                        h["verified"] += 1
+                        h["last_action"] = f"actuator_continued:{target}"
+                        actions.append({"target": target, "action": "actuator", "verified": True})
+                    else:
+                        h["blocked"] += 1
+                        h["last_action"] = f"actuator_blocked:{target}:{reason}"
+                        actions.append({"target": target, "action": "actuator", "verified": False,
+                                        "reason": reason})
+                    continue      # legacy ledger/event bypassed → legacy retired for canary
+                out = deliver_and_verify(ctrl, target=target, cwd=cwd, action=d["action"],
+                                         step_text=step_text, expected_pending=step_text,
+                                         sleep=sleep)
                 v = out["verify"]
                 attempts = (prior["attempts"] if prior else 0) + 1 + (1 if out["retried"] else 0)
                 h["submitted"] += 1 if v.get("submitted") else 0

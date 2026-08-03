@@ -18,6 +18,7 @@ from core import agent_continuation_watchdog as cw
 @pytest.fixture(autouse=True)
 def _isolated_db(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))   # isolate legacy cw_step
     monkeypatch.setattr(cw, "VERIFY_TIMEOUT", 1)
     monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"proj:0.0"}))
     yield
@@ -71,6 +72,42 @@ def test_routing_scoped_to_canary_agents_only(monkeypatch):
     assert cw._route_via_actuator("other:0.0") is False        # non-canary → legacy inline
     monkeypatch.setattr(cw, "ROUTE_VIA_ACTUATOR", False)
     assert cw._route_via_actuator("canary:0.0") is False        # routing off → legacy
+
+
+def test_routing_retires_legacy_writes_cp_action_not_cw_step(monkeypatch):
+    # canary routed → Actuator owns the record (cp_action + action_verified); the legacy
+    # cw_step / cw-ok are NOT written for the canary (legacy retired for it).
+    monkeypatch.setattr(cw, "ENABLED", True)
+    monkeypatch.setattr(cw, "ROUTE_VIA_ACTUATOR", True)
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"canary:0.0"}))
+    agents = [{"target": "canary:0.0", "session": "canary", "is_agent": True, "alive": True,
+               "state": "idle", "claude_cwd": "/canary",
+               "_pending": "continue with the next safe step"}]
+
+    class Ctrl(FakeCtrl):
+        def inventory(self):
+            return {"agents": agents}
+
+        def load_config(self):
+            return {"sessions": {"canary": {"mode": "auto", "project": "cp"}}}
+
+        def emit(self, *a, **k):
+            return True
+
+    c = Ctrl()
+    cw.run_once(c, now_ts=1000, sleep=lambda _: None)
+    res = cw.run_once(c, now_ts=1000 + cw.IDLE_CONFIRM_SECS + 5, sleep=lambda _: None)
+    assert any(a.get("action") == "actuator" and a.get("verified") for a in res["actions"])
+    # cp_action has the verified row; cw_step (legacy) has NONE for the canary
+    import sqlite3
+    from core.control_plane.store import db_path
+    cpa = sqlite3.connect(db_path()).execute(
+        "SELECT count(*) FROM cp_action WHERE target='canary:0.0' AND verified=1").fetchone()[0]
+    import os
+    cws = sqlite3.connect(os.environ["AGENT_CONTROL_DB"]).execute(
+        "SELECT count(*) FROM cw_step WHERE target='canary:0.0'").fetchone()[0]
+    assert cpa >= 1 and cws == 0
 
 
 def test_routing_is_safe_noop_when_actuator_disabled(monkeypatch):
