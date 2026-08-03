@@ -178,7 +178,11 @@ def _record_run(target: str, decision: str, detail: dict, conn=None) -> None:
                      "detail TEXT)")
         prev = conn.execute("SELECT decision, ts FROM autopilot_run WHERE target=? "
                             "ORDER BY id DESC LIMIT 1", (target,)).fetchone()
-        if prev and prev[0] == decision:
+        # A DELIVERED poke is always recorded: dedupe compares only the decision string,
+        # so a verified delivery following a refused attempt (both "poke") would otherwise
+        # leave no ledger row at all (2026-08-03 live: the verified 21:23:49Z canary poke
+        # was invisible in autopilot_run — only cp_action/event carried it).
+        if prev and prev[0] == decision and not detail.get("delivered"):
             from datetime import datetime
             try:
                 age = now_ts() - datetime.fromisoformat(prev[1]).timestamp()

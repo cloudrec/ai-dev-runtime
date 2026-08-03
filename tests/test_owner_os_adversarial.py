@@ -247,6 +247,24 @@ def test_autopilot_run_ledger_dedupes_repeated_skips(tmp_path, monkeypatch):
     assert n == 1, f"expected 1 deduped ledger row, got {n}"
 
 
+def test_delivered_poke_is_never_deduped_out_of_the_ledger():
+    """Live 2026-08-03: a refused poke (stale lease) followed 10 min later by the
+    VERIFIED poke — both decision "poke" — left the verified delivery with no
+    autopilot_run row at all (dedupe compared only the decision string). A row whose
+    detail records delivered=True must always be written."""
+    import os
+    import sqlite3
+    t = "dedupe-poke-test:0.0"
+    ap._record_run(t, "poke", {"delivered": False, "actuation_reason": "stale_or_no_lease"})
+    ap._record_run(t, "poke", {"delivered": True})
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    rows = conn.execute("SELECT detail FROM autopilot_run WHERE target=? ORDER BY id",
+                        (t,)).fetchall()
+    conn.close()
+    assert len(rows) == 2, f"verified delivery must be durable, got {len(rows)} rows"
+    assert '"delivered": true' in rows[1][0]
+
+
 # ── 2b. waiting_owner is never a poke target; glyph noise must not block pokes ─
 def test_waiting_owner_is_never_poked():
     """Pre-fix: POKE_STATES included waiting_owner, so the autopilot would deliver
