@@ -30,9 +30,11 @@ def emit(source: str, type: str, *, project_id: str = "", agent_id: str = "",
          payload: Optional[dict] = None, evidence_ref: str = "", action_taken: str = "",
          correlation_id: str = "", dedup_key: str = "", dedup_window_secs: int = 900,
          supersedes: int = 0, resolves: int = 0, push_channel: str = "telegram",
-         conn=None) -> dict:
+         push: Optional[bool] = None, conn=None) -> dict:
     """Record a CTO event and, for high/critical severity or owner_action_required,
-    enqueue a durable owner push. Returns {event_id, pushed, notification_id?}."""
+    enqueue a durable owner push. Returns {event_id, pushed, notification_id?}.
+    `push=False` forces inbox-only (used for channel-health meta-events, which must not
+    recurse by pushing through the very channel that is down)."""
     conn, own = _c(conn)
     try:
         eid = append_event(source, type, entity_type="agent" if agent_id else "",
@@ -44,7 +46,8 @@ def emit(source: str, type: str, *, project_id: str = "", agent_id: str = "",
                            dedup_window_secs=dedup_window_secs, supersedes=supersedes,
                            resolves=resolves, conn=conn)
         pushed = None
-        if severity in _PUSH_SEVERITIES or owner_action_required:
+        want_push = push if push is not None else (severity in _PUSH_SEVERITIES or owner_action_required)
+        if want_push:
             pushed = enqueue_notification(event_id=eid, channel=push_channel,
                                           dedup_key=dedup_key or f"evt:{eid}",
                                           correlation_id=correlation_id, conn=conn)

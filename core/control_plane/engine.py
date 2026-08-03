@@ -16,10 +16,11 @@ INTERVAL = int(os.getenv("CONTROL_PLANE_INTERVAL_SECS", "30"))
 
 
 def tick_once() -> dict:
-    from core.control_plane import discovery, delivery
+    from core.control_plane import discovery, delivery, notifier
     disc = discovery.discover()                    # observe-only registry reconcile
     health = delivery.refresh_channel_health()     # fail-closed delivery posture
-    return {"discovery": disc, "notifications": health["status"]}
+    notif = notifier.drain()                        # durable outbox: attempt/retry/dead-letter
+    return {"discovery": disc, "notifications": health["status"], "outbox": notif}
 
 
 async def run_loop() -> None:

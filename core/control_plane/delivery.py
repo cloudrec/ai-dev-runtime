@@ -121,7 +121,8 @@ def refresh_channel_health(conn=None) -> dict:
         # never silent: a red delivery posture is a durable owner-visible blocker
         from core.control_plane.cto import emit
         emit("delivery", "notifications_red", severity="critical", owner_action_required=True,
-             payload=status, dedup_key="notifications_red", dedup_window_secs=3600, conn=conn)
+             payload=status, dedup_key="notifications_red", dedup_window_secs=3600,
+             push=False, conn=conn)          # inbox-only: pushing a down-channel alert would recurse
     return status
 
 
