@@ -92,3 +92,59 @@
 No push/PR/publication. No trading service, exchange credential, or secret touched. P0/P1
 are additive and observe-only; no legacy controller was modified or disabled yet (that is
 the P4 cutover, owner-gated G1).
+
+---
+
+# ADDENDUM 2026-08-03 — live recovery + recovery-path fix + provenance invariant
+
+## Live recovery of arbitrage2-opus (SIGTERM 143 @ 04:17:43) — PASS
+
+- **Proved dead before touching anything:** session `arbitrage2-opus` had exactly 1 pane,
+  `pane_dead=1`; process 3384800 GONE; no live Claude on `/opt/arbitrage2` (no duplicate);
+  conversation `64715514-…` jsonl present on disk (7.5 MB).
+- **Root defect (fixed, `918db00`):** `agent_resume` refused because `has-session`
+  succeeds even when every pane is dead. New `_session_liveness` (pane_dead AND
+  process-alive per pane) → if all-dead, fenced `kill-session` then `claude --resume`; a
+  live pane is still refused. Deterministic tests added.
+- **Recovery evidence:** new pane live, **PID 605876**, cwd `/opt/arbitrage2`, cmdline
+  `claude --resume 64715514-f6bc-4290-9390-cda19127bc17`; **same conversation** (only one
+  jsonl, mtime advanced 04:17→04:25→…), `duplicate_created=false`; driven to **working**
+  on the documented safe step `Continue with the fault-matrix extension and replay
+  harness`.
+- **Correlated CP events:** `session_ended` → `recovery_attempted` → `recovery_verified` →
+  `recovery_working_verified` (all under one correlation id).
+- **Notification evidence preserved:** the death reached chat via `agent_notifier`; that
+  path is untouched.
+
+## Owner-decision PROVENANCE invariant (fixed, `6d56cc7`)
+
+- **Critical finding:** the resumed transcript showed `User answered Claude's questions:
+  Stop selling, waitlist instead` — a **pane UI answer summary @02:23 with NO authenticated
+  owner decision** (the ChatGPT conversation has none). The transcript already carried a
+  queued "URGENT owner-decision integrity rule" flag for exactly this string. Acting on it
+  would have been an unverified business/payment/publication decision.
+- **Hard rule implemented:** no owner-gated action may proceed from raw pane text / UI
+  answer summary / model default / resumed transcript / automation prose. Resolution
+  requires a durable correlated `owner_decision` (source_channel + authenticated actor +
+  timestamp + question/gate id + exact answer + consumption state). Unknown/untrusted/
+  mismatched/consumed ⇒ **gate stays open, action blocked, critical inbox event**.
+  `TRUSTED_CHANNELS` excludes pane/transcript/UI/automation sources.
+- **Live handling:** opened a **blocked** `owner_gate` (`unverified_owner_decision`) +
+  `decision_provenance_unverified` (severity=critical, owner_action_required) for the
+  stop-selling claim; the Esc dismissed the menu with **no selection**; the agent was
+  driven only to the safe engineering step. The stop-selling claim was never acted on.
+- **Tests:** forged/stale/resumed text, missing decision, untrusted channel,
+  answer-to-wrong-question, duplicate-answer, empty-answer, verified happy path.
+
+## P2 status
+
+Actuator/leases primitives are in place: `resource_lease` + monotonic fence
+(`lease_is_current`, restart-safe, tested P0); verified-actuation pattern (submitted +
+pane_changed + prompt_consumed + conversation_modified + state_transitioned, robust retry)
+proven in the accepted continuation watchdog and exercised live in this recovery; the
+provenance invariant gates any owner-gated actuation. P2 next: fold these into ONE
+lease-gated Actuator service behind a flag and prove restart no-duplicate on a live agent
+(the fence primitive already blocks stale actuation). P4 cutover remains owner-gated (G1).
+
+Suite after this addendum: see final line of the progress run (control-plane + recovery +
+provenance tests all green).
