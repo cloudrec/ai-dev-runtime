@@ -157,6 +157,21 @@ async def _start_continuation_watchdog():
         logger.warning(f"continuation watchdog not started: {e}")
 
 
+@app.on_event("startup")
+async def _start_commander_autopilot():
+    # Commander autopilot: per-minute evaluation of critical projects (state + unfinished
+    # tasks + background subagents + last proven progress) and auto-delivery of the exact
+    # SAFE next step to an idle/waiting agent with unfinished pre-approved work. DORMANT by
+    # default (COMMANDER_AUTOPILOT_ENABLED off = owner gate); even enabled, actuation stays
+    # confined to CONTROL_PLANE_CANARY_AGENTS. No scope expansion without an owner decision.
+    import asyncio
+    try:
+        from core.commander_autopilot import run_loop as _ap_loop
+        asyncio.create_task(_ap_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"commander autopilot not started: {e}")
+
+
 # ---- движок и очередь ----
 engine = RuntimeEngine()
 

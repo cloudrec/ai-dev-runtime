@@ -1,0 +1,51 @@
+# Commander Autopilot — persistent registry of critical projects.
+#
+# The autopilot EVALUATES every registered agent each tick (state + unfinished tasks +
+# background subagents + last proven progress) and, when an agent is idle/waiting with
+# documented pre-approved SAFE unfinished work, delivers the exact next step to the EXISTING
+# agent via the canonical lease-gated Actuator and confirms the transition to working.
+#
+# SAFETY: actuation is routed through core.control_plane.actuator, which is confined to
+# CONTROL_PLANE_CANARY_AGENTS. An agent NOT in that allowlist is EVALUATED ONLY (read-only);
+# enabling its live actuation is an explicit owner gate (add it to CANARY_AGENTS). The step
+# text is additionally classified autonomous_safe (deny-by-default on destructive / live /
+# payment / credential / publication / push / deploy / ssh) before any delivery.
+#
+# end_state = the acceptance/definition-of-done; next_step = the documented SAFE continuation
+# delivered when the agent is idle/waiting with unfinished work.
+
+agents:
+  owneros-direct-fix:0.0:
+    project: ai-dev-runtime
+    root: /root/ai-dev-runtime
+    end_state: "Owner OS Commander autopilot green; observability + acceptance reports complete."
+    next_step: "continue with the next safe internal observability/report task; run tests; commit locally."
+    live_actuation: false          # owner gate — evaluate only until added to CANARY_AGENTS
+
+  cp-canary:0.0:
+    project: cp-canary-v2
+    root: /root/cp-canary-v2
+    end_state: "Disposable canary green; each safe dated log note recorded, no external effect."
+    next_step: "continue with the next safe canary note; append a dated line to the log; do nothing external."
+    live_actuation: true           # the authorized disposable canary (in CANARY_AGENTS)
+
+  payment:0.0:
+    project: payment-orchestrator
+    root: /opt/payment-orchestrator
+    end_state: "Server connection-mapping recovered (correct user/IdentityFile/alias); DR + Git reports corrected."
+    next_step: "continue the read-only connection-mapping recovery and record progress in the report; run read-only checks only."
+    live_actuation: false          # owner gate + payment execution must not be touched
+
+  arbitrage2-opus:0.0:
+    project: arbitrage2
+    root: /opt/arbitrage2
+    end_state: "June stable-period audit + clean-restart plan complete; no live trading."
+    next_step: "continue the next safe read-only audit step and update the audit report."
+    live_actuation: false          # owner gate — evaluate only
+
+  mess-qa-automation:0.0:
+    project: mess-qa-automation
+    root: /opt/mess-qa-automation
+    end_state: "QA automation suite green; reports produced; no destructive or external side effects."
+    next_step: "continue the next safe QA/test step; run the test suite; commit locally."
+    live_actuation: false          # owner gate — evaluate only
