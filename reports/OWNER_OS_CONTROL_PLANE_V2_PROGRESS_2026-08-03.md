@@ -207,3 +207,37 @@ only; touches no pane).
 G1 P4 actuation cutover on live agents · G3 push/PR/publication · G4 Telegram/credential
 channel config · G5 same-chat proactive wake trigger. P2/P3 shipped without hitting any
 (actuator proven via synthetic canary; no live pane actuated).
+
+---
+
+# ADDENDUM 2026-08-03 (3) — P4 PREPARATION (dormant) + blocker resolution (`b55a560`)
+
+Preparation only — NO cutover, NO legacy actuation disabled, all live flags OFF.
+
+- **Watchdog → Actuator routing (dormant):** new `CONTINUATION_VIA_ACTUATOR` flag (default
+  OFF) + `deliver_via_actuator` bridge that acquires the agent lease and routes delivery
+  through the canonical lease-gated Actuator. With the actuator disabled (or not our lease)
+  routing is a safe no-op (delivers nothing); flag-off keeps the legacy inline path
+  unchanged. Both `CONTINUATION_VIA_ACTUATOR` and `CONTROL_PLANE_ACTUATOR_ENABLED` verified
+  default OFF.
+- **Blocker-resolution events:** `resolutions.resolve_blocker` + `api.close_gates` close
+  SYSTEM blocker gates (actuation_failed/continuation/…) and emit a correlated
+  `blocker_resolved` event (resolves link, inbox-only) — the all-clear. NEVER closes an
+  owner-DECISION gate (scope/business/unverified_owner_decision), which still requires a
+  verified owner_decision. Wired into the actuator: an action blocked earlier that later
+  verifies clears its blocker.
+- **Tests (+5):** bridge routes+verifies under a watchdog lease; routing no-op when actuator
+  disabled; run_once route-on + actuator-off delivers nothing; blocked→verified emits
+  blocker_resolved and closes the system gate but preserves the owner-decision gate;
+  resolve_blocker never closes an owner-decision gate. **Full suite: 879 passed.**
+- Deployed dormant (code loaded; both flags OFF → behavior identical to before). Legacy
+  continuation watchdog still runs its proven inline path live.
+
+## STOP — owner gate G1
+
+P0→P3 shipped + P4 wiring is READY and dormant. The next step, **P4 cutover** (turning on
+`CONTROL_PLANE_ACTUATOR_ENABLED` + `CONTINUATION_VIA_ACTUATOR` on live agents and disabling
+the legacy inline actuation path), changes how real agents are commanded and is **owner-gated
+(G1)**. Stopping here per instruction. To proceed later: enable both flags for one canary
+agent, watch the CTO inbox for `action_verified` / `blocker_resolved`, then disable the
+legacy path once green.
