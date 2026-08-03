@@ -229,6 +229,95 @@ def lease_report(*, now: Optional[float] = None, conn=None) -> dict:
     }
 
 
+def cto_cursor_report(*, now: Optional[float] = None, stale_after_secs: float = 3600,
+                      conn=None) -> dict:
+    """CTO consumer cursor lag. Per the CTO contract a STALE cursor (unread events exist but
+    the cursor has not advanced within the window) is a health error — the consumer stopped
+    reading. No registered consumer is informational, not an error. Read-only."""
+    now = now if now is not None else time.time()
+    own = conn is None
+    if conn is None:
+        from core.control_plane.store import connect, init_db
+        conn = connect()
+        init_db(conn)
+    try:
+        latest = conn.execute("SELECT coalesce(max(id),0) FROM event").fetchone()[0]
+        rows = conn.execute("SELECT consumer,last_event_id,updated_at FROM cto_cursor").fetchall()
+    finally:
+        if own:
+            conn.close()
+    consumers = []
+    stale = 0
+    for consumer, last_id, updated_at in rows:
+        lag = latest - (last_id or 0)
+        age = (now - _epoch(updated_at)) if _epoch(updated_at) is not None else None
+        is_stale = lag > 0 and age is not None and age > stale_after_secs
+        stale += 1 if is_stale else 0
+        consumers.append({"consumer": consumer, "last_event_id": last_id, "lag": lag,
+                          "cursor_age_secs": (round(age) if age is not None else None),
+                          "stale": is_stale})
+    return {
+        "metric": "cto_cursor",
+        "latest_event_id": latest,
+        "consumers": consumers,
+        "consumer_count": len(rows),
+        "stale_consumers": stale,
+        "status": "red" if stale else "green",
+        "note": ("no CTO consumer has registered a durable cursor (informational)" if not rows
+                 else ("a CTO consumer cursor is stale — consumer stopped reading"
+                       if stale else "all CTO consumers current")),
+    }
+
+
+def _ac_db() -> str:
+    return os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+
+
+def commander_delivery_report(*, now: Optional[float] = None, stall_after_secs: float = 1800,
+                              ac_db: str = None) -> dict:
+    """Same-chat delivery health: unacked commander_events (drained + acked by agent_notifier).
+    A growing unacked backlog with no recent ack = the drain stalled → the owner is silently
+    NOT getting same-chat messages = health error. Read-only (mode=ro)."""
+    now = now if now is not None else time.time()
+    path = ac_db or _ac_db()
+    try:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.OperationalError:
+        return {"metric": "commander_same_chat_delivery", "total": 0, "unacked": 0,
+                "oldest_unacked_age_secs": None, "newest_ack_age_secs": None,
+                "drain_alive": True, "status": "green", "note": "commander store unavailable"}
+    try:
+        total = conn.execute("SELECT count(*) FROM commander_events").fetchone()[0]
+        unacked = conn.execute("SELECT count(*) FROM commander_events WHERE acknowledged=0").fetchone()[0]
+        oldest_unacked = conn.execute(
+            "SELECT min(ts) FROM commander_events WHERE acknowledged=0").fetchone()[0]
+        newest_acked = conn.execute(
+            "SELECT max(ts) FROM commander_events WHERE acknowledged=1").fetchone()[0]
+    except sqlite3.OperationalError:
+        conn.close()
+        return {"metric": "commander_same_chat_delivery", "total": 0, "unacked": 0,
+                "oldest_unacked_age_secs": None, "newest_ack_age_secs": None,
+                "drain_alive": True, "status": "green", "note": "no commander_events table"}
+    finally:
+        conn.close()
+    oldest_age = (now - _epoch(oldest_unacked)) if _epoch(oldest_unacked) is not None else None
+    newest_ack_age = (now - _epoch(newest_acked)) if _epoch(newest_acked) is not None else None
+    stalled = (unacked > 0 and oldest_age is not None and oldest_age > stall_after_secs
+               and (newest_ack_age is None or newest_ack_age > stall_after_secs))
+    drain_alive = not stalled
+    return {
+        "metric": "commander_same_chat_delivery",
+        "total": total,
+        "unacked": unacked,
+        "oldest_unacked_age_secs": (round(oldest_age) if oldest_age is not None else None),
+        "newest_ack_age_secs": (round(newest_ack_age) if newest_ack_age is not None else None),
+        "drain_alive": drain_alive,
+        "status": "green" if drain_alive else "red",
+        "note": ("agent_notifier drain keeping up (no stalled backlog)" if drain_alive
+                 else "same-chat drain STALLED — unacked events not delivered; owner not notified"),
+    }
+
+
 def observability_summary(*, now: Optional[float] = None) -> dict:
     """Combined read-only view. `all_clear` is true when there are no ACTIVE failures,
     regardless of historical totals — so a green system is not flagged by stale counters."""
@@ -239,9 +328,13 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     registry = registry_health_report(now=now)
     gates = owner_gate_report(now=now)
     leases = lease_report(now=now)
+    cto = cto_cursor_report(now=now)
+    commander = commander_delivery_report(now=now)
     active = notif["active"] + jobs["active"]
-    # overall red if there are ACTIVE failures OR the discovery engine looks stalled.
-    healthy = (active == 0) and registry["engine_alive"]
+    # overall red if there are ACTIVE failures, the discovery engine looks stalled, the
+    # same-chat drain stalled, or a CTO consumer cursor is stale (stopped reading).
+    healthy = (active == 0 and registry["engine_alive"]
+               and commander["drain_alive"] and cto["stale_consumers"] == 0)
     return {
         "notifications": notif,
         "notification_history": notif_hist,
@@ -249,9 +342,13 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         "registry_health": registry,
         "open_owner_gates": gates,
         "resource_leases": leases,
+        "cto_cursor": cto,
+        "commander_same_chat_delivery": commander,
         "active_failures_total": active,
         "historical_failures_total": notif["historical"] + jobs["historical"],
         "engine_alive": registry["engine_alive"],
+        "same_chat_drain_alive": commander["drain_alive"],
+        "stale_cto_cursors": cto["stale_consumers"],
         "open_gate_backlog": gates["open_total"],
         "all_clear": healthy,
         "status": "green" if healthy else "red",

@@ -268,3 +268,50 @@ failures. Root remains owner-push RED (gate G4), owner-gated.
 - Commit: local only; read-only diagnostics only (SELECT / `mode=ro`). No live behavior
   changed. Endpoint `GET /api/v1/control-plane/observability` now includes
   `notification_history`.
+
+---
+
+# ADDENDUM 4 — CTO cursor lag + same-chat delivery drain health (read-only)
+
+## Gap
+
+The CTO contract requires surfacing a "stale cursor / failed delivery as health errors," but
+no diagnostic existed for either the CTO consumer cursor lag or the agent_notifier same-chat
+delivery backlog. A silently stalled drain (unacked commander_events piling up) means the
+owner stops receiving same-chat messages with no signal.
+
+## Added (read-only)
+
+- `cto_cursor_report` — per CTO consumer: `lag` (latest_event_id − last_event_id) and
+  `cursor_age`; a cursor is **stale** (health error) only when it has unread events AND has
+  not advanced within the window. No registered consumer is informational, not an error.
+- `commander_delivery_report` — same-chat delivery: `total` / `unacked` /
+  `oldest_unacked_age` / `newest_ack_age` → **`drain_alive`**. Stalled = unacked backlog +
+  no recent ack → red (owner silently not notified). Reads `agent_control.db` `mode=ro`; safe
+  if the table is absent.
+- `observability_summary` now red if the same-chat drain stalled OR a CTO cursor is stale.
+
+## Live (read-only) result
+
+- CTO inbox latest event **#57**; **0 durable consumer cursors** registered → informational
+  green. *Observation:* the ChatGPT/CTO consumer currently reads ad-hoc rather than via the
+  persisted cursor (`cto_brief_since(..., ack=true)`); wiring a durable cursor would let lag
+  be measured — noted, not a failure.
+- Same-chat drain: **477 total, 0 unacked, newest ack ~6.5 min ago → `drain_alive=true`,
+  green** — agent_notifier is keeping up.
+- Summary: `status=green, all_clear=true, engine_alive=true, same_chat_drain_alive=true,
+  stale_cto_cursors=0`.
+
+## Tests / commit
+
+- Tests: **+7** (CTO no-consumer/current/stale/lagging-but-recent; commander drain
+  alive/stalled/recent-ack-despite-unacked). `test_control_plane_diagnostics.py` total **23**.
+  Full suite: see run.
+- Commit: local only; read-only. Endpoint `/observability` now includes `cto_cursor` +
+  `commander_same_chat_delivery`.
+
+## Genuine owner-gated remainder
+
+The dead-letter backlog clears only by enabling owner-push (**G4**, secret-bearing); the 6
+open owner gates need owner decisions; a durable CTO consumer cursor requires the ChatGPT
+side to adopt the ack contract. All owner-side — no autonomous action taken.

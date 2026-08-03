@@ -25,6 +25,7 @@ def _iso(ts):
 def _isolated(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "jobs.db"))
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))   # isolate commander store
     yield
 
 
@@ -219,6 +220,79 @@ def test_lease_live_vs_expired():
     r = diag.lease_report(now=NOW)
     assert r["total"] == 2 and r["live"] == 1 and r["expired_stale"] == 1
     assert r["live_holders"][0]["resource"] == "agent:a:0.0"
+
+
+# ── CTO cursor lag / staleness ───────────────────────────────────────────────
+def _events(n):
+    c = _conn()
+    for _ in range(n):
+        c.execute("INSERT INTO event(ts,ts_epoch,source,type) VALUES('t',0,'x','e')")
+    c.commit(); c.close()
+
+
+def _cursor(consumer, last_id, updated_ts):
+    c = _conn()
+    c.execute("INSERT INTO cto_cursor(consumer,last_event_id,updated_at) VALUES(?,?,?)",
+              (consumer, last_id, _iso(updated_ts)))
+    c.commit(); c.close()
+
+
+def test_cto_cursor_no_consumers_is_informational_green():
+    _events(5)
+    r = diag.cto_cursor_report(now=NOW)
+    assert r["consumer_count"] == 0 and r["status"] == "green" and "no CTO consumer" in r["note"]
+
+
+def test_cto_cursor_current_consumer_green():
+    _events(5)   # latest id = 5
+    _cursor("chatgpt", 5, NOW - 10)
+    r = diag.cto_cursor_report(now=NOW)
+    assert r["consumers"][0]["lag"] == 0 and r["stale_consumers"] == 0 and r["status"] == "green"
+
+
+def test_cto_cursor_stale_consumer_is_red():
+    _events(10)                         # latest id = 10
+    _cursor("chatgpt", 3, NOW - 8000)   # 7 unread, cursor not advanced in >1h → stale
+    r = diag.cto_cursor_report(now=NOW, stale_after_secs=3600)
+    assert r["consumers"][0]["lag"] == 7 and r["stale_consumers"] == 1 and r["status"] == "red"
+
+
+def test_cto_cursor_lagging_but_recent_is_not_stale():
+    _events(10)
+    _cursor("chatgpt", 3, NOW - 60)     # behind but advanced recently → not stale
+    r = diag.cto_cursor_report(now=NOW, stale_after_secs=3600)
+    assert r["consumers"][0]["lag"] == 7 and r["stale_consumers"] == 0 and r["status"] == "green"
+
+
+# ── commander same-chat delivery drain health ────────────────────────────────
+def _commander_db(path, rows):
+    c = sqlite3.connect(path)
+    c.execute("CREATE TABLE commander_events(id INTEGER PRIMARY KEY, ts TEXT, acknowledged INTEGER)")
+    for i, (ack, ts) in enumerate(rows):
+        c.execute("INSERT INTO commander_events VALUES(?,?,?)", (i + 1, _iso(ts), ack))
+    c.commit(); c.close()
+
+
+def test_commander_drain_alive_when_no_backlog(tmp_path):
+    p = str(tmp_path / "ac.db")
+    _commander_db(p, [(1, NOW - 100), (1, NOW - 50)])   # all acked, recent
+    r = diag.commander_delivery_report(now=NOW, ac_db=p)
+    assert r["unacked"] == 0 and r["drain_alive"] is True and r["status"] == "green"
+
+
+def test_commander_drain_stalled_when_unacked_backlog_and_no_recent_ack(tmp_path):
+    p = str(tmp_path / "ac.db")
+    _commander_db(p, [(1, NOW - 9000), (0, NOW - 7000), (0, NOW - 6000)])  # unacked, old, no recent ack
+    r = diag.commander_delivery_report(now=NOW, stall_after_secs=1800, ac_db=p)
+    assert r["unacked"] == 2 and r["drain_alive"] is False and r["status"] == "red"
+    assert "STALLED" in r["note"]
+
+
+def test_commander_recent_ack_means_not_stalled_despite_unacked(tmp_path):
+    p = str(tmp_path / "ac.db")
+    _commander_db(p, [(1, NOW - 60), (0, NOW - 30)])   # unacked but a very recent ack → draining
+    r = diag.commander_delivery_report(now=NOW, stall_after_secs=1800, ac_db=p)
+    assert r["unacked"] == 1 and r["drain_alive"] is True and r["status"] == "green"
 
 
 # ── summary: engine stall makes it RED even with zero active failures ────────
