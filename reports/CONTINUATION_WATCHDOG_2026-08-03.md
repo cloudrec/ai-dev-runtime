@@ -139,3 +139,76 @@ Trading services and exchange credentials are untouched.
 - Live functional submission was proven by the 23 deterministic tests + the live loop
   running with zero false actions; it was **not** exercised against a real user pane
   (no synthetic continuation was injected into a live agent, to avoid disturbing work).
+
+---
+
+# ADDENDUM 2026-08-03 — acceptance gap closed + REAL live acceptance PASS
+
+The first cut was **not accepted**: `arbitrage2-opus:0.0` was idle with a safe typed
+continuation but the watchdog reported `agents_checked=0` because the session was not
+configured — and health still looked "ok". Fixes below, ending in a real live PASS.
+
+## Additional changed files
+
+| File | Change | Commit |
+|---|---|---|
+| `config/agent_orchestrator.yaml` | add `arbitrage2-opus` as managed-auto (`mode: auto`) scoped to `/opt/arbitrage2`, `proactive_continue: true`, documented `safe_continuation`; bounded — `advance_phases: false`, no `auto_push`/`service_ops` (pushes/service-ops/credentials stay owner-gated). File-based ⇒ survives restart | `e0ef33a` |
+| `core/agent_continuation_watchdog.py` | (1) `health()` flags **misconfiguration** (`status: warning`, `no_eligible_sessions`) when enabled with zero managed-auto sessions, and surfaces `eligible_sessions`/`eligible_count`; (2) retry now uses **`robust_submit`** (clear line + paste + Enter via `agent_send`) instead of a bare Enter that does not land; `VERIFY_TIMEOUT` 8→12s; (3) a **BLOCKED step self-heals** — `should_skip_prior` re-attempts after a cooldown (600s) up to a cap (6), while VERIFIED never repeats | `e0ef33a`, `1e31a45` |
+| `tests/test_agent_continuation_watchdog.py` | +8 tests: real-config eligibility (`arbitrage2-opus`), zero-eligible warning, ok-when-eligible, missed-Enter→robust-resubmit recovery, blocked cooldown re-attempt / attempt-cap / verified-permanent | `e0ef33a`, `1e31a45` |
+
+Focused suite: **31 passed**. Full suite: **826 passed**.
+
+## Live root cause of the "missed Enter"
+
+The running watchdog re-reads the config each tick, so it picked up `arbitrage2-opus`
+and acted at **01:06:17Z**: a `submit` (bare `send-keys Enter`) on the typed line, then
+one retry, then a blocker with `verify = {submitted:true, pane_changed:false,
+prompt_consumed:false, conversation_modified:false, state_transitioned:false}` — the
+Enter did **not** land. The delivery log shows a human then force-continued the same
+agent 17s later via `agent_send` (key `arb2-force-continue-after-watcher-missed-enter`,
+`pane_changed:true`) — i.e. the paste+Enter path DOES land. So the fix routes the retry
+through `robust_submit` (clear + paste + Enter), and blocked steps become re-attemptable.
+
+## REAL live acceptance — PASS (2026-08-03 01:22:23Z)
+
+Sequence observed on the live `arbitrage2-opus:0.0` pane (bounded read-only monitor):
+
+1. Agent finished a 15m32s turn and went **idle** (empty input line), conv
+   `64715514-…`. Idle confirmed across the dwell (ticks [07],[08]).
+2. Watchdog (proactive) **delivered** the documented safe step `Continue with the
+   fault-matrix extension and replay harness` via the reliable `agent_send` path.
+3. **All five proofs true** — `verify = {submitted:true, pane_changed:true,
+   prompt_consumed:true, conversation_modified:true, state_transitioned:true, ok:true}`,
+   `retried:false`.
+4. Pane transitioned into real work: `❯ Continue with the fault-matrix extension and
+   replay harness` → `· Osmosing… (8s · thinking)`; conversation mtime advanced
+   `01:21:45Z → 01:22:22Z`.
+
+Durable evidence:
+- **cw_step**: `verified=1, blocked=0, attempts=3, last_outcome=verified,
+  conv=64715514, updated_at=01:22:23Z` (the stale blocker self-healed to verified).
+- **cw_health**: `agents_checked=1, submitted=1, verified=1, retried=0, blocked=0,
+  errors=0, last_action=continued:arbitrage2-opus:0.0:deliver, status=ok`.
+- **Commander event** `agent_continuation_submitted` (dedup `cw-ok:…`) carrying the
+  full `verify` block above + `step` + `cwd=/opt/arbitrage2`.
+- **Retry-once behaviour** was exercised live at 01:06:17Z (attempts=2 = deliver + one
+  retry) and is covered by the `missed-Enter → robust-resubmit` regression test.
+
+## Health misconfiguration surface
+
+`GET /api/v1/agents/continuation-watchdog/health` (and `agent_orchestrator.status()`)
+now return `eligible_sessions`, `eligible_count`, and `status` — `warning` +
+`no_eligible_sessions` when enabled with zero managed-auto sessions (so a watchdog that
+can never act no longer reports healthy). Post-fix live value: `status=ok`,
+`eligible_sessions=[arbitrage2-opus, job, seo-audit]`.
+
+## Scope / safety
+
+No trading service, exchange credential, secret, or git history touched; nothing
+pushed/published. `arbitrage2-opus` is bounded to `/opt/arbitrage2` analysis+code/tests;
+the watchdog refuses any destructive/live/payment/credential/publication text. Commits
+`e0ef33a`, `1e31a45` are local only.
+
+## Acceptance verdict: **PASS** — live watchdog detected the idle approved agent,
+delivered + verified the safe continuation (all five proofs), and drove
+`arbitrage2-opus` into real work, with durable `cw_step`/health/event evidence.
