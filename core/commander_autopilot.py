@@ -167,13 +167,33 @@ def evaluate(target: str, *, state: str, tail: str = "", conv_age_secs: Optional
                         "tail-based guards cannot be evaluated"}
     if state not in POKE_STATES:
         return {**base, "decision": "skip_other_state"}
+    # ZERO-HUMAN-PING classification (2026-08-04). An agent parked on "ready to continue
+    # on request" / "next block available" is NOT finished — it is work waiting for a
+    # ping, and supplying that ping is precisely this loop's job. A model/session limit
+    # is a WAIT, not a failure and not a terminal state. Only a verified completion or a
+    # real external dependency stops the loop.
+    from core import continuation_signals as sig
+    cls = sig.classify(tail)
+    base = {**base, "situation": cls["class"], "situation_reason": cls["reason"]}
+    if cls["class"] == "model_limit":
+        return {**base, "decision": "skip_model_limit",
+                "note": "model/session limit — the SAME session resumes after reset; "
+                        "not a technical failure"}
+    if cls["class"] == "external_block":
+        return {**base, "decision": "terminal_external_block", "note": cls["reason"]}
+    if cls["class"] == "terminal":
+        return {**base, "decision": "terminal_pass", "note": cls["reason"]}
+
     # idle/waiting with a task footer showing ZERO unfinished work = the documented
     # end-state is met — report it as such (registry end-state logic), don't poke.
-    if tf["present"] and tf["has_unfinished"] is False:
+    if tf["present"] and tf["has_unfinished"] is False and not sig.awaiting_ping(tail):
         return {**base, "decision": "end_state_met",
                 "note": "task footer shows no open/in-progress work — end-state met"}
-    # idle/waiting — is there unfinished pre-approved work?
-    has_work = (tf["has_unfinished"] is True) or (tf["has_unfinished"] is None and bool(step))
+    # idle/waiting — is there unfinished pre-approved work? A pane parked awaiting a ping
+    # counts as unfinished even with no task footer at all.
+    has_work = (tf["has_unfinished"] is True
+                or sig.awaiting_ping(tail)
+                or (tf["has_unfinished"] is None and bool(step)))
     if not has_work:
         return {**base, "decision": "skip_no_work"}
     if safety != "autonomous_safe":

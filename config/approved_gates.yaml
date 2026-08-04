@@ -1,0 +1,81 @@
+# Pre-approved gate registry — the ONLY dialogs Owner OS may answer automatically.
+#
+# Every entry binds ONE target to ONE command shape, with a scope and an expiry. Anything
+# not matched exactly is REFUSED (deny by default). A prohibited marker in the dialog text
+# (payment execution, promotion/failover, real orders, credentials, destructive verbs)
+# vetoes an entry even if it would otherwise match — see core/approved_gates.py.
+#
+# `command_pattern` must describe the WHOLE command: it is matched with re.fullmatch
+# against the whitespace-normalised, lower-cased command text.
+#
+# Owner-approved 2026-08-04. Scopes are deliberately narrow:
+#   mess_local_test      local test/lint/typecheck runs in the MESS repo
+#   arb_paper            isolated paper work: public read-only data, paper DB, local svc
+#   payment_standby      RU-2 passive standby plumbing ONLY (tunnel/backup/replication)
+#   owner_os_selftest    Owner OS' own tests and local git
+#
+# NOT granted here, deliberately: MESS build/sign/publish, any payment traffic or
+# provider/promotion/failover action, any venue adapter / key / real order, and any
+# arbitrary "Yes". Those stay human decisions; add an entry only with a real command.
+
+gates:
+  # ── Owner OS: its own test suite ──────────────────────────────────────────
+  - id: owneros-pytest
+    target: owneros-direct-fix:0.0
+    command_pattern: '(\./venv/bin/)?python3? -m pytest( -q| -x| tests/[a-z0-9_/\.]+)*'
+    scope: owner_os_selftest
+    answer: "1"
+    expires_at: "2026-08-11T00:00:00Z"
+    note: "run the repo suite; no network, no writes outside the repo"
+
+  # ── MESS: local verification only ─────────────────────────────────────────
+  - id: mess-local-tests
+    target: mess-qa-automation:0.0
+    command_pattern: '(npm|pnpm|yarn) (run )?(test|lint|typecheck)( --.*)?'
+    scope: mess_local_test
+    answer: "1"
+    expires_at: "2026-08-11T00:00:00Z"
+    note: "local test/lint/typecheck only; build, sign and publish are NOT approved here"
+
+  - id: mess-pytest
+    target: mess-qa-automation:0.0
+    command_pattern: '(\./venv/bin/)?python3? -m pytest( -q| -x| [a-z0-9_/\.]+)*'
+    scope: mess_local_test
+    answer: "1"
+    expires_at: "2026-08-11T00:00:00Z"
+
+  # ── Arbitrage2: isolated paper work ───────────────────────────────────────
+  - id: arb-paper-tests
+    target: arbitrage2-opus:0.0
+    command_pattern: '(\./venv/bin/)?python3? -m pytest( -q| -x| [a-z0-9_/\.]+)*'
+    scope: arb_paper
+    answer: "1"
+    expires_at: "2026-08-11T00:00:00Z"
+    note: "paper-only test runs; no venue adapters, no keys, no orders"
+
+  - id: arb-paper-migrate
+    target: arbitrage2-opus:0.0
+    command_pattern: 'alembic upgrade head'
+    scope: arb_paper
+    answer: "1"
+    expires_at: "2026-08-11T00:00:00Z"
+    note: "paper database schema only"
+
+  # ── Payment: RU-2 passive standby plumbing ONLY ───────────────────────────
+  # Reads and non-mutating checks of the standby. Nothing here touches payment traffic,
+  # provider accounts, promotion or failover — those are vetoed by the denylist too.
+  - id: payment-standby-replication-status
+    target: payment:0.0
+    command_pattern: 'psql -x?c? ?"?select \* from pg_stat_replication;?"?'
+    scope: payment_standby
+    answer: "1"
+    expires_at: "2026-08-11T00:00:00Z"
+    note: "read-only replication status on the standby"
+
+  - id: payment-standby-recovery-status
+    target: payment:0.0
+    command_pattern: 'pg_isready( -.*)?|systemctl status postgresql(@[a-z0-9\-]+)?'
+    scope: payment_standby
+    answer: "1"
+    expires_at: "2026-08-11T00:00:00Z"
+    note: "standby liveness check; no promotion, no failover, no traffic change"

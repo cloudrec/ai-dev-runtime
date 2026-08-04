@@ -305,6 +305,56 @@ def is_safe_continuation(text: str) -> bool:
     return bool(words) and all(w in _SAFE_STEP_VOCAB for w in words)
 
 
+_GATE_CMD_RE = re.compile(
+    r"(?:run|execute|allow|permit)?\s*(?:this\s+)?(?:command|tool)?\s*[:\-]?\s*"
+    r"[`\"']?([^\n`\"']{3,200})[`\"']?")
+
+
+def gate_command_text(tail: str) -> str:
+    """The command a permission dialog is asking about. Best effort and deliberately
+    conservative: if it cannot be isolated, the caller gets '' and REFUSES."""
+    lines = [ln.strip() for ln in (tail or "").splitlines() if ln.strip()]
+    for ln in reversed(lines[-14:]):
+        s = ln.lstrip("│┃|>❯ ").strip()
+        # a bare shell-ish line is the usual rendering of the proposed command
+        if re.match(r"^[a-z0-9_./\-]+(\s+\S+)*$", s, re.I) and len(s) >= 3:
+            if not re.match(r"^\d+[.)]", s) and "?" not in s:
+                return s[:200]
+    return ""
+
+
+def _approved_gate_answer(agent: dict, cfg: dict) -> dict:
+    """Consult the owner's pre-approved gate registry for this pane. Fail-closed."""
+    tail = agent.get("_tail") or ""
+    target = agent.get("target") or ""
+    try:
+        from core import approved_gates
+        command = gate_command_text(tail)
+        scopes = cfg.get("approved_gate_scopes") if isinstance(cfg, dict) else None
+        res = approved_gates.match(target, command, scope_allowed=scopes)
+        res["command"] = command
+        return res
+    except Exception as e:  # noqa: BLE001
+        return {"allowed": False, "reason": f"gate_registry_unavailable:{e}",
+                "command": ""}
+
+
+def _audit_gate(conn, target: str, decision: dict, *, answered: bool) -> None:
+    """Durable record of every gate answer — what was asked, which entry approved it."""
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS gate_answer_log (
+            ts TEXT, target TEXT, entry_id TEXT, command TEXT, answer TEXT,
+            reason TEXT, answered INTEGER)""")
+        conn.execute("INSERT INTO gate_answer_log VALUES (?,?,?,?,?,?,?)",
+                     (_now_iso(), target, decision.get("gate_entry") or "",
+                      (decision.get("gate_command") or "")[:400],
+                      (decision.get("step_text") or "")[:80],
+                      decision.get("reason") or "", 1 if answered else 0))
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _live_active_marker(tail: str) -> bool:
     """True when the LIVE status region shows real active execution. Fail-closed: if the
     shared detector is unavailable, fall back to the local regex over the whole tail
@@ -382,7 +432,18 @@ def decide(*, agent: dict, cfg: dict, pending: str, state: str, prev_target: Opt
         # idle, a visible system/tool-permission or confirmation dialog (RU or EN)
         # means a HUMAN answer is required — pressing Enter or pasting here would
         # ANSWER the dialog. Never auto-submit anything on such a pane.
-        return {"action": "skip", "reason": "dialog_open_never_auto_answer"}
+        # A dialog is never answered on its own authority. The ONLY exception is an exact
+        # match in the owner's pre-approved gate registry (target + command hash/pattern
+        # + scope + expiry); everything else — unknown wording, expired, ambiguous, or
+        # carrying a prohibited marker — is refused, with the reason recorded.
+        gate = _approved_gate_answer(agent, cfg)
+        if gate.get("allowed"):
+            return {"action": "answer_gate", "step_text": gate["answer"],
+                    "reason": gate["reason"], "gate_entry": gate.get("entry_id"),
+                    "gate_command": gate.get("command", "")[:200]}
+        return {"action": "skip", "reason": "dialog_open_never_auto_answer",
+                "gate_refusal": gate.get("reason"),
+                "gate_command": gate.get("command", "")[:200]}
 
     # Idle must be CONFIRMED across the dwell window (restart-safe via cw_target).
     idle_since = (prev_target or {}).get("idle_since_ts")
@@ -717,7 +778,17 @@ def run_once(ctrl=None, *, now_ts: Optional[float] = None, sleep=time.sleep) -> 
                            prev_target=prev_for_decide, now_ts=now_ts, eligible=is_elig,
                            continuation=continuation, proactive=proactive, conv_count=conv_count)
                 if d["action"] == "skip":
+                    # every refusal carries its reason into the audit trail
+                    h["last_action"] = f"skip:{target}:{d.get('reason')}" + (
+                        f":{d.get('gate_refusal')}" if d.get("gate_refusal") else "")
                     continue
+
+                if d["action"] == "answer_gate":
+                    # An owner-pre-approved confirmation: deliver the RECORDED answer.
+                    log.info(f"approved gate answer for {target}: entry="
+                             f"{d.get('gate_entry')} cmd={d.get('gate_command')!r}")
+                    _audit_gate(conn, target, d, answered=True)
+                    d = {**d, "action": "deliver"}
 
                 step_text = d["step_text"]
                 sh = step_hash(conv_id, step_text)
