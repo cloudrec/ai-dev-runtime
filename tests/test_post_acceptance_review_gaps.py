@@ -150,9 +150,25 @@ def test_unsafe_step_still_blocked_before_any_gate(monkeypatch):
     assert ctrl.sends == 0 and ctrl.enters == 0
 
 
-def test_shipped_registry_grants_live_actuation_to_the_canary_only():
-    """CI invariant over the REAL shipped file: exactly one project may be actuated live.
-    If a future edit flips another to true, this fails loudly."""
+def test_shipped_registry_grants_live_actuation_to_the_approved_set_only():
+    """CI invariant over the REAL shipped file. Owner-approved set (2026-08-04): the
+    canary plus the two managed sessions. payment and owneros must NEVER appear — payment
+    is excluded under every revision of this policy. Any other grant fails loudly."""
     reg = ap.load_registry()
     granted = sorted(t for t, e in reg.items() if e.get("live_actuation"))
-    assert granted == ["cp-canary:0.0"], granted
+    assert granted == ["arbitrage2-opus:0.0", "cp-canary:0.0", "mess-qa-automation:0.0"], granted
+    for never in ("payment:0.0", "owneros-direct-fix:0.0"):
+        assert never not in granted, never
+
+
+def test_every_shipped_next_step_is_autonomous_safe():
+    """The delivered text must pass the safety classifier for every granted project — the
+    autopilot may never instruct a build/sign/publish/release/restart or any trading action."""
+    reg = ap.load_registry()
+    for target, entry in reg.items():
+        step = entry.get("next_step", "")
+        assert ap.classify_safety(step) == "autonomous_safe", (target, step)
+    for banned in ("publish", "release", "deploy", "restart", "sign", "trade", "order",
+                   "venue", "key", "payment"):
+        for target, entry in reg.items():
+            assert banned not in entry.get("next_step", "").lower(), (target, banned)

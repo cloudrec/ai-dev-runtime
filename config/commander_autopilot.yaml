@@ -40,12 +40,22 @@ agents:
     project: arbitrage2
     root: /opt/arbitrage2
     end_state: "June stable-period audit + clean-restart plan complete; no live trading."
-    next_step: "continue the next safe read-only audit step and update the audit report."
-    live_actuation: false          # owner gate — evaluate only
+    # Owner-approved 2026-08-04 (re-approved after a brief canary-only interval), NARROW:
+    # resume the EXISTING session only, isolated paper-only work. The delivered text is a
+    # read-only audit continuation — the autopilot never instructs trading, orders, venues
+    # or key use. Any paper analysis is the agent's own approved plan, not an autopilot
+    # order. No real trading, ever.
+    next_step: "continue the next safe read-only audit step and update the audit report"
+    live_actuation: true           # owner-approved live resume (read-only continuation)
 
   mess-qa-automation:0.0:
     project: mess-qa-automation
     root: /opt/mess-qa-automation
     end_state: "QA automation suite green; reports produced; no destructive or external side effects."
-    next_step: "continue the next safe QA/test step; run the test suite; commit locally."
-    live_actuation: false          # owner gate — evaluate only
+    # Owner-approved 2026-08-04 (re-approved after a brief canary-only interval), NARROW:
+    # resume the EXISTING session only, confined to the already-approved 0.1.91 staged
+    # work. The delivered text names NO build, sign, publish, release or restart action —
+    # live MESS publication and restart stay prohibited, so the autopilot never instructs
+    # them. What the agent does inside its own approved staged plan is its decision.
+    next_step: "continue the next safe internal qa audit step; run the tests; commit locally"
+    live_actuation: true           # owner-approved live resume (staged internal work)
