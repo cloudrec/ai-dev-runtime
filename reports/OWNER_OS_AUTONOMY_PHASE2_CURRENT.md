@@ -82,7 +82,8 @@ the soak runs: **WORKING** with completed A–C evidence. Never fake a PASS.
 | deploy | backup `predeploy-phase2-20260804T211458Z`, restart | done — PID 4160968, HEAD `952b341` |
 | A live | arbitrage2 durable `terminal_pass` recorded with git HEAD + evidence fp | proven |
 | C live | approved / wrong-wording / expired / one-copy | proven |
-| D | detached restart-persistent 24h soak recorder | running (wrapper PID 4165509) |
+| D | detached restart-persistent 24h soak recorder | running |
+| D | recorder survives an ai-runtime restart | **proven** — no gap |
 
 ## A — durable terminal state (live)
 
@@ -129,3 +130,32 @@ exact dialog, because a genuine in-agent permission prompt cannot be manufacture
 the running canary without faking it (the canary runs in auto-approve mode). The decision
 path, the registry match, the refusals and the one-copy delivery are all real; what was
 not exercised is a real Claude permission prompt answered inside the canary agent.
+
+
+## D — soak (in progress)
+
+Recorder: `tools/phase2_soak.py` under `tools/phase2_soak.sh`, started detached with
+`setsid nohup`. No interactive shell holds it; if the sampler dies the wrapper restarts it
+inside a 24h window. Output `reports/phase2_soak.jsonl`, one JSON sample per 60s.
+
+**Restart survival proven.** `ai-runtime.service` was restarted deliberately
+(PID 4160968 → 38064) while the recorder ran:
+
+- recorder process unchanged across the restart,
+- **zero sampling gaps >150s** across the whole run so far,
+- the recorder picked up the new service PID in the very next sample.
+
+Window opened `2026-08-04T23:16:25`. 6h checkpoint falls at ~`05:16`. Running totals:
+
+| metric | so far |
+|---|---|
+| samples | 22 (at time of writing) |
+| sampling gaps >150s | 0 |
+| duplicate panes | 0 |
+| gate answers (any) | 0 |
+| managed sessions alive | 3/3, none quarantined, 0 recoveries in 6h |
+| durable terminal markers | 1 — `arbitrage2-opus:0.0` `terminal_pass` |
+
+**No verdict yet.** `PHASE2_SOAK_6H_PASS` is not claimed until ≥360 samples exist and the
+counters above still hold. Current phase status remains
+`OWNER_OS_AUTONOMY_PHASE2 = WORKING`.
