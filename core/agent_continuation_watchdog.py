@@ -514,19 +514,35 @@ def _body_text(tail: str) -> str:
     return "\n".join(x for x in body if x.strip())
 
 
-def text_is_queued(after: dict, expected_pending: str) -> bool:
-    """True when the delivered text is STILL sitting in the input line. Checks the
-    snapshot's `pending` AND the rendered input box — the live failure was `pending`
-    reading empty while the text was plainly queued in the box."""
+def text_is_queued(after: dict, expected_pending: str, *, target: str = "") -> bool:
+    """True when the delivered text is STILL sitting in the input line, unsubmitted.
+
+    Ghost-aware. Claude Code re-renders the last submitted command as a DIM recall
+    suggestion in the same box; that ghost is not queued input (Enter does not submit
+    it). Reading the plain capture cannot tell the two apart, so when a live target is
+    available the STYLED reader (`pending_input_text`, which drops SGR-2 runs) is the
+    authority — otherwise a successful delivery is followed by its own ghost, read as
+    "still queued", and retried forever (observed live: attempts=4, verify_failed).
+    """
     want = _norm(expected_pending)
     if not want:
         return False
     if want == _norm(after.get("pending") or ""):
         return True
+    if target:
+        try:
+            from core import agent_control as ac
+            ok, live_tail = ac.pane_capture(target, 12)
+            if ok:
+                # styled read: real typed text only, ghosts excluded
+                return want == _norm(ac.pending_input_text(target, live_tail))
+        except Exception:  # noqa: BLE001
+            pass
     return want in _norm(input_region(after.get("tail") or ""))
 
 
-def verify(before: dict, after: dict, *, expected_pending: str, enter_rc: int) -> dict:
+def verify(before: dict, after: dict, *, expected_pending: str, enter_rc: int,
+           target: str = "") -> dict:
     """Proofs that the step was actually EXECUTED — not merely that text appeared.
 
     2026-08-04 incident: MESS was left at `waiting_input` with the delivered text sitting
@@ -541,7 +557,7 @@ def verify(before: dict, after: dict, *, expected_pending: str, enter_rc: int) -
     """
     submitted = enter_rc == 0
     pane_changed = before.get("tail") != after.get("tail")
-    queued_input = text_is_queued(after, expected_pending)
+    queued_input = text_is_queued(after, expected_pending, target=target)
     prompt_consumed = not queued_input
     conversation_modified = (
         after.get("conv_mtime") is not None
@@ -682,7 +698,8 @@ def deliver_and_verify(ctrl, *, target: str, cwd: str, action: str, step_text: s
         while _now_ts() < deadline:
             sleep(1)
             after = ctrl.snapshot(target, cwd)
-            last = verify(before, after, expected_pending=expected_pending, enter_rc=enter_rc)
+            last = verify(before, after, expected_pending=expected_pending,
+                          enter_rc=enter_rc, target=target)
             if last["ok"]:
                 return last, after
         return last, ctrl.snapshot(target, cwd)
@@ -702,7 +719,7 @@ def deliver_and_verify(ctrl, *, target: str, cwd: str, action: str, step_text: s
         # C-u would destroy someone else's queued input and paste ours over it.
         fresh = ctrl.snapshot(target, cwd)
         fresh_pending = _norm(fresh.get("pending") or "")
-        still_queued = text_is_queued(fresh, step_text)
+        still_queued = text_is_queued(fresh, step_text, target=target)
         if fresh_pending == _norm(step_text) or (still_queued and not fresh_pending):
             # Our exact text is still queued. Press Enter FIRST — a bare submit can never
             # duplicate it. Only if that fails to consume the line do we fall back to the
@@ -710,7 +727,7 @@ def deliver_and_verify(ctrl, *, target: str, cwd: str, action: str, step_text: s
             retried = True
             enter_rc = ctrl.enter(target)
             v, after = _poll_verify()
-            if not (v and v["ok"]) and text_is_queued(after, step_text):
+            if not (v and v["ok"]) and text_is_queued(after, step_text, target=target):
                 enter_rc = 0 if ctrl.robust_submit(target, step_text) else 1
                 v, after = _poll_verify()
         elif not fresh_pending and not still_queued:

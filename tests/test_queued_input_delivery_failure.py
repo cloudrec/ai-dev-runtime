@@ -157,7 +157,7 @@ class QueuedCtrl:
 
 def test_delivery_retries_with_a_bare_submit_and_never_repastes():
     ctrl = QueuedCtrl()
-    out = cw.deliver_and_verify(ctrl, target="mess-qa-automation:0.0", cwd="/opt/x",
+    out = cw.deliver_and_verify(ctrl, target="unit-test-fake:9.9", cwd="/opt/x",
                                 action="deliver", step_text=STEP, expected_pending=STEP,
                                 sleep=lambda _: None)
     assert out["verify"]["ok"] is True, out
@@ -181,7 +181,7 @@ class NeverSubmitsCtrl(QueuedCtrl):
 
 def test_delivery_that_never_executes_is_reported_failed():
     ctrl = NeverSubmitsCtrl()
-    out = cw.deliver_and_verify(ctrl, target="mess-qa-automation:0.0", cwd="/opt/x",
+    out = cw.deliver_and_verify(ctrl, target="unit-test-fake:9.9", cwd="/opt/x",
                                 action="deliver", step_text=STEP, expected_pending=STEP,
                                 sleep=lambda _: None)
     assert out["verify"]["ok"] is False, "queued forever must never read as delivered"
@@ -415,3 +415,28 @@ def test_typing_alone_still_fails_even_with_the_new_signal():
 def test_body_text_excludes_the_input_box():
     assert STEP not in cw._body_text(QUEUED_TAIL)
     assert "Prior note appended" in cw._body_text(QUEUED_TAIL)
+
+
+# ═════════ 9. the dim recall ghost is NOT queued input ══════════════════════
+def test_recall_ghost_is_not_treated_as_queued(monkeypatch):
+    """Live on cp-canary: after a successful submit Claude Code re-renders the same text
+    as a DIM suggestion. Plain capture cannot tell it from real input, so the delivery was
+    read as 'still queued' and retried (attempts=4, verify_failed) even though the step had
+    run. With a live target the styled reader is the authority."""
+    from core import agent_control as ac
+    monkeypatch.setattr(ac, "pane_capture", lambda *a, **k: (True, QUEUED_TAIL))
+    monkeypatch.setattr(ac, "pending_input_text", lambda *a, **k: "")   # ghost → empty
+    assert cw.text_is_queued({"tail": QUEUED_TAIL, "pending": ""}, STEP,
+                             target="cp-canary:0.0") is False
+
+
+def test_real_typed_text_is_still_queued_with_a_live_target(monkeypatch):
+    from core import agent_control as ac
+    monkeypatch.setattr(ac, "pane_capture", lambda *a, **k: (True, QUEUED_TAIL))
+    monkeypatch.setattr(ac, "pending_input_text", lambda *a, **k: STEP)
+    assert cw.text_is_queued({"tail": QUEUED_TAIL, "pending": ""}, STEP,
+                             target="cp-canary:0.0") is True
+
+
+def test_without_a_target_the_box_reading_still_applies():
+    assert cw.text_is_queued({"tail": QUEUED_TAIL, "pending": ""}, STEP) is True
