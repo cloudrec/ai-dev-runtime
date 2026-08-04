@@ -217,7 +217,7 @@ def _record_run(target: str, decision: str, detail: dict, conn=None) -> None:
 
 
 def deliver_next_step(target: str, step_text: str, *, conversation_id: str = "", cwd: str = "",
-                      ctrl=None, sleep=None) -> dict:
+                      ctrl=None, sleep=None, registry: Optional[dict] = None) -> dict:
     """Deliver the next step to the EXISTING agent via the lease-gated Actuator (scope-confined
     to CANARY_AGENTS; a non-canary target returns not_canary = read-only/owner-gated). The
     Actuator supplies the lease+fence (no duplicate, restart-safe), the false-idle guard, and
@@ -229,6 +229,19 @@ def deliver_next_step(target: str, step_text: str, *, conversation_id: str = "",
     # hard pre-gate: never deliver an unsafe step, even if somehow requested.
     if classify_safety(step_text) != "autonomous_safe":
         return {"acted": False, "reason": "unsafe_step_blocked"}
+    # 2026-08-04 review: `live_actuation` in config/commander_autopilot.yaml was PARSED into
+    # the assessment but never enforced — the per-project owner gate was decorative, and the
+    # env allowlist (CONTROL_PLANE_CANARY_AGENTS) was the only real gate. Adding an agent to
+    # that env var would then actuate it even with `live_actuation: false` still in the
+    # registry. Both gates must hold. Checked only for targets INSIDE the allowlist so the
+    # non-canary path keeps returning the actuator's `not_canary` refusal unchanged;
+    # deny-by-default for an allowlisted target that is not in the registry at all.
+    if target in actuator.CANARY_AGENTS:
+        entry = (registry if registry is not None else load_registry()).get(target)
+        if not (entry or {}).get("live_actuation"):
+            return {"acted": False, "reason": "registry_live_actuation_disabled",
+                    "note": "target is in CANARY_AGENTS but the registry does not grant "
+                            "live_actuation — owner gate, evaluate only"}
     ctrl = ctrl or cw.Controller()
     sleep = sleep or _t.sleep
     lease = cp.acquire_lease(f"agent:{target}", "commander_autopilot", ttl_secs=120)
@@ -305,7 +318,8 @@ def tick(*, inventory: Optional[dict] = None, registry: Optional[dict] = None,
         action = None
         if ev["decision"] == "poke" and not evaluate_only:
             action = deliver_next_step(target, ev["next_step"], conversation_id=conv,
-                                       cwd=entry.get("root", ""), ctrl=ctrl)
+                                       cwd=entry.get("root", ""), ctrl=ctrl,
+                                       registry=registry)
             ev["actuation"] = action
             ev["delivered"] = bool(action.get("acted"))
             ev["actuation_reason"] = action.get("reason")
