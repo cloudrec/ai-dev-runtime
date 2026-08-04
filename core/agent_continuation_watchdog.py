@@ -305,6 +305,17 @@ def is_safe_continuation(text: str) -> bool:
     return bool(words) and all(w in _SAFE_STEP_VOCAB for w in words)
 
 
+def _live_active_marker(tail: str) -> bool:
+    """True when the LIVE status region shows real active execution. Fail-closed: if the
+    shared detector is unavailable, fall back to the local regex over the whole tail
+    (the conservative, over-skipping behaviour)."""
+    try:
+        from core.agent_control import _STATE_ACTIVE_RUN_RE, live_status_region
+        return bool(_STATE_ACTIVE_RUN_RE.search(live_status_region(tail or "")))
+    except Exception:  # noqa: BLE001
+        return bool(_ACTIVE_EXEC_RE.search(tail or ""))
+
+
 def pane_shows_dialog(tail: str) -> bool:
     """FAIL-CLOSED wrapper around the bilingual dialog detector: when detection is
     unavailable the pane is treated as SHOWING a dialog (refuse), never as clear."""
@@ -355,7 +366,13 @@ def decide(*, agent: dict, cfg: dict, pending: str, state: str, prev_target: Opt
         return {"action": "skip", "reason": "not_allowlisted"}
     if state in ("working", "shell_running"):
         return {"action": "skip", "reason": "active"}          # real work in progress
-    if _ACTIVE_EXEC_RE.search(agent.get("_tail") or ""):
+    # ACTIVE-EXECUTION guard. 2026-08-04: this used a watchdog-local regex over the WHOLE
+    # tail, and that regex matches a BARE spinner glyph — so a completed line like
+    # "✻ Sautéed for 6s" anywhere in scrollback pinned the agent at "thinking" forever and
+    # a queued line could never be recovered (live on cp-canary). Use the SAME detector as
+    # the state classifier and the actuator, over the LIVE status region only, so there is
+    # one definition of "actually running" instead of three that disagree.
+    if _live_active_marker(agent.get("_tail") or ""):
         return {"action": "skip", "reason": "thinking"}        # false idle — mid-turn
     if state == "waiting_owner":
         # a genuine permission dialog — the supervisor's job, not a continuation

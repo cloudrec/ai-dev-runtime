@@ -259,3 +259,58 @@ def test_dwell_still_resets_when_the_agent_is_actually_working(monkeypatch, tmp_
     cw.run_once(ctrl, now_ts=now, sleep=lambda _: None)
     cw.run_once(ctrl, now_ts=now + cw.IDLE_CONFIRM_SECS + 5, sleep=lambda _: None)
     assert ctrl.enters == 0 and ctrl.pastes == 0
+
+
+# ═════════ 6. a completed spinner in scrollback must not pin "thinking" ══════
+COMPLETED_SPINNER_TAIL = (
+    "● Note appended.\n"
+    "\n"
+    "✻ Sautéed for 6s\n"                     # finished — NOT live execution
+    "\n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    f"❯ {STEP}\n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    "  [CAVEMAN]\n"
+)
+LIVE_SPINNER_TAIL = (
+    "● Working.\n"
+    "\n"
+    "✻ Wibbling… (57s · ↓ 1.7k tokens · esc to interrupt)\n"
+    "\n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+    "❯ \n"
+    "────────────────────────────────────────────────────────────────────────────────\n"
+)
+
+
+def _decide(tail, pending, state="waiting_input"):
+    agent = {"target": "cp-canary:0.0", "session": "cp-canary", "alive": True,
+             "is_agent": True, "state": state, "_tail": tail,
+             "claude_cwd": "/root/cp-canary-v2"}
+    return cw.decide(agent=agent, cfg={}, pending=pending, state=state,
+                     prev_target={"idle_since_ts": 1.0, "last_state": "waiting_input"},
+                     now_ts=1.0 + cw.IDLE_CONFIRM_SECS + 5, eligible=True,
+                     continuation=STEP, proactive=False, conv_count=0)
+
+
+def test_completed_spinner_in_scrollback_does_not_block_recovery():
+    """Pre-fix the watchdog used its own regex over the WHOLE tail, and that regex matches
+    a BARE spinner glyph — so a finished '✻ Sautéed for 6s' line pinned the agent at
+    'thinking' forever and the queued step was never submitted (observed live on
+    cp-canary). Now the shared detector runs over the live status region only."""
+    d = _decide(COMPLETED_SPINNER_TAIL, "continue with the next safe canary note")
+    assert d["action"] == "submit", d
+
+
+def test_live_spinner_still_blocks_as_thinking():
+    """Anti-overcorrection: genuine in-flight execution must still be left alone."""
+    d = _decide(LIVE_SPINNER_TAIL, "continue with the next safe canary note")
+    assert d["action"] == "skip" and d["reason"] == "thinking", d
+
+
+def test_watchdog_and_classifier_agree_on_what_is_running():
+    """The divergence between three 'is it running' definitions was the defect itself."""
+    from core import agent_control as ac
+    for tail, expected in ((COMPLETED_SPINNER_TAIL, False), (LIVE_SPINNER_TAIL, True)):
+        assert cw._live_active_marker(tail) is expected
+        assert bool(ac._STATE_ACTIVE_RUN_RE.search(ac.live_status_region(tail))) is expected
