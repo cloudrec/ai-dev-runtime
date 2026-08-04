@@ -144,12 +144,14 @@ class QueuedCtrl:
     def enter(self, target):
         self.enters += 1
         self.executed = True
-        self.s.update(tail=EXECUTED_TAIL, state="working", conv_mtime="m1", activity="a2")
-        return 0
+        # a real pane CLEARS the input line when the text is submitted
+        self.s.update(tail=EXECUTED_TAIL, state="working", conv_mtime="m1", activity="a2",
+                      pending="")
+        return True and 0
 
     def robust_submit(self, target, text):
         self.pastes += 1
-        self.s.update(tail=EXECUTED_TAIL, state="working", conv_mtime="m1")
+        self.s.update(tail=EXECUTED_TAIL, state="working", conv_mtime="m1", pending="")
         return True
 
 
@@ -314,3 +316,70 @@ def test_watchdog_and_classifier_agree_on_what_is_running():
     for tail, expected in ((COMPLETED_SPINNER_TAIL, False), (LIVE_SPINNER_TAIL, True)):
         assert cw._live_active_marker(tail) is expected
         assert bool(ac._STATE_ACTIVE_RUN_RE.search(ac.live_status_region(tail))) is expected
+
+
+# ═════════ 7. a stale "verified" record must not block a queued line ═════════
+def test_queued_line_is_submitted_even_when_recorded_verified(monkeypatch, tmp_path):
+    """2026-08-04 live: the old verifier recorded a never-executed step as `verified`;
+    that stale record then made the actuator answer `already_verified` and refuse to
+    recover the very line it mis-recorded. A line still sitting in the input box is proof
+    the record is wrong — submit it (one Enter on existing text cannot duplicate)."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    from core.control_plane import actuator as act, api as cp
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    monkeypatch.setattr(cw, "VERIFY_TIMEOUT", 1)
+
+    ctrl = QueuedCtrl()
+    ctrl.s.update(tail=QUEUED_TAIL, pending=STEP, state="waiting_input")
+    conv = "cv-stale-verified"
+    lease = cp.acquire_lease("agent:cp-canary:0.0", "t", ttl_secs=60)
+    # first attempt records the action; force the stale 'verified' shape
+    act.actuate(target="cp-canary:0.0", action_text=STEP, controller="t",
+                conversation_id=conv, lease=lease, ctrl=ctrl, sleep=lambda _: None)
+    ah = act._action_hash(STEP) if hasattr(act, "_action_hash") else None
+    from core.control_plane import store
+    conn = store.connect()
+    try:
+        conn.execute("UPDATE cp_action SET verified=1, blocked=0, outcome='verified'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    ctrl2 = QueuedCtrl()
+    ctrl2.s.update(tail=QUEUED_TAIL, pending=STEP, state="waiting_input")
+    lease2 = cp.acquire_lease("agent:cp-canary:0.0", "t", ttl_secs=60)
+    out = act.actuate(target="cp-canary:0.0", action_text=STEP, controller="t",
+                      conversation_id=conv, lease=lease2, ctrl=ctrl2, sleep=lambda _: None)
+    assert out.get("reason") != "already_verified", out
+    assert ctrl2.enters >= 1, "the queued line must be submitted"
+    assert ctrl2.pastes == 0, "submitting an existing line must never paste a copy"
+
+
+def test_already_verified_still_short_circuits_when_nothing_is_queued(monkeypatch, tmp_path):
+    """Anti-overcorrection: with a clean input line the dedupe must still hold."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    from core.control_plane import actuator as act, api as cp
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    monkeypatch.setattr(cw, "VERIFY_TIMEOUT", 1)
+    ctrl = QueuedCtrl()
+    conv = "cv-clean-dedupe"
+    lease = cp.acquire_lease("agent:cp-canary:0.0", "t", ttl_secs=60)
+    act.actuate(target="cp-canary:0.0", action_text=STEP, controller="t",
+                conversation_id=conv, lease=lease, ctrl=ctrl, sleep=lambda _: None)
+    from core.control_plane import store
+    conn = store.connect()
+    try:
+        conn.execute("UPDATE cp_action SET verified=1, blocked=0, outcome='verified'")
+        conn.commit()
+    finally:
+        conn.close()
+    clean = QueuedCtrl()
+    clean.s.update(tail=EXECUTED_TAIL, pending="", state="idle")
+    lease2 = cp.acquire_lease("agent:cp-canary:0.0", "t", ttl_secs=60)
+    out = act.actuate(target="cp-canary:0.0", action_text=STEP, controller="t",
+                      conversation_id=conv, lease=lease2, ctrl=clean, sleep=lambda _: None)
+    assert out["reason"] == "already_verified" and clean.enters == 0 and clean.pastes == 0

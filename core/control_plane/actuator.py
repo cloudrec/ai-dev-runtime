@@ -182,18 +182,31 @@ def actuate(*, target: str, action_text: str, controller: str, conversation_id: 
                      outcome=f"blocked:{pc}")
         return {"acted": False, "reason": pc, "blocked": True, "gate_id": g["id"]}
 
-    # 3) idempotency — never re-issue a verified action
-    prior = _get_action(idkey)
-    if prior and prior["verified"]:
-        return {"acted": False, "reason": "already_verified", "idempotent": True}
-
-    # 3b) FALSE-IDLE GUARD — never command a truly-working agent. Re-read the pane and,
-    # if active-execution evidence is present (spinner timer / thinking / tokens / esc), or
-    # the agent is working/shell_running, refuse and record a correlated correction event.
     ctrl = ctrl or cw.Controller()
     cwd = cwd or (cp.get_agent(target) or {}).get("cwd") or ""
     from core.control_plane import state_estimator as se
     pre = ctrl.snapshot(target, cwd)
+
+    # 3) idempotency — never re-issue a verified action. EXCEPTION: if this exact text is
+    #    STILL SITTING QUEUED in the input line, the prior "verified" record is provably
+    #    wrong (2026-08-04: the old verifier accepted text that merely appeared on screen,
+    #    so a never-executed step was recorded verified — and that stale record then
+    #    blocked the recovery of the very line it mis-recorded). Submitting a line that is
+    #    already typed cannot duplicate anything: it is one Enter on existing text.
+    prior = _get_action(idkey)
+    if prior and prior["verified"]:
+        if not cw.text_is_queued(pre, action_text):
+            return {"acted": False, "reason": "already_verified", "idempotent": True}
+        emit("actuator", "verified_record_contradicted", agent_id=target, severity="warn",
+             payload={"note": "action recorded verified but its text is still queued in "
+                              "the input line — submitting the existing line",
+                      "action_tip": action_text[:120]},
+             action_taken="re-submitting a queued line recorded as verified",
+             dedup_key=f"requeued:{idkey}")
+
+    # 3b) FALSE-IDLE GUARD — never command a truly-working agent. Re-read the pane and,
+    # if active-execution evidence is present (spinner timer / thinking / tokens / esc), or
+    # the agent is working/shell_running, refuse and record a correlated correction event.
     if se.has_active_marker(pre.get("tail") or "") or pre.get("state") in ("working", "shell_running"):
         emit("actuator", "false_idle_corrected", agent_id=target, severity="info",
              payload={"observed_state": pre.get("state"), "tail_tip": (pre.get("tail") or "")[-120:],
