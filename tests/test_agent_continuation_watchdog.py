@@ -118,9 +118,13 @@ def test_decide_requires_idle_dwell_confirmation():
 
 
 def test_decide_proactive_deliver_only_when_opted_in_and_capped():
-    assert _d(_agent(), "", "idle", proactive=False)["action"] == "skip"
-    assert _d(_agent(), "", "idle", proactive=True)["action"] == "deliver"
-    assert _d(_agent(), "", "idle", proactive=True, conv_count=cw.MAX_CONTINUATIONS)["action"] == "skip"
+    # a READABLE clean pane: since the M2 unobservable-pane guard (2026-08-04) an
+    # all-empty capture means capture-pane failed, which is refused separately —
+    # this test is about the opt-in + cap, not about blindness.
+    clean = _agent(tail="❯ ready")
+    assert _d(clean, "", "idle", proactive=False)["action"] == "skip"
+    assert _d(clean, "", "idle", proactive=True)["action"] == "deliver"
+    assert _d(clean, "", "idle", proactive=True, conv_count=cw.MAX_CONTINUATIONS)["action"] == "skip"
 
 
 # ── blocked-step cooldown re-attempt (verified stays permanent) ──────────────

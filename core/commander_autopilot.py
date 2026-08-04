@@ -157,6 +157,14 @@ def evaluate(target: str, *, state: str, tail: str = "", conv_age_secs: Optional
         return {**base, "decision": "skip_dialog_open",
                 "note": "pane shows a permission/confirmation dialog — awaiting a human "
                         "answer; never auto-poked"}
+    # UNOBSERVABLE-PANE GUARD (M2, 2026-08-04 targeted review): `_pane_tail` returns ""
+    # when capture-pane fails, and every tail-based guard above — active markers,
+    # background subagent, end-state, dialog — then reads "" as "clear". Poking a pane
+    # nobody can read is a blind keystroke. Unobservable ⇒ never a poke candidate.
+    if not (tail or "").strip():
+        return {**base, "decision": "skip_unobservable_pane",
+                "note": "pane tail empty — capture failed or pane unreadable; "
+                        "tail-based guards cannot be evaluated"}
     if state not in POKE_STATES:
         return {**base, "decision": "skip_other_state"}
     # idle/waiting with a task footer showing ZERO unfinished work = the documented

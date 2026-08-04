@@ -78,6 +78,12 @@ ledger all untouched by the diff).
   failure domain, and verify would then fail (after the paste). Contradicts
   UNSURE⇒REFUSE in spirit. Proposed (not applied, >1 line): in `run_once`, skip an
   alive agent whose snapshot tail comes back empty, counting it as an error.
+  **RESOLVED 2026-08-04** — fixed in `cw.decide` (before every keyboard path) and
+  `ap.evaluate` (`skip_unobservable_pane`); blindness narrowed to an all-empty snapshot
+  because `pending` proves the capture succeeded. 18 tests, 11 failing on pre-fix
+  `8887460`; suite 1141. The actuator-layer guard was built and deliberately reverted
+  (15 existing contracts model a clean pane as `tail=""`). Details:
+  `reports/COMMANDER_WATCHER_M2_UNOBSERVABLE_PANE_2026-08-04.md`.
 - **L1** `Controller.snapshot` captures 12 lines; a dialog whose only recognisable
   markers scrolled >12 lines above the bottom would be missed. In practice options +
   cursor render at the bottom. No action.
@@ -114,6 +120,7 @@ origin: `IMPORT-FROM: …/wt-b4153fa/core/agent_control.py` (trap avoided).
   attribution runs in the throwaway worktree + in-process probes (read-only).
 - State: no service touched (no restart/reload), no env/allowlist/unit change, autopilot
   untouched, zero pane contact, nothing pushed. This report is the only new file.
-- Remains open (owner decision): M1 pattern breadth, M2 empty-tail skip in run_once;
-  both fail-safe-adjacent residuals, neither blocks acceptance. Deploy of f9c06ee to
-  the live watcher is still the explicit owner restart gate.
+- Remains open (owner decision): M1 pattern breadth; the deferred actuator-layer
+  blind-pane guard. **M2 itself is resolved** (2026-08-04, see above). Deploy of
+  f9c06ee — and of the M2 fix — to the live watcher is still the explicit owner
+  restart gate.

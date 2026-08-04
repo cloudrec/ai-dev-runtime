@@ -114,7 +114,9 @@ def test_no_unfinished_work_is_end_state_met():
 
 def test_no_footer_and_no_step_is_skip_no_work():
     reg = {"x:0.0": {"root": "/tmp", "next_step": ""}}
-    assert ap.evaluate("x:0.0", state="idle", tail="", registry=reg)["decision"] == "skip_no_work"
+    # readable pane, no task footer (an empty capture is the M2 unobservable case)
+    assert ap.evaluate("x:0.0", state="idle", tail="❯ ready",
+                       registry=reg)["decision"] == "skip_no_work"
 
 
 # ── safety boundaries ────────────────────────────────────────────────────────

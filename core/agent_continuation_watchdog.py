@@ -372,6 +372,18 @@ def decide(*, agent: dict, cfg: dict, pending: str, state: str, prev_target: Opt
     if idle_since is None or (now_ts - idle_since) < IDLE_CONFIRM_SECS:
         return {"action": "skip", "reason": "idle_not_confirmed"}
 
+    # M2 (2026-08-04 targeted review) — UNOBSERVABLE-PANE GUARD. `_pane_tail` returns
+    # "" when capture-pane fails, and every tail-based guard above (thinking marker,
+    # dialog fail-closed gate) reads "" as "clear". If capture failed while send-keys
+    # still worked, the watchdog would type onto a pane whose contents — a dialog,
+    # foreign queued text, live work — are unknown. Unobservable ⇒ never act.
+    # Placed after the classification returns above (skip/blocker touch no pane) and
+    # before EVERY path that reaches the keyboard.
+    # Blind = NOTHING was captured. `pending` is read from the same styled capture as
+    # the tail, so text on the input line proves the pane WAS readable; only the
+    # all-empty snapshot is the capture-failure signature.
+    blind = not (agent.get("_tail") or "").strip() and not pending.strip()
+
     if pending.strip():
         # Text typed but not submitted — the exact bug. Submit only if it is SAFE.
         if not is_safe_continuation(pending):
@@ -382,6 +394,8 @@ def decide(*, agent: dict, cfg: dict, pending: str, state: str, prev_target: Opt
     # Input line empty. Proactive delivery is opt-in and capped so the watchdog
     # never invents open-ended direction or loops forever.
     if proactive and is_safe_continuation(continuation) and conv_count < MAX_CONTINUATIONS:
+        if blind:
+            return {"action": "skip", "reason": "unobservable_pane"}
         return {"action": "deliver", "step_text": continuation}
     return {"action": "skip", "reason": "nothing_to_submit"}
 

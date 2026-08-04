@@ -218,6 +218,14 @@ def actuate(*, target: str, action_text: str, controller: str, conversation_id: 
              action_taken="refused (dialog open)", dedup_key=f"dialoggate:{idkey}")
         return {"acted": False, "reason": "dialog_open", "dialog": dialog_sig}
 
+    # NOTE (M2, 2026-08-04): an actuator-level unobservable-pane refusal was built and
+    # reverted here. In production an all-empty snapshot means capture-pane failed, but
+    # 15 established actuator/bridge contracts model a CLEAN pane as tail="" — the guard
+    # turned every one of them into a refusal. Closing it at this layer needs a fixture
+    # convention change (a clean pane must render something), which is a separate scoped
+    # task. The watchdog refuses blind panes before it ever calls the actuator; see
+    # reports/COMMANDER_WATCHER_M2_UNOBSERVABLE_PANE_2026-08-04.md.
+
     # 3c) PENDING-INPUT GUARD — never paste onto a NON-EMPTY input line. agent_send does
     # not clear the line, so DIFFERENT queued (never safety-classified) text and this
     # action would CONCATENATE and submit as one command → refuse. When the pending line
