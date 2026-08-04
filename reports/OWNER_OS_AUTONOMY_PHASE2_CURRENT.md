@@ -132,6 +132,27 @@ path, the registry match, the refusals and the one-copy delivery are all real; w
 not exercised is a real Claude permission prompt answered inside the canary agent.
 
 
+## A — reopen path PROVEN LIVE (2026-08-04 22:33)
+
+The durable marker did not just persist — it reopened correctly on a real material signal,
+unprompted:
+
+| when | event |
+|---|---|
+| 21:15:20 | `arbitrage2-opus:0.0` recorded `terminal_pass`, git HEAD `37f496be…`, evidence fp `51b4bc6c…` |
+| 21:15 → 22:33 | marker held across pane scroll and continued sampling; the session was NOT poked |
+| 22:33:58 | **`reopen` — reason `git_head_changed`** (the project advanced; HEAD is now `56ccd16`) |
+| 23:33 / 23:35 | autopilot resumed poking arbitrage2, which is progressing again |
+
+So the v1 limitation is closed in both directions on live evidence: a finished project stays
+finished while nothing material changes, and it reopens by itself the moment the repo moves.
+
+Bookkeeping note for accuracy: an earlier `cp-canary:0.0` marker against cwd `/tmp` was
+test pollution from my own probes and I removed it with raw SQL. Its `record_terminal`
+audit line remains (the audit table is append-only) with no matching `reopen` line, because
+a direct SQL delete does not pass through `reopen()`. Not a product defect — but worth
+stating so the audit trail is not misread.
+
 ## D — soak (in progress)
 
 Recorder: `tools/phase2_soak.py` under `tools/phase2_soak.sh`, started detached with
