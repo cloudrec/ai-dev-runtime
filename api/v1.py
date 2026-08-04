@@ -42,12 +42,51 @@ async def _auth(request: Request,
         expected = hmac.new(_TOKEN.encode(), x_runtime_timestamp.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, x_runtime_signature):
             raise HTTPException(status_code=401, detail="bad signature")
+        request.state.auth_method = "hmac"
         return True
     # Bearer path
     if authorization and authorization.startswith("Bearer "):
         if hmac.compare_digest(authorization[7:].strip(), _TOKEN):
+            request.state.auth_method = "bearer"
             return True
     raise HTTPException(status_code=401, detail="unauthorized")
+
+
+# ── caller attribution (observability only — no gate reads these) ───────────
+# `deliveries` recorded WHAT was delivered but never WHO sent it, so attributing a row
+# meant correlating the access log, the docker network and the caller's source by hand
+# (reports/ACTUATOR_BLIND_PANE_AND_DELIVERY_ATTRIBUTION_2026-08-04.md). The API knows
+# the authenticated principal and the client address at request time; it now passes both
+# down to the delivery record instead of discarding them.
+_ACTOR_MAX = 120
+_SOURCE_MAX = 160
+# A caller MAY name itself (e.g. "chatgpt-mcp"). Self-declared and therefore NOT
+# trustworthy for any decision — it is recorded next to the auth method, which is.
+_ACTOR_SAFE_RE = re.compile(r"[^A-Za-z0-9 ._:@/+-]")
+
+
+def caller_identity(request: Optional[Request], declared: Optional[str] = None) -> tuple:
+    """(actor, source) for a delivery record. Never raises: attribution must not be able
+    to break a delivery, so every field degrades to "unknown" rather than failing."""
+    method = "unknown"
+    try:
+        method = getattr(request.state, "auth_method", None) or "unknown"
+    except Exception:  # noqa: BLE001
+        method = "unknown"
+    name = _ACTOR_SAFE_RE.sub("", (declared or "").strip())[:64]
+    actor = f"api:{method}" + (f"/{name}" if name else "")
+    host = port = agent = ""
+    try:
+        client = getattr(request, "client", None)
+        host = getattr(client, "host", "") or ""
+        port = str(getattr(client, "port", "") or "")
+        agent = (request.headers.get("user-agent") or "")[:60]
+    except Exception:  # noqa: BLE001
+        pass
+    source = f"{host or 'unknown'}{':' + port if port else ''}"
+    if agent:
+        source += f" ua={_ACTOR_SAFE_RE.sub('', agent)}"
+    return actor[:_ACTOR_MAX], source[:_SOURCE_MAX]
 
 
 def _validate_project_path(path: str) -> str:
@@ -247,13 +286,21 @@ class AgentSendReq(BaseModel):
 
 
 @router.post("/agents/send")
-async def agents_send(req: AgentSendReq, _: bool = Depends(_auth)):
-    return _agent_call(agent_control.agent_send, req.target, req.text, req.idempotency_key)
+async def agents_send(req: AgentSendReq, request: Request,
+                      x_runtime_actor: Optional[str] = Header(None),
+                      _: bool = Depends(_auth)):
+    actor, source = caller_identity(request, x_runtime_actor)
+    return _agent_call(agent_control.agent_send, req.target, req.text, req.idempotency_key,
+                       actor=actor, source=source)
 
 
 @router.post("/agents/answer")
-async def agents_answer(req: AgentSendReq, _: bool = Depends(_auth)):
-    return _agent_call(agent_control.agent_answer, req.target, req.text, req.idempotency_key)
+async def agents_answer(req: AgentSendReq, request: Request,
+                        x_runtime_actor: Optional[str] = Header(None),
+                        _: bool = Depends(_auth)):
+    actor, source = caller_identity(request, x_runtime_actor)
+    return _agent_call(agent_control.agent_answer, req.target, req.text, req.idempotency_key,
+                       actor=actor, source=source)
 
 
 class AgentResumeReq(BaseModel):

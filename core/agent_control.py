@@ -294,11 +294,34 @@ def find_claude_in_pane(pane_pid: Optional[int]) -> Optional[dict]:
 
 
 # ── idempotency + audit ─────────────────────────────────────────────────────
+def _migrate_delivery_attribution(conn: sqlite3.Connection) -> None:
+    """Create the attribution sidecar. Idempotent; safe to call on every open.
+
+    Deliberately a SIDECAR TABLE rather than two columns on `deliveries`. An older
+    build writes that table with a POSITIONAL `INSERT ... VALUES (?,?,?,?,?,?)`, so
+    adding columns would make every delivery fail with "table deliveries has 8 columns
+    but 6 values were supplied" — for the currently running service (which is one
+    version behind by owner decision) and for any rollback to it. A separate table is
+    compatible in BOTH directions: old code ignores it, new code fills it, and no
+    delivery can ever fail because of attribution.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS delivery_attribution (
+        idempotency_key TEXT PRIMARY KEY, actor TEXT, source TEXT,
+        recorded_at TEXT, recorded_ts REAL)""")
+
+
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(_db_path(), timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS deliveries (
         idempotency_key TEXT PRIMARY KEY, target TEXT, action TEXT,
         result TEXT, created_at TEXT, created_ts REAL)""")
+    # 2026-08-04 attribution migration (backward compatible): `deliveries` recorded WHAT
+    # was delivered but never WHO sent it, so answering "who wrote this row?" meant
+    # correlating the API access log, the docker network and the caller's source by hand
+    # (see reports/ACTUATOR_BLIND_PANE_AND_DELIVERY_ATTRIBUTION_2026-08-04.md). Added as
+    # nullable columns — pre-existing rows keep reading fine with actor/source NULL, and
+    # an older build writing to a migrated DB still works (named-column INSERT below).
+    _migrate_delivery_attribution(conn)
     # Supervisor decisions per (target, prompt hash) — persisted so the same
     # prompt is never re-processed or re-alerted after a service restart.
     conn.execute("""CREATE TABLE IF NOT EXISTS supervisor_prompts (
@@ -602,7 +625,10 @@ def _seen_delivery(key: str) -> Optional[dict]:
     """Return a prior delivery for this key, or None. Expired rows are dropped."""
     conn = _db()
     try:
-        conn.execute("DELETE FROM deliveries WHERE created_ts < ?", (time.time() - _IDEMPOTENCY_TTL_SECS,))
+        cutoff = time.time() - _IDEMPOTENCY_TTL_SECS
+        conn.execute("DELETE FROM deliveries WHERE created_ts < ?", (cutoff,))
+        # keep the attribution sidecar on the same retention as the rows it describes
+        conn.execute("DELETE FROM delivery_attribution WHERE recorded_ts < ?", (cutoff,))
         conn.commit()
         row = conn.execute("SELECT result FROM deliveries WHERE idempotency_key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
@@ -610,12 +636,57 @@ def _seen_delivery(key: str) -> Optional[dict]:
         conn.close()
 
 
-def _record_delivery(key: str, target: str, action: str, result: dict) -> None:
+def _record_delivery(key: str, target: str, action: str, result: dict,
+                     actor: Optional[str] = None, source: Optional[str] = None) -> None:
+    """Record the delivery WITH its caller. `actor` = who asked (authenticated principal
+    / declared caller), `source` = where from (client address, transport). Both are
+    observability only — no safety gate reads them, and both may be None for an internal
+    caller that has no external principal."""
     conn = _db()
     try:
-        conn.execute("INSERT OR REPLACE INTO deliveries VALUES (?,?,?,?,?,?)",
-                     (key, target, action, json.dumps(result), _now(), time.time()))
+        now, ts = _now(), time.time()
+        # Named columns, not positional — so a future column cannot break the write.
+        conn.execute(
+            "INSERT OR REPLACE INTO deliveries "
+            "(idempotency_key, target, action, result, created_at, created_ts) "
+            "VALUES (?,?,?,?,?,?)",
+            (key, target, action, json.dumps(result), now, ts))
+        # Attribution goes to the sidecar and must NEVER be able to fail a delivery.
+        if actor or source:
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO delivery_attribution "
+                    "(idempotency_key, actor, source, recorded_at, recorded_ts) "
+                    "VALUES (?,?,?,?,?)",
+                    (key, (actor or None), (source or None), now, ts))
+            except Exception as e:  # noqa: BLE001
+                # Never propagate: an unattributed delivery is acceptable, a failed
+                # delivery is not.
+                try:
+                    audit("delivery_attribution_failed", target, key, error=str(e)[:200])
+                except Exception:  # noqa: BLE001
+                    pass
         conn.commit()
+    finally:
+        conn.close()
+
+
+def delivery_attribution(key: str) -> Optional[dict]:
+    """Who sent the delivery with this idempotency key, if it was recorded.
+
+    Observability only — `actor` is partly self-declared by the caller (the auth method
+    prefix is not), so this answers "who says they sent it, over which authenticated
+    transport, from where", not "who is authorised".
+    """
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT idempotency_key, actor, source, recorded_at FROM delivery_attribution "
+            "WHERE idempotency_key=?", (key,)).fetchone()
+        if not row:
+            return None
+        return {"idempotency_key": row[0], "actor": row[1], "source": row[2],
+                "recorded_at": row[3]}
     finally:
         conn.close()
 
@@ -1152,7 +1223,8 @@ def _pane_is_live_agent(target: str) -> dict:
     return pane
 
 
-def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]) -> dict:
+def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str],
+             actor: Optional[str] = None, source: Optional[str] = None) -> dict:
     """Deliver multiline text to a pane through a tmux buffer.
 
     A tmux buffer is used rather than `send-keys` because send-keys would
@@ -1203,22 +1275,30 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
     }
     if rc_enter != 0:
         result["error"] = enter_err.strip()[:200]
-    _record_delivery(key, resolved, action, result)
+    _record_delivery(key, resolved, action, result, actor=actor, source=source)
     audit(action, resolved, key, delivered=result["delivered"], pane_changed=pane_changed,
-          bytes=result["bytes"])
+          bytes=result["bytes"], actor=actor, source=source)
     return result
 
 
-def agent_send(target: str, text: str, idempotency_key: Optional[str] = None) -> dict:
-    """Send a message to an existing agent. Never creates one."""
+def agent_send(target: str, text: str, idempotency_key: Optional[str] = None,
+               actor: Optional[str] = None, source: Optional[str] = None) -> dict:
+    """Send a message to an existing agent. Never creates one.
+
+    `actor`/`source` are recorded for attribution only (who asked, from where)."""
     validate_target(target)
-    return _deliver(target, text, "agent_send", idempotency_key)
+    return _deliver(target, text, "agent_send", idempotency_key,
+                    actor=actor, source=source)
 
 
-def agent_answer(target: str, text: str, idempotency_key: Optional[str] = None) -> dict:
-    """Answer a prompt an existing agent is waiting on. Never creates one."""
+def agent_answer(target: str, text: str, idempotency_key: Optional[str] = None,
+                 actor: Optional[str] = None, source: Optional[str] = None) -> dict:
+    """Answer a prompt an existing agent is waiting on. Never creates one.
+
+    `actor`/`source` are recorded for attribution only (who asked, from where)."""
     validate_target(target)
-    return _deliver(target, text, "agent_answer", idempotency_key)
+    return _deliver(target, text, "agent_answer", idempotency_key,
+                    actor=actor, source=source)
 
 
 def find_live_agent_for_dir(project_dir: str) -> Optional[dict]:
