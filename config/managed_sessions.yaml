@@ -1,0 +1,45 @@
+# Managed sessions eligible for SAFE DEAD-SESSION RECOVERY (owner-approved 2026-08-04).
+#
+# EXPLICIT registry only — recovery never discovers targets. A session absent from this
+# file is never revived, whatever its state. payment:0.0 is deliberately absent and must
+# stay absent.
+#
+# Recovery revives the EXACT tmux session/pane and resumes the EXACT approved
+# conversation. It never creates a second live pane for the same cwd, and it authorises no
+# new work: the existing safe-step allowlist still governs what may then be delivered.
+#
+# resume_shape describes how the session is restarted. `--resume <conversation_id>`
+# reattaches the approved conversation; when Claude offers the large-session choice the
+# recovery always picks "Resume from summary", never a full replay.
+
+sessions:
+  - target: cp-canary:0.0
+    session: cp-canary
+    cwd: /root/cp-canary-v2
+    conversation_id: b2635b20-8de7-4bcd-b0ea-8478799e38f6
+    resume_shape: "claude --resume {conversation_id}"
+    enabled: true
+    note: "disposable canary"
+
+  - target: mess-qa-automation:0.0
+    session: mess-qa-automation
+    cwd: /opt/mess-qa-automation
+    conversation_id: 406eab3c-66f4-4a35-b1cf-4a0f657480fc
+    resume_shape: "claude --resume {conversation_id}"
+    enabled: true
+    note: "staged QA/test/review work only; no build, sign, publish or restart"
+
+  - target: arbitrage2-opus:0.0
+    session: arbitrage2-opus
+    cwd: /opt/arbitrage2
+    conversation_id: 15f13266-34f0-4314-8e6b-eab42ca0ed98
+    resume_shape: "claude --resume {conversation_id}"
+    enabled: true
+    note: "isolated paper-only work; no keys, venue adapters or orders"
+
+# Crash-loop protection
+limits:
+  max_recoveries_per_target: 3
+  window_secs: 21600          # 6 hours
+  backoff_base_secs: 60       # 60s, 120s, 240s …
+  quarantine_on_exhaustion: true

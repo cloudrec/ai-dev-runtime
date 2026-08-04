@@ -137,6 +137,20 @@ def evaluate(target: str, *, state: str, tail: str = "", conv_age_secs: Optional
 
     # watchdogs first
     if state == "dead":
+        # PHASE 2 (B): a REGISTERED session may be revived in place — same tmux
+        # session/pane, same approved conversation, proven single-pane-per-cwd first.
+        # Everything else keeps v1 behaviour: record, never duplicate, wait for the owner.
+        try:
+            from core import session_recovery as sr
+            reg = sr.load_registry()
+            if target in (reg.get("sessions") or {}):
+                res = sr.recover(target, registry=reg)
+                return {**base, "decision": "watchdog_dead_recovery",
+                        "recovery": res,
+                        "note": f"registered session recovery: {res.get('reason')}"}
+        except Exception as e:  # noqa: BLE001
+            return {**base, "decision": "watchdog_dead",
+                    "note": f"recovery unavailable ({e}); recorded, NO duplicate created"}
         return {**base, "decision": "watchdog_dead",
                 "note": "agent pane dead — recorded; NO duplicate created"}
     if state == "shell_running" and conv_age_secs is not None and conv_age_secs > 1800:
@@ -173,15 +187,39 @@ def evaluate(target: str, *, state: str, tail: str = "", conv_age_secs: Optional
     # is a WAIT, not a failure and not a terminal state. Only a verified completion or a
     # real external dependency stops the loop.
     from core import continuation_signals as sig
+    from core import project_state as ps
     cls = sig.classify(tail)
     base = {**base, "situation": cls["class"], "situation_reason": cls["reason"]}
+
+    # PHASE 2 (A): a DURABLE terminal marker outranks whatever is on screen. v1 read
+    # terminal from the visible pane, so a finished project was resumed again the moment
+    # its completion text scrolled out of the capture window. The marker is reopened only
+    # by a material project signal (git HEAD, report fingerprint, owner command, new
+    # queued task, freshness deadline) — never by pane scroll.
+    root = entry.get("root", "")
+    stored = ps.get_state(target, root) if root else None
+    if stored:
+        chg = ps.material_change(stored, cwd=root)
+        if not chg["reopen"]:
+            return {**base, "decision": "terminal_sticky",
+                    "terminal_status": stored["status"],
+                    "note": f"durable {stored['status']} from {stored['decided_at']} "
+                            f"({stored['reason']}); {chg['reason']}"}
+        ps.reopen(target, root, chg["reason"])
+        base = {**base, "reopened": chg["reason"]}
     if cls["class"] == "model_limit":
         return {**base, "decision": "skip_model_limit",
                 "note": "model/session limit — the SAME session resumes after reset; "
                         "not a technical failure"}
     if cls["class"] == "external_block":
+        if root:
+            ps.record_terminal(target, root, status="terminal_blocked", reason=cls["reason"],
+                               evidence=tail[-400:], report_path=entry.get("report", ""))
         return {**base, "decision": "terminal_external_block", "note": cls["reason"]}
     if cls["class"] == "terminal":
+        if root:
+            ps.record_terminal(target, root, status="terminal_pass", reason=cls["reason"],
+                               evidence=tail[-400:], report_path=entry.get("report", ""))
         return {**base, "decision": "terminal_pass", "note": cls["reason"]}
 
     # idle/waiting with a task footer showing ZERO unfinished work = the documented

@@ -142,7 +142,12 @@ def test_deliver_blocks_unsafe_step():
 # ── watchdogs ────────────────────────────────────────────────────────────────
 def test_dead_agent_watchdog_no_duplicate():
     ev = ap.evaluate("cp-canary:0.0", state="dead", tail="", registry=REG)
-    assert ev["decision"] == "watchdog_dead" and "NO duplicate" in ev["note"]
+    # Phase 2: a REGISTERED session is revived in place (same pane, same conversation,
+    # single-pane-per-cwd proven first); an unregistered one keeps the v1 behaviour.
+    # Neither path ever creates a duplicate.
+    assert ev["decision"] in ("watchdog_dead", "watchdog_dead_recovery"), ev
+    if ev["decision"] == "watchdog_dead":
+        assert "NO duplicate" in ev["note"]
 
 
 def test_stuck_shell_watchdog():

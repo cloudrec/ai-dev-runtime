@@ -19,6 +19,14 @@ from core import continuation_signals as sig
 from core import commander_autopilot as ap
 
 
+@pytest.fixture(autouse=True)
+def _isolated_phase(tmp_path, monkeypatch):
+    """Tests must never read or write the production control-plane state."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    yield
+
+
 FUTURE = "2099-01-01T00:00:00Z"
 PAST = "2000-01-01T00:00:00Z"
 
