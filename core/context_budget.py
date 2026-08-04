@@ -102,13 +102,24 @@ def phase(state: str, tail: str, pending: str) -> dict:
     command / test / build runs, a background Fable/subagent is active, a
     tool-permission dialog is open, active-execution markers show, or unsubmitted
     text sits in the input line (the /clear-concatenation hazard)."""
-    from core.agent_control import _STATE_ACTIVE_RUN_RE
+    from core.agent_control import _STATE_ACTIVE_RUN_RE, looks_like_dialog
     from core.commander_autopilot import has_background_subagent
     reasons = []
     if state in ("working", "shell_running"):
         reasons.append(f"state_{state}")
     if state == "waiting_owner":
         reasons.append("permission_dialog_open")
+    # 2026-08-04 review gap: the dialog test was `state == "waiting_owner"` ONLY, so a
+    # pane visibly showing a dialog while the caller-supplied state said `idle` was a
+    # SAFE boundary — and /clear would answer that dialog. Read the pane directly, the
+    # same fail-closed detector the watchdog and actuator use (RU/EN + structural).
+    elif looks_like_dialog(tail or ""):
+        reasons.append("permission_dialog_open")
+    # An empty tail means capture-pane failed (agent_control.pane_capture) or the pane is
+    # unreadable. Every check below reads "" as "clear", so rotation would /clear a pane
+    # it cannot see — the most destructive action in the system, taken blind.
+    if not (tail or "").strip():
+        reasons.append("unobservable_pane")
     if state == "waiting_input":
         reasons.append("unsubmitted_input_state")
     if state in ("dead", "stale"):

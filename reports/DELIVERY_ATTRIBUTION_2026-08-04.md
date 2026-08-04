@@ -77,6 +77,13 @@ Notable pins:
 
 **Full suite: 1200 passed, 0 failed** (1183 before). No existing test or fixture changed.
 
+> **Follow-up 2026-08-04** — a local independent review found that a duplicate delivery
+> replayed by a DIFFERENT caller left no trace at all. Fixed via
+> `_note_duplicate_attribution` (first writer wins; a cross-caller replay is audited as
+> `delivery_duplicate_other_actor`). Same review closed a rotation gap in
+> `context_budget.phase`. See
+> `reports/LOCAL_REVIEW_ATTRIBUTION_AND_WATCHER_2026-08-04.md`.
+
 ## Limitations
 
 - Attribution starts now: the 2026-08-03 rows stay unattributed in the DB (their origin is

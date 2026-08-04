@@ -659,7 +659,7 @@ def _record_delivery(key: str, target: str, action: str, result: dict,
                     "(idempotency_key, actor, source, recorded_at, recorded_ts) "
                     "VALUES (?,?,?,?,?)",
                     (key, (actor or None), (source or None), now, ts))
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:  # noqa: BLE001  # pragma: no cover - see _record_attribution
                 # Never propagate: an unattributed delivery is acceptable, a failed
                 # delivery is not.
                 try:
@@ -669,6 +669,44 @@ def _record_delivery(key: str, target: str, action: str, result: dict,
         conn.commit()
     finally:
         conn.close()
+
+
+def _record_attribution(key: str, actor: Optional[str], source: Optional[str]) -> None:
+    """Insert an attribution row for a delivery that was NOT written by
+    `_record_delivery` (the duplicate-replay path). Never overwrites."""
+    conn = _db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO delivery_attribution "
+            "(idempotency_key, actor, source, recorded_at, recorded_ts) VALUES (?,?,?,?,?)",
+            (key, (actor or None), (source or None), _now(), time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _note_duplicate_attribution(key: str, target: str, actor: Optional[str],
+                                source: Optional[str]) -> None:
+    """Attribute a DUPLICATE (suppressed) delivery. First writer wins: the original
+    attribution is never overwritten, because the original is the caller who actually
+    reached the pane. A replay by a DIFFERENT caller is audited as a conflict so the
+    key-reuse is visible instead of silent."""
+    if not (actor or source):
+        return
+    try:
+        prior = delivery_attribution(key)
+        if prior is None:
+            _record_attribution(key, actor, source)
+            return
+        if (prior.get("actor"), prior.get("source")) != (actor or None, source or None):
+            audit("delivery_duplicate_other_actor", target, key,
+                  original_actor=prior.get("actor"), original_source=prior.get("source"),
+                  replay_actor=actor, replay_source=source)
+    except Exception as e:  # noqa: BLE001
+        try:
+            audit("delivery_attribution_failed", target, key, error=str(e)[:200])
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def delivery_attribution(key: str) -> Optional[dict]:
@@ -1239,7 +1277,12 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
 
     prior = _seen_delivery(key)
     if prior is not None:
-        audit(action, resolved, key, duplicate=True, delivered=False)
+        # 2026-08-04 review gap: a duplicate was recorded as "not delivered" and nothing
+        # else, so a SECOND caller replaying someone else's idempotency key left no trace
+        # at all. Attribute the replay without ever overwriting the original attribution.
+        _note_duplicate_attribution(key, resolved, actor, source)
+        audit(action, resolved, key, duplicate=True, delivered=False,
+              actor=actor, source=source)
         return {**prior, "duplicate": True, "delivered": False,
                 "note": "idempotency key already used — not delivered again"}
 
