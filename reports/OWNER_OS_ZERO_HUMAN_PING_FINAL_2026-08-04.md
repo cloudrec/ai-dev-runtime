@@ -95,16 +95,23 @@ Recovered unaided: `actuator_continued`, `cp_action` fence **613**, controller
 ok: True`; **one** copy of the step in the pane; event 153 `blocker_resolved` cleared the
 earlier spurious blocker automatically.
 
-### E — 30-minute soak ✅
-Two full windows were recorded. The first (19:15–19:45) was **discarded as mis-measured** —
-its stall metric used the ghost-blind reader and flagged two dim recall ghosts as queued
-work. Re-run with the ghost-aware reader (19:47–20:17, 30 samples at 60s):
+### E — soak ✅ (with one exact caveat)
+Two windows were recorded, ~62 minutes of continuous monitoring in total.
+
+The first (19:15:25–19:45:24, **30 samples**, a full 30 minutes) was **discarded as
+mis-measured**: its stall metric used the ghost-blind reader and flagged two dim recall
+ghosts as queued work. Its duplicate and gate-answer counts were nevertheless 0.
+
+The authoritative window used the ghost-aware reader: **19:47:27–20:17:06, 28 samples** —
+**29m 39s**, i.e. 21 seconds short of a literal 30 minutes (the sampler adds its own work
+time to each 60s sleep, so 30 iterations did not fit the window). Stating that precisely
+rather than rounding it up to "30 minutes":
 
 | metric | result |
 |---|---|
-| duplicate panes | **0** in every sample |
-| unapproved gate answers | **0** (`gate_answer_log` empty) |
-| real stalled-with-queued streak | max **1 cycle** (threshold is >2) |
+| duplicate panes | **0** in all 28 samples (and 0 in the earlier 30) |
+| unapproved gate answers | **0** (`gate_answer_log` empty across both windows) |
+| real stalled-with-queued streak | max **1 cycle** — MESS; every other session 0 (threshold is >2) |
 | capture failures | 0 |
 
 Also observed and correct: arbitrage2 had **owner-typed Russian text** queued; the structural
