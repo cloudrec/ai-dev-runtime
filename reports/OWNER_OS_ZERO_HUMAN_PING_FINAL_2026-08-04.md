@@ -1,5 +1,7 @@
 # OWNER OS — ZERO HUMAN PING (FINAL)
 
+**Verdict: `OWNER_OS_ZERO_HUMAN_PING = PASS`** — A–E all proven live (details below).
+
 **2026-08-04.** Closing report for the zero-human-ping mandate: a production loop that
 carries pre-approved work from idle/waiting_input to a finished result or a genuine
 external blocker, with no human pings.
@@ -55,8 +57,29 @@ pane, so once that text scrolled out of the capture window the session was resum
 tests/security/e2ee_roundtrip.mjs`). No harm here, but a durable terminal marker would need
 a state store, which the freeze excluded.
 
-### B — Arbitrage2 autonomous continuation ❌ **externally blocked**
-The loop behaved correctly at every step:
+### B — Arbitrage2 autonomous continuation ✅
+**Proven after the owner restarted the session** (below is the full history, including the
+earlier blocked attempt, because it is what forced the `4ed8d93` fix).
+
+The owner restarted `arbitrage2-opus:0.0` in place — verified as **one pane, `dead=0`, no
+duplicate**. The service then did the rest unaided:
+
+| time (UTC) | event |
+|---|---|
+| 18:25:19 | **`skip_unobservable_pane`** — the pane was still rendering after restart; the blind-pane guard refused to type into it. Correct refusal, not a stall. |
+| 18:26:26 | **`poke`**, situation `unfinished` → delivered |
+| 18:26:25 | `cp_action` controller **`commander_autopilot`**, conversation **`15f13266-…|p43cb399e9704`** (the progress-fingerprinted key from `4ed8d93` — the very defect that blocked this case), fence **423**, policy `autonomous_safe`, **`verified=1`**, outcome `verified`, **attempts 1** |
+| event 201 | `action_verified` — `queued_input: False, prompt_consumed: True, conversation_modified: True, progressed: True, ok: True` |
+| event 195 | `agent_recovered` |
+
+Delivered text was exactly the registry's approved step —
+`"continue the next safe read-only audit step and update the audit report"`, classified
+`autonomous_safe`. The pane then showed **real execution**: `tools/paper_run/*` with
+`state/backfill.json` — paper-only work, no keys, no venue adapters, no orders. State after:
+`working`. Still **one pane per session**.
+
+#### The earlier attempt, and why it failed
+Before the restart the loop behaved correctly at every step:
 
 - 18:02:46Z — decided **`poke`** with situation `unfinished` (the classifier working as
   designed).
@@ -68,12 +91,12 @@ The loop behaved correctly at every step:
 - The loop then recorded **`watchdog_dead`** twice, took no action, and **created no
   duplicate** — still exactly one pane per session.
 
-Reviving it means creating a new Claude agent, which the mandate forbids. So B is blocked by
-an external condition I may not resolve.
+Reviving it required creating a Claude agent, which the mandate forbids me to do — so the
+case sat blocked until the owner restarted the session in place. No duplicate was ever
+created, before or after.
 
-**The capability B tests is proven** on another real managed project session: MESS was idle,
-auto-resumed **once** (fence 279, `verified`), and produced a real tool call with output —
-submit plus actual progress, no human.
+The same capability was independently proven on MESS in the meantime: idle, auto-resumed
+**once** (fence 279, `verified`), producing a real tool call with output.
 
 ### C — Payment gate ✅ refusal proven; approved-answer path unreachable by design
 Payment evaluates `unfinished → poke`, and the actuator returns **`poke_owner_gated`** with
@@ -120,21 +143,33 @@ owner blocker rather than an autonomous keystroke.
 
 ## Verdict
 
-**`OWNER_OS_ZERO_HUMAN_PING = BLOCKED`**
+**`OWNER_OS_ZERO_HUMAN_PING = PASS`**
 
-Precise external blocker: **the `arbitrage2-opus:0.0` Claude session is dead** — pane exited
-with status 143 (SIGTERM) at 2026-08-04 20:08, from outside Owner OS. Acceptance case B
-requires resuming *that* session, and recreating it would mean starting a new agent, which
-the mandate explicitly forbids. Nothing in the loop can resolve it.
+All five cases proven on the live system, with ledger and pane evidence:
 
-This is not an internal bug, a classifier problem, queued input, a retry or a rollback —
-each of those was found, fixed and re-proven live during this run (`0455cc4`, `a13e6a5`,
-`4ed8d93`). A, C, D and E are proven live, and B's capability is proven on MESS.
+| case | result | key evidence |
+|---|---|---|
+| A | PASS | MESS `terminal_pass` on "matrix exhausted… only physical-device items remain"; not poked |
+| B | PASS | arbitrage2 resumed unaided after restart — fence 423, `verified`, attempts 1, real `tools/paper_run` execution |
+| C | PASS | payment `poke_owner_gated`, zero pane contact; `gate_answer_log` empty; registry refuses promote/build/orders/`rm -rf` |
+| D | PASS | queued line recovered unaided — fence 613, `conversation_modified: True`, one copy, `retried: 0` |
+| E | PASS | 28 samples / 29m39s ghost-aware (plus an earlier 30/30min window): 0 duplicates, 0 unapproved answers, max real stall 1 cycle |
 
-**To reach PASS:** restart the arbitrage2 Claude session in its existing tmux window (owner
-action — creating agents is outside my permit). The loop will then detect it idle, deliver
-the paper-only read-only audit step, and verify real progress with no further human input;
-no code change is needed.
+No human ping was needed for any delivery. The only human action in the whole run was
+restarting a session that an external SIGTERM had killed — which the mandate reserves to the
+owner, and which the loop correctly refused to work around by creating a duplicate.
+
+Four defects were found by driving the live system and fixed inside this run (`0455cc4`,
+`a13e6a5`, `4ed8d93`, plus the earlier `494a52d`). None of them is a residual blocker.
+
+### What this verdict does not claim
+- Terminal is **not sticky** (§A): the classifier reads the visible pane, so a terminal
+  session is resumed again once that evidence scrolls away. Harmless here — MESS did real
+  in-scope work — but it is a real limitation.
+- The **approved-gate answer path was never exercised live** (§C). It is proven only by
+  unit tests and by live refusals. Its one reachable scope would be payment, which is
+  excluded by standing policy, so no dialog was ever auto-answered in production.
+- Soak is ~30 minutes, not sustained operation over days.
 
 ## Rollback
 
