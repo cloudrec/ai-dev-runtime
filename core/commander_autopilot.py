@@ -264,9 +264,27 @@ def deliver_next_step(target: str, step_text: str, *, conversation_id: str = "",
                             "live_actuation — owner gate, evaluate only"}
     ctrl = ctrl or cw.Controller()
     sleep = sleep or _t.sleep
+    # 2026-08-04: the idempotency key is (target, conversation, step_hash), so the SAME
+    # documented next step was deliverable only ONCE PER CONVERSATION — ever. Live on
+    # arbitrage2: the loop correctly decided `poke` on a fresh idle cycle and the actuator
+    # answered `already_verified` from a delivery hours earlier, so the session could
+    # never be resumed again. A repeated meta-instruction ("continue the next safe step")
+    # is not a one-shot action; it is legitimately re-deliverable once the agent has
+    # actually moved on. Qualify the key with a PROGRESS FINGERPRINT of the pane body:
+    # new work since the last poke ⇒ a new cycle ⇒ deliverable; an unchanged pane keeps
+    # the old key and stays deduped, so a stuck agent is still never spammed.
+    conv_key = conversation_id
+    try:
+        snap = ctrl.snapshot(target, cwd) or {}
+        body = cw._body_text(snap.get("tail") or "")
+        if body:
+            import hashlib
+            conv_key = f"{conversation_id}|p{hashlib.sha256(body.encode()).hexdigest()[:12]}"
+    except Exception:  # noqa: BLE001
+        pass
     lease = cp.acquire_lease(f"agent:{target}", "commander_autopilot", ttl_secs=120)
     out = actuator.actuate(target=target, action_text=step_text, controller="commander_autopilot",
-                           conversation_id=conversation_id, kind="autopilot_next_step",
+                           conversation_id=conv_key, kind="autopilot_next_step",
                            cwd=cwd, lease=lease, ctrl=ctrl, sleep=sleep)
     # 2026-08-04: RELEASE THE LEASE WHEN WE DID NOT ACT. The autopilot acquires a lease
     # every tick; holding it for the full TTL after a refusal STARVED the continuation

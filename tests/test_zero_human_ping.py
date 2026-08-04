@@ -227,3 +227,85 @@ def test_autopilot_still_skips_a_working_pane():
     d = _ev("✻ Wibbling… (12s · ↓ 2k tokens · esc to interrupt)\n2 open\n",
             state="working")
     assert d["decision"] == "skip_progressing"
+
+
+# ═════════ 5. a session must be resumable on EVERY new idle cycle ═══════════
+class CycleCtrl:
+    """Pane that does a bit of work each time it is poked, then returns to idle."""
+
+    def __init__(self):
+        self.sends = 0
+        self.body = "● block 1 done\n"
+        self._sync()
+
+    def _sync(self):
+        R = "─" * 80
+        self.s = {"tail": f"{self.body}{R}\n❯ \n{R}\n", "pending": "",
+                  "conv_mtime": f"m{self.sends}", "state": "idle",
+                  "activity": f"a{self.sends}", "capture_ok": True}
+
+    def snapshot(self, target, cwd):
+        return dict(self.s)
+
+    def send(self, target, text, idem):
+        self.sends += 1
+        self.body += f"● block {self.sends + 1} done\n"
+        self._sync()
+        self.s["state"] = "working"
+        return {"submitted": True}
+
+    def enter(self, target):
+        return 0
+
+    def robust_submit(self, target, text):
+        return True
+
+
+def test_same_step_is_deliverable_again_after_the_agent_has_moved_on(monkeypatch, tmp_path):
+    """Live on arbitrage2: the loop decided `poke` on a fresh idle cycle and the actuator
+    answered `already_verified` from a delivery hours earlier — the session could never be
+    resumed again. New work since the last poke must make the step deliverable."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    from core import agent_continuation_watchdog as cw
+    monkeypatch.setattr(cw, "VERIFY_TIMEOUT", 1)
+
+    ctrl = CycleCtrl()
+    step = "continue with the next safe step"
+    reg = {"cp-canary:0.0": {"root": "/tmp", "next_step": step, "live_actuation": True}}
+    first = ap.deliver_next_step("cp-canary:0.0", step, conversation_id="cv-same",
+                                 cwd="/tmp", ctrl=ctrl, sleep=lambda _: None, registry=reg)
+    assert first["acted"] is True, first
+    ctrl.s["state"] = "idle"                      # the agent finished and went idle again
+    second = ap.deliver_next_step("cp-canary:0.0", step, conversation_id="cv-same",
+                                  cwd="/tmp", ctrl=ctrl, sleep=lambda _: None, registry=reg)
+    assert second.get("reason") != "already_verified", second
+    assert second["acted"] is True, second
+    assert ctrl.sends == 2
+
+
+def test_an_unchanged_pane_is_still_deduped(monkeypatch, tmp_path):
+    """Anti-spam pin: if the agent has NOT moved on, the key is unchanged and the second
+    delivery is still suppressed."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    from core import agent_continuation_watchdog as cw
+    monkeypatch.setattr(cw, "VERIFY_TIMEOUT", 1)
+
+    ctrl = CycleCtrl()
+    step = "continue with the next safe step"
+    reg = {"cp-canary:0.0": {"root": "/tmp", "next_step": step, "live_actuation": True}}
+    before_state = dict(ctrl.s)                   # the pane as it looked at poke #1
+    ap.deliver_next_step("cp-canary:0.0", step, conversation_id="cv-static", cwd="/tmp",
+                         ctrl=ctrl, sleep=lambda _: None, registry=reg)
+    before_state["state"] = "idle"                # ...and it produced NOTHING since
+    ctrl.snapshot = lambda t, c: dict(before_state)
+    out = ap.deliver_next_step("cp-canary:0.0", step, conversation_id="cv-static",
+                               cwd="/tmp", ctrl=ctrl, sleep=lambda _: None, registry=reg)
+    assert out.get("reason") == "already_verified", out
