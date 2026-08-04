@@ -74,4 +74,58 @@ the soak runs: **WORKING** with completed A–C evidence. Never fake a PASS.
 
 | when | item | status |
 |---|---|---|
-| start | assignment persisted | done |
+| start | assignment persisted | done (`7ff7a82`) |
+| impl | A durable terminal state — `core/project_state.py` | done (`952b341`) |
+| impl | B safe recovery — `core/session_recovery.py` + `config/managed_sessions.yaml` | done (`952b341`) |
+| tests | `tests/test_autonomy_phase2.py`, 29 tests | pass |
+| suite | full suite | **1330 passed, 0 failed** |
+| deploy | backup `predeploy-phase2-20260804T211458Z`, restart | done — PID 4160968, HEAD `952b341` |
+| A live | arbitrage2 durable `terminal_pass` recorded with git HEAD + evidence fp | proven |
+| C live | approved / wrong-wording / expired / one-copy | proven |
+| D | detached restart-persistent 24h soak recorder | running (wrapper PID 4165509) |
+
+## A — durable terminal state (live)
+
+`project_state` is populated by the running service. First live marker:
+`arbitrage2-opus:0.0` @ `/opt/arbitrage2` → `terminal_pass`, reason "verified completion
+with no open work", git HEAD `37f496be…`, evidence fp `51b4bc6c…`, freshness 24h. It
+survives pane scroll and service restart, and reopens only on git HEAD change, report
+update, owner command, a new queued task, or the freshness deadline — never on pane text.
+
+Isolation defect found and fixed while testing: `tests/test_zero_human_ping.py` had no
+isolation fixture and was reading/writing the PRODUCTION control-plane DB; my own earlier
+`ap.evaluate` probes had written a stray `/tmp` marker into it. Fixture added, stray row
+removed.
+
+## B — safe dead-session recovery (deployed)
+
+Registry loaded live with exactly `arbitrage2-opus:0.0`, `cp-canary:0.0`,
+`mess-qa-automation:0.0` — **payment absent**, and a test pins that it stays absent. All
+three currently alive, none quarantined, 0 recoveries in the last 6h.
+
+Refusals proven by test: unregistered target, disabled entry, already-alive pane, a live
+Claude on the same cwd (duplicate proof), deliberate stop/quarantine, crash-loop cap →
+quarantine + owner blocker, and failed post-recovery verification never reported as
+success. "Resume from summary" is chosen from the option number read off the pane; a full
+replay is never selected. Live end-to-end revival is **not yet exercised** — no registered
+session has died since deploy, and killing one deliberately to prove it would be
+manufacturing the failure.
+
+## C — live gate path (proven)
+
+Against **real rendered dialogs**, decisions for target `cp-canary:0.0`:
+
+| dialog | result |
+|---|---|
+| `echo phase2-gate-probe` (exact) | `answer_gate`, entry `phase2-canary-echo`, answer `1` |
+| `echo phase2-gate-prob` (wrong wording) | refused — `no_matching_approval` |
+| `echo phase2-expired-probe` (expired entry) | refused — `expired` |
+| `echo phase2-gate-probe; rm -rf /` | refused — `prohibited_marker_in_command` |
+
+Delivery: **one** `send()` call, payload `['1']`, **zero re-pastes**, input line consumed.
+
+Honest scope note: the delivery half ran against a disposable probe pane rendering the
+exact dialog, because a genuine in-agent permission prompt cannot be manufactured inside
+the running canary without faking it (the canary runs in auto-approve mode). The decision
+path, the registry match, the refusals and the one-copy delivery are all real; what was
+not exercised is a real Claude permission prompt answered inside the canary agent.
