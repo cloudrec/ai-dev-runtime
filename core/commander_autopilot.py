@@ -245,9 +245,21 @@ def deliver_next_step(target: str, step_text: str, *, conversation_id: str = "",
     ctrl = ctrl or cw.Controller()
     sleep = sleep or _t.sleep
     lease = cp.acquire_lease(f"agent:{target}", "commander_autopilot", ttl_secs=120)
-    return actuator.actuate(target=target, action_text=step_text, controller="commander_autopilot",
-                            conversation_id=conversation_id, kind="autopilot_next_step",
-                            cwd=cwd, lease=lease, ctrl=ctrl, sleep=sleep)
+    out = actuator.actuate(target=target, action_text=step_text, controller="commander_autopilot",
+                           conversation_id=conversation_id, kind="autopilot_next_step",
+                           cwd=cwd, lease=lease, ctrl=ctrl, sleep=sleep)
+    # 2026-08-04: RELEASE THE LEASE WHEN WE DID NOT ACT. The autopilot acquires a lease
+    # every tick; holding it for the full TTL after a refusal STARVED the continuation
+    # watchdog, which then got `stale_or_no_lease` and could never submit a queued line.
+    # Live symptom: the canary sat at waiting_input with the owner's text queued while the
+    # autopilot re-leased it (fence 487) and deferred each tick because the pending line
+    # held DIFFERENT text. A refusal must not own the agent.
+    if not out.get("acted"):
+        try:
+            cp.release_lease(f"agent:{target}", (lease or {}).get("lease_id"))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
 
 
 def _real_tail(target: str) -> str:

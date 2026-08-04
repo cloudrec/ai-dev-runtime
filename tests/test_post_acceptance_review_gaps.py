@@ -20,6 +20,7 @@ import pytest
 
 from core import commander_autopilot as ap
 from core.control_plane import actuator as act
+from core.control_plane import api as cp
 
 
 SAFE_STEP = "continue with the next safe canary note"
@@ -172,3 +173,33 @@ def test_every_shipped_next_step_is_autonomous_safe():
                    "venue", "key", "payment"):
         for target, entry in reg.items():
             assert banned not in entry.get("next_step", "").lower(), (target, banned)
+
+
+# ═══ 3. a refusal must not keep owning the agent (lease starvation) ══════════
+def test_refused_delivery_releases_the_lease(monkeypatch):
+    """2026-08-04 live: the autopilot re-leased cp-canary every tick and held the lease
+    for the full TTL even when it refused to act, so the continuation watchdog always got
+    `stale_or_no_lease` and could never submit the queued line. A refusal must free the
+    agent immediately."""
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"payment:0.0"}))
+    ap.deliver_next_step("payment:0.0", SAFE_STEP, conversation_id="cv1", cwd="/tmp",
+                         ctrl=FakeCtrl(), sleep=_no_sleep, registry=REG)   # gated refusal
+    held = cp.acquire_lease("agent:payment:0.0", "someone-else", ttl_secs=60)
+    assert held and held.get("lease_id"), "the refused lease must have been released"
+
+
+def test_successful_delivery_keeps_its_lease(monkeypatch):
+    """Anti-overcorrection: a real actuation must still own the agent while it works."""
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    out = ap.deliver_next_step("cp-canary:0.0", SAFE_STEP, conversation_id="cv-keep",
+                               cwd="/root/cp-canary-v2", ctrl=FakeCtrl(),
+                               sleep=_no_sleep, registry=REG)
+    assert out["acted"] is True
+    from core.control_plane import store
+    conn = store.connect()
+    try:
+        row = conn.execute("SELECT expires_ts FROM resource_lease WHERE resource=?",
+                           ("agent:cp-canary:0.0",)).fetchone()
+    finally:
+        conn.close()
+    assert row and row[0] > 0, "a verified actuation must not release its lease"
