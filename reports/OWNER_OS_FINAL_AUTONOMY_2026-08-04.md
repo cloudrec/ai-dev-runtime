@@ -1,3 +1,10 @@
+> **⚠ RETRACTED IN PART (2026-08-04).** The MESS cycle claimed below was **not** a real
+> execution: the step was typed into the input line and never submitted, and the verifier
+> accepted it because text merely appearing on screen satisfied `state_transitioned`. Five
+> defects were found and fixed; see
+> `reports/OWNER_OS_DELIVERY_VERIFICATION_CORRECTION_2026-08-04.md`, which supersedes the
+> verdict in this report. The Arbitrage2 cycle stands (it had a transcript write).
+
 # OWNER OS — FINAL AUTONOMY
 
 **2026-08-04.** Deploy of the reviewed safety fix plus the owner-approved narrow autopilot
