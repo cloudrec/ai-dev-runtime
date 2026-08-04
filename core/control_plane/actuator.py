@@ -52,8 +52,12 @@ def action_hash(conversation_id: Optional[str], action_text: str, kind: str) -> 
         f"{conversation_id or ''}\x1f{_norm(action_text)}\x1f{kind}".encode()).hexdigest()[:16]
 
 
-# autonomous_safe is NARROW by design (deny-by-default): only a documented continuation
-# meta-instruction. Arbitrary free-form text is owner_approval, never auto-actuated.
+# autonomous_safe is STRUCTURAL (2026-08-03 audit §3.1 fix): the prefix below is only the
+# first hurdle — cw.is_safe_continuation additionally requires a recognised safe step
+# shape (closed benign vocabulary, printable-ASCII script, no digits, not a dialog
+# answer). Pre-fix, ANY continue/proceed/resume-prefixed text that dodged the English
+# denylist classified autonomous_safe — verified live probes: "proceed to send 5 BTC to
+# wallet X" and "resume and promote staging traffic to production" were both SAFE.
 _SAFE_CONTINUATION_RE = re.compile(
     r"^\s*(continue|proceed|resume|carry on|keep going|go on|next safe step)\b", re.I)
 
@@ -63,16 +67,37 @@ _SAFE_CONTINUATION_RE = re.compile(
 # rotation, which additionally gates on a VERIFIED checkpoint + a safe phase boundary.
 _BARE_CONTEXT_CMD_RE = re.compile(r"^\s*/(clear|compact)\s*$", re.I)
 
+# The context-rotation RESUME message is a FIXED internal template
+# (core.context_budget._resume_text) with exactly two slots: a plain checkpoint
+# path (restricted charset — no shell metacharacters, no spaces) and the
+# registry next_step. Recognised STRUCTURALLY: the template must match end-to-end
+# and the embedded step must itself pass the fail-closed continuation gate.
+# Free-form text that merely mentions a checkpoint never matches.
+_RESUME_TEMPLATE_RE = re.compile(
+    r"^\s*resume the SAME project from the checkpoint file "
+    r"(?P<path>[A-Za-z0-9._/\-]+): read it fully first, then continue with the exact "
+    r"NEXT COMMAND recorded there;(?: the exact next command from the checkpoint is: "
+    r"(?P<step>.*?)\.)? do not repeat work already listed as completed; never start a "
+    r"duplicate agent\.\s*$")
+
 
 def classify_action(action_text: str) -> str:
-    """Machine-readable policy class. Deny-by-default: destructive/live/payment/credential/
-    publication → prohibited; a documented safe continuation or an exact bare /clear|/compact
-    (context management) → autonomous_safe; ANYTHING else → owner_approval_required (never
-    auto-actuated)."""
+    """Machine-readable policy class. FAIL-CLOSED: destructive/live/payment/credential/
+    publication (English tokens or Russian stems) → prohibited; an exact bare
+    /clear|/compact (context management) or a RECOGNISED safe step shape (continuation
+    prefix + closed benign vocabulary, printable-ASCII only, no digits) → autonomous_safe;
+    ANYTHING else — including any unknown-script text the denylist cannot evaluate —
+    → owner_approval_required (never auto-actuated)."""
     if cw._FORBIDDEN_RE.search(action_text or ""):
         return PROHIBITED
     if _BARE_CONTEXT_CMD_RE.match(action_text or ""):
         return AUTONOMOUS_SAFE
+    m = _RESUME_TEMPLATE_RE.match(action_text or "")
+    if m:
+        step = (m.group("step") or "").strip()
+        if not step or cw.is_safe_continuation(step):
+            return AUTONOMOUS_SAFE
+        return OWNER_APPROVAL          # template with an unrecognised step → owner gate
     if cw.is_safe_continuation(action_text) and _SAFE_CONTINUATION_RE.search(action_text or ""):
         return AUTONOMOUS_SAFE
     return OWNER_APPROVAL
@@ -176,6 +201,23 @@ def actuate(*, target: str, action_text: str, controller: str, conversation_id: 
              action_taken="suppressed continuation (target working)",
              dedup_key=f"falseidle:{idkey}")
         return {"acted": False, "reason": "target_working", "false_idle_corrected": True}
+    # 3b2) DIALOG GUARD (fail-closed, RU/EN) — never act on a pane showing a system/
+    # tool-permission or confirmation dialog, or classified waiting_owner: pasting or
+    # pressing Enter there ANSWERS the dialog. Detection unavailable ⇒ treated as a
+    # dialog (refuse), never as clear.
+    dialog_sig = "dialog_detection_unavailable"
+    try:
+        from core import agent_control as _ac
+        dialog_sig = _ac.dialog_signature(pre.get("tail") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    if dialog_sig or pre.get("state") == "waiting_owner":
+        emit("actuator", "action_deferred_dialog_open", agent_id=target, severity="info",
+             payload={"dialog": dialog_sig, "observed_state": pre.get("state"),
+                      "note": "pane is awaiting a HUMAN dialog answer — never auto-answered"},
+             action_taken="refused (dialog open)", dedup_key=f"dialoggate:{idkey}")
+        return {"acted": False, "reason": "dialog_open", "dialog": dialog_sig}
+
     # 3c) PENDING-INPUT GUARD — never paste onto a NON-EMPTY input line. agent_send does
     # not clear the line, so DIFFERENT queued (never safety-classified) text and this
     # action would CONCATENATE and submit as one command → refuse. When the pending line

@@ -70,14 +70,28 @@ MAX_STEP_ATTEMPTS = int(os.getenv("CONTINUATION_WATCHDOG_MAX_STEP_ATTEMPTS", "6"
 
 # A continuation must be benign prose. Anything that looks like a destructive /
 # live / payment / credential / publication action is NEVER auto-submitted — it is
-# surfaced to the owner. Deny-by-default on these tokens.
+# surfaced to the owner. Deny-by-default on these tokens. The denylist is a
+# SECONDARY wall: the primary gate (is_safe_continuation) is allowlist-structural
+# and fail-closed — a denylist miss alone never makes text safe.
 _FORBIDDEN_RE = re.compile(
-    r"(rm\s+-rf|\brm\b|\bdrop\b|truncate|delete\s+from|\bkill\b|shutdown|reboot|"
+    r"(rm\s+-rf|\brm\b|\bdrop\b|truncate|delete\s+from|\bdelete\b|\bkill\b|shutdown|reboot|"
     r"\bpush\b|force[- ]?push|publish|deploy|release|npm\s+publish|docker\s+push|"
+    # 2026-08-03 audit §3.1 verified holes: "promote"/"send … BTC … wallet" dodged
+    # the list while an autonomous-safe prefix classified them safe.
+    r"\bpromote\b|promotion|\bsend\b|\bwallet\b|\bbtc\b|\beth\b|bitcoin|crypto|"
+    r"\bbuy\b|\bsell\b|\btrade\b|trading|\bwipe\b|\berase\b|\bdestroy\b|\brestart\b|"
     r"payment|charge|stripe|invoice|billing|payout|refund|withdraw|transfer|"
     r"credential|secret|token|api[_-]?key|password|\.env|private[_-]?key|"
     r"mainnet|live\s+trade|real\s+order|systemctl|reset\s+--hard|chmod|chown|"
-    r"curl|wget|ssh\b|scp\b)", re.I)
+    r"curl|wget|ssh\b|scp\b"
+    # Russian destructive / live / credential stems (case-folded). The script gate
+    # in is_safe_continuation already fail-closes ALL non-ASCII text; these stems
+    # additionally upgrade recognisably destructive Russian to PROHIBITED in
+    # classify_action. Live incident vocabulary included: «удали …» (delete).
+    r"|удал|снес(и|ти)|снос|стереть|сотр(и|ите)|очист|перезапус|рестарт"
+    r"|деплой|публик|отправ|перевед|перевест|перевод|перечисл"
+    r"|\bкупи|прода(й|ть|ж)|ключ|парол|секрет|токен|продвин|промоут|промот"
+    r"|залей|залить|форс)", re.I)
 
 # Active-execution markers — Claude is mid-turn (thinking / running a tool). Their
 # presence means an idle-looking pane must NOT be treated as finished.
@@ -233,13 +247,74 @@ def health(load_config: Optional[Callable] = None) -> dict:
 
 
 # ── pure helpers ─────────────────────────────────────────────────────────────
+# FAIL-CLOSED continuation gate. 2026-08-03 live incident (arbitrage2-opus:0.0):
+# this gate was DENYLIST-ONLY and ENGLISH-ONLY, so six owner-typed RUSSIAN
+# instructions — including «удали старый scratchpad», a delete — were auto-
+# Entered: an English denylist cannot see Russian at all. The gate is now
+# ALLOWLIST-STRUCTURAL; when the classifier is UNSURE it REFUSES:
+#   * any character outside printable ASCII (Cyrillic, CJK, …) → the denylist
+#     cannot evaluate the text → refuse;
+#   * a bare dialog answer ("1", "y", "yes", "да", "нет") → refuse — submitting
+#     it would ANSWER a permission dialog;
+#   * digits anywhere → refuse (amounts/ids are never part of a safe meta-step);
+#   * otherwise the text must have a RECOGNISED SAFE STEP SHAPE — a documented
+#     continuation prefix AND every word from a closed benign vocabulary — or be
+#     an exact bare /clear | /compact.
+# Anything unrecognised → refuse (surfaced to the owner). Over-refusal is
+# acceptable; under-refusal is not.
+_EVALUABLE_TEXT_RE = re.compile(r"^[\x09\x0a\x0d\x20-\x7e]*$")
+_DIALOG_ANSWER_RE = re.compile(
+    r"^\s*(\d{1,2}[.)]?|y|yes|n|no|ok|okay|да|нет|д|н)\s*[.!]?\s*$", re.I)
+_BARE_CONTEXT_RE = re.compile(r"^\s*/(clear|compact)\s*$", re.I)
+_SAFE_STEP_PREFIX_RE = re.compile(
+    r"^\s*(continue|proceed|resume|carry on|keep going|go on|next safe step)\b", re.I)
+_SAFE_STEP_VOCAB = frozenset("""
+    continue proceed resume carry keep going go on next safe step steps task tasks
+    work working with the a an and then to in of for from do done doing nothing only
+    please now current remaining internal observability report reports reporting
+    test tests testing suite run running checks check checking commit commits
+    locally local canary note notes append dated line lines log logs external read
+    audit auditing update updating qa checkpoint checkpoints connection mapping
+    recovery record recording write progress plan planned documented finish finishing
+    complete completing wrap up summary summarize review verify verification
+    analysis analyze document its all
+    """.split())
+
+
 def is_safe_continuation(text: str) -> bool:
-    """A continuation may be auto-submitted only if it is benign prose — never a
-    destructive / live / payment / credential / publication action."""
+    """A continuation may be auto-submitted only when it is a RECOGNISED benign
+    meta-step (see the fail-closed rules above) — never a destructive / live /
+    payment / credential / publication action, never unknown-script text, never a
+    dialog answer, and never merely 'text the denylist did not match'."""
     t = (text or "").strip()
-    if not t:
+    if not t or len(t) > 300:
         return False
-    return not _FORBIDDEN_RE.search(t)
+    if _FORBIDDEN_RE.search(t):
+        return False
+    if _BARE_CONTEXT_RE.match(t):
+        return True                     # exact bare context command — recognised shape
+    if not _EVALUABLE_TEXT_RE.match(t):
+        return False                    # unknown script — cannot be evaluated → refuse
+    if _DIALOG_ANSWER_RE.match(t):
+        return False                    # would answer a permission dialog → refuse
+    if re.search(r"\d", t):
+        return False                    # amounts / ids / option numbers → refuse
+    if not _SAFE_STEP_PREFIX_RE.match(t):
+        return False                    # not a documented continuation shape → refuse
+    words = re.findall(r"[a-z]+", t.lower())
+    return bool(words) and all(w in _SAFE_STEP_VOCAB for w in words)
+
+
+def pane_shows_dialog(tail: str) -> bool:
+    """FAIL-CLOSED wrapper around the bilingual dialog detector: when detection is
+    unavailable the pane is treated as SHOWING a dialog (refuse), never as clear."""
+    if not (tail or "").strip():
+        return False
+    try:
+        from core import agent_control as _ac
+        return _ac.looks_like_dialog(tail)
+    except Exception:  # noqa: BLE001
+        return True
 
 
 def _norm(text: str) -> str:
@@ -285,6 +360,12 @@ def decide(*, agent: dict, cfg: dict, pending: str, state: str, prev_target: Opt
     if state == "waiting_owner":
         # a genuine permission dialog — the supervisor's job, not a continuation
         return {"action": "skip", "reason": "waiting_owner_supervisor"}
+    if pane_shows_dialog(agent.get("_tail") or ""):
+        # FAIL-CLOSED (2026-08-03): even when the state classifier read the pane as
+        # idle, a visible system/tool-permission or confirmation dialog (RU or EN)
+        # means a HUMAN answer is required — pressing Enter or pasting here would
+        # ANSWER the dialog. Never auto-submit anything on such a pane.
+        return {"action": "skip", "reason": "dialog_open_never_auto_answer"}
 
     # Idle must be CONFIRMED across the dwell window (restart-safe via cw_target).
     idle_since = (prev_target or {}).get("idle_since_ts")
@@ -506,9 +587,17 @@ def run_once(ctrl=None, *, now_ts: Optional[float] = None, sleep=time.sleep) -> 
 
             try:
                 pending = a.get("_pending")
-                if pending is None:
+                tail_for_decide = a.get("_tail")
+                if pending is None or tail_for_decide is None:
+                    # PRODUCTION CONTRACT: the real agent_list() inventory carries no
+                    # `_tail` key, so decide()'s tail-based guards (thinking marker,
+                    # dialog fail-closed gate) would otherwise evaluate against "".
                     snap = ctrl.snapshot(target, cwd)
-                    pending = snap.get("pending") or ""
+                    if pending is None:
+                        pending = snap.get("pending") or ""
+                    if tail_for_decide is None:
+                        tail_for_decide = snap.get("tail") or ""
+                a = {**a, "_tail": tail_for_decide}
                 cfg = (ctrl.load_config().get("sessions") or {}).get(session, {}) or {}
                 continuation = cfg.get("safe_continuation") or DEFAULT_CONTINUATION
                 proactive = bool(cfg.get("proactive_continue"))

@@ -700,6 +700,68 @@ _STATE_WAIT_OWNER_RE = re.compile(
     r"which (option|approach)|choose an option|awaiting your (approval|decision|confirmation))", re.I)
 
 
+# ── system/tool-permission & confirmation dialog detection (RU + EN) ─────────
+# The watcher must NEVER auto-answer a dialog: any Enter/paste on a pane showing
+# one ANSWERS it. 2026-08-03 disclosure: dialog recognition was ENGLISH-ONLY
+# (_STATE_WAIT_OWNER_RE), so «Продолжить? (да/нет)» read as `idle` and the
+# continuation watchdog would press Enter straight onto it. Detection here is
+# FAIL-CLOSED and must survive ANSI styling, box-drawing frames and glyph noise.
+# Full ANSI escapes (SGR + cursor/OSC), not just colour codes.
+_ANSI_ANY_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)")
+# Box-drawing / block glyphs Claude Code (and TUIs generally) frame dialogs with.
+_BOX_NOISE_RE = re.compile(r"[│┃┆┇┊┋║╎╏┌┐└┘├┤╭╮╰╯─━═╔╗╚╝▏▕▌▐░▒▓]")
+_DIALOG_RE = re.compile(
+    # — English: tool-permission / proceed / trust / destructive-confirm dialogs —
+    r"(do you want to (proceed|continue|allow|run|make|create|apply|overwrite|delete)"
+    r"|would you like to (proceed|continue|allow)"
+    r"|do you trust the (files|contents)"
+    r"|trust (this|the) (folder|workspace|directory|files)"
+    r"|yes, and don.?t ask again"
+    r"|\b1[.)]\s*yes\b.{0,160}?\b2[.)]"            # numbered option list: 1. Yes … 2. …
+    r"|❯\s*\d{1,2}[.)]\s"                          # menu cursor on a numbered option
+    r"|\((y/n|yes/no|да/нет|д/н)\)|\[(y/n|yes/no|да/нет|д/н)\]"
+    r"|are you sure"
+    r"|press enter to (continue|confirm|proceed)"
+    r"|type\s+\S{1,40}\s+to confirm"
+    # credential / secret prompts — auto-answering one can leak or wedge a login
+    r"|(enter|input)\s+(your\s+)?(password|passphrase|token|api.?key|secret|otp|2fa)"
+    r"|password:|passphrase"
+    # deploy / publish confirmations
+    r"|confirm (the )?(deployment|deploy|publish|publication|release|push)\b"
+    r"|deploy to production\?"
+    # — Russian equivalents —
+    r"|разрешить\?"                                # "Allow?"
+    r"|продолжить\?|продолжаем\?"                  # "Continue?"
+    r"|подтвердит(е|ь)|подтверждени"               # confirm / confirmation
+    r"|вы уверены|точно (удалить|продолжить|выполнить|стереть)"
+    r"|\b1[.)]\s*да\b"                             # numbered «1. Да»
+    r"|введите (пароль|токен|ключ|секрет|код)"
+    r"|пароль:|нажмите (enter|ввод)"
+    r"|доверяете)", re.I)
+
+
+def _dialog_scan_text(text: str) -> str:
+    """Normalise pane text for dialog matching: strip ANSI escapes, box-drawing
+    frames and NBSP, collapse whitespace — so a styled/framed dialog matches the
+    same as plain text (numbered options may span frame lines)."""
+    t = _ANSI_ANY_RE.sub("", text or "").replace("\xa0", " ")
+    t = _BOX_NOISE_RE.sub(" ", t)
+    return re.sub(r"\s+", " ", t)
+
+
+def dialog_signature(pane_tail: str) -> Optional[str]:
+    """The matched dialog marker when the end of the pane looks like a system/
+    tool-permission or confirmation dialog (RU or EN), else None. Consumers must
+    treat ANY non-None return as 'a human answer is required' — never auto-send
+    text or Enter to such a pane."""
+    m = _DIALOG_RE.search(_dialog_scan_text((pane_tail or "")[-1500:]))
+    return (m.group(0)[:80].strip() or "dialog") if m else None
+
+
+def looks_like_dialog(pane_tail: str) -> bool:
+    return dialog_signature(pane_tail) is not None
+
+
 # Spinner glyphs Claude Code uses for the LIVE status line. The live status block is
 # always rendered at the BOTTOM of the pane (last spinner line → input box), so an
 # active-execution marker in an OLDER spinner line is stale scrollback, not live work.
@@ -748,8 +810,11 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
         return "shell_running"
     # 2) an ACTIVE permission dialog is waiting_owner even if the command it shows
     #    contains an external-looking word; the command text is not evidence of a
-    #    real external block. Checked BEFORE the external heuristic.
-    if _STATE_WAIT_OWNER_RE.search(tail):
+    #    real external block. Checked BEFORE the external heuristic. Recognition is
+    #    bilingual (RU/EN) and styling/box-frame tolerant (_DIALOG_RE) — an
+    #    unrecognised-language dialog previously read as `idle` and was one Enter
+    #    away from being auto-answered.
+    if _STATE_WAIT_OWNER_RE.search(tail) or _DIALOG_RE.search(_dialog_scan_text(tail)):
         return "waiting_owner"
     # 3) a typed/pasted but unsubmitted command → waiting_input (owner must submit).
     #    Recovers idle agents with a staged command that were previously lost.

@@ -148,6 +148,15 @@ def evaluate(target: str, *, state: str, tail: str = "", conv_age_secs: Optional
 
     if progressing:
         return {**base, "decision": "skip_progressing"}
+    # FAIL-CLOSED dialog gate (RU/EN, 2026-08-03): a visible system/tool-permission or
+    # confirmation dialog means a HUMAN answer is required, even when the state
+    # classifier read the pane as idle/waiting_input — never a poke candidate. The
+    # Actuator re-checks this at delivery time; this makes the DECISION honest too.
+    from core.agent_continuation_watchdog import pane_shows_dialog
+    if pane_shows_dialog(tail):
+        return {**base, "decision": "skip_dialog_open",
+                "note": "pane shows a permission/confirmation dialog — awaiting a human "
+                        "answer; never auto-poked"}
     if state not in POKE_STATES:
         return {**base, "decision": "skip_other_state"}
     # idle/waiting with a task footer showing ZERO unfinished work = the documented
