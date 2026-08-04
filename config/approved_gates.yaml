@@ -79,3 +79,22 @@ gates:
     answer: "1"
     expires_at: "2026-08-11T00:00:00Z"
     note: "standby liveness check; no promotion, no failover, no traffic change"
+
+  # ── Phase 2 acceptance (C): harmless exact command on the disposable canary ──
+  # Deliberately trivial and side-effect-free. Present so the approved-answer path can be
+  # exercised end to end without touching payment or any real project.
+  - id: phase2-canary-echo
+    target: cp-canary:0.0
+    command_pattern: 'echo phase2-gate-probe'
+    scope: owner_os_selftest
+    answer: "1"
+    expires_at: "2026-08-11T00:00:00Z"
+    note: "acceptance probe only; echo has no side effects"
+
+  - id: phase2-canary-echo-expired
+    target: cp-canary:0.0
+    command_pattern: 'echo phase2-expired-probe'
+    scope: owner_os_selftest
+    answer: "1"
+    expires_at: "2026-08-03T00:00:00Z"
+    note: "deliberately EXPIRED — must never be answered"
