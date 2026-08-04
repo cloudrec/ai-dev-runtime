@@ -500,6 +500,20 @@ def input_region(tail: str) -> str:
     return text if len(text) <= 400 else ""
 
 
+def _body_text(tail: str) -> str:
+    """The pane ABOVE the input box — the agent's actual output. Excludes the input line
+    so that typing (which the original defect mistook for progress) can never change it."""
+    lines = [ln.rstrip() for ln in (tail or "").splitlines()]
+    rules = [i for i, ln in enumerate(lines) if _RULE_RE.match(ln.strip())]
+    if not rules:
+        # No input box identifiable — we cannot separate output from the input line, so
+        # claim NOTHING. Returning the whole tail here would let typing masquerade as
+        # output, which is the defect this whole guard exists to prevent.
+        return ""
+    body = lines[:rules[-2]] if len(rules) >= 2 else lines[:rules[-1]]
+    return "\n".join(x for x in body if x.strip())
+
+
 def text_is_queued(after: dict, expected_pending: str) -> bool:
     """True when the delivered text is STILL sitting in the input line. Checks the
     snapshot's `pending` AND the rendered input box — the live failure was `pending`
@@ -539,8 +553,15 @@ def verify(before: dict, after: dict, *, expected_pending: str, enter_rc: int) -
     except Exception:  # noqa: BLE001
         active_marker = False
     working_state = after.get("state") in ("working", "shell_running")
-    # REAL execution evidence — a pane/activity delta is NOT evidence (typing causes one).
-    progressed = bool(conversation_modified or active_marker or working_state)
+    # A fast step can finish inside the poll window: back at rest, transcript mtime not
+    # yet visible. The line being CONSUMED plus new content OUTSIDE the input box is real
+    # evidence — and it cannot be produced by typing, which is what the original defect
+    # exploited (typing leaves the text queued, which `queued_input` now rejects).
+    body_changed = _body_text(before.get("tail") or "") != _body_text(after.get("tail") or "")
+    output_progress = bool(prompt_consumed and body_changed)
+    # REAL execution evidence — a pane/activity delta ALONE is NOT evidence.
+    progressed = bool(conversation_modified or active_marker or working_state
+                      or output_progress)
     # reported for diagnostics only; deliberately NOT part of `ok` any more.
     state_transitioned = (
         after.get("state") != "idle"

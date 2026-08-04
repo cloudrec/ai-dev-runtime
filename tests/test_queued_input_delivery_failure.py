@@ -383,3 +383,35 @@ def test_already_verified_still_short_circuits_when_nothing_is_queued(monkeypatc
     out = act.actuate(target="cp-canary:0.0", action_text=STEP, controller="t",
                       conversation_id=conv, lease=lease2, ctrl=clean, sleep=lambda _: None)
     assert out["reason"] == "already_verified" and clean.enters == 0 and clean.pastes == 0
+
+
+# ═════════ 8. a fast step that finished must not read as a failure ══════════
+def test_fast_step_with_new_output_and_a_consumed_line_is_accepted():
+    """Live on cp-canary: the step ran (note appended) and returned to rest inside the
+    poll window with no visible transcript-mtime change. Verify said not_verified, the
+    fallback re-pasted, and a SECOND copy ended up queued. New output above the input box
+    with the line consumed is real evidence — typing cannot produce it."""
+    R = "────────────────────────────────────────────────────────────────────────────────"
+    before = {"tail": f"● earlier output\n{R}\n❯ \n{R}\n", "pending": "",
+              "conv_mtime": "m0", "state": "idle", "activity": "a0"}
+    after = {"tail": f"● earlier output\n● Note #12 appended.\n✻ Baked for 14s\n"
+                     f"{R}\n❯ \n{R}\n", "pending": "", "conv_mtime": "m0",
+             "state": "idle", "activity": "a1"}
+    v = cw.verify(before, after, expected_pending=STEP, enter_rc=0)
+    assert v["queued_input"] is False and v["ok"] is True, v
+
+
+def test_typing_alone_still_fails_even_with_the_new_signal():
+    """The anti-regression that matters: the queued-text case must stay a failure."""
+    R = "────────────────────────────────────────────────────────────────────────────────"
+    before = {"tail": f"● earlier output\n{R}\n❯ \n{R}\n", "pending": "",
+              "conv_mtime": "m0", "state": "idle", "activity": "a0"}
+    v = cw.verify(before, {"tail": QUEUED_TAIL, "pending": "", "conv_mtime": "m0",
+                           "state": "idle", "activity": "a1"},
+                  expected_pending=STEP, enter_rc=0)
+    assert v["queued_input"] is True and v["ok"] is False
+
+
+def test_body_text_excludes_the_input_box():
+    assert STEP not in cw._body_text(QUEUED_TAIL)
+    assert "Prior note appended" in cw._body_text(QUEUED_TAIL)
