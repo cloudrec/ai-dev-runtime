@@ -43,6 +43,11 @@ Ordering is deliberate: an unsafe pending text still returns `blocker`
 `dialog_open` — neither touches a pane, and both carry more information for the ledger
 than "unobservable" would.
 
+> **CLOSED 2026-08-04** — the deferral below was resolved by making capture failure an
+> explicit fact (`agent_control.pane_capture` → `Controller.snapshot.capture_ok`) instead
+> of inferring it from an empty tail, so the guard fires without touching the 15 clean-pane
+> contracts. See `reports/ACTUATOR_BLIND_PANE_AND_DELIVERY_ATTRIBUTION_2026-08-04.md`.
+
 ## Deferred: the actuator-level guard (not applied)
 
 The same refusal was implemented in `actuate` (3b3, `action_deferred_unobservable_pane`)

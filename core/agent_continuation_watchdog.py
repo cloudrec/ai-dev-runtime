@@ -437,13 +437,15 @@ class Controller:
         return self._orch.load_config()
 
     def snapshot(self, target, cwd):
-        tail = self._ac._pane_tail(target, 12)
+        # capture_ok distinguishes "tmux could not read the pane" from "the pane is
+        # blank" — the actuator refuses to act on the former (M2 guard).
+        capture_ok, tail = self._ac.pane_capture(target, 12)
         pending = self._ac.pending_input_text(target, tail)
         conv = self._ac.conversation_evidence(cwd) or {}
         latest = conv.get("latest") or {}
         # derive state from a fuller tail
         st = self._ac.agent_status(target)
-        return {"tail": tail, "pending": pending,
+        return {"capture_ok": capture_ok, "tail": tail, "pending": pending,
                 "conv_mtime": latest.get("modified_at"),
                 "state": st.get("state"),
                 "activity": (st.get("recent_activity") or "")[-400:]}

@@ -218,13 +218,29 @@ def actuate(*, target: str, action_text: str, controller: str, conversation_id: 
              action_taken="refused (dialog open)", dedup_key=f"dialoggate:{idkey}")
         return {"acted": False, "reason": "dialog_open", "dialog": dialog_sig}
 
-    # NOTE (M2, 2026-08-04): an actuator-level unobservable-pane refusal was built and
-    # reverted here. In production an all-empty snapshot means capture-pane failed, but
-    # 15 established actuator/bridge contracts model a CLEAN pane as tail="" — the guard
-    # turned every one of them into a refusal. Closing it at this layer needs a fixture
-    # convention change (a clean pane must render something), which is a separate scoped
-    # task. The watchdog refuses blind panes before it ever calls the actuator; see
-    # reports/COMMANDER_WATCHER_M2_UNOBSERVABLE_PANE_2026-08-04.md.
+    # 3b3) UNOBSERVABLE-PANE GUARD (M2 closeout, 2026-08-04). `tmux capture-pane` failing
+    # and a genuinely blank pane both produced tail="" — indistinguishable, so an earlier
+    # attempt to refuse on "empty tail" turned 15 established clean-pane contracts into
+    # refusals. The Controller now reports `capture_ok` explicitly (agent_control.
+    # pane_capture), so the failure is a FACT, not an inference. Refuse when the capture
+    # failed, and refuse a snapshot that carries no observation at all (no capture flag,
+    # no tail, no pending, no state) — acting there is a blind paste onto a pane whose
+    # contents, dialog or otherwise, are unknown. Ordered AFTER the dialog gate so an
+    # explicit waiting_owner snapshot keeps its own reason, and BEFORE any keystroke.
+    _unobservable = None
+    if pre.get("capture_ok") is False:
+        _unobservable = "capture_failed"
+    elif ("capture_ok" not in pre and not (pre.get("tail") or "").strip()
+            and not (pre.get("pending") or "").strip() and not pre.get("state")):
+        _unobservable = "empty_snapshot"
+    if _unobservable:
+        emit("actuator", "action_deferred_unobservable_pane", agent_id=target,
+             severity="info",
+             payload={"why": _unobservable, "observed_state": pre.get("state"),
+                      "note": "pane could not be read — tail-based guards (dialog, "
+                              "false-idle, pending) cannot be evaluated"},
+             action_taken="refused (unobservable pane)", dedup_key=f"blindpane:{idkey}")
+        return {"acted": False, "reason": "unobservable_pane", "why": _unobservable}
 
     # 3c) PENDING-INPUT GUARD — never paste onto a NON-EMPTY input line. agent_send does
     # not clear the line, so DIFFERENT queued (never safety-classified) text and this

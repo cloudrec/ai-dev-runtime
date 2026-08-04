@@ -904,9 +904,17 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
     return "idle"
 
 
-def _pane_tail(target: str, lines: int = 25) -> str:
+def pane_capture(target: str, lines: int = 25) -> tuple:
+    """(capture_ok, tail). `capture_ok` is False when tmux could not read the pane —
+    the distinction `_pane_tail` erases by returning "" for both a failed capture and
+    a genuinely blank pane. Consumers that act on a pane MUST refuse when it is False
+    (M2/actuator guard): every tail-based guard reads "" as 'the pane is clear'."""
     rc, out, _ = _tmux(["capture-pane", "-p", "-t", target, "-S", f"-{lines}"])
-    return redact(out) if rc == 0 else ""
+    return (rc == 0, redact(out) if rc == 0 else "")
+
+
+def _pane_tail(target: str, lines: int = 25) -> str:
+    return pane_capture(target, lines)[1]
 
 
 # Foreground commands that mean the pane is at rest (an interactive shell or the
