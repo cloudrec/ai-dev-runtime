@@ -749,13 +749,88 @@ def _dialog_scan_text(text: str) -> str:
     return re.sub(r"\s+", " ", t)
 
 
+# ── M1 (2026-08-04 targeted review): SHAPE-INDEPENDENT dialog detection ──────
+# `_DIALOG_RE` above is a denylist of KNOWN phrasings, so an unseen wording evades it —
+# the review's live probe `"Allow this tool to run?\n> approve / deny"` was NOT detected
+# and would have been auto-answered. A prompt awaiting a human answer has STRUCTURE
+# regardless of wording: a short question at the end of the pane, and/or a small set of
+# mutually exclusive choices offered right after it. Match that structure in any
+# language. Over-refusal here only delays a poke; under-refusal answers a dialog.
+_CHOICE_WORD = (r"(?:y|n|yes|no|allow|deny|permit|reject|approve|accept|decline|confirm|"
+                r"cancel|abort|skip|proceed|continue|retry|trust|always|never|ok|quit|exit|"
+                r"да|нет|разреш\w*|запрет\w*|подтверд\w*|отмен\w*|принять|отклонить|"
+                r"продолжить|пропустить|всегда|никогда|выйти)")
+# "approve / deny", "разрешить / запретить", "(y/n)" — a slash-separated choice pair.
+_SLASH_CHOICE_RE = re.compile(rf"\b{_CHOICE_WORD}\s*/\s*{_CHOICE_WORD}\b", re.I)
+# A line offering one option: bullet, arrow, menu cursor or "1." / "2)".
+_OPTION_LINE_RE = re.compile(r"^\s*(?:[❯>»▸▶\*•\-–—]|\(?\d{1,2}[.)])\s*\S")
+_QUESTION_END_RE = re.compile(r"[?？]\s*$")
+# Permission/authorisation intent — enough on its own when options are on offer.
+_PERMISSION_WORD_RE = re.compile(
+    r"\b(allow|permit|grant|authori[sz]e|approve|deny|trust|permission|confirm|"
+    r"разреш\w*|запрет\w*|довер\w*|подтверд\w*|полномочи\w*)\b", re.I)
+
+_STRUCT_SCAN_LINES = 12      # how far back from the pane tip a dialog may start
+_MAX_QUESTION_LEN = 200      # prose paragraphs ending in "?" are not prompts
+_MAX_OPTION_LEN = 80         # an option line is short by nature
+
+
+def _dialog_scan_lines(text: str) -> list:
+    """Per-line normalisation (ANSI, box frames, NBSP stripped) that PRESERVES line
+    structure — `_dialog_scan_text` collapses it, which structural matching needs."""
+    out = []
+    for raw in (text or "").splitlines():
+        line = _ANSI_ANY_RE.sub("", raw).replace("\xa0", " ")
+        line = _BOX_NOISE_RE.sub(" ", line).strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _structural_dialog(pane_tail: str) -> Optional[str]:
+    """A wording-independent 'this pane is asking a human something' signature."""
+    lines = _dialog_scan_lines((pane_tail or "")[-1500:])[-_STRUCT_SCAN_LINES:]
+    if not lines:
+        return None
+
+    def _options_after(idx: int) -> list:
+        opts = []
+        for line in lines[idx:idx + 5]:
+            if len(line) <= _MAX_OPTION_LEN and _OPTION_LINE_RE.match(line):
+                opts.append(line)
+        return opts
+
+    for i, line in enumerate(lines):
+        # 1) a short question, with choices offered on it or just below it
+        if _QUESTION_END_RE.search(line) and len(line) <= _MAX_QUESTION_LEN:
+            if _SLASH_CHOICE_RE.search(line):
+                return f"question+choices:{line[:60]}"
+            window = lines[i + 1:i + 5]
+            if any(_SLASH_CHOICE_RE.search(w) for w in window):
+                return f"question+choices:{line[:60]}"
+            opts = _options_after(i + 1)
+            if len(opts) >= 2:
+                return f"question+options:{line[:60]}"
+            if opts and _PERMISSION_WORD_RE.search(opts[0]):
+                return f"question+permission_option:{line[:60]}"
+            if _PERMISSION_WORD_RE.search(line):
+                return f"permission_question:{line[:60]}"
+        # 2) no question mark, but an explicit permission choice is on offer
+        if _SLASH_CHOICE_RE.search(line) and _PERMISSION_WORD_RE.search(line):
+            return f"permission_choices:{line[:60]}"
+    return None
+
+
 def dialog_signature(pane_tail: str) -> Optional[str]:
     """The matched dialog marker when the end of the pane looks like a system/
     tool-permission or confirmation dialog (RU or EN), else None. Consumers must
     treat ANY non-None return as 'a human answer is required' — never auto-send
-    text or Enter to such a pane."""
+    text or Enter to such a pane. Two independent detectors: the known-phrasing
+    denylist, then the shape-independent structural one (M1)."""
     m = _DIALOG_RE.search(_dialog_scan_text((pane_tail or "")[-1500:]))
-    return (m.group(0)[:80].strip() or "dialog") if m else None
+    if m:
+        return m.group(0)[:80].strip() or "dialog"
+    return _structural_dialog(pane_tail)
 
 
 def looks_like_dialog(pane_tail: str) -> bool:
@@ -811,10 +886,11 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
     # 2) an ACTIVE permission dialog is waiting_owner even if the command it shows
     #    contains an external-looking word; the command text is not evidence of a
     #    real external block. Checked BEFORE the external heuristic. Recognition is
-    #    bilingual (RU/EN) and styling/box-frame tolerant (_DIALOG_RE) — an
-    #    unrecognised-language dialog previously read as `idle` and was one Enter
-    #    away from being auto-answered.
-    if _STATE_WAIT_OWNER_RE.search(tail) or _DIALOG_RE.search(_dialog_scan_text(tail)):
+    #    bilingual (RU/EN) and styling/box-frame tolerant, and since M1 (2026-08-04)
+    #    also SHAPE-INDEPENDENT via `dialog_signature` — an unrecognised-language or
+    #    unseen-wording dialog previously read as `idle` and was one Enter away from
+    #    being auto-answered.
+    if _STATE_WAIT_OWNER_RE.search(tail) or dialog_signature(tail):
         return "waiting_owner"
     # 3) a typed/pasted but unsubmitted command → waiting_input (owner must submit).
     #    Recovers idle agents with a staged command that were previously lost.

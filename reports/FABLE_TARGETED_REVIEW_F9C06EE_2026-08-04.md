@@ -69,6 +69,12 @@ ledger all untouched by the diff).
   third-party CLI prompt with nonstandard wording inside a pane would not be, and a
   proactive continuation could answer it. Inherent to the regex approach; mitigated by
   dwell + pending-input + verify. Accept as residual or extend patterns over time.
+  **RESOLVED 2026-08-04** — not by extending the denylist but by adding a
+  SHAPE-INDEPENDENT structural detector (short question at the pane tip + mutually
+  exclusive choices, or an explicit permission choice), wired into `dialog_signature`
+  and `classify_state`. The live probe is now detected; 30 tests, 21 failing on pre-fix
+  `9fbb7f4`; suite 1171, no existing fixture changed. Details:
+  `reports/COMMANDER_WATCHER_M1_STRUCTURAL_DIALOG_2026-08-04.md`.
 - **M2** fail-open on an *unobservable* pane: `_pane_tail` returns `""` on
   capture-pane failure (`core/agent_control.py:832-833`), `pane_shows_dialog` returns
   False for empty tail (`core/agent_continuation_watchdog.py:311-312`), actuator 3b2
@@ -120,7 +126,7 @@ origin: `IMPORT-FROM: …/wt-b4153fa/core/agent_control.py` (trap avoided).
   attribution runs in the throwaway worktree + in-process probes (read-only).
 - State: no service touched (no restart/reload), no env/allowlist/unit change, autopilot
   untouched, zero pane contact, nothing pushed. This report is the only new file.
-- Remains open (owner decision): M1 pattern breadth; the deferred actuator-layer
-  blind-pane guard. **M2 itself is resolved** (2026-08-04, see above). Deploy of
-  f9c06ee — and of the M2 fix — to the live watcher is still the explicit owner
-  restart gate.
+- **Both findings are now closed** (2026-08-04): M1 via the structural detector, M2 via
+  the unobservable-pane guard. Remains open (owner decision): the deferred actuator-layer
+  blind-pane guard. Deploy of f9c06ee — and of the M1/M2 fixes — to the live watcher is
+  still the explicit owner restart gate.
