@@ -400,23 +400,79 @@ def decide(*, agent: dict, cfg: dict, pending: str, state: str, prev_target: Opt
     return {"action": "skip", "reason": "nothing_to_submit"}
 
 
+# The Claude Code input box is the region between the LAST two horizontal rules at the
+# bottom of the pane. Text sitting there is TYPED BUT NOT SUBMITTED.
+_RULE_RE = re.compile(r"^[\s─━═\-_]{20,}$")
+
+
+def input_region(tail: str) -> str:
+    """The pane's input box contents (best effort). Used to detect text that was typed
+    but never submitted — `pending` alone missed it live (2026-08-04 MESS incident)."""
+    lines = [ln.rstrip() for ln in (tail or "").splitlines()]
+    rules = [i for i, ln in enumerate(lines) if _RULE_RE.match(ln.strip())]
+    if len(rules) >= 2:
+        region = lines[rules[-2] + 1:rules[-1]]
+    elif rules:
+        region = lines[rules[-1] + 1:]
+    else:
+        # No input box rendered in this capture — infer NOTHING. Guessing from the last
+        # lines would read ordinary output as queued input (false "delivery failed").
+        return ""
+    text = " ".join(x.strip().lstrip("❯>").strip() for x in region if x.strip())
+    return text if len(text) <= 400 else ""
+
+
+def text_is_queued(after: dict, expected_pending: str) -> bool:
+    """True when the delivered text is STILL sitting in the input line. Checks the
+    snapshot's `pending` AND the rendered input box — the live failure was `pending`
+    reading empty while the text was plainly queued in the box."""
+    want = _norm(expected_pending)
+    if not want:
+        return False
+    if want == _norm(after.get("pending") or ""):
+        return True
+    return want in _norm(input_region(after.get("tail") or ""))
+
+
 def verify(before: dict, after: dict, *, expected_pending: str, enter_rc: int) -> dict:
-    """Compute the five submission proofs from before/after snapshots."""
+    """Proofs that the step was actually EXECUTED — not merely that text appeared.
+
+    2026-08-04 incident: MESS was left at `waiting_input` with the delivered text sitting
+    unsubmitted in the input line, yet this returned ok=True. Two holes:
+      * `state_transitioned` alone satisfied the final clause — but simply TYPING into the
+        pane changes `activity`, so it flips for text that was never submitted;
+      * `prompt_consumed` trusted `pending`, which read empty while the text was visibly
+        queued in the input box.
+    Now: queued text is a hard failure, and acceptance requires real progress evidence
+    (transcript write, live active-execution marker, or a working/shell_running state) —
+    never a mere pane/activity delta.
+    """
     submitted = enter_rc == 0
     pane_changed = before.get("tail") != after.get("tail")
-    # prompt consumed = the continuation text is no longer sitting in the input line
-    prompt_consumed = _norm(after.get("pending") or "") != _norm(expected_pending)
+    queued_input = text_is_queued(after, expected_pending)
+    prompt_consumed = not queued_input
     conversation_modified = (
         after.get("conv_mtime") is not None
         and after.get("conv_mtime") != before.get("conv_mtime"))
+    after_tail = after.get("tail") or ""
+    try:
+        from core.agent_control import _STATE_ACTIVE_RUN_RE, live_status_region
+        active_marker = bool(_STATE_ACTIVE_RUN_RE.search(live_status_region(after_tail)))
+    except Exception:  # noqa: BLE001
+        active_marker = False
+    working_state = after.get("state") in ("working", "shell_running")
+    # REAL execution evidence — a pane/activity delta is NOT evidence (typing causes one).
+    progressed = bool(conversation_modified or active_marker or working_state)
+    # reported for diagnostics only; deliberately NOT part of `ok` any more.
     state_transitioned = (
         after.get("state") != "idle"
         or after.get("activity") != before.get("activity"))
-    ok = submitted and pane_changed and prompt_consumed and (
-        conversation_modified or state_transitioned)
+    ok = bool(submitted and pane_changed and prompt_consumed and progressed)
     return {"submitted": submitted, "pane_changed": pane_changed,
-            "prompt_consumed": prompt_consumed,
+            "prompt_consumed": prompt_consumed, "queued_input": queued_input,
             "conversation_modified": conversation_modified,
+            "active_marker": active_marker, "working_state": working_state,
+            "progressed": progressed,
             "state_transitioned": state_transitioned, "ok": ok}
 
 
@@ -534,7 +590,10 @@ def deliver_and_verify(ctrl, *, target: str, cwd: str, action: str, step_text: s
 
     v, after = _poll_verify()
     retried = False
-    if not (v and v["ok"]) and v and not v["prompt_consumed"]:
+    # Retry whenever the text is still queued — either detected in `pending` or seen in
+    # the rendered input box (2026-08-04: `pending` read empty while the line was queued,
+    # so keying the retry off `prompt_consumed` alone missed the real failure).
+    if not (v and v["ok"]) and v and (v.get("queued_input") or not v["prompt_consumed"]):
         # Text is still sitting unsubmitted (the live "missed Enter" failure) —
         # retry ONCE with the reliable clear + paste + Enter path rather than a bare
         # Enter that already did not land. 2026-08-03 live race fix: re-check the
@@ -544,11 +603,18 @@ def deliver_and_verify(ctrl, *, target: str, cwd: str, action: str, step_text: s
         # C-u would destroy someone else's queued input and paste ours over it.
         fresh = ctrl.snapshot(target, cwd)
         fresh_pending = _norm(fresh.get("pending") or "")
-        if fresh_pending == _norm(step_text):
+        still_queued = text_is_queued(fresh, step_text)
+        if fresh_pending == _norm(step_text) or (still_queued and not fresh_pending):
+            # Our exact text is still queued. Press Enter FIRST — a bare submit can never
+            # duplicate it. Only if that fails to consume the line do we fall back to the
+            # clear+repaste path (same text, so still no new content introduced).
             retried = True
-            enter_rc = 0 if ctrl.robust_submit(target, step_text) else 1
+            enter_rc = ctrl.enter(target)
             v, after = _poll_verify()
-        elif not fresh_pending:
+            if not (v and v["ok"]) and text_is_queued(after, step_text):
+                enter_rc = 0 if ctrl.robust_submit(target, step_text) else 1
+                v, after = _poll_verify()
+        elif not fresh_pending and not still_queued:
             # line already consumed (slow Enter landed) — treat the keystroke as
             # delivered and re-verify; never paste a second copy.
             enter_rc = 0
