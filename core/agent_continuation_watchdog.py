@@ -660,8 +660,17 @@ def run_once(ctrl=None, *, now_ts: Optional[float] = None, sleep=time.sleep) -> 
 
             # dwell bookkeeping (restart-safe)
             prev_t = _get_target(conn, target)
-            if state == "idle":
-                idle_since = (prev_t or {}).get("idle_since_ts") if (prev_t and prev_t.get("last_state") == "idle") else now_ts
+            # AT-REST states accumulate the dwell window. `waiting_input` MUST be included:
+            # it is exactly the missed-Enter failure this watchdog exists to recover, and
+            # excluding it meant a queued line could never clear the dwell gate — decide()
+            # returned `idle_not_confirmed` forever while the agent sat doing nothing
+            # (2026-08-04 MESS incident: the step stayed typed but unsubmitted).
+            at_rest = ("idle", "waiting_input")
+            if state in at_rest:
+                idle_since = ((prev_t or {}).get("idle_since_ts")
+                              if (prev_t and prev_t.get("last_state") in at_rest
+                                  and (prev_t or {}).get("idle_since_ts") is not None)
+                              else now_ts)
             else:
                 idle_since = None
             _save_target(conn, target, state, idle_since)

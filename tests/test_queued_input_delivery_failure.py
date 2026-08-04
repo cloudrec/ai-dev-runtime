@@ -184,3 +184,78 @@ def test_delivery_that_never_executes_is_reported_failed():
                                 sleep=lambda _: None)
     assert out["verify"]["ok"] is False, "queued forever must never read as delivered"
     assert out["verify"]["queued_input"] is True
+
+
+# ═════════ 5. the dwell gate must let a queued line be recovered ═════════════
+class WaitingInputCtrl:
+    """Production shape of the incident: the pane is at `waiting_input` with our exact
+    safe step queued. Nothing else is running. The watchdog must eventually SUBMIT it."""
+
+    def __init__(self):
+        self.enters = 0
+        self.pastes = 0
+        self.state = "waiting_input"
+
+    def inventory(self):
+        return {"agents": [{"target": "cp-canary:0.0", "session": "cp-canary",
+                            "alive": True, "is_agent": True, "state": self.state,
+                            "claude_cwd": "/root/cp-canary-v2"}]}
+
+    def load_config(self):
+        return {"sessions": {"cp-canary": {"mode": "auto"}}}
+
+    def snapshot(self, target, cwd):
+        if self.state == "waiting_input":
+            return {"tail": QUEUED_TAIL, "pending": STEP, "conv_mtime": "m0",
+                    "state": "waiting_input", "activity": "a0", "capture_ok": True}
+        return {"tail": EXECUTED_TAIL, "pending": "", "conv_mtime": "m1",
+                "state": "working", "activity": "a1", "capture_ok": True}
+
+    def enter(self, target):
+        self.enters += 1
+        self.state = "working"
+        return 0
+
+    def robust_submit(self, target, text):
+        self.pastes += 1
+        self.state = "working"
+        return True
+
+    def send(self, target, text, idem):
+        self.pastes += 1
+        return {"submitted": True}
+
+    def emit(self, target, project, et, payload, dedup_key):
+        return True
+
+
+def test_waiting_input_accumulates_dwell_so_a_queued_line_can_be_recovered(monkeypatch,
+                                                                          tmp_path):
+    """Pre-fix: `idle_since_ts` was only set for state == 'idle', so a pane parked at
+    `waiting_input` never cleared the dwell gate and decide() returned
+    `idle_not_confirmed` forever — the queued line was NEVER submitted."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    monkeypatch.setenv("CONTINUATION_WATCHDOG_SESSIONS", "cp-canary")
+    monkeypatch.setattr(cw, "ENABLED", True)
+    monkeypatch.setattr(cw, "CONTINUATION_VIA_ACTUATOR", False, raising=False)
+    ctrl = WaitingInputCtrl()
+    now = 1_700_000_000.0
+    cw.run_once(ctrl, now_ts=now, sleep=lambda _: None)                  # seed dwell
+    out = cw.run_once(ctrl, now_ts=now + cw.IDLE_CONFIRM_SECS + 5, sleep=lambda _: None)
+    assert ctrl.enters + ctrl.pastes >= 1, ("the queued line must be submitted", out)
+    assert ctrl.state == "working"
+
+
+def test_dwell_still_resets_when_the_agent_is_actually_working(monkeypatch, tmp_path):
+    """Anti-overcorrection: a working pane must not accumulate dwell."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    monkeypatch.setenv("CONTINUATION_WATCHDOG_SESSIONS", "cp-canary")
+    monkeypatch.setattr(cw, "ENABLED", True)
+    ctrl = WaitingInputCtrl()
+    ctrl.state = "working"
+    now = 1_700_000_000.0
+    cw.run_once(ctrl, now_ts=now, sleep=lambda _: None)
+    cw.run_once(ctrl, now_ts=now + cw.IDLE_CONFIRM_SECS + 5, sleep=lambda _: None)
+    assert ctrl.enters == 0 and ctrl.pastes == 0
