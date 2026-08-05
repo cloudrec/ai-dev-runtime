@@ -983,3 +983,52 @@ def test_widening_a_scope_never_narrows_another(tmp_path):
                  "start the rollout"):
         r = cg.check_project_isolation("x:0.0", text, cfg)
         assert r["allowed"] is False, text
+
+
+# ═════════ 11. owner pause on arbitrage2 (2026-08-05) ══════════════════════
+def test_arbitrage2_is_paused_in_the_shipped_config():
+    """An owner pause on a project extends to the autonomous system acting on it. The
+    autopilot was touching this pane every 60s tick, which IS working on it."""
+    cfg = cg.load_config()
+    assert cfg["arbitrage2-opus:0.0"]["enabled"] is False
+
+
+def test_a_paused_project_is_never_governed():
+    for state, pending in (("idle", ""), ("waiting_input", PASTE),
+                           ("waiting_owner", "continue the next safe step")):
+        d = cg.govern("arbitrage2-opus:0.0", state=state, pending=pending,
+                      config=cg.load_config())
+        assert d["action"] == "skip", (state, d)
+        assert d["reason"] == "governor_disabled_for_project"
+
+
+def test_the_pause_survives_a_queue_source_appearing():
+    """Even if someone later names a durable queue for the paused project, the pause wins."""
+    cfg = cg.load_config()
+    cfg["arbitrage2-opus:0.0"]["authoritative_pointer"] = "/tmp/whatever.md"
+    d = cg.govern("arbitrage2-opus:0.0", state="idle", stage_complete=True, config=cfg)
+    assert d["action"] == "skip" and d["reason"] == "governor_disabled_for_project"
+
+
+def test_the_paused_project_is_not_in_the_actuation_allowlist():
+    """Second, independent gate: even a config flipped back to enabled cannot actuate."""
+    scope = "/etc/systemd/system/ai-runtime.service.d/zz-actuation-scope.conf"
+    if not os.path.isfile(scope):
+        pytest.skip("actuation drop-in not present in this environment")
+    line = [l for l in open(scope, encoding="utf-8").read().splitlines()
+            if l.startswith("Environment=CONTROL_PLANE_CANARY_AGENTS=")]
+    assert line, "the allowlist directive must exist"
+    assert "arbitrage2" not in line[-1], line[-1]
+    assert "payment" not in line[-1], "payment must never appear"
+
+
+def test_the_paused_project_has_live_actuation_off_in_the_registry():
+    """Third gate. The autopilot registry drives ordinary pokes independently of the
+    governor, and it had live_actuation: true for this project."""
+    import yaml as _y
+    reg = _y.safe_load(open("/root/ai-dev-runtime/config/commander_autopilot.yaml",
+                            encoding="utf-8")) or {}
+    agents = reg.get("agents") or reg.get("projects") or reg
+    entry = agents.get("arbitrage2-opus:0.0") or {}
+    assert entry, "arbitrage2 must still be present (paused, not deleted)"
+    assert entry.get("live_actuation") is False

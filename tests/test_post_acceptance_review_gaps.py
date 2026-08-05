@@ -152,14 +152,17 @@ def test_unsafe_step_still_blocked_before_any_gate(monkeypatch):
 
 
 def test_shipped_registry_grants_live_actuation_to_the_approved_set_only():
-    """CI invariant over the REAL shipped file. Owner-approved set (2026-08-04): the
-    canary plus the two managed sessions. payment and owneros must NEVER appear — payment
-    is excluded under every revision of this policy. Any other grant fails loudly."""
+    """CI invariant over the REAL shipped file. Owner-approved set (2026-08-04) was the
+    canary plus the two managed sessions; arbitrage2 was REMOVED 2026-08-05 under an owner
+    pause, because a pause on a project has to extend to the autopilot acting on it. payment
+    and owneros must NEVER appear — payment is excluded under every revision of this policy.
+    Any other grant fails loudly."""
     reg = ap.load_registry()
     granted = sorted(t for t, e in reg.items() if e.get("live_actuation"))
-    assert granted == ["arbitrage2-opus:0.0", "cp-canary:0.0", "mess-qa-automation:0.0"], granted
-    for never in ("payment:0.0", "owneros-direct-fix:0.0"):
+    assert granted == ["cp-canary:0.0", "mess-qa-automation:0.0"], granted
+    for never in ("payment:0.0", "owneros-direct-fix:0.0", "arbitrage2-opus:0.0"):
         assert never not in granted, never
+    assert "arbitrage2-opus:0.0" in reg, "the paused project stays registered, just ungranted"
 
 
 def test_every_shipped_next_step_is_autonomous_safe():

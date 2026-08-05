@@ -46,7 +46,12 @@ agents:
     # or key use. Any paper analysis is the agent's own approved plan, not an autopilot
     # order. No real trading, ever.
     next_step: "continue the next safe read-only audit step and update the audit report"
-    live_actuation: true           # owner-approved live resume (read-only continuation)
+    # OWNER PAUSE 2026-08-05: "Do not work on Arbitrage2 while its owner pause is active."
+    # Was true (owner-approved read-only resume). A pause on the project extends to the
+    # autopilot acting on it. Third of three independent gates now closed: this flag,
+    # `enabled: false` in config/project_queues.yaml, and removal from
+    # CONTROL_PLANE_CANARY_AGENTS. Restore only on an explicit owner instruction.
+    live_actuation: false
 
   mess-qa-automation:0.0:
     project: mess-qa-automation

@@ -50,7 +50,13 @@ projects:
     authoritative_pointer: ""
     pointer_section: ""
     submit_owner_queued_paste: false
-    enabled: true
+    # OWNER PAUSE (2026-08-05): "Do not work on Arbitrage2 while its owner pause is active."
+    # A pause on a project has to extend to the autonomous system acting on it — the
+    # autopilot was touching this pane on every 60s tick, which IS working on it. Governance
+    # is off here, and the target is also removed from CONTROL_PLANE_CANARY_AGENTS so no
+    # actuation is possible even if this flag were flipped back. Re-enable only on an
+    # explicit owner instruction lifting the pause.
+    enabled: false
 
   cp-canary:0.0:
     project: cp-canary
