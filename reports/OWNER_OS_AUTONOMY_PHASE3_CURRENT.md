@@ -371,6 +371,43 @@ eligible set, those approvals would become live without further review.
 Not removed unilaterally, since editing the gate registry was not part of this pass.
 Recommended: delete both entries so payment exclusion is structural rather than incidental.
 
+## MILESTONE — queued input recovered on a REAL project session (2026-08-05 12:40:27)
+
+Until now the exactly-once submit had only fired on the disposable canary. It has now
+fired on `arbitrage2-opus:0.0`, a real project session, from a naturally occurring queued
+line — nothing was staged:
+
+```
+governor reason: queued_text_unsubmitted   mode: enter
+expected_pending: "Resume the approved paper-only audit"
+verify: submitted=True prompt_consumed=True queued_input=False progressed=True ok=True
+delivered: True        pane state after: working, input line empty
+```
+
+The line was submitted with a bare Enter (never re-sent), the input line was consumed, and
+real execution followed. Note `conversation_modified: False` — acceptance rested on
+`progressed` via the output/working signal, which is exactly the fast-step case the
+`0455cc4` fix added; without it this legitimate recovery would have been recorded as a
+failure and re-pasted.
+
+### Blocker durability extended
+`stage_06_misc_real_surfaces` is still ONE row: `first_seen 10:17:30 → last_seen 12:40:28`
+— **~2h23m of continuous tick cycles**, refreshed not duplicated. `owner_gate` count
+unchanged at 2 (one per blocked stage).
+
+Governor decisions since 10:40Z, all service-written:
+```
+11:17:42  mess-qa-automation:0.0   governor_blocker
+12:18:43  mess-qa-automation:0.0   governor_blocker
+12:20:56  cp-canary:0.0            governor_submitted
+12:32:38  cp-canary:0.0            governor_submitted
+12:40:27  arbitrage2-opus:0.0      governor_submitted   ← first on a real project
+```
+
+Invariants hold: one pane each for mess / canary / arbitrage2 / payment; MESS still idle at
+`stage_06` with an empty input line and no invented payload; Phase 2 soak alive and
+untouched; service PID 2480752 unchanged.
+
 ## Remaining unproven (unchanged)
 - **advance exactly once on grounded work** — the MESS agent self-advances per the queue's
   own `advancement_rule`; the governor's advance path is a fallback that has not been
