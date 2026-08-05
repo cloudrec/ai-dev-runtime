@@ -408,6 +408,34 @@ Invariants hold: one pane each for mess / canary / arbitrage2 / payment; MESS st
 `stage_06` with an empty input line and no invented payload; Phase 2 soak alive and
 untouched; service PID 2480752 unchanged.
 
+## DEFECT — owner gates were mislabelled (found 13:00:57, fixed `8e298a0`)
+
+An opaque owner paste appeared in `arbitrage2-opus:0.0`'s input line. That project sets
+`submit_owner_queued_paste: false`, so the governor refused — correct. But the refusal was
+recorded as `stage='-'`, `fields=[]`, and opened an owner gate labelled
+**`owner_payload_missing` / "NEEDS_OWNER_PAYLOAD at -"**.
+
+A refused paste is not a missing payload. `_record_governor_blocker` hard-coded that kind
+for every blocker reason, so the owner's gate list read **3** `owner_payload_missing`
+entries when only **2** are real (stage 4, stage 6) — the third buried its own actual cause.
+
+Fixed: the gate now carries the governor's real reason
+(`governor_owner_paste_not_auto_submittable`), and a fieldless blocker records what it
+actually observed instead of an empty `-`. Test asserts a refused paste can never land as
+`owner_payload_missing`. Suite **1370 passed**; deployed HEAD `8e298a0`, PID 3155542,
+backup `predeploy-phase3d-20260805T131724Z`.
+
+**History not rewritten:** the mislabelled gate row from 13:00:57 remains in the ledger. It
+is stale, not recurring.
+
+## OPEN — an owner paste is stuck on arbitrage2
+
+`arbitrage2-opus:0.0` is holding an unsubmitted opaque paste. The governor will not submit
+it because that project does not opt in to paste submission (MESS does; arbitrage2
+deliberately does not). It moves when the owner submits it, or when the owner decides
+arbitrage2 should carry `submit_owner_queued_paste: true`. Not changed unilaterally — the
+flag is precisely the "may an agent press Enter on content it cannot read" decision.
+
 ## Remaining unproven (unchanged)
 - **advance exactly once on grounded work** — the MESS agent self-advances per the queue's
   own `advancement_rule`; the governor's advance path is a fallback that has not been
