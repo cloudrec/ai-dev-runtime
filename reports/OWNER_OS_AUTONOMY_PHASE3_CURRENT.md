@@ -628,9 +628,78 @@ fallback — instead of writing `ACCEPTANCE_A.md`. It had never seen the queue i
 because a running session does not re-read `CLAUDE.md`. That is exactly what the `/clear`
 resolves.
 
+### Post-`/clear` resume — delivered exactly once, stage A executed
+
+```
+14:53:49Z  governor_advanced   (one delivery; ledger conv = 2ba40b9f…, the NEW conversation)
+```
+
+`reports/ACCEPTANCE_A.md` appeared at 16:55 CEST — the stage the queue named, written by the
+resumed agent in the correct cwd. The 600s cooldown on the pre-existing legacy row expired
+just after the `/clear`, and because that row carried no recorded conversation it was
+correctly NOT treated as a fresh one (attempts went 1 → 2, not 1 → 1).
+
+Stage A complete → the governor advanced to stage B **exactly once** at 14:55:17Z, writing a
+second ledger row `stage_b_write_summary attempts=1`. Genuine progress to a new stage was
+not blocked by the per-stage guard, which is the anti-overcorrection property.
+
+### DEFECT — a finished stage that is still the queue's pointer (found live, fixed `cf27579`)
+
+The stage B advance did not produce `ACCEPTANCE_B.md`. The canary instead appended a second
+line to the stage A artefact:
+
+```
+- 2026-08-05 — stage_a_write_note (repeat run): queue re-read after continuation prompt;
+  pointer still `stage_a_write_note`, so appended this dated line per that stage's instruction.
+```
+
+**Two sources of truth.** The governor derives stage completion from artefacts on disk; the
+agent derives it from the queue file's `pointer:` field. Nothing advanced the pointer, so the
+agent correctly redid the stage the file still named. The per-stage guard then suppressed
+stage B — meaning the ledger showed a tidy `governor_advance_suppressed` row every tick while
+the project was silently repeating finished work and could never progress. **Suppression that
+reads as "already handled" was in fact a stall.** That is the Phase 2 MESS failure mode
+returning through a new door.
+
+Why it did not show up earlier: MESS's real agent advances its own pointer (all four natural
+transitions were agent-driven), so the branch that fires when a completed stage is still the
+pointer had never persisted across ticks in production.
+
+**Fix, split along the ownership line:**
+
+- *Owner OS* — `govern()` marks the condition `pointer_stale`; a suppressed advance over a
+  stale pointer is recorded as `governor_queue_pointer_stale` with a durable blocker naming
+  the stage, so it surfaces in the owner view instead of hiding as `suppressed`.
+- *The queue's owner* — advances the pointer. The canary harness (`CLAUDE.md` + the queue's
+  own `advancement_rule`) now instructs the agent to set `status: DONE` and move `pointer` to
+  `next_stage` after writing an artefact, matching what MESS already does.
+
+**The governor deliberately does not fix the pointer itself.** Editing a project's durable
+queue would make the control plane the author of project state — precisely what this phase
+exists to prevent. One test asserts the queue file is byte-identical after three governed
+ticks.
+
+Four tests pin it: the stale state is flagged; an advanced pointer is *not* flagged
+(anti-overcorrection); the stall is durable and still does not re-nudge; the queue file is
+never written. Focused run 101 passed.
+
+### Restart durability — proven
+
+Service restarted for the `cf27579` deploy (PID `3496198`). Ledger rows written *before* the
+restart survived it and continued to gate:
+
+```
+stage_a_write_note   attempts 2  last_at 14:53:38Z  conv 2ba40b9f…
+stage_b_write_summary attempts 1  last_at 14:54:59Z  conv 2ba40b9f…
+15:02:01Z  governor_queue_pointer_stale   ← first post-restart tick: no re-nudge
+```
+
+Dedup state is durable across a real service restart, and the new detection went live in the
+same tick.
+
 ### Still to do before any PASS
-Post-`/clear` resume delivered exactly once → stage A artefact → B once → restart
-durability. Item 4 (MESS/Arbitrage2) remains observational and non-interfering.
+Stage B artefact after the pointer fix. Item 4 (MESS/Arbitrage2) remains observational and
+non-interfering.
 
 ## Remaining unproven (unchanged)
 - **advance exactly once on grounded work** — the MESS agent self-advances per the queue's
