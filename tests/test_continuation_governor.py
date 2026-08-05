@@ -1200,3 +1200,53 @@ def test_an_ungroundable_advance_delivers_nothing(tmp_path, monkeypatch):
                             ctrl=None, conv="c", evaluate_only=False, conn=None)
     assert out["decision"] == "governor_advance_ungrounded"
     assert calls == []
+
+
+def test_a_gate_is_retracted_when_the_pointer_moves_past_its_stage(tmp_path, monkeypatch):
+    """Live on MESS: the queue advanced to stage_07 while the stage_06 payload gate stayed
+    open, so the owner view read "BLOCKED at stage_06" for a stage already left behind.
+    Whole-queue completion was too narrow a trigger — a project still working never hits it."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    cp = str(tmp_path / "cp.db")
+    monkeypatch.setenv("CONTROL_PLANE_DB", cp)
+    import sqlite3
+    import yaml as _y
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    monkeypatch.setattr(ap, "CP_DB_PATH", lambda: cp)
+
+    stages = [{"id": "stage_06", "status": "DONE", "next_stage": "stage_07"},
+              {"id": "stage_07", "status": "CURRENT", "instruction": "carry on",
+               "artefact": "reports/S7.md", "next_stage": None}]
+    body = _y.safe_dump({"pointer": "stage_07", "cwd": str(tmp_path), "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+
+    conn = sqlite3.connect(cp)
+    conn.execute("""CREATE TABLE IF NOT EXISTS owner_gate (id TEXT, work_item_id TEXT,
+        agent_id TEXT, reason TEXT, kind TEXT, state TEXT, correlation_id TEXT, answer TEXT,
+        opened_at TEXT, notified_at TEXT, answered_at TEXT)""")
+    for gid, corr in (("g_stale", "gov:cp-canary:0.0:stage_06"),
+                      ("g_live", "gov:cp-canary:0.0:stage_07")):
+        conn.execute("INSERT INTO owner_gate VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                     (gid, "", "cp-canary:0.0", "r", "owner_payload_missing", "open", corr,
+                      "", "2026-08-05T10:00:00", None, None))
+    conn.commit()
+    conn.close()
+
+    answered = []
+    from core.control_plane import api as cpapi
+    monkeypatch.setattr(cpapi, "answer_gate",
+                        lambda gid, answer="", **k: answered.append(gid))
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, str(p)))
+    monkeypatch.setattr(ap, "load_registry", lambda *a, **k: {
+        "cp-canary:0.0": {"next_step": "continue with the next safe step"}})
+    monkeypatch.setattr(ap, "deliver_next_step",
+                        lambda t, step, **k: {"acted": True, "verified": True})
+
+    ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                      ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert "g_stale" in answered, "the passed stage's gate must be retracted"
+    assert "g_live" not in answered, "the CURRENT stage keeps its gate"

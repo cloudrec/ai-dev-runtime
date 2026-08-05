@@ -568,6 +568,22 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
         return {**base, "decision": "governor_blocker", "note": reason,
                 "blocker_fields": fields[:10], "blocker_detail": detail}
 
+    # Retract stale gates whenever the queue moves on, not only when it finishes. Live: MESS
+    # advanced to stage_07 while its stage_06 payload gate stayed open, so the owner view
+    # reported it BLOCKED on a stage it had already left. Whole-queue completion was too
+    # narrow a trigger — a project that keeps working never reaches it.
+    try:
+        _q = cg.parse_queue(str((cfg.get(target) or {}).get("authoritative_pointer") or ""))
+        if _q.get("ok"):
+            _done = {"DONE", "PASS", "COMPLETE", "COMPLETED"}
+            _finished = [str(x.get("id")) for x in (_q.get("stages") or [])
+                         if isinstance(x, dict)
+                         and str(x.get("status") or "").upper() in _done]
+            if _finished:
+                _retract_governor_gates(target, _finished)
+    except Exception:  # noqa: BLE001 — bookkeeping must never break a tick
+        pass
+
     if d["action"] == "skip" and d.get("reason") == "queue_complete":
         # Nothing left to continue, and nothing wrong. Retract the governor's own gates for
         # the finished stages so the owner view stops reporting a completed project as
