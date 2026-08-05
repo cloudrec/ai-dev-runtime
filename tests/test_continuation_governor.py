@@ -426,3 +426,34 @@ def test_governor_reads_pending_through_the_injected_controller(tmp_path, monkey
                             cwd="/opt/mess", ctrl=Ctrl(), conv="c", evaluate_only=True,
                             conn=None)
     assert out is None or out["decision"].startswith("governor")
+
+
+def test_a_refused_paste_is_not_labelled_a_missing_payload(tmp_path, monkeypatch):
+    """Live 13:00:57: an opaque paste on arbitrage2 was refused (correct), but the gate was
+    written as `owner_payload_missing` / "NEEDS_OWNER_PAYLOAD at -" with empty fields. A
+    refused paste is not a missing payload; mislabelling buries the real payload gaps."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    cfg = {"arbitrage2-opus:0.0": {"cwd": "/opt/arbitrage2", "required_sources": [],
+                                   "authoritative_pointer": "", "pointer_section": "",
+                                   "submit_owner_queued_paste": False, "enabled": True}}
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: cfg)
+
+    class Ctrl:
+        def snapshot(self, target, cwd):
+            return {"pending": PASTE, "tail": "", "state": "waiting_input"}
+
+    out = ap._governor_pass("arbitrage2-opus:0.0", state="waiting_input", tail="",
+                            cwd="/opt/arbitrage2", ctrl=Ctrl(), conv="c",
+                            evaluate_only=True, conn=None)
+    assert out["decision"] == "governor_blocker"
+    assert out["note"] == "owner_paste_not_auto_submittable"
+    assert out["blocker_detail"], "a fieldless blocker must still record what it saw"
+
+    import sqlite3
+    conn = sqlite3.connect(str(tmp_path / "cp.db"))
+    kinds = [r[0] for r in conn.execute("SELECT kind FROM owner_gate")]
+    conn.close()
+    assert "owner_payload_missing" not in kinds, kinds
+    assert any("paste" in k for k in kinds), kinds

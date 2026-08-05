@@ -380,7 +380,8 @@ def _governor_blocker_seen(conn, target: str, stage: str, fingerprint: str) -> b
             conn.close()
 
 
-def _record_governor_blocker(conn, target: str, stage: str, fields: list) -> None:
+def _record_governor_blocker(conn, target: str, stage: str, fields: list,
+                             reason: str = "NEEDS_OWNER_PAYLOAD", detail: str = "") -> None:
     import hashlib
     import json as _j
     fp = hashlib.sha256(_j.dumps(sorted(map(str, fields))).encode()).hexdigest()[:16]
@@ -394,16 +395,23 @@ def _record_governor_blocker(conn, target: str, stage: str, fields: list) -> Non
     finally:
         if own:
             c2.close()
+    # The gate must describe the ACTUAL blocker. Hard-coding owner_payload_missing put a
+    # refused opaque paste into the owner's gate list as "NEEDS_OWNER_PAYLOAD at -", which
+    # is simply wrong and buries the real payload gaps.
+    kind = ("owner_payload_missing" if reason == "NEEDS_OWNER_PAYLOAD"
+            else f"governor_{reason}"[:60])
+    where = stage if stage and stage != "-" else target
     try:
         from core.control_plane import api as cp
         from core.control_plane.cto import emit
-        cp.open_gate(agent_id=target, reason=f"NEEDS_OWNER_PAYLOAD at {stage}",
-                     kind="owner_payload_missing", correlation_id=f"gov:{target}:{stage}")
-        emit("continuation_governor", "needs_owner_payload", agent_id=target,
+        cp.open_gate(agent_id=target, reason=f"{reason} at {where}",
+                     kind=kind, correlation_id=f"gov:{target}:{where}")
+        emit("continuation_governor", reason.lower(), agent_id=target,
              severity="warn", owner_action_required=True,
-             payload={"stage": stage, "missing_fields": fields[:20]},
-             action_taken="blocked — owner payload required",
-             dedup_key=f"govblock:{target}:{stage}:{fp}")
+             payload={"stage": stage, "missing_fields": fields[:20],
+                      "detail": detail[:200]},
+             action_taken=f"blocked — {reason}",
+             dedup_key=f"govblock:{target}:{where}:{fp}")
     except Exception:  # noqa: BLE001
         pass
 
@@ -442,9 +450,17 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
 
     if d["action"] == "blocker":
         fields = d.get("blocker_fields") or []
-        _record_governor_blocker(conn, target, str(d.get("stage") or "-"), list(fields))
-        return {**base, "decision": "governor_blocker", "note": d.get("reason"),
-                "blocker_fields": fields[:10]}
+        reason = str(d.get("reason") or "governor_blocker")
+        # a refused paste carries no stage/fields — record what it DOES have so the row is
+        # actionable instead of an empty "-"
+        detail = ""
+        if not fields:
+            det = d.get("detail") or {}
+            detail = f"{det.get('evidence','')}:{(det.get('text') or '')[:80]}"
+        _record_governor_blocker(conn, target, str(d.get("stage") or "-"), list(fields),
+                                 reason=reason, detail=detail)
+        return {**base, "decision": "governor_blocker", "note": reason,
+                "blocker_fields": fields[:10], "blocker_detail": detail}
 
     if d["action"] == "submit_queued" and not evaluate_only:
         # Press Enter on the owner's OWN queued line. Never re-sends text.
