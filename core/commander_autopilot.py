@@ -641,7 +641,9 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
     except Exception:  # noqa: BLE001
         pending = ""
     d = cg.govern(target, state=state, pending=pending, tail=tail, config=cfg)
-    base = {"target": target, "state": state, "governor": d}
+    # Surface what the governor saw so the caller can watch text it declined to submit.
+    _pending_seen = pending
+    base = {"target": target, "state": state, "governor": d, "pending_seen": _pending_seen}
 
     if d["action"] == "blocker":
         fields = d.get("blocker_fields") or []
@@ -830,9 +832,28 @@ def tick(*, inventory: Optional[dict] = None, registry: Optional[dict] = None,
         gov = _governor_pass(target, state=state, tail=tail, cwd=cwd, ctrl=ctrl,
                              conv=conv, evaluate_only=evaluate_only, conn=conn)
         if gov is not None:
-            _record_run(target, gov["decision"], gov, conn=conn)
             if gov["decision"] == "governor_submitted":
                 _clear_queued_watch(conn, target)
+            else:
+                # The governor answered but did NOT submit. If the owner's line is still
+                # sitting there, that is a stall in the making — an opaque paste the project
+                # will not auto-submit, cross-project text it refuses, an owner-gated target.
+                # Each of these previously produced a tidy decision row and no signal at all.
+                _p = str(gov.get("pending_seen") or "").strip()
+                if _p:
+                    _st = _track_queued_input(conn, target, _p,
+                                              str(gov.get("note") or gov["decision"])[:60])
+                    gov["queued_input_waiting"] = {"age_secs": int(_st["age_secs"]),
+                                                   "sample": _p[:80]}
+                    if _st["stalled"]:
+                        _record_governor_blocker(
+                            conn, target, "-",
+                            [f"owner text unsubmitted for {int(_st['age_secs'] // 60)} min: "
+                             f"{_p[:120]}"],
+                            reason="queued_input_stalled",
+                            detail=str(gov["decision"])[:60])
+                        gov["decision"] = "queued_input_stalled"
+            _record_run(target, gov["decision"], gov, conn=conn)
             results.append(gov)
             continue
 
