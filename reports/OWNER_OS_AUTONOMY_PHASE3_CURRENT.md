@@ -940,6 +940,23 @@ never touched; rows are retained; each retraction is written as an answer naming
 A paused project also now renders **PAUSED**, not IDLE — idle invites a nudge, paused is a
 decision.
 
+### Tick liveness at the deployed commit `0c64f51`
+
+`autopilot_run` dedupes an unchanged decision for 3600s, so a stable state writes one row per
+hour — sparse rows are suppression, not a stalled loop. Positive proof was taken instead by
+changing the state: a benign line was typed into the canary input and left unsubmitted.
+
+```
+16:36:12Z  governor_queue_complete      (governor tick, after the 16:35:57 restart)
+16:40:53Z  cp_action kind=continuation  controller=continuation_watchdog
+           outcome=verified  submitted=1  verified=1
+```
+
+Attribution matters here: the 30s **continuation watchdog** reached the idle pane before the
+60s autopilot tick, so this delivery is the watchdog's, not the governor's. Both are Owner OS
+and both are live at the deployed commit. It is also a third independent demonstration of
+allowed queued-input submission — by Enter, verified, never re-typed.
+
 ### Owner view after the fixes (live)
 
 ```
