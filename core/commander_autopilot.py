@@ -829,6 +829,25 @@ def tick(*, inventory: Optional[dict] = None, registry: Optional[dict] = None,
         # evaluation for governed projects. It only ever submits what the owner already
         # queued, or reports a blocker the project's own queue records — it authors
         # nothing. A `skip` falls straight through to the existing logic.
+        # DETERMINISTIC PATH FIRST. A queued task is a durable ROW; it outranks anything
+        # inferred from the pane. Screen reading below is diagnostic only and can no longer
+        # decide whether a continuation exists.
+        if not evaluate_only:
+            try:
+                from core import os_task_queue as _q
+                if _q.pending_for(target, conn=conn):
+                    _q.restore_after_reset(target, cwd=cwd, conn=conn)
+                    _r = _q.advance(target, cwd=cwd, ctrl=ctrl, conn=conn)
+                    if _r.get("action") != "idle":
+                        _res = {"target": target, "state": state,
+                                "decision": f"task_{_r['action']}", "task": _r}
+                        _record_run(target, _res["decision"], _res, conn=conn)
+                        results.append(_res)
+                        continue
+            except Exception as _e:  # noqa: BLE001 — never let the ledger break the tick
+                _record_run(target, "task_queue_error", {"target": target,
+                                                         "error": str(_e)[:200]}, conn=conn)
+
         gov = _governor_pass(target, state=state, tail=tail, cwd=cwd, ctrl=ctrl,
                              conv=conv, evaluate_only=evaluate_only, conn=conn)
         if gov is not None:

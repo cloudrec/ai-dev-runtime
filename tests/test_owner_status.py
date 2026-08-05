@@ -183,3 +183,33 @@ def test_a_completed_queue_renders_as_complete_not_as_a_problem(_isolated):
     out = osx.render(st)
     assert "queue: complete — every stage DONE" in out
     assert "PROBLEM" not in out
+
+
+def test_leftover_pane_text_is_diagnostic_not_a_blocker(_isolated, monkeypatch):
+    """Owner correction: a completed agent showing stale/suggested typed text or a
+    "new task?" hint is NOT blocked. Since the task ledger owns continuations, pane text
+    cannot imply waiting work."""
+    from core import agent_control as ac
+    from core import continuation_governor as cg
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: {
+        "cp-canary:0.0": {"project": "cp-canary", "enabled": True,
+                          "authoritative_pointer": ""}})
+    monkeypatch.setattr(ac, "pane_capture", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(ac, "agent_status", lambda *a, **k: {"state": "waiting_input"})
+    monkeypatch.setattr(ac, "pending_input_text", lambda *a, **k: "new task?")
+    row = osx.status()["agents"][0]
+    assert row["status"] == "idle", "leftover text must not read as blocked or stuck"
+    assert row["pane_text_diagnostic"] is True
+
+
+def test_a_classification_gap_is_not_an_owner_decision():
+    """`classify_scope: unknown-scope agent at /opt/x` needs engineering, not a decision."""
+    assert osx.classify_gate("classify_scope") == "diagnostic"
+    assert osx.classify_gate("canary_agent_selection") == "diagnostic"
+    assert osx.classify_gate("unverified_owner_decision") == "owner_decision"
+    assert osx.classify_gate("owner_payload_missing") == "owner_decision"
+
+
+def test_payment_is_policy_excluded_and_never_judged():
+    assert "standing owner policy" in osx.is_policy_excluded("payment:0.0")
+    assert osx.is_policy_excluded("cp-canary:0.0") == ""

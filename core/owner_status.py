@@ -18,6 +18,40 @@ CP_DB = os.getenv("CONTROL_PLANE_DB", "/root/ai-dev-runtime/control_plane.db")
 AC_DB = os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
 
 
+# Projects the owner has DELIBERATELY excluded from Owner OS. Their stalls are policy, not
+# autonomy defects, and they must never gate a PASS. payment:0.0 is excluded under every
+# revision of owner policy; arbitrage2 is under an active owner pause.
+POLICY_EXCLUDED = {
+    "payment:0.0": "excluded by standing owner policy — Owner OS never actuates payment",
+    "jobhunter": "production services outside Owner OS",
+}
+
+# Gate kinds that describe an internal classification gap or a diagnostic condition. They are
+# NOT owner blockers: a real owner blocker requires a DECISION that cannot be derived safely
+# from existing policy. Reporting these as blockers buried the one gate that did need an
+# owner (an unverified owner decision) under nine that did not.
+DIAGNOSTIC_GATE_KINDS = {
+    "classify_scope",            # "unknown-scope agent at /opt/x" — a mapping gap, not a decision
+    "canary_agent_selection",    # internal selection of a canary target
+    "governor_queued_input_stalled",   # visibility signal; the task ledger now owns delivery
+    "os_task_failed",            # actionable, but reported in the task section, not as a gate
+}
+
+
+def is_policy_excluded(target: str) -> str:
+    """Reason this target is out of scope, or '' when it is governed."""
+    for key, why in POLICY_EXCLUDED.items():
+        if target == key or key in target:
+            return why
+    return ""
+
+
+def classify_gate(kind: str) -> str:
+    """`owner_decision` (needs a human choice) | `diagnostic` (needs engineering, not a
+    decision)."""
+    return "diagnostic" if (kind or "") in DIAGNOSTIC_GATE_KINDS else "owner_decision"
+
+
 def _rows(db: str, q: str, args=()) -> list:
     try:
         c = sqlite3.connect(db, timeout=10)
@@ -125,8 +159,13 @@ def status(targets: Optional[list] = None) -> dict:
             row["status"] = "working"
             row["why"] = "agent is executing"
         elif row["queued_input"]:
-            row["status"] = "queued_input"
-            row["why"] = "text is sitting unsubmitted in the input line"
+            # DIAGNOSTIC ONLY. Since the task ledger owns continuations, text visible in a
+            # pane no longer implies work is waiting: it may be a stale recall ghost, a
+            # suggested command, or a "new task?" hint. It is never an owner blocker, and it
+            # never means the agent is stuck.
+            row["status"] = "idle"
+            row["why"] = "at rest; pane shows leftover text (diagnostic only, not a blocker)"
+            row["pane_text_diagnostic"] = True
         elif row["state"] in ("idle", "waiting_owner", "waiting_input"):
             row["status"] = "idle"
             row["why"] = "at rest; no durable blocker recorded"
@@ -141,8 +180,13 @@ def status(targets: Optional[list] = None) -> dict:
         row["recoveries_6h"] = rec.get("recoveries_6h")
         out["agents"].append(row)
 
-    out["open_owner_gates"] = _rows(
-        CP_DB, "SELECT kind,count(*) c FROM owner_gate WHERE state='open' GROUP BY kind")
+    gates = _rows(CP_DB, "SELECT kind,count(*) c FROM owner_gate WHERE state='open' "
+                         "GROUP BY kind")
+    out["open_owner_gates"] = [g for g in gates
+                               if classify_gate(g.get("kind")) == "owner_decision"]
+    out["diagnostics"] = [g for g in gates
+                          if classify_gate(g.get("kind")) == "diagnostic"]
+    out["policy_excluded"] = [{"target": t, "why": w} for t, w in POLICY_EXCLUDED.items()]
     return out
 
 
@@ -162,10 +206,20 @@ def render(st: Optional[dict] = None) -> str:
         for f in (a.get("missing_fields") or [])[:4]:
             lines.append(f"      needs: {f}")
     gates = st.get("open_owner_gates") or []
+    lines.append("")
     if gates:
-        lines.append("")
-        lines.append("  open owner gates: " +
+        lines.append("  OWNER DECISIONS NEEDED: " +
                      ", ".join(f"{g['kind']}={g['c']}" for g in gates))
+    else:
+        lines.append("  OWNER DECISIONS NEEDED: none")
+    diag = st.get("diagnostics") or []
+    if diag:
+        lines.append("  diagnostics (no owner decision): " +
+                     ", ".join(f"{g['kind']}={g['c']}" for g in diag))
+    excl = st.get("policy_excluded") or []
+    if excl:
+        lines.append("  policy-excluded (not judged for autonomy): " +
+                     ", ".join(e["target"] for e in excl))
     return "\n".join(lines)
 
 

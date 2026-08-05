@@ -1,0 +1,187 @@
+"""The deterministic control path: a continuation exists because a ROW exists.
+
+This replaces the heuristic that failed for two weeks. The tests below pin the properties
+the owner named, and deliberately include the two live failures that motivated the rewrite:
+a dim recall ghost read as staged input, and dim staged input read as a ghost.
+"""
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from core import os_task_queue as q
+
+
+@pytest.fixture(autouse=True)
+def _iso(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    yield
+
+
+def _transcript(monkeypatch, msgs):
+    monkeypatch.setattr(q, "transcript_messages", lambda cwd, limit_files=1: msgs)
+
+
+# ── 1. the queue is the source of truth ─────────────────────────────────────
+def test_a_task_exists_because_a_row_exists():
+    t = q.enqueue("cp-canary:0.0", "do thing one")
+    assert t["state"] == q.QUEUED and t["id"] and t["idem"].startswith("ostask:")
+    assert q.next_queued("cp-canary:0.0")["id"] == t["id"]
+
+
+def test_tasks_are_issued_in_order():
+    a = q.enqueue("cp-canary:0.0", "first")
+    b = q.enqueue("cp-canary:0.0", "second")
+    assert q.next_queued("cp-canary:0.0")["id"] == a["id"]
+    q.set_state(a["id"], q.DONE)
+    assert q.next_queued("cp-canary:0.0")["id"] == b["id"]
+
+
+def test_no_pane_text_can_create_a_task():
+    """The whole point: nothing visible in a terminal makes a continuation exist."""
+    assert q.next_queued("cp-canary:0.0") is None
+    assert q.active_task("cp-canary:0.0") is None
+
+
+# ── 2. acknowledgement comes from the transcript, not the prompt ────────────
+def test_ack_requires_the_text_in_the_transcript(monkeypatch):
+    t = q.enqueue("cp-canary:0.0", "continue with slice 2")
+    q.set_state(t["id"], q.SUBMITTED, submitted_ts=1000.0)
+    _transcript(monkeypatch, [])
+    assert q.find_ack("/x", "continue with slice 2", 1000.0) is None
+    _transcript(monkeypatch, [{"type": "user", "text": "continue with slice 2", "ts": 1001.0}])
+    assert q.find_ack("/x", "continue with slice 2", 1000.0) is not None
+
+
+def test_a_prompt_line_is_never_evidence_of_ack(monkeypatch):
+    """A dim/bright prompt line proves nothing — only the transcript does. This is exactly
+    what the ghost-vs-staged confusion got wrong in both directions."""
+    _transcript(monkeypatch, [{"type": "user", "text": "some OTHER command", "ts": 1001.0}])
+    assert q.find_ack("/x", "continue with slice 2", 1000.0) is None
+
+
+def test_ack_ignores_an_older_identical_message(monkeypatch):
+    """A previous run of the same text must not acknowledge today's task."""
+    _transcript(monkeypatch, [{"type": "user", "text": "run the thing", "ts": 500.0}])
+    assert q.find_ack("/x", "run the thing", 1000.0) is None
+
+
+def test_ack_survives_collapsed_multiline(monkeypatch):
+    """A pasted multiline command can arrive with line breaks collapsed; content decides."""
+    _transcript(monkeypatch, [{"type": "user", "text": "line one line two", "ts": 1001.0}])
+    assert q.find_ack("/x", "line one\nline two", 1000.0) is not None
+
+
+def test_turn_finished_only_when_the_agent_answered_last(monkeypatch):
+    _transcript(monkeypatch, [{"type": "user", "text": "go", "ts": 1000.0}])
+    assert q.turn_finished("/x", 1000.0) is False
+    _transcript(monkeypatch, [{"type": "user", "text": "go", "ts": 1000.0},
+                              {"type": "assistant", "text": "done", "ts": 1002.0}])
+    assert q.turn_finished("/x", 1000.0) is True
+
+
+# ── 3. bounded retry, exactly one, same idempotency key ────────────────────
+def _stub_submit(monkeypatch, calls, acted=True):
+    def _s(task, *, cwd, ctrl=None, conn=None, now=None):
+        calls.append({"id": task["id"], "idem": task["idem"],
+                      "attempt": int(task.get("attempts") or 0) + 1})
+        q.set_state(task["id"], q.SUBMITTED, attempts=int(task.get("attempts") or 0) + 1,
+                    submitted_ts=now or 0.0)
+        return {"acted": acted, "task_id": task["id"]}
+    monkeypatch.setattr(q, "submit", _s)
+
+
+def test_no_ack_retries_exactly_once_then_fails_and_notifies(monkeypatch):
+    calls = []
+    _stub_submit(monkeypatch, calls)
+    _transcript(monkeypatch, [])
+    notified = []
+    monkeypatch.setattr(q, "_notify_owner",
+                        lambda t, r, d: notified.append((t["id"], r)) or "gate1")
+
+    t = q.enqueue("cp-canary:0.0", "never acknowledged")
+    assert q.advance("cp-canary:0.0", cwd="/x", now=1000.0)["action"] == "submitted"
+    # inside the window: wait, do not resend
+    assert q.advance("cp-canary:0.0", cwd="/x", now=1000.0 + 5)["action"] == "awaiting_ack"
+    # past the window: exactly one retry, SAME idempotency key
+    r = q.advance("cp-canary:0.0", cwd="/x", now=1000.0 + q.ACK_TIMEOUT_SECS + 1)
+    assert r["action"] == "retried" and r["idempotency_key"] == t["idem"]
+    assert calls[0]["idem"] == calls[1]["idem"], "a retry must never take a new identity"
+    # still nothing: fail + notify, and never send a third time
+    r2 = q.advance("cp-canary:0.0", cwd="/x", now=1000.0 + 2 * q.ACK_TIMEOUT_SECS + 2)
+    assert r2["action"] == "failed" and r2["reason"] == "ack_timeout"
+    assert notified == [(t["id"], "not acknowledged")]
+    assert len(calls) == 2, calls
+    assert q.get(t["id"])["state"] == q.FAILED
+
+
+def test_an_acknowledged_task_is_never_resent(monkeypatch):
+    calls = []
+    _stub_submit(monkeypatch, calls)
+    t = q.enqueue("cp-canary:0.0", "do it once")
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
+    _transcript(monkeypatch, [{"type": "user", "text": "do it once", "ts": 1001.0}])
+    for step in range(4):
+        q.advance("cp-canary:0.0", cwd="/x", now=1000.0 + q.ACK_TIMEOUT_SECS * (step + 2))
+    assert len(calls) == 1, "exactly-once: an acknowledged task is never resent"
+
+
+def test_completion_moves_to_done_and_releases_the_next_task(monkeypatch):
+    calls = []
+    _stub_submit(monkeypatch, calls)
+    a = q.enqueue("cp-canary:0.0", "task A")
+    q.enqueue("cp-canary:0.0", "task B")
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
+    _transcript(monkeypatch, [{"type": "user", "text": "task A", "ts": 1001.0},
+                              {"type": "assistant", "text": "finished A", "ts": 1002.0}])
+    assert q.advance("cp-canary:0.0", cwd="/x", now=1003.0)["action"] == "done"
+    assert q.get(a["id"])["state"] == q.DONE
+    r = q.advance("cp-canary:0.0", cwd="/x", now=1004.0)
+    assert r["action"] == "submitted" and len(calls) == 2
+
+
+# ── 4. /clear and restart recover from the ledger ──────────────────────────
+def test_clear_before_ack_requeues_the_same_task(monkeypatch):
+    t = q.enqueue("cp-canary:0.0", "survive the clear")
+    q.set_state(t["id"], q.SUBMITTED, conversation_id="conv-old", submitted_ts=1000.0)
+    monkeypatch.setattr(q, "transcript_messages", lambda cwd, limit_files=1: [])
+    monkeypatch.setattr("core.agent_control.conversation_evidence",
+                        lambda cwd: {"latest": {"conversation_id": "conv-new"}})
+    r = q.restore_after_reset("cp-canary:0.0", cwd="/x")
+    assert r["action"] == "requeued"
+    again = q.get(t["id"])
+    assert again["state"] == q.QUEUED and again["idem"] == t["idem"], \
+        "the SAME task returns, keeping its identity"
+
+
+def test_clear_after_ack_keeps_the_task(monkeypatch):
+    """The agent already read it — a new conversation must not cause a re-send."""
+    t = q.enqueue("cp-canary:0.0", "already read")
+    q.set_state(t["id"], q.ACKNOWLEDGED, conversation_id="conv-old", submitted_ts=1000.0)
+    monkeypatch.setattr("core.agent_control.conversation_evidence",
+                        lambda cwd: {"latest": {"conversation_id": "conv-new"}})
+    assert q.restore_after_reset("cp-canary:0.0", cwd="/x")["action"] == "kept"
+    assert q.get(t["id"])["state"] == q.ACKNOWLEDGED
+
+
+def test_restart_with_no_active_task_is_a_no_op():
+    assert q.restore_after_reset("cp-canary:0.0", cwd="/x")["action"] == "nothing_active"
+
+
+# ── 5. allowlist and cross-project safety ─────────────────────────────────
+def test_submission_refuses_a_target_outside_the_actuation_allowlist(monkeypatch):
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    t = q.enqueue("payment:0.0", "anything at all")
+    out = q.submit(t, cwd="/opt/payment-orchestrator")
+    assert out["acted"] is False and out["reason"] == "not_canary"
+    assert q.get(t["id"])["state"] == q.QUEUED, "a refused task stays queued, never submitted"
+
+
+def test_a_task_is_only_ever_delivered_to_its_own_target(monkeypatch):
+    q.enqueue("cp-canary:0.0", "canary work")
+    q.enqueue("other:0.0", "other work")
+    assert q.next_queued("cp-canary:0.0")["text"] == "canary work"
+    assert q.next_queued("other:0.0")["text"] == "other work"
