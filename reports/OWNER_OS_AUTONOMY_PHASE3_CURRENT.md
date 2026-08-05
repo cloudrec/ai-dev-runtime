@@ -317,6 +317,69 @@ safety one.
 Not changed unilaterally: capping it means either a per-target poke budget or a canary step
 that can complete, and both are owner decisions about what the canary is for.
 
+## GROUNDED VERIFICATION PASS (2026-08-05, no events manufactured)
+
+Nothing was staged, pasted, cleared, crashed or nudged. Only observation and ledger reads.
+
+### 1. The wiring is genuinely exercised by the real tick
+Service PID **2480752**, started **11:45:22 CEST** (09:45Z) on HEAD `28c2afb`. Governor
+rows written by the production tick **after** that restart:
+
+```
+10:07:22  cp-canary:0.0            governor_submitted
+10:11:46  cp-canary:0.0            governor_submitted
+10:16:16  cp-canary:0.0            governor_submitted
+10:17:32  mess-qa-automation:0.0   governor_blocker
+```
+
+These are ledger rows produced by the running service, not by me invoking the module — the
+distinction that invalidated the earlier "armed" claim. Wiring confirmed live across a
+restart boundary.
+
+### 2. Blocker persists and de-duplicates across tick cycles
+`governor_blocker`, one row per stage, refreshed rather than duplicated:
+
+| target | stage | first_seen | last_seen |
+|---|---|---|---|
+| mess-qa-automation:0.0 | stage_04_security_devices | 08:35:29 | 08:44:37 |
+| mess-qa-automation:0.0 | **stage_06_misc_real_surfaces** | **10:17:30** | **10:31:56** |
+
+Stage 6's blocker survived **~14 minutes of ticks** as a single row with a moving
+`last_seen`. `owner_gate` count for `kind=owner_payload_missing` is **2** — one per blocked
+stage, not one per tick.
+
+Stage 5's blocker exists only in the monitor record: it fired before the `missing_fields`
+fix reached production, so it never reached this ledger. Stated so the ledger is not
+misread as complete.
+
+### 3. Invariants
+- **One live pane** each for `mess-qa-automation`, `cp-canary`, `arbitrage2-opus`,
+  `payment` — all `dead=0`, no duplicate agent, prompt or cwd collision.
+- **Payment excluded** from the governor config (`False`) and the recovery registry
+  (`False`).
+- **Phase 2 soak untouched and healthy:** recorder alive, **765/1440 samples**, 13.26h,
+  last sample 62s old.
+
+### ⚠ One residue worth naming: payment entries remain in the GATE registry
+`config/approved_gates.yaml` still carries **2 `payment_standby` entries** (read-only
+replication/liveness checks) written before payment was ruled out of scope. They are
+currently unreachable — payment is not in `CANARY_AGENTS`, not in the watchdog's eligible
+sessions, not governed — and `gate_answer_log` holds no payment rows, so nothing has ever
+been answered for it. But they are latent approvals: if payment were ever added to the
+eligible set, those approvals would become live without further review.
+
+Not removed unilaterally, since editing the gate registry was not part of this pass.
+Recommended: delete both entries so payment exclusion is structural rather than incidental.
+
+## Remaining unproven (unchanged)
+- **advance exactly once on grounded work** — the MESS agent self-advances per the queue's
+  own `advancement_rule`; the governor's advance path is a fallback that has not been
+  needed. Four natural transitions have all been agent-driven.
+- **`/clear` resume from the durable queue** — no `/clear` has occurred. The verbatim
+  resume instruction extracts cleanly, but extraction is not proof of use.
+
+No PASS is claimed. Status: **WORKING, monitored.**
+
 ## Superseded — the wiring gap as first reported
 
 `core/continuation_governor.py` is imported by **nothing** in `core/` or `api/`:
