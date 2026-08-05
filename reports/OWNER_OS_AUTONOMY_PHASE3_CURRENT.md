@@ -570,10 +570,67 @@ appeared). This is not a governor defect — and it is resolved by the `/clear` 
 of the acceptance requires anyway. `PROJECT_STATE.md` has been written to the canary in
 preparation, as item 3 specifies.
 
+### Full suite, backup, deploy of the guard (16:43 CEST)
+
+Full suite before deploying: **1393 passed, 0 failed** (629.51s). The `test_phase13.py`
+planner flake recorded earlier did NOT recur here; it remains an unresolved load flake, not
+something claimed as fixed.
+
+Backup `/root/owner-os-backups/predeploy-nudgeguard-20260805T144302Z` (both DBs via sqlite
+`.backup`, config, HEAD). Deployed HEAD `06d2c8d`, service PID `3436777` @ 16:43:05 CEST.
+
+**Exactly-once then confirmed live on the real recurring tick:**
+
+```
+14:43:19Z  governor_advanced             stage_a_write_note
+14:44:20Z  governor_advance_suppressed   stage_a_write_note   (stage_nudge_cooldown)
+```
+
+`governor_stage_delivery` = `attempts: 1`, `last_at 2026-08-05T14:43:11Z`. The pre-guard
+behaviour was one nudge every 60s without end; it is now one delivery followed by
+suppression, produced by the recurring service tick, not a manual module call.
+
+### DEFECT — the guard would have suppressed the post-`/clear` resume (found before running it, fixed `55aee81`)
+
+Caught by reading the gate against the next acceptance step rather than by an accident. The
+guard keyed only on `(target, stage)`. A `/clear` does not change the stage, so the first
+thing the acceptance required — resume an agent that has just lost all context — would have
+been answered with `stage_nudge_cooldown` for 600s, and permanently once the 3-attempt cap
+was reached. The guard against over-nudging would have become the stall it exists to
+prevent, and quietly: `governor_advance_suppressed` reads like correct behaviour.
+
+**Fix:** the gate records the conversation id and resets the counter when it *provably*
+changes. Fail-closed on the unknown case — an empty or unreadable conversation id proves
+nothing and never resets, so an unobservable pane cannot buy an unlimited nudge budget. The
+attempt cap still binds within a single conversation. Rows written by the already-deployed
+guard predate the column: they are migrated in place and, having no recorded conversation,
+stay suppressed rather than being mistaken for a fresh one.
+
+Four tests pin it: new conversation reopens the stage; unknown/blank id never resets; the
+cap still binds within one conversation; a legacy row survives the migration and stays
+suppressed. Focused run 90 passed. Deployed HEAD `55aee81`, PID `3462309`.
+
+### Real `/clear` executed on the canary (14:52:49Z)
+
+`PROJECT_STATE.md` written first, as item 3 specifies. `/clear` sent to the live pane.
+
+| | before | after |
+|---|---|---|
+| conversation | `b2635b20-8de7-4bcd-b0ea-8478799e38f6` | `2ba40b9f-b827-4d9f-b48b-4e0b5e562c70` |
+| cwd | `/root/cp-canary-v2` | `/root/cp-canary-v2` |
+| tmux target | `cp-canary:0.0` | `cp-canary:0.0` |
+
+Same session, same pane, same cwd, new conversation — **no duplicate agent created**.
+
+The pre-`/clear` pane also confirmed the harness limitation concretely rather than by
+inference: at 16:43 the agent appended note #1031 to `CANARY_LOG.md` — the documented
+fallback — instead of writing `ACCEPTANCE_A.md`. It had never seen the queue instruction,
+because a running session does not re-read `CLAUDE.md`. That is exactly what the `/clear`
+resolves.
+
 ### Still to do before any PASS
-Full suite → backup → deploy → verify recurring ticks → post-deploy canary tick → the live
-deterministic canary run (A → idle → B once → no resubmit → restart durability → real
-`/clear` + resume). Item 4 (MESS/Arbitrage2) remains observational and non-interfering.
+Post-`/clear` resume delivered exactly once → stage A artefact → B once → restart
+durability. Item 4 (MESS/Arbitrage2) remains observational and non-interfering.
 
 ## Remaining unproven (unchanged)
 - **advance exactly once on grounded work** — the MESS agent self-advances per the queue's
