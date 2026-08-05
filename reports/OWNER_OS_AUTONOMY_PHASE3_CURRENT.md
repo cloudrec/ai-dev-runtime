@@ -159,6 +159,42 @@ an anti-overcorrection test that a fully-specified payload does NOT block).
   available (`resume_instruction available: True`), but no `/clear` has occurred.
 - **no duplicate prompt/agent/cwd collision** — one `mess-qa-automation` pane throughout.
 
+## STANDING STATE — re-verified 2026-08-05 (post-deploy)
+
+| check | value |
+|---|---|
+| queue valid | yes — `pointer: stage_03_media_voice`, `status: CURRENT` |
+| needs_owner_payload | **true** (3 exact fields, unchanged) |
+| branch / deploy_allowed | `fable-0.1.91-realdevice-ux` / `false` |
+| MESS pane | `idle`, input line empty, **one pane** |
+| governor decision | `blocker: NEEDS_OWNER_PAYLOAD` |
+| duplicates | none — 1 pane each for mess / canary / arbitrage2 / payment |
+| Phase 2 soak | alive, 597/1440 samples, 10.28h, last sample 10s old |
+
+The media/voice design is NOT invented and MESS is not being interfered with. The blocker
+stands as the correct terminal answer for stage 3 until the owner supplies the payload.
+
+## ⚠ GAP — the governor is deployed but NOT WIRED IN
+
+`core/continuation_governor.py` is imported by **nothing** in `core/` or `api/`:
+
+```
+grep -rn 'continuation_governor' core/ api/   → no hits outside the module itself
+```
+
+Every governor decision recorded in this report — including the live
+`NEEDS_OWNER_PAYLOAD` blocker — was produced by invoking the module directly during
+verification. The logic is proven against real live state, but no running loop calls it,
+so it is **not autonomously governing anything yet**, and it does not persist blockers to
+a durable ledger.
+
+"Armed" is therefore currently **false**. Wiring it into the watchdog/autopilot tick is a
+code change plus a service restart; MESS is mid backup-remediation and the owner asked for
+no interference, so it is NOT being done unannounced. It is the next step and needs an
+explicit go-ahead.
+
+This does not change any evidence above — it changes what may be claimed from it.
+
 ## Deployment (current)
 
 HEAD `ab39d65`, service PID 1907051, suite **1361 passed**, backups
