@@ -142,8 +142,21 @@ def evaluate(target: str, *, state: str, tail: str = "", conv_age_secs: Optional
         # Everything else keeps v1 behaviour: record, never duplicate, wait for the owner.
         try:
             from core import session_recovery as sr
+            # A PAUSED project must not be revived. Session recovery keeps its own registry,
+            # so none of the pause gates (governor `enabled`, `live_actuation`, the actuation
+            # allowlist) reached this path: live at 18:45:56Z, nine seconds after arbitrage2
+            # was deliberately stopped under an owner pause, the watchdog tried to restart it
+            # with a new session. It stopped at `verify_failed` — luck, not policy. Restarting
+            # a project the owner paused is exactly the kind of action a pause forbids.
             reg = sr.load_registry()
             if target in (reg.get("sessions") or {}):
+                # Registration alone is not permission. The pause gate sits INSIDE this
+                # branch so an unregistered session keeps its original `watchdog_dead`
+                # answer, and only a recovery that would otherwise have run is refused.
+                if not bool(entry.get("live_actuation", False)):
+                    return {**base, "decision": "watchdog_dead_not_recovered_paused",
+                            "note": "session is dead and registered for recovery, but the "
+                                    "project is paused/ungranted — recorded, never revived"}
                 res = sr.recover(target, registry=reg)
                 return {**base, "decision": "watchdog_dead_recovery",
                         "recovery": res,

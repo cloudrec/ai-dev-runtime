@@ -1250,3 +1250,43 @@ def test_a_gate_is_retracted_when_the_pointer_moves_past_its_stage(tmp_path, mon
                       ctrl=None, conv="c", evaluate_only=False, conn=None)
     assert "g_stale" in answered, "the passed stage's gate must be retracted"
     assert "g_live" not in answered, "the CURRENT stage keeps its gate"
+
+
+# ═════════ 14. an owner pause must survive the dead-session watchdog ════════
+def test_a_paused_project_is_never_revived_when_it_dies(tmp_path, monkeypatch):
+    """Live 18:45:56Z: arbitrage2 was deliberately stopped under an owner pause and the
+    watchdog tried to restart it nine seconds later with a NEW session. It stopped at
+    verify_failed — luck, not policy. Session recovery keeps its own registry, so none of the
+    pause gates reached that path."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core import session_recovery as sr
+    called = []
+    monkeypatch.setattr(sr, "load_registry",
+                        lambda *a, **k: {"sessions": {"arbitrage2-opus:0.0": {}}})
+    monkeypatch.setattr(sr, "recover",
+                        lambda t, **k: called.append(t) or {"recovered": True})
+    reg = {"arbitrage2-opus:0.0": {"next_step": "continue the next safe step",
+                                   "live_actuation": False}}      # paused
+    out = ap.evaluate("arbitrage2-opus:0.0", state="dead", tail="", registry=reg)
+    assert out["decision"] == "watchdog_dead_not_recovered_paused", out
+    assert called == [], "a paused project must never be revived"
+
+
+def test_a_granted_project_is_still_recovered_when_it_dies(tmp_path, monkeypatch):
+    """Anti-overcorrection: the pause gate must not disable recovery for approved projects."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core import session_recovery as sr
+    called = []
+    monkeypatch.setattr(sr, "load_registry",
+                        lambda *a, **k: {"sessions": {"cp-canary:0.0": {}}})
+    monkeypatch.setattr(sr, "recover",
+                        lambda t, **k: called.append(t) or {"recovered": True})
+    reg = {"cp-canary:0.0": {"next_step": "continue the next safe step",
+                             "live_actuation": True}}
+    out = ap.evaluate("cp-canary:0.0", state="dead", tail="", registry=reg)
+    assert out["decision"] == "watchdog_dead_recovery"
+    assert called == ["cp-canary:0.0"]

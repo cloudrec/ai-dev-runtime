@@ -293,7 +293,8 @@ def test_autopilot_routes_a_dead_registered_session_to_recovery(monkeypatch, tmp
     monkeypatch.setattr(sr, "recover",
                         lambda t, **k: {"recovered": True, "reason": "verified"})
     d = ap.evaluate("cp-canary:0.0", state="dead", tail="",
-                    registry={"cp-canary:0.0": {"root": str(tmp_path), "next_step": "x"}})
+                    registry={"cp-canary:0.0": {"root": str(tmp_path), "next_step": "x",
+                                                "live_actuation": True}})
     assert d["decision"] == "watchdog_dead_recovery"
     assert d["recovery"]["recovered"] is True
 
