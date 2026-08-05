@@ -1,6 +1,6 @@
 # OWNER OS — AUTONOMY PHASE 3: CONTINUATION GOVERNOR (LIVE)
 
-**Status: WORKING — gate passed, governor built and tested, not yet deployed.** Persisted 2026-08-05 before any work, so context
+**Status: WORKING — deployed, awaiting a natural V8 stage completion for live acceptance.** Persisted 2026-08-05 before any work, so context
 compaction cannot lose it. Phase 3 begins ONLY if the Phase 2 6-hour checkpoint is clean
 enough to continue; Phase 2 evidence lives in `OWNER_OS_AUTONOMY_PHASE2_CURRENT.md` and is
 kept separate from this file.
@@ -62,7 +62,59 @@ violated (0 duplicates, 0 unapproved answers, 0 gaps, 0 quarantines, service act
 throughout) and the single failing criterion — MESS parked 37 minutes on
 `[Pasted text #3 +99 lines]` — is precisely what Phase 3 exists to govern.
 
-## OWNER BLOCKER (open) — the declared MESS queue file does not exist
+## BLOCKER RESOLVED — the owner's agent authored the queue during V8
+
+`/opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md` now exists (created 07:19, rewritten
+08:11) and **validates**. It arrived in a far better shape than the markdown I had planned
+for: a `MACHINE-READABLE STATE` YAML block plus a verbatim post-`/clear` resume
+instruction.
+
+```
+pointer: stage_02_invites      branch: fable-0.1.91-realdevice-ux
+cwd: /opt/mess                 deploy_allowed: false
+completed: 7 entries           stages: 10
+```
+
+The parser was rewritten against the real format (YAML first, markdown retained as a
+fallback), and `config/project_queues.yaml` now points at this file — PROJECT_STATE is no
+longer treated as the queue, per the owner's correction. Live check after deploy:
+`queue valid: True | pointer: stage_02_invites | status: IN_PROGRESS`, and the governor
+correctly returns `skip` while V8 is in flight. **V8 work was never touched.**
+
+### Three defects found while building against the real file
+1. **Placeholder would have been typed as text.** The first decision returned the pane's
+   `[Pasted text #3 +99 lines]` placeholder as `step_text`; delivering it would have typed
+   that literal string into MESS instead of submitting the owner's real 99-line paste. A
+   queued line is now submitted with a bare Enter — `mode: enter`, no `step_text`.
+2. **False `NEEDS_OWNER_PAYLOAD`.** The first parser matched the token anywhere, so stage 2
+   was flagged as blocked because its body *instructs* "if absent, record
+   NEEDS_OWNER_PAYLOAD". Anchored to line-start records; the resolved stage-1 marker is
+   excluded too.
+3. **Invalid YAML was masked.** When a machine-readable block existed but was mid-write,
+   `parse_queue` fell through to the markdown parser and returned *its* error — making
+   "the owner's agent is writing right now" indistinguishable from "this is a legacy file".
+   The fallback now applies only when no YAML block exists at all; a mid-write queue is a
+   WAIT.
+
+I also removed a path I had invented for arbitrage2 (`reports/ACAP_STATE.md`, which does
+not exist) rather than leave a fabricated source in config.
+
+## Deployment
+
+| | |
+|---|---|
+| HEAD | `18260ff` |
+| Service | `ai-runtime.service` active, PID 1808767 |
+| Suite | **1358 passed, 0 failed** |
+| Backup | `/root/owner-os-backups/predeploy-phase3-20260805T062310Z` (incl. a snapshot of the queue file) |
+
+## Live acceptance — pending a NATURAL V8 completion
+
+Nothing is manufactured. The governor is deployed and observing; MESS is `working` on
+stage 2, so the correct decision right now is `skip`. Acceptance will be recorded when V8
+finishes on its own and the pointer moves.
+
+## Superseded — original blocker text
 
 `/opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md` is **not present**, and a search of
 `/opt/mess` for `*EXECUTION_QUEUE*` / `*REDESIGN_EXECUTION*` finds nothing. The directory
