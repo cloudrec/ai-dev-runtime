@@ -856,18 +856,115 @@ so a **second, cleanly post-fix recorder** was started after `cf27579`
 untouched. Both track sampling gaps, duplicate submissions, wrong-project actions, unknown
 prompt answers, recoveries, `/clear` resumes and quarantine events.
 
+## ═══ ROUND 2 (owner directive: finish without pausing) ═══
+
+### Arbitrage2 owner pause — extended to Owner OS itself
+
+The owner paused Arbitrage2. The autopilot was still poking that pane every 60s with
+`live_actuation: true`, which is working on it by any honest reading, so the pause was
+extended to the control plane. **Three independent gates**, so no single edit resumes contact:
+
+| gate | file | value |
+|---|---|---|
+| governance | `config/project_queues.yaml` | `enabled: false` → `skip:governor_disabled_for_project` |
+| autopilot poke | `config/commander_autopilot.yaml` | `live_actuation: false` |
+| actuation allowlist | `zz-actuation-scope.conf` | removed from `CONTROL_PLANE_CANARY_AGENTS` |
+
+The project stays *registered*, not deleted, so the pause is visible and reversible on an
+explicit owner instruction. Live proof:
+
+```
+arbitrage2 last actuation ever : 2026-08-05T15:56:07Z (autopilot_next_step, verified)
+arbitrage2 cp_action rows since pause deploy 16:23Z : 0
+arbitrage2 autopilot_run rows since pause deploy    : 0
+cp-canary  cp_action rows in the same window        : 11   (system still live, not stalled)
+effective allowlist: CONTROL_PLANE_CANARY_AGENTS=cp-canary:0.0,mess-qa-automation:0.0
+```
+
+Six tests pin it, one reading the systemd drop-in directly. Payment remains absent from every
+list. MESS continues untouched.
+
+### Complete canary continuation cycle, blocker → payload → done
+
+Stage C had been left deliberately unspecified to prove the `NEEDS_OWNER_PAYLOAD` path; that
+proof is recorded above (gate `ba2c9b382c56`, blocker `15:07:16Z → 15:18:49Z`). The two
+withheld fields were then supplied **by the author of this harness** — a harness bookkeeping
+decision, explicitly *not* a project design decision; no real project payload has ever been
+authored by the control plane.
+
+```
+16:03:25Z  governor advance, stage_c ledger attempts=1   (exactly once)
+           agent wrote reports/ACCEPTANCE_C.md, marked stage_c DONE, pointer → null
+16:23:18Z  poke on cp-canary, delivered=true, verified
+           (submitted, pane_changed, prompt_consumed, conversation_modified)
+```
+
+The canary's own report states the blocker fired as intended and that it refused to invent a
+title or section list — the refusal and the resumption are now both demonstrated on the same
+stage.
+
+### DEFECT — a finished queue reported as a broken one (fixed `0c64f51`)
+
+On completion the agent cleared `pointer`, and the governor reported:
+
+```
+queue_not_valid:pointer_missing     blocker_fields: ["field:pointer"]
+owner view:  cp-canary  BLOCKED  NEEDS_OWNER_PAYLOAD at stage_c_missing_payload
+             queue PROBLEM: pointer_missing
+```
+
+Every stage was DONE and `ACCEPTANCE_C.md` was on disk. The owner-facing view was telling the
+owner to go fix a queue that had simply finished, and reporting a completed project as
+blocked on a payload it had already received. It failed *safe* (`action: skip`, no gate
+opened) but it was still false.
+
+Fixed: a cleared pointer with every stage DONE is recognised as completion (`complete: true`,
+`queue_complete`); a cleared pointer with unfinished stages is still the error it always was.
+
+### DEFECT — condition-derived gates never self-resolved (fixed `0c64f51`)
+
+Previously recorded as an observation and deliberately deferred as a policy question. The
+completed canary turned it into active harm: gates `43e8eb7a5d19` (stale pointer) and
+`ba2c9b382c56` (payload missing) stayed open after both conditions were gone, so a finished
+project rendered as BLOCKED.
+
+The governor now retracts **its own** gates for stages the durable queue reports DONE,
+identified by the `gov:` correlation id. Owner decisions and gates from any other source are
+never touched; rows are retained; each retraction is written as an answer naming why. Live:
+
+```
+16:36:12Z  governor_queue_complete
+           retracted: ['43e8eb7a5d194e37', 'ba2c9b382c564a18']   → both state=answered
+```
+
+A paused project also now renders **PAUSED**, not IDLE — idle invites a nudge, paused is a
+decision.
+
+### Owner view after the fixes (live)
+
+```
+arbitrage2-opus:0.0     PAUSED   owner pause active — Owner OS is not acting on this project
+cp-canary:0.0           IDLE     at rest; no durable blocker recorded
+    queue: complete — every stage DONE
+mess-qa-automation:0.0  BLOCKED  NEEDS_OWNER_PAYLOAD at stage_06_misc_real_surfaces
+    needs: folders, scheduled messages, admin panel, update modal, SOS/check-in, polls,
+           location cards, contact profile — per-surface titles, row copy, action labels…
+```
+
+Three agents, three different truthful states, each traceable to durable records.
+
 ## ═══ ACCEPTANCE RESULT ═══
 
 ### Exact state
 
 | | |
 |---|---|
-| code commit (HEAD) | `b34dd49` |
-| deployed commit | `b34dd49` |
-| service | `ai-runtime.service`, PID **3635247**, active since 2026-08-05 17:47:17 CEST, `NRestarts=0` |
+| code commit (HEAD) | `0c64f51` |
+| deployed commit | `0c64f51` |
+| service | `ai-runtime.service`, PID **3806674**, active since 2026-08-05 18:35:5x CEST, `NRestarts=0` |
 | durable store | `/root/ai-dev-runtime/control_plane.db` (service `WorkingDirectory`, no `CONTROL_PLANE_DB` override) |
-| full suite | **1421 passed, 0 failed** (633.48s) at `b34dd49` |
-| earlier full suites | 1393 passed at `06d2c8d`; 1408 passed at `bf46252` |
+| full suite | **1432 passed, 0 failed** (444.58s) at `0c64f51` |
+| earlier full suites | 1393 @ `06d2c8d`; 1408 @ `bf46252`; 1421 @ `b34dd49`; 1426 @ `29ae290` |
 | soaks | Phase 2 24h (untouched, ~18h), Phase 3 (since first deploy), Phase 3 **post-fix** (since `cf27579`) |
 
 The `test_phase13` planner flake recorded earlier did not recur in three subsequent full
@@ -884,7 +981,9 @@ an unresolved load flake, not as fixed.
 | 4 | exercise real projects safely, no interference | **PASS** | MESS correctly BLOCKED on a genuine owner payload, untouched; arbitrage2 paper-only; no real transition in window → canary recorded as decisive per instruction, monitor left active |
 | 5 | project-role isolation + cross-project rejection | **PASS (after a defect found live)** | four cross-project instructions were ALLOWED against the shipped config until `a6dadc5`; all refused now, in-role work still passes, no unenforceable scopes remain |
 | 6 | focused + full suite, backup, deploy, restart, health, post-deploy tick | **PASS** | backups `predeploy-nudgeguard-20260805T144302Z`, `predeploy-scopefix-20260805T154716Z`; four clean deploys |
-| 7 | fresh post-fix soak | **RUNNING** | `reports/phase3_postfix_soak.jsonl`, detached, restart-persistent; `duplicates: {}`, all pane counts 1 |
+| 7 | fresh post-fix soak | **RUNNING** | `reports/phase3_postfix_soak.jsonl`, detached, restart-persistent; `duplicates: {}`, all pane counts 1; survived 7 service restarts |
+| 9 | Arbitrage2 owner pause honoured by Owner OS | **PASS** | three gates closed; 0 actions since 16:23Z vs 11 on the canary |
+| 10 | Payment untouched | **PASS** | absent from the governed config, the registry grant list and the actuation allowlist |
 | 8 | this report | **DONE** | — |
 
 Item 3 in detail — every gate proven on the live pane, not in a test:
@@ -918,11 +1017,15 @@ each element is backed by a timestamped durable record rather than by a test.
 - **The opaque-paste refusal on the canary used a typed marker**, which triggers the same
   detector path but is not a genuine multi-line paste. The genuine one was observed on
   arbitrage2 — before the taxonomy fix, so it carried the wrong label at the time.
-- **Nine Phase 3 defects were found by driving production; one by the suite.** Three surfaced
-  in the final verification pass, after the earlier gates were already green — including a
-  role-isolation config that enforced almost nothing, and a status view that reported an agent
-  with an open owner gate as idle. A green suite has repeatedly not been evidence of correct
-  live behaviour in this phase.
+- **Eleven Phase 3 defects were found by driving production; one by the suite.** Five surfaced
+  after the acceptance gates were already green — a role-isolation config that enforced almost
+  nothing, a status view that showed an agent with an open owner gate as idle, a finished queue
+  reported as broken, and gates that never released a completed project. A green suite has
+  repeatedly not been evidence of correct live behaviour in this phase; every one of these was
+  found by reading live state.
+- **The role-isolation markers are deliberately blunt.** They refused my own harmless stage C
+  instruction because its title contained the word "deploy". Deny-by-default was chosen over
+  precision, so expect occasional false refusals of text that merely mentions a forbidden word.
 - **The post-fix soak has minutes of data, not hours.** Item 7 is running, not concluded.
 - Condition-derived gates do not self-resolve (see the observation above); left unchanged
   deliberately.
