@@ -1,6 +1,6 @@
 # OWNER OS — AUTONOMY PHASE 3: CONTINUATION GOVERNOR (LIVE)
 
-**Status: WORKING — deployed, awaiting a natural V8 stage completion for live acceptance.** Persisted 2026-08-05 before any work, so context
+**Status: WORKING — natural V8 completion observed; NEEDS_OWNER_PAYLOAD blocker proven live. Remaining acceptance items pending.** Persisted 2026-08-05 before any work, so context
 compaction cannot lose it. Phase 3 begins ONLY if the Phase 2 6-hour checkpoint is clean
 enough to continue; Phase 2 evidence lives in `OWNER_OS_AUTONOMY_PHASE2_CURRENT.md` and is
 kept separate from this file.
@@ -108,11 +108,61 @@ not exist) rather than leave a fabricated source in config.
 | Suite | **1358 passed, 0 failed** |
 | Backup | `/root/owner-os-backups/predeploy-phase3-20260805T062310Z` (incl. a snapshot of the queue file) |
 
-## Live acceptance — pending a NATURAL V8 completion
+## Live acceptance — NATURAL V8 completion observed (2026-08-05 08:46)
 
-Nothing is manufactured. The governor is deployed and observing; MESS is `working` on
-stage 2, so the correct decision right now is `skip`. Acceptance will be recorded when V8
-finishes on its own and the pointer moves.
+Nothing was manufactured and V8 was never touched. The monitor recorded the transition as
+it happened:
+
+```
+08:26  pointer=stage_02_invites     status=IN_PROGRESS  mess=working  decision=skip
+08:46  pointer=stage_03_media_voice status=CURRENT      mess=working  decision=skip
+08:48  pointer=stage_03_media_voice status=CURRENT      mess=idle     decision=blocker:NEEDS_OWNER_PAYLOAD
+```
+
+### ✅ V8 completion updates the pointer
+The MESS agent finished stage 2 and advanced the queue itself
+(`stage_02_invites` → `stage_03_media_voice`); `completed` now carries 7 entries, the last
+being `v7_group_flows / PASS / 25206a2`. The governor read the moved pointer immediately.
+
+### ✅ Governor observes the completed stage and does not interfere
+While the agent was working, every decision was `skip` — `stage_in_progress` /
+`nothing_queued_and_stage_incomplete`. It only spoke once the pane went idle.
+
+### ✅ Missing payload raises a precise NEEDS_OWNER_PAYLOAD blocker
+Live, post-deploy, against the real queue:
+
+```
+decision: blocker  reason: NEEDS_OWNER_PAYLOAD  stage: stage_03_media_voice
+blocker_fields:
+  - image/media viewer: title, chrome, actions, zoom/close affordances, metrics
+  - file surface: row copy, size/type presentation, download/open action labels
+  - voice: recording, preview, send and failure state copy + metrics
+```
+
+Exact fields, quoted from the owner's own queue. No design invented, no spinning.
+
+#### Defect this case caught — and it was caught by the live run, not the tests
+The real queue records the blocker as **`payload: NEEDS_OWNER_PAYLOAD`** while `status`
+stays `CURRENT`. My parser checked `status` only, so it read `needs_owner_payload: False`
+and would have returned a silent `skip` on an idle agent — the exact stall this phase
+exists to remove, reintroduced by my own code. Now `status`, `payload` and `blockers` are
+all consulted, `missing_fields` is surfaced, and three regression tests pin it (including
+an anti-overcorrection test that a fully-specified payload does NOT block).
+
+### Still outstanding for a PASS
+- **advance exactly once on grounded work** — not yet observed live. The MESS agent
+  advances its own pointer per the queue's `advancement_rule`, so the governor's advance
+  path is a fallback that has not been exercised naturally yet.
+- **queued pasted input submitted once, live** — proven in tests; not yet reproduced
+  naturally since the 37-minute stall.
+- **`/clear` resume from the durable queue** — the verbatim instruction is extracted and
+  available (`resume_instruction available: True`), but no `/clear` has occurred.
+- **no duplicate prompt/agent/cwd collision** — one `mess-qa-automation` pane throughout.
+
+## Deployment (current)
+
+HEAD `ab39d65`, service PID 1907051, suite **1361 passed**, backups
+`predeploy-phase3-20260805T062310Z` and `predeploy-phase3b-*` (each with a queue snapshot).
 
 ## Superseded — original blocker text
 
