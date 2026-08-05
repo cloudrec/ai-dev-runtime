@@ -160,9 +160,21 @@ def parse_queue_yaml(path: str) -> dict:
                 "blocker_fields": [f"pointer:{pointer} not among {ids[:6]}"]}
     cur = next(s for s in stages if isinstance(s, dict) and str(s.get("id")) == pointer)
     status = str(cur.get("status") or "").upper()
+    # The real queue records a missing payload in the `payload` field (and/or `blockers`)
+    # while `status` stays CURRENT — checking status alone missed it live on stage 3 and
+    # would have idled silently instead of raising the blocker.
+    payload_field = cur.get("payload")
+    payload_txt = (payload_field if isinstance(payload_field, str)
+                   else " ".join(str(v) for v in (payload_field or {}).values())
+                   if isinstance(payload_field, dict) else "")
+    blockers_txt = " ".join(str(b) for b in (cur.get("blockers") or [])
+                            if b is not None)
+    needs = ("NEEDS_OWNER_PAYLOAD" in
+             f"{status} {payload_txt} {blockers_txt}".upper())
     return {"ok": True, "format": "yaml", "path": path, "pointer": pointer,
             "current": cur, "current_status": status,
-            "needs_owner_payload": status == "NEEDS_OWNER_PAYLOAD",
+            "needs_owner_payload": needs,
+            "missing_fields": list(cur.get("missing_fields") or []),
             "branch": str(data.get("branch") or ""), "cwd": str(data.get("cwd") or ""),
             "deploy_allowed": bool(data.get("deploy_allowed")),
             "completed": data.get("completed") or [],
@@ -325,7 +337,8 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
                 cur = q.get("current") or {}
                 status = q.get("current_status") or ""
                 if q.get("needs_owner_payload"):
-                    missing = cur.get("missing_fields") or cur.get("missing") or []
+                    missing = (q.get("missing_fields") or cur.get("missing_fields")
+                               or cur.get("missing") or [])
                     return {"action": "blocker", "reason": "NEEDS_OWNER_PAYLOAD",
                             "owner_blocker": True, "stage": q.get("pointer"),
                             "blocker_fields": missing or ["see stage entry in the queue"],

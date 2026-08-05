@@ -259,3 +259,42 @@ def test_live_owner_queue_parses_and_validates():
     assert q["pointer"] and q["branch"] and q["cwd"] == "/opt/mess"
     assert q["deploy_allowed"] is False
     assert q["resume_instruction"], "the durable /clear resume text must be extractable"
+
+
+def test_needs_owner_payload_recorded_in_the_payload_field(tmp_path):
+    """The live shape on stage 3: `status: CURRENT` with `payload: NEEDS_OWNER_PAYLOAD`
+    and `missing_fields`. Checking `status` alone missed it and idled silently."""
+    stages = [{"id": "stage_03_media_voice", "status": "CURRENT",
+               "payload": "NEEDS_OWNER_PAYLOAD",
+               "missing_fields": ["image/media viewer: title, chrome, actions",
+                                  "voice: recording, preview, send copy + metrics"]},
+              {"id": "stage_04_security_devices", "status": "PENDING"}]
+    path = _yaml_queue(tmp_path, pointer="stage_03_media_voice", stages=stages)
+    q = cg.parse_queue(path)
+    assert q["needs_owner_payload"] is True
+    d = cg.govern("mess-qa-automation:0.0", state="idle",
+                  config=_cfg(authoritative_pointer=path, required_sources=[]))
+    assert d["action"] == "blocker" and d["reason"] == "NEEDS_OWNER_PAYLOAD"
+    assert d["stage"] == "stage_03_media_voice"
+    assert d["blocker_fields"] == stages[0]["missing_fields"]
+
+
+def test_needs_owner_payload_recorded_in_blockers_list(tmp_path):
+    stages = [{"id": "stage_03_media_voice", "status": "CURRENT",
+               "blockers": ["NEEDS_OWNER_PAYLOAD"], "missing_fields": ["copy.x"]},
+              {"id": "stage_04_security_devices", "status": "PENDING"}]
+    path = _yaml_queue(tmp_path, pointer="stage_03_media_voice", stages=stages)
+    assert cg.parse_queue(path)["needs_owner_payload"] is True
+
+
+def test_a_specified_payload_is_not_mistaken_for_a_blocker(tmp_path):
+    """Anti-overcorrection: a stage whose payload is fully specified must NOT block."""
+    stages = [{"id": "stage_03_media_voice", "status": "CURRENT",
+               "payload": {"spec": "design/v1/SPEC_V9.md", "copy": "design/v1/COPY_V9.json"}},
+              {"id": "stage_04_security_devices", "status": "PENDING"}]
+    path = _yaml_queue(tmp_path, pointer="stage_03_media_voice", stages=stages)
+    q = cg.parse_queue(path)
+    assert q["needs_owner_payload"] is False
+    d = cg.govern("mess-qa-automation:0.0", state="idle",
+                  config=_cfg(authoritative_pointer=path, required_sources=[]))
+    assert d["action"] == "skip" and d["reason"] == "stage_in_progress"
