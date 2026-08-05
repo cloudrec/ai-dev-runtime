@@ -201,6 +201,48 @@ autopilot's own detector is the authority. Pinned by a new test using the real
 Live confirmation right now: MESS is `working` → `progressing: True` → wired pass returns
 `None`, so the ordinary path runs and nothing is governed. Correct.
 
+## LIVE EVIDENCE FROM THE WIRED GOVERNOR (2026-08-05)
+
+The governor is now acting inside the production tick, not being invoked by me. Ledger
+rows, verified after the fact:
+
+| time (UTC) | target | decision | proof |
+|---|---|---|---|
+| 08:16:18 | `cp-canary:0.0` | **`governor_submitted`** | `verify: ok=True, queued_input=False, progressed=True` — an owner-queued line was submitted with Enter and real execution followed |
+| 08:35:29 | `mess-qa-automation:0.0` | **`governor_blocker`** | `NEEDS_OWNER_PAYLOAD` at `stage_04_security_devices` |
+
+**Durable blocker record, deduped as designed:**
+`governor_blocker` holds ONE row — `first_seen 08:35:29`, `last_seen 08:44:37` — i.e. the
+condition was re-observed across ticks and the record was refreshed rather than duplicated.
+`owner_gate 9016e3eca57342d9 / kind=owner_payload_missing` was opened once.
+
+**Second natural stage transition observed** (no human ping, no interference):
+```
+08:35  stage_04_security_devices  CURRENT  mess=idle     → blocker:NEEDS_OWNER_PAYLOAD
+10:35  stage_04_security_devices  CURRENT  mess=idle     → blocker (still standing)
+10:45  stage_04_security_devices  CURRENT  mess=working  → skip (resumed; hands off)
+```
+Stage 3 media/voice completed and the pointer advanced to stage 4 on its own; the missing
+payload for stage 4 was recorded with its four exact field groups (Security modal/Center
+titles and row copy, device list + revoke confirm copy, key-verification QR match/mismatch
+copy, recovery/backup warning copy).
+
+**One pane throughout** for both `mess-qa-automation` and `cp-canary` — no duplicate agent,
+prompt or cwd collision at any point.
+
+### Acceptance status
+| criterion | status |
+|---|---|
+| V8/stage completion updates the pointer | ✅ observed twice, naturally |
+| governor observes the completed stage | ✅ |
+| missing payload → precise `NEEDS_OWNER_PAYLOAD` blocker | ✅ live, with exact fields, deduped, owner gate opened |
+| queued paste submitted exactly once | ✅ live on cp-canary (`governor_submitted`, verified) |
+| advance exactly once on grounded work | ⏳ not observed — the MESS agent self-advances per the queue's own `advancement_rule`, so the governor's advance path is a fallback that has not been needed |
+| `/clear` resume from the durable queue | ⏳ no `/clear` has occurred; the verbatim instruction extracts cleanly |
+| no duplicate prompt/agent/cwd | ✅ |
+
+Two criteria remain unobserved, so the phase verdict stays unclaimed.
+
 ## Superseded — the wiring gap as first reported
 
 `core/continuation_governor.py` is imported by **nothing** in `core/` or `api/`:
