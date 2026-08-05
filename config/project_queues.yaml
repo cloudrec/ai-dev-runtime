@@ -15,8 +15,10 @@ projects:
     required_sources:
       - /opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md
       - /opt/mess/reports/PROJECT_STATE.md
-    authoritative_pointer: /opt/mess/reports/PROJECT_STATE.md
-    pointer_section: "EXECUTE NEXT"
+    # The owner's agent created the durable machine-readable queue during V8; it — not
+    # PROJECT_STATE alone — is authoritative.
+    authoritative_pointer: /opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md
+    pointer_section: ""
     # An OWNER-typed paste already sitting in the input line is the owner's own
     # instruction; submitting it restores their intent rather than inventing work. This
     # is what the 2026-08-05 37-minute stall was. Enabled here deliberately and audited;

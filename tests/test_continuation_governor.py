@@ -160,8 +160,102 @@ def test_disabled_project_is_skipped():
     assert d["action"] == "skip" and d["reason"] == "governor_disabled_for_project"
 
 
-def test_live_shipped_config_flags_the_missing_mess_queue_file():
-    """The real gap: the owner named a queue file that does not exist on disk."""
+def test_live_shipped_config_points_at_the_real_owner_queue():
+    """The queue file was absent when this phase started; the owner's agent created it
+    during V8, so the config now points at it and nothing is missing."""
     src = cg.queue_sources("mess-qa-automation:0.0")
     assert src["configured"] is True
-    assert any("REDESIGN_EXECUTION_QUEUE" in m for m in src["missing"])
+    assert src["missing"] == [], src["missing"]
+    assert src["pointer"].endswith("REDESIGN_EXECUTION_QUEUE.md")
+
+
+# ═════════ 5. the REAL owner-authored queue format (machine-readable) ═══════
+REAL_QUEUE = "/opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md"
+
+
+def _yaml_queue(tmp_path, pointer="stage_02_invites", status="IN_PROGRESS",
+                stages=None, extra=""):
+    stages = stages or [{"id": "stage_02_invites", "status": status},
+                        {"id": "stage_03_media_voice", "status": "PENDING"}]
+    import yaml as _y
+    body = _y.safe_dump({"pointer": pointer, "branch": "b", "cwd": "/opt/mess",
+                         "deploy_allowed": False, "stages": stages})
+    p = tmp_path / "QUEUE.md"
+    p.write_text("# Q\n\n## RESUME AFTER `/clear`\n\n> Read the queue.\n> Verify branch.\n\n"
+                 "## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n" + extra)
+    return str(p)
+
+
+def test_parses_the_machine_readable_block(tmp_path):
+    q = cg.parse_queue(_yaml_queue(tmp_path))
+    assert q["ok"] and q["format"] == "yaml"
+    assert q["pointer"] == "stage_02_invites" and q["current_status"] == "IN_PROGRESS"
+
+
+def test_resume_instruction_is_quoted_verbatim(tmp_path):
+    q = cg.parse_queue(_yaml_queue(tmp_path))
+    assert "Read the queue." in q["resume_instruction"]
+    assert "Verify branch." in q["resume_instruction"]
+
+
+def test_pointer_not_among_stages_is_invalid(tmp_path):
+    q = cg.parse_queue(_yaml_queue(tmp_path, pointer="stage_99_ghost"))
+    assert q["ok"] is False and q["reason"] == "pointer_stage_not_in_stages"
+
+
+def test_midwrite_yaml_is_a_wait_not_an_improvisation(tmp_path):
+    p = tmp_path / "Q.md"
+    p.write_text("## MACHINE-READABLE STATE\n\n```yaml\npointer: [unclosed\n```\n")
+    q = cg.parse_queue(str(p))
+    assert q["ok"] is False and q["reason"].startswith("yaml_invalid")
+    d = cg.govern("mess-qa-automation:0.0", state="idle",
+                  config=_cfg(authoritative_pointer=str(p), required_sources=[str(p)]))
+    assert d["action"] == "skip" and d["reason"].startswith("queue_not_valid")
+
+
+def test_in_progress_stage_is_left_alone(tmp_path):
+    d = cg.govern("mess-qa-automation:0.0", state="idle",
+                  config=_cfg(authoritative_pointer=_yaml_queue(tmp_path),
+                              required_sources=[]))
+    assert d["action"] == "skip" and d["reason"] == "stage_in_progress"
+
+
+def test_completed_stage_advances_exactly_once_to_the_next_queue_stage(tmp_path):
+    path = _yaml_queue(tmp_path, status="DONE")
+    d = cg.govern("mess-qa-automation:0.0", state="idle",
+                  config=_cfg(authoritative_pointer=path, required_sources=[]))
+    assert d["action"] == "advance_queue"
+    assert d["stage"] == "stage_02_invites" and d["next_stage"] == "stage_03_media_voice"
+    assert d["resume_instruction"]
+
+
+def test_needs_owner_payload_raises_a_precise_blocker(tmp_path):
+    stages = [{"id": "stage_02_invites", "status": "NEEDS_OWNER_PAYLOAD",
+               "missing_fields": ["copy.invite_title", "metrics.qr_card",
+                                  "states.expired_code"]},
+              {"id": "stage_03_media_voice", "status": "PENDING"}]
+    path = _yaml_queue(tmp_path, stages=stages, status="NEEDS_OWNER_PAYLOAD")
+    d = cg.govern("mess-qa-automation:0.0", state="idle",
+                  config=_cfg(authoritative_pointer=path, required_sources=[]))
+    assert d["action"] == "blocker" and d["reason"] == "NEEDS_OWNER_PAYLOAD"
+    assert d["owner_blocker"] is True
+    assert d["blocker_fields"] == ["copy.invite_title", "metrics.qr_card",
+                                   "states.expired_code"]
+
+
+def test_exhausted_queue_does_not_invent_a_next_stage(tmp_path):
+    stages = [{"id": "stage_02_invites", "status": "DONE"}]
+    path = _yaml_queue(tmp_path, stages=stages, status="DONE")
+    d = cg.govern("mess-qa-automation:0.0", state="idle",
+                  config=_cfg(authoritative_pointer=path, required_sources=[]))
+    assert d["action"] == "skip" and d["reason"] == "queue_exhausted"
+
+
+@pytest.mark.skipif(not os.path.isfile(REAL_QUEUE), reason="live queue not present")
+def test_live_owner_queue_parses_and_validates():
+    """The real file the owner's agent authored during V8."""
+    q = cg.parse_queue(REAL_QUEUE)
+    assert q["ok"] is True and q["format"] == "yaml"
+    assert q["pointer"] and q["branch"] and q["cwd"] == "/opt/mess"
+    assert q["deploy_allowed"] is False
+    assert q["resume_instruction"], "the durable /clear resume text must be extractable"

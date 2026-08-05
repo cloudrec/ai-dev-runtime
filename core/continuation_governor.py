@@ -79,6 +79,163 @@ def queue_sources(target: str, config: Optional[dict] = None) -> dict:
             "cwd": cfg.get("cwd") or ""}
 
 
+# ── the real MESS queue format (owner-authored 2026-08-05) ──────────────────
+# ## POINTER
+# ```
+# CURRENT_STAGE: 2  — Invites
+# LAST_COMPLETED: V7 Group Flows (…)
+# BRANCH: fable-0.1.91-realdevice-ux
+# ```
+# ## STAGES
+# ### 2. Invites — CURRENT
+_POINTER_BLOCK_RE = re.compile(r"^##+\s*POINTER\s*$(.*?)^##+\s", re.M | re.S)
+_CURRENT_STAGE_RE = re.compile(r"^\s*CURRENT_STAGE:\s*(\d+)\s*(?:[—\-–]\s*(.+?))?\s*$", re.M)
+_LAST_COMPLETED_RE = re.compile(r"^\s*LAST_COMPLETED:\s*(.+?)\s*$", re.M)
+_BRANCH_RE = re.compile(r"^\s*BRANCH:\s*(\S+)", re.M)
+_STAGE_HEAD_RE = re.compile(r"^###\s*(\d+)\.\s*(.+?)\s*$", re.M)
+# A RECORDED blocker starts its own line (optionally bold/backticked), per the queue's own
+# convention. The token also appears inside instructions ("if absent, record
+# NEEDS_OWNER_PAYLOAD with the exact missing fields") — matching those would raise a
+# blocker for a stage the agent is actively working. Anchor to line start.
+_NEEDS_PAYLOAD_RE = re.compile(r"^\s*[*_`]{0,3}NEEDS_OWNER_PAYLOAD\b", re.I | re.M)
+_RESOLVED_RE = re.compile(r"^\s*[*_`]{0,3}NEEDS_OWNER_PAYLOAD[^\n]{0,60}RESOLVED",
+                          re.I | re.M)
+
+
+_YAML_BLOCK_RE = re.compile(r"```ya?ml\s*(.*?)```", re.S | re.I)
+_RESUME_SECTION_RE = re.compile(
+    r"^##+[^\n]*RESUME AFTER[^\n]*$\n(.*?)(?=^##+\s|\Z)", re.M | re.S | re.I)
+
+
+def resume_instruction(path: str) -> str:
+    """The owner's verbatim post-`/clear` instruction, quoted from the queue itself.
+
+    Requirement 4 says the resume text must be the durable one, not something composed
+    here, so this returns the blockquote lines exactly as written.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except Exception:  # noqa: BLE001
+        return ""
+    m = _RESUME_SECTION_RE.search(text)
+    if not m:
+        return ""
+    lines = [re.sub(r"^>\s?", "", ln).strip() for ln in m.group(1).splitlines()
+             if ln.strip().startswith(">")]
+    return " ".join(x for x in lines if x)[:1200]
+
+
+def parse_queue_yaml(path: str) -> dict:
+    """Parse the MACHINE-READABLE STATE block. This is the authoritative form once the
+    owner's agent has written it; the markdown parser below stays as a fallback."""
+    try:
+        import yaml
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": f"queue_unreadable:{e}"}
+    m = _YAML_BLOCK_RE.search(text)
+    if not m:
+        return {"ok": False, "reason": "no_machine_readable_block"}
+    try:
+        data = yaml.safe_load(m.group(1)) or {}
+    except Exception as e:  # noqa: BLE001
+        # mid-write files are expected; the caller polls rather than acting
+        return {"ok": False, "reason": f"yaml_invalid:{str(e)[:80]}"}
+    if not isinstance(data, dict):
+        return {"ok": False, "reason": "yaml_not_a_mapping"}
+
+    pointer = str(data.get("pointer") or "")
+    stages = data.get("stages") or []
+    if not pointer:
+        return {"ok": False, "reason": "pointer_missing",
+                "blocker_fields": ["field:pointer"]}
+    if not isinstance(stages, list) or not stages:
+        return {"ok": False, "reason": "no_stages",
+                "blocker_fields": ["field:stages"]}
+    ids = [str(s.get("id")) for s in stages if isinstance(s, dict)]
+    if pointer not in ids:
+        return {"ok": False, "reason": "pointer_stage_not_in_stages",
+                "blocker_fields": [f"pointer:{pointer} not among {ids[:6]}"]}
+    cur = next(s for s in stages if isinstance(s, dict) and str(s.get("id")) == pointer)
+    status = str(cur.get("status") or "").upper()
+    return {"ok": True, "format": "yaml", "path": path, "pointer": pointer,
+            "current": cur, "current_status": status,
+            "needs_owner_payload": status == "NEEDS_OWNER_PAYLOAD",
+            "branch": str(data.get("branch") or ""), "cwd": str(data.get("cwd") or ""),
+            "deploy_allowed": bool(data.get("deploy_allowed")),
+            "completed": data.get("completed") or [],
+            "stages": stages, "resume_instruction": resume_instruction(path),
+            "mtime": os.path.getmtime(path)}
+
+
+def parse_queue(path: str) -> dict:
+    """Parse the durable execution queue and VALIDATE it against its own pointer.
+
+    Returns the stages and pointer verbatim. It never rewrites or infers work: an
+    unparsable or self-inconsistent queue is reported as invalid so the caller blocks.
+    """
+    y = parse_queue_yaml(path)
+    if y.get("ok"):
+        return y
+    # Fall back to the markdown form ONLY when there is no machine-readable block at all.
+    # If a YAML block exists but is mid-write or self-inconsistent, that is the real
+    # answer — masking it with the markdown parser's error would make "wait, the owner's
+    # agent is writing" indistinguishable from "this is a legacy file".
+    if y.get("reason") != "no_machine_readable_block":
+        return y
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": f"queue_unreadable:{e}"}
+
+    pm = _POINTER_BLOCK_RE.search(text)
+    block = pm.group(1) if pm else ""
+    cm = _CURRENT_STAGE_RE.search(block)
+    if not cm:
+        return {"ok": False, "reason": "pointer_missing_current_stage",
+                "blocker_fields": ["field:CURRENT_STAGE in POINTER"]}
+    current = int(cm.group(1))
+    current_name = (cm.group(2) or "").strip()
+    lc = _LAST_COMPLETED_RE.search(block)
+    br = _BRANCH_RE.search(block)
+
+    stages = []
+    heads = list(_STAGE_HEAD_RE.finditer(text))
+    for i, h in enumerate(heads):
+        body = text[h.end():heads[i + 1].start()] if i + 1 < len(heads) else text[h.end():]
+        title = h.group(2)
+        status = ""
+        if "—" in title or "-" in title:
+            parts = re.split(r"\s[—\-–]\s", title, maxsplit=1)
+            if len(parts) == 2:
+                title, status = parts[0].strip(), parts[1].strip()
+        needs = bool(_NEEDS_PAYLOAD_RE.search(body)) and not _RESOLVED_RE.search(body)
+        stages.append({"n": int(h.group(1)), "name": title, "status": status,
+                       "needs_owner_payload": needs, "body": body.strip()[:2000]})
+
+    if not stages:
+        return {"ok": False, "reason": "no_stages_parsed",
+                "blocker_fields": ["section:STAGES"]}
+    if not any(s["n"] == current for s in stages):
+        return {"ok": False, "reason": "pointer_stage_not_in_stages",
+                "blocker_fields": [f"CURRENT_STAGE:{current} has no matching '### {current}.' stage"]}
+
+    return {"ok": True, "path": path, "current_stage": current,
+            "current_stage_name": current_name,
+            "last_completed": (lc.group(1).strip() if lc else ""),
+            "branch": (br.group(1) if br else ""),
+            "stages": stages, "mtime": os.path.getmtime(path)}
+
+
+def current_stage_entry(parsed: dict) -> Optional[dict]:
+    if not parsed.get("ok"):
+        return None
+    return next((s for s in parsed["stages"] if s["n"] == parsed["current_stage"]), None)
+
+
 def read_pointer(target: str, config: Optional[dict] = None) -> dict:
     """The current queue item from the authoritative pointer file.
 
@@ -144,7 +301,58 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
                 "note": "presses Enter on the OWNER'S already-queued input exactly once; "
                         "never re-sends or authors text"}
 
-    # 2) Nothing queued and the stage is done — advance only on written-down work.
+    # 2) Nothing queued — consult the durable queue. Advancement is grounded in the
+    #    queue's own pointer and stage status; nothing here authors work.
+    if state in ("idle", "waiting_owner"):
+        qpath = src["pointer"]
+        if qpath and qpath.endswith(".md") and os.path.isfile(qpath):
+            q = parse_queue(qpath)
+            if not q.get("ok"):
+                # No machine-readable block AND a configured section ⇒ this project still
+                # uses the legacy markdown pointer; fall through to that path. Anything
+                # else (mid-write, invalid YAML, pointer/stage mismatch) is a WAIT — never
+                # an invitation to improvise.
+                legacy = (q.get("reason") in ("no_machine_readable_block",
+                                              "pointer_missing_current_stage",
+                                              "no_stages_parsed")
+                          and bool(src.get("pointer_section")))
+                if not legacy:
+                    return {"action": "skip",
+                            "reason": f"queue_not_valid:{q.get('reason')}",
+                            "blocker_fields": q.get("blocker_fields")}
+                q = {}
+            if q and q.get("format") == "yaml":
+                cur = q.get("current") or {}
+                status = q.get("current_status") or ""
+                if q.get("needs_owner_payload"):
+                    missing = cur.get("missing_fields") or cur.get("missing") or []
+                    return {"action": "blocker", "reason": "NEEDS_OWNER_PAYLOAD",
+                            "owner_blocker": True, "stage": q.get("pointer"),
+                            "blocker_fields": missing or ["see stage entry in the queue"],
+                            "queue_path": qpath,
+                            "note": "the queue itself records the payload as missing; "
+                                    "no design is fabricated"}
+                if status in ("IN_PROGRESS", "CURRENT"):
+                    return {"action": "skip", "reason": "stage_in_progress",
+                            "stage": q.get("pointer")}
+                if status in ("DONE", "PASS", "COMPLETE", "COMPLETED"):
+                    nxt = None
+                    ids = [str(x.get("id")) for x in q.get("stages") or []]
+                    if q.get("pointer") in ids:
+                        i = ids.index(q["pointer"])
+                        nxt = (q["stages"][i + 1] if i + 1 < len(q["stages"]) else None)
+                    if not nxt:
+                        return {"action": "skip", "reason": "queue_exhausted",
+                                "stage": q.get("pointer")}
+                    return {"action": "advance_queue", "reason": "stage_complete_in_queue",
+                            "stage": q.get("pointer"), "next_stage": str(nxt.get("id")),
+                            "queue_path": qpath,
+                            "resume_instruction": q.get("resume_instruction", ""),
+                            "note": "next stage taken verbatim from the durable queue"}
+                return {"action": "skip", "reason": f"stage_status_{status.lower() or 'unknown'}",
+                        "stage": q.get("pointer")}
+
+    # 2b) legacy markdown pointer path (kept for projects without a YAML queue)
     if stage_complete and state in ("idle", "waiting_owner"):
         ptr = read_pointer(target, cfg_all)
         if not ptr.get("ok"):
