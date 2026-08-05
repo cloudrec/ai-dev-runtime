@@ -1,6 +1,6 @@
 # OWNER OS — AUTONOMY PHASE 3: CONTINUATION GOVERNOR (LIVE)
 
-**Status: `OWNER_OS_AUTONOMY_PHASE3 = PASS` at commit `47d5142` (see ACCEPTANCE RESULT below for the exact evidence, and "What this PASS does not claim" for the limits).** Persisted 2026-08-05 before any work, so context
+**Status: `OWNER_OS_AUTONOMY_PHASE3 = PASS` at commit `827f73f` (see ACCEPTANCE RESULT below for the exact evidence, and "What this PASS does not claim" for the limits).** Persisted 2026-08-05 before any work, so context
 compaction cannot lose it. Phase 3 begins ONLY if the Phase 2 6-hour checkpoint is clean
 enough to continue; Phase 2 evidence lives in `OWNER_OS_AUTONOMY_PHASE2_CURRENT.md` and is
 kept separate from this file.
@@ -1069,17 +1069,42 @@ This also explains the canary log growth seen earlier: those 27 runs were fallba
 arriving while `pointer` was null, with no stage to execute — the old ungrounded nudge doing
 nothing useful, which is precisely what this fix removes.
 
+### DEFECT — a gate outlived its stage on a real project (fixed `827f73f`)
+
+Caught by reading the live owner view one more time after the round-3 deploy:
+
+```
+mess  BLOCKED  NEEDS_OWNER_PAYLOAD at stage_06_misc_real_surfaces
+      queue: stage_07_cross_surface_polish      <- pointer already past it
+```
+
+The retraction added in `0c64f51` only fired on whole-queue completion. A real project that
+keeps working never reaches that, so on any long-running queue a payload gate would stay open
+for a stage the project had already left — indefinitely. The canary hid this because its queue
+does complete.
+
+Retraction now runs whenever the queue parses, for every stage the queue reports DONE; the
+CURRENT stage keeps its gate and other sources are still untouched. Live:
+
+```
+19:21:46Z  retracted gov:mess…:stage_06_misc_real_surfaces  -> answered
+19:21:46Z  retracted gov:mess…:stage_04_security_devices    -> answered   (older, also stale)
+
+mess-qa-automation:0.0   IDLE   at rest; no durable blocker recorded
+    queue: stage_07_cross_surface_polish
+```
+
 ## ═══ ACCEPTANCE RESULT ═══
 
 ### Exact state
 
 | | |
 |---|---|
-| code commit (HEAD) | `47d5142` |
-| deployed commit | `47d5142` |
-| service | `ai-runtime.service`, PID **123672**, active since 2026-08-05 21:02 CEST, `NRestarts=0` |
+| code commit (HEAD) | `827f73f` |
+| deployed commit | `827f73f` |
+| service | `ai-runtime.service`, PID **182287**, active since 2026-08-05 21:20 CEST, `NRestarts=0` |
 | durable store | `/root/ai-dev-runtime/control_plane.db` (service `WorkingDirectory`, no `CONTROL_PLANE_DB` override) |
-| full suite | **1442 passed, 0 failed** (506.32s) at `47d5142` |
+| full suite | **1443 passed, 0 failed** (635.21s) at `827f73f` |
 | earlier full suites | 1393 @ `06d2c8d`; 1408 @ `bf46252`; 1421 @ `b34dd49`; 1426 @ `29ae290` |
 | soaks | Phase 2 24h (untouched, ~18h), Phase 3 (since first deploy), Phase 3 **post-fix** (since `cf27579`) |
 
