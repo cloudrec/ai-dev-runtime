@@ -424,28 +424,52 @@ GOVERNOR_STAGE_COOLDOWN_SECS = int(os.getenv("GOVERNOR_STAGE_COOLDOWN_SECS", "60
 GOVERNOR_STAGE_MAX_ATTEMPTS = int(os.getenv("GOVERNOR_STAGE_MAX_ATTEMPTS", "3"))
 
 
-def _stage_delivery_gate(conn, target: str, stage: str, *, now: Optional[float] = None) -> dict:
-    """May the governor nudge this (target, stage) now? Records the attempt if yes."""
+def _stage_delivery_gate(conn, target: str, stage: str, *, now: Optional[float] = None,
+                         conv: str = "") -> dict:
+    """May the governor nudge this (target, stage) now? Records the attempt if yes.
+
+    The gate is per (target, stage) BUT a genuinely new conversation resets it. After a
+    `/clear` (or a context reset) the stage is unchanged while the agent has lost every
+    instruction it was ever given — suppressing there would strand the pane for the whole
+    cooldown, i.e. the guard against over-nudging would itself become a stall. The rule is
+    the same boundary the governor already draws: same stage + same conversation → suppress;
+    same stage + PROVABLY different conversation → allow one fresh delivery.
+
+    "Provably" matters. An empty/unknown conversation id proves nothing, so it never resets
+    the counter — otherwise an unreadable pane would silently buy an unlimited nudge budget.
+    """
     now = now if now is not None else now_ts()
+    conv = str(conv or "").strip()
     conn, own = _c(conn)
     try:
         conn.execute("""CREATE TABLE IF NOT EXISTS governor_stage_delivery (
             target TEXT, stage TEXT, attempts INTEGER, last_ts REAL, last_at TEXT,
-            PRIMARY KEY (target, stage))""")
-        r = conn.execute("SELECT attempts,last_ts FROM governor_stage_delivery "
+            conv TEXT, PRIMARY KEY (target, stage))""")
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(governor_stage_delivery)")}
+        if "conv" not in cols:                      # migrate rows written before this fix
+            conn.execute("ALTER TABLE governor_stage_delivery ADD COLUMN conv TEXT")
+            conn.commit()
+        r = conn.execute("SELECT attempts,last_ts,conv FROM governor_stage_delivery "
                          "WHERE target=? AND stage=?", (target, stage)).fetchone()
         attempts = int(r[0]) if r else 0
         last_ts = float(r[1]) if r and r[1] else 0.0
+        prev_conv = str((r[2] if r else "") or "").strip()
+        fresh_conv = bool(conv and prev_conv and conv != prev_conv)
+        if fresh_conv:
+            # New conversation for the same stage: the agent needs the instruction again.
+            attempts, last_ts = 0, 0.0
         if attempts >= GOVERNOR_STAGE_MAX_ATTEMPTS:
             return {"allow": False, "reason": "stage_nudge_cap_reached", "attempts": attempts}
         if last_ts and (now - last_ts) < GOVERNOR_STAGE_COOLDOWN_SECS:
             return {"allow": False, "reason": "stage_nudge_cooldown",
                     "attempts": attempts,
                     "wait_secs": int(GOVERNOR_STAGE_COOLDOWN_SECS - (now - last_ts))}
-        conn.execute("INSERT OR REPLACE INTO governor_stage_delivery VALUES (?,?,?,?,?)",
-                     (target, stage, attempts + 1, now, now_iso()))
+        conn.execute("INSERT OR REPLACE INTO governor_stage_delivery VALUES (?,?,?,?,?,?)",
+                     (target, stage, attempts + 1, now, now_iso(), conv))
         conn.commit()
-        return {"allow": True, "reason": "stage_nudge_allowed", "attempts": attempts + 1}
+        return {"allow": True, "reason": ("stage_nudge_allowed_new_conversation" if fresh_conv
+                                          else "stage_nudge_allowed"),
+                "attempts": attempts + 1, "conv_reset": fresh_conv}
     finally:
         if own:
             conn.close()
@@ -548,7 +572,8 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
             if target not in act.CANARY_AGENTS:
                 return {**base, "decision": "governor_advance_owner_gated",
                         "next_stage": d.get("next_stage")}
-            gate = _stage_delivery_gate(conn, target, str(d.get("next_stage") or "-"))
+            gate = _stage_delivery_gate(conn, target, str(d.get("next_stage") or "-"),
+                                        conv=conv or "")
             if not gate["allow"]:
                 return {**base, "decision": "governor_advance_suppressed",
                         "next_stage": d.get("next_stage"), "note": gate["reason"],

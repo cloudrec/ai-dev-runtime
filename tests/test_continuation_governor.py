@@ -756,3 +756,69 @@ def test_stage_nudges_stop_after_the_attempt_cap(tmp_path, monkeypatch):
         assert g["allow"] is True
     g = ap._stage_delivery_gate(None, "x:0.0", "s", now=t0 + 900000)
     assert g["allow"] is False and g["reason"] == "stage_nudge_cap_reached"
+
+
+def test_a_new_conversation_reopens_the_same_stage(tmp_path, monkeypatch):
+    """After a real `/clear` the stage is unchanged but the agent has lost every instruction
+    it was ever given. Suppressing there would turn the anti-over-nudge guard into a stall —
+    the exact failure it exists to prevent, only quieter."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    a = ap._stage_delivery_gate(None, "cp-canary:0.0", "stage_a", conv="conv-1")
+    b = ap._stage_delivery_gate(None, "cp-canary:0.0", "stage_a", conv="conv-1")
+    c = ap._stage_delivery_gate(None, "cp-canary:0.0", "stage_a", conv="conv-2")
+    assert a["allow"] is True
+    assert b["allow"] is False, "same conversation must stay suppressed"
+    assert c["allow"] is True and c["reason"] == "stage_nudge_allowed_new_conversation"
+    assert c["attempts"] == 1, "the counter restarts for the new conversation"
+
+
+def test_an_unknown_conversation_id_never_resets_the_guard(tmp_path, monkeypatch):
+    """Fail-closed: an empty/unreadable conversation id proves nothing. If it reset the
+    counter, an unobservable pane would buy an unlimited nudge budget."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    assert ap._stage_delivery_gate(None, "y:0.0", "s", conv="conv-1")["allow"] is True
+    for bad in ("", "   ", None):
+        g = ap._stage_delivery_gate(None, "y:0.0", "s", conv=bad or "")
+        assert g["allow"] is False, f"unknown conv {bad!r} must not reset the guard"
+    # ...and a known-but-identical id is likewise no reset.
+    assert ap._stage_delivery_gate(None, "y:0.0", "s", conv="conv-1")["allow"] is False
+
+
+def test_the_cap_still_binds_within_one_conversation(tmp_path, monkeypatch):
+    """The conversation reset must not become an escape hatch from the attempt cap."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    t0 = 1_000_000.0
+    for i in range(ap.GOVERNOR_STAGE_MAX_ATTEMPTS):
+        assert ap._stage_delivery_gate(None, "z:0.0", "s", now=t0 + i * 100000,
+                                       conv="same")["allow"] is True
+    g = ap._stage_delivery_gate(None, "z:0.0", "s", now=t0 + 900000, conv="same")
+    assert g["allow"] is False and g["reason"] == "stage_nudge_cap_reached"
+
+
+def test_rows_written_before_the_conv_column_existed_still_work(tmp_path, monkeypatch):
+    """Live rows already exist without `conv` (the deployed guard wrote one for the canary).
+    The migration must neither crash nor silently treat the legacy row as a new conversation."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    cp = str(tmp_path / "cp.db")
+    monkeypatch.setenv("CONTROL_PLANE_DB", cp)
+    import sqlite3
+    import time as _t
+    conn = sqlite3.connect(cp)
+    conn.execute("""CREATE TABLE governor_stage_delivery (
+        target TEXT, stage TEXT, attempts INTEGER, last_ts REAL, last_at TEXT,
+        PRIMARY KEY (target, stage))""")          # the pre-fix schema, verbatim
+    conn.execute("INSERT INTO governor_stage_delivery VALUES (?,?,?,?,?)",
+                 ("cp-canary:0.0", "stage_a_write_note", 1, _t.time(), "legacy"))
+    conn.commit()
+    conn.close()
+    from core import commander_autopilot as ap
+    g = ap._stage_delivery_gate(None, "cp-canary:0.0", "stage_a_write_note", conv="conv-new")
+    assert g["allow"] is False, ("a legacy row has no recorded conversation, so a new id "
+                                 "cannot be PROVEN different — it must stay suppressed")
+    assert g["reason"] == "stage_nudge_cooldown"
