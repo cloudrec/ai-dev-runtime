@@ -1,6 +1,6 @@
 # OWNER OS — AUTONOMY PHASE 3: CONTINUATION GOVERNOR (LIVE)
 
-**Status: `OWNER_OS_AUTONOMY_PHASE3 = PASS` at commit `827f73f` (see ACCEPTANCE RESULT below for the exact evidence, and "What this PASS does not claim" for the limits).** Persisted 2026-08-05 before any work, so context
+**Status: `OWNER_OS_AUTONOMY_PHASE3 = PASS` at commit `c13ef86` (see ACCEPTANCE RESULT below for the exact evidence, and "What this PASS does not claim" for the limits).** Persisted 2026-08-05 before any work, so context
 compaction cannot lose it. Phase 3 begins ONLY if the Phase 2 6-hour checkpoint is clean
 enough to continue; Phase 2 evidence lives in `OWNER_OS_AUTONOMY_PHASE2_CURRENT.md` and is
 kept separate from this file.
@@ -1094,17 +1094,48 @@ mess-qa-automation:0.0   IDLE   at rest; no durable blocker recorded
     queue: stage_07_cross_surface_polish
 ```
 
+### DEFECT — the pause did not survive the dead-session watchdog (fixed `c13ef86`)
+
+Found by auditing every post-pause ledger row for arbitrage2 rather than trusting the earlier
+"zero contact" summary. The sequence:
+
+```
+18:45:47Z  agent_stop  arbitrage2-opus:0.0  killed_pid 3668817
+           idempotency_key 'stop-arbitrage-paused-agent-20260805-2146'   (external stop)
+18:45:56Z  watchdog_dead_recovery  how: "new-session"  recovered: false  reason: verify_failed
+```
+
+Nine seconds after the paused project was deliberately stopped, Owner OS tried to **restart
+it with a new session**. It failed on `verify_failed` — luck, not policy.
+
+Session recovery keeps its OWN registry, so none of the three pause gates reached it: the
+governor's `enabled`, the registry's `live_actuation` and the actuation allowlist all sit on
+the *delivery* side, whereas recovery revives a session outright. Recovery now also requires
+`live_actuation`, checked inside the recovery-registration branch so an unregistered dead
+session keeps its original `watchdog_dead` answer.
+
+**Correction to the earlier record.** Round 2 reported "zero contact since the pause" on the
+strength of `cp_action` and `autopilot_run` counts. That was true for *actuation* and remains
+true — 0 `cp_action` rows for arbitrage2 since 16:23Z, last ever 15:56:07Z — but it was not
+true for *contact*: the paused pane was still evaluated each tick and a recovery was
+attempted. Zero actuation, not zero contact.
+
+A second correction: an earlier check of this recovery record reported `live_actuation: true`.
+That query had no `ORDER BY` and returned a pre-pause row from 15:58:17Z. The actual
+18:45:56Z record shows `live_actuation: false` — the pause config was applied correctly; the
+gap was that recovery never consulted it.
+
 ## ═══ ACCEPTANCE RESULT ═══
 
 ### Exact state
 
 | | |
 |---|---|
-| code commit (HEAD) | `827f73f` |
-| deployed commit | `827f73f` |
-| service | `ai-runtime.service`, PID **182287**, active since 2026-08-05 21:20 CEST, `NRestarts=0` |
+| code commit (HEAD) | `c13ef86` |
+| deployed commit | `c13ef86` |
+| service | `ai-runtime.service`, PID **365828**, active since 2026-08-05 22:3x CEST, `NRestarts=0` |
 | durable store | `/root/ai-dev-runtime/control_plane.db` (service `WorkingDirectory`, no `CONTROL_PLANE_DB` override) |
-| full suite | **1443 passed, 0 failed** (635.21s) at `827f73f` |
+| full suite | **1445 passed, 0 failed** (399.44s) at `c13ef86` |
 | earlier full suites | 1393 @ `06d2c8d`; 1408 @ `bf46252`; 1421 @ `b34dd49`; 1426 @ `29ae290` |
 | soaks | Phase 2 24h (untouched, ~18h), Phase 3 (since first deploy), Phase 3 **post-fix** (since `cf27579`) |
 
@@ -1123,7 +1154,7 @@ an unresolved load flake, not as fixed.
 | 5 | project-role isolation + cross-project rejection | **PASS (after a defect found live)** | four cross-project instructions were ALLOWED against the shipped config until `a6dadc5`; all refused now, in-role work still passes, no unenforceable scopes remain |
 | 6 | focused + full suite, backup, deploy, restart, health, post-deploy tick | **PASS** | backups `predeploy-nudgeguard-20260805T144302Z`, `predeploy-scopefix-20260805T154716Z`; four clean deploys |
 | 7 | fresh post-fix soak | **RUNNING** | `reports/phase3_postfix_soak.jsonl`, detached, restart-persistent; `duplicates: {}`, all pane counts 1; survived 7 service restarts |
-| 9 | Arbitrage2 owner pause honoured by Owner OS | **PASS** | three gates closed; 0 actions since 16:23Z vs 11 on the canary |
+| 9 | Arbitrage2 owner pause honoured by Owner OS | **PASS** | four gates closed (delivery x3 + dead-session recovery); 0 actuations since 16:23Z |
 | 10 | Payment untouched | **PASS** | absent from the governed config, the registry grant list and the actuation allowlist |
 | 8 | this report | **DONE** | — |
 
