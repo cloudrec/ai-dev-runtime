@@ -66,6 +66,46 @@ def detect_queued_input(*, pending: str = "", tail: str = "") -> dict:
     return {"queued": False, "kind": "", "text": "", "evidence": ""}
 
 
+# Words that betray work belonging to ANOTHER project. Cross-project instructions are the
+# failure this isolation exists to stop: payment work landing on a product agent, product
+# work landing on payment, trading verbs reaching a paper-only session.
+_SCOPE_MARKERS = {
+    "payment": re.compile(r"\b(payment|payout|invoice|charge|refund|billing|wayforpay|"
+                          r"merchant|standby|replication)\b", re.I),
+    "jobhunter": re.compile(r"\b(jobhunter|job\.clients\.help|vacanc|resume|applicant|"
+                            r"microtask)\b", re.I),
+    "mess_ui": re.compile(r"\b(mess|messenger|redesign|screen[_ ]spec|copy_ru|apk)\b", re.I),
+    "live_trading": re.compile(r"\b(live trade|real order|place order|mainnet|venue|"
+                               r"exchange key|withdraw)\b", re.I),
+    "publication": re.compile(r"\b(publish|release|deploy|push to prod)\b", re.I),
+}
+
+
+def project_policy(target: str, config: Optional[dict] = None) -> dict:
+    cfg = (config if config is not None else load_config()).get(target) or {}
+    return {"role": cfg.get("role") or "", "project": cfg.get("project") or "",
+            "allowed_scopes": list(cfg.get("allowed_scopes") or []),
+            "forbidden_scopes": list(cfg.get("forbidden_scopes") or [])}
+
+
+def check_project_isolation(target: str, text: str,
+                            config: Optional[dict] = None) -> dict:
+    """Would this instruction take the project outside its own role?
+
+    Returns {"allowed": bool, "reason": str, "scope": str}. Deny-by-default on a match
+    against a forbidden scope — the governor never continues another project's work.
+    """
+    pol = project_policy(target, config)
+    if not pol["project"]:
+        return {"allowed": False, "reason": "project_not_governed", "scope": ""}
+    body = text or ""
+    for scope, rx in _SCOPE_MARKERS.items():
+        if scope in pol["forbidden_scopes"] and rx.search(body):
+            return {"allowed": False, "reason": "cross_project_work_refused",
+                    "scope": scope}
+    return {"allowed": True, "reason": "within_project_role", "scope": pol["role"]}
+
+
 def queue_sources(target: str, config: Optional[dict] = None) -> dict:
     """Which declared sources exist, and which are missing."""
     cfg = (config if config is not None else load_config()).get(target) or {}
@@ -309,6 +349,14 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
                     "detail": q, "owner_blocker": True,
                     "note": "an opaque owner paste is queued; this project does not opt in "
                             "to submitting pastes automatically"}
+        # PROJECT-ROLE ISOLATION: even the owner's own queued line is refused when it
+        # would drag this project into another project's work.
+        iso = check_project_isolation(target, q["text"], cfg_all)
+        if not iso["allowed"]:
+            return {"action": "blocker", "reason": "cross_project_work_refused",
+                    "owner_blocker": True, "scope": iso["scope"], "detail": q,
+                    "note": f"queued text looks like {iso['scope']} work; this project's "
+                            f"role forbids it"}
         # SUBMIT THE EXISTING LINE — never re-send its text. For a paste the pane shows
         # only a placeholder like "[Pasted text #3 +99 lines]"; sending that string would
         # type the placeholder instead of submitting the owner's real content. The caller
@@ -352,6 +400,68 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
                             "note": "the queue itself records the payload as missing; "
                                     "no design is fabricated"}
                 if status in ("IN_PROGRESS", "CURRENT"):
+                    # A queue may define completion by ARTEFACT (the canary harness does:
+                    # "a stage advances only when its own artefact exists on disk"). That
+                    # is the queue's own rule, so honouring it is grounded, not invented.
+                    art = cur.get("artefact")
+                    art_path = (os.path.join(src.get("cwd") or "", str(art))
+                                if art and not str(art).startswith("/") else str(art or ""))
+                    if art and os.path.isfile(art_path):
+                        nxt_id = cur.get("next_stage")
+                        if not nxt_id:
+                            return {"action": "skip", "reason": "queue_exhausted",
+                                    "stage": q.get("pointer")}
+                        nxt = next((x for x in (q.get("stages") or [])
+                                    if str(x.get("id")) == str(nxt_id)), None)
+                        if nxt is None:
+                            return {"action": "blocker",
+                                    "reason": "next_stage_not_in_queue",
+                                    "owner_blocker": True,
+                                    "blocker_fields": [f"next_stage:{nxt_id}"]}
+                        nxt_missing = [str(x) for x in (nxt.get("missing_fields") or [])
+                                       if str(x).strip()]
+                        if nxt_missing or "NEEDS_OWNER_PAYLOAD" in str(nxt.get("payload") or "").upper():
+                            return {"action": "blocker", "reason": "NEEDS_OWNER_PAYLOAD",
+                                    "owner_blocker": True, "stage": str(nxt_id),
+                                    "blocker_fields": nxt_missing,
+                                    "queue_path": qpath}
+                        instr = str(nxt.get("instruction") or "").strip()
+                        if not instr:
+                            return {"action": "blocker", "reason": "NEEDS_OWNER_PAYLOAD",
+                                    "owner_blocker": True, "stage": str(nxt_id),
+                                    "blocker_fields": [f"instruction for {nxt_id}"]}
+                        iso2 = check_project_isolation(target, instr, cfg_all)
+                        if not iso2["allowed"]:
+                            return {"action": "blocker",
+                                    "reason": "cross_project_work_refused",
+                                    "owner_blocker": True, "scope": iso2["scope"]}
+                        return {"action": "advance_queue",
+                                "reason": "artefact_present_stage_complete",
+                                "stage": q.get("pointer"), "next_stage": str(nxt_id),
+                                "step_text": instr, "queue_path": qpath,
+                                "resume_instruction": q.get("resume_instruction", ""),
+                                "note": "instruction quoted verbatim from the durable queue"}
+                    # Artefact absent. If the CURRENT stage declares its own instruction
+                    # and the pane is idle, the stage has not been started — deliver that
+                    # instruction verbatim, exactly once (the actuator's idempotency and
+                    # the progress fingerprint stop repeats). Stages with no `instruction`
+                    # (e.g. the MESS queue, which carries payload/implementation blocks)
+                    # are untouched by this path.
+                    instr_cur = str(cur.get("instruction") or "").strip()
+                    if instr_cur and state in ("idle", "waiting_owner"):
+                        iso3 = check_project_isolation(target, instr_cur, cfg_all)
+                        if not iso3["allowed"]:
+                            return {"action": "blocker",
+                                    "reason": "cross_project_work_refused",
+                                    "owner_blocker": True, "scope": iso3["scope"]}
+                        return {"action": "advance_queue",
+                                "reason": "stage_not_started",
+                                "stage": q.get("pointer"),
+                                "next_stage": q.get("pointer"),
+                                "step_text": instr_cur, "queue_path": qpath,
+                                "resume_instruction": q.get("resume_instruction", ""),
+                                "note": "current stage instruction quoted verbatim from "
+                                        "the durable queue"}
                     return {"action": "skip", "reason": "stage_in_progress",
                             "stage": q.get("pointer")}
                 if status in ("DONE", "PASS", "COMPLETE", "COMPLETED"):

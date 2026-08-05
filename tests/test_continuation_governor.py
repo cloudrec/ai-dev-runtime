@@ -457,3 +457,210 @@ def test_a_refused_paste_is_not_labelled_a_missing_payload(tmp_path, monkeypatch
     conn.close()
     assert "owner_payload_missing" not in kinds, kinds
     assert any("paste" in k for k in kinds), kinds
+
+
+# ═════════ 7. project-role isolation ════════════════════════════════════════
+ISO_CFG = {
+    "mess-qa-automation:0.0": {"project": "mess", "role": "messenger_ui_redesign",
+                               "cwd": "/opt/mess", "enabled": True,
+                               "allowed_scopes": ["mess_ui"],
+                               "forbidden_scopes": ["payment", "jobhunter", "live_trading"],
+                               "submit_owner_queued_paste": True,
+                               "required_sources": [], "authoritative_pointer": ""},
+    "arbitrage2-opus:0.0": {"project": "arbitrage2", "role": "paper_only_research",
+                            "cwd": "/opt/arbitrage2", "enabled": True,
+                            "allowed_scopes": ["arb_paper"],
+                            "forbidden_scopes": ["live_trading", "payment", "jobhunter",
+                                                 "mess_ui"],
+                            "submit_owner_queued_paste": True,
+                            "required_sources": [], "authoritative_pointer": ""},
+}
+
+
+@pytest.mark.parametrize("target,text,scope", [
+    ("mess-qa-automation:0.0", "run the payment payout reconciliation", "payment"),
+    ("mess-qa-automation:0.0", "post the JobHunter vacancy microtask", "jobhunter"),
+    ("arbitrage2-opus:0.0", "place order on the venue with the exchange key", "live_trading"),
+    ("arbitrage2-opus:0.0", "rebuild the messenger redesign screen spec", "mess_ui"),
+])
+def test_cross_project_work_is_refused_with_the_right_label(target, text, scope):
+    r = cg.check_project_isolation(target, text, ISO_CFG)
+    assert r["allowed"] is False
+    assert r["reason"] == "cross_project_work_refused" and r["scope"] == scope
+
+
+@pytest.mark.parametrize("target,text", [
+    ("mess-qa-automation:0.0", "continue the next safe internal qa audit step"),
+    ("arbitrage2-opus:0.0", "continue the next safe read-only audit step"),
+])
+def test_in_role_work_is_allowed(target, text):
+    assert cg.check_project_isolation(target, text, ISO_CFG)["allowed"] is True
+
+
+def test_queued_paste_is_refused_when_it_is_another_projects_work():
+    """Even the owner's OWN queued line is refused if it drags the project out of role."""
+    d = cg.govern("arbitrage2-opus:0.0", state="waiting_input",
+                  pending="place order on the venue using the exchange key",
+                  config=ISO_CFG)
+    assert d["action"] == "blocker" and d["reason"] == "cross_project_work_refused"
+    assert d["scope"] == "live_trading"
+
+
+def test_payment_can_never_be_governed_at_all():
+    assert cg.check_project_isolation("payment:0.0", "anything", ISO_CFG)["allowed"] is False
+    assert cg.govern("payment:0.0", state="idle", config=ISO_CFG)["reason"] == \
+        "project_not_governed"
+
+
+def test_shipped_config_declares_roles_and_forbidden_scopes():
+    cfg = cg.load_config()
+    assert "payment:0.0" not in cfg
+    for target, e in cfg.items():
+        assert e.get("role"), target
+        assert e.get("forbidden_scopes"), target
+    assert "live_trading" in cfg["arbitrage2-opus:0.0"]["forbidden_scopes"]
+    assert "payment" in cfg["mess-qa-automation:0.0"]["forbidden_scopes"]
+
+
+# ═════════ 8. artefact-driven advancement (canary harness) ══════════════════
+def _artefact_queue(tmp_path, artefact="reports/A.md", nxt_instruction="write B"):
+    import yaml as _y
+    stages = [{"id": "stage_a", "status": "CURRENT", "artefact": artefact,
+               "next_stage": "stage_b"},
+              {"id": "stage_b", "status": "PENDING", "instruction": nxt_instruction,
+               "next_stage": None}]
+    body = _y.safe_dump({"pointer": "stage_a", "cwd": str(tmp_path),
+                         "deploy_allowed": False, "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## RESUME AFTER `/clear`\n\n> Read the queue.\n\n"
+                 "## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    return str(p)
+
+
+def _canary_cfg(tmp_path, path):
+    return {"cp-canary:0.0": {"project": "cp-canary", "role": "disposable_canary",
+                              "cwd": str(tmp_path), "enabled": True,
+                              "allowed_scopes": ["canary_file"],
+                              "forbidden_scopes": ["payment", "publication"],
+                              "submit_owner_queued_paste": False,
+                              "required_sources": [], "authoritative_pointer": path}}
+
+
+def test_stage_is_incomplete_until_its_artefact_exists(tmp_path):
+    path = _artefact_queue(tmp_path)
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "skip" and d["reason"] == "stage_in_progress"
+
+
+def test_artefact_present_advances_once_with_the_verbatim_instruction(tmp_path):
+    path = _artefact_queue(tmp_path)
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "advance_queue"
+    assert d["reason"] == "artefact_present_stage_complete"
+    assert d["next_stage"] == "stage_b" and d["step_text"] == "write B"
+
+
+def test_advance_blocks_when_the_next_stage_has_no_instruction(tmp_path):
+    path = _artefact_queue(tmp_path, nxt_instruction="")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "blocker" and d["reason"] == "NEEDS_OWNER_PAYLOAD"
+    assert d["blocker_fields"] == ["instruction for stage_b"]
+
+
+def test_advance_refuses_a_next_stage_outside_the_project_role(tmp_path):
+    path = _artefact_queue(tmp_path, nxt_instruction="publish the release to production")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "blocker" and d["reason"] == "cross_project_work_refused"
+
+
+def test_idle_agent_on_an_unstarted_stage_gets_its_instruction_once(tmp_path):
+    """Bootstrap: the first stage has no artefact yet, so artefact-completion cannot fire.
+    An idle agent on a stage that declares an instruction must receive it verbatim."""
+    path = _artefact_queue(tmp_path)
+    import yaml as _y
+    data = _y.safe_load(open(path).read().split("```yaml")[1].split("```")[0])
+    data["stages"][0]["instruction"] = "append one dated line to reports/A.md"
+    body = _y.safe_dump(data)
+    open(path, "w").write("## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "advance_queue" and d["reason"] == "stage_not_started"
+    assert d["step_text"] == "append one dated line to reports/A.md"
+
+
+def test_a_working_agent_on_an_unstarted_stage_is_left_alone(tmp_path):
+    path = _artefact_queue(tmp_path)
+    import yaml as _y
+    data = _y.safe_load(open(path).read().split("```yaml")[1].split("```")[0])
+    data["stages"][0]["instruction"] = "append one dated line to reports/A.md"
+    open(path, "w").write("## MACHINE-READABLE STATE\n\n```yaml\n" + _y.safe_dump(data) + "```\n")
+    d = cg.govern("cp-canary:0.0", state="working", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "skip"
+
+
+def test_stage_without_an_instruction_is_not_invented(tmp_path):
+    """A stage with neither artefact-completion nor an instruction must NOT be filled in."""
+    path = _artefact_queue(tmp_path)
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "skip" and d["reason"] == "stage_in_progress"
+
+
+def test_advance_is_delivered_not_merely_reported(tmp_path, monkeypatch):
+    """Reporting `advance_queue` without delivering left the agent with neither an
+    autopilot poke (short-circuited by the governor) nor a governor step — a stall the
+    governor itself introduced."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+
+    path = _artefact_queue(tmp_path, nxt_instruction="continue with the next safe step")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, path))
+
+    delivered = {}
+    monkeypatch.setattr(ap, "deliver_next_step",
+                        lambda t, step, **k: delivered.update(target=t, step=step)
+                        or {"acted": True, "verified": True})
+    out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                            ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert out["decision"] == "governor_advanced" and out["delivered"] is True
+    assert delivered["step"] == "continue with the next safe step"
+
+
+def test_advance_outside_the_allowlist_is_owner_gated(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset())
+    path = _artefact_queue(tmp_path, nxt_instruction="continue with the next safe step")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, path))
+    out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                            ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert out["decision"] == "governor_advance_owner_gated"
+
+
+def test_an_unsafe_queue_instruction_is_never_delivered(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    path = _artefact_queue(tmp_path, nxt_instruction="git push and deploy to prod")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, path))
+    out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                            ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert out["decision"] in ("governor_step_unsafe", "governor_blocker")

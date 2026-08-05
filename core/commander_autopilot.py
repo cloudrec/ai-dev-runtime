@@ -484,10 +484,32 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
             return {**base, "decision": "governor_submit_error", "note": str(e)[:120]}
 
     if d["action"] == "advance_queue":
-        return {**base, "decision": "governor_advance_available",
-                "next_stage": d.get("next_stage"),
-                "note": "next stage is grounded in the durable queue; delivery is the "
-                        "agent's own advancement rule unless it stalls"}
+        step = str(d.get("step_text") or "").strip()
+        if not step or evaluate_only:
+            return {**base, "decision": "governor_advance_available",
+                    "next_stage": d.get("next_stage"),
+                    "note": "next stage grounded in the durable queue; nothing delivered "
+                            "(no instruction text, or evaluate-only)"}
+        # DELIVER the queue's own instruction, exactly once. Reporting it without
+        # delivering left the agent with neither an autopilot poke (short-circuited here)
+        # nor a governor step — i.e. a stall introduced by the governor itself.
+        if classify_safety(step) != "autonomous_safe":
+            return {**base, "decision": "governor_step_unsafe",
+                    "note": f"queue instruction is not autonomous_safe: {step[:80]}"}
+        try:
+            from core.control_plane import actuator as act
+            if target not in act.CANARY_AGENTS:
+                return {**base, "decision": "governor_advance_owner_gated",
+                        "next_stage": d.get("next_stage")}
+            out = deliver_next_step(target, step, conversation_id=conv, cwd=cwd, ctrl=ctrl)
+            return {**base,
+                    "decision": ("governor_advanced" if out.get("acted")
+                                 else "governor_advance_refused"),
+                    "next_stage": d.get("next_stage"), "actuation": out,
+                    "delivered": bool(out.get("acted")),
+                    "note": "instruction quoted verbatim from the durable queue"}
+        except Exception as e:  # noqa: BLE001
+            return {**base, "decision": "governor_advance_error", "note": str(e)[:120]}
     return None
 
 

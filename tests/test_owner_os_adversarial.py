@@ -20,6 +20,16 @@ from __future__ import annotations
 
 import pytest
 
+from core import continuation_governor as _cg
+
+
+@pytest.fixture(autouse=True)
+def _no_governor(monkeypatch):
+    """The governor reads the shipped queue config; these adversarial tests target the
+    autopilot itself, so keep production queue state out of them."""
+    monkeypatch.setattr(_cg, "load_config", lambda *a, **k: {})
+    yield
+
 from core import agent_control as ac
 from core import commander_autopilot as ap
 from core import agent_continuation_watchdog as cw

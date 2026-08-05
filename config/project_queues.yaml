@@ -8,9 +8,19 @@
 # `authoritative_pointer` names the file whose "execute next" section defines the current
 # item. `required_sources` must ALL exist for queue-driven advancement to be allowed.
 
+# PROJECT-ROLE ISOLATION (owner requirement 2026-08-05).
+# `role` and `allowed_scopes` bound what a project may EVER be asked to do. The governor
+# only continues work grounded in that project's own durable queue, and cross-project work
+# is rejected with an explicit blocker rather than silently skipped. Payment can never be
+# handed JobHunter product work; MESS can never receive unrelated tasks; arbitrage2 stays
+# paper-only.
+
 projects:
   mess-qa-automation:0.0:
     project: mess
+    role: messenger_ui_redesign
+    allowed_scopes: [mess_ui, mess_qa, mess_local_test]
+    forbidden_scopes: [payment, trading, jobhunter, publication, deploy]
     cwd: /opt/mess
     required_sources:
       - /opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md
@@ -28,6 +38,9 @@ projects:
 
   arbitrage2-opus:0.0:
     project: arbitrage2
+    role: paper_only_research
+    allowed_scopes: [arb_paper, arb_audit]
+    forbidden_scopes: [live_trading, orders, venue_adapters, keys, payment, jobhunter, mess_ui]
     cwd: /opt/arbitrage2
     # The owner named a durable queue source for MESS only. Nothing is declared here
     # because I do not know which arbitrage2 report is authoritative, and inventing a path
@@ -41,9 +54,14 @@ projects:
 
   cp-canary:0.0:
     project: cp-canary
+    role: disposable_canary
+    allowed_scopes: [canary_file, canary_report]
+    forbidden_scopes: [payment, trading, jobhunter, mess_ui, publication, deploy]
     cwd: /root/cp-canary-v2
-    required_sources: []
-    authoritative_pointer: ""
+    # deterministic acceptance harness (owner-authorised 2026-08-05): file/report only
+    required_sources:
+      - /root/cp-canary-v2/CANARY_EXECUTION_QUEUE.md
+    authoritative_pointer: /root/cp-canary-v2/CANARY_EXECUTION_QUEUE.md
     pointer_section: ""
     submit_owner_queued_paste: false
     enabled: true

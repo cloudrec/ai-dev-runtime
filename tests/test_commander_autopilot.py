@@ -14,6 +14,11 @@ from core.control_plane import api as cp
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):
+    # These tests are about the autopilot's own evaluation. The governor consults the
+    # SHIPPED project-queue config and real queue files, so leaving it live made them
+    # depend on production state — isolate it explicitly.
+    from core import continuation_governor as _cg
+    monkeypatch.setattr(_cg, "load_config", lambda *a, **k: {})
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
     monkeypatch.setattr(act, "ENABLED", True)

@@ -436,6 +436,63 @@ deliberately does not). It moves when the owner submits it, or when the owner de
 arbitrage2 should carry `submit_owner_queued_paste: true`. Not changed unilaterally — the
 flag is precisely the "may an agent press Enter on content it cannot read" decision.
 
+## ACCEPTANCE SEQUENCE (owner-directed 2026-08-05) — IN PROGRESS
+
+### 1. Blocker taxonomy — DONE
+Gates now carry the governor's real reason. The mislabelled live gate
+`819f13b8cc76495d` (opened as `owner_payload_missing` / "NEEDS_OWNER_PAYLOAD at -" for a
+REFUSED PASTE on arbitrage2) was **closed via `answer_gate`, not deleted** — the row is
+retained, audit event **id 2720** `owner_gate_answered` was appended, and the answer text
+records why it was wrong. Open `owner_payload_missing` gates are back to the **2 genuine
+ones** (`9016e3eca57342d9` stage 4, `cf206922bb2742ff` stage 6).
+
+### 5. Project-role isolation — DONE (code + tests)
+`config/project_queues.yaml` now carries `role`, `allowed_scopes`, `forbidden_scopes` per
+project; `check_project_isolation()` refuses cross-project work with an explicit label, and
+the check also guards the queued-paste path — even the owner's own queued line is refused
+if it would drag a project out of role. Verified:
+
+| target | instruction | result |
+|---|---|---|
+| mess | "run the payment payout reconciliation" | refused `payment` |
+| mess | JobHunter vacancy microtask | refused `jobhunter` |
+| arbitrage2 | "place order on the venue with the exchange key" | refused `live_trading` |
+| arbitrage2 | rebuild the messenger redesign spec | refused `mess_ui` |
+| mess / arbitrage2 | their own in-role step | allowed |
+| payment | anything | `project_not_governed` |
+
+### 3. Canary acceptance harness — BUILT, live run pending
+`/root/cp-canary-v2/CANARY_EXECUTION_QUEUE.md`: 3 stages, file/report only, with stage C
+deliberately unspecified so `NEEDS_OWNER_PAYLOAD` is proven against a genuinely absent
+payload. Two grounded governor paths added:
+- **artefact present → advance once** (the queue's own `advancement_rule`);
+- **idle on an unstarted stage → deliver its verbatim instruction once**.
+
+MESS is unaffected: its stages carry no `instruction` field and it still returns
+`NEEDS_OWNER_PAYLOAD` for stage 6.
+
+### Two defects found while building the harness
+1. **`advance_queue` was reported, never delivered.** `_governor_pass` short-circuits the
+   ordinary autopilot evaluation, so once it claims a target it must also act. It didn't:
+   cp-canary would have lost its autopilot poke AND received nothing — a stall introduced
+   by the governor itself. It now delivers the queue instruction through the lease-gated
+   actuator, guarded by safety classification (`governor_step_unsafe`), allowlist
+   confinement (`governor_advance_owner_gated`) and role isolation.
+2. **Tick tests were reading production queue state.** Three autopilot/adversarial tests
+   failed because the governor consults the shipped config and real queue files. The
+   governor is now explicitly isolated in their fixtures. Third occurrence of production
+   state leaking into tests in this phase — recorded as a pattern, not just a fix.
+
+### 7. Post-fix soak recorder — BUILT
+`tools/phase3_soak.py` + wrapper, detached and restart-persistent, tracking sampling gaps,
+duplicate submissions, wrong-project actions, unknown prompt answers, recoveries,
+`/clear` resumes and quarantine events. Smoke-tested. Starts after deploy.
+
+### Still to do before any PASS
+Full suite → backup → deploy → verify recurring ticks → post-deploy canary tick → the live
+deterministic canary run (A → idle → B once → no resubmit → restart durability → real
+`/clear` + resume). Item 4 (MESS/Arbitrage2) remains observational and non-interfering.
+
 ## Remaining unproven (unchanged)
 - **advance exactly once on grounded work** — the MESS agent self-advances per the queue's
   own `advancement_rule`; the governor's advance path is a fallback that has not been
