@@ -298,3 +298,81 @@ def test_a_specified_payload_is_not_mistaken_for_a_blocker(tmp_path):
     d = cg.govern("mess-qa-automation:0.0", state="idle",
                   config=_cfg(authoritative_pointer=path, required_sources=[]))
     assert d["action"] == "skip" and d["reason"] == "stage_in_progress"
+
+
+# ═════════ 6. runtime wiring into the autopilot tick ════════════════════════
+def test_tick_records_a_governor_blocker_once(tmp_path, monkeypatch):
+    """The blocker must reach a durable record and an owner gate — but only ONCE per
+    (target, stage, missing-fields). A gate reopening every 60s is noise."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    stages = [{"id": "stage_03_media_voice", "status": "CURRENT",
+               "payload": "NEEDS_OWNER_PAYLOAD",
+               "missing_fields": ["viewer: title", "voice: send copy"]},
+              {"id": "stage_04", "status": "PENDING"}]
+    path = _yaml_queue(tmp_path, pointer="stage_03_media_voice", stages=stages)
+    cfg = _cfg(authoritative_pointer=path, required_sources=[])
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: cfg)
+
+    out1 = ap._governor_pass("mess-qa-automation:0.0", state="idle", tail="", cwd="/opt/mess",
+                             ctrl=None, conv="c", evaluate_only=True, conn=None)
+    assert out1["decision"] == "governor_blocker"
+    assert out1["blocker_fields"] == ["viewer: title", "voice: send copy"]
+    ap._governor_pass("mess-qa-automation:0.0", state="idle", tail="", cwd="/opt/mess",
+                      ctrl=None, conv="c", evaluate_only=True, conn=None)
+
+    import sqlite3
+    # the blocker ledger is control-plane state (it opens an owner gate), so it lives in
+    # CONTROL_PLANE_DB alongside cp_action / owner_gate
+    conn = sqlite3.connect(str(tmp_path / "cp.db"))
+    n = conn.execute("SELECT count(*) FROM governor_blocker").fetchone()[0]
+    conn.close()
+    assert n == 1, "the same blocker must not be recorded twice"
+
+
+def test_tick_leaves_ungoverned_projects_to_the_normal_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: {})
+    assert ap._governor_pass("payment:0.0", state="idle", tail="", cwd="/x", ctrl=None,
+                             conv="c", evaluate_only=True, conn=None) is None
+
+
+def test_governor_submit_is_owner_gated_outside_the_allowlist(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset())     # nothing allowlisted
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _cfg())
+    monkeypatch.setattr("core.agent_control.pending_input_text", lambda *a, **k: PASTE)
+    out = ap._governor_pass("mess-qa-automation:0.0", state="waiting_input", tail="",
+                            cwd="/opt/mess", ctrl=None, conv="c", evaluate_only=False,
+                            conn=None)
+    assert out["decision"] == "governor_submit_owner_gated"
+
+
+def test_governor_skip_falls_through_to_normal_evaluation(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _cfg())
+    monkeypatch.setattr("core.agent_control.pending_input_text", lambda *a, **k: "")
+    out = ap._governor_pass("mess-qa-automation:0.0", state="working", tail="", cwd="/opt/mess",
+                            ctrl=None, conv="c", evaluate_only=True, conn=None)
+    assert out is None, "a skip must not short-circuit the ordinary autopilot logic"
+
+
+def test_governor_never_runs_on_a_pane_that_is_actually_progressing(tmp_path, monkeypatch):
+    """A pane can read `idle` while a background subagent works. Governing there would
+    raise a blocker over live work — caught by the adversarial suite, not by mine."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _cfg())
+    busy = "✻ Waiting for 1 background agent to finish\n"
+    assert ap._governor_pass("mess-qa-automation:0.0", state="idle", tail=busy,
+                             cwd="/opt/mess", ctrl=None, conv="c", evaluate_only=True,
+                             conn=None) is None

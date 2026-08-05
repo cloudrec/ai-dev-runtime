@@ -361,6 +361,114 @@ def _real_conv(cwd: str):
         return None, None
 
 
+def _governor_blocker_seen(conn, target: str, stage: str, fingerprint: str) -> bool:
+    """A blocker is recorded ONCE per (target, stage, missing-fields) — an owner gate that
+    reopens every 60s is noise, not signal."""
+    conn, own = _c(conn)
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS governor_blocker (
+            target TEXT, stage TEXT, fingerprint TEXT, first_seen TEXT, last_seen TEXT,
+            fields TEXT, PRIMARY KEY (target, stage, fingerprint))""")
+        row = conn.execute("SELECT 1 FROM governor_blocker WHERE target=? AND stage=? "
+                           "AND fingerprint=?", (target, stage, fingerprint)).fetchone()
+        conn.execute("UPDATE governor_blocker SET last_seen=? WHERE target=? AND stage=? "
+                     "AND fingerprint=?", (now_iso(), target, stage, fingerprint))
+        conn.commit()
+        return bool(row)
+    finally:
+        if own:
+            conn.close()
+
+
+def _record_governor_blocker(conn, target: str, stage: str, fields: list) -> None:
+    import hashlib
+    import json as _j
+    fp = hashlib.sha256(_j.dumps(sorted(map(str, fields))).encode()).hexdigest()[:16]
+    if _governor_blocker_seen(conn, target, stage, fp):
+        return
+    c2, own = _c(conn)
+    try:
+        c2.execute("INSERT OR REPLACE INTO governor_blocker VALUES (?,?,?,?,?,?)",
+                   (target, stage, fp, now_iso(), now_iso(), _j.dumps(fields)[:2000]))
+        c2.commit()
+    finally:
+        if own:
+            c2.close()
+    try:
+        from core.control_plane import api as cp
+        from core.control_plane.cto import emit
+        cp.open_gate(agent_id=target, reason=f"NEEDS_OWNER_PAYLOAD at {stage}",
+                     kind="owner_payload_missing", correlation_id=f"gov:{target}:{stage}")
+        emit("continuation_governor", "needs_owner_payload", agent_id=target,
+             severity="warn", owner_action_required=True,
+             payload={"stage": stage, "missing_fields": fields[:20]},
+             action_taken="blocked — owner payload required",
+             dedup_key=f"govblock:{target}:{stage}:{fp}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
+                   conv: str, evaluate_only: bool, conn) -> Optional[dict]:
+    """Consult the continuation governor. Returns a result dict to record, or None to let
+    the ordinary autopilot evaluation proceed."""
+    try:
+        from core import continuation_governor as cg
+    except Exception:  # noqa: BLE001
+        return None
+    cfg = cg.load_config()
+    if target not in cfg:
+        return None
+    # NEVER govern a pane that is actually progressing. `govern()` only sees `state`, but a
+    # pane can be working via a background subagent or a live active-execution marker while
+    # its state reads idle — governing there would raise a blocker (or submit) over real
+    # work in flight. The autopilot's own progress detector is the authority.
+    if is_progressing(state, tail):
+        return None
+    pending = ""
+    try:
+        from core import agent_control as ac
+        pending = ac.pending_input_text(target, tail) or ""
+    except Exception:  # noqa: BLE001
+        pending = ""
+    d = cg.govern(target, state=state, pending=pending, tail=tail, config=cfg)
+    base = {"target": target, "state": state, "governor": d}
+
+    if d["action"] == "blocker":
+        fields = d.get("blocker_fields") or []
+        _record_governor_blocker(conn, target, str(d.get("stage") or "-"), list(fields))
+        return {**base, "decision": "governor_blocker", "note": d.get("reason"),
+                "blocker_fields": fields[:10]}
+
+    if d["action"] == "submit_queued" and not evaluate_only:
+        # Press Enter on the owner's OWN queued line. Never re-sends text.
+        try:
+            from core import agent_continuation_watchdog as cw
+            from core.control_plane import api as cp
+            from core.control_plane import actuator as act
+            if target not in act.CANARY_AGENTS:
+                return {**base, "decision": "governor_submit_owner_gated"}
+            lease = cp.acquire_lease(f"agent:{target}", "continuation_governor", ttl_secs=120)
+            c = ctrl or cw.Controller()
+            out = cw.deliver_and_verify(c, target=target, cwd=cwd, action="submit",
+                                        step_text=d.get("expected_pending", ""),
+                                        expected_pending=d.get("expected_pending", ""))
+            ok = bool((out.get("verify") or {}).get("ok"))
+            if not ok:
+                cp.release_lease(f"agent:{target}", (lease or {}).get("lease_id"))
+            return {**base, "decision": "governor_submitted" if ok else "governor_submit_unverified",
+                    "verify": out.get("verify"), "delivered": ok}
+        except Exception as e:  # noqa: BLE001
+            return {**base, "decision": "governor_submit_error", "note": str(e)[:120]}
+
+    if d["action"] == "advance_queue":
+        return {**base, "decision": "governor_advance_available",
+                "next_stage": d.get("next_stage"),
+                "note": "next stage is grounded in the durable queue; delivery is the "
+                        "agent's own advancement rule unless it stalls"}
+    return None
+
+
 def tick(*, inventory: Optional[dict] = None, registry: Optional[dict] = None,
          ctrl=None, evaluate_only: bool = False, conv_age_fn=None, now: Optional[float] = None,
          tail_fn=None, conv_fn=None, conn=None) -> dict:
@@ -401,6 +509,17 @@ def tick(*, inventory: Optional[dict] = None, registry: Optional[dict] = None,
             conv_age = (now if now is not None else now_ts()) - conv_mtime
         else:
             conv_age = None
+        # PHASE 3 (wired 2026-08-05): the continuation governor runs BEFORE the ordinary
+        # evaluation for governed projects. It only ever submits what the owner already
+        # queued, or reports a blocker the project's own queue records — it authors
+        # nothing. A `skip` falls straight through to the existing logic.
+        gov = _governor_pass(target, state=state, tail=tail, cwd=cwd, ctrl=ctrl,
+                             conv=conv, evaluate_only=evaluate_only, conn=conn)
+        if gov is not None:
+            _record_run(target, gov["decision"], gov, conn=conn)
+            results.append(gov)
+            continue
+
         ev = evaluate(target, state=state, tail=tail, conv_age_secs=conv_age,
                       registry=registry, now=now)
         action = None
