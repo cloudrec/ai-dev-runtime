@@ -462,7 +462,7 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
                             "queue_path": qpath,
                             "note": "the queue itself records the payload as missing; "
                                     "no design is fabricated"}
-                if status in ("IN_PROGRESS", "CURRENT"):
+                if status in ("IN_PROGRESS", "CURRENT", "PENDING"):
                     # A queue may define completion by ARTEFACT (the canary harness does:
                     # "a stage advances only when its own artefact exists on disk"). That
                     # is the queue's own rule, so honouring it is grounded, not invented.
@@ -519,7 +519,22 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
                     # the progress fingerprint stop repeats). Stages with no `instruction`
                     # (e.g. the MESS queue, which carries payload/implementation blocks)
                     # are untouched by this path.
-                    instr_cur = str(cur.get("instruction") or "").strip()
+                    # A stage carrying no `instruction` is NOT a dead end. Live on MESS:
+                    # the agent finished stage_07, moved the pointer to
+                    # stage_08_full_visual_qa_web_acceptance (PENDING, payload-independent,
+                    # blockers empty) and stopped; the governor answered
+                    # `skip:stage_status_pending` and recorded nothing, so a queue that had
+                    # just advanced simply sat there. The grounded continuation names the
+                    # stage id and the queue file, so the agent reads the stage content
+                    # itself — no instruction text is needed to start it.
+                    stage_blockers = [str(b) for b in (cur.get("blockers") or []) if b]
+                    if stage_blockers and state in ("idle", "waiting_owner"):
+                        return {"action": "blocker", "reason": "stage_blocked_in_queue",
+                                "owner_blocker": True, "stage": q.get("pointer"),
+                                "blocker_fields": stage_blockers[:10], "queue_path": qpath,
+                                "note": "the queue itself records blockers on this stage"}
+                    instr_cur = (str(cur.get("instruction") or "").strip()
+                                 or str(cur.get("scope") or "").strip())
                     if instr_cur and state in ("idle", "waiting_owner"):
                         iso3 = check_project_isolation(target, instr_cur, cfg_all)
                         if not iso3["allowed"]:

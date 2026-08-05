@@ -1290,3 +1290,59 @@ def test_a_granted_project_is_still_recovered_when_it_dies(tmp_path, monkeypatch
     out = ap.evaluate("cp-canary:0.0", state="dead", tail="", registry=reg)
     assert out["decision"] == "watchdog_dead_recovery"
     assert called == ["cp-canary:0.0"]
+
+
+# ═════════ 15. a PENDING pointer stage is startable, not a dead end ═════════
+def _mess_style_queue(tmp_path, status="PENDING", blockers=None, scope="do the visual QA"):
+    """The real MESS queue shape: stages carry scope/implementation blocks, NOT `instruction`."""
+    import yaml as _y
+    stages = [{"id": "stage_07", "status": "DONE", "next_stage": "stage_08"},
+              {"id": "stage_08", "status": status, "payload": "payload-independent",
+               "scope": scope, "blockers": list(blockers or []),
+               "implementation": {"report": None}, "next_stage": None}]
+    body = _y.safe_dump({"pointer": "stage_08", "cwd": str(tmp_path), "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    return str(p)
+
+
+def test_a_pending_pointer_stage_with_no_instruction_is_started(tmp_path):
+    """Live on MESS: the agent finished stage_07, moved the pointer to stage_08 (PENDING,
+    payload-independent, blockers empty) and stopped. The governor answered
+    `skip:stage_status_pending` and recorded nothing, so a queue that had just advanced sat
+    idle. The grounded continuation names the stage and the file, so no `instruction` field
+    is needed to start it."""
+    path = _mess_style_queue(tmp_path)
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "advance_queue", d
+    assert d["next_stage"] == "stage_08"
+    assert d["step_text"].startswith("do the visual QA"), "scope quoted verbatim for audit"
+    assert d["queue_path"] == path
+
+
+def test_a_pending_stage_with_queue_blockers_is_an_owner_blocker(tmp_path):
+    """Anti-overcorrection: starting a PENDING stage must not bulldoze recorded blockers."""
+    path = _mess_style_queue(tmp_path, blockers=["waiting on owner screenshots"])
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "blocker" and d["reason"] == "stage_blocked_in_queue"
+    assert d["owner_blocker"] is True
+    assert d["blocker_fields"] == ["waiting on owner screenshots"]
+
+
+def test_a_pending_stage_with_a_missing_payload_still_blocks(tmp_path):
+    """The NEEDS_OWNER_PAYLOAD path must keep priority over the new start path."""
+    import yaml as _y
+    stages = [{"id": "stage_08", "status": "PENDING", "payload": "NEEDS_OWNER_PAYLOAD",
+               "missing_fields": ["exact screen list"], "next_stage": None}]
+    body = _y.safe_dump({"pointer": "stage_08", "cwd": str(tmp_path), "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, str(p)))
+    assert d["action"] == "blocker" and d["reason"] == "NEEDS_OWNER_PAYLOAD"
+    assert d["blocker_fields"] == ["exact screen list"]
+
+
+def test_a_working_pane_is_not_started_even_on_a_pending_stage(tmp_path):
+    path = _mess_style_queue(tmp_path)
+    d = cg.govern("cp-canary:0.0", state="working", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "skip", d
