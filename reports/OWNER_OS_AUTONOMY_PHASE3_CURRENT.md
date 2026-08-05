@@ -697,9 +697,89 @@ stage_b_write_summary attempts 1  last_at 14:54:59Z  conv 2ba40b9f…
 Dedup state is durable across a real service restart, and the new detection went live in the
 same tick.
 
-### Still to do before any PASS
-Stage B artefact after the pointer fix. Item 4 (MESS/Arbitrage2) remains observational and
-non-interfering.
+### The full canary chain, end to end
+
+After the pointer fix the canary completed the harness under its own power:
+
+```
+15:05:43Z  governor_advanced          stage_b (re-nudge after cooldown; attempts 1 → 2)
+           agent wrote reports/ACCEPTANCE_B.md
+           agent advanced the queue ITSELF: stage_a DONE, stage_b DONE,
+                                            pointer → stage_c_missing_payload
+15:07:16Z  governor_blocker           NEEDS_OWNER_PAYLOAD at stage_c_missing_payload
+```
+
+Stage C is the deliberately-unspecified stage, and the governor stopped exactly there with
+the two recorded missing fields and no fabricated design:
+
+```
+blocker_fields: ["acceptance C: exact report title",
+                 "acceptance C: required section list"]
+owner_blocker: true
+```
+
+Worth noting: `ACCEPTANCE_B.md`, written by the agent, documents the duplicate stage A run
+and its cause accurately without being asked to.
+
+### Blocker taxonomy and dedup — live
+
+| gate kind | stage | correlation |
+|---|---|---|
+| `owner_payload_missing` | `stage_c_missing_payload` | `gov:cp-canary:0.0:stage_c_missing_payload` |
+| `governor_queue_pointer_stale` | `stage_a_write_note` | `gov:cp-canary:0.0:stage_a_write_note` |
+| `governor_owner_paste_not_auto_submittable` | — | `gov:cp-canary:0.0:cp-canary:0.0` |
+
+Each kind now derives from the *real* reason. Dedup holds live: the stage C blocker is a
+single row with `first_seen 15:07:16Z` and `last_seen 15:18:49Z` — updated across many ticks,
+never reopened.
+
+### Queued input — both directions, live
+
+**Allowed.** An owner line was typed into the canary input and left unsubmitted. The
+governor pressed Enter, exactly once:
+
+```
+15:08:22Z  governor_submitted
+           verify: submitted=true, pane_changed=true, prompt_consumed=true, queued_input=false
+```
+
+**Refused.** An opaque paste marker was then placed in the same input line:
+
+```
+15:20:06Z  gate governor_owner_paste_not_auto_submittable
+           reason: owner_paste_not_auto_submittable at cp-canary:0.0
+```
+
+The line was **not** submitted. This re-proves on the canary what was first seen on
+arbitrage2 *before* the taxonomy fix, when the same refusal was mislabelled
+`owner_payload_missing` — the label is now correct at the point of refusal, not just in
+theory. The probe marker was cleared (`C-u`) and its gate closed through `answer_gate`
+recording that it was an acceptance probe; the row is retained, nothing erased.
+
+### No duplicate agent
+
+`tmux list-sessions`: `cp-canary` is **1 window, created Aug 3 08:10** — the same session
+across the `/clear`, four service restarts and every nudge. `mess-qa-automation` and
+`arbitrage2-opus` are 1 window each. The post-fix soak records `duplicates: {}`.
+
+### Item 4 — real managed projects, not interfered with
+
+- **MESS** — BLOCKED on a genuine owner payload at `stage_06_misc_real_surfaces`, with the
+  exact missing per-surface fields listed. Untouched: no design authored, no nudge, no
+  interference. This is the correct terminal state for a real missing payload.
+- **Arbitrage2** — WORKING, paper-only, no queue invented for it, `submit_owner_queued_paste`
+  still false.
+
+No real grounded transition occurred in the window, so per the owner's instruction the canary
+acceptance is recorded as decisive and the monitor stays active.
+
+### Item 7 — post-fix soak
+
+The Phase 3 recorder that has been running since the first deploy spans the pre-fix period,
+so a **second, cleanly post-fix recorder** was started after `cf27579`
+(`reports/phase3_postfix_soak.jsonl`, detached, restart-persistent). Phase 2's 24h soak is
+untouched. Both track sampling gaps, duplicate submissions, wrong-project actions, unknown
+prompt answers, recoveries, `/clear` resumes and quarantine events.
 
 ## Remaining unproven (unchanged)
 - **advance exactly once on grounded work** — the MESS agent self-advances per the queue's
