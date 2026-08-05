@@ -416,6 +416,41 @@ def _record_governor_blocker(conn, target: str, stage: str, fields: list,
         pass
 
 
+# A stage may be nudged at most once per cooldown, and only a few times in total. Without
+# this the `stage_not_started` path re-delivered every 60s tick (observed live: two
+# governor_advanced for stage_a_write_note 70s apart) — exactly-once violated, and a real
+# project would be nudged endlessly for a stage it had not begun.
+GOVERNOR_STAGE_COOLDOWN_SECS = int(os.getenv("GOVERNOR_STAGE_COOLDOWN_SECS", "600"))
+GOVERNOR_STAGE_MAX_ATTEMPTS = int(os.getenv("GOVERNOR_STAGE_MAX_ATTEMPTS", "3"))
+
+
+def _stage_delivery_gate(conn, target: str, stage: str, *, now: Optional[float] = None) -> dict:
+    """May the governor nudge this (target, stage) now? Records the attempt if yes."""
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS governor_stage_delivery (
+            target TEXT, stage TEXT, attempts INTEGER, last_ts REAL, last_at TEXT,
+            PRIMARY KEY (target, stage))""")
+        r = conn.execute("SELECT attempts,last_ts FROM governor_stage_delivery "
+                         "WHERE target=? AND stage=?", (target, stage)).fetchone()
+        attempts = int(r[0]) if r else 0
+        last_ts = float(r[1]) if r and r[1] else 0.0
+        if attempts >= GOVERNOR_STAGE_MAX_ATTEMPTS:
+            return {"allow": False, "reason": "stage_nudge_cap_reached", "attempts": attempts}
+        if last_ts and (now - last_ts) < GOVERNOR_STAGE_COOLDOWN_SECS:
+            return {"allow": False, "reason": "stage_nudge_cooldown",
+                    "attempts": attempts,
+                    "wait_secs": int(GOVERNOR_STAGE_COOLDOWN_SECS - (now - last_ts))}
+        conn.execute("INSERT OR REPLACE INTO governor_stage_delivery VALUES (?,?,?,?,?)",
+                     (target, stage, attempts + 1, now, now_iso()))
+        conn.commit()
+        return {"allow": True, "reason": "stage_nudge_allowed", "attempts": attempts + 1}
+    finally:
+        if own:
+            conn.close()
+
+
 def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
                    conv: str, evaluate_only: bool, conn) -> Optional[dict]:
     """Consult the continuation governor. Returns a result dict to record, or None to let
@@ -513,6 +548,11 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
             if target not in act.CANARY_AGENTS:
                 return {**base, "decision": "governor_advance_owner_gated",
                         "next_stage": d.get("next_stage")}
+            gate = _stage_delivery_gate(conn, target, str(d.get("next_stage") or "-"))
+            if not gate["allow"]:
+                return {**base, "decision": "governor_advance_suppressed",
+                        "next_stage": d.get("next_stage"), "note": gate["reason"],
+                        "attempts": gate.get("attempts")}
             out = deliver_next_step(target, step, conversation_id=conv, cwd=cwd, ctrl=ctrl)
             return {**base,
                     "decision": ("governor_advanced" if out.get("acted")

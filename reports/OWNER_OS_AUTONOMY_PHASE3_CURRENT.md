@@ -537,6 +537,39 @@ pointer, falling back to the old log line if the queue or its instruction is mis
 re-read the queue after every `/clear`. That is harness wiring inside the disposable
 canary, not project work.
 
+### DEFECT — exactly-once violated on the `stage_not_started` path (live 14:28–14:32)
+
+The corrected governor deployed and immediately re-nudged the SAME unstarted stage on every
+tick:
+
+```
+14:28:29  governor_advanced   stage_a_write_note
+14:29:39  governor_advanced   stage_a_write_note
+14:30:57  governor_advanced   stage_a_write_note
+14:32:xx  governor_advanced   stage_a_write_note      (4 total pre-guard)
+```
+
+One nudge per 60s tick, indefinitely. On a real project that is a pane prodded every minute
+for a stage it has not begun — exactly-once broken.
+
+**Fix:** per-stage delivery gate `governor_stage_delivery` keyed `(target, stage)`, with a
+10-minute cooldown and a 3-attempt cap, then `governor_advance_suppressed`. Per-stage, so
+genuine progress to a NEW stage is never blocked. Pinned by three tests: one nudge then
+five suppressed ticks; a different stage still nudged; the cap terminating.
+
+**Note the boundary this establishes.** This is the inverse of `4ed8d93`, which made a
+session re-resumable on each new idle cycle. Both are right, and the distinguishing signal
+is *whether the stage advanced*, not *whether the pane went idle again*. I got that
+boundary wrong in both directions before landing on it, which is worth recording as the
+actual lesson rather than filing two isolated fixes.
+
+### Harness limitation discovered
+An already-running Claude session does not re-read `CLAUDE.md`, so the canary could not see
+the new queue instruction and kept doing its old log note (artefact `ACCEPTANCE_A.md` never
+appeared). This is not a governor defect — and it is resolved by the `/clear` that item 3
+of the acceptance requires anyway. `PROJECT_STATE.md` has been written to the canary in
+preparation, as item 3 specifies.
+
 ### Still to do before any PASS
 Full suite → backup → deploy → verify recurring ticks → post-deploy canary tick → the live
 deterministic canary run (A → idle → B once → no resubmit → restart durability → real

@@ -702,3 +702,57 @@ def test_queue_instruction_is_never_typed_into_the_pane(tmp_path, monkeypatch):
     assert ap.classify_safety(sent["step"]) == "autonomous_safe"
     assert out["queue_step"].startswith("append one dated line"), \
         "the queue step is still recorded for audit, just not delivered"
+
+
+def test_a_stage_is_nudged_once_then_suppressed(tmp_path, monkeypatch):
+    """Live: two `governor_advanced` for stage_a_write_note 70s apart. The
+    stage_not_started path re-delivered on every tick — exactly-once violated."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    path = _artefact_queue(tmp_path, nxt_instruction="do the thing")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, path))
+    monkeypatch.setattr(ap, "load_registry", lambda *a, **k: {
+        "cp-canary:0.0": {"next_step": "continue with the next safe step"}})
+    calls = []
+    monkeypatch.setattr(ap, "deliver_next_step",
+                        lambda t, step, **k: calls.append(step)
+                        or {"acted": True, "verified": True})
+
+    first = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                              ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert first["decision"] == "governor_advanced"
+    for _ in range(5):                       # several later ticks
+        later = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                                  ctrl=None, conv="c", evaluate_only=False, conn=None)
+        assert later["decision"] == "governor_advance_suppressed"
+        assert later["note"] == "stage_nudge_cooldown"
+    assert len(calls) == 1, calls
+
+
+def test_a_different_stage_is_still_nudged(tmp_path, monkeypatch):
+    """Anti-overcorrection: the guard is per-stage, so real progress is never blocked."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    g1 = ap._stage_delivery_gate(None, "cp-canary:0.0", "stage_a")
+    g2 = ap._stage_delivery_gate(None, "cp-canary:0.0", "stage_a")
+    g3 = ap._stage_delivery_gate(None, "cp-canary:0.0", "stage_b")
+    assert g1["allow"] is True and g2["allow"] is False and g3["allow"] is True
+
+
+def test_stage_nudges_stop_after_the_attempt_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    t0 = 1_000_000.0
+    for i in range(ap.GOVERNOR_STAGE_MAX_ATTEMPTS):
+        g = ap._stage_delivery_gate(None, "x:0.0", "s", now=t0 + i * 100000)
+        assert g["allow"] is True
+    g = ap._stage_delivery_gate(None, "x:0.0", "s", now=t0 + 900000)
+    assert g["allow"] is False and g["reason"] == "stage_nudge_cap_reached"
