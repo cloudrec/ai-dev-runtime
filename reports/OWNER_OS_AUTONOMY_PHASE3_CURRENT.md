@@ -1,6 +1,6 @@
 # OWNER OS — AUTONOMY PHASE 3: CONTINUATION GOVERNOR (LIVE)
 
-**Status: QUEUED — not started.** Persisted 2026-08-05 before any work, so context
+**Status: WORKING — gate passed, governor built and tested, not yet deployed.** Persisted 2026-08-05 before any work, so context
 compaction cannot lose it. Phase 3 begins ONLY if the Phase 2 6-hour checkpoint is clean
 enough to continue; Phase 2 evidence lives in `OWNER_OS_AUTONOMY_PHASE2_CURRENT.md` and is
 kept separate from this file.
@@ -48,5 +48,61 @@ project queue.
 
 | when | item | status |
 |---|---|---|
-| 2026-08-05 | assignment persisted | done |
-| — | phase 2 checkpoint gate | pending |
+| 2026-08-05 | assignment persisted | done (`a9c8c5a`) |
+| 2026-08-05 05:28 | phase 2 6h checkpoint | **PARTIAL** — clean on every safety criterion; failed only on the MESS stall, which is this phase's target |
+| 2026-08-05 | governor + config + 19 tests | done (`b9ce855`) |
+| 2026-08-05 | full suite | **1349 passed, 0 failed** |
+| — | deploy + live acceptance on a natural MESS stage completion | pending |
+
+## Gate decision
+
+Phase 2's checkpoint was `clean: false`, so I did not upgrade it to PASS — it stands at
+PARTIAL. I judged it "clean enough to continue" because no Phase 2 safety property was
+violated (0 duplicates, 0 unapproved answers, 0 gaps, 0 quarantines, service active
+throughout) and the single failing criterion — MESS parked 37 minutes on
+`[Pasted text #3 +99 lines]` — is precisely what Phase 3 exists to govern.
+
+## OWNER BLOCKER (open) — the declared MESS queue file does not exist
+
+`/opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md` is **not present**, and a search of
+`/opt/mess` for `*EXECUTION_QUEUE*` / `*REDESIGN_EXECUTION*` finds nothing. The directory
+holds payload manifests and design assets only.
+
+The second declared source **does** exist: `/opt/mess/reports/PROJECT_STATE.md` (170 KB)
+with an owner-ordered `▶▶ EXECUTE NEXT (2026-08-05)` section naming two concrete JSX
+implementations and their authoritative specs.
+
+**Exact missing field:** `file:/opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md`.
+
+Needed from the owner, one of:
+1. the real path of the execution queue, or
+2. confirmation that `PROJECT_STATE.md` §`EXECUTE NEXT` alone is the authoritative queue
+   and pointer for MESS.
+
+Until then queue-driven ADVANCEMENT for MESS is blocked by design — the governor reports
+the blocker instead of guessing. Queued-input submission does not depend on it and works.
+
+## What was built
+
+`core/continuation_governor.py` + `config/project_queues.yaml`:
+
+- **Detection** — `pending` (ghost-aware), `[Pasted text …]` markers, and the
+  `Press up to edit queued messages` hint.
+- **Submit exactly once, by ENTER.** A defect caught during construction: the first version
+  returned the pane's placeholder as `step_text`, which would have TYPED
+  `[Pasted text #3 +99 lines]` instead of submitting the owner's real content. A queued line
+  is now submitted, never re-sent; the decision carries `mode: enter` and no `step_text`.
+- **Advance only on written-down work** — the next item is quoted from the durable pointer
+  section and stops at the next heading. Missing source or missing section ⇒ owner blocker
+  naming the exact file/section.
+- **Scope** — payment absent from the config and pinned absent by test. For arbitrage2 I
+  declared NO queue source: the owner named one only for MESS, and inventing a path is the
+  very failure this phase forbids. I initially guessed `ACAP_STATE.md`, found it did not
+  exist, and removed it rather than leave a fabricated path in config.
+
+### Deliberate policy note, stated plainly
+`submit_owner_queued_paste: true` for MESS lets the governor press Enter on an opaque
+owner paste it cannot read. That is a real widening: the content is unclassified. The
+justification is that the text is the OWNER's own, already sitting in their input line, and
+pressing Enter restores their intent rather than authoring anything — which is exactly the
+stall the owner asked to eliminate. It is per-project, default off elsewhere, and audited.
