@@ -1032,3 +1032,77 @@ def test_the_paused_project_has_live_actuation_off_in_the_registry():
     entry = agents.get("arbitrage2-opus:0.0") or {}
     assert entry, "arbitrage2 must still be present (paused, not deleted)"
     assert entry.get("live_actuation") is False
+
+
+# ═════════ 12. a finished queue is a success state, not a broken one ════════
+def _completed_queue(tmp_path):
+    import yaml as _y
+    stages = [{"id": "s1", "status": "DONE", "artefact": "a.md", "next_stage": "s2"},
+              {"id": "s2", "status": "DONE", "artefact": "b.md", "next_stage": None}]
+    body = _y.safe_dump({"pointer": None, "cwd": str(tmp_path), "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    return str(p)
+
+
+def test_a_completed_queue_is_not_reported_as_invalid(tmp_path):
+    """Live: the canary's agent cleared `pointer` after the last stage and the governor
+    reported `queue_not_valid:pointer_missing` with `blocker_fields: [field:pointer]` — i.e.
+    "go fix your queue" for work that was simply finished."""
+    q = cg.parse_queue(_completed_queue(tmp_path))
+    assert q["ok"] is True and q["complete"] is True
+    assert q["completed"] == ["s1", "s2"]
+    assert q.get("needs_owner_payload") is False
+
+
+def test_a_completed_queue_yields_queue_complete_not_a_blocker(tmp_path):
+    path = _completed_queue(tmp_path)
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "skip" and d["reason"] == "queue_complete"
+    assert d["completed"] == ["s1", "s2"]
+
+
+def test_a_cleared_pointer_with_unfinished_stages_is_still_an_error(tmp_path):
+    """Anti-overcorrection: a missing pointer is only benign when everything is DONE."""
+    import yaml as _y
+    stages = [{"id": "s1", "status": "DONE", "next_stage": "s2"},
+              {"id": "s2", "status": "PENDING", "next_stage": None}]
+    body = _y.safe_dump({"pointer": None, "cwd": str(tmp_path), "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    q = cg.parse_queue(str(p))
+    assert q["ok"] is False and q["reason"] == "pointer_missing"
+
+
+def test_the_governor_retracts_only_its_own_gates_for_finished_stages(tmp_path, monkeypatch):
+    """A gate raised from a derived condition sat open after the condition cleared, so the
+    owner view showed the canary BLOCKED on a stage whose report was already written."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    cp = str(tmp_path / "cp.db")
+    monkeypatch.setenv("CONTROL_PLANE_DB", cp)
+    import sqlite3
+    from core import commander_autopilot as ap
+    monkeypatch.setattr(ap, "CP_DB_PATH", lambda: cp)
+    from core.control_plane import api as cpapi
+    conn = sqlite3.connect(cp)
+    conn.execute("""CREATE TABLE IF NOT EXISTS owner_gate (id TEXT, work_item_id TEXT,
+        agent_id TEXT, reason TEXT, kind TEXT, state TEXT, correlation_id TEXT, answer TEXT,
+        opened_at TEXT, notified_at TEXT, answered_at TEXT)""")
+    rows = [("g_done", "gov:cp-canary:0.0:s1", "open"),      # governor gate, stage finished
+            ("g_open", "gov:cp-canary:0.0:s9", "open"),      # governor gate, NOT finished
+            ("g_other", "act:cp-canary:0.0|x|y", "open")]    # someone else's gate
+    for gid, corr, state in rows:
+        conn.execute("INSERT INTO owner_gate VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                     (gid, "", "cp-canary:0.0", "r", "k", state, corr, "",
+                      "2026-08-05T10:00:00", None, None))
+    conn.commit()
+    conn.close()
+    answered = []
+    monkeypatch.setattr(cpapi, "answer_gate",
+                        lambda gid, answer="", **k: answered.append(gid))
+
+    closed = ap._retract_governor_gates("cp-canary:0.0", ["s1", "s2"])
+    assert closed == ["g_done"], closed
+    assert answered == ["g_done"]
+    assert "g_open" not in answered, "a stage that is not finished keeps its gate"
+    assert "g_other" not in answered, "gates from other sources are never touched"

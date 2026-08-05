@@ -156,3 +156,30 @@ def test_when_nothing_is_open_the_agent_is_not_reported_blocked(_isolated):
     _gate(cp, "x:0.0", "owner_payload_missing", "answered", "gov:x:0.0:s1")
     b = osx._why_blocked("x:0.0")
     assert b is not None and b["gate"] is None, "no open gate → no blocked status"
+
+
+def test_a_paused_project_reads_as_paused_not_idle(_isolated, monkeypatch):
+    """Idle invites a nudge; paused is a decision. Owner pause on arbitrage2, 2026-08-05."""
+    from core import continuation_governor as cg
+    from core import agent_control as ac
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: {
+        "arbitrage2-opus:0.0": {"project": "arbitrage2", "role": "paper_only_research",
+                                "enabled": False, "authoritative_pointer": ""}})
+    monkeypatch.setattr(ac, "pane_capture", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(ac, "agent_status", lambda *a, **k: {"state": "idle"})
+    monkeypatch.setattr(ac, "pending_input_text", lambda *a, **k: "")
+    st = osx.status()
+    row = st["agents"][0]
+    assert row["status"] == "paused"
+    assert "owner pause" in row["why"]
+    assert "PAUSED" in osx.render(st)
+
+
+def test_a_completed_queue_renders_as_complete_not_as_a_problem(_isolated):
+    st = {"generated_at": "t", "agents": [
+        {"target": "cp-canary:0.0", "status": "idle", "why": "at rest",
+         "queue_complete": True, "queue_pointer": None}],
+        "open_owner_gates": []}
+    out = osx.render(st)
+    assert "queue: complete — every stage DONE" in out
+    assert "PROBLEM" not in out

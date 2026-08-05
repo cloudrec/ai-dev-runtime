@@ -380,6 +380,53 @@ def _governor_blocker_seen(conn, target: str, stage: str, fingerprint: str) -> b
             conn.close()
 
 
+def _retract_governor_gates(target: str, stages_done: list) -> list:
+    """Close the governor's OWN gates for stages the durable queue now reports DONE.
+
+    A gate raised from a derived condition kept sitting open after the condition cleared, so
+    the owner view showed the canary BLOCKED on `NEEDS_OWNER_PAYLOAD` for a stage whose
+    report was already written. That is the status view lying about finished work.
+
+    This retracts only gates the governor itself raised, identified by the `gov:` correlation
+    id, and only when the queue says that exact stage is done. Owner decisions and gates from
+    any other source are never touched, the row is retained, and the retraction is recorded
+    as an answer so the audit trail shows who closed it and why.
+    """
+    if not stages_done:
+        return []
+    closed = []
+    try:
+        from core.control_plane import api as cp
+        rows = _rows_cp("SELECT id,correlation_id FROM owner_gate WHERE agent_id=? AND "
+                        "state='open' AND correlation_id LIKE 'gov:%'", (target,))
+        for gid, corr in rows:
+            stage = str(corr or "").split(":")[-1]
+            if stage in stages_done:
+                cp.answer_gate(gid, answer=(
+                    f"Retracted by the continuation governor: the durable queue now reports "
+                    f"stage '{stage}' DONE, so the condition that raised this gate no longer "
+                    f"holds. Row retained for audit."))
+                closed.append(gid)
+    except Exception:  # noqa: BLE001 — never let bookkeeping break a tick
+        return closed
+    return closed
+
+
+def _rows_cp(q: str, args=()) -> list:
+    import sqlite3 as _s
+    try:
+        c = _s.connect(CP_DB_PATH(), timeout=10)
+        out = list(c.execute(q, args))
+        c.close()
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def CP_DB_PATH() -> str:
+    return os.getenv("CONTROL_PLANE_DB", "/root/ai-dev-runtime/control_plane.db")
+
+
 def _record_governor_blocker(conn, target: str, stage: str, fields: list,
                              reason: str = "NEEDS_OWNER_PAYLOAD", detail: str = "") -> None:
     import hashlib
@@ -520,6 +567,16 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
                                  reason=reason, detail=detail)
         return {**base, "decision": "governor_blocker", "note": reason,
                 "blocker_fields": fields[:10], "blocker_detail": detail}
+
+    if d["action"] == "skip" and d.get("reason") == "queue_complete":
+        # Nothing left to continue, and nothing wrong. Retract the governor's own gates for
+        # the finished stages so the owner view stops reporting a completed project as
+        # blocked.
+        retracted = _retract_governor_gates(target, list(d.get("completed") or []))
+        return {**base, "decision": "governor_queue_complete",
+                "completed": d.get("completed"),
+                "retracted_gates": retracted,
+                "note": d.get("note", "")}
 
     if d["action"] == "submit_queued" and not evaluate_only:
         # Press Enter on the owner's OWN queued line. Never re-sends text.

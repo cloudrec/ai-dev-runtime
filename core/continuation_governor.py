@@ -227,12 +227,30 @@ def parse_queue_yaml(path: str) -> dict:
 
     pointer = str(data.get("pointer") or "")
     stages = data.get("stages") or []
-    if not pointer:
-        return {"ok": False, "reason": "pointer_missing",
-                "blocker_fields": ["field:pointer"]}
     if not isinstance(stages, list) or not stages:
         return {"ok": False, "reason": "no_stages",
                 "blocker_fields": ["field:stages"]}
+    if not pointer:
+        # A FINISHED queue clears its pointer — the canary's agent wrote `pointer: null`
+        # after the last stage, and this was reported as `queue_not_valid:pointer_missing`
+        # with `blocker_fields: [field:pointer]`, i.e. "the owner must go fix the queue"
+        # when in truth the work was simply done. A completed queue is a success state and
+        # must never read as a broken one.
+        done = {"DONE", "PASS", "COMPLETE", "COMPLETED"}
+        finished = [s for s in stages if isinstance(s, dict)
+                    and str(s.get("status") or "").upper() in done]
+        if len(finished) == len(stages):
+            return {"ok": True, "format": "yaml", "path": path, "pointer": None,
+                    "complete": True, "current": None, "current_status": "COMPLETE",
+                    "needs_owner_payload": False, "missing_fields": [],
+                    "branch": str(data.get("branch") or ""),
+                    "cwd": str(data.get("cwd") or ""),
+                    "deploy_allowed": bool(data.get("deploy_allowed")),
+                    "completed": [str(s.get("id")) for s in finished],
+                    "stages": stages, "resume_instruction": resume_instruction(path),
+                    "mtime": os.path.getmtime(path)}
+        return {"ok": False, "reason": "pointer_missing",
+                "blocker_fields": ["field:pointer"]}
     ids = [str(s.get("id")) for s in stages if isinstance(s, dict)]
     if pointer not in ids:
         return {"ok": False, "reason": "pointer_stage_not_in_stages",
@@ -429,6 +447,12 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
             if q and q.get("format") == "yaml":
                 cur = q.get("current") or {}
                 status = q.get("current_status") or ""
+                if q.get("complete"):
+                    return {"action": "skip", "reason": "queue_complete",
+                            "stage": None, "queue_path": qpath,
+                            "completed": q.get("completed") or [],
+                            "note": "every stage in the durable queue is DONE; there is "
+                                    "nothing to continue and nothing is wrong"}
                 if q.get("needs_owner_payload"):
                     missing = (q.get("missing_fields") or cur.get("missing_fields")
                                or cur.get("missing") or [])

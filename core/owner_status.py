@@ -101,6 +101,7 @@ def status(targets: Optional[list] = None) -> dict:
             if q.get("ok"):
                 row["queue_pointer"] = q.get("pointer")
                 row["queue_valid"] = True
+                row["queue_complete"] = bool(q.get("complete"))
             else:
                 row["queue_pointer"] = None
                 row["queue_valid"] = False
@@ -110,7 +111,12 @@ def status(targets: Optional[list] = None) -> dict:
             row["queue_valid"] = None
 
         blocked = _why_blocked(t)
-        if blocked and blocked.get("gate"):
+        if entry.get("enabled") is False:
+            # A paused project must not read as "idle" — idle invites a nudge, paused is a
+            # decision. Owner pause on arbitrage2, 2026-08-05.
+            row["status"] = "paused"
+            row["why"] = "owner pause active — Owner OS is not acting on this project"
+        elif blocked and blocked.get("gate"):
             row["status"] = "blocked"
             row["why"] = blocked["gate"]["reason"]
             row["missing_fields"] = blocked["missing_fields"]
@@ -147,7 +153,9 @@ def render(st: Optional[dict] = None) -> str:
     for a in st["agents"]:
         head = f"  {a['target']:26} {a['status'].upper():13} {a.get('why','')}"
         lines.append(head)
-        if a.get("queue_pointer"):
+        if a.get("queue_complete"):
+            lines.append("      queue: complete — every stage DONE")
+        elif a.get("queue_pointer"):
             lines.append(f"      queue: {a['queue_pointer']}")
         if a.get("queue_valid") is False:
             lines.append(f"      queue PROBLEM: {a.get('queue_problem')}")
