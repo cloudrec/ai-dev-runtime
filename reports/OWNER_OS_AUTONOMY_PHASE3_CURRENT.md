@@ -174,7 +174,34 @@ an anti-overcorrection test that a fully-specified payload does NOT block).
 The media/voice design is NOT invented and MESS is not being interfered with. The blocker
 stands as the correct terminal answer for stage 3 until the owner supplies the payload.
 
-## ⚠ GAP — the governor is deployed but NOT WIRED IN
+## ✅ GAP CLOSED — the governor is now wired into the live tick (`7b7849f`)
+
+`commander_autopilot.tick` consults `_governor_pass` for governed projects **before** its
+ordinary evaluation. Deployed HEAD `7b7849f`, service PID 2161534, suite **1366 passed**,
+backup `predeploy-phase3wire-20260805T081128Z`.
+
+Wired behaviour:
+- **blocker** → durable `governor_blocker` row + `owner_gate` + a `needs_owner_payload`
+  event, recorded **once** per (target, stage, missing-fields). A gate that reopens every
+  60s is noise, not signal.
+- **submit_queued** → presses Enter on the owner's own queued line under a lease, with the
+  standard verification; outside `CANARY_AGENTS` it reports `governor_submit_owner_gated`
+  and touches nothing.
+- **advance_queue** → reported as available; delivery stays the agent's own advancement
+  rule unless it stalls.
+- **skip** → falls straight through to the existing autopilot logic.
+
+### Defect the adversarial suite caught during wiring
+My governor pass originally ran *before* the progress check. A pane can read `idle` while a
+background subagent works, so the governor raised a blocker over live work in flight.
+`_governor_pass` now returns immediately when `is_progressing(state, tail)` is true — the
+autopilot's own detector is the authority. Pinned by a new test using the real
+"✻ Waiting for 1 background agent to finish" render.
+
+Live confirmation right now: MESS is `working` → `progressing: True` → wired pass returns
+`None`, so the ordinary path runs and nothing is governed. Correct.
+
+## Superseded — the wiring gap as first reported
 
 `core/continuation_governor.py` is imported by **nothing** in `core/` or `api/`:
 
