@@ -1,6 +1,6 @@
 # OWNER OS — AUTONOMY PHASE 3: CONTINUATION GOVERNOR (LIVE)
 
-**Status: `OWNER_OS_AUTONOMY_PHASE3 = PASS` at commit `0c64f51` (see ACCEPTANCE RESULT below for the exact evidence, and "What this PASS does not claim" for the limits).** Persisted 2026-08-05 before any work, so context
+**Status: `OWNER_OS_AUTONOMY_PHASE3 = PASS` at commit `47d5142` (see ACCEPTANCE RESULT below for the exact evidence, and "What this PASS does not claim" for the limits).** Persisted 2026-08-05 before any work, so context
 compaction cannot lose it. Phase 3 begins ONLY if the Phase 2 6-hour checkpoint is clean
 enough to continue; Phase 2 evidence lives in `OWNER_OS_AUTONOMY_PHASE2_CURRENT.md` and is
 kept separate from this file.
@@ -1005,17 +1005,81 @@ governor can act on a pane the autopilot considers terminally blocked.
 (Separately, the MESS pane reported "93% of session limit · resets 8pm"; that is the agent's
 own quota, untouched and outside Owner OS.)
 
+## ═══ ROUND 3 — grounded advancement, the last real gap ═══
+
+### DEFECT — advancement delivered a static string, not the stage (fixed `47d5142`)
+
+Re-reading the advance path against the owner's phrase "exactly-once advancement **without
+fallback**" exposed the last substantive gap, and it was worse than a fallback.
+
+Every advancement delivered the project's STATIC registry string, identical for every stage:
+
+```
+delivered  : 'continue with the next safe canary note; append a dated line to the log…'   (all stages)
+queue step : 'write reports/ACCEPTANCE_B.md summarising what stage A wrote'   (stage B, never sent)
+queue step : "write reports/ACCEPTANCE_C.md titled 'ACCEPTANCE C …'"          (stage C, never sent)
+```
+
+For stages B and C the delivered instruction was **wrong**. Advancement appeared to work only
+because the agent independently re-read its queue; an agent that obeyed the text it was sent
+would have appended log lines instead of writing the reports. And when the registry string
+failed the classifier, the code silently substituted a generic continuation — so the
+delivered text was grounded in nothing at all.
+
+**Fix.** The continuation is now built from the durable queue: a FIXED internal template with
+exactly two charset-restricted slots — a stage id and a queue path — modelled on the existing
+`_RESUME_TEMPLATE_RE` precedent, with builder and matcher kept together so they cannot drift.
+There is no free-text slot, so the message cannot express a build, deploy, publish, payment or
+trading instruction whatever a queue file contains, and the denylist still runs first.
+
+**No fallback remains.** An unsafe stage id is refused (`governor_step_unsafe`); an advance
+with no stage id or queue path delivers nothing (`governor_advance_ungrounded`). Slot
+behaviour is fail-closed and tested: forbidden token → `prohibited`, spaces →
+`owner_approval_required`, shell metacharacters in the path → `prohibited`, appended prose →
+not `autonomous_safe`.
+
+### Live proof, and an objection the canary itself raised
+
+Stage D was added to the harness and advanced on the deployed build:
+
+```
+19:03:55Z  governor_advanced  ledger stage_d_grounded_check attempts=1
+  delivered: 'continue with the durable queue stage stage_d_grounded_check defined in
+              /root/cp-canary-v2/CANARY_EXECUTION_QUEUE.md: read that stage …'
+```
+
+The canary's own report then made a fair epistemic objection I had not:
+
+> *"a hardcoded id would look the same from inside this pane. Distinguishing the two needs at
+> least one run where the pointer is changed and the message is expected to follow it."*
+
+Correct. Stage E was added so the delivered id had to **track** a changed pointer:
+
+```
+19:07:11Z  governor_advanced  ledger stage_e_pointer_tracking attempts=1
+  delivered: '… stage stage_e_pointer_tracking defined in /root/cp-canary-v2/…'
+```
+
+`ACCEPTANCE_E.md`, written independently by the pane, records the message content changing
+shape three times across the session — static generic text (27 runs, notes #1034–#1060), then
+a stage id, then a *different* stage id following the pointer. Exactly once per stage
+throughout: `attempts=1` for both.
+
+This also explains the canary log growth seen earlier: those 27 runs were fallback-only pokes
+arriving while `pointer` was null, with no stage to execute — the old ungrounded nudge doing
+nothing useful, which is precisely what this fix removes.
+
 ## ═══ ACCEPTANCE RESULT ═══
 
 ### Exact state
 
 | | |
 |---|---|
-| code commit (HEAD) | `0c64f51` |
-| deployed commit | `0c64f51` |
-| service | `ai-runtime.service`, PID **3806674**, active since 2026-08-05 18:35:5x CEST, `NRestarts=0` |
+| code commit (HEAD) | `47d5142` |
+| deployed commit | `47d5142` |
+| service | `ai-runtime.service`, PID **123672**, active since 2026-08-05 21:02 CEST, `NRestarts=0` |
 | durable store | `/root/ai-dev-runtime/control_plane.db` (service `WorkingDirectory`, no `CONTROL_PLANE_DB` override) |
-| full suite | **1432 passed, 0 failed** (444.58s) at `0c64f51` |
+| full suite | **1442 passed, 0 failed** (506.32s) at `47d5142` |
 | earlier full suites | 1393 @ `06d2c8d`; 1408 @ `bf46252`; 1421 @ `b34dd49`; 1426 @ `29ae290` |
 | soaks | Phase 2 24h (untouched, ~18h), Phase 3 (since first deploy), Phase 3 **post-fix** (since `cf27579`) |
 
@@ -1062,6 +1126,9 @@ each element is backed by a timestamped durable record rather than by a test.
 
 ### What this PASS does not claim
 
+- **Grounded advancement is proven on the canary only.** It is now genuinely grounded and
+  fallback-free, and pointer-tracking is confirmed by an independent report from the pane —
+  but the projects it has advanced are the harness, not production work.
 - **The governor has still never ADVANCED a real project's queue.** Every MESS stage
   transition, including `stage_06 -> stage_07`, was agent-driven; the queue-advance path has
   been exercised end-to-end only on the canary. This limit is now narrower than it was: at
