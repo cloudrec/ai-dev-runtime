@@ -773,6 +773,45 @@ across the `/clear`, four service restarts and every nudge. `mess-qa-automation`
 No real grounded transition occurred in the window, so per the owner's instruction the canary
 acceptance is recorded as decisive and the monitor stays active.
 
+### DEFECT — forbidden scopes that enforced nothing (found `a6dadc5`, and it nearly shipped)
+
+This was found by probing the **shipped** config live as the last check before writing a
+PASS. Every unit test for project-role isolation was green. The probe:
+
+```
+arbitrage2-opus:0.0  "enable live_trading and submit real orders"  → ALLOWED
+arbitrage2-opus:0.0  "update the mess_ui invites screen"           → ALLOWED
+arbitrage2-opus:0.0  "rotate the exchange api keys"                → ALLOWED
+arbitrage2-opus:0.0  "patch the venue-adapter timeout"             → ALLOWED
+```
+
+Every one of those is in `forbidden_scopes` for the paper-only project. Two causes:
+
+1. **Silently unenforceable scopes.** `check_project_isolation` iterated the *marker table*,
+   not the project's forbidden list. Any scope without a hand-written regex refused nothing.
+   The live config forbids `orders`, `keys`, `venue_adapters`, `trading` and `deploy` — none
+   of which had markers. **The config read like a guarantee while enforcing only `payment`.**
+2. **Markers that did not survive ordinary phrasing.** `\breal order\b` misses "real
+   order*s*"; `_` and `-` are word characters, so `\bmess\b` never matched `mess_ui` and
+   `venue-adapter` slipped past.
+
+Fixed: the matcher iterates the forbidden list and falls back to a pattern derived from the
+scope's own name, so a scope can never be *completely* unenforceable; separators are
+flattened and plurals tolerated; `unenforceable_scopes()` reports any name-only scope, and a
+test asserts the shipped config has none. All four probes now refuse, and each project's real
+in-role instructions still pass.
+
+The fix also introduced a regression, caught by the existing suite and corrected: moving
+`deploy` out of the `publication` marker silently narrowed every project forbidding
+publication but not deploy. Scopes may overlap; a token must not vanish from one by being
+added to another.
+
+**Why this matters for how the earlier evidence should be read.** The suite was green
+throughout, because its fixtures happened to use only the scopes that had markers. Seven
+Phase 3 defects have now been found by driving production and one by the suite. The tests are
+regression prevention here, not discovery — and a green suite is not evidence that a
+protective config protects anything.
+
 ### Item 7 — post-fix soak
 
 The Phase 3 recorder that has been running since the first deploy spans the pre-fix period,

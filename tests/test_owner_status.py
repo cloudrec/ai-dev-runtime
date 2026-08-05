@@ -113,3 +113,46 @@ def test_render_never_proposes_work(_isolated):
     out = osx.render(st).lower()
     for verb in ("you should", "next step:", "recommend", "todo", "try "):
         assert verb not in out, verb
+
+
+def _gate(cp, target, kind, state, corr, reason="r"):
+    conn = sqlite3.connect(cp)
+    conn.execute("INSERT INTO owner_gate VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                 ("g", "", target, reason, kind, state, corr, "",
+                  "2026-08-05T10:00:00", None, None))
+    conn.commit()
+    conn.close()
+
+
+def _blocker_row(cp, target, stage, fields):
+    conn = sqlite3.connect(cp)
+    conn.execute("INSERT INTO governor_blocker VALUES (?,?,?,?,?,?)",
+                 (target, stage, "fp", "2026-08-05T10:00:00", "2026-08-05T10:30:00",
+                  json.dumps(fields)))
+    conn.commit()
+    conn.close()
+
+
+def test_an_answered_later_blocker_does_not_mask_an_open_earlier_one(_isolated):
+    """Live: the canary's stage_c payload gate was still OPEN, but a LATER blocker row whose
+    gate had been answered was picked instead, so the agent rendered as
+    "IDLE — no durable blocker recorded" with an owner gate outstanding against it."""
+    cp = _isolated
+    _blocker_row(cp, "cp-canary:0.0", "stage_c", ["title", "sections"])
+    _gate(cp, "cp-canary:0.0", "owner_payload_missing", "open", "gov:cp-canary:0.0:stage_c")
+    _blocker_row(cp, "cp-canary:0.0", "-", [])          # newer, and its gate is answered
+    _gate(cp, "cp-canary:0.0", "paste_refused", "answered", "gov:cp-canary:0.0:cp-canary:0.0")
+
+    b = osx._why_blocked("cp-canary:0.0")
+    assert b["stage"] == "stage_c", "the still-open blocker must win over a newer answered one"
+    assert b["gate"]["kind"] == "owner_payload_missing"
+    assert b["missing_fields"] == ["title", "sections"]
+
+
+def test_when_nothing_is_open_the_agent_is_not_reported_blocked(_isolated):
+    """Anti-overcorrection: searching back for an open gate must not resurrect closed work."""
+    cp = _isolated
+    _blocker_row(cp, "x:0.0", "s1", ["a"])
+    _gate(cp, "x:0.0", "owner_payload_missing", "answered", "gov:x:0.0:s1")
+    b = osx._why_blocked("x:0.0")
+    assert b is not None and b["gate"] is None, "no open gate → no blocked status"

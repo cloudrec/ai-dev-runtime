@@ -30,28 +30,42 @@ def _rows(db: str, q: str, args=()) -> list:
 
 
 def _why_blocked(target: str) -> Optional[dict]:
-    """The most recent durable blocker for this target, with its exact fields."""
+    """The durable blocker that is still holding this target, with its exact fields.
+
+    Newest-first, but the newest row is NOT automatically the answer: taking it blindly let a
+    later blocker whose gate had been ANSWERED mask an earlier one whose gate was still open,
+    and the agent then rendered as "IDLE — at rest; no durable blocker recorded" while an
+    owner gate sat open against it (live: the canary's stage_c payload gate, hidden behind an
+    answered paste-probe gate). A missing reason is worse than a wrong one — it reads as
+    "nothing needs you".
+    """
+    import json
     rows = _rows(CP_DB, "SELECT stage,fields,first_seen,last_seen FROM governor_blocker "
-                        "WHERE target=? ORDER BY rowid DESC LIMIT 1", (target,))
+                        "WHERE target=? ORDER BY rowid DESC", (target,))
     if not rows:
         return None
-    r = rows[0]
-    # Correlate the gate to THIS blocker via the governor's own correlation id. Taking
-    # "any open gate for this agent" made arbitrage2 read as blocked by an unrelated
-    # `unverified_owner_decision` gate from other work — a wrong reason is worse than none.
-    stage = r.get("stage") or "-"
-    corr = f"gov:{target}:{stage if stage != '-' else target}"
-    gates = _rows(CP_DB, "SELECT id,kind,reason FROM owner_gate WHERE agent_id=? AND "
-                         "state='open' AND correlation_id=? ORDER BY rowid DESC LIMIT 1",
-                  (target, corr))
-    import json
-    try:
-        fields = json.loads(r.get("fields") or "[]")
-    except Exception:  # noqa: BLE001
-        fields = []
-    return {"stage": r.get("stage"), "missing_fields": fields,
-            "since": r.get("first_seen"), "last_seen": r.get("last_seen"),
-            "gate": (gates[0] if gates else None)}
+    newest = None
+    for r in rows:
+        # Correlate the gate to THIS blocker via the governor's own correlation id. Taking
+        # "any open gate for this agent" made arbitrage2 read as blocked by an unrelated
+        # `unverified_owner_decision` gate from other work — a wrong reason is worse than none.
+        stage = r.get("stage") or "-"
+        corr = f"gov:{target}:{stage if stage != '-' else target}"
+        gates = _rows(CP_DB, "SELECT id,kind,reason FROM owner_gate WHERE agent_id=? AND "
+                             "state='open' AND correlation_id=? ORDER BY rowid DESC LIMIT 1",
+                      (target, corr))
+        try:
+            fields = json.loads(r.get("fields") or "[]")
+        except Exception:  # noqa: BLE001
+            fields = []
+        entry = {"stage": r.get("stage"), "missing_fields": fields,
+                 "since": r.get("first_seen"), "last_seen": r.get("last_seen"),
+                 "gate": (gates[0] if gates else None)}
+        if newest is None:
+            newest = entry                      # what to report if nothing is still open
+        if gates:
+            return entry                        # the newest blocker STILL holding the agent
+    return newest
 
 
 def status(targets: Optional[list] = None) -> dict:
