@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 
 import pytest
 
@@ -36,10 +37,13 @@ def _legacy_db(path):
     conn.execute("""CREATE TABLE deliveries (
         idempotency_key TEXT PRIMARY KEY, target TEXT, action TEXT,
         result TEXT, created_at TEXT, created_ts REAL)""")
+    # NOTE: use a CURRENT timestamp. A hardcoded epoch ages past the idempotency TTL and
+    # the row is then legitimately pruned, which made this test fail with the clock rather
+    # than with a code change.
     conn.execute("INSERT INTO deliveries VALUES (?,?,?,?,?,?)",
                  ("legacy-key", "proj:0.0", "agent_send",
                   json.dumps({"delivered": True}), "2026-08-03T22:29:17+00:00",
-                  1785796157.0))
+                  time.time()))
     conn.commit()
     conn.close()
 

@@ -1,0 +1,49 @@
+# Durable per-project execution queues for the Phase 3 continuation governor.
+#
+# The governor NEVER invents work. It may only submit something already queued in the pane
+# by the owner, or advance to an item that is written down in these sources. If a declared
+# source is missing, that is an owner blocker naming the missing file — not licence to
+# improvise.
+#
+# `authoritative_pointer` names the file whose "execute next" section defines the current
+# item. `required_sources` must ALL exist for queue-driven advancement to be allowed.
+
+projects:
+  mess-qa-automation:0.0:
+    project: mess
+    cwd: /opt/mess
+    required_sources:
+      - /opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md
+      - /opt/mess/reports/PROJECT_STATE.md
+    authoritative_pointer: /opt/mess/reports/PROJECT_STATE.md
+    pointer_section: "EXECUTE NEXT"
+    # An OWNER-typed paste already sitting in the input line is the owner's own
+    # instruction; submitting it restores their intent rather than inventing work. This
+    # is what the 2026-08-05 37-minute stall was. Enabled here deliberately and audited;
+    # see the limitation note in the phase 3 report.
+    submit_owner_queued_paste: true
+    enabled: true
+
+  arbitrage2-opus:0.0:
+    project: arbitrage2
+    cwd: /opt/arbitrage2
+    # The owner named a durable queue source for MESS only. Nothing is declared here
+    # because I do not know which arbitrage2 report is authoritative, and inventing a path
+    # is exactly what this phase forbids. Queue-driven advancement therefore stays off for
+    # this project until the owner names the file; detection and refusals still apply.
+    required_sources: []
+    authoritative_pointer: ""
+    pointer_section: ""
+    submit_owner_queued_paste: false
+    enabled: true
+
+  cp-canary:0.0:
+    project: cp-canary
+    cwd: /root/cp-canary-v2
+    required_sources: []
+    authoritative_pointer: ""
+    pointer_section: ""
+    submit_owner_queued_paste: false
+    enabled: true
+
+# payment:0.0 is deliberately absent and must stay absent.
