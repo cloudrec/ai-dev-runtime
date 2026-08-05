@@ -169,8 +169,14 @@ def parse_queue_yaml(path: str) -> dict:
                    if isinstance(payload_field, dict) else "")
     blockers_txt = " ".join(str(b) for b in (cur.get("blockers") or [])
                             if b is not None)
-    needs = ("NEEDS_OWNER_PAYLOAD" in
-             f"{status} {payload_txt} {blockers_txt}".upper())
+    # A stage can name a payload file AND still record `missing_fields` — stage 5 does
+    # exactly that (payload: CALLS_AND_STATES_V3.json, three fields still missing). The
+    # token-only check read that as "fully specified", so an idle agent parked on it was
+    # never surfaced: the stop-and-wait stall, reintroduced. Recorded missing fields ARE
+    # the gap, whatever the payload field says.
+    recorded_missing = [str(x) for x in (cur.get("missing_fields") or []) if str(x).strip()]
+    needs = bool(recorded_missing) or ("NEEDS_OWNER_PAYLOAD" in
+                                       f"{status} {payload_txt} {blockers_txt}".upper())
     return {"ok": True, "format": "yaml", "path": path, "pointer": pointer,
             "current": cur, "current_status": status,
             "needs_owner_payload": needs,

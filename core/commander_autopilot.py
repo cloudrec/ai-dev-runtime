@@ -425,10 +425,16 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
     # work in flight. The autopilot's own progress detector is the authority.
     if is_progressing(state, tail):
         return None
+    # Read the input line through the INJECTED controller when one is supplied. Going
+    # straight to agent_control here meant the governor read the live tmux pane even under
+    # test, making suite runs depend on whatever a real canary happened to be showing.
     pending = ""
     try:
-        from core import agent_control as ac
-        pending = ac.pending_input_text(target, tail) or ""
+        if ctrl is not None and hasattr(ctrl, "snapshot"):
+            pending = (ctrl.snapshot(target, cwd) or {}).get("pending") or ""
+        else:
+            from core import agent_control as ac
+            pending = ac.pending_input_text(target, tail) or ""
     except Exception:  # noqa: BLE001
         pending = ""
     d = cg.govern(target, state=state, pending=pending, tail=tail, config=cfg)

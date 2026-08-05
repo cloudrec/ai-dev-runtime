@@ -376,3 +376,53 @@ def test_governor_never_runs_on_a_pane_that_is_actually_progressing(tmp_path, mo
     assert ap._governor_pass("mess-qa-automation:0.0", state="idle", tail=busy,
                              cwd="/opt/mess", ctrl=None, conv="c", evaluate_only=True,
                              conn=None) is None
+
+
+def test_recorded_missing_fields_are_a_gap_even_with_a_payload_path(tmp_path):
+    """Live stage 5: `status: CURRENT`, `payload: design/v1/screens/CALLS_AND_STATES_V3.json`
+    — a real file — yet three `missing_fields` were still recorded. The token-only check
+    read that as fully specified, so an idle agent parked on it was never surfaced: the
+    stop-and-wait stall, reintroduced. Recorded missing fields ARE the gap."""
+    stages = [{"id": "stage_05_live_calls", "status": "CURRENT",
+               "payload": "design/v1/screens/CALLS_AND_STATES_V3.json",
+               "missing_fields": ["participant picker: metrics and state copy",
+                                  "active call: control layout, reconnect copy"]},
+              {"id": "stage_06", "status": "PENDING"}]
+    path = _yaml_queue(tmp_path, pointer="stage_05_live_calls", stages=stages)
+    q = cg.parse_queue(path)
+    assert q["needs_owner_payload"] is True
+    d = cg.govern("mess-qa-automation:0.0", state="idle",
+                  config=_cfg(authoritative_pointer=path, required_sources=[]))
+    assert d["action"] == "blocker" and d["reason"] == "NEEDS_OWNER_PAYLOAD"
+    assert d["blocker_fields"] == stages[0]["missing_fields"]
+
+
+def test_empty_missing_fields_list_is_not_a_gap(tmp_path):
+    """Anti-overcorrection: an empty or whitespace-only list must not raise a blocker."""
+    stages = [{"id": "stage_05_live_calls", "status": "CURRENT",
+               "payload": "design/v1/screens/SPEC.json", "missing_fields": ["", "  "]},
+              {"id": "stage_06", "status": "PENDING"}]
+    path = _yaml_queue(tmp_path, pointer="stage_05_live_calls", stages=stages)
+    assert cg.parse_queue(path)["needs_owner_payload"] is False
+
+
+def test_governor_reads_pending_through_the_injected_controller(tmp_path, monkeypatch):
+    """It previously went straight to agent_control, so the governor read the LIVE tmux
+    pane during tests and the suite depended on what a real canary was showing."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _cfg())
+
+    def _boom(*a, **k):
+        raise AssertionError("live pane must not be read when a controller is injected")
+    monkeypatch.setattr("core.agent_control.pending_input_text", _boom)
+
+    class Ctrl:
+        def snapshot(self, target, cwd):
+            return {"pending": PASTE, "tail": "", "state": "waiting_input"}
+
+    out = ap._governor_pass("mess-qa-automation:0.0", state="waiting_input", tail="",
+                            cwd="/opt/mess", ctrl=Ctrl(), conv="c", evaluate_only=True,
+                            conn=None)
+    assert out is None or out["decision"].startswith("governor")
