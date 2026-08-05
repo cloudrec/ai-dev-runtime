@@ -435,10 +435,19 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
                             return {"action": "blocker",
                                     "reason": "cross_project_work_refused",
                                     "owner_blocker": True, "scope": iso2["scope"]}
+                        # The completed stage is STILL the queue's own `pointer`. The agent
+                        # reads that file, so it will redo the finished stage no matter what
+                        # the control plane concludes from the artefact (observed live: the
+                        # canary appended a second "repeat run" line to ACCEPTANCE_A.md while
+                        # the governor was advancing to stage B). Only whoever owns the queue
+                        # may rewrite it — the governor editing a project's durable queue
+                        # would be the control plane authoring project state — so this is
+                        # surfaced, not silently corrected.
                         return {"action": "advance_queue",
                                 "reason": "artefact_present_stage_complete",
                                 "stage": q.get("pointer"), "next_stage": str(nxt_id),
                                 "step_text": instr, "queue_path": qpath,
+                                "pointer_stale": True,
                                 "resume_instruction": q.get("resume_instruction", ""),
                                 "note": "instruction quoted verbatim from the durable queue"}
                     # Artefact absent. If the CURRENT stage declares its own instruction

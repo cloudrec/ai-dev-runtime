@@ -730,8 +730,9 @@ def test_a_stage_is_nudged_once_then_suppressed(tmp_path, monkeypatch):
     for _ in range(5):                       # several later ticks
         later = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
                                   ctrl=None, conv="c", evaluate_only=False, conn=None)
-        assert later["decision"] == "governor_advance_suppressed"
-        assert later["note"] == "stage_nudge_cooldown"
+        # This queue's pointer still names the finished stage, so the repeat ticks report
+        # the stall rather than a tidy "suppressed" — see the stale-pointer tests below.
+        assert later["decision"] == "governor_queue_pointer_stale"
     assert len(calls) == 1, calls
 
 
@@ -822,3 +823,101 @@ def test_rows_written_before_the_conv_column_existed_still_work(tmp_path, monkey
     assert g["allow"] is False, ("a legacy row has no recorded conversation, so a new id "
                                  "cannot be PROVEN different — it must stay suppressed")
     assert g["reason"] == "stage_nudge_cooldown"
+
+
+# ═════════ 9. a completed stage that is still the queue's pointer ═══════════
+def _advanced_pointer_queue(tmp_path):
+    """The same queue after its owner did advance the pointer — stage_a DONE, pointer on b."""
+    import yaml as _y
+    stages = [{"id": "stage_a", "status": "DONE", "artefact": "reports/A.md",
+               "next_stage": "stage_b"},
+              {"id": "stage_b", "status": "CURRENT", "instruction": "write B",
+               "artefact": "reports/B.md", "next_stage": None}]
+    body = _y.safe_dump({"pointer": "stage_b", "cwd": str(tmp_path),
+                         "deploy_allowed": False, "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## RESUME AFTER `/clear`\n\n> Read the queue.\n\n"
+                 "## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    return str(p)
+
+
+def test_a_finished_stage_still_named_by_the_pointer_is_flagged(tmp_path):
+    """The agent reads the FILE. If the pointer still names a stage whose artefact exists,
+    the agent redoes finished work no matter what the control plane concluded — observed
+    live as a second 'repeat run' line appended to the canary's ACCEPTANCE_A.md."""
+    path = _artefact_queue(tmp_path)
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert d["action"] == "advance_queue"
+    assert d.get("pointer_stale") is True
+
+
+def test_an_advanced_pointer_is_not_flagged_stale(tmp_path):
+    """Anti-overcorrection: once the queue owner advances the pointer, nothing is stale."""
+    path = _advanced_pointer_queue(tmp_path)
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, path))
+    assert not d.get("pointer_stale"), d
+    assert d["action"] == "advance_queue" and d["reason"] == "stage_not_started"
+
+
+def test_the_stall_is_raised_to_the_owner_not_recorded_as_suppressed(tmp_path, monkeypatch):
+    """A suppressed row reads as 'already handled'. When the pointer is stale it means the
+    opposite: work is being repeated every tick and nothing will ever advance it."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    cp = str(tmp_path / "cp.db")
+    monkeypatch.setenv("CONTROL_PLANE_DB", cp)
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    path = _artefact_queue(tmp_path, nxt_instruction="do the thing")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, path))
+    monkeypatch.setattr(ap, "load_registry", lambda *a, **k: {
+        "cp-canary:0.0": {"next_step": "continue with the next safe step"}})
+    calls = []
+    monkeypatch.setattr(ap, "deliver_next_step",
+                        lambda t, step, **k: calls.append(step)
+                        or {"acted": True, "verified": True})
+
+    ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                      ctrl=None, conv="c", evaluate_only=False, conn=None)
+    out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                            ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert out["decision"] == "governor_queue_pointer_stale"
+    assert out["stage"] == "stage_a"
+    import sqlite3
+    rows = sqlite3.connect(cp).execute(
+        "SELECT stage,fields FROM governor_blocker WHERE target='cp-canary:0.0'").fetchall()
+    assert rows, "the stall must be durable, not just a log line"
+    assert "stage_a" in rows[0][0] and "pointer" in rows[0][1]
+    assert len(calls) == 1, "and it must still not re-nudge"
+
+
+def test_the_governor_never_rewrites_the_projects_queue(tmp_path, monkeypatch):
+    """The fix for a stale pointer is the queue OWNER advancing it. A control plane that
+    edits a project's durable queue is authoring project state — the one thing the governor
+    must never do, however convenient."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    path = _artefact_queue(tmp_path, nxt_instruction="do the thing")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    before = open(path, encoding="utf-8").read()
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, path))
+    monkeypatch.setattr(ap, "load_registry", lambda *a, **k: {
+        "cp-canary:0.0": {"next_step": "continue with the next safe step"}})
+    monkeypatch.setattr(ap, "deliver_next_step",
+                        lambda t, step, **k: {"acted": True, "verified": True})
+    for _ in range(3):
+        ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                          ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert open(path, encoding="utf-8").read() == before, "the queue file must be untouched"

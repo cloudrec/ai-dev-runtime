@@ -575,6 +575,23 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
             gate = _stage_delivery_gate(conn, target, str(d.get("next_stage") or "-"),
                                         conv=conv or "")
             if not gate["allow"]:
+                # Suppression normally means "already handled". But when the queue's own
+                # pointer still names a stage whose artefact is finished, suppression means
+                # a STALL: the agent re-reads that pointer and repeats completed work while
+                # the control plane records a tidy `suppressed` row. Nobody advanced the
+                # queue, and the governor must not — so raise it to the owner once.
+                if d.get("pointer_stale"):
+                    stale_stage = str(d.get("stage") or "-")
+                    _record_governor_blocker(
+                        conn, target, stale_stage,
+                        [f"queue pointer still `{stale_stage}` after its artefact was "
+                         f"written; nothing advances it to `{d.get('next_stage')}`"],
+                        "queue_pointer_stale",
+                        "the agent re-reads the stale pointer and repeats finished work")
+                    return {**base, "decision": "governor_queue_pointer_stale",
+                            "next_stage": d.get("next_stage"), "stage": stale_stage,
+                            "note": "completed stage is still the queue pointer; the queue "
+                                    "owner must advance it (the governor never writes it)"}
                 return {**base, "decision": "governor_advance_suppressed",
                         "next_stage": d.get("next_stage"), "note": gate["reason"],
                         "attempts": gate.get("attempts")}
