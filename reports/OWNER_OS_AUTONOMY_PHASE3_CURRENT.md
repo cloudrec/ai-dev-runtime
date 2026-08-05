@@ -282,6 +282,41 @@ controller is given. Suite went 1366 → **1369 passed** with the flake gone.
 
 Deployed HEAD `28c2afb`, PID 2480752, backup `predeploy-phase3c-20260805T094520Z`.
 
+## FOURTH TRANSITION + an operational finding worth the owner's attention (12:16–12:18)
+
+`stage_05_live_calls` → `stage_06_misc_real_surfaces`; the new stage records one broad
+missing-fields entry (folders, scheduled messages, admin panel, update modal, SOS/check-in,
+polls, location cards, contact profile — titles, row copy, action labels, states, metrics)
+and the wired governor raised the blocker at 12:17 when the pane went idle.
+
+**Blocker ledger is per-stage, as designed:** one row for `stage_04_security_devices`
+(08:35→08:44) and one for `stage_06_misc_real_surfaces` (10:17 UTC). No duplicates.
+Stage 5's blocker predates the `missing_fields` fix being deployed, so it exists only in
+the monitor record, not the ledger.
+
+### Exactly-once: verified, but only after checking
+Eight `governor_submitted` events on `cp-canary:0.0` between 08:16 and 10:16 all carry the
+SAME `expected_pending` text, three of them inside nine minutes. That looked like a
+resubmit loop. It is not: the canary log shows a distinct note appended per submit, so each
+event is its own work cycle where the autopilot's paste did not submit and the governor
+pressed Enter once. Exactly-once holds **per queued line**.
+
+### ⚠ But the canary is in a make-work busy loop — 619 notes today
+`/root/cp-canary-v2/reports/CANARY_LOG.md` contains **619 entries dated 2026-08-05**
+(latest: note #830). The canary's registry step is a repeating safe instruction, and since
+the re-resumability fix (`4ed8d93`) every new idle cycle produces a fresh progress
+fingerprint, so the autopilot re-pokes it on essentially every tick. Each poke burns model
+tokens and appends another line.
+
+That fix was correct for real projects — a session must be resumable on each new idle
+cycle — but combined with a step that is *always* satisfiable it yields an unbounded loop
+on the canary. Nothing unsafe is happening (the work is a dated log line, no external
+effect), and no duplicate agents or panes exist. It is a cost and noise problem, not a
+safety one.
+
+Not changed unilaterally: capping it means either a per-target poke budget or a canary step
+that can complete, and both are owner decisions about what the canary is for.
+
 ## Superseded — the wiring gap as first reported
 
 `core/continuation_governor.py` is imported by **nothing** in `core/` or `api/`:
