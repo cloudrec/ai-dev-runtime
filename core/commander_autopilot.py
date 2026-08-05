@@ -258,6 +258,82 @@ def evaluate(target: str, *, state: str, tail: str = "", conv_age_secs: Optional
 _RECORD_DEDUP_SECS = int(os.getenv("COMMANDER_AUTOPILOT_RECORD_DEDUP_SECS", "3600"))
 
 
+# How long the owner's own unsubmitted text may sit before it becomes an owner blocker.
+QUEUED_STALL_SECS = int(os.getenv("COMMANDER_QUEUED_STALL_SECS", "600"))
+
+
+def cg_targets() -> set:
+    """Targets the continuation governor is configured to act on (empty on any error)."""
+    try:
+        from core import continuation_governor as cg
+        return set(cg.load_config() or {})
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def _track_queued_input(conn, target: str, text: str, reason: str,
+                        *, now: Optional[float] = None) -> dict:
+    """Track owner text sitting unsubmitted, and escalate it once it has waited too long.
+
+    The failure this closes: owner text sat in `payment:0.0` for 985 consecutive samples
+    (~16h) while the autopilot recorded a bland `poke_owner_gated` every hour and raised
+    NOTHING. Across the whole system there was not one owner gate mentioning stuck input.
+    Every reason we decline to submit — the pane is busy, the project is paused, the target
+    is outside the actuation allowlist, a dialog is open — looked identical from outside:
+    silence. Requirement: record a precise blocker instead of silently idling.
+
+    Returns {"stalled": bool, "age_secs": float, "reason": str}.
+    """
+    import hashlib
+    now = now if now is not None else now_ts()
+    h = hashlib.sha256((text or "").encode()).hexdigest()[:16]
+    conn, own = _c(conn)
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS queued_input_watch (
+            target TEXT, text_hash TEXT, sample TEXT, reason TEXT,
+            first_ts REAL, first_at TEXT, last_ts REAL, last_at TEXT, escalated INTEGER,
+            PRIMARY KEY (target, text_hash))""")
+        r = conn.execute("SELECT first_ts,escalated FROM queued_input_watch WHERE target=? "
+                         "AND text_hash=?", (target, h)).fetchone()
+        first_ts = float(r[0]) if r else now
+        escalated = bool(r[1]) if r else False
+        conn.execute("INSERT OR REPLACE INTO queued_input_watch VALUES (?,?,?,?,?,?,?,?,?)",
+                     (target, h, (text or "")[:200], reason, first_ts,
+                      now_iso() if not r else (r and now_iso()), now, now_iso(),
+                      int(escalated)))
+        # a DIFFERENT text on the same target supersedes the old watch — the owner replaced it
+        conn.execute("DELETE FROM queued_input_watch WHERE target=? AND text_hash<>?",
+                     (target, h))
+        conn.commit()
+        age = now - first_ts
+        if age >= QUEUED_STALL_SECS and not escalated:
+            conn.execute("UPDATE queued_input_watch SET escalated=1 WHERE target=? AND "
+                         "text_hash=?", (target, h))
+            conn.commit()
+            return {"stalled": True, "age_secs": age, "reason": reason, "text_hash": h}
+        return {"stalled": False, "age_secs": age, "reason": reason, "text_hash": h}
+    finally:
+        if own:
+            conn.close()
+
+
+def _clear_queued_watch(conn, target: str) -> None:
+    """The line went in — stop watching it."""
+    conn, own = _c(conn)
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS queued_input_watch (
+            target TEXT, text_hash TEXT, sample TEXT, reason TEXT,
+            first_ts REAL, first_at TEXT, last_ts REAL, last_at TEXT, escalated INTEGER,
+            PRIMARY KEY (target, text_hash))""")
+        conn.execute("DELETE FROM queued_input_watch WHERE target=?", (target,))
+        conn.commit()
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        if own:
+            conn.close()
+
+
 def _record_run(target: str, decision: str, detail: dict, conn=None) -> None:
     conn, own = _c(conn)
     try:
@@ -755,6 +831,8 @@ def tick(*, inventory: Optional[dict] = None, registry: Optional[dict] = None,
                              conv=conv, evaluate_only=evaluate_only, conn=conn)
         if gov is not None:
             _record_run(target, gov["decision"], gov, conn=conn)
+            if gov["decision"] == "governor_submitted":
+                _clear_queued_watch(conn, target)
             results.append(gov)
             continue
 
@@ -770,6 +848,39 @@ def tick(*, inventory: Optional[dict] = None, registry: Optional[dict] = None,
             ev["actuation_reason"] = action.get("reason")
             if not action.get("acted") and action.get("reason") == "not_canary":
                 ev["decision"] = "poke_owner_gated"      # would poke, but live actuation gated
+
+        # OWNER TEXT LEFT SITTING. Whatever the decision above was, if the owner's own
+        # unsubmitted line is still in the pane and nothing submitted it, say so — and after
+        # a bounded wait raise it as a real blocker naming the exact reason. Silence here is
+        # what let payment sit for ~16h with an approved instruction typed and unsent.
+        try:
+            from core import agent_control as _ac
+            pend = ""
+            if ctrl is not None and hasattr(ctrl, "snapshot"):
+                pend = (ctrl.snapshot(target, cwd) or {}).get("pending") or ""
+            else:
+                pend = _ac.pending_input_text(target, tail) or ""
+            pend = pend.strip()
+            if pend:
+                why = ("pane_busy" if is_progressing(state, tail)
+                       else "not_actuatable" if ev["decision"] == "poke_owner_gated"
+                       else "project_not_governed" if target not in cg_targets()
+                       else f"decision_{ev['decision']}")
+                st = _track_queued_input(conn, target, pend, why)
+                ev["queued_input_waiting"] = {"age_secs": int(st["age_secs"]),
+                                              "reason": why, "sample": pend[:80]}
+                if st["stalled"]:
+                    _record_governor_blocker(
+                        conn, target, "-",
+                        [f"owner text unsubmitted for {int(st['age_secs'] // 60)} min: "
+                         f"{pend[:120]}"],
+                        reason="queued_input_stalled", detail=why)
+                    ev["decision"] = "queued_input_stalled"
+            else:
+                _clear_queued_watch(conn, target)
+        except Exception:  # noqa: BLE001 — visibility must never break the tick
+            pass
+
         _record_run(target, ev["decision"], ev, conn=conn)
         results.append(ev)
     return {"evaluated": len(results), "results": results,
