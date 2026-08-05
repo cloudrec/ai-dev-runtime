@@ -563,8 +563,14 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
                     "owner_blocker": True,
                     "note": "next work needs an owner-authored source that is absent; "
                             "no design is fabricated"}
+        # Ground the legacy path too. It has no stage id, so the pointer SECTION name stands
+        # in for one; if that name will not survive the delivery template's charset (spaces,
+        # punctuation), the caller refuses rather than sending an ungrounded generic nudge.
+        section = str((cfg_all.get(target) or {}).get("pointer_section") or "").strip()
         return {"action": "advance_queue", "reason": "stage_complete_with_grounded_next",
                 "pointer_path": ptr["pointer_path"], "queue_excerpt": ptr["body"][:600],
+                "next_stage": section or None, "queue_path": ptr["pointer_path"],
+                "step_text": ptr["body"][:600],
                 "note": "the next item is quoted from the durable queue, not invented"}
 
     return {"action": "skip", "reason": "nothing_queued_and_stage_incomplete"}

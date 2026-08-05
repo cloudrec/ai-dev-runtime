@@ -674,7 +674,8 @@ def test_queue_instruction_is_never_typed_into_the_pane(tmp_path, monkeypatch):
     ("append one dated line to reports/ACCEPTANCE_A.md") and the safety classifier refused
     it — `governor_step_unsafe`. Correct refusal, wrong design: the queue's text is domain
     content for the AGENT to read, not something the governor may type. The governor now
-    delivers only a classifier-safe continuation nudge."""
+    delivers a classifier-safe GROUNDED pointer instead: it names the stage id and the queue
+    file, and never the stage's prose."""
     monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     from core import commander_autopilot as ap
@@ -697,8 +698,10 @@ def test_queue_instruction_is_never_typed_into_the_pane(tmp_path, monkeypatch):
     out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
                             ctrl=None, conv="c", evaluate_only=False, conn=None)
     assert out["decision"] == "governor_advanced"
-    assert sent["step"] == "continue with the next safe canary note"
     assert rich not in sent["step"], "the queue's rich text must never be typed"
+    assert "reports/ACCEPTANCE_A.md" not in sent["step"], "no prose from the stage body"
+    assert "stage_b" in sent["step"] and path in sent["step"], \
+        "the delivered text must be grounded: the stage id and the queue file it came from"
     assert ap.classify_safety(sent["step"]) == "autonomous_safe"
     assert out["queue_step"].startswith("append one dated line"), \
         "the queue step is still recorded for audit, just not delivered"
@@ -1106,3 +1109,94 @@ def test_the_governor_retracts_only_its_own_gates_for_finished_stages(tmp_path, 
     assert answered == ["g_done"]
     assert "g_open" not in answered, "a stage that is not finished keeps its gate"
     assert "g_other" not in answered, "gates from other sources are never touched"
+
+
+# ═════════ 13. grounded advancement, no fallback ════════════════════════════
+def test_the_delivered_step_names_the_actual_stage(tmp_path, monkeypatch):
+    """The defect: every advancement sent the project's STATIC registry string. Live, stages
+    B and C were both nudged with "continue with the next safe canary note; append a dated
+    line to the log" — the wrong instruction for both. Advancement worked only because the
+    agent re-read its queue on its own; obeying the delivered text would have done the wrong
+    work."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    path = _artefact_queue(tmp_path, nxt_instruction="write B")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, path))
+    monkeypatch.setattr(ap, "load_registry", lambda *a, **k: {
+        "cp-canary:0.0": {"next_step": "continue with the next safe canary note"}})
+    sent = {}
+
+    def _deliver(t, step, **k):
+        sent["step"] = step
+        return {"acted": True, "verified": True}
+    monkeypatch.setattr(ap, "deliver_next_step", _deliver)
+
+    out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                            ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert out["decision"] == "governor_advanced"
+    assert "stage_b" in sent["step"], sent["step"]
+    assert path in sent["step"], "the delivered text must name the queue it came from"
+    assert "next safe canary note" not in sent["step"], \
+        "the static registry string must no longer be delivered for advancement"
+    assert ap.classify_safety(sent["step"]) == "autonomous_safe"
+
+
+def test_no_generic_fallback_when_the_grounded_step_is_unsafe(tmp_path, monkeypatch):
+    """A queue naming `stage_deploy_prod` must be REFUSED, never quietly replaced by a
+    generic continuation the queue did not authorise."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    import yaml as _y
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    stages = [{"id": "stage_a", "status": "CURRENT", "artefact": "reports/A.md",
+               "next_stage": "stage_deploy_prod"},
+              {"id": "stage_deploy_prod", "status": "PENDING", "instruction": "do it",
+               "next_stage": None}]
+    body = _y.safe_dump({"pointer": "stage_a", "cwd": str(tmp_path), "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, str(p)))
+    monkeypatch.setattr(ap, "load_registry", lambda *a, **k: {
+        "cp-canary:0.0": {"next_step": "continue with the next safe step"}})
+    calls = []
+    monkeypatch.setattr(ap, "deliver_next_step",
+                        lambda t, step, **k: calls.append(step) or {"acted": True})
+    out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                            ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert out["decision"] in ("governor_step_unsafe", "governor_blocker"), out
+    assert calls == [], "nothing may be delivered for an unsafe stage"
+
+
+def test_an_ungroundable_advance_delivers_nothing(tmp_path, monkeypatch):
+    """No stage id or no queue path → refuse. Previously this silently sent the registry
+    string, so the agent received a continuation grounded in nothing at all."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    monkeypatch.setattr(cg, "govern", lambda *a, **k: {
+        "action": "advance_queue", "reason": "x", "step_text": "do something",
+        "next_stage": "", "queue_path": ""})
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, "/nope.md"))
+    monkeypatch.setattr(ap, "load_registry", lambda *a, **k: {
+        "cp-canary:0.0": {"next_step": "continue with the next safe step"}})
+    calls = []
+    monkeypatch.setattr(ap, "deliver_next_step",
+                        lambda t, step, **k: calls.append(step) or {"acted": True})
+    out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                            ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert out["decision"] == "governor_advance_ungrounded"
+    assert calls == []

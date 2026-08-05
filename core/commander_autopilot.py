@@ -608,22 +608,34 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
         # So: deliver only the project's own classifier-safe continuation nudge; the agent
         # reads the queue itself and does the stage named by the pointer.
         queue_step = str(d.get("step_text") or "").strip()
-        reg_entry = (load_registry() or {}).get(target) or {}
-        step = str(reg_entry.get("next_step") or "").strip()
-        if classify_safety(step) != "autonomous_safe":
-            from core.agent_continuation_watchdog import DEFAULT_CONTINUATION
-            step = DEFAULT_CONTINUATION
+        # GROUNDED, NO FALLBACK. The delivered text now names the exact stage and the queue
+        # file it came from, built from the durable queue itself. Previously this sent the
+        # project's static registry string — the same sentence for every stage, and the wrong
+        # instruction for all but the first — with a silent fall back to a generic
+        # continuation whenever that string failed the classifier. Advancement then depended
+        # on the agent re-reading its queue rather than on anything the governor said.
+        from core.control_plane import actuator as _act
+        stage_id = str(d.get("next_stage") or "").strip()
+        qpath = str(d.get("queue_path") or "").strip()
+        step = _act.build_queue_stage_step(stage_id, qpath) if (stage_id and qpath) else ""
+        if not step:
+            return {**base, "decision": "governor_advance_ungrounded",
+                    "next_stage": stage_id or None,
+                    "note": "no stage id or queue path to ground the continuation in; "
+                            "nothing delivered rather than falling back to a generic nudge"}
         if not queue_step or evaluate_only:
             return {**base, "decision": "governor_advance_available",
                     "next_stage": d.get("next_stage"),
                     "note": "next stage grounded in the durable queue; nothing delivered "
                             "(no instruction text, or evaluate-only)"}
-        # DELIVER the queue's own instruction, exactly once. Reporting it without
-        # delivering left the agent with neither an autopilot poke (short-circuited here)
-        # nor a governor step — i.e. a stall introduced by the governor itself.
+        # The grounded template is normally autonomous_safe by construction, but the denylist
+        # runs first inside the classifier: a stage id carrying a forbidden token (a queue
+        # with `stage_deploy_prod`) lands here. Refuse and say so — never fall back to a
+        # generic nudge, which would deliver a continuation the queue never authorised.
         if classify_safety(step) != "autonomous_safe":
             return {**base, "decision": "governor_step_unsafe",
-                    "note": f"queue instruction is not autonomous_safe: {step[:80]}"}
+                    "next_stage": stage_id or None,
+                    "note": f"grounded queue step is not autonomous_safe: {step[:80]}"}
         try:
             from core.control_plane import actuator as act
             if target not in act.CANARY_AGENTS:

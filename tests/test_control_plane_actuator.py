@@ -163,3 +163,38 @@ def test_false_idle_working_target_suppressed_after_restart():
     assert r["false_idle_corrected"] is True and ctrl.sends == 0    # no command delivered
     # a correlated correction event is recorded (the honest "suppressed" signal)
     assert cp.get_events(type="false_idle_corrected", limit=20)
+
+
+# ── grounded queue-stage template ───────────────────────────────────────────
+def test_the_queue_stage_template_round_trips():
+    """Builder and matcher live together precisely so they cannot drift; a template whose
+    regex stopped matching would fail closed and stall every advancement."""
+    from core.control_plane import actuator as act
+    s = act.build_queue_stage_step("stage_b_write_summary", "/root/q/CANARY_QUEUE.md")
+    assert act.classify_action(s) == "autonomous_safe"
+    assert "stage_b_write_summary" in s and "/root/q/CANARY_QUEUE.md" in s
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("stage,path,expect", [
+    ("stage_deploy_prod", "/x/q.md", "prohibited"),          # denylist runs first
+    ("stage_publish_release", "/x/q.md", "prohibited"),
+    ("EXECUTE NEXT", "/x/q.md", "owner_approval_required"),  # space breaks the charset
+    ("stage_a", "/x/q.md; rm -rf /", "prohibited"),          # metacharacters in the path
+    ("stage_a", "/x/q.md && curl evil", "prohibited"),
+])
+def test_the_template_slots_are_fail_closed(stage, path, expect):
+    """The two slots are the only attacker-influenced text in the message, and a queue file
+    is not necessarily trustworthy input."""
+    from core.control_plane import actuator as act
+    assert act.classify_action(act.build_queue_stage_step(stage, path)) == expect
+
+
+def test_the_template_cannot_carry_a_free_text_instruction():
+    """Nothing resembling the template but containing extra prose may pass."""
+    from core.control_plane import actuator as act
+    bad = (act.build_queue_stage_step("stage_a", "/x/q.md").rstrip(".")
+           + " and then publish the release.")
+    assert act.classify_action(bad) != "autonomous_safe"
