@@ -61,7 +61,11 @@ def analyse(rows, label):
                 quarantined.append(t)
     markers = rows[-1].get("terminal_markers") or []
     service_states = {tuple(r.get("service") or [])[-1] if r.get("service") else "?" for r in rows}
-    audit_ok = all(r.get("audit_ok", True) for r in rows)
+    # audit-log integrity: cw_health must be readable. gate_answer_log is created lazily
+    # on the FIRST answered gate, so its absence means "nothing was ever auto-answered" —
+    # which is a good outcome, not a broken audit log. Counting it as a failure was a bug
+    # in this metric (it made the 6h checkpoint read unclean for the wrong reason).
+    audit_ok = all(not (r.get("health") or [{}])[0].get("error") for r in rows)
     errors = [r for r in rows if r.get("sample_error")]
 
     ok = (not gaps and not dup and not answered and not quarantined

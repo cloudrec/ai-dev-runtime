@@ -1,6 +1,6 @@
 # OWNER OS — AUTONOMY PHASE 2 (LIVE, CONTINUOUSLY UPDATED)
 
-**Status: WORKING.** Started 2026-08-04. This file is the durable record of the assignment
+**Status: 6h CHECKPOINT REACHED — `OWNER_OS_AUTONOMY_PHASE2 = PARTIAL`.** Started 2026-08-04. This file is the durable record of the assignment
 and its progress — written before any coding so context compaction cannot lose it.
 
 ## Assignment (owner, verbatim intent)
@@ -180,3 +180,58 @@ Window opened `2026-08-04T23:16:25`. 6h checkpoint falls at ~`05:16`. Running to
 **No verdict yet.** `PHASE2_SOAK_6H_PASS` is not claimed until ≥360 samples exist and the
 counters above still hold. Current phase status remains
 `OWNER_OS_AUTONOMY_PHASE2 = WORKING`.
+
+
+## D — 6h CHECKPOINT RESULT (2026-08-05T05:28)
+
+`reports/phase2_soak_6h_checkpoint.json`, written by the detached evaluator:
+**360 samples over 6.19h**, window `2026-08-04T23:16:25` → `2026-08-05T05:27:49`.
+
+| criterion | result |
+|---|---|
+| sampling gaps >150s | **0** |
+| duplicate panes | **0** |
+| unapproved gate answers | **0** |
+| quarantined sessions | **0** |
+| recoveries in 6h | 0 for all three |
+| service state seen | `active` only, across a deliberate restart |
+| sampler errors | 0 |
+| audit log readable | yes (after the metric fix below) |
+| **max stall streak** | cp-canary 2, arbitrage2 **3**, **mess-qa-automation 37** |
+
+**`clean: false`** — and I am NOT calling `PHASE2_SOAK_6H_PASS`.
+
+### Flag 1 — MESS stalled 37 minutes (real)
+`mess-qa-automation:0.0` sat at `waiting_input` from `00:46:06` to `01:23:11` holding
+`[Pasted text #3 +99 lines]` — a pasted block that was never submitted.
+
+The watchdog did not submit it, and that refusal is *correct*: the structural safe-step
+allowlist does not recognise an opaque 99-line paste, so auto-submitting it would mean
+sending unclassified content. Correct safety behaviour, and a stalled project — which is
+exactly the stop-and-wait pattern Phase 3 exists to govern. Recorded here as evidence, not
+excused.
+
+Arbitrage2's 3-sample streak was the ordinary safe continuation text and cleared itself.
+
+### Flag 2 — audit metric bug (mine, fixed)
+`audit_log_ok: false` was wrong. `gate_answer_log` is created lazily on the FIRST answered
+gate, so its absence means "nothing was ever auto-answered" — a good outcome. My evaluator
+counted the missing table as a broken audit log. Fixed; recomputed over the same 360
+samples → `audit_log_ok: true`, every other number unchanged.
+
+## Phase 2 verdict
+
+**`OWNER_OS_AUTONOMY_PHASE2 = PARTIAL`**
+
+- **A — durable terminal state: PASS.** Proven live in both directions: marker held while
+  nothing material changed, then reopened by itself on `git_head_changed`.
+- **B — safe dead-session recovery: PARTIAL.** Deployed, registry live with payment absent,
+  every refusal path proven by test — but no registered session died during the window, so
+  end-to-end revival is unproven live. I will not kill one to manufacture the proof.
+- **C — live gate path: PASS.** Exact approval, wrong-wording refusal, expired refusal,
+  prohibited-marker veto, one-copy delivery — all against real rendered dialogs.
+- **D — 6h soak: PARTIAL.** Every safety criterion clean; the stall criterion failed on the
+  MESS paste.
+
+Not a PASS, and not a BLOCKED: nothing external stopped the work, and no Phase 2 safety
+property was violated. The single failing criterion is the precise problem Phase 3 targets.
