@@ -812,6 +812,42 @@ Phase 3 defects have now been found by driving production and one by the suite. 
 regression prevention here, not discovery — and a green suite is not evidence that a
 protective config protects anything.
 
+### DEFECT — an open owner gate rendered as "IDLE, nothing wrong" (found `b34dd49`)
+
+Noticed while re-reading the live owner view during the same final pass. The canary showed:
+
+```
+cp-canary:0.0    IDLE    at rest; no durable blocker recorded
+```
+
+while owner gate `ba2c9b382c56` (`owner_payload_missing` at `stage_c_missing_payload`) was
+**open** against it. `_why_blocked` took the newest `governor_blocker` row unconditionally;
+the newest row was the paste-probe blocker whose gate I had just answered, so the still-open
+stage C blocker underneath it was never consulted.
+
+This is the worse half of the bug this view was built to fix. It previously showed a *wrong*
+reason (an unrelated gate); this showed *no* reason, which reads as "nothing needs you" —
+precisely the stop-and-wait stall Phase 3 exists to surface, reintroduced in the very view
+meant to reveal it.
+
+Fixed: walk blockers newest-first and return the newest whose correlated gate is still open,
+falling back to the newest row when nothing is open, so closed work is never resurrected. Two
+tests pin both directions.
+
+### OBSERVATION (not changed) — condition-derived gates do not self-resolve
+
+The `governor_queue_pointer_stale` gate `43e8eb7a5d19` is still **open** although its
+condition is objectively gone: the pointer advanced to `stage_c_missing_payload` when the
+agent fixed it. Nothing closes a gate when the state that raised it clears, so the open-gate
+summary accumulates resolved entries and slowly loses its meaning.
+
+This is real, but auto-closing owner-visible gates is a **policy decision about what the
+owner is guaranteed to see**, not a bug fix, so it was not done unilaterally at an acceptance
+boundary. Impact today is limited to the count line — `owner_status` only attributes a gate
+to an agent when it is open *and* correlated, so no agent is mislabelled by it. Recommend a
+follow-up: gates raised from a derived condition should carry a resolution predicate and
+close themselves when it stops holding, leaving the row and its history intact.
+
 ### Item 7 — post-fix soak
 
 The Phase 3 recorder that has been running since the first deploy spans the pre-fix period,
@@ -819,6 +855,88 @@ so a **second, cleanly post-fix recorder** was started after `cf27579`
 (`reports/phase3_postfix_soak.jsonl`, detached, restart-persistent). Phase 2's 24h soak is
 untouched. Both track sampling gaps, duplicate submissions, wrong-project actions, unknown
 prompt answers, recoveries, `/clear` resumes and quarantine events.
+
+## ═══ ACCEPTANCE RESULT ═══
+
+### Exact state
+
+| | |
+|---|---|
+| code commit (HEAD) | `b34dd49` |
+| deployed commit | `b34dd49` |
+| service | `ai-runtime.service`, PID **3635247**, active since 2026-08-05 17:47:17 CEST, `NRestarts=0` |
+| durable store | `/root/ai-dev-runtime/control_plane.db` (service `WorkingDirectory`, no `CONTROL_PLANE_DB` override) |
+| full suite | **1421 passed, 0 failed** (633.48s) at `b34dd49` |
+| earlier full suites | 1393 passed at `06d2c8d`; 1408 passed at `bf46252` |
+| soaks | Phase 2 24h (untouched, ~18h), Phase 3 (since first deploy), Phase 3 **post-fix** (since `cf27579`) |
+
+The `test_phase13` planner flake recorded earlier did not recur in three subsequent full
+runs, one of them under heavier load (20min wall clock vs 10.5min). It is still recorded as
+an unresolved load flake, not as fixed.
+
+### Item-by-item
+
+| # | item | result | evidence |
+|---|---|---|---|
+| 1 | blocker taxonomy, migrate/close bad gate without erasing history, dedup | **PASS** | kinds now derive from the real reason; bad gate `819f13b8cc76495d` closed via `answer_gate` (audit event 2720), row retained; stage C blocker is one row `first_seen 15:07:16Z → last_seen 15:18:49Z` |
+| 2 | governor invoked by the real recurring tick; durable records in the real DB, surviving restart | **PASS** | 60s ticks recorded per target; ledger rows written pre-restart gated the first post-restart tick (15:02:01Z, no re-nudge) |
+| 3 | cp-canary deterministic acceptance harness | **PASS** | see below |
+| 4 | exercise real projects safely, no interference | **PASS** | MESS correctly BLOCKED on a genuine owner payload, untouched; arbitrage2 paper-only; no real transition in window → canary recorded as decisive per instruction, monitor left active |
+| 5 | project-role isolation + cross-project rejection | **PASS (after a defect found live)** | four cross-project instructions were ALLOWED against the shipped config until `a6dadc5`; all refused now, in-role work still passes, no unenforceable scopes remain |
+| 6 | focused + full suite, backup, deploy, restart, health, post-deploy tick | **PASS** | backups `predeploy-nudgeguard-20260805T144302Z`, `predeploy-scopefix-20260805T154716Z`; four clean deploys |
+| 7 | fresh post-fix soak | **RUNNING** | `reports/phase3_postfix_soak.jsonl`, detached, restart-persistent; `duplicates: {}`, all pane counts 1 |
+| 8 | this report | **DONE** | — |
+
+Item 3 in detail — every gate proven on the live pane, not in a test:
+
+| gate | evidence |
+|---|---|
+| stage completes → idle | `ACCEPTANCE_A.md` written after the `/clear` resume |
+| governor submits next stage exactly once | `governor_advanced` 14:55:17Z, one ledger row `stage_b attempts=1` |
+| later ticks do not resubmit | `governor_advance_suppressed` 14:44:20Z; `_record_run` collapses repeats |
+| restart durability of dedup | pre-restart rows gated the 15:02:01Z post-restart tick |
+| real `/clear` + resume | conv `b2635b20…` → `2ba40b9f…`, same session/pane/cwd, exactly one nudge |
+| allowed queued paste submitted | `governor_submitted` 15:08:22Z, `submitted/pane_changed/prompt_consumed` true |
+| prohibited opaque paste refused | gate `governor_owner_paste_not_auto_submittable` 15:20:06Z, line left unsent |
+| no duplicate agent | `cp-canary` 1 window, created Aug 3 08:10, across `/clear` + 4 restarts |
+
+### Verdict
+
+**`OWNER_OS_AUTONOMY_PHASE3 = PASS`**
+
+The PASS bar the owner set — deployed runtime wiring plus live deterministic proof of
+exactly-once continuation, restart durability, real `/clear` resume, correct queued-paste
+behaviour in both directions, no duplicate agent, and project-role isolation — is met, and
+each element is backed by a timestamped durable record rather than by a test.
+
+### What this PASS does not claim
+
+- **The governor has still never advanced a real project.** All five MESS transitions were
+  agent-driven; the governor's advance path has been exercised end-to-end only on the canary.
+  MESS's current terminal state is a genuine owner payload gap, which is the correct outcome
+  but not a demonstration of grounded advancement in production.
+- **The opaque-paste refusal on the canary used a typed marker**, which triggers the same
+  detector path but is not a genuine multi-line paste. The genuine one was observed on
+  arbitrage2 — before the taxonomy fix, so it carried the wrong label at the time.
+- **Nine Phase 3 defects were found by driving production; one by the suite.** Three surfaced
+  in the final verification pass, after the earlier gates were already green — including a
+  role-isolation config that enforced almost nothing, and a status view that reported an agent
+  with an open owner gate as idle. A green suite has repeatedly not been evidence of correct
+  live behaviour in this phase.
+- **The post-fix soak has minutes of data, not hours.** Item 7 is running, not concluded.
+- Condition-derived gates do not self-resolve (see the observation above); left unchanged
+  deliberately.
+
+### Outside this phase, for the owner
+
+The pre-existing gate `unverified_owner_decision` remains open and untouched: *"'User
+answered: Stop selling, waitlist instead' has NO durable authenticated owner_decision
+(source = pane UI summary @02:23, not a verified owner channel)."*
+
+Also: the systemd unit sets `CONTROL_PLANE_CANARY_AGENTS` **twice**. The second wins
+(`cp-canary,mess-qa-automation,arbitrage2-opus`), which is the intended Phase 2/3 allowlist,
+so behaviour is correct — but a duplicated directive is a misreading waiting to happen and
+should be collapsed to one line.
 
 ## Remaining unproven (unchanged)
 - **advance exactly once on grounded work** — the MESS agent self-advances per the queue's
