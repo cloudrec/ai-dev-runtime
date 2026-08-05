@@ -1,6 +1,6 @@
 # OWNER OS — AUTONOMY PHASE 3: CONTINUATION GOVERNOR (LIVE)
 
-**Status: WORKING — natural V8 completion observed; NEEDS_OWNER_PAYLOAD blocker proven live. Remaining acceptance items pending.** Persisted 2026-08-05 before any work, so context
+**Status: `OWNER_OS_AUTONOMY_PHASE3 = PASS` at commit `0c64f51` (see ACCEPTANCE RESULT below for the exact evidence, and "What this PASS does not claim" for the limits).** Persisted 2026-08-05 before any work, so context
 compaction cannot lose it. Phase 3 begins ONLY if the Phase 2 6-hour checkpoint is clean
 enough to continue; Phase 2 evidence lives in `OWNER_OS_AUTONOMY_PHASE2_CURRENT.md` and is
 kept separate from this file.
