@@ -71,14 +71,49 @@ def detect_queued_input(*, pending: str = "", tail: str = "") -> dict:
 # work landing on payment, trading verbs reaching a paper-only session.
 _SCOPE_MARKERS = {
     "payment": re.compile(r"\b(payment|payout|invoice|charge|refund|billing|wayforpay|"
-                          r"merchant|standby|replication)\b", re.I),
+                          r"merchant|standby|replication)s?\b", re.I),
     "jobhunter": re.compile(r"\b(jobhunter|job\.clients\.help|vacanc|resume|applicant|"
-                            r"microtask)\b", re.I),
-    "mess_ui": re.compile(r"\b(mess|messenger|redesign|screen[_ ]spec|copy_ru|apk)\b", re.I),
-    "live_trading": re.compile(r"\b(live trade|real order|place order|mainnet|venue|"
-                               r"exchange key|withdraw)\b", re.I),
-    "publication": re.compile(r"\b(publish|release|deploy|push to prod)\b", re.I),
+                            r"microtask)s?\b", re.I),
+    "mess_ui": re.compile(r"\b(mess|mess ui|messenger|redesign|screen spec|copy ru|apk)s?\b",
+                          re.I),
+    "live_trading": re.compile(r"\b(live trade|live trading|real order|place order|"
+                               r"submit order|mainnet|venue|exchange key|withdraw)s?\b", re.I),
+    "trading": re.compile(r"\b(trade|trading|position|leverage|margin)s?\b", re.I),
+    "orders": re.compile(r"\b(order|order book|fill|execution)s?\b", re.I),
+    "venue_adapters": re.compile(r"\b(venue adapter|adapter|exchange connector)s?\b", re.I),
+    "keys": re.compile(r"\b(api key|secret key|private key|credential|secret|token)s?\b",
+                       re.I),
+    # `deploy` is BOTH its own scope and a publication event. Moving it out of `publication`
+    # silently narrowed every project that forbids publication but not deploy — scopes are
+    # allowed to overlap, and dropping a token from one is a coverage regression.
+    "publication": re.compile(r"\b(publish|release|deploy|rollout|push to prod)s?\b", re.I),
+    "deploy": re.compile(r"\b(deploy|deployment|rollout|ship to prod)s?\b", re.I),
 }
+
+
+def _normalise_scope_text(text: str) -> str:
+    """`_` and `-` are word characters to `\\b`, so "mess_ui" never matched `\\bmess\\b` and
+    the shipped mess_ui ban silently passed. Separators are flattened before matching."""
+    return re.sub(r"[_\-/]+", " ", text or "")
+
+
+def _scope_name_pattern(scope: str) -> "re.Pattern":
+    """Last-resort marker built from the scope's own name, so a forbidden scope is never
+    completely unenforceable just because nobody wrote a hand-tuned regex for it."""
+    words = [w for w in re.split(r"[_\-\s]+", scope) if w]
+    return re.compile(r"\b" + r"[ ]?".join(re.escape(w) for w in words) + r"s?\b", re.I)
+
+
+def unenforceable_scopes(target: str, config: Optional[dict] = None) -> list:
+    """Forbidden scopes with NO hand-written marker — enforceable only by their own name.
+
+    This is the failure worth naming: a config that lists `forbidden_scopes: [orders, keys,
+    venue_adapters]` READS like a guarantee, but a scope with no marker refuses nothing. It
+    was found live, not by the suite, because the tests happened to probe only the scopes
+    that did have markers.
+    """
+    pol = project_policy(target, config)
+    return [s for s in pol["forbidden_scopes"] if s not in _SCOPE_MARKERS]
 
 
 def project_policy(target: str, config: Optional[dict] = None) -> dict:
@@ -98,9 +133,13 @@ def check_project_isolation(target: str, text: str,
     pol = project_policy(target, config)
     if not pol["project"]:
         return {"allowed": False, "reason": "project_not_governed", "scope": ""}
-    body = text or ""
-    for scope, rx in _SCOPE_MARKERS.items():
-        if scope in pol["forbidden_scopes"] and rx.search(body):
+    body = _normalise_scope_text(text)
+    for scope in pol["forbidden_scopes"]:
+        # Every forbidden scope is checked — by its hand-written marker where one exists,
+        # otherwise by its own name. Iterating the MARKERS instead of the forbidden list
+        # meant a scope nobody had written a regex for was silently unenforceable.
+        rx = _SCOPE_MARKERS.get(scope) or _scope_name_pattern(scope)
+        if rx.search(body):
             return {"allowed": False, "reason": "cross_project_work_refused",
                     "scope": scope}
     return {"allowed": True, "reason": "within_project_role", "scope": pol["role"]}

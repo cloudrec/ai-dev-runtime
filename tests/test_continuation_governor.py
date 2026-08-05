@@ -921,3 +921,65 @@ def test_the_governor_never_rewrites_the_projects_queue(tmp_path, monkeypatch):
         ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
                           ctrl=None, conv="c", evaluate_only=False, conn=None)
     assert open(path, encoding="utf-8").read() == before, "the queue file must be untouched"
+
+
+# ═════════ 10. scope enforcement gaps found by probing the SHIPPED config ═══
+def test_every_forbidden_scope_in_the_shipped_config_is_enforceable():
+    """The dangerous class: `forbidden_scopes: [orders, keys, venue_adapters]` READS like a
+    guarantee, but the matcher iterated the MARKER table, so a scope nobody had written a
+    regex for refused nothing. Found by probing the live config; the suite had missed it
+    because its fixtures only used scopes that happened to have markers."""
+    cfg = cg.load_config()
+    assert cfg, "shipped config must load"
+    for target in cfg:
+        assert cg.unenforceable_scopes(target, cfg) == [], target
+
+
+def test_a_forbidden_scope_with_no_marker_is_still_enforced_by_its_name():
+    cfg = {"x:0.0": {"project": "x", "role": "r", "forbidden_scopes": ["quantum_widgets"]}}
+    r = cg.check_project_isolation("x:0.0", "build the quantum widgets pipeline", cfg)
+    assert r["allowed"] is False and r["scope"] == "quantum_widgets"
+
+
+@pytest.mark.parametrize("text", [
+    "enable live_trading and submit real orders",   # plural broke `\breal order\b`
+    "place orders on the venue",
+    "rotate the exchange api keys",
+    "patch the venue-adapter timeout",              # hyphen broke the word boundary
+])
+def test_arbitrage2_stays_paper_only_against_the_shipped_config(text):
+    """Every one of these was ALLOWED live before the fix."""
+    r = cg.check_project_isolation("arbitrage2-opus:0.0", text, cg.load_config())
+    assert r["allowed"] is False, text
+    assert r["reason"] == "cross_project_work_refused"
+
+
+def test_underscored_scope_names_are_matched():
+    """`_` is a word character, so `\\bmess\\b` never matched "mess_ui" and arbitrage2 could
+    have been handed messenger work."""
+    r = cg.check_project_isolation("arbitrage2-opus:0.0", "update the mess_ui invites screen",
+                                   cg.load_config())
+    assert r["allowed"] is False and r["scope"] == "mess_ui"
+
+
+@pytest.mark.parametrize("target,text", [
+    ("mess-qa-automation:0.0", "redesign the invites screen rows and copy"),
+    ("cp-canary:0.0", "append one dated line to reports/ACCEPTANCE_A.md"),
+    ("arbitrage2-opus:0.0", "summarise paper research findings in a report"),
+])
+def test_in_role_work_survives_the_broader_markers(target, text):
+    """Anti-overcorrection: widening the markers must not start refusing each project's own
+    work. These are the real in-role instructions from the live queues."""
+    assert cg.check_project_isolation(target, text, cg.load_config())["allowed"] is True
+
+
+def test_widening_a_scope_never_narrows_another(tmp_path):
+    """Regression from this very fix: `deploy` was moved OUT of the publication marker into
+    its own scope, which silently un-protected every project that forbids publication but
+    not deploy. Scopes may overlap; a token must not vanish from one by being added to
+    another."""
+    cfg = {"x:0.0": {"project": "x", "role": "r", "forbidden_scopes": ["publication"]}}
+    for text in ("git push and deploy to prod", "publish the build", "cut a release",
+                 "start the rollout"):
+        r = cg.check_project_isolation("x:0.0", text, cfg)
+        assert r["allowed"] is False, text
