@@ -243,6 +243,45 @@ prompt or cwd collision at any point.
 
 Two criteria remain unobserved, so the phase verdict stays unclaimed.
 
+## THIRD TRANSITION — and a stall the governor was blind to (2026-08-05 11:23)
+
+```
+11:23  stage_05_live_calls  CURRENT  mess=idle     → skip:stage_in_progress   ← WRONG
+11:25  stage_05_live_calls  CURRENT  mess=idle     → blocker:NEEDS_OWNER_PAYLOAD  (after fix)
+11:43  stage_05_live_calls  CURRENT  mess=working  → skip (resumed)
+```
+
+Stage 4 completed and the pointer advanced to `stage_05_live_calls` on its own — the third
+natural transition. But the pane then sat **idle**, not progressing, nothing queued, while
+the governor returned `skip: stage_in_progress`. Nothing would have nudged it. That is the
+stop-and-wait stall, alive again inside my own code.
+
+**Cause.** Stage 5 names a real payload file (`design/v1/screens/CALLS_AND_STATES_V3.json`)
+*and* records three `missing_fields`. My check looked only for the literal
+`NEEDS_OWNER_PAYLOAD` token, so a payload path read as "fully specified" and the recorded
+gaps were ignored.
+
+**Fix (`28c2afb`).** Recorded `missing_fields` ARE the gap, whatever the payload field says.
+Live decision immediately afterwards:
+
+```
+blocker NEEDS_OWNER_PAYLOAD  stage: stage_05_live_calls
+  - participant picker: metrics and state copy
+  - active call: control layout, metrics, reconnect/error copy
+  - unavailable state copy beyond the existing V3 strings
+```
+
+An empty/whitespace `missing_fields` list is pinned NOT to raise a blocker.
+
+### Second defect found in the same pass — a self-inflicted flake
+`_governor_pass` read the input line straight from `agent_control`, i.e. from the **live
+tmux pane**, so full-suite runs depended on whatever the real canary happened to be
+showing (two autopilot tests failed in the suite, passed in isolation). It now reads
+`pending` through the injected controller and only falls back to the live read when no
+controller is given. Suite went 1366 → **1369 passed** with the flake gone.
+
+Deployed HEAD `28c2afb`, PID 2480752, backup `predeploy-phase3c-20260805T094520Z`.
+
 ## Superseded — the wiring gap as first reported
 
 `core/continuation_governor.py` is imported by **nothing** in `core/` or `api/`:
