@@ -1125,6 +1125,43 @@ That query had no `ORDER BY` and returned a pre-pause row from 15:58:17Z. The ac
 18:45:56Z record shows `live_actuation: false` — the pause config was applied correctly; the
 gap was that recovery never consulted it.
 
+### Systematic pause-bypass audit (after the recovery defect)
+
+The recovery defect was one instance of a class: every pause gate had been placed on the
+DELIVERY path, while `session_recovery` acts outside it. So every component that can touch a
+pane was audited, by code and then against the ledgers.
+
+| component | can touch a pane | pause-gated by | pre-existing test |
+|---|---|---|---|
+| `commander_autopilot` delivery | yes | `live_actuation` + `CANARY_AGENTS` | `test_deliver_non_canary_is_owner_gated` |
+| `continuation_governor` | yes | `enabled` + `CANARY_AGENTS` | `test_governor_submit_is_owner_gated_outside_the_allowlist` |
+| `agent_continuation_watchdog` | yes | `CANARY_AGENTS` | `test_non_canary_agent_never_actuated` |
+| `context_budget` (sends `/clear` + resume) | yes | `CANARY_AGENTS` (line 483) | `test_non_canary_rotation_is_owner_gated` |
+| `session_recovery` (revives a session) | **yes** | **nothing — the bypass** | **none** |
+
+Session recovery was the only actuating path with no allowlist test, which is exactly why it
+was the one that leaked. It now has two.
+
+Empirical confirmation across every ledger table carrying a target column, since the pause at
+16:23Z, arbitrage2 only:
+
+```
+control_plane.event            2   discovery marked the session dead (observation)
+control_plane.agent            1   state row
+control_plane.autopilot_run    5   skip_dialog_open x4 + the recovery attempt (now refused)
+agent_control.deliveries       1   the EXTERNAL agent_stop at 18:45:47, not Owner OS
+agent_control.cw_target        1   watchdog state tracking (observation)
+agent_control.context_budget_state 1  measurement only — over_hard=1, rotation owner-gated
+agent_control.session_recovery 1   the failed revive (now refused by policy)
+cp_action                      0   NO actuation
+```
+
+Worth the owner's attention: the paused project's context is over its **hard** budget
+(est. 4.0M tokens) and its pane shows a permission dialog. Rotation is correctly withheld
+because it is not in `CANARY_AGENTS` — policy, not the dialog — and an owner-gated
+`context_rotation_needed` event is emitted instead. Nothing will be done about it while the
+pause holds.
+
 ## ═══ ACCEPTANCE RESULT ═══
 
 ### Exact state
