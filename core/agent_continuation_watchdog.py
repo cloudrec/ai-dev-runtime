@@ -611,7 +611,7 @@ class Controller:
         # capture_ok distinguishes "tmux could not read the pane" from "the pane is
         # blank" — the actuator refuses to act on the former (M2 guard).
         capture_ok, tail = self._ac.pane_capture(target, 12)
-        pending = self._ac.pending_input_text(target, tail)
+        pending = self._ac.pending_input_text(target, tail, cwd=cwd or "")
         conv = self._ac.conversation_evidence(cwd) or {}
         latest = conv.get("latest") or {}
         # derive state from a fuller tail

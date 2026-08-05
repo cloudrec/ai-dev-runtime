@@ -95,3 +95,60 @@ def test_submission_clears_the_watch_so_it_cannot_alarm_later():
     out = ap._track_queued_input(None, "cp-canary:0.0", "do the thing", "pane_busy",
                                  now=t0 + ap.QUEUED_STALL_SECS + 1)
     assert out["stalled"] is False, "the clock restarts after a successful submission"
+
+
+# ── the slice-2 incident: dim staged input treated as a ghost ───────────────
+def _styled(dim: bool, text: str) -> str:
+    return ("\x1b[2m" + text + "\x1b[0m") if dim else (text)
+
+
+def test_dim_text_that_is_not_the_last_submitted_is_real_staged_input(monkeypatch):
+    """THE incident. mess-qa-automation sat idle ~40 minutes holding a dim
+    `continue with slice 2`; the soak recorded `queued: ''` on every sample because dim was
+    treated as always-ghost, and the owner had to submit it by hand at 20:42:24Z."""
+    from core import agent_control as ac
+    monkeypatch.setattr(ac, "last_submitted_text",
+                        lambda cwd: "Proceed with stage_07_cross_surface_polish now.")
+    assert ac._is_recall_ghost("continue with slice 2", "/opt/mess") is False
+
+
+def test_dim_text_matching_the_last_submitted_is_a_ghost(monkeypatch):
+    """The opposite live case: cp-canary showed a dim line that survived C-u and reappeared.
+    Submitting it would re-run the last command — the 2026-08-03 duplicate-poke bug."""
+    from core import agent_control as ac
+    monkeypatch.setattr(ac, "last_submitted_text",
+                        lambda cwd: "write reports/CYCLE3.md confirming cycle 3")
+    assert ac._is_recall_ghost("write reports/CYCLE3.md confirming cycle 3",
+                               "/root/cp-canary-v2") is True
+
+
+def test_a_multiline_submission_ghosts_on_its_first_line(monkeypatch):
+    """Claude Code shows only the first line of a multiline command as the ghost."""
+    from core import agent_control as ac
+    monkeypatch.setattr(ac, "last_submitted_text",
+                        lambda cwd: "write reports/X.md with:\nline one\nline two")
+    assert ac._is_recall_ghost("write reports/X.md with:", "/opt/x") is True
+
+
+def test_without_a_transcript_dim_stays_conservative(monkeypatch):
+    """Fail-safe: if we cannot check what was last submitted we must NOT auto-submit a dim
+    line — a wrong guess re-runs the previous command."""
+    from core import agent_control as ac
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "")
+    assert ac._is_recall_ghost("continue with slice 2", "/opt/mess") is True
+
+
+def test_prompt_text_from_styled_marks_dim_instead_of_dropping_it():
+    """The extractor no longer silently discards dim text; it tags it so the caller can
+    decide with the cwd it alone has."""
+    from core import agent_control as ac
+    out = ac.prompt_text_from_styled(_styled(True, "continue with slice 2"))
+    assert out.startswith(ac.DIM_PREFIX)
+    assert out[len(ac.DIM_PREFIX):] == "continue with slice 2"
+    assert ac.prompt_text_from_styled(_styled(False, "bright text")) == "bright text"
+
+
+def test_a_numbered_menu_is_still_never_input():
+    from core import agent_control as ac
+    assert ac.prompt_text_from_styled(_styled(False, "1. Yes")) == ""
+    assert ac.prompt_text_from_styled(_styled(True, "2. No")) == ""

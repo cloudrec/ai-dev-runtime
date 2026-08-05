@@ -419,9 +419,14 @@ def test_actuator_still_delivers_a_safe_step_to_a_clean_idle_canary():
     assert out["acted"] is True and out["verified"] is True
 
 
-def test_dim_recall_ghost_and_menu_selection_still_not_pending_input():
-    # the styled-capture cases already covered must not regress
-    assert ac.prompt_text_from_styled(" \x1b[2mcontinue with the next safe canary note\x1b[0m") == ""
+def test_dim_recall_ghost_and_menu_selection_still_not_pending_input(monkeypatch):
+    # the styled-capture cases already covered must not regress. Dim is now TAGGED rather
+    # than dropped, and resolves to a ghost when it matches the last submitted message.
+    tagged = ac.prompt_text_from_styled(" \x1b[2mcontinue with the next safe canary note\x1b[0m")
+    assert tagged.startswith(ac.DIM_PREFIX)
+    monkeypatch.setattr(ac, "last_submitted_text",
+                        lambda cwd: "continue with the next safe canary note")
+    assert ac._is_recall_ghost(tagged[len(ac.DIM_PREFIX):], "/root/cp-canary-v2") is True
     assert ac.prompt_text_from_styled(" 1. Yes, proceed") == ""
     assert ac.prompt_text_from_styled(" continue with the next safe canary note\x1b[0m") == \
         "continue with the next safe canary note"

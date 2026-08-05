@@ -637,7 +637,7 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
             pending = (ctrl.snapshot(target, cwd) or {}).get("pending") or ""
         else:
             from core import agent_control as ac
-            pending = ac.pending_input_text(target, tail) or ""
+            pending = ac.pending_input_text(target, tail, cwd=cwd or "") or ""
     except Exception:  # noqa: BLE001
         pending = ""
     d = cg.govern(target, state=state, pending=pending, tail=tail, config=cfg)
@@ -880,7 +880,7 @@ def tick(*, inventory: Optional[dict] = None, registry: Optional[dict] = None,
             if ctrl is not None and hasattr(ctrl, "snapshot"):
                 pend = (ctrl.snapshot(target, cwd) or {}).get("pending") or ""
             else:
-                pend = _ac.pending_input_text(target, tail) or ""
+                pend = _ac.pending_input_text(target, tail, cwd=cwd or "") or ""
             pend = pend.strip()
             if pend:
                 why = ("pane_busy" if is_progressing(state, tail)

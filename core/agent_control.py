@@ -512,6 +512,66 @@ _MODE_PLAN_RE = re.compile(r"\bplan mode on\b", re.I)
 NONSTALL_MODES = ("auto", "accept_edits")
 
 
+def last_submitted_text(cwd: str) -> str:
+    """The most recent message actually SUBMITTED in this project's Claude conversation.
+
+    Read from the conversation transcript, which records every submitted user message. This
+    is the only reliable way to tell Claude Code's dim RECALL GHOST from dim STAGED INPUT:
+    the ghost is, by definition, the last submitted command; staged input is not.
+    Returns '' when no transcript can be read — the caller then stays conservative.
+    """
+    import glob
+    import json as _json
+    try:
+        proj = "/root/.claude/projects/" + cwd.replace("/", "-")
+        files = sorted(glob.glob(proj + "/*.jsonl"), key=os.path.getmtime)
+        if not files:
+            return ""
+        last = ""
+        with open(files[-1], "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = _json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if d.get("type") != "user":
+                    continue
+                m = d.get("message") or {}
+                c = m.get("content")
+                t = c if isinstance(c, str) else " ".join(
+                    x.get("text", "") for x in (c or []) if isinstance(x, dict))
+                if (t or "").strip():
+                    last = t.strip()
+        return last
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _is_recall_ghost(dim_text: str, cwd: str) -> bool:
+    """Is this dim line the recall ghost of what was last submitted?
+
+    LIVE, both directions, 2026-08-05:
+      * cp-canary showed a dim line that survived C-u and reappeared — a true ghost.
+      * mess-qa-automation sat idle ~40 min holding a dim `continue with slice 2` that was
+        REAL staged input; treating dim as always-ghost made it invisible and the owner had
+        to submit it by hand at 20:42:24Z.
+    So `dim` alone decides nothing. The ghost equals the last submitted message; staged input
+    does not. With no transcript to compare against we return True (unchanged, conservative
+    behaviour) and the caller raises the text as a stall rather than acting blind.
+    """
+    d = (dim_text or "").strip()
+    if not d:
+        return True
+    last = (last_submitted_text(cwd) or "").strip()
+    if not last:
+        return True                      # cannot verify → do not auto-submit
+    first_line = last.splitlines()[0].strip() if last else ""
+    return d == last or d == first_line or last.startswith(d) or d.startswith(first_line)
+
+
+DIM_PREFIX = "\x00dim\x00"
+
+
 def prompt_text_from_styled(after: str) -> str:
     """Extract REAL staged input from the styled (`capture-pane -e`) text after the
     last `❯`. Claude Code renders the RECALL GHOST of the last submitted command in
@@ -519,15 +579,17 @@ def prompt_text_from_styled(after: str) -> str:
     2026-08-03 cp-canary: the ghost `continue with the next safe canary note` read
     as pending input, deferring every poke and blocking rotation indefinitely.
     Dim ghost → '' ; numbered menu selection (`❯ 1. Yes`) → ''."""
-    if "\x1b[2m" in after:                 # dim ghost = recall hint, not staged input
-        return ""
     content = _SGR_RE.sub("", after).replace("\xa0", " ").strip()
     if re.match(r"^\d+\.", content):       # menu option, not the input line
         return ""
+    if "\x1b[2m" in after:
+        # Dim: ghost OR real staged input. Only the caller knows the cwd needed to check
+        # against the last submitted message, so report it separately rather than guessing.
+        return DIM_PREFIX + content
     return content
 
 
-def pending_input_text(target: str, tail: str | None = None) -> str:
+def pending_input_text(target: str, tail: str | None = None, cwd: str = "") -> str:
     """Text typed into the agent's input line but NOT yet submitted (e.g. an
     owner/ChatGPT-queued instruction). CRITICAL for /clear safety: agent_send
     pastes then hits Enter WITHOUT clearing the line, so sending `/clear` while
@@ -543,7 +605,15 @@ def pending_input_text(target: str, tail: str | None = None) -> str:
         prompt_lines = [ln for ln in out.splitlines() if "❯" in ln]
         if not prompt_lines:
             return ""
-        return prompt_text_from_styled(prompt_lines[-1].split("❯", 1)[1])
+        raw = prompt_text_from_styled(prompt_lines[-1].split("❯", 1)[1])
+        if raw.startswith(DIM_PREFIX):
+            dim = raw[len(DIM_PREFIX):]
+            # A dim line is the recall ghost ONLY if it matches the last submitted message.
+            # Without a cwd we cannot check, so we keep the old conservative answer.
+            if not cwd or _is_recall_ghost(dim, cwd):
+                return ""
+            return dim
+        return raw
     text = tail if tail is not None else _pane_tail(target, 10)
     for line in reversed((text or "").splitlines()):
         m = re.search(r"❯\s?(.*)$", line.rstrip())

@@ -379,8 +379,16 @@ GHOST_STYLED = " \x1b[2mcontinue with the next safe canary note\x1b[0m"
 TYPED_STYLED = " continue with the next safe canary note\x1b[0m"
 
 
-def test_dim_recall_ghost_is_not_pending_input():
-    assert ac.prompt_text_from_styled(GHOST_STYLED) == ""
+def test_dim_recall_ghost_is_not_pending_input(monkeypatch):
+    """The invariant is unchanged; the DECISION moved. The extractor now tags dim text
+    because only the caller knows the cwd needed to compare it against the last submitted
+    message — dim is a ghost when it matches that, and real staged input when it does not
+    (mess-qa-automation, `continue with slice 2`, ~40 min idle)."""
+    tagged = ac.prompt_text_from_styled(GHOST_STYLED)
+    assert tagged.startswith(ac.DIM_PREFIX)
+    monkeypatch.setattr(ac, "last_submitted_text",
+                        lambda cwd: "continue with the next safe canary note")
+    assert ac._is_recall_ghost(tagged[len(ac.DIM_PREFIX):], "/root/cp-canary-v2") is True
 
 
 def test_real_typed_text_is_pending_input():
