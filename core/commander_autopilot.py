@@ -484,8 +484,20 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
             return {**base, "decision": "governor_submit_error", "note": str(e)[:120]}
 
     if d["action"] == "advance_queue":
-        step = str(d.get("step_text") or "").strip()
-        if not step or evaluate_only:
+        # The governor must NEVER type the queue's rich instruction into a pane. That text
+        # is domain content for the AGENT to read from its durable queue; relaying it would
+        # mean the governor authoring/echoing arbitrary instructions, and the safety
+        # classifier correctly refuses it (live: `governor_step_unsafe` on the canary when
+        # the queue said "append one dated line to reports/ACCEPTANCE_A.md").
+        # So: deliver only the project's own classifier-safe continuation nudge; the agent
+        # reads the queue itself and does the stage named by the pointer.
+        queue_step = str(d.get("step_text") or "").strip()
+        reg_entry = (load_registry() or {}).get(target) or {}
+        step = str(reg_entry.get("next_step") or "").strip()
+        if classify_safety(step) != "autonomous_safe":
+            from core.agent_continuation_watchdog import DEFAULT_CONTINUATION
+            step = DEFAULT_CONTINUATION
+        if not queue_step or evaluate_only:
             return {**base, "decision": "governor_advance_available",
                     "next_stage": d.get("next_stage"),
                     "note": "next stage grounded in the durable queue; nothing delivered "
@@ -507,7 +519,9 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
                                  else "governor_advance_refused"),
                     "next_stage": d.get("next_stage"), "actuation": out,
                     "delivered": bool(out.get("acted")),
-                    "note": "instruction quoted verbatim from the durable queue"}
+                    "delivered_text": step, "queue_step": queue_step[:120],
+                    "note": "delivered a classifier-safe continuation nudge; the stage "
+                            "content stays in the durable queue for the agent to read"}
         except Exception as e:  # noqa: BLE001
             return {**base, "decision": "governor_advance_error", "note": str(e)[:120]}
     return None

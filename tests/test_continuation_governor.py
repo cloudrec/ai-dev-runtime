@@ -633,7 +633,10 @@ def test_advance_is_delivered_not_merely_reported(tmp_path, monkeypatch):
     out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
                             ctrl=None, conv="c", evaluate_only=False, conn=None)
     assert out["decision"] == "governor_advanced" and out["delivered"] is True
-    assert delivered["step"] == "continue with the next safe step"
+    # The DELIVERED text is the project's own classifier-safe nudge, never the queue's
+    # instruction — see test_queue_instruction_is_never_typed_into_the_pane.
+    assert ap.classify_safety(delivered["step"]) == "autonomous_safe"
+    assert out["queue_step"].startswith("continue with the next safe step")
 
 
 def test_advance_outside_the_allowlist_is_owner_gated(tmp_path, monkeypatch):
@@ -664,3 +667,38 @@ def test_an_unsafe_queue_instruction_is_never_delivered(tmp_path, monkeypatch):
     out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
                             ctrl=None, conv="c", evaluate_only=False, conn=None)
     assert out["decision"] in ("governor_step_unsafe", "governor_blocker")
+
+
+def test_queue_instruction_is_never_typed_into_the_pane(tmp_path, monkeypatch):
+    """Live 14:09:29: the governor tried to deliver the queue's own rich instruction
+    ("append one dated line to reports/ACCEPTANCE_A.md") and the safety classifier refused
+    it — `governor_step_unsafe`. Correct refusal, wrong design: the queue's text is domain
+    content for the AGENT to read, not something the governor may type. The governor now
+    delivers only a classifier-safe continuation nudge."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "ENABLED", True)
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+
+    rich = "append one dated line to reports/ACCEPTANCE_A.md describing this stage"
+    path = _artefact_queue(tmp_path, nxt_instruction=rich)
+    (tmp_path / "reports").mkdir()
+    (tmp_path / "reports" / "A.md").write_text("done")
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _canary_cfg(tmp_path, path))
+    monkeypatch.setattr(ap, "load_registry", lambda *a, **k: {
+        "cp-canary:0.0": {"next_step": "continue with the next safe canary note"}})
+
+    sent = {}
+    monkeypatch.setattr(ap, "deliver_next_step",
+                        lambda t, step, **k: sent.update(step=step)
+                        or {"acted": True, "verified": True})
+    out = ap._governor_pass("cp-canary:0.0", state="idle", tail="", cwd=str(tmp_path),
+                            ctrl=None, conv="c", evaluate_only=False, conn=None)
+    assert out["decision"] == "governor_advanced"
+    assert sent["step"] == "continue with the next safe canary note"
+    assert rich not in sent["step"], "the queue's rich text must never be typed"
+    assert ap.classify_safety(sent["step"]) == "autonomous_safe"
+    assert out["queue_step"].startswith("append one dated line"), \
+        "the queue step is still recorded for audit, just not delivered"

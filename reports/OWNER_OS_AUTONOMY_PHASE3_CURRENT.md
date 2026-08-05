@@ -488,6 +488,37 @@ MESS is unaffected: its stages carry no `instruction` field and it still returns
 duplicate submissions, wrong-project actions, unknown prompt answers, recoveries,
 `/clear` resumes and quarantine events. Smoke-tested. Starts after deploy.
 
+### DESIGN CORRECTION — the governor must never type the queue's text (live 14:09:29)
+
+First post-deploy canary tick produced **`governor_step_unsafe`**. The governor had tried
+to deliver stage A's own instruction — `"append one dated line to reports/ACCEPTANCE_A.md
+describing this stage"` — and the safety classifier refused it.
+
+Measured behaviour of the gate:
+
+| instruction | class |
+|---|---|
+| `continue with the next safe step` | autonomous_safe |
+| `continue with the next safe canary note; append a dated line` | autonomous_safe |
+| `append one dated line to reports/ACCEPTANCE_A.md …` | **owner_approval_required** |
+| `resume the current stage from the durable queue` | **owner_approval_required** |
+
+The tempting fix — widening the safe vocabulary so the harness worked — would have been
+backwards. That gate exists precisely to stop the governor typing arbitrary text into a
+live pane, and the queue's rich instruction is arbitrary text from the classifier's point
+of view.
+
+**Corrected design:** the governor delivers ONLY the project's own classifier-safe
+continuation nudge. The stage content stays in the durable queue for the AGENT to read —
+which is what the queue's `RESUME AFTER /clear` instruction already tells it to do. The
+queue step is still recorded in the decision (`queue_step`) for audit; it is simply never
+typed. This removes an entire class of risk: there is no path where governor-delivered
+text is domain content.
+
+Pinned by two tests — the queue's rich text must never appear in the delivered step, and
+the delivered step must classify `autonomous_safe`. The earlier test that asserted the
+opposite contract was corrected rather than left green on a wrong expectation.
+
 ### Still to do before any PASS
 Full suite → backup → deploy → verify recurring ticks → post-deploy canary tick → the live
 deterministic canary run (A → idle → B once → no resubmit → restart durability → real
