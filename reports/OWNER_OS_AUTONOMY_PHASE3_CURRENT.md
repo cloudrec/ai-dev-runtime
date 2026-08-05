@@ -519,6 +519,24 @@ Pinned by two tests — the queue's rich text must never appear in the delivered
 the delivered step must classify `autonomous_safe`. The earlier test that asserted the
 opposite contract was corrected rather than left green on a wrong expectation.
 
+### Deployment of the corrected governor
+HEAD **`b760019`**, service PID **3385505**, started 16:28:09 CEST, all six loops up.
+Suite **1390 passed, 0 failed** — and the earlier `test_planner_hanging_parent…` failure
+did NOT recur, which supports reading it as load starvation during a 13-minute run rather
+than a regression. Backup `predeploy-phase3final-20260805T142806Z`.
+
+### Harness gap found immediately after deploy
+The first post-deploy tick poked the canary, which dutifully did its OLD registry note —
+because nothing told the canary agent that `CANARY_EXECUTION_QUEUE.md` exists. The
+governor delivers only a safe nudge (by design, above), so the queue is useless unless the
+agent reads it.
+
+Fixed in `/root/cp-canary-v2/CLAUDE.md`: on "continue with the next safe step/canary note"
+the agent must FIRST read `./CANARY_EXECUTION_QUEUE.md` and do the stage named by its
+pointer, falling back to the old log line if the queue or its instruction is missing; and
+re-read the queue after every `/clear`. That is harness wiring inside the disposable
+canary, not project work.
+
 ### Still to do before any PASS
 Full suite → backup → deploy → verify recurring ticks → post-deploy canary tick → the live
 deterministic canary run (A → idle → B once → no resubmit → restart durability → real
