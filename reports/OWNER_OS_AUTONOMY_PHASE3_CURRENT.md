@@ -970,6 +970,41 @@ mess-qa-automation:0.0  BLOCKED  NEEDS_OWNER_PAYLOAD at stage_06_misc_real_surfa
 
 Three agents, three different truthful states, each traceable to durable records.
 
+### ★ THE TARGET FAILURE, RESOLVED ON A REAL PROJECT (2026-08-05 16:50:33Z)
+
+Phase 3 exists because MESS sat 37 minutes at `waiting_input` holding an unsubmitted owner
+line and nothing moved. That exact situation recurred on the real project — not the canary,
+not manufactured — and the deployed governor resolved it without a human ping.
+
+```
+16:49    MESS pointer advanced stage_06_misc_real_surfaces -> stage_07_cross_surface_polish
+         state=waiting_input, needs_owner_payload=false
+         pending: 'Finish the already-started docs-only backlog task after the API retry:'
+16:50:33 governor_submitted
+         verify: submitted=true pane_changed=true prompt_consumed=true
+                 queued_input=false conversation_modified=true
+16:51    MESS state=working, input line empty — the agent resumed its own task
+```
+
+**Exactly once**: `governor_submitted` count for this window = **1**. The owner's line was
+submitted by Enter and never re-typed — the defect the whole submit path was redesigned
+around.
+
+This is the strongest single piece of evidence in the phase: the failure that motivated it,
+occurring naturally on a real managed project, cleared autonomously by the deployed build.
+
+#### Precedence worth the owner's attention
+One tick later the autopilot recorded `terminal_sticky` — MESS carries a durable
+`terminal_blocked` from `01:23:58Z` ("real external dependency — outside what the loop may
+resolve"), so ordinary poking is correctly suppressed. The governor's submit ran *before*
+that check. I judge this correct — submitting text the owner already typed restores their
+intent, whereas the terminal state exists to stop the loop inventing continuations against an
+unresolvable dependency — but it is a real precedence decision and the owner should know the
+governor can act on a pane the autopilot considers terminally blocked.
+
+(Separately, the MESS pane reported "93% of session limit · resets 8pm"; that is the agent's
+own quota, untouched and outside Owner OS.)
+
 ## ═══ ACCEPTANCE RESULT ═══
 
 ### Exact state
@@ -1027,10 +1062,12 @@ each element is backed by a timestamped durable record rather than by a test.
 
 ### What this PASS does not claim
 
-- **The governor has still never advanced a real project.** All five MESS transitions were
-  agent-driven; the governor's advance path has been exercised end-to-end only on the canary.
-  MESS's current terminal state is a genuine owner payload gap, which is the correct outcome
-  but not a demonstration of grounded advancement in production.
+- **The governor has still never ADVANCED a real project's queue.** Every MESS stage
+  transition, including `stage_06 -> stage_07`, was agent-driven; the queue-advance path has
+  been exercised end-to-end only on the canary. This limit is now narrower than it was: at
+  16:50:33Z the governor resolved the phase's target failure — an unsubmitted owner line on
+  the real MESS project — exactly once and verified. Submission on a real project is proven;
+  grounded advancement on a real project is not.
 - **The opaque-paste refusal on the canary used a typed marker**, which triggers the same
   detector path but is not a genuine multi-line paste. The genuine one was observed on
   arbitrage2 — before the taxonomy fix, so it carried the wrong label at the time.
