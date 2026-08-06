@@ -24,7 +24,7 @@ real gaps are elsewhere.
 | owner gates split from diagnostics | done | genuine decisions separated from classification gaps |
 | Telegram push | **RED — credentials unset** | `owner_push enabled=0`, 3 notifications `dead_letter` |
 | same-chat wake | **unavailable** | no inbound trigger; `same_chat_wake_complete=false` |
-| model routing / dispatcher | **absent** | no dispatcher or OpenRouter module in `core/` |
+| model routing / dispatcher | **EXISTS — reuse, do not rebuild** | `/opt/seo/backend/services/dispatcher.py` + `routes_dispatcher.py` + migration `0011_ai_dispatcher` + tests. Cost-per-1k registry across premium/balanced/cheap/local tiers, `score_model` with risk fit, `estimate_cost`. My earlier "absent" claim was wrong — I had searched only `ai-dev-runtime/core/`. |
 | portfolio / opportunity ledger | **absent** | — |
 
 So the loop exists and is fast. What is missing is the **executive layer** above it
@@ -89,17 +89,46 @@ Tables: `project_goal`, `promotion_backlog`, `experiment_backlog`, `opportunity_
 Scoring: expected revenue × confidence ÷ (effort × risk), with a reuse bonus for existing
 assets. Idle capacity only — never pre-empts managed project work.
 
-### Phase 5 — Model routing + budgets
-Route by task class (cheap classification vs deep design) with hard token/cost ceilings and
-a durable spend ledger. A budget breach stops dispatch and raises a genuine owner decision.
+### Phase 5 — Model routing + budgets (MANDATORY; integrate the existing dispatcher)
 
-### Phase 6 — Wake bridge (owner-side companion)
-Server: authenticated wake endpoint (SSE/WebSocket/short-poll), event dedupe, minimum
-cooldown, enable/disable + kill switch, and an audit row per wake. Companion (owner's
-Windows/Chrome): opens the exact configured conversation and submits ONE fixed phrase —
-`Check the Owner OS CTO inbox and continue approved work.` It never reads or extracts
-ChatGPT output, stores no ChatGPT credentials or cookies on the server, and bypasses no
-CAPTCHA, rate limit or safety control. Interim bridge because Scheduled Tasks have a 1h floor.
+Reuse `/opt/seo/backend/services/dispatcher.py` — it already carries a per-model cost
+registry, tier metadata (premium/balanced/cheap/local), risk-fit scoring and `estimate_cost`.
+Night Shift adds the routing POLICY on top, not a second router.
+
+| tier | use | rule |
+|---|---|---|
+| 0 | polling, state reduction, dedupe, tests, routine checks | **deterministic code, no model at all** |
+| 1 | classification, extraction, summaries, broad idea screening | local / free / lowest cost |
+| 2 | ordinary research, specs, coding | inexpensive capable |
+| 3 | complex implementation / review | Sonnet-class |
+| 4 | ambiguous architecture, high-impact reasoning, final critical audit | Opus-class only |
+
+Required behaviour: **automatic downgrade** whenever a lower tier can complete the task
+safely; **escalation only with a recorded reason** on the task row; per-task token and cost
+ceilings; caching, batching and context compaction; loop detection; a daily budget with a
+kill switch. **Never spend tokens to prove liveness** — tier 0 already answers "is it alive".
+The 24h report breaks cost down by project and model and reports useful artefacts per dollar.
+
+### Phase 6 — Wake bridge (SERVER-HOSTED Linux companion)
+
+Owner correction 2026-08-06: the bridge must not depend on the owner's PC being awake. It
+runs on the server as a dedicated Linux browser companion with a persistent isolated profile
+and a ChatGPT session the owner authenticates ONCE by hand.
+
+* **Wake-only.** On a deduped urgent/actionable CTO event it opens the configured existing
+  conversation and submits exactly one fixed phrase:
+  `Проверь новые события Owner OS через MCP и продолжи разрешённую работу.`
+* **Never**: scrape or parse assistant output, inject arbitrary event text, store plaintext
+  credentials, or bypass login / 2FA / CAPTCHA / rate limits.
+* **Never the control plane.** Owner OS + MCP stay the source of truth; the phrase carries no
+  payload, so refreshing ChatGPT on any other device shows the same conversation history.
+* One-time manual login / re-auth through noVNC or equivalent, with restricted profile
+  permissions.
+* Controls: explicit enable/disable, cooldown, event correlation, **acknowledgement stops
+  further wakes**, health check, emergency kill switch, audit row per wake.
+* **Experimental and reversible.** Consumer ChatGPT UI automation is unsupported, so this
+  bridge must never be required for core autonomy — if it is disabled or broken, the CTO
+  inbox and Telegram surfaces carry on unchanged.
 
 ### Phase 7 — Morning brief + 8h overnight canary
 Brief: work completed, decisions, cost, blockers, new opportunities. Then the acceptance run
@@ -128,13 +157,17 @@ in §5.
 
 ## 5. Acceptance (as mandated)
 
-8-hour unattended overnight canary, ≥2 managed project agents, no manual Enter or pings;
+**24 continuous hours** unattended (owner correction 2026-08-06), ≥2 managed project agents, no manual Enter or pings;
 safe continuation works; one bounded promotion/revenue experiment researched and specified;
 one new opportunity evaluated; no duplicate agents/tasks/notifications; budgets respected;
 the companion wakes the configured chat exactly once for a canary event and stops after
 acknowledgement; restart survives; full evidence report.
 
-**Honest limit to state now:** the companion runs on the owner's Windows machine. I can build
-and test the server half (wake endpoint, dedupe, cooldown, kill switch, audit) and ship the
-companion with its own tests, but I cannot install or run it on your machine — that leg of
-acceptance needs you. Everything else is demonstrable server-side.
+Also required in the 24h evidence: survives BOTH a service restart and a browser-companion
+restart; the companion wakes the configured chat exactly once for a canary event and stops
+after acknowledgement; cost broken down by project and model with useful artefacts per dollar.
+
+**The one owner-side step that remains** is the initial ChatGPT authentication in the
+companion profile (login + 2FA through noVNC). It is one-time and interactive by nature — I
+will not store or handle ChatGPT credentials. Everything after that, including the 24h run,
+is server-side and unattended.
