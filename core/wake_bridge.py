@@ -250,3 +250,29 @@ def bind_history(limit: int = 20, conn=None) -> list:
     finally:
         if own:
             conn.close()
+
+
+def pending_wake(conn=None) -> dict:
+    """The oldest decided-but-unacknowledged wake, with the CURRENT target.
+
+    The companion asks this; it never decides for itself. The conversation is resolved at
+    read time from the rotatable pointer, so a rebind between decision and submission sends
+    to the new chat rather than a stale one.
+    """
+    enabled, kill = _enabled()
+    if kill or not enabled:
+        return {"pending": False, "reason": "kill_switch_engaged" if kill else "bridge_disabled"}
+    target = active_chat(conn=conn)
+    if not target.get("bound"):
+        return {"pending": False, "reason": target.get("reason", "no_active_control_chat")}
+    conn, own = _conn(conn)
+    try:
+        r = conn.execute("SELECT event_id FROM wake_audit WHERE decision='wake' AND "
+                         "acknowledged=0 ORDER BY id ASC LIMIT 1").fetchone()
+        if not r:
+            return {"pending": False, "reason": "nothing_to_wake_for"}
+        return {"pending": True, "event_id": int(r[0]),
+                "conversation": target["conversation"], "phrase": WAKE_PHRASE}
+    finally:
+        if own:
+            conn.close()
