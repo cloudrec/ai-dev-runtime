@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Identity of THIS process run. Delivery health is evidence-scoped to a runtime: a proof
 # recorded by a PREVIOUS process (before a restart/redeploy) is history, not a live claim
@@ -208,6 +208,25 @@ CREATE TABLE IF NOT EXISTS work_evidence (
     id TEXT PRIMARY KEY, project TEXT, target TEXT, kind TEXT, ref TEXT,
     fingerprint TEXT, first_seen_at TEXT, last_seen_at TEXT, event_id INTEGER);
 CREATE INDEX IF NOT EXISTS ix_work_evidence_project ON work_evidence(project, kind);
+
+-- (v8) One row per owner-action MEANING — project + report + event kind — not per set of
+-- bytes. `work_evidence` already fingerprints content so a rewritten report is news again;
+-- that is correct for the audit trail and wrong for the owner, who was woken three times in
+-- sixteen minutes for one piece of work being saved three times. This table is what makes a
+-- repeat interruption suppressible while every material change still reaches the inbox.
+--
+-- Durable ON PURPOSE: an in-memory timer would forget the cooldown across the 5-minute tick
+-- and, worse, across a restart — turning a redeploy into a fresh round of owner wakes. The
+-- comparison columns (not just the timestamp) are stored so a change of MEANING — a
+-- different classification, task or stage — can re-open delivery immediately instead of
+-- waiting out a cooldown that no longer describes the situation.
+CREATE TABLE IF NOT EXISTS work_evidence_push (
+    meaning_key TEXT PRIMARY KEY, project TEXT, target TEXT, ref TEXT, kind TEXT,
+    class_sig TEXT, task_id TEXT, stage_pointer TEXT, severity TEXT,
+    last_push_at TEXT, last_event_id INTEGER DEFAULT 0,
+    suppressed_count INTEGER DEFAULT 0, updated_at TEXT);
+CREATE INDEX IF NOT EXISTS ix_work_evidence_push_project
+    ON work_evidence_push(project, kind);
 """
 
 

@@ -34,6 +34,7 @@ import hashlib
 import os
 import re
 import subprocess
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from core.control_plane import cto
@@ -72,6 +73,20 @@ BACKFILL_WINDOW_SECS = int(os.getenv("WORK_EVIDENCE_BACKFILL_WINDOW_SECS", str(2
 # state then sees each new report as it lands. `backfilled` reports what this suppressed.
 COLD_START_MAX_REPORTS = int(os.getenv("WORK_EVIDENCE_COLD_START_MAX_REPORTS", "3"))
 
+# How long one piece of work may interrupt the owner only once. Live 2026-08-06:
+# `MESS_AUTO_UPDATE_AND_MOBILE_MENU_2026-08-06.md` was saved three times in sixteen minutes
+# and raised `work_partial_completion` three times — three owner pushes and three wake
+# consultations for a single unchanged decision ("this work is partial"). The fingerprint
+# was not misbehaving: the bytes really did change. What was wrong is that a NEW SET OF
+# BYTES was treated as A NEW THING TO WAKE SOMEONE FOR.
+OWNER_ACTION_COOLDOWN_SECS = int(
+    os.getenv("WORK_EVIDENCE_OWNER_ACTION_COOLDOWN_SECS", str(30 * 60)))
+
+# Ordering used to decide "did this get WORSE?". A rise in severity is news even inside the
+# cooldown; anything else at or below the delivered level is the same interruption again.
+_SEVERITY_RANK = {"": 0, "info": 0, "low": 0, "warning": 1, "medium": 1,
+                  "high": 2, "critical": 3}
+
 
 def _sha(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
@@ -104,6 +119,162 @@ def _record(ev_id: str, *, project: str, target: str, kind: str, ref: str,
             "fingerprint=excluded.fingerprint,last_seen_at=excluded.last_seen_at,"
             "event_id=excluded.event_id",
             (ev_id, project, target, kind, ref, fingerprint, now_iso(), now_iso(), event_id))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def _stage_pointer(target: str) -> str:
+    """The governed stage this target is on, or "" when there is no readable pointer.
+
+    Only ever used to notice that the stage CHANGED. Unreadable resolves to a stable ""
+    rather than to a fresh value, so a broken pointer file cannot manufacture a "the stage
+    moved" reason and re-open owner delivery on every scan.
+    """
+    try:
+        from core import continuation_governor as cg
+        cfg = (cg.load_config() or {}).get(target) or {}
+        ap = cfg.get("authoritative_pointer")
+        if not ap:
+            return ""
+        return str((cg.parse_queue(ap) or {}).get("pointer") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _class_sig(kind: str, cls: dict, reason: str = "") -> str:
+    """The MEANING of a finding, deliberately excluding the report's bytes.
+
+    Two saves of the same half-finished report produce the same signature; a report that
+    stops saying NOT STARTED and starts saying DONE does not.
+    """
+    flags = ",".join(k for k in ("done", "not_started", "audit_only", "blocked",
+                                 "unverified", "partial", "incomplete") if cls.get(k))
+    return f"{kind}|{flags}|{reason}"
+
+
+def _ts_epoch(value: str) -> float:
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _iso_at(now: Optional[float]) -> str:
+    """The stamp written for a delivery, on the SAME clock the cooldown is measured with.
+    Using `now_iso()` here instead would compare an injected test clock against wall time
+    and make the window untestable without really sleeping for half an hour."""
+    if now is None:
+        return now_iso()
+    return datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
+
+
+def _owner_action_gate(meaning_key: str, *, class_sig: str, task_id: str,
+                       stage_pointer: str, severity: str, now: float, conn=None) -> dict:
+    """May this owner-action finding interrupt the owner AGAIN?
+
+    Fail-closed toward being heard: every reason to believe the situation is genuinely
+    different re-opens delivery immediately. Only the exact same meaning, inside the
+    cooldown, is coalesced — and even then the event itself is still recorded.
+    """
+    conn, own = _c(conn)
+    try:
+        r = conn.execute(
+            "SELECT class_sig,task_id,stage_pointer,severity,last_push_at,last_event_id,"
+            "suppressed_count FROM work_evidence_push WHERE meaning_key=?",
+            (meaning_key,)).fetchone()
+        if not r:
+            return {"deliver": True, "reason": "first_time", "suppressed_count": 0,
+                    "prior_event_id": 0}
+        prev_sig, prev_task, prev_stage, prev_sev, last_push_at, last_eid, sup = r
+        sup = int(sup or 0)
+        prior = int(last_eid or 0)
+        if not last_push_at:
+            # Recorded but never actually delivered (e.g. the per-scan bound held it back).
+            # An undelivered finding has not interrupted anyone, so it is still owed one.
+            return {"deliver": True, "reason": "not_yet_delivered",
+                    "suppressed_count": sup, "prior_event_id": prior}
+        if (prev_sig or "") != class_sig:
+            return {"deliver": True, "reason": "classification_changed",
+                    "suppressed_count": sup, "prior_event_id": prior}
+        if (prev_task or "") != (task_id or ""):
+            return {"deliver": True, "reason": "task_correlation_changed",
+                    "suppressed_count": sup, "prior_event_id": prior}
+        if (prev_stage or "") != (stage_pointer or ""):
+            return {"deliver": True, "reason": "stage_pointer_moved",
+                    "suppressed_count": sup, "prior_event_id": prior}
+        if _SEVERITY_RANK.get(severity, 0) > _SEVERITY_RANK.get(prev_sev or "", 0):
+            return {"deliver": True, "reason": "severity_increased",
+                    "suppressed_count": sup, "prior_event_id": prior}
+        elapsed = now - _ts_epoch(last_push_at)
+        if elapsed >= OWNER_ACTION_COOLDOWN_SECS:
+            return {"deliver": True, "reason": "cooldown_expired",
+                    "suppressed_count": sup, "prior_event_id": prior}
+        return {"deliver": False, "reason": "coalesced_same_meaning",
+                "suppressed_count": sup + 1, "prior_event_id": prior,
+                "cooldown_remaining_secs": int(OWNER_ACTION_COOLDOWN_SECS - elapsed)}
+    finally:
+        if own:
+            conn.close()
+
+
+def _meaning_columns(meaning_key: str, *, project: str, target: str, ref: str, kind: str,
+                     class_sig: str, task_id: str, stage_pointer: str, severity: str,
+                     conn) -> None:
+    """Upsert only what a finding MEANS, never the delivery counters.
+
+    Called for informational report events too. Without it a report that goes
+    partial → done → partial would compare its new signature against the stale `partial`
+    left behind before the `done`, conclude nothing had changed, and silently coalesce a
+    genuine relapse.
+    """
+    ts = now_iso()
+    conn.execute(
+        "INSERT INTO work_evidence_push(meaning_key,project,target,ref,kind,class_sig,"
+        "task_id,stage_pointer,severity,last_push_at,last_event_id,suppressed_count,"
+        "updated_at) VALUES(?,?,?,?,?,?,?,?,?,NULL,0,0,?) "
+        "ON CONFLICT(meaning_key) DO UPDATE SET class_sig=excluded.class_sig,"
+        "task_id=excluded.task_id,stage_pointer=excluded.stage_pointer,"
+        "severity=excluded.severity,kind=excluded.kind,updated_at=excluded.updated_at",
+        (meaning_key, project, target, ref, kind, class_sig, task_id, stage_pointer,
+         severity, ts))
+
+
+def _meaning_touch(meaning_key: str, *, project: str, target: str, ref: str, kind: str,
+                   class_sig: str, task_id: str, stage_pointer: str, severity: str,
+                   conn=None) -> None:
+    conn, own = _c(conn)
+    try:
+        _meaning_columns(meaning_key, project=project, target=target, ref=ref, kind=kind,
+                         class_sig=class_sig, task_id=task_id,
+                         stage_pointer=stage_pointer, severity=severity, conn=conn)
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def _owner_action_record(meaning_key: str, *, project: str, target: str, ref: str,
+                         kind: str, class_sig: str, task_id: str, stage_pointer: str,
+                         severity: str, delivered: bool, event_id: int,
+                         suppressed_count: int, now: float = None, conn=None) -> None:
+    """Persist the coalescing state. `last_push_at` advances ONLY on a real delivery, so a
+    suppressed repeat can never extend the window that is suppressing it."""
+    conn, own = _c(conn)
+    try:
+        _meaning_columns(meaning_key, project=project, target=target, ref=ref, kind=kind,
+                         class_sig=class_sig, task_id=task_id,
+                         stage_pointer=stage_pointer, severity=severity, conn=conn)
+        if delivered:
+            conn.execute(
+                "UPDATE work_evidence_push SET last_push_at=?,last_event_id=?,"
+                "suppressed_count=0 WHERE meaning_key=?",
+                (_iso_at(now), int(event_id or 0), meaning_key))
+        else:
+            conn.execute(
+                "UPDATE work_evidence_push SET suppressed_count=? WHERE meaning_key=?",
+                (int(suppressed_count), meaning_key))
         conn.commit()
     finally:
         if own:
@@ -239,19 +410,22 @@ def _open_task(target: str, conn=None) -> Optional[dict]:
 
 
 def scan(projects: Optional[dict] = None, *, emit_fn: Callable = None,
-         state_fn: Callable = None, conn=None) -> dict:
+         state_fn: Callable = None, pointer_fn: Callable = None, now: float = None,
+         conn=None) -> dict:
     """One evidence pass over every governed project. Returns what it found and emitted.
 
-    `projects` maps target → {cwd, project}; `emit_fn` and `state_fn` are injectable so the
-    scan is testable without a live pane or a real registry.
+    `projects` maps target → {cwd, project}; `emit_fn`, `state_fn` and `pointer_fn` are
+    injectable so the scan is testable without a live pane or a real registry. `now`
+    overrides the clock so the owner-action cooldown can be exercised without sleeping.
     """
     import time
     emit_fn = emit_fn or cto.emit
     state_fn = state_fn or _agent_state
+    pointer_fn = pointer_fn or _stage_pointer
     projects = projects if projects is not None else _projects_from_config()
     emitted, skipped = [], []
     backfilled = 0
-    now = time.time()
+    now = time.time() if now is None else float(now)
 
     for target, meta in (projects or {}).items():
         root = meta.get("cwd") or ""
@@ -262,6 +436,7 @@ def scan(projects: Optional[dict] = None, *, emit_fn: Callable = None,
             continue
 
         state = state_fn(target)
+        stage_pointer = pointer_fn(target)
         open_task = _open_task(target, conn=conn)
         known = _project_known(project, conn=conn)
         cold_budget = COLD_START_MAX_REPORTS if not known else 10 ** 6
@@ -307,23 +482,85 @@ def scan(projects: Optional[dict] = None, *, emit_fn: Callable = None,
             owner_action = bool(cls["partial"])
             summary = (f"{target}: {'partial completion' if cls['partial'] else 'new report'} "
                        f"— {headline}")
-            push = None if (owner_action and not pushed_this_scan) else False
+            rel = os.path.relpath(path, root)
+            task_id = (open_task or {}).get("id", "")
+            class_sig = _class_sig(kind, cls)
+            payload = {"report": rel, "markers": cls, "headline": headline,
+                       "agent_state": state, "open_task": task_id,
+                       "stage_pointer_moved": False}
+            # The owner is interrupted for MEANING, not for bytes. `ev_id` keys the report
+            # itself (not the event kind), so a report that flips partial → done → partial
+            # is compared against its own previous meaning rather than against a separate
+            # per-kind row that would never see the flip.
+            gate = None
+            deliver = False
             if owner_action:
+                gate = _owner_action_gate(
+                    ev_id, class_sig=class_sig, task_id=task_id,
+                    stage_pointer=stage_pointer, severity=severity, now=now, conn=conn)
+                # Scoped per MEANING, not per sweep. A sweep-level bound would silently
+                # drop the second distinct report's owner-action entirely: `_seen()` skips
+                # an unchanged fingerprint on the next scan, so a finding held back once is
+                # never reconsidered. Two different half-finished reports are two different
+                # decisions and each gets its own window; the sweep bound below still keeps
+                # a single sweep from sending more than one Telegram push.
+                deliver = bool(gate["deliver"])
+                if not deliver:
+                    # Inbox-only. Severity and owner_action_required are BOTH dropped
+                    # because `cto.emit` consults the wake bridge and the night-shift
+                    # signal on those two fields alone — `push=False` silences Telegram
+                    # and would still have woken someone.
+                    payload.update({
+                        "coalesced": True,
+                        "coalesced_reason": gate["reason"],
+                        "coalesced_with_event_id": gate["prior_event_id"],
+                        "suppressed_count": gate["suppressed_count"],
+                        "owner_action_suppressed": True,
+                        "original_severity": severity,
+                        "cooldown_secs": OWNER_ACTION_COOLDOWN_SECS,
+                    })
+                    if "cooldown_remaining_secs" in gate:
+                        payload["cooldown_remaining_secs"] = gate["cooldown_remaining_secs"]
+            else:
+                payload["coalesced"] = False
+            eff_severity = severity if (not owner_action or deliver) else "info"
+            eff_owner_action = bool(owner_action and deliver)
+            if owner_action and deliver:
+                payload["owner_action_delivery_reason"] = gate["reason"]
+                if gate["suppressed_count"]:
+                    payload["suppressed_since_last_delivery"] = gate["suppressed_count"]
+            # Owner-action findings still reach the wake bridge individually, but one sweep
+            # sends at most one push through the outbox — the original bound, kept.
+            wants_push = eff_owner_action or eff_severity in ("high", "critical")
+            push = None if (wants_push and not pushed_this_scan) else False
+            if wants_push:
                 pushed_this_scan = True
             res = emit_fn("work_evidence", kind, project_id=project, agent_id=target,
-                          severity=severity, owner_action_required=owner_action,
-                          payload={"report": os.path.relpath(path, root), "markers": cls,
-                                   "headline": headline, "agent_state": state,
-                                   "open_task": (open_task or {}).get("id", ""),
-                                   "stage_pointer_moved": False},
+                          severity=eff_severity, owner_action_required=eff_owner_action,
+                          payload=payload,
                           action_taken=summary, evidence_ref=path, push=push,
                           dedup_key=f"we:{kind}:{ev_id}:{fp}",
                           dedup_window_secs=DEDUP_WINDOW_SECS, conn=conn)
             _record(ev_id, project=project, target=target, kind=kind, ref=path,
                     fingerprint=fp, event_id=(res or {}).get("event_id", 0), conn=conn)
+            if owner_action:
+                _owner_action_record(
+                    ev_id, project=project, target=target, ref=rel, kind=kind,
+                    class_sig=class_sig, task_id=task_id, stage_pointer=stage_pointer,
+                    severity=severity, delivered=deliver,
+                    event_id=(res or {}).get("event_id", 0),
+                    suppressed_count=gate["suppressed_count"], now=now, conn=conn)
+            else:
+                # Informational reports are never suppressed, but their meaning is still
+                # recorded so the NEXT partial is measured against the truth.
+                _meaning_touch(ev_id, project=project, target=target, ref=rel, kind=kind,
+                               class_sig=class_sig, task_id=task_id,
+                               stage_pointer=stage_pointer, severity=severity, conn=conn)
             emitted.append({"target": target, "kind": kind, "ref": path,
                             "event_id": (res or {}).get("event_id"), "markers": cls,
-                            "first_time": first_time})
+                            "first_time": first_time,
+                            "owner_action_delivered": eff_owner_action,
+                            "coalesced": bool(owner_action and not deliver)})
 
             # ── the case nobody was told about: work stopped half-done ─────
             # An agent that is idle while its own report says the requested work was not
@@ -337,15 +574,40 @@ def scan(projects: Optional[dict] = None, *, emit_fn: Callable = None,
                               if cls["not_started"] or cls["audit_only"] else
                               "its ledger task is still open" if open_task else
                               "the report records blocked/unverified work")
-                    push2 = None if not pushed_this_scan else False
-                    pushed_this_scan = True
+                    stop_sig = _class_sig(EVENT_STOPPED, cls, reason=f"{reason}|{state}")
+                    gate2 = _owner_action_gate(
+                        stop_id, class_sig=stop_sig, task_id=task_id,
+                        stage_pointer=stage_pointer, severity="high", now=now, conn=conn)
+                    deliver2 = bool(gate2["deliver"])
+                    stop_payload = {"report": rel, "markers": cls, "agent_state": state,
+                                    "open_task": task_id, "reason": reason}
+                    if deliver2:
+                        stop_payload["coalesced"] = False
+                        stop_payload["owner_action_delivery_reason"] = gate2["reason"]
+                        if gate2["suppressed_count"]:
+                            stop_payload["suppressed_since_last_delivery"] = \
+                                gate2["suppressed_count"]
+                    else:
+                        stop_payload.update({
+                            "coalesced": True,
+                            "coalesced_reason": gate2["reason"],
+                            "coalesced_with_event_id": gate2["prior_event_id"],
+                            "suppressed_count": gate2["suppressed_count"],
+                            "owner_action_suppressed": True,
+                            "original_severity": "high",
+                            "cooldown_secs": OWNER_ACTION_COOLDOWN_SECS,
+                        })
+                        if "cooldown_remaining_secs" in gate2:
+                            stop_payload["cooldown_remaining_secs"] = \
+                                gate2["cooldown_remaining_secs"]
+                    push2 = None if (deliver2 and not pushed_this_scan) else False
+                    if deliver2:
+                        pushed_this_scan = True
                     res2 = emit_fn("work_evidence", EVENT_STOPPED, project_id=project,
-                                   agent_id=target, severity="high",
-                                   owner_action_required=True, push=push2,
-                                   payload={"report": os.path.relpath(path, root),
-                                            "markers": cls, "agent_state": state,
-                                            "open_task": (open_task or {}).get("id", ""),
-                                            "reason": reason},
+                                   agent_id=target,
+                                   severity=("high" if deliver2 else "info"),
+                                   owner_action_required=deliver2, push=push2,
+                                   payload=stop_payload,
                                    action_taken=(f"{target} went {state} with work incomplete "
                                                  f"— {reason}"),
                                    evidence_ref=path,
@@ -354,9 +616,17 @@ def scan(projects: Optional[dict] = None, *, emit_fn: Callable = None,
                     _record(stop_id, project=project, target=target, kind=EVENT_STOPPED,
                             ref=path, fingerprint=stop_fp,
                             event_id=(res2 or {}).get("event_id", 0), conn=conn)
+                    _owner_action_record(
+                        stop_id, project=project, target=target, ref=rel,
+                        kind=EVENT_STOPPED, class_sig=stop_sig, task_id=task_id,
+                        stage_pointer=stage_pointer, severity="high", delivered=deliver2,
+                        event_id=(res2 or {}).get("event_id", 0),
+                        suppressed_count=gate2["suppressed_count"], now=now, conn=conn)
                     emitted.append({"target": target, "kind": EVENT_STOPPED, "ref": path,
                                     "event_id": (res2 or {}).get("event_id"),
-                                    "reason": reason})
+                                    "reason": reason,
+                                    "owner_action_delivered": deliver2,
+                                    "coalesced": not deliver2})
 
         # ── commits ────────────────────────────────────────────────────────
         head = _git_head(root)
