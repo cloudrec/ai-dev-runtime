@@ -1450,3 +1450,31 @@ def test_blocked_stage_reasons_are_quoted_never_invented(tmp_path):
     d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, str(p)))
     assert d["action"] == "blocker"
     assert d["blocker_fields"] == ["stage status BLOCKED"], "no reason is fabricated"
+
+
+@pytest.mark.parametrize("status,blocked", [
+    ("BLOCKED_EXTERNAL", True),
+    ("APK_BUILT / DEVICE_QA_BLOCKED", True),   # the real MESS status my prefix check missed
+    ("BLOCKED", True),
+    ("PARTIALLY_BLOCKED_ON_OWNER", True),
+    ("UNBLOCKED", False),                      # must NOT match
+    ("CURRENT", False),
+    ("DONE", False),
+    ("", False),
+])
+def test_blocked_is_detected_wherever_the_word_appears(status, blocked):
+    """`startswith("BLOCKED")` missed `APK_BUILT / DEVICE_QA_BLOCKED` live — genuinely
+    blocked, three blockers recorded, and the governor fell back to a silent skip."""
+    assert cg._is_blocked_status(status) is blocked
+
+
+def test_a_trailing_blocked_status_surfaces_its_recorded_blockers(tmp_path):
+    import yaml as _y
+    stages = [{"id": "stage_09", "status": "APK_BUILT / DEVICE_QA_BLOCKED", "next_stage": None,
+               "blockers": [{"id": "no_device", "detail": "no adb, no emulator on host"}]}]
+    body = _y.safe_dump({"pointer": "stage_09", "cwd": str(tmp_path), "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, str(p)))
+    assert d["action"] == "blocker" and d["reason"] == "stage_blocked_external"
+    assert any("no_device" in f for f in d["blocker_fields"])

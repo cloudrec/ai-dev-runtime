@@ -145,6 +145,18 @@ def _forbidden_hit(scope: str, rx, text: str) -> bool:
     return hit
 
 
+def _is_blocked_status(status: str) -> bool:
+    """Is this stage status a BLOCKED state, wherever the word appears?
+
+    My first cut used `startswith("BLOCKED")` and missed the real thing live: MESS reported
+    `APK_BUILT / DEVICE_QA_BLOCKED` — genuinely blocked, three blockers recorded, and the
+    governor went back to a silent skip because the word was at the END. Tokenising avoids
+    both that miss and the opposite error: `UNBLOCKED` is its own token and must NOT match.
+    """
+    toks = {t for t in re.split(r"[^A-Za-z]+", (status or "").upper()) if t}
+    return "BLOCKED" in toks
+
+
 def project_policy(target: str, config: Optional[dict] = None) -> dict:
     cfg = (config if config is not None else load_config()).get(target) or {}
     return {"role": cfg.get("role") or "", "project": cfg.get("project") or "",
@@ -593,7 +605,7 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
                             "queue_path": qpath,
                             "resume_instruction": q.get("resume_instruction", ""),
                             "note": "next stage taken verbatim from the durable queue"}
-                if status.startswith("BLOCKED"):
+                if _is_blocked_status(status):
                     # A stage the queue itself marks blocked is NOT a bare skip. Live on
                     # MESS stage_09: status BLOCKED_EXTERNAL with three recorded blockers
                     # (stage_08 precondition PARTIAL, empty Android SDK, no device or
