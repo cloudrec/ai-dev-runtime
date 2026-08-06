@@ -116,6 +116,35 @@ def unenforceable_scopes(target: str, config: Optional[dict] = None) -> list:
     return [s for s in pol["forbidden_scopes"] if s not in _SCOPE_MARKERS]
 
 
+# A forbidden token inside a PROHIBITION or PRESERVATION clause is not an instruction to do
+# the thing — it is an instruction NOT to. Live false positive: MESS stage_09 reads
+# "Build a NON-PRODUCTION test APK only. Preserve signer/version policy (release keystore
+# CN=Mess,O=NovaTraders; live APK ... must not be replaced)". The word `release` matched the
+# `publication` marker and the stage was refused as cross-project work, even though APK work
+# is squarely inside MESS's own mess_ui role and the sentence forbids republishing.
+_PRESERVE_RE = re.compile(
+    r"\b(must not|may not|cannot|can[' ]?t|do not|don[' ]?t|never|not be|no\s+new|"
+    r"non[- ]production|preserve|preserving|unchanged|untouched|leave\s+\w+\s+alone|"
+    r"without|avoid|prohibited|forbidden|must remain|keep\s+\w+\s+as[- ]is)\b", re.I)
+
+
+def _clauses(text: str) -> list:
+    """Split into clauses so a prohibition binds only to its own clause, not the whole text."""
+    return [c for c in re.split(r"[.\n;]+", text or "") if c.strip()]
+
+
+def _forbidden_hit(scope: str, rx, text: str) -> bool:
+    """Does this scope appear as something to DO, rather than something to avoid?"""
+    hit = False
+    for clause in _clauses(text):
+        if not rx.search(_normalise_scope_text(clause)):
+            continue
+        if _PRESERVE_RE.search(clause):
+            continue        # named only to forbid or preserve it — not an instruction
+        hit = True
+    return hit
+
+
 def project_policy(target: str, config: Optional[dict] = None) -> dict:
     cfg = (config if config is not None else load_config()).get(target) or {}
     return {"role": cfg.get("role") or "", "project": cfg.get("project") or "",
@@ -133,13 +162,12 @@ def check_project_isolation(target: str, text: str,
     pol = project_policy(target, config)
     if not pol["project"]:
         return {"allowed": False, "reason": "project_not_governed", "scope": ""}
-    body = _normalise_scope_text(text)
     for scope in pol["forbidden_scopes"]:
         # Every forbidden scope is checked — by its hand-written marker where one exists,
         # otherwise by its own name. Iterating the MARKERS instead of the forbidden list
         # meant a scope nobody had written a regex for was silently unenforceable.
         rx = _SCOPE_MARKERS.get(scope) or _scope_name_pattern(scope)
-        if rx.search(body):
+        if _forbidden_hit(scope, rx, text):
             return {"allowed": False, "reason": "cross_project_work_refused",
                     "scope": scope}
     return {"allowed": True, "reason": "within_project_role", "scope": pol["role"]}

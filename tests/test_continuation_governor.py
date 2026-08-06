@@ -1346,3 +1346,54 @@ def test_a_working_pane_is_not_started_even_on_a_pending_stage(tmp_path):
     path = _mess_style_queue(tmp_path)
     d = cg.govern("cp-canary:0.0", state="working", config=_canary_cfg(tmp_path, path))
     assert d["action"] == "skip", d
+
+
+# ═════════ 16. a forbidden word inside a PROHIBITION is not an instruction ══
+MESS_S9_SCOPE = ("Build a NON-PRODUCTION test APK only. Preserve signer/version policy "
+                 "(release keystore CN=Mess,O=NovaTraders; live APK e51493f0 0.1.91/code 101 "
+                 "must not be replaced). Verify install/upgrade path, native Back, share.")
+
+
+def test_a_mess_apk_stage_is_allowed():
+    """Live false positive: stage_09_android_test_apk was refused as cross-project work
+    because `release keystore` matched the publication marker — yet APK work is squarely
+    inside MESS's own mess_ui role and that sentence FORBIDS republishing."""
+    r = cg.check_project_isolation("mess-qa-automation:0.0", MESS_S9_SCOPE, cg.load_config())
+    assert r["allowed"] is True, r
+    assert r["reason"] == "within_project_role"
+
+
+@pytest.mark.parametrize("text", [
+    "publish the release APK to the play store",
+    "deploy the build to production",
+    "push to prod and cut a release",
+])
+def test_genuine_publication_work_is_still_refused(text):
+    """Anti-overcorrection: the preservation rule must not disarm the real ban."""
+    r = cg.check_project_isolation("mess-qa-automation:0.0", text, cg.load_config())
+    assert r["allowed"] is False and r["reason"] == "cross_project_work_refused"
+
+
+@pytest.mark.parametrize("target,text", [
+    ("mess-qa-automation:0.0", "apply the jobhunter microtask payout flow"),
+    ("arbitrage2-opus:0.0", "enable live_trading and submit real orders"),
+    ("arbitrage2-opus:0.0", "update the mess_ui invites screen"),
+])
+def test_genuine_cross_project_work_is_still_refused(target, text):
+    r = cg.check_project_isolation(target, text, cg.load_config())
+    assert r["allowed"] is False and r["reason"] == "cross_project_work_refused"
+
+
+def test_a_prohibition_binds_only_to_its_own_clause():
+    """`do not break anything` must NOT license a publish instruction elsewhere in the text."""
+    cfg = {"x:0.0": {"project": "x", "role": "r", "forbidden_scopes": ["publication"]}}
+    txt = "Publish the release to production. Do not break anything."
+    assert cg.check_project_isolation("x:0.0", txt, cfg)["allowed"] is False
+
+
+def test_mess_advancement_is_held_pending_stage_08():
+    """Owner hold 2026-08-06: the scope fix must not advance MESS while stage_08 gaps are open."""
+    cfg = cg.load_config()
+    assert cfg["mess-qa-automation:0.0"]["enabled"] is False
+    d = cg.govern("mess-qa-automation:0.0", state="idle", config=cfg)
+    assert d["action"] == "skip" and d["reason"] == "governor_disabled_for_project"
