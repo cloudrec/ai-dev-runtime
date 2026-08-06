@@ -202,3 +202,42 @@ def test_bind_audit_records_the_move_and_no_conversation_content():
     assert h[0]["action"] == "rebind" and h[0]["previous"].endswith("one")
     assert set(h[0]) == {"at", "action", "conversation", "previous", "by", "note"}, \
         "the audit stores the pointer move only — never message content"
+
+
+# ── the global send choke point ────────────────────────────────────────────
+def test_only_one_submission_is_allowed_inside_the_cooldown():
+    """The owner saw the phrase TWICE. Neither was a duplicate of the same event: one came
+    from the companion and one from a direct out-of-band call that bypassed the bridge,
+    recorded nothing and consumed no cooldown. Per-event dedupe cannot catch that."""
+    a = wb.claim_send("companion", event_id=1, now=1000.0)
+    b = wb.claim_send("operator_script", event_id=None, now=1000.0 + 55)
+    assert a["allowed"] is True
+    assert b["allowed"] is False and b["reason"].startswith("global_cooldown_active")
+
+
+def test_a_second_send_is_allowed_once_the_cooldown_expires():
+    wb.claim_send("companion", event_id=1, now=1000.0)
+    later = wb.claim_send("companion", event_id=2, now=1000.0 + wb.COOLDOWN_SECS + 1)
+    assert later["allowed"] is True
+
+
+def test_every_attempt_is_recorded_even_when_refused():
+    """An out-of-band send must be VISIBLE even when it is blocked."""
+    wb.claim_send("companion", event_id=1, now=1000.0)
+    wb.claim_send("rogue_script", event_id=None, now=1000.0 + 10)
+    import os, sqlite3
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    rows = c.execute("SELECT source,allowed FROM wake_send ORDER BY id").fetchall()
+    assert ("rogue_script", 0) in rows, rows
+    assert ("companion", 1) in rows
+
+
+def test_the_kill_switch_blocks_the_claim(monkeypatch):
+    monkeypatch.setenv("WAKE_BRIDGE_KILL_SWITCH", "1")
+    assert wb.claim_send("companion", event_id=1)["allowed"] is False
+
+
+def test_a_disabled_bridge_blocks_the_claim(monkeypatch):
+    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "0")
+    r = wb.claim_send("companion", event_id=1)
+    assert r["allowed"] is False and r["reason"] == "bridge_disabled"

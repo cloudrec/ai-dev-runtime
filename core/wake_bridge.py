@@ -276,3 +276,50 @@ def pending_wake(conn=None) -> dict:
     finally:
         if own:
             conn.close()
+
+
+_SEND_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wake_send (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL, at TEXT, source TEXT, event_id INTEGER, allowed INTEGER, reason TEXT
+)
+"""
+
+
+def claim_send(source: str, event_id: Optional[int] = None, conn=None,
+               now: Optional[float] = None) -> dict:
+    """The single choke point every submission must pass, whatever called it.
+
+    The owner saw the wake phrase twice. Neither was a duplicate of the same event: one came
+    from the companion and one from a DIRECT out-of-band call that bypassed the bridge
+    entirely — recording nothing and consuming no cooldown, so the next legitimate wake fired
+    55 seconds later unimpeded. Per-event dedupe cannot prevent that; only a global claim can.
+
+    Every attempt is recorded, allowed or not, so an out-of-band send is visible even when
+    it is refused.
+    """
+    now = now if now is not None else now_ts()
+    enabled, kill = _enabled()
+    conn, own = _c(conn)
+    try:
+        conn.execute(_SEND_SCHEMA)
+        if kill:
+            res = (False, "kill_switch_engaged")
+        elif not enabled:
+            res = (False, "bridge_disabled")
+        else:
+            r = conn.execute("SELECT ts FROM wake_send WHERE allowed=1 "
+                             "ORDER BY id DESC LIMIT 1").fetchone()
+            if r and (now - float(r[0] or 0)) < COOLDOWN_SECS:
+                res = (False, f"global_cooldown_active:"
+                              f"{int(COOLDOWN_SECS - (now - float(r[0])))}s")
+            else:
+                res = (True, "claimed")
+        conn.execute("INSERT INTO wake_send (ts,at,source,event_id,allowed,reason) "
+                     "VALUES (?,?,?,?,?,?)",
+                     (now, now_iso(), source, int(event_id or 0), int(res[0]), res[1]))
+        conn.commit()
+        return {"allowed": res[0], "reason": res[1], "source": source}
+    finally:
+        if own:
+            conn.close()
