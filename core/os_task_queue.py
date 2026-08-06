@@ -342,6 +342,34 @@ def submit(task: dict, *, cwd: str, ctrl=None, conn=None, now: Optional[float] =
             "idempotency_key": task["idem"], "evidence": evidence}
 
 
+def _emit_task_event(task: dict, kind: str, *, severity: str = "info",
+                     owner_action_required: bool = False, detail: str = "") -> None:
+    """Make a task's outcome a durable CTO-inbox event.
+
+    Completion previously emitted NOTHING — a task could finish and the owner had no record of
+    it anywhere except the ledger row. The inbox is where finished and blocked work becomes
+    visible, and the dedup key makes each outcome appear exactly once however many ticks
+    observe it.
+
+    Completions are deliberately `info` with no owner action: they belong in the inbox, not in
+    Telegram and not as a chat wake. Waking someone to say a routine task finished is how a
+    notification channel becomes noise.
+    """
+    try:
+        from core.control_plane.cto import emit
+        emit("os_task_queue", kind, agent_id=task.get("target", ""),
+             project_id=task.get("project", ""), severity=severity,
+             owner_action_required=owner_action_required,
+             payload={"task_id": task.get("id"), "text": str(task.get("text") or "")[:200],
+                      "attempts": task.get("attempts"), "detail": detail[:200]},
+             action_taken=kind.replace("_", " "),
+             correlation_id=f"ostask:{task.get('id')}",
+             dedup_key=f"ostask:{task.get('id')}:{kind}",
+             dedup_window_secs=86400)
+    except Exception:  # noqa: BLE001 — visibility must never break the state machine
+        pass
+
+
 def _notify_owner(task: dict, reason: str, detail: str) -> Optional[str]:
     """An explicit, durable owner notification. A failed task is never a silent stall."""
     try:
@@ -404,6 +432,7 @@ def advance(target: str, *, cwd: str, ctrl=None, conn=None,
                              ack_at=now_iso(), ack_ts=ack["ts"] or now)
         if turn_finished(cwd, float(task.get("ack_ts") or now), target=target):
             set_state(task["id"], DONE, conn=conn, done_at=now_iso())
+            _emit_task_event(task, "task_completed")
             return {"action": "done", "task_id": task["id"]}
         if task["state"] != WORKING:
             set_state(task["id"], WORKING, conn=conn)
@@ -415,6 +444,9 @@ def advance(target: str, *, cwd: str, ctrl=None, conn=None,
                                  f"agent idle {int(since_ack)}s without completing")
             set_state(task["id"], FAILED, conn=conn, done_at=now_iso(),
                       last_error=f"stalled_after_ack_{int(since_ack)}s")
+            _emit_task_event(task, "task_failed", severity="high",
+                             owner_action_required=True,
+                             detail=f"agent idle {int(since_ack)}s without completing")
             return {"action": "failed", "task_id": task["id"], "gate_id": gate,
                     "reason": "work_stall"}
         return {"action": "working", "task_id": task["id"],
@@ -433,6 +465,8 @@ def advance(target: str, *, cwd: str, ctrl=None, conn=None,
                                                    f"{int(waited)}s and {task['attempts']} attempts")
     set_state(task["id"], FAILED, conn=conn, done_at=now_iso(),
               last_error=f"no_ack_after_{int(waited)}s")
+    _emit_task_event(task, "task_failed", severity="high", owner_action_required=True,
+                     detail=f"no transcript acknowledgement after {int(waited)}s")
     return {"action": "failed", "task_id": task["id"], "gate_id": gate,
             "reason": "ack_timeout"}
 

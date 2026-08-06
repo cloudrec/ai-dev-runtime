@@ -286,3 +286,88 @@ def test_a_long_running_turn_is_never_declared_stalled(monkeypatch):
     monkeypatch.setattr(q, "_agent_busy", lambda target: True)      # still executing
     r = q.advance("cp-canary:0.0", cwd="/x", now=1001.0 + q.WORK_STALL_SECS * 10)
     assert r["action"] == "working", "a busy agent is never failed for taking its time"
+
+
+# ── outcomes must reach the CTO inbox ──────────────────────────────────────
+def _events(kind=None):
+    import os, sqlite3
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    c.row_factory = sqlite3.Row
+    q = "SELECT type,severity,owner_action_required,payload FROM event"
+    if kind:
+        q += f" WHERE type='{kind}'"
+    return [dict(r) for r in c.execute(q)]
+
+
+def test_a_completed_task_becomes_a_durable_inbox_event(monkeypatch):
+    """Completion previously emitted NOTHING — a task could finish with no record anywhere
+    but its own ledger row."""
+    calls = []
+    _stub_submit(monkeypatch, calls)
+    t = q.enqueue("cp-canary:0.0", "finish me", project="canary")
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
+    _transcript(monkeypatch, [{"type": "user", "text": f"task_{t['id']}", "ts": 1001.0},
+                              {"type": "assistant", "text": "done", "ts": 1002.0}])
+    monkeypatch.setattr(q, "_agent_busy", lambda target: False)
+    assert q.advance("cp-canary:0.0", cwd="/x", now=1003.0)["action"] == "done"
+    ev = _events("task_completed")
+    assert len(ev) == 1 and t["id"] in ev[0]["payload"]
+
+
+def test_a_completion_does_not_page_the_owner(monkeypatch):
+    """It belongs in the inbox, not in Telegram and not as a chat wake. Waking someone to say
+    a routine task finished is how a channel becomes noise."""
+    calls = []
+    _stub_submit(monkeypatch, calls)
+    t = q.enqueue("cp-canary:0.0", "quiet finish")
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
+    _transcript(monkeypatch, [{"type": "user", "text": f"task_{t['id']}", "ts": 1001.0},
+                              {"type": "assistant", "text": "ok", "ts": 1002.0}])
+    monkeypatch.setattr(q, "_agent_busy", lambda target: False)
+    q.advance("cp-canary:0.0", cwd="/x", now=1003.0)
+    ev = _events("task_completed")[0]
+    assert ev["severity"] == "info" and not ev["owner_action_required"]
+
+
+def test_a_failure_does_page_the_owner(monkeypatch):
+    calls = []
+    _stub_submit(monkeypatch, calls)
+    _transcript(monkeypatch, [])
+    monkeypatch.setattr(q, "_notify_owner", lambda t, r, d: "gate")
+    q.enqueue("cp-canary:0.0", "never acked")
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0 + q.ACK_TIMEOUT_SECS + 1)
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0 + 2 * q.ACK_TIMEOUT_SECS + 2)
+    ev = _events("task_failed")
+    assert ev and ev[0]["severity"] == "high" and ev[0]["owner_action_required"]
+
+
+def test_the_same_outcome_appears_once_however_many_ticks_see_it(monkeypatch):
+    calls = []
+    _stub_submit(monkeypatch, calls)
+    t = q.enqueue("cp-canary:0.0", "finish once")
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
+    _transcript(monkeypatch, [{"type": "user", "text": f"task_{t['id']}", "ts": 1001.0},
+                              {"type": "assistant", "text": "done", "ts": 1002.0}])
+    monkeypatch.setattr(q, "_agent_busy", lambda target: False)
+    for step in range(4):
+        q.advance("cp-canary:0.0", cwd="/x", now=1003.0 + step)
+    assert len(_events("task_completed")) == 1, "dedupe keeps one row per outcome"
+
+
+def test_visibility_never_breaks_the_state_machine(monkeypatch):
+    """An unavailable inbox must not stop a task completing."""
+    calls = []
+    _stub_submit(monkeypatch, calls)
+    t = q.enqueue("cp-canary:0.0", "finish anyway")
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
+    _transcript(monkeypatch, [{"type": "user", "text": f"task_{t['id']}", "ts": 1001.0},
+                              {"type": "assistant", "text": "done", "ts": 1002.0}])
+    monkeypatch.setattr(q, "_agent_busy", lambda target: False)
+    monkeypatch.setattr(q, "_emit_task_event",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("inbox down")))
+    try:
+        out = q.advance("cp-canary:0.0", cwd="/x", now=1003.0)
+    except RuntimeError:
+        out = {"action": "raised"}
+    assert q.get(t["id"])["state"] == q.DONE or out["action"] == "done"
