@@ -21,6 +21,18 @@ from core import continuation_governor as cg
 PASTE = "[Pasted text #3 +99 lines]"
 
 
+@pytest.fixture(autouse=True)
+def _no_live_pane_reads(monkeypatch):
+    """`_governor_pass` falls back to the LIVE tmux pane when no controller is injected, so
+    these tests silently depended on whatever the real canary happened to be showing. That
+    made them pass or fail with the machine's mood — twice now a leftover line in the pane
+    flipped a decision from advance_queue to submit_queued mid-suite.
+
+    Default to an empty input line; a test that wants queued input patches this itself.
+    """
+    monkeypatch.setattr("core.agent_control.pending_input_text", lambda *a, **k: "")
+
+
 def _cfg(**over):
     base = {"mess-qa-automation:0.0": {
         "project": "mess", "cwd": "/opt/mess",

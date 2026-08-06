@@ -81,12 +81,18 @@ def _row(r) -> dict:
 
 
 # ── transcript: the acknowledgement source of truth ──────────────────────────
-def transcript_messages(cwd: str, limit_files: int = 1) -> list:
+def transcript_messages(cwd: str, limit_files: int = 4) -> list:
     """Every submitted user / assistant message in the project's newest transcript.
 
     Returns [{"type": "user"|"assistant", "text": str, "ts": float}] in file order. This is
     what the agent actually RECEIVED and produced, which is why acknowledgement is anchored
     here rather than in a rendered prompt line.
+
+    Reads the last few conversation files, not just the newest. Live 2026-08-06: the canary's
+    conversation rotated between submission and the next tick, the acknowledgement was left in
+    the previous file, `restore_after_reset` concluded the task had never been received and
+    RESUBMITTED work the agent had already completed — the duplicate this whole ledger exists
+    to prevent, caused by looking in one file.
     """
     import glob
     out = []

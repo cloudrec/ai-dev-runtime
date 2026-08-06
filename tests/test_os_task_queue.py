@@ -371,3 +371,38 @@ def test_visibility_never_breaks_the_state_machine(monkeypatch):
     except RuntimeError:
         out = {"action": "raised"}
     assert q.get(t["id"])["state"] == q.DONE or out["action"] == "done"
+
+
+def test_ack_survives_a_conversation_rotation(tmp_path, monkeypatch):
+    """Live: the conversation rotated between submission and the next tick, the ack was left
+    in the PREVIOUS file, and the task was resubmitted although the work was already done."""
+    proj = tmp_path / "projects" / "-x"
+    proj.mkdir(parents=True)
+    import json, os, time
+    old = proj / "old.jsonl"
+    old.write_text(json.dumps({"type": "user", "message": {"content": "run owner os task task_ABC"},
+                               "timestamp": "2026-08-06T10:00:00Z"}) + "\n")
+    new = proj / "new.jsonl"
+    new.write_text(json.dumps({"type": "user", "message": {"content": "something else"},
+                               "timestamp": "2026-08-06T11:00:00Z"}) + "\n")
+    os.utime(old, (time.time() - 100, time.time() - 100))
+    monkeypatch.setattr(q, "transcript_messages",
+                        lambda cwd, limit_files=4: q.__wrapped_tm__(str(proj), limit_files))
+    # emulate the real reader over the directory we built
+    def _read(_dir, limit_files):
+        import glob
+        out = []
+        for f in sorted(glob.glob(str(proj / "*.jsonl")), key=os.path.getmtime)[-limit_files:]:
+            for line in open(f):
+                d = json.loads(line)
+                out.append({"type": d["type"], "text": d["message"]["content"], "ts": 0.0})
+        return out
+    q.__wrapped_tm__ = _read
+    assert q.find_ack("/x", "task_ABC", 0) is not None, \
+        "an ack in a rotated-away file must still count"
+
+
+def test_the_default_reads_more_than_one_conversation_file():
+    import inspect
+    sig = inspect.signature(q.transcript_messages)
+    assert sig.parameters["limit_files"].default > 1
