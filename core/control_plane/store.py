@@ -9,9 +9,28 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+import uuid
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
+
+# Identity of THIS process run. Delivery health is evidence-scoped to a runtime: a proof
+# recorded by a PREVIOUS process (before a restart/redeploy) is history, not a live claim
+# that the channel works now. See `channel.proof_epoch` and delivery.refresh_channel_health.
+_RUNTIME_EPOCH = ""
+
+
+def new_runtime_epoch() -> str:
+    """Start a new runtime epoch and return it. Called once at import (process start);
+    tests call it to honestly simulate a service restart."""
+    global _RUNTIME_EPOCH
+    _RUNTIME_EPOCH = f"{os.getpid()}:{int(time.time() * 1000)}:{uuid.uuid4().hex[:8]}"
+    return _RUNTIME_EPOCH
+
+
+def runtime_epoch() -> str:
+    """The current process' epoch. Stable for the life of the process."""
+    return _RUNTIME_EPOCH or new_runtime_epoch()
 
 
 def db_path() -> str:
@@ -50,9 +69,16 @@ CREATE TABLE IF NOT EXISTS cto_cursor (
 
 -- notification channel registry + health (a disabled/failed channel is a BLOCKER,
 -- never a silent healthy state).
+-- `state` is the tri-state truth: 'unverified' (no proof in THIS runtime — not green),
+-- 'healthy' (a delivery was proven), 'unhealthy' (a send was proven to fail / channel is
+-- misconfigured). `healthy` is the legacy mirror (1 only when state='healthy').
+-- `proof_epoch` is the runtime epoch that produced the current state; a row whose proof
+-- comes from an earlier epoch degrades to 'unverified' on the next health refresh.
+-- `last_proof` keeps the receipt/evidence of the last proven delivery.
 CREATE TABLE IF NOT EXISTS channel (
     name TEXT PRIMARY KEY, enabled INTEGER DEFAULT 0, kind TEXT, config_ref TEXT,
-    healthy INTEGER DEFAULT 0, last_ok_at TEXT, last_error TEXT, updated_at TEXT);
+    healthy INTEGER DEFAULT 0, last_ok_at TEXT, last_error TEXT, updated_at TEXT,
+    state TEXT DEFAULT 'unverified', proof_epoch TEXT, last_proof TEXT);
 
 CREATE TABLE IF NOT EXISTS project (
     id TEXT PRIMARY KEY, name TEXT, root TEXT, priority INTEGER DEFAULT 100,
@@ -158,13 +184,26 @@ def init_db(conn: sqlite3.Connection | None = None) -> sqlite3.Connection:
         "event": ["project_id TEXT", "agent_id TEXT", "severity TEXT DEFAULT 'info'",
                   "owner_action_required INTEGER DEFAULT 0", "action_taken TEXT",
                   "dedup_key TEXT", "supersedes INTEGER", "resolves INTEGER"],
+        # v5: evidence-scoped channel health. Existing rows adopt 'unverified' — a DB that
+        # was written by an older build carries no proof for this runtime, so it must not
+        # come back green on upgrade.
+        "channel": ["state TEXT DEFAULT 'unverified'", "proof_epoch TEXT", "last_proof TEXT"],
     }
+    added = set()
     for table, cols in _V2_COLS.items():
         for coldef in cols:
             try:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {coldef}")
+                added.add((table, coldef.split()[0]))
             except sqlite3.OperationalError:
                 pass                                      # column already exists
+    if ("channel", "last_proof") in added:
+        # One-time v5 hygiene, on the upgrade write only. Pre-v5 `owner_push.last_ok_at`
+        # was stamped by the CONFIG probe, not by a delivery, so it is indistinguishable
+        # from a real receipt and must not be carried forward as proof (it is what made
+        # `verified` true for a channel that had never delivered anything).
+        conn.execute("UPDATE channel SET last_ok_at=NULL "
+                     "WHERE name='owner_push' AND last_proof IS NULL")
     row = conn.execute("SELECT version FROM schema_meta WHERE id=1").fetchone()
     if not row:
         conn.execute("INSERT INTO schema_meta(id,version,updated_at) VALUES(1,?,?)",

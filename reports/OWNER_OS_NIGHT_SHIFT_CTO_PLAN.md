@@ -209,6 +209,26 @@ A related defect was found and fixed while configuring it: `owner_push` reported
 credentials being PRESENT rather than from delivery succeeding. A rejected send now marks the
 channel unhealthy; abstention (no credentials) still does not.
 
+**The rest of that false-green (2026-08-06, later):** marking a rejected send unhealthy was
+only half the fix. The health probe runs every engine tick and re-derived `healthy` from the
+credentials, so the next tick — and every process restart — put the channel straight back to
+green with no delivery behind it. The live DB showed it plainly: `owner_push healthy=1,
+last_ok_at=2026-08-06T19:03:17Z` where that timestamp was written by the *config probe*, not
+by any receipt. Channel health is now evidence-scoped (schema v5, `channel.state` /
+`proof_epoch` / `last_proof`):
+
+| Situation | State | Posture |
+|---|---|---|
+| cold start / restart / upgrade from an old DB | `unverified` | **not green** — amber, "no proof in this runtime" |
+| send rejected | `unhealthy` | red, error kept; the next probe cannot reset it |
+| send accepted (real receipt) | `healthy` | green, with `last_ok_at` + the receipt as evidence |
+
+A proof belongs to the runtime that produced it: after a restart the old receipt stays on the
+row as history (`verified` = "ever proven"), but the channel is not green again until a send
+is proven in the new process. The v5 upgrade drops the config-stamped `last_ok_at` so the old
+false timestamp is not imported as proof. `same_chat_wake` and `scheduled_chatgpt` semantics
+are unchanged — this fix is scoped to `owner_push`.
+
 ## 5. Acceptance (as mandated)
 
 **24 continuous hours** unattended (owner correction 2026-08-06), ≥2 managed project agents, no manual Enter or pings;

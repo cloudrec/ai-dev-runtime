@@ -11,7 +11,7 @@ import json
 import uuid
 from typing import Optional
 
-from core.control_plane.store import connect, init_db, now_iso, now_ts
+from core.control_plane.store import connect, init_db, now_iso, now_ts, runtime_epoch
 
 _UNKNOWN = "unknown"
 
@@ -551,19 +551,42 @@ def upsert_budget(scope: str, *, model: str = "", tokens: int = 0, cost_usd: flo
             conn.close()
 
 
+CHANNEL_STATES = ("unverified", "healthy", "unhealthy")
+
+
 def upsert_channel(name: str, *, enabled: bool, kind: str = "", config_ref: str = "",
-                   healthy: Optional[bool] = None, last_error: str = "", conn=None) -> None:
+                   healthy: Optional[bool] = None, last_error: str = "",
+                   state: Optional[str] = None, proof: str = "",
+                   proof_epoch: Optional[str] = None, conn=None) -> None:
+    """Record a channel's configuration AND its evidence-backed state.
+
+    `state` is the truth ('unverified' | 'healthy' | 'unhealthy'); `healthy` is kept as the
+    legacy boolean mirror and, when `state` is omitted, is used to derive it. A 'healthy'
+    state is only ever written by a PROVEN delivery, and it is stamped with the runtime
+    epoch that proved it — so a restart cannot inherit someone else's green.
+    """
+    if state is None:
+        state = "healthy" if healthy else "unhealthy"
+    if state not in CHANNEL_STATES:
+        raise ValueError(f"unknown channel state: {state}")
+    proven = state in ("healthy", "unhealthy")
+    epoch = (proof_epoch if proof_epoch is not None
+             else (runtime_epoch() if proven else None))
     conn, own = _c(conn)
     try:
-        ok_at = now_iso() if healthy else None
+        ok_at = now_iso() if state == "healthy" else None
         conn.execute(
             "INSERT INTO channel(name,enabled,kind,config_ref,healthy,last_ok_at,last_error,"
-            "updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+            "updated_at,state,proof_epoch,last_proof) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(name) DO UPDATE SET "
             "enabled=excluded.enabled,kind=excluded.kind,config_ref=excluded.config_ref,"
             "healthy=excluded.healthy,last_ok_at=COALESCE(excluded.last_ok_at,channel.last_ok_at),"
-            "last_error=excluded.last_error,updated_at=excluded.updated_at",
-            (name, 1 if enabled else 0, kind, config_ref, 1 if healthy else 0, ok_at,
-             last_error, now_iso()))
+            "last_error=excluded.last_error,updated_at=excluded.updated_at,"
+            "state=excluded.state,proof_epoch=excluded.proof_epoch,"
+            # keep the historical receipt when this write carries none
+            "last_proof=COALESCE(NULLIF(excluded.last_proof,''),channel.last_proof)",
+            (name, 1 if enabled else 0, kind, config_ref, 1 if state == "healthy" else 0,
+             ok_at, last_error, now_iso(), state, epoch, proof or None))
         conn.commit()
     finally:
         if own:
@@ -574,14 +597,19 @@ def get_channel(name: str, conn=None) -> Optional[dict]:
     conn, own = _c(conn)
     try:
         r = conn.execute("SELECT name,enabled,kind,config_ref,healthy,last_ok_at,last_error,"
-                         "updated_at FROM channel WHERE name=?", (name,)).fetchone()
+                         "updated_at,state,proof_epoch,last_proof FROM channel WHERE name=?",
+                         (name,)).fetchone()
         cols = ("name", "enabled", "kind", "config_ref", "healthy", "last_ok_at",
-                "last_error", "updated_at")
+                "last_error", "updated_at", "state", "proof_epoch", "last_proof")
         if not r:
             return None
         d = dict(zip(cols, r))
         d["enabled"] = bool(d["enabled"])
-        d["healthy"] = bool(d["healthy"])
+        # `state` is authoritative; `healthy` mirrors it. A row written before v5 has no
+        # state, so it falls back to its stored boolean rather than inventing a green.
+        d["state"] = d["state"] or ("healthy" if d["healthy"] else "unhealthy")
+        d["healthy"] = d["state"] == "healthy"
+        d["proven_this_runtime"] = bool(d["proof_epoch"]) and d["proof_epoch"] == runtime_epoch()
         return d
     finally:
         if own:

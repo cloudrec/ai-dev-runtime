@@ -17,6 +17,11 @@ Tiers (priority order, best-effort proactive → durable pull):
 Health: if NO proactive channel (same_chat_wake or a healthy owner_push) is enabled/
 healthy, `notifications_status()` is RED — `notifications_enabled=false` is a red state,
 never "working delivery". A red state raises a durable blocker event.
+
+owner_push health is EVIDENCE-SCOPED, never configuration-derived (see `_owner_push_state`):
+having a bot token is not delivery. After a cold start or a service restart the channel is
+explicitly `unverified` (amber, NOT green) until a send is proven in THIS runtime; a proven
+failure makes it `unhealthy`; a proven send makes it `healthy` with a timestamp + receipt.
 """
 from __future__ import annotations
 
@@ -24,14 +29,47 @@ import os
 from typing import Optional
 
 from core.control_plane import api
-from core.control_plane.store import now_iso, now_ts
+from core.control_plane.store import now_iso, now_ts, runtime_epoch
 
 # priority order (proactive first)
 TIERS = ("same_chat_wake", "owner_push", "scheduled_chatgpt", "cto_inbox")
 
+UNVERIFIED_DETAIL = ("unverified — credentials present but no delivery proven in this "
+                     "runtime (not green until a real receipt)")
+
 
 def _env_flag(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _owner_push_state(row: Optional[dict], *, enabled: bool) -> tuple:
+    """Decide owner_push's state from EVIDENCE, never from configuration.
+
+    Configuration presence answers "could this channel be tried?", not "does it work?".
+    The live 2026-08-06 failure was exactly this conflation: creds present ⇒ healthy=1 ⇒
+    green, while every send returned `Bad Request: chat not found`.
+
+    Returns (state, last_error):
+      * not configured                       → unhealthy (red, misconfigured)
+      * proof recorded in THIS runtime epoch → keep it (healthy or unhealthy; a proven
+        failure must survive every subsequent refresh tick, not be reset by the next probe)
+      * anything else (cold start, restart, pre-v5 row) → unverified: NOT green, and the
+        historical last_ok_at/last_proof stay on the row as evidence of what once worked.
+    """
+    if not enabled:
+        return ("unhealthy", "TELEGRAM_BOT_TOKEN/CHAT_ID unset")
+    if row and row.get("state") in ("healthy", "unhealthy") and row.get("proven_this_runtime"):
+        return (row["state"], row.get("last_error") or "")
+    return ("unverified", UNVERIFIED_DETAIL)
+
+
+def _owner_push_detail(row: Optional[dict], state: str) -> str:
+    """Human-readable posture for the UI — says WHY, not just red/green."""
+    if not (row and row["enabled"]):
+        return "disabled/misconfigured"
+    if state == "healthy":
+        return f"delivery proven at {row.get('last_ok_at')} ({row.get('last_proof') or 'receipt'})"
+    return row.get("last_error") or UNVERIFIED_DETAIL
 
 
 def detect_capabilities(conn=None) -> dict:
@@ -49,14 +87,21 @@ def detect_capabilities(conn=None) -> dict:
                    "no supported inbound trigger configured — same-chat proactive wake "
                    "NOT available (fail closed to owner_push / cto_inbox)"),
     }
-    # 2) owner push (telegram)
+    # 2) owner push (telegram) — evidence-scoped: `available` requires a PROVEN delivery in
+    # this runtime, never merely present credentials. `state` distinguishes "not yet proven"
+    # (unverified/amber) from "proven broken" (unhealthy/red) so the UI can tell them apart.
     tg = api.get_channel("owner_push", conn=conn)
+    tg_state = (tg or {}).get("state") or "unverified"
     owner_push = {
         "tier": "owner_push",
-        "available": bool(tg and tg["enabled"] and tg["healthy"]),
-        "verified": bool(tg and tg.get("last_ok_at")),
-        "detail": (tg or {}).get("last_error") or ("enabled" if (tg and tg["enabled"])
-                                                    else "disabled/misconfigured"),
+        "available": bool(tg and tg["enabled"] and tg_state == "healthy"),
+        "verified": bool(tg and tg.get("last_ok_at")),      # historical: ever proven
+        "state": tg_state,
+        "configured": bool(tg and tg["enabled"]),
+        "proven_this_runtime": bool((tg or {}).get("proven_this_runtime")),
+        "proven_at": (tg or {}).get("last_ok_at"),
+        "evidence": (tg or {}).get("last_proof"),
+        "detail": _owner_push_detail(tg, tg_state),
     }
     # 3) scheduled ChatGPT hourly automation
     sched = api.get_channel("scheduled_chatgpt", conn=conn)
@@ -83,7 +128,9 @@ def notifications_status(conn=None) -> dict:
     status = "green" if proactive_ok else "red"
     reasons = []
     if not caps["owner_push"]["available"]:
-        reasons.append("owner_push disabled/unhealthy")
+        op_state = caps["owner_push"]["state"]
+        reasons.append("owner_push unverified — no delivery proven since start"
+                       if op_state == "unverified" else f"owner_push disabled/{op_state}")
     if not caps["same_chat_wake"]["available"]:
         reasons.append("same_chat_wake unavailable (no proven inbound trigger)")
     return {
@@ -99,13 +146,15 @@ def notifications_status(conn=None) -> dict:
 def refresh_channel_health(conn=None) -> dict:
     """Probe channel config from the environment and record health. Deterministic +
     cheap. A disabled channel is recorded as unhealthy (red), never omitted."""
-    # owner_push / telegram: enabled only if a bot token + chat id are present.
+    # owner_push / telegram: CONFIGURATION says it can be tried; only EVIDENCE says it works.
+    # A probe therefore never invents health — it re-derives state from the stored proof, so
+    # a cold start is `unverified` and a proven failure is not reset by the next tick.
     tg_enabled = _env_flag("WATCHDOG_TELEGRAM_ENABLED") or bool(
         os.getenv("TELEGRAM_BOT_TOKEN") and os.getenv("TELEGRAM_CHAT_ID"))
+    tg_state, tg_error = _owner_push_state(api.get_channel("owner_push", conn=conn),
+                                           enabled=tg_enabled)
     api.upsert_channel("owner_push", enabled=tg_enabled, kind="telegram",
-                       healthy=tg_enabled,
-                       last_error="" if tg_enabled else "TELEGRAM_BOT_TOKEN/CHAT_ID unset",
-                       conn=conn)
+                       state=tg_state, last_error=tg_error, conn=conn)
     # scheduled ChatGPT hourly automation (fallback). Evidence: runs hourly but currently
     # notifications_enabled=false, so NOT accepted as the pinger.
     api.upsert_channel("scheduled_chatgpt", enabled=_env_flag("CHATGPT_HOURLY_ENABLED"),
@@ -209,16 +258,19 @@ def _mark_channel_failed(tier: str, error: str, conn=None) -> None:
     — the same false-green that makes a monitoring system worse than none.
     """
     try:
-        api.upsert_channel(tier, enabled=True, healthy=False,
+        api.upsert_channel(tier, enabled=True, state="unhealthy",
                            last_error=str(error or "send failed")[:200], conn=conn)
     except Exception:  # noqa: BLE001 — never let bookkeeping break a delivery attempt
         pass
 
 
-def _mark_channel_ok(tier: str, conn=None) -> None:
-    """Record a PROVEN delivery on a channel — sets last_ok_at so `verified` (and, for
-    same_chat_wake, `same_chat_wake_complete`) flips true only after a real receipt."""
-    api.upsert_channel(tier, enabled=True, healthy=True, conn=conn)   # healthy → last_ok_at=now
+def _mark_channel_ok(tier: str, receipt: str = "", conn=None) -> None:
+    """Record a PROVEN delivery on a channel — the ONLY thing that turns a channel green.
+    Stamps last_ok_at + the receipt as evidence and the current runtime epoch, so `verified`
+    (and, for same_chat_wake, `same_chat_wake_complete`) flips true only after a real
+    receipt, and the green does not survive into the next process without a fresh proof."""
+    api.upsert_channel(tier, enabled=True, state="healthy", proof=str(receipt or "")[:200],
+                       last_error="", conn=conn)   # healthy → last_ok_at=now
 
 
 def deliver(notif_id: int, *, severity: str = "info", adapters=None, conn=None) -> dict:
@@ -236,7 +288,7 @@ def deliver(notif_id: int, *, severity: str = "info", adapters=None, conn=None) 
         ok, receipt, err = adapters[tier](message)
         if ok and receipt:
             api.mark_notification(notif_id, "sent", receipt=receipt, conn=conn)
-            _mark_channel_ok(tier, conn=conn)
+            _mark_channel_ok(tier, receipt=receipt, conn=conn)
             attempts.append({"tier": tier, "result": "sent", "receipt": receipt})
             return {"delivered": True, "tier": tier, "receipt": receipt, "attempts": attempts}
         # A rejected send is EVIDENCE the channel does not work. Configuration presence is
