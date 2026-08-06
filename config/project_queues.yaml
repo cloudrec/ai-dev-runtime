@@ -34,12 +34,11 @@ projects:
     # is what the 2026-08-05 37-minute stall was. Enabled here deliberately and audited;
     # see the limitation note in the phase 3 report.
     submit_owner_queued_paste: true
-    # OWNER HOLD 2026-08-06: "Do not advance MESS until the MESS agent closes its stage_08
-    # product gaps; only remove the erroneous policy refusal." Removing the false
-    # cross_project_work_refused would otherwise let the governor deliver stage_09 on the
-    # next tick. Governance is held OFF so the fix can land without advancing MESS.
-    # Re-enable when the owner confirms stage_08 is closed.
-    enabled: false
+    # Hold LIFTED 2026-08-06 on explicit owner instruction: the approved owner-queued design
+    # task sitting in this pane must be submitted. Note that re-enabling governance also
+    # re-enables queue advancement, so stage_09 becomes deliverable again once its stage is
+    # current — that is a consequence of lifting the hold, not a separate decision.
+    enabled: true
 
   arbitrage2-opus:0.0:
     project: arbitrage2

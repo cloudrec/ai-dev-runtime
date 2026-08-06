@@ -314,6 +314,10 @@ def test_tick_records_a_governor_blocker_once(tmp_path, monkeypatch):
     path = _yaml_queue(tmp_path, pointer="stage_03_media_voice", stages=stages)
     cfg = _cfg(authoritative_pointer=path, required_sources=[])
     monkeypatch.setattr(cg, "load_config", lambda *a, **k: cfg)
+    # The pass falls back to the LIVE tmux pane when no controller is injected. This test
+    # passed only while the real MESS pane happened to be empty; once it held an owner
+    # paste, govern() took the queued-input branch and the blocker was never reached.
+    monkeypatch.setattr("core.agent_control.pending_input_text", lambda *a, **k: "")
 
     out1 = ap._governor_pass("mess-qa-automation:0.0", state="idle", tail="", cwd="/opt/mess",
                              ctrl=None, conv="c", evaluate_only=True, conn=None)
@@ -1391,9 +1395,29 @@ def test_a_prohibition_binds_only_to_its_own_clause():
     assert cg.check_project_isolation("x:0.0", txt, cfg)["allowed"] is False
 
 
-def test_mess_advancement_is_held_pending_stage_08():
-    """Owner hold 2026-08-06: the scope fix must not advance MESS while stage_08 gaps are open."""
+def test_mess_governance_is_enabled_so_owner_queued_work_can_be_submitted():
+    """The 2026-08-06 hold was lifted on explicit owner instruction so the approved
+    owner-queued design task in the MESS pane can be submitted."""
     cfg = cg.load_config()
-    assert cfg["mess-qa-automation:0.0"]["enabled"] is False
-    d = cg.govern("mess-qa-automation:0.0", state="idle", config=cfg)
-    assert d["action"] == "skip" and d["reason"] == "governor_disabled_for_project"
+    assert cfg["mess-qa-automation:0.0"]["enabled"] is True
+    d = cg.govern("mess-qa-automation:0.0", state="waiting_input",
+                  pending="[Pasted text #4 +57 lines]", config=cfg)
+    assert d["action"] == "submit_queued" and d["mode"] == "enter"
+    assert "step_text" not in d, "an owner paste is submitted, never re-typed"
+
+
+def test_evaluate_only_reports_queued_input_instead_of_going_blind(tmp_path, monkeypatch):
+    """Live root cause: with owner input in the pane, evaluate-only fell off the end of
+    `_governor_pass` and returned None — indistinguishable from "nothing to do"."""
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import commander_autopilot as ap
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: _cfg())
+    monkeypatch.setattr("core.agent_control.pending_input_text",
+                        lambda *a, **k: "[Pasted text #4 +57 lines]")
+    out = ap._governor_pass("mess-qa-automation:0.0", state="waiting_input", tail="",
+                            cwd="/opt/mess", ctrl=None, conv="c", evaluate_only=True,
+                            conn=None)
+    assert out is not None, "evaluate-only must never be blind to submittable input"
+    assert out["decision"] == "governor_submit_available"
+    assert out["expected_pending"] == "[Pasted text #4 +57 lines]"

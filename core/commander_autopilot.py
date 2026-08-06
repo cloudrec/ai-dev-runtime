@@ -685,6 +685,14 @@ def _governor_pass(target: str, *, state: str, tail: str, cwd: str, ctrl,
                 "retracted_gates": retracted,
                 "note": d.get("note", "")}
 
+    if d["action"] == "submit_queued" and evaluate_only:
+        # Evaluate-only must still REPORT what it would do. Returning None here made the
+        # pass silently blind: a pane holding owner-queued input looked identical to a pane
+        # with nothing to do, and the caller fell through to ordinary evaluation.
+        return {**base, "decision": "governor_submit_available",
+                "expected_pending": d.get("expected_pending", ""),
+                "note": "owner-queued input present; nothing delivered (evaluate-only)"}
+
     if d["action"] == "submit_queued" and not evaluate_only:
         # Press Enter on the owner's OWN queued line. Never re-sends text.
         try:
