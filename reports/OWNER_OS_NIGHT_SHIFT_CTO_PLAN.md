@@ -168,6 +168,47 @@ in §5.
 
 ---
 
+## 4b. Delivery surfaces — live state 2026-08-06
+
+### Same-chat wake bridge — LIVE and end-to-end tested
+
+| | |
+|---|---|
+| server companion | Xvfb :99 + openbox + Google Chrome (.deb) + x11vnc + noVNC |
+| access | `127.0.0.1` only, reached by SSH tunnel; nothing publicly bound |
+| browser profile | `/home/owneros/companion-profile`, mode 700, dedicated `owneros` user |
+| active chat | rotatable pointer, `owner-os-chat bind <url>`, audited, fail-closed |
+| bridge | `WAKE_BRIDGE_ENABLED=1`, cooldown 900s, kill switch available |
+| end-to-end test | event 3136 → decided 14:31:28Z → submitted 14:31:48Z → acknowledged; **exactly one** wake row, no duplicate over three further polls |
+
+Two failures worth recording, because both were reported as working before they were:
+
+* **Black screen.** Chrome was crash-looping (233 restarts, `Running as root without
+  --no-sandbox is not supported`), and I called it "running" from a transient PID caught
+  between restarts. A live PID is not evidence of a mapped window. Fixed with a dedicated
+  unprivileged user rather than `--no-sandbox`, which would have run a browser holding an
+  authenticated session as root with its sandbox off. Snap Chromium then failed a second way
+  (`not a snap cgroup` — snaps need a logind session a system service lacks) and Ubuntu 24.04
+  ships no native Chromium, hence the .deb. Proven by framebuffer: 4849 distinct colours.
+* **"Enable the already-implemented bridge"** turned out to be only the decision half; nothing
+  submitted anything. The companion daemon had to be written before "enabled" meant anything.
+
+### Telegram owner_push — configured, BLOCKED on one owner action
+
+Credentials installed in `configs/.env` (mode 600, git-ignored), service restarted, bot
+identity verified (`ezzetasecurity_bot`, getMe OK). Sending fails with
+`Bad Request: chat not found`: a bot cannot open a conversation with a user who has never
+messaged it. **The owner must press Start on the bot once.** Until then this tier is dead and
+the CTO inbox plus the same-chat wake carry everything.
+
+`getUpdates` returns 409 Conflict — the bot is already long-polled by another service, i.e.
+this is an existing product bot, not a dedicated Owner OS one. Worth separating.
+
+A related defect was found and fixed while configuring it: `owner_push` reported
+`healthy=1, status=green` while every send failed, because health was derived from
+credentials being PRESENT rather than from delivery succeeding. A rejected send now marks the
+channel unhealthy; abstention (no credentials) still does not.
+
 ## 5. Acceptance (as mandated)
 
 **24 continuous hours** unattended (owner correction 2026-08-06), ≥2 managed project agents, no manual Enter or pings;
