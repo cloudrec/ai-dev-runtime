@@ -64,6 +64,19 @@ def emit(source: str, type: str, *, project_id: str = "", agent_id: str = "",
                            conn=conn)
             except Exception:  # noqa: BLE001
                 pass
+        # Consult the wake bridge. Only CONSULTED when it is enabled, so a disabled bridge
+        # writes no audit rows at all — otherwise every urgent event would leave a "skip:
+        # bridge_disabled" row and the audit trail would be noise before it was ever used.
+        try:
+            from core import wake_bridge as _wb
+            if _wb._enabled()[0] and (severity in _PUSH_SEVERITIES or owner_action_required):
+                _d = _wb.should_wake(event_id=eid, severity=severity,
+                                     correlation_id=correlation_id,
+                                     owner_action_required=owner_action_required, conn=conn)
+                _wb.record(_d, event_id=eid, severity=severity,
+                           correlation_id=correlation_id, conn=conn)
+        except Exception:  # noqa: BLE001 — the bridge must never break event recording
+            pass
         return {"event_id": eid, "pushed": bool(pushed), "notification": pushed}
     finally:
         if own:

@@ -484,6 +484,37 @@ async def control_plane_cto_ack(req: CtoAckReq, _: bool = Depends(_auth)):
     return cto.ack_through(req.consumer, req.through_event_id)
 
 
+@router.get("/control-plane/wake/pending")
+async def control_plane_wake_pending(_: bool = Depends(_auth)):
+    """What the wake companion polls. Returns the fixed phrase and the event to acknowledge,
+    or nothing at all. Carries NO event content — the companion never learns why it woke."""
+    from core import wake_bridge as wb
+    h = wb.health()
+    pending = (h.get("last_wake_event_id") if h.get("enabled")
+               and h.get("last_wake_acknowledged") is False else None)
+    return {"wake": pending is not None, "event_id": pending,
+            "phrase": wb.WAKE_PHRASE if pending is not None else None,
+            "enabled": h.get("enabled"), "kill_switch": h.get("kill_switch")}
+
+
+class WakeAckReq(BaseModel):
+    event_id: int
+
+
+@router.post("/control-plane/wake/ack")
+async def control_plane_wake_ack(req: WakeAckReq, _: bool = Depends(_auth)):
+    """The companion confirms it submitted the phrase. Stops further wakes for this event."""
+    from core import wake_bridge as wb
+    return wb.acknowledge(req.event_id)
+
+
+@router.get("/control-plane/wake/health")
+async def control_plane_wake_health(_: bool = Depends(_auth)):
+    """Freshness for the owner: enabled, kill switch, last wake and whether it was acked."""
+    from core import wake_bridge as wb
+    return wb.health()
+
+
 @router.get("/control-plane/registry")
 async def control_plane_registry(_: bool = Depends(_auth)):
     """The auto-discovered AgentRegistry (visibility never depends on an allowlist)."""

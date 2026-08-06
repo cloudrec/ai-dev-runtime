@@ -102,3 +102,36 @@ def test_the_phrase_carries_no_event_content():
     assert d["phrase"] == wb.WAKE_PHRASE
     assert "secret-correlation-value" not in d["phrase"]
     assert "60" not in d["phrase"]
+
+
+# ── integration: consulted only when enabled ───────────────────────────────
+def test_a_disabled_bridge_writes_no_audit_rows(monkeypatch):
+    """Otherwise every urgent event leaves a `skip: bridge_disabled` row and the audit trail
+    is noise before the bridge is ever used."""
+    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "0")
+    from core.control_plane import cto
+    cto.emit("test", "urgent_thing", agent_id="a:0.0", severity="critical")
+    import sqlite3, os
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    n = c.execute("SELECT COUNT(*) FROM wake_audit").fetchone()[0] \
+        if c.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='wake_audit'"
+                     ).fetchone()[0] else 0
+    assert n == 0
+
+
+def test_an_enabled_bridge_decides_on_an_urgent_event():
+    from core.control_plane import cto
+    out = cto.emit("test", "urgent_thing", agent_id="a:0.0", severity="critical")
+    import sqlite3, os
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    row = c.execute("SELECT event_id,decision FROM wake_audit ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+    assert row[0] == out["event_id"] and row[1] == "wake"
+
+
+def test_a_broken_bridge_never_breaks_event_recording(monkeypatch):
+    from core.control_plane import cto
+    from core import wake_bridge as wb
+    monkeypatch.setattr(wb, "should_wake", lambda **k: (_ for _ in ()).throw(RuntimeError("x")))
+    out = cto.emit("test", "urgent_thing", agent_id="a:0.0", severity="critical")
+    assert out["event_id"] > 0, "the event is recorded regardless"
