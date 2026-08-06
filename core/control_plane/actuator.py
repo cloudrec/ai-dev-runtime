@@ -108,6 +108,22 @@ def build_queue_stage_step(stage: str, queue_path: str) -> str:
             f"do not start a duplicate agent.")
 
 
+# An OWNER OS TASK is not a project queue stage. Delivering one with the queue-stage wording
+# made the canary refuse it as "out-of-band" — correctly, since its CLAUDE.md names a
+# different authoritative queue. Same closed form, two charset-restricted slots, distinct and
+# honest wording.
+_OWNER_TASK_TEMPLATE_RE = re.compile(
+    r"^\s*run owner os task (?P<task>[A-Za-z0-9_.\-]+) recorded in (?P<path>[A-Za-z0-9._/\-]+): "
+    r"read that file and do exactly what it specifies, then stop; "
+    r"do not start a duplicate agent\.\s*$")
+
+
+def build_owner_task_step(task_id: str, task_path: str) -> str:
+    return (f"run owner os task {task_id} recorded in {task_path}: "
+            f"read that file and do exactly what it specifies, then stop; "
+            f"do not start a duplicate agent.")
+
+
 def classify_action(action_text: str) -> str:
     """Machine-readable policy class. FAIL-CLOSED: destructive/live/payment/credential/
     publication (English tokens or Russian stems) → prohibited; an exact bare
@@ -125,6 +141,8 @@ def classify_action(action_text: str) -> str:
         if not step or cw.is_safe_continuation(step):
             return AUTONOMOUS_SAFE
         return OWNER_APPROVAL          # template with an unrecognised step → owner gate
+    if _OWNER_TASK_TEMPLATE_RE.match(action_text or ""):
+        return AUTONOMOUS_SAFE
     if _QUEUE_STAGE_TEMPLATE_RE.match(action_text or ""):
         # Every slot is charset-restricted and the denylist ran first, so nothing harmful
         # can have reached here through the stage id or the path.

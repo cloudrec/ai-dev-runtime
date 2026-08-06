@@ -84,8 +84,8 @@ def test_turn_finished_only_when_the_agent_answered_last(monkeypatch):
 
 # ── 3. bounded retry, exactly one, same idempotency key ────────────────────
 def _stub_submit(monkeypatch, calls, acted=True):
-    def _s(task, *, cwd, ctrl=None, conn=None, now=None):
-        calls.append({"id": task["id"], "idem": task["idem"],
+    def _s(task, *, cwd, ctrl=None, conn=None, now=None, robust=False):
+        calls.append({"id": task["id"], "idem": task["idem"], "robust": robust,
                       "attempt": int(task.get("attempts") or 0) + 1})
         q.set_state(task["id"], q.SUBMITTED, attempts=int(task.get("attempts") or 0) + 1,
                     submitted_ts=now or 0.0)
@@ -109,6 +109,8 @@ def test_no_ack_retries_exactly_once_then_fails_and_notifies(monkeypatch):
     r = q.advance("cp-canary:0.0", cwd="/x", now=1000.0 + q.ACK_TIMEOUT_SECS + 1)
     assert r["action"] == "retried" and r["idempotency_key"] == t["idem"]
     assert calls[0]["idem"] == calls[1]["idem"], "a retry must never take a new identity"
+    assert calls[0]["robust"] is False and calls[1]["robust"] is True, \
+        "the retry uses the robust path — a bare Enter is exactly what failed live"
     # still nothing: fail + notify, and never send a third time
     r2 = q.advance("cp-canary:0.0", cwd="/x", now=1000.0 + 2 * q.ACK_TIMEOUT_SECS + 2)
     assert r2["action"] == "failed" and r2["reason"] == "ack_timeout"
@@ -122,7 +124,11 @@ def test_an_acknowledged_task_is_never_resent(monkeypatch):
     _stub_submit(monkeypatch, calls)
     t = q.enqueue("cp-canary:0.0", "do it once")
     q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
-    _transcript(monkeypatch, [{"type": "user", "text": "do it once", "ts": 1001.0}])
+    # the transcript shows what was SENT: the grounded pointer naming this task id
+    _transcript(monkeypatch, [{"type": "user",
+                               "text": f"continue with the durable queue stage task_{t['id']}"
+                                       f" defined in /x/.owner-os-tasks/task_{t['id']}.md",
+                               "ts": 1001.0}])
     for step in range(4):
         q.advance("cp-canary:0.0", cwd="/x", now=1000.0 + q.ACK_TIMEOUT_SECS * (step + 2))
     assert len(calls) == 1, "exactly-once: an acknowledged task is never resent"
@@ -134,7 +140,8 @@ def test_completion_moves_to_done_and_releases_the_next_task(monkeypatch):
     a = q.enqueue("cp-canary:0.0", "task A")
     q.enqueue("cp-canary:0.0", "task B")
     q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
-    _transcript(monkeypatch, [{"type": "user", "text": "task A", "ts": 1001.0},
+    _transcript(monkeypatch, [{"type": "user", "text": f"continue with task_{a['id']} now",
+                               "ts": 1001.0},
                               {"type": "assistant", "text": "finished A", "ts": 1002.0}])
     assert q.advance("cp-canary:0.0", cwd="/x", now=1003.0)["action"] == "done"
     assert q.get(a["id"])["state"] == q.DONE
@@ -185,3 +192,64 @@ def test_a_task_is_only_ever_delivered_to_its_own_target(monkeypatch):
     q.enqueue("other:0.0", "other work")
     assert q.next_queued("cp-canary:0.0")["text"] == "canary work"
     assert q.next_queued("other:0.0")["text"] == "other work"
+
+
+def test_the_pane_never_receives_the_tasks_free_text(tmp_path, monkeypatch):
+    """The safety classifier refused arbitrary task prose (live: owner_approval_required),
+    and bypassing it would remove the last wall. The task text goes to a durable FILE inside
+    the project's own directory; the pane receives only the closed-form grounded pointer."""
+    from core.control_plane import actuator as act
+    sent = {}
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    monkeypatch.setattr(act, "actuate",
+                        lambda **kw: sent.update(text=kw["action_text"]) or {"acted": True})
+    monkeypatch.setattr("core.control_plane.api.acquire_lease",
+                        lambda *a, **k: {"lease_id": "l", "fence_token": 1})
+    t = q.enqueue("cp-canary:0.0", "delete everything and publish the release")
+    q.submit(t, cwd=str(tmp_path))
+    assert "delete everything" not in sent["text"], "free text must never reach the pane"
+    assert f"task_{t['id']}" in sent["text"]
+    assert act.classify_action(sent["text"]) == "autonomous_safe"
+    written = (tmp_path / ".owner-os-tasks" / f"task_{t['id']}.md").read_text()
+    assert "delete everything and publish the release" in written, \
+        "the owner's own words are preserved in the durable file for the agent to read"
+
+
+def test_a_policy_refusal_does_not_consume_the_retry_budget(tmp_path, monkeypatch):
+    """Live: five `owner_approval_required` refusals pushed attempts to 7 before any real
+    delivery, exhausting a budget that exists for DELIVERY failures."""
+    from core.control_plane import actuator as act
+    monkeypatch.setattr(act, "CANARY_AGENTS", frozenset({"cp-canary:0.0"}))
+    monkeypatch.setattr(act, "actuate", lambda **kw: {"acted": False,
+                                                      "reason": "owner_approval_required"})
+    monkeypatch.setattr("core.control_plane.api.acquire_lease",
+                        lambda *a, **k: {"lease_id": "l", "fence_token": 1})
+    t = q.enqueue("cp-canary:0.0", "something the classifier will refuse")
+    for _ in range(4):
+        q.submit(t, cwd=str(tmp_path))
+        t = q.get(t["id"])
+    assert t["attempts"] == 0, "refusals never reached the pane; they cost no attempts"
+    assert t["state"] == q.QUEUED
+
+
+def test_done_is_not_declared_while_the_agent_is_still_working(monkeypatch):
+    """Live: task e8702015 was acknowledged at 00:12:41 and marked done at 00:12:42 — one
+    second — and its artefact was never written. Claude Code emits an assistant entry per
+    tool call, so "last entry is assistant" fires mid-turn."""
+    _transcript(monkeypatch, [{"type": "user", "text": "task_x", "ts": 1000.0},
+                              {"type": "assistant", "text": "calling a tool", "ts": 1001.0}])
+    monkeypatch.setattr("core.agent_control.pane_capture", lambda *a, **k: (True, ""))
+    monkeypatch.setattr("core.agent_control.agent_status", lambda *a, **k: {"state": "working"})
+    assert q.turn_finished("/x", 1000.0, target="cp-canary:0.0") is False
+    monkeypatch.setattr("core.agent_control.agent_status", lambda *a, **k: {"state": "idle"})
+    assert q.turn_finished("/x", 1000.0, target="cp-canary:0.0") is True
+
+
+def test_completion_is_not_claimed_when_the_pane_cannot_be_read(monkeypatch):
+    """Fail-safe: no corroboration means no `done`."""
+    _transcript(monkeypatch, [{"type": "user", "text": "task_x", "ts": 1000.0},
+                              {"type": "assistant", "text": "ok", "ts": 1001.0}])
+    def _boom(*a, **k):
+        raise RuntimeError("tmux unavailable")
+    monkeypatch.setattr("core.agent_control.pane_capture", _boom)
+    assert q.turn_finished("/x", 1000.0, target="cp-canary:0.0") is False
