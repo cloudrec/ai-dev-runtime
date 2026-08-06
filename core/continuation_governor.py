@@ -593,6 +593,27 @@ def govern(target: str, *, state: str, pending: str = "", tail: str = "",
                             "queue_path": qpath,
                             "resume_instruction": q.get("resume_instruction", ""),
                             "note": "next stage taken verbatim from the durable queue"}
+                if status.startswith("BLOCKED"):
+                    # A stage the queue itself marks blocked is NOT a bare skip. Live on
+                    # MESS stage_09: status BLOCKED_EXTERNAL with three recorded blockers
+                    # (stage_08 precondition PARTIAL, empty Android SDK, no device or
+                    # emulator) — the governor answered `skip:stage_status_blocked_external`
+                    # and recorded nothing, so a project stopped for reasons no one was told
+                    # about. None of these are derivable from policy, so they are a genuine
+                    # owner decision. Fields are quoted from the queue, never invented.
+                    fields = []
+                    for b in (cur.get("blockers") or []):
+                        if isinstance(b, dict):
+                            fields.append(f"{b.get('id', 'blocker')}: "
+                                          f"{str(b.get('detail') or '').strip()[:200]}")
+                        elif str(b).strip():
+                            fields.append(str(b).strip()[:200])
+                    return {"action": "blocker", "reason": "stage_blocked_external",
+                            "owner_blocker": True, "stage": q.get("pointer"),
+                            "blocker_fields": fields or [f"stage status {status}"],
+                            "queue_path": qpath,
+                            "note": "the queue itself marks this stage blocked; the reasons "
+                                    "are quoted from it and need an owner decision"}
                 return {"action": "skip", "reason": f"stage_status_{status.lower() or 'unknown'}",
                         "stage": q.get("pointer")}
 

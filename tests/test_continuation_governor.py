@@ -1421,3 +1421,32 @@ def test_evaluate_only_reports_queued_input_instead_of_going_blind(tmp_path, mon
     assert out is not None, "evaluate-only must never be blind to submittable input"
     assert out["decision"] == "governor_submit_available"
     assert out["expected_pending"] == "[Pasted text #4 +57 lines]"
+
+
+def test_a_blocked_external_stage_is_surfaced_not_silently_skipped(tmp_path):
+    """Live on MESS stage_09: status BLOCKED_EXTERNAL with three recorded blockers, and the
+    governor answered `skip:stage_status_blocked_external` while recording nothing — a
+    project stopped for reasons nobody was told."""
+    import yaml as _y
+    stages = [{"id": "stage_09", "status": "BLOCKED_EXTERNAL", "next_stage": None,
+               "blockers": [{"id": "no_android_sdk", "detail": "ANDROID_HOME unset"},
+                            {"id": "no_device", "detail": "no adb, no emulator"}]}]
+    body = _y.safe_dump({"pointer": "stage_09", "cwd": str(tmp_path), "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, str(p)))
+    assert d["action"] == "blocker" and d["reason"] == "stage_blocked_external"
+    assert d["owner_blocker"] is True
+    assert any("no_android_sdk" in f for f in d["blocker_fields"])
+    assert any("no adb" in f for f in d["blocker_fields"])
+
+
+def test_blocked_stage_reasons_are_quoted_never_invented(tmp_path):
+    import yaml as _y
+    stages = [{"id": "s1", "status": "BLOCKED", "blockers": [], "next_stage": None}]
+    body = _y.safe_dump({"pointer": "s1", "cwd": str(tmp_path), "stages": stages})
+    p = tmp_path / "Q.md"
+    p.write_text("## MACHINE-READABLE STATE\n\n```yaml\n" + body + "```\n")
+    d = cg.govern("cp-canary:0.0", state="idle", config=_canary_cfg(tmp_path, str(p)))
+    assert d["action"] == "blocker"
+    assert d["blocker_fields"] == ["stage status BLOCKED"], "no reason is fabricated"
