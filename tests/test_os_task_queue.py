@@ -253,3 +253,36 @@ def test_completion_is_not_claimed_when_the_pane_cannot_be_read(monkeypatch):
         raise RuntimeError("tmux unavailable")
     monkeypatch.setattr("core.agent_control.pane_capture", _boom)
     assert q.turn_finished("/x", 1000.0, target="cp-canary:0.0") is False
+
+
+def test_an_agent_that_dies_after_ack_does_not_stall_forever(monkeypatch):
+    """Live gap: T7 was acknowledged, its agent was then killed, and the task sat in
+    `working` indefinitely — the bounded timeout covered only the ack phase."""
+    calls = []
+    _stub_submit(monkeypatch, calls)
+    t = q.enqueue("cp-canary:0.0", "will be abandoned")
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
+    _transcript(monkeypatch, [{"type": "user", "text": f"task_{t['id']}", "ts": 1001.0}])
+    monkeypatch.setattr(q, "_agent_busy", lambda target: False)
+    notified = []
+    monkeypatch.setattr(q, "_notify_owner",
+                        lambda t_, r, d: notified.append(r) or "gate")
+    # within the bound: still working, no alarm
+    assert q.advance("cp-canary:0.0", cwd="/x",
+                     now=1001.0 + q.WORK_STALL_SECS - 1)["action"] == "working"
+    r = q.advance("cp-canary:0.0", cwd="/x", now=1001.0 + q.WORK_STALL_SECS + 1)
+    assert r["action"] == "failed" and r["reason"] == "work_stall"
+    assert notified == ["stalled after acknowledgement"]
+    assert q.get(t["id"])["state"] == q.FAILED
+
+
+def test_a_long_running_turn_is_never_declared_stalled(monkeypatch):
+    """Anti-overcorrection: MESS legitimately held one turn for 1h19m."""
+    calls = []
+    _stub_submit(monkeypatch, calls)
+    t = q.enqueue("cp-canary:0.0", "long but healthy")
+    q.advance("cp-canary:0.0", cwd="/x", now=1000.0)
+    _transcript(monkeypatch, [{"type": "user", "text": f"task_{t['id']}", "ts": 1001.0}])
+    monkeypatch.setattr(q, "_agent_busy", lambda target: True)      # still executing
+    r = q.advance("cp-canary:0.0", cwd="/x", now=1001.0 + q.WORK_STALL_SECS * 10)
+    assert r["action"] == "working", "a busy agent is never failed for taking its time"

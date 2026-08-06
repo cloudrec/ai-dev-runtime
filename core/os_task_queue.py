@@ -36,6 +36,12 @@ from core.control_plane.store import now_iso, now_ts
 ACK_TIMEOUT_SECS = int(os.getenv("OS_TASK_ACK_TIMEOUT_SECS", "120"))
 # A task may be sent at most twice: the original and exactly one retry.
 MAX_ATTEMPTS = int(os.getenv("OS_TASK_MAX_ATTEMPTS", "2"))
+# An acknowledged task whose agent has STOPPED without finishing is stalled. The bound is
+# generous and additionally requires the pane to be idle, because real work legitimately runs
+# for a long time (MESS held one turn for 1h19m). Live gap this closes: an agent killed right
+# after acknowledging left its task in `working` indefinitely with no timeout at all — the
+# ack-phase timeout did not cover the working phase.
+WORK_STALL_SECS = int(os.getenv("OS_TASK_WORK_STALL_SECS", "600"))
 
 QUEUED, SUBMITTED, ACKNOWLEDGED = "queued", "submitted", "acknowledged"
 WORKING, DONE, FAILED, OWNER_BLOCKED = "working", "done", "failed", "owner_blocked"
@@ -356,6 +362,23 @@ def _notify_owner(task: dict, reason: str, detail: str) -> Optional[str]:
         return None
 
 
+def _agent_busy(target: str) -> bool:
+    """Is the pane actually executing? Diagnostic corroboration only — it can delay a stall
+    verdict, never create or cancel a task. Unreadable ⇒ treated as busy (fail-safe: we do
+    not declare a stall we cannot see)."""
+    if not target:
+        return True
+    try:
+        from core import agent_control as ac
+        from core.commander_autopilot import is_progressing
+        ok, tail = ac.pane_capture(target, 12)
+        if not ok:
+            return True
+        return is_progressing(ac.agent_status(target).get("state") or "", tail)
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def advance(target: str, *, cwd: str, ctrl=None, conn=None,
             now: Optional[float] = None) -> dict:
     """One deterministic step of the state machine for `target`. Reads no pane to decide."""
@@ -384,7 +407,18 @@ def advance(target: str, *, cwd: str, ctrl=None, conn=None,
             return {"action": "done", "task_id": task["id"]}
         if task["state"] != WORKING:
             set_state(task["id"], WORKING, conn=conn)
-        return {"action": "working", "task_id": task["id"]}
+        # Acknowledged, but has the agent simply stopped? An idle pane that never produced a
+        # completion is a stall, and a stall must never be silent.
+        since_ack = now - float(task.get("ack_ts") or now)
+        if since_ack > WORK_STALL_SECS and not _agent_busy(target):
+            gate = _notify_owner(task, "stalled after acknowledgement",
+                                 f"agent idle {int(since_ack)}s without completing")
+            set_state(task["id"], FAILED, conn=conn, done_at=now_iso(),
+                      last_error=f"stalled_after_ack_{int(since_ack)}s")
+            return {"action": "failed", "task_id": task["id"], "gate_id": gate,
+                    "reason": "work_stall"}
+        return {"action": "working", "task_id": task["id"],
+                "since_ack_secs": int(since_ack)}
 
     # Not acknowledged. Bounded wait, then exactly one retry on the same idempotency key.
     waited = now - float(task.get("submitted_ts") or now)
