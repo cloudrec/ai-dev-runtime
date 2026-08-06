@@ -49,6 +49,17 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
     id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER, updated_at TEXT);
 
+-- Forward-only enforced by the DATABASE, not only by the writer. Fixing init_db protects
+-- processes running the fixed code; it cannot protect against a process that imported an
+-- OLDER build and is still alive (a daemon polling every 20s keeps rewriting the version
+-- backwards from memory, and restarting that daemon is not always available). The trigger
+-- silently ignores any UPDATE that would lower the version, so the recorded number can
+-- never regress below the schema that is actually present.
+CREATE TRIGGER IF NOT EXISTS trg_schema_meta_forward_only
+    BEFORE UPDATE ON schema_meta
+    WHEN NEW.version < OLD.version
+    BEGIN SELECT RAISE(IGNORE); END;
+
 -- append-only event bus/log = the ONE event table AND the canonical CTO inbox.
 -- (v2) enriched with the CTO push contract fields.
 CREATE TABLE IF NOT EXISTS event (
@@ -243,8 +254,13 @@ def init_db(conn: sqlite3.Connection | None = None) -> sqlite3.Connection:
     if not row:
         conn.execute("INSERT INTO schema_meta(id,version,updated_at) VALUES(1,?,?)",
                      (SCHEMA_VERSION, now_iso()))
-    elif row[0] != SCHEMA_VERSION:
-        # forward-only migrations would run here; P0 is version 1
+    elif row[0] < SCHEMA_VERSION:
+        # FORWARD-ONLY, as the module contract says. The old `!=` also fired when the
+        # stored version was NEWER than this process' constant, so any long-lived process
+        # that imported an older build kept rewriting the number BACKWARDS — live
+        # 2026-08-06: the wake companion (started 20:05, constant 4) and the restarted
+        # runtime (constant 7) flipped `schema_meta` every 20-30s while every v5/v6/v7
+        # object was actually present. A downgrade write is never a migration.
         conn.execute("UPDATE schema_meta SET version=?, updated_at=? WHERE id=1",
                      (SCHEMA_VERSION, now_iso()))
     conn.commit()
