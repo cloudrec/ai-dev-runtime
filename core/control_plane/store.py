@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Identity of THIS process run. Delivery health is evidence-scoped to a runtime: a proof
 # recorded by a PREVIOUS process (before a restart/redeploy) is history, not a live claim
@@ -187,6 +187,16 @@ CREATE TABLE IF NOT EXISTS policy_claim (
     risk_class TEXT, state TEXT DEFAULT 'active', created_at TEXT, created_ts REAL,
     released_at TEXT);
 CREATE INDEX IF NOT EXISTS ix_policy_claim_project ON policy_claim(project, state);
+
+-- (v7) WORK EVIDENCE cursor. Owner OS used to notice work only when an agent's observable
+-- STATE changed or a stage pointer moved. A finished report, a partial completion, an
+-- abandoned goal and fresh commits were all invisible if the pointer stood still (live
+-- 2026-08-06: MESS shipped goal 2, declared goal 1 not started, went idle — zero events).
+-- One row per piece of evidence already seen, so the same report is never re-announced.
+CREATE TABLE IF NOT EXISTS work_evidence (
+    id TEXT PRIMARY KEY, project TEXT, target TEXT, kind TEXT, ref TEXT,
+    fingerprint TEXT, first_seen_at TEXT, last_seen_at TEXT, event_id INTEGER);
+CREATE INDEX IF NOT EXISTS ix_work_evidence_project ON work_evidence(project, kind);
 """
 
 
