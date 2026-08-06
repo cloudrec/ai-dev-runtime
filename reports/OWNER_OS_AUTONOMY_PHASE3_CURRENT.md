@@ -1,9 +1,30 @@
 # OWNER OS — AUTONOMY PHASE 3: CONTINUATION GOVERNOR (LIVE)
 
-**Status: `OWNER_OS_AUTONOMY_PHASE3 = PASS` at commit `c13ef86` (see ACCEPTANCE RESULT below for the exact evidence, and "What this PASS does not claim" for the limits).** Persisted 2026-08-05 before any work, so context
-compaction cannot lose it. Phase 3 begins ONLY if the Phase 2 6-hour checkpoint is clean
-enough to continue; Phase 2 evidence lives in `OWNER_OS_AUTONOMY_PHASE2_CURRENT.md` and is
-kept separate from this file.
+**Status: `OWNER_OS_AUTONOMY = VERIFIED PASS` (owner-confirmed 2026-08-06) for the
+deterministic queue/governor architecture.**
+
+Both live acceptance runs are green:
+
+* **Run 1 — 7 ledger tasks on cp-canary, zero manual Enter, every task `attempts=1`:** simple
+  typed task, multiline preserved exactly, `/clear` + runtime restart (ack 00:06:16Z after the
+  00:06:11Z restart), ordering, a real agent restart (new pane PID 1068657), a forced ack
+  timeout (`no_ack_after_128s`, gate `77509577bc19`) and a forced post-ack stall
+  (`stalled_after_ack_397s`, gate `8822f832fe4f`). One tmux window throughout, no duplicates,
+  no cross-project delivery, explicit owner notification on both failure paths.
+* **Run 2 — three-stage project queue, start to completion, no human intervention:**
+  `stage_f1_notes` 00:36:56Z, `stage_f2_summary` 00:37:59Z, `stage_f3_final` 00:39:07Z, each
+  `attempts=1`, artefacts F1/F2/F3 exact.
+
+Architecture: continuations exist only as rows in `os_task`
+(`queued → submitted → acknowledged → working → done | failed | owner_blocked`); one
+lease-gated actuator records send time, pane, task id, idempotency key and evidence;
+acknowledgement is read from the conversation TRANSCRIPT, never the prompt; retry exactly once
+on the same idempotency key; `/clear` and restart restore from the ledger. Task text never
+reaches a pane — it goes to a durable file and the pane receives a closed-form pointer, so the
+safety classifier stays intact. Screen reading is diagnostic only.
+
+Payment and JobHunter are policy-excluded and are not judged for autonomy. Arbitrage2 remains
+paused. MESS advancement is held pending its stage_08 product gaps.
 
 ## Goal
 
