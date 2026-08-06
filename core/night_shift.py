@@ -97,6 +97,28 @@ def consume_signals(ids: list, conn=None) -> int:
             conn.close()
 
 
+SIGNAL_RETENTION_SECS = int(os.getenv("NIGHT_SHIFT_SIGNAL_RETENTION_SECS", str(7 * 86400)))
+
+
+def prune_signals(conn=None, now: Optional[float] = None) -> int:
+    """Drop consumed signals past their retention window.
+
+    Wiring a producer with no consumer let this table reach 71 rows within minutes of
+    deploying the emitter. Consumption alone is not enough — consumed rows must also age
+    out, or the accelerator becomes a slow leak.
+    """
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        cur = conn.execute("DELETE FROM ns_signal WHERE consumed=1 AND ts < ?",
+                           (now - SIGNAL_RETENTION_SECS,))
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        if own:
+            conn.close()
+
+
 # ── the make-work brake ──────────────────────────────────────────────────────
 def _fingerprint(target: str, kind: str, summary: str) -> str:
     import hashlib
@@ -224,6 +246,7 @@ def executive_pass(*, trigger: str = "tick", conn=None, now: Optional[float] = N
         # arrives with the portfolio brain (phase 4) behind the same brakes, so an executive
         # that is merely alive can never manufacture work.
         consume_signals([s["id"] for s in obs.get("signals", [])], conn=conn)
+        prune_signals(conn=conn, now=now)
         conn.execute("INSERT INTO ns_pass (ts,at,trigger,observed,findings,acted) "
                      "VALUES (?,?,?,?,?,?)",
                      (now, now_iso(), trigger, len(obs.get("signals", [])),

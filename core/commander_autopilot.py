@@ -931,6 +931,17 @@ def tick(*, inventory: Optional[dict] = None, registry: Optional[dict] = None,
 
         _record_run(target, ev["decision"], ev, conn=conn)
         results.append(ev)
+    # Run the Night Shift executive on the back of the tick the service already runs. The
+    # emitter was deployed without a consumer, so signals accumulated (71 rows within minutes)
+    # and the event-driven wake was never actually executing. Best-effort by construction: the
+    # executive must never be able to break the control loop it observes.
+    if not evaluate_only:
+        try:
+            from core import night_shift as _ns
+            _ns.executive_pass(trigger="autopilot_tick", conn=conn)
+        except Exception:  # noqa: BLE001
+            pass
+
     return {"evaluated": len(results), "results": results,
             "poked": sum(1 for r in results if r.get("delivered")),
             "owner_gated": sum(1 for r in results if r["decision"] == "poke_owner_gated")}

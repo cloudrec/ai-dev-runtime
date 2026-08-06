@@ -139,3 +139,29 @@ def test_event_recording_survives_an_unavailable_executive(monkeypatch):
     monkeypatch.setattr(_ns, "signal", _boom)
     out = cto.emit("os_task_queue", "task_failed", agent_id="c:0.0", severity="critical")
     assert out["event_id"] > 0, "the event is recorded regardless"
+
+
+def test_consumed_signals_age_out():
+    """A producer with no consumer let this table reach 71 rows in minutes. Consumption
+    alone is not enough — consumed rows must age out too."""
+    sid = ns.signal("test", "old", target="t:0.0")
+    ns.consume_signals([sid])
+    assert ns.prune_signals(now=ns.now_ts()) == 0, "recent consumed rows are kept"
+    removed = ns.prune_signals(now=ns.now_ts() + ns.SIGNAL_RETENTION_SECS + 1)
+    assert removed == 1
+
+
+def test_unconsumed_signals_are_never_pruned():
+    ns.signal("test", "still_pending", target="t:0.0")
+    ns.prune_signals(now=ns.now_ts() + ns.SIGNAL_RETENTION_SECS * 10)
+    assert len(ns.pending_signals()) == 1, "an unhandled signal must never be dropped"
+
+
+def test_the_autopilot_tick_drains_signals(monkeypatch, tmp_path):
+    """The wake must actually RUN in the service, not merely exist."""
+    from core import commander_autopilot as ap
+    ns.signal("test", "wake_me", target="cp-canary:0.0")
+    assert len(ns.pending_signals()) == 1
+    monkeypatch.setattr(ap, "load_registry", lambda *a, **k: {})
+    ap.tick(inventory={"agents": []}, registry={})
+    assert ns.pending_signals() == [], "the tick must consume pending signals"
