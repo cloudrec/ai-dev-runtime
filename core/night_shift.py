@@ -204,6 +204,11 @@ def observe(conn=None) -> dict:
                              if osx.classify_gate(g.get("kind")) == "owner_decision"]
     except Exception:  # noqa: BLE001
         pass
+    try:
+        out["resources"] = observe_resources(conn=conn)
+        out["services"] = observe_services()
+    except Exception:  # noqa: BLE001
+        out["resources"], out["services"] = [], []
     return out
 
 
@@ -220,6 +225,8 @@ def diagnose(obs: dict) -> list:
         findings.append({"kind": "owner_decision_open", "target": g.get("agent_id") or "",
                          "severity": "high", "source": "owner_gate",
                          "detail": (g.get("reason") or "")[:160]})
+    findings.extend(obs.get("resources") or [])
+    findings.extend(obs.get("services") or [])
     for t, meta in (obs.get("targets") or {}).items():
         if not meta.get("enabled"):
             findings.append({"kind": "project_paused", "target": t, "severity": "info",
@@ -258,3 +265,107 @@ def executive_pass(*, trigger: str = "tick", conn=None, now: Optional[float] = N
     finally:
         if own:
             conn.close()
+
+
+# ── phase 3: observation breadth ─────────────────────────────────────────────
+# A single spike is not pressure. Sustained means N consecutive samples over the line, which
+# is why samples are durable rather than read once — a restart must not reset the judgement.
+PRESSURE_SAMPLES_NEEDED = int(os.getenv("NIGHT_SHIFT_PRESSURE_SAMPLES", "3"))
+MEM_AVAIL_MIN_PCT = float(os.getenv("NIGHT_SHIFT_MEM_AVAIL_MIN_PCT", "8"))
+LOAD_PER_CPU_MAX = float(os.getenv("NIGHT_SHIFT_LOAD_PER_CPU_MAX", "3.0"))
+DISK_FREE_MIN_PCT = float(os.getenv("NIGHT_SHIFT_DISK_FREE_MIN_PCT", "5"))
+
+_PRESSURE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ns_pressure (
+    metric TEXT PRIMARY KEY, breaches INTEGER, last_value REAL, last_ts REAL, last_at TEXT
+)
+"""
+
+
+def _pressure(metric: str, breached: bool, value: float, *, conn=None,
+              now: Optional[float] = None) -> int:
+    """Count consecutive breaches for a metric; any healthy sample resets it to zero."""
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        conn.execute(_PRESSURE_SCHEMA)
+        r = conn.execute("SELECT breaches FROM ns_pressure WHERE metric=?", (metric,)).fetchone()
+        n = (int(r[0]) if r else 0) + 1 if breached else 0
+        conn.execute("INSERT INTO ns_pressure VALUES (?,?,?,?,?) ON CONFLICT(metric) DO UPDATE "
+                     "SET breaches=excluded.breaches, last_value=excluded.last_value,"
+                     "last_ts=excluded.last_ts, last_at=excluded.last_at",
+                     (metric, n, value, now, now_iso()))
+        conn.commit()
+        return n
+    finally:
+        if own:
+            conn.close()
+
+
+def observe_resources(conn=None, now: Optional[float] = None) -> list:
+    """Memory, load and disk. Read-only; reports only SUSTAINED pressure."""
+    findings = []
+    try:
+        mem = {}
+        with open("/proc/meminfo", "r", encoding="utf-8") as fh:
+            for line in fh:
+                k, _, v = line.partition(":")
+                mem[k.strip()] = float(v.strip().split()[0])
+        total, avail = mem.get("MemTotal", 0.0), mem.get("MemAvailable", 0.0)
+        pct = (avail / total * 100.0) if total else 100.0
+        n = _pressure("mem_available_pct", pct < MEM_AVAIL_MIN_PCT, pct, conn=conn, now=now)
+        if n >= PRESSURE_SAMPLES_NEEDED:
+            findings.append({"kind": "resource_pressure", "metric": "memory",
+                             "severity": "high", "target": "", "source": "resources",
+                             "evidence": f"MemAvailable {pct:.1f}% for {n} consecutive samples",
+                             "recommendation": "identify the largest resident consumers before "
+                                               "starting new work; do not add concurrency"})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        with open("/proc/loadavg", "r", encoding="utf-8") as fh:
+            load1 = float(fh.read().split()[0])
+        cpus = os.cpu_count() or 1
+        per = load1 / cpus
+        n = _pressure("load_per_cpu", per > LOAD_PER_CPU_MAX, per, conn=conn, now=now)
+        if n >= PRESSURE_SAMPLES_NEEDED:
+            findings.append({"kind": "resource_pressure", "metric": "cpu",
+                             "severity": "warning", "target": "", "source": "resources",
+                             "evidence": f"load {load1:.2f} over {cpus} cpus "
+                                         f"({per:.2f}/cpu) for {n} samples",
+                             "recommendation": "defer new dispatch until load settles"})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        st = os.statvfs("/")
+        free_pct = (st.f_bavail / st.f_blocks * 100.0) if st.f_blocks else 100.0
+        n = _pressure("disk_free_pct", free_pct < DISK_FREE_MIN_PCT, free_pct,
+                      conn=conn, now=now)
+        if n >= PRESSURE_SAMPLES_NEEDED:
+            findings.append({"kind": "resource_pressure", "metric": "disk",
+                             "severity": "critical", "target": "", "source": "resources",
+                             "evidence": f"root filesystem {free_pct:.1f}% free for {n} samples",
+                             "recommendation": "free space before any build or backup runs"})
+    except Exception:  # noqa: BLE001
+        pass
+    return findings
+
+
+def observe_services(units: Optional[list] = None) -> list:
+    """Are the units Owner OS depends on actually running? Read-only, no restarts."""
+    findings = []
+    units = units if units is not None else ["ai-runtime.service"]
+    import subprocess
+    for u in units:
+        try:
+            rc = subprocess.run(["systemctl", "is-active", u], capture_output=True,
+                                text=True, timeout=10)
+            state = (rc.stdout or "").strip()
+        except Exception as e:  # noqa: BLE001
+            state = f"unknown:{str(e)[:40]}"
+        if state != "active":
+            findings.append({"kind": "service_down", "target": u, "severity": "critical",
+                             "source": "services", "evidence": f"systemctl is-active = {state}",
+                             "recommendation": "a control-plane unit is not active; autonomy "
+                                               "is degraded until it is restored"})
+    return findings

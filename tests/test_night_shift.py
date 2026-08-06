@@ -165,3 +165,50 @@ def test_the_autopilot_tick_drains_signals(monkeypatch, tmp_path):
     monkeypatch.setattr(ap, "load_registry", lambda *a, **k: {})
     ap.tick(inventory={"agents": []}, registry={})
     assert ns.pending_signals() == [], "the tick must consume pending signals"
+
+
+# ── phase 3: observation breadth ───────────────────────────────────────────
+def test_a_single_spike_is_not_pressure():
+    """One bad sample is noise. Reporting it would train the owner to ignore the signal."""
+    for i in range(ns.PRESSURE_SAMPLES_NEEDED - 1):
+        n = ns._pressure("mem_available_pct", True, 3.0)
+        assert n < ns.PRESSURE_SAMPLES_NEEDED, i
+    assert ns._pressure("mem_available_pct", True, 3.0) >= ns.PRESSURE_SAMPLES_NEEDED
+
+
+def test_one_healthy_sample_resets_the_breach_count():
+    for _ in range(ns.PRESSURE_SAMPLES_NEEDED):
+        ns._pressure("load_per_cpu", True, 9.0)
+    assert ns._pressure("load_per_cpu", False, 0.5) == 0, "recovery clears the pressure"
+
+
+def test_pressure_state_is_durable_across_a_restart():
+    """A restart must not reset the judgement — otherwise sustained pressure is unprovable."""
+    ns._pressure("disk_free_pct", True, 2.0)
+    ns._pressure("disk_free_pct", True, 2.0)
+    import sqlite3, os
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    row = c.execute("SELECT breaches FROM ns_pressure WHERE metric='disk_free_pct'").fetchone()
+    assert row[0] == 2, "the count lives in the DB, not in memory"
+
+
+def test_a_down_service_is_critical_with_a_recommendation():
+    out = ns.observe_services(units=["definitely-not-a-real-unit.service"])
+    assert out and out[0]["kind"] == "service_down"
+    assert out[0]["severity"] == "critical"
+    assert out[0]["recommendation"], "a finding without a recommendation is just an alarm"
+
+
+def test_a_healthy_service_produces_no_finding():
+    assert ns.observe_services(units=["ai-runtime.service"]) == []
+
+
+def test_breadth_findings_reach_the_executive(monkeypatch):
+    monkeypatch.setattr(ns, "observe_resources", lambda conn=None, now=None: [
+        {"kind": "resource_pressure", "metric": "memory", "severity": "high",
+         "target": "", "source": "resources", "evidence": "e", "recommendation": "r"}])
+    monkeypatch.setattr(ns, "observe_services", lambda units=None: [])
+    out = ns.executive_pass(trigger="test")
+    kinds = [f["kind"] for f in out["findings"]]
+    assert "resource_pressure" in kinds
+    assert out["findings"][0]["severity"] in ("critical", "high"), "ranked ahead of noise"
