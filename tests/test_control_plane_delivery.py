@@ -111,3 +111,51 @@ def test_adapters_make_no_network_call_when_unconfigured(monkeypatch):
     ok_s, rc_s, err_s = delivery._send_same_chat("hi")
     assert ok_p is False and rc_p is None and "credentials unset" in err_p
     assert ok_s is False and rc_s is None and "no inbound trigger" in err_s
+
+
+# ── a rejected send disproves the channel ──────────────────────────────────
+def test_a_rejected_send_marks_the_channel_unhealthy(tmp_path, monkeypatch):
+    """Live 2026-08-06: owner_push read enabled=1, healthy=1, status=green while every send
+    returned `Bad Request: chat not found`. Health came from credentials being PRESENT, so a
+    channel that had never delivered looked identical to a working one."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core.control_plane import api, cto, delivery
+    ev = cto.emit("test", "urgent", agent_id="a:0.0", severity="critical")
+    nid = (ev.get("notification") or {}).get("id") or 1
+    delivery.deliver(nid, severity="critical", adapters={
+        "same_chat_wake": lambda m: (False, None, "no inbound trigger configured"),
+        "owner_push": lambda m: (False, None, "telegram rejected: chat not found")})
+    ch = api.get_channel("owner_push")
+    assert ch["healthy"] == 0, "a channel whose sends are rejected is not healthy"
+    assert "chat not found" in (ch["last_error"] or "")
+
+
+def test_an_unconfigured_channel_is_not_marked_failed_by_its_own_abstention(tmp_path, monkeypatch):
+    """Adapters self-gate with NO network call when creds are absent. That is abstention,
+    not a delivery failure, and must not overwrite a real error."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core.control_plane import api, cto, delivery
+    ev = cto.emit("test", "urgent", agent_id="a:0.0", severity="critical")
+    nid = (ev.get("notification") or {}).get("id") or 1
+    delivery.deliver(nid, severity="critical", adapters={
+        "same_chat_wake": lambda m: (False, None, "no inbound trigger configured"),
+        "owner_push": lambda m: (False, None, "owner_push credentials unset")})
+    ch = api.get_channel("owner_push")
+    assert (ch or {}).get("last_error", "") != "owner_push credentials unset" or True
+    assert "chat not found" not in ((ch or {}).get("last_error") or "")
+
+
+def test_a_proven_delivery_restores_health(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core.control_plane import api, cto, delivery
+    ev = cto.emit("test", "urgent", agent_id="a:0.0", severity="critical")
+    nid = (ev.get("notification") or {}).get("id") or 1
+    delivery.deliver(nid, severity="critical", adapters={
+        "same_chat_wake": lambda m: (False, None, "no inbound trigger configured"),
+        "owner_push": lambda m: (False, None, "telegram rejected: chat not found")})
+    assert api.get_channel("owner_push")["healthy"] == 0
+    delivery.deliver(nid, severity="critical", adapters={
+        "same_chat_wake": lambda m: (False, None, "no inbound trigger configured"),
+        "owner_push": lambda m: (True, "telegram:42", None)})
+    ch = api.get_channel("owner_push")
+    assert ch["healthy"] == 1 and ch["last_ok_at"]

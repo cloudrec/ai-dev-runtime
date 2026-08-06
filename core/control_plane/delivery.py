@@ -199,6 +199,22 @@ def _message_for(notif_id: int, conn=None) -> str:
     return "(owner-os event)"
 
 
+def _mark_channel_failed(tier: str, error: str, conn=None) -> None:
+    """Record a PROVEN delivery FAILURE. A channel whose sends are rejected is not healthy,
+    whatever its configuration says.
+
+    Live 2026-08-06: owner_push reported enabled=1, healthy=1, status=green while every send
+    returned `Bad Request: chat not found`. Health was derived purely from credentials being
+    PRESENT, so a channel that had never delivered anything looked identical to a working one
+    — the same false-green that makes a monitoring system worse than none.
+    """
+    try:
+        api.upsert_channel(tier, enabled=True, healthy=False,
+                           last_error=str(error or "send failed")[:200], conn=conn)
+    except Exception:  # noqa: BLE001 — never let bookkeeping break a delivery attempt
+        pass
+
+
 def _mark_channel_ok(tier: str, conn=None) -> None:
     """Record a PROVEN delivery on a channel — sets last_ok_at so `verified` (and, for
     same_chat_wake, `same_chat_wake_complete`) flips true only after a real receipt."""
@@ -223,6 +239,10 @@ def deliver(notif_id: int, *, severity: str = "info", adapters=None, conn=None) 
             _mark_channel_ok(tier, conn=conn)
             attempts.append({"tier": tier, "result": "sent", "receipt": receipt})
             return {"delivered": True, "tier": tier, "receipt": receipt, "attempts": attempts}
+        # A rejected send is EVIDENCE the channel does not work. Configuration presence is
+        # not health; only a delivery proves a channel, and only a failure disproves it.
+        if err and "credentials unset" not in str(err) and "no inbound trigger" not in str(err):
+            _mark_channel_failed(tier, err, conn=conn)
         attempts.append({"tier": tier, "result": ("error" if err else "unavailable"),
                          "detail": err})
     # nothing proactive delivered → visible failure + remains in the durable inbox (pull)
