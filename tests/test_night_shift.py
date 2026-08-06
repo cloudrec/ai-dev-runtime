@@ -104,3 +104,38 @@ def test_phase_2_creates_no_work_at_all():
     out = ns.executive_pass(trigger="signal")
     assert out["acted"] == []
     assert q._list("1=1") == [], "no task rows may be created by an executive pass"
+
+
+# ── the signal source: cto.emit feeds the executive ────────────────────────
+def test_a_high_severity_event_wakes_the_executive():
+    from core.control_plane import cto
+    cto.emit("os_task_queue", "task_failed", agent_id="cp-canary:0.0", severity="high",
+             payload={"task_id": "t1"})
+    kinds = [s["kind"] for s in ns.pending_signals()]
+    assert "task_failed" in kinds
+
+
+def test_an_owner_decision_wakes_the_executive_even_at_low_severity():
+    from core.control_plane import cto
+    cto.emit("governor", "needs_owner_payload", agent_id="mess:0.0", severity="info",
+             owner_action_required=True)
+    assert [s["kind"] for s in ns.pending_signals()] == ["needs_owner_payload"]
+
+
+def test_routine_info_events_do_not_wake_the_executive():
+    """Noise suppression: waking on every info event would make the signal meaningless."""
+    from core.control_plane import cto
+    cto.emit("discovery", "agent_seen", agent_id="x:0.0", severity="info")
+    assert ns.pending_signals() == []
+
+
+def test_event_recording_survives_an_unavailable_executive(monkeypatch):
+    """The signal is an accelerator. Emitting an event must never fail because the
+    executive's table is unreachable."""
+    from core.control_plane import cto
+    from core import night_shift as _ns
+    def _boom(*a, **k):
+        raise RuntimeError("ns table gone")
+    monkeypatch.setattr(_ns, "signal", _boom)
+    out = cto.emit("os_task_queue", "task_failed", agent_id="c:0.0", severity="critical")
+    assert out["event_id"] > 0, "the event is recorded regardless"

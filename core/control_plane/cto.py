@@ -51,6 +51,19 @@ def emit(source: str, type: str, *, project_id: str = "", agent_id: str = "",
             pushed = enqueue_notification(event_id=eid, channel=push_channel,
                                           dedup_key=dedup_key or f"evt:{eid}",
                                           correlation_id=correlation_id, conn=conn)
+        # Wake the Night Shift executive at once for anything that matters. This is an
+        # ACCELERATOR only: the bounded tick still runs, so a dropped signal costs latency,
+        # never correctness. Deliberately best-effort — event recording must never fail
+        # because the executive's table is unavailable.
+        if severity in _PUSH_SEVERITIES or owner_action_required:
+            try:
+                from core import night_shift as _ns
+                _ns.signal(source, type, target=agent_id or project_id,
+                           payload={"event_id": eid, "severity": severity,
+                                    "owner_action_required": bool(owner_action_required)},
+                           conn=conn)
+            except Exception:  # noqa: BLE001
+                pass
         return {"event_id": eid, "pushed": bool(pushed), "notification": pushed}
     finally:
         if own:
