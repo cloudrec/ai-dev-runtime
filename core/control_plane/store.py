@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Identity of THIS process run. Delivery health is evidence-scoped to a runtime: a proof
 # recorded by a PREVIOUS process (before a restart/redeploy) is history, not a live claim
@@ -162,6 +162,31 @@ CREATE TABLE IF NOT EXISTS cp_action (
     submitted INTEGER DEFAULT 0, verified INTEGER DEFAULT 0, blocked INTEGER DEFAULT 0,
     attempts INTEGER DEFAULT 0, outcome TEXT, created_at TEXT, updated_at TEXT);
 CREATE INDEX IF NOT EXISTS ix_cp_action_target ON cp_action(target, action_hash);
+
+-- (v6) Owner OS Operating Constitution enforcement. Every policy evaluation — preflight
+-- before an action and the completion gate before DONE — writes a row here, allowed or
+-- blocked. An action that produced no row was never evaluated, which is itself a finding.
+CREATE TABLE IF NOT EXISTS policy_decision (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, phase TEXT, actor TEXT, project TEXT,
+    task_id TEXT, action TEXT, risk_class TEXT, decision TEXT, rules TEXT,
+    missing_evidence TEXT, evidence TEXT, override_id TEXT, idem_key TEXT, reason TEXT);
+CREATE INDEX IF NOT EXISTS ix_policy_decision_task ON policy_decision(task_id, id);
+CREATE INDEX IF NOT EXISTS ix_policy_decision_dec ON policy_decision(decision, id);
+
+-- Emergency override: owner-scoped, expiring, single-purpose. It can permit an action the
+-- policy blocks — it can never hide that it did (`used`/`decision` rows keep the trail).
+CREATE TABLE IF NOT EXISTS policy_override (
+    id TEXT PRIMARY KEY, created_at TEXT, actor TEXT, scope TEXT, rules TEXT, reason TEXT,
+    task_id TEXT, expires_at TEXT, expires_ts REAL, uses INTEGER DEFAULT 0,
+    revoked_at TEXT);
+
+-- One live claim per (project, idempotency key): the duplicate-agent / repeated-
+-- irreversible-action guard. A claim is released when its task reaches a terminal state.
+CREATE TABLE IF NOT EXISTS policy_claim (
+    idem_key TEXT PRIMARY KEY, task_id TEXT, actor TEXT, project TEXT, action TEXT,
+    risk_class TEXT, state TEXT DEFAULT 'active', created_at TEXT, created_ts REAL,
+    released_at TEXT);
+CREATE INDEX IF NOT EXISTS ix_policy_claim_project ON policy_claim(project, state);
 """
 
 

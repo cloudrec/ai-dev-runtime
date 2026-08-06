@@ -1,0 +1,171 @@
+# Owner OS — machine-readable operating policy.
+#
+# This file is DATA. `core/policy_engine.py` is the mechanism that enforces it, and
+# `docs/OWNER_OS_OPERATING_CONSTITUTION.md` is the human-readable law it encodes. Rule
+# ids (R1.1 …) are shared by all three, so a block reason points at a specific rule.
+#
+# Evaluation order (first match wins, most severe first):
+#   1. hard_block   — never proceeds; an owner override is required and is itself audited
+#   2. require_owner— proceeds only with a recorded, unconsumed owner approval
+#   3. risk class   — decides which evidence must exist before the action and before DONE
+#
+# Deny-by-default: an action that matches nothing recognisable is MUTATING, not read-only.
+
+version: 1
+
+risk_classes:
+  READ_ONLY:
+    description: observes state, changes nothing
+    backup_required: false
+    default_decision: ALLOW
+    completion_evidence: [summary]
+  MUTATING:
+    description: changes files, config, or records that can be restored
+    backup_required: true
+    default_decision: REQUIRE_EVIDENCE
+    completion_evidence: [rollback, baseline, changed_files]
+  HIGH_RISK:
+    description: production surface, dependencies, resources, or data movement
+    backup_required: true
+    default_decision: REQUIRE_OWNER
+    completion_evidence: [rollback, baseline, changed_files, tests, live]
+  IRREVERSIBLE:
+    description: cannot be undone by any local rollback (external, financial, destructive)
+    backup_required: true
+    default_decision: REQUIRE_OWNER
+    completion_evidence: [rollback, baseline, changed_files, tests, live, owner_approval]
+
+# Structured evidence fields. Free text is never accepted in place of these.
+evidence_schema:
+  rollback:    {required: [kind, ref], kinds: [git_commit, file_backup, db_snapshot, artifact_swap, none]}
+  baseline:    {required: [head, clean_tree]}
+  changed_files: {required: []}
+  tests:       {required: [ok]}
+  live:        {required: [service, active]}
+  artifacts:   {required: []}
+  owner_approval: {required: [gate_id, actor]}
+  summary:     {required: []}
+
+# ── R3/R10: actions that never run unattended ──────────────────────────────
+hard_block:
+  - id: R5.3-history-rewrite
+    why: rewriting shared history destroys other people's work irrecoverably
+    patterns:
+      - '\bgit\s+push\b.*(--force\b|--force-with-lease\b|-f\b)'
+      - '\bgit\s+reset\s+--hard\b'
+      - '\bgit\s+(filter-branch|filter-repo)\b'
+      - '\bgit\s+push\b.*--delete\b'
+      - '\bgit\s+branch\s+-D\b'
+  - id: R1.4-destructive-fs
+    why: mass deletion has no local rollback
+    patterns:
+      - '\brm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+/(\s|$)'
+      - '\brm\s+-[a-zA-Z]*[rf][a-zA-Z]*\s+(/etc|/var|/usr|/root/?\s|/home)'
+      - '\bmkfs\b|\bdd\s+if=.*of=/dev/'
+      - ':\(\)\{.*\};:'
+  - id: R1.5-destructive-db
+    why: dropping or truncating data is not restorable from a code rollback
+    patterns:
+      - '\bdrop\s+(database|schema|table)\b'
+      - '\btruncate\s+table\b'
+      - '\bdelete\s+from\s+\w+\s*;?\s*$'
+  - id: R6.1-secret-exfiltration
+    why: a secret that reaches a log, report, or commit is already compromised
+    patterns:
+      - '\b(cat|echo|printf|less|more|head|tail)\b[^|;]*\.(env|pem|key|p12|pfx)\b'
+      - '\bgit\s+add\b[^|;]*\.(env|pem|key|p12|pfx)\b'
+      - '\b(curl|wget|scp|rsync)\b[^|;]*\.(env|pem|key)\b'
+  - id: R9.4-network-exposure
+    why: binding a management port to a public interface exposes the host
+    patterns:
+      - '--host[= ]0\.0\.0\.0'
+      - '\bufw\s+(disable|allow)\b'
+      - '\biptables\s+-(F|X|P\s+INPUT\s+ACCEPT)\b'
+      - '\bremote-debugging-address=(?!127\.0\.0\.1)'
+
+# ── R3/R10: real business/irreversible gates the owner must answer ─────────
+require_owner:
+  - id: R3.1-production-change
+    risk: HIGH_RISK
+    patterns:
+      - '\b(deploy|publish|release)\b.*\b(prod|production|live)\b'
+      - '\bsystemctl\s+(stop|disable|mask)\b'
+      - '\bdocker\s+compose\s+down\b'
+      - '\bsystemctl\s+restart\b.*\b(prod|production)\b'
+  - id: R3.2-service-restart
+    risk: HIGH_RISK
+    patterns:
+      - '\bsystemctl\s+(restart|start|reload|enable)\b'
+      - '\bdocker\s+(restart|stop|kill)\b'
+      - '\bnginx\s+-s\s+reload\b'
+  - id: R3.3-dns-firewall
+    risk: IRREVERSIBLE
+    patterns: ['\bdns\b.*\b(record|zone|update)\b', '\b(ufw|iptables|firewalld)\b', '\bcertbot\b']
+  - id: R10.1-money
+    risk: IRREVERSIBLE
+    patterns:
+      - '\b(payment|invoice|charge|refund|withdraw|transfer)\b'
+      - '\b(buy|purchase|order)\b.*\b(api|credits|plan|subscription)\b'
+      - '\blive\s+trading\b|\bplace\s+order\b'
+  - id: R10.2-external-message
+    risk: IRREVERSIBLE
+    patterns:
+      - '\bsend\b.*\b(email|telegram|sms|newsletter|broadcast)\b'
+      - '\bpost\b.*\b(twitter|x\.com|linkedin|facebook|instagram)\b'
+      - '\bnotify\s+(customers|clients|users)\b'
+  - id: R6.3-secret-rotation
+    risk: IRREVERSIBLE
+    patterns: ['\brotate\b.*\b(secret|key|token|credential)\b', '\brevoke\b.*\b(key|token)\b']
+  - id: R9.1-dependency-install
+    risk: HIGH_RISK
+    patterns:
+      - '\b(apt-get|apt)\s+(install|upgrade|remove|purge)\b'
+      - '\bnpm\s+(install|i|update)\b(?!.*--dry-run)'
+      - '\bpip3?\s+install\b(?!.*--dry-run)'
+      - '\bdocker\s+(pull|build)\b'
+  - id: R5.4-push
+    risk: HIGH_RISK
+    patterns: ['\bgit\s+push\b']
+  - id: R2.3-cross-project
+    risk: HIGH_RISK
+    patterns: ['\bcd\s+/opt/', '\bgit\s+-C\s+/opt/']
+
+# ── R1: actions that mutate but are restorable ─────────────────────────────
+mutating:
+  patterns:
+    - '\b(write|edit|patch|create|update|delete|move|rename)\b'
+    - '\bgit\s+(commit|add|checkout|switch|merge|rebase|stash|branch)\b'
+    - '\b(mkdir|touch|cp|mv|chmod|chown|ln|tee|sed\s+-i)\b'
+    - '\balembic\s+upgrade\b|\bmigrat(e|ion)\b'
+    - '>>?\s*\S'
+
+# ── read-only: proven observation ──────────────────────────────────────────
+read_only:
+  patterns:
+    - '^\s*(cat|ls|head|tail|grep|rg|find|stat|wc|diff|jq|pwd|which|file|du|df)\b'
+    - '\bgit\s+(status|log|diff|show|branch\s*$|rev-parse|ls-files)\b'
+    - '\bsystemctl\s+(status|is-active|is-enabled|show|list-units)\b'
+    - '\b(pytest|python3?\s+-m\s+pytest)\b.*--collect-only'
+    - '\b(read|inspect|audit|analy[sz]e|review|report|list|check|verify)\b'
+
+# ── R6: redaction applied to every stored reason, evidence blob and report ──
+redaction:
+  patterns:
+    - '(?i)(bot)?token["\s:=]+[A-Za-z0-9:_\-]{12,}'
+    - '(?i)(api[_-]?key|secret|password|passwd|credential)["\s:=]+\S{6,}'
+    - '(?i)authorization:\s*bearer\s+\S+'
+    - '-----BEGIN [A-Z ]*PRIVATE KEY-----'
+    - '\b\d{9,10}:[A-Za-z0-9_\-]{30,}\b'          # telegram bot token shape
+  replacement: '[REDACTED]'
+
+# ── R7: one live actor per project/worktree; one idempotency key per action ─
+concurrency:
+  duplicate_window_secs: 86400
+  enforce_idempotency: true
+
+# ── R8: emergency override — owner-scoped, expiring, always audited ────────
+override:
+  max_ttl_secs: 3600
+  require_reason_chars: 12
+  allowed_actors: [owner]
+  never_hidden_from_reports: true

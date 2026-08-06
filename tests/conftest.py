@@ -20,3 +20,9 @@ os.environ.setdefault("PYTHONPATH", "/root/ai-dev-runtime")
 # даже если запущен один файл (`pytest tests/test_x.py`).
 _TEST_DB_DIR = tempfile.mkdtemp(prefix="ai-runtime-tests-")
 os.environ["RUNTIME_DB"] = os.path.join(_TEST_DB_DIR, "runtime_jobs_test.db")
+
+# Same rule for the control plane database. Policy enforcement (preflight/completion)
+# writes decisions and CLAIMS from any code path a test exercises; against the live
+# file a test run would leave claims that block real work, and read live channel/gate
+# state as if it were fixture data. Tests that need their own DB still monkeypatch it.
+os.environ["CONTROL_PLANE_DB"] = os.path.join(_TEST_DB_DIR, "control_plane_test.db")

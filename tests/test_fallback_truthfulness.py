@@ -61,16 +61,42 @@ def test_finish_downgrades_a_plan_only_completed_call(monkeypatch):
     assert recorded["outcome"] == job_kinds.FALLBACK_PLAN_ONLY
 
 
-def test_finish_leaves_a_real_implementation_completed(monkeypatch):
+def test_finish_leaves_a_real_implementation_completed(monkeypatch, tmp_path):
     from core import job_executor
 
     recorded = {}
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     monkeypatch.setattr(job_executor.job_store, "update_job",
                         lambda job_id, **kw: recorded.update(kw) or {"id": job_id, **kw})
+    # The constitution's completion gate reads the job's recorded evidence, so this
+    # fully-mocked store must present a job that HAS a rollback path — otherwise the
+    # correct answer is `blocked`, which is a different invariant than the one here.
+    monkeypatch.setattr(job_executor.job_store, "get_job", lambda job_id: {
+        "id": job_id, "goal": "implement the widget", "instructions": "",
+        "project_path": str(tmp_path), "changed_files": [{"path": "w.py"}],
+        "git_info": {"branch": "work", "commit": "abc1234"},
+        "artifacts": [{"rollback": {"kind": "file_backup", "ref": "bk-1", "verified": True}}]})
     monkeypatch.setattr(job_executor, "_write_report", lambda job: None)
 
     job_executor._finish("job-2", "completed", outcome=job_kinds.IMPLEMENTED)
     assert recorded["status"] == "completed"
+
+
+def test_finish_refuses_completed_when_the_job_record_cannot_be_read(monkeypatch, tmp_path):
+    """Fail-closed: no readable job means no evidence, and no evidence is not a
+    completion. A gate that passed here would be bypassable by losing the record."""
+    from core import job_executor
+
+    recorded = {}
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp2.db"))
+    monkeypatch.setattr(job_executor.job_store, "update_job",
+                        lambda job_id, **kw: recorded.update(kw) or {"id": job_id, **kw})
+    monkeypatch.setattr(job_executor.job_store, "get_job", lambda job_id: None)
+    monkeypatch.setattr(job_executor, "_write_report", lambda job: None)
+
+    job_executor._finish("job-3", "completed", outcome=job_kinds.IMPLEMENTED)
+    assert recorded["status"] == "blocked"
+    assert "completion gate" in (recorded.get("error") or "")
 
 
 # ── notifications ───────────────────────────────────────────────────────────

@@ -530,6 +530,38 @@ async def control_plane_notifications_status(_: bool = Depends(_auth)):
     return delivery.notifications_status()
 
 
+@router.get("/policy/explain")
+async def policy_explain(action: str, declared_risk: Optional[str] = None,
+                         owner_approved: bool = False, _: bool = Depends(_auth)):
+    """What the Operating Constitution would decide about an action, and why.
+
+    Side-effect free: it creates no claim and consumes no override, so an operator (or an
+    agent deciding whether to ask) can query the policy without changing its state.
+    """
+    from core import policy_engine
+    try:
+        return policy_engine.explain(action, declared_risk=declared_risk,
+                                     owner_approved=owner_approved)
+    except policy_engine.PolicyError as e:
+        raise HTTPException(status_code=503, detail=f"policy unavailable: {e}")
+
+
+@router.get("/policy/decisions")
+async def policy_decisions(task_id: str = "", limit: int = 50, _: bool = Depends(_auth)):
+    """The durable audit: every preflight/completion evaluation, allowed and blocked
+    alike, with the rules violated and the evidence that was missing."""
+    from core import policy_engine
+    return {"decisions": policy_engine.decisions(task_id=task_id, limit=limit)}
+
+
+@router.get("/policy/overrides")
+async def policy_overrides(include_expired: bool = True, _: bool = Depends(_auth)):
+    """Every emergency override ever granted — active, expired and revoked. An override
+    is never hidden from this list; that is the point of it being owner-scoped."""
+    from core import policy_engine
+    return {"overrides": policy_engine.list_overrides(include_expired=include_expired)}
+
+
 @router.get("/control-plane/observability")
 async def control_plane_observability(_: bool = Depends(_auth)):
     """Read-only observability: failed runtime jobs + dead-lettered notifications split

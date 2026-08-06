@@ -13,8 +13,14 @@ import subprocess
 import threading
 
 from core import ai_planner, git_write, job_kinds, job_store, job_validation
+from core import policy_engine
 from core.backup_engine import BackupEngine
 from core.file_engine import FileEngine
+
+# Owner OS Operating Constitution enforcement. ON by default: a runtime job is exactly
+# the path that must not depend on an agent having read the rules. Set to 0 only to
+# diagnose the policy layer itself — the audit records which mode a decision ran in.
+POLICY_ENFORCE = os.getenv("OWNER_OS_POLICY_ENFORCE", "1") not in ("0", "false", "no", "")
 
 AUTONOMY_ORDER = ["observe", "suggest", "prepare", "execute_safe", "execute_full", "deploy"]
 _MAX_REPAIRS = int(os.getenv("RUNTIME_MAX_REPAIRS", "1"))
@@ -177,6 +183,42 @@ def _write_report(job: dict) -> None:
         pass
 
 
+def _job_action(job: dict) -> str:
+    """The action text the policy classifies: what the job says it will do."""
+    return f"{job.get('goal') or ''} {job.get('instructions') or ''}".strip()
+
+
+def _rollback_evidence(job: dict) -> dict:
+    """The rollback reference this job actually recorded, or nothing.
+
+    Reads the job's own artifacts rather than assuming a backup happened: an unrecorded
+    backup is, for policy purposes, not a backup (R1.7).
+    """
+    for art in reversed(job.get("artifacts") or []):
+        if isinstance(art, dict) and art.get("rollback"):
+            return art["rollback"]
+    return {}
+
+
+def _completion_evidence(job: dict) -> dict:
+    """Structured evidence assembled from what the pipeline actually recorded."""
+    git_info = job.get("git_info") or {}
+    tests = job.get("tests") or {}
+    ev = {
+        "rollback": _rollback_evidence(job),
+        "baseline": {"head": git_info.get("commit") or git_info.get("base") or "",
+                     "branch": git_info.get("branch") or "",
+                     "clean_tree": True},
+        "changed_files": job.get("changed_files") if job.get("changed_files") is not None else [],
+        "summary": (job.get("goal") or "")[:200],
+    }
+    if tests or job.get("validation"):
+        ev["tests"] = {"ok": bool(tests.get("ok", (job.get("validation") or {}).get("ok")))}
+    if job.get("artifacts"):
+        ev["artifacts"] = job["artifacts"]
+    return ev
+
+
 def _finish(job_id: str, status: str, **extra):
     # Every terminal state carries an explicit outcome: a job that ends without
     # one is exactly the ambiguity this model removes. Failure paths default to
@@ -188,6 +230,32 @@ def _finish(job_id: str, status: str, **extra):
     # fallback PLAN as a completed implementation; this is the one chokepoint
     # every terminal transition goes through, so that cannot recur.
     status = job_kinds.terminal_status_for(extra.get("outcome"), status)
+    # Constitution completion gate (R4): a `completed` claim must be backed by the
+    # structured evidence its risk class demands. Without it the job is recorded as
+    # UNVERIFIED — honest about what is known — instead of green. Non-success terminal
+    # states are not gated: a failure needs no evidence to be believed.
+    if POLICY_ENFORCE and status == job_kinds.STATUS_COMPLETED:
+        cur = job_store.get_job(job_id) or {}
+        merged = {**cur, **{k: v for k, v in extra.items() if k in
+                            ("changed_files", "tests", "validation", "git_info", "artifacts")}}
+        try:
+            gate = policy_engine.completion_gate(
+                action=_job_action(merged), evidence=_completion_evidence(merged),
+                actor="runtime_job", project=merged.get("project_path") or "",
+                task_id=job_id, claimed_status="completed")
+        except policy_engine.PolicyError as e:      # unreadable policy ⇒ stop, never pass
+            gate = {"allowed": False, "status": "blocked", "reason": f"policy unavailable: {e}",
+                    "missing_evidence": [], "violated_rules": ["R8.1-fail-closed"]}
+        if not gate["allowed"]:
+            status = "blocked"
+            extra["error"] = (f"completion gate: {gate['reason']}"[:400]
+                              if gate.get("reason") else "completion gate refused DONE")
+            try:
+                job_store.append_log(job_id, "warn",
+                                     f"completion gate refused `completed` — missing "
+                                     f"{gate.get('missing_evidence')}; recorded as {status}")
+            except Exception:  # noqa: BLE001 — logging must never undo the gate's decision
+                pass
     job = job_store.update_job(job_id, status=status, finished_at=job_store._now(), **extra)
     if job:
         _write_report(job)
@@ -332,6 +400,38 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     except Exception as e:  # noqa: BLE001 — BackupError or any tar/os failure -> terminal, precise
         _finish(job_id, "failed", error=f"backup failed: {str(e)[:400]}")
         return
+
+    # 2b) CONSTITUTION PREFLIGHT (R1/R2/R3/R7) — evaluated with the rollback path in
+    # hand and BEFORE the first edit, so a prohibited, owner-gated, out-of-scope or
+    # duplicated job stops without having touched the workspace.
+    rollback_ref = {"kind": "file_backup", "ref": str(backup_meta.get("id") or ""),
+                    "verified": bool(backup_meta.get("id"))}
+    # Append to the artifacts as they stand NOW, not to the snapshot taken when the
+    # pipeline started: earlier stages (e.g. fallback planning) record artifacts too, and
+    # writing back a stale list would silently drop them.
+    _cur = job_store.get_job(job_id) or job
+    job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) +
+                         [{"backup_id": backup_meta.get("id"), "rollback": rollback_ref}])
+    if POLICY_ENFORCE:
+        try:
+            gate = policy_engine.preflight(
+                action=_job_action(job), actor="runtime_job", project=pp, task_id=job_id,
+                scope=(job.get("allowed_paths") or None),
+                evidence={"rollback": rollback_ref},
+                owner_approved=not job.get("approval_required"))
+        except policy_engine.PolicyError as e:      # unreadable policy ⇒ stop, never proceed
+            _finish(job_id, "blocked", error=f"policy unavailable: {str(e)[:300]}")
+            return
+        if not gate["allowed"]:
+            job_store.append_log(job_id, "warn",
+                                 f"policy {gate['decision']} ({gate['risk_class']}): "
+                                 f"{gate['reason']}")
+            _finish(job_id, "blocked",
+                    error=f"policy {gate['decision']}: {gate['reason']}"[:400])
+            return
+        job_store.append_log(job_id, "info",
+                             f"policy preflight ALLOW (risk {gate['risk_class']}, "
+                             f"rollback {rollback_ref['kind']}:{rollback_ref['ref']})")
 
     # Paths this job brought into existence, tracked so a rollback can undo them.
     created_paths: list[str] = []
