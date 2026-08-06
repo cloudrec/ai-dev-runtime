@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Switch Owner OS to a different ChatGPT conversation. One command, no reinstall.
+#   owner-os-chat show                 what the bridge will wake right now
+#   owner-os-chat bind <conversation>  point it at a different conversation
+#   owner-os-chat history              audit of pointer moves (never any chat content)
+set -euo pipefail
+cd /root/ai-dev-runtime
+case "${1:-show}" in
+  bind)
+    [ -n "${2:-}" ] || { echo "usage: owner-os-chat bind https://chatgpt.com/c/<id>"; exit 2; }
+    ./venv/bin/python -c "
+from core import wake_bridge as wb
+import json; print(json.dumps(wb.bind_chat('''$2''', by='owner'), indent=1))"
+    ;;
+  show)
+    ./venv/bin/python -c "
+from core import wake_bridge as wb
+import json; print(json.dumps(wb.active_chat(), indent=1))"
+    ;;
+  history)
+    ./venv/bin/python -c "
+from core import wake_bridge as wb
+for h in wb.bind_history():
+    print(f\"{h['at'][:19]}  {h['action']:6}  {h['conversation']}  (was: {h['previous'] or '-'})\")"
+    ;;
+  *) echo "usage: owner-os-chat {show|bind <url>|history}"; exit 2 ;;
+esac

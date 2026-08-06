@@ -12,6 +12,9 @@ def _iso(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
     monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "1")
     monkeypatch.setenv("WAKE_BRIDGE_KILL_SWITCH", "0")
+    # A wake needs a target. Binding one here keeps every other test about the behaviour it
+    # actually covers; the unbound case is asserted explicitly in its own test.
+    wb.bind_chat("https://chatgpt.com/c/default-test-chat")
     yield
 
 
@@ -135,3 +138,67 @@ def test_a_broken_bridge_never_breaks_event_recording(monkeypatch):
     monkeypatch.setattr(wb, "should_wake", lambda **k: (_ for _ in ()).throw(RuntimeError("x")))
     out = cto.emit("test", "urgent_thing", agent_id="a:0.0", severity="critical")
     assert out["event_id"] > 0, "the event is recorded regardless"
+
+
+# ── the rotatable active control chat ──────────────────────────────────────
+def test_no_active_chat_fails_closed():
+    """With nowhere to wake, guessing a conversation would be exactly the arbitrary
+    behaviour this design forbids."""
+    import sqlite3, os
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    c.execute("DELETE FROM wake_target"); c.commit()
+    d = wb.should_wake(event_id=100, severity="critical")
+    assert d["wake"] is False and d["reason"] == "no_active_control_chat"
+
+
+def test_binding_a_chat_enables_waking_and_returns_the_target():
+    wb.bind_chat("https://chatgpt.com/c/aaaa-1111")
+    d = wb.should_wake(event_id=101, severity="critical")
+    assert d["wake"] is True
+    assert d["conversation"] == "https://chatgpt.com/c/aaaa-1111"
+    assert d["phrase"] == wb.WAKE_PHRASE
+
+
+def test_rebinding_moves_the_target_without_touching_anything_else():
+    """A chat fills up and gets replaced; rotation must not need a reinstall."""
+    wb.bind_chat("https://chatgpt.com/c/old-one")
+    r = wb.bind_chat("https://chatgpt.com/c/new-one")
+    assert r["action"] == "rebind" and r["previous"] == "https://chatgpt.com/c/old-one"
+    assert wb.active_chat()["conversation"] == "https://chatgpt.com/c/new-one"
+    d = wb.should_wake(event_id=102, severity="critical")
+    assert d["conversation"] == "https://chatgpt.com/c/new-one", "wakes follow the pointer"
+
+
+@pytest.mark.parametrize("bad", [
+    "https://example.com/evil", "not-a-url", "", "https://chatgpt.com/c/../etc/passwd",
+    "javascript:alert(1)"])
+def test_only_a_conversation_url_may_be_bound(bad):
+    assert wb.bind_chat(bad)["ok"] is False
+
+
+def test_an_invalid_stored_target_fails_closed(tmp_path, monkeypatch):
+    """Corruption must not become a wake at an arbitrary URL."""
+    import sqlite3, os
+    wb.bind_chat("https://chatgpt.com/c/good")
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    c.execute("UPDATE wake_target SET conversation='https://evil.example/x' WHERE id=1")
+    c.commit()
+    assert wb.active_chat()["reason"] == "active_chat_invalid"
+    assert wb.should_wake(event_id=103, severity="critical")["wake"] is False
+
+
+def test_the_pointer_is_read_fresh_on_every_wake():
+    """The URL must never be cached in code or a unit file."""
+    wb.bind_chat("https://chatgpt.com/c/first")
+    assert wb.should_wake(event_id=104, severity="critical")["conversation"].endswith("first")
+    wb.bind_chat("https://chatgpt.com/c/second")
+    assert wb.should_wake(event_id=105, severity="critical")["conversation"].endswith("second")
+
+
+def test_bind_audit_records_the_move_and_no_conversation_content():
+    wb.bind_chat("https://chatgpt.com/c/one", note="rotated after chat filled up")
+    wb.bind_chat("https://chatgpt.com/c/two")
+    h = wb.bind_history()
+    assert h[0]["action"] == "rebind" and h[0]["previous"].endswith("one")
+    assert set(h[0]) == {"at", "action", "conversation", "previous", "by", "note"}, \
+        "the audit stores the pointer move only — never message content"

@@ -24,6 +24,7 @@ event and the Telegram tier still carries the urgent ones.
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from core.control_plane.api import _c
@@ -76,6 +77,11 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
         return {"wake": False, "reason": "bridge_disabled"}
     if severity not in WAKE_SEVERITIES and not owner_action_required:
         return {"wake": False, "reason": "severity_below_wake_threshold"}
+    # FAIL CLOSED on the target. With no valid active chat there is nowhere to wake, and
+    # guessing a conversation would be exactly the arbitrary behaviour this design forbids.
+    target = active_chat(conn=conn)
+    if not target.get("bound"):
+        return {"wake": False, "reason": target.get("reason", "no_active_control_chat")}
 
     conn, own = _conn(conn)
     try:
@@ -92,7 +98,7 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
             wait = int(COOLDOWN_SECS - (now - float(last[0])))
             return {"wake": False, "reason": "cooldown_active", "wait_secs": wait}
         return {"wake": True, "reason": "urgent_event_not_yet_signalled",
-                "phrase": WAKE_PHRASE}
+                "phrase": WAKE_PHRASE, "conversation": target["conversation"]}
     finally:
         if own:
             conn.close()
@@ -151,6 +157,96 @@ def health(conn=None, now: Optional[float] = None) -> dict:
                 "last_wake_age_secs": (int(last_age) if last_age is not None else None),
                 "phrase": WAKE_PHRASE,
                 "note": "accelerator only — the CTO inbox holds every event regardless"}
+    finally:
+        if own:
+            conn.close()
+
+
+# ── the active control chat: a rotatable POINTER, never a hardcoded URL ──────
+# A chat fills up and gets replaced. Binding the bridge to one conversation forever would
+# mean a reinstall every time that happens, so the target lives in a durable record that the
+# bridge reads on EVERY wake. Owner OS state stays in the CTO inbox; the chat is only a
+# replaceable doorbell.
+_CHAT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wake_target (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    conversation TEXT, bound_at TEXT, bound_ts REAL, bound_by TEXT, note TEXT
+);
+CREATE TABLE IF NOT EXISTS wake_bind_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL, at TEXT, action TEXT, conversation TEXT, previous TEXT, by TEXT, note TEXT
+)
+"""
+
+_CHAT_RE = re.compile(r"^https://chat(gpt)?\.(com|openai\.com)/(c/)?[A-Za-z0-9\-]+/?$")
+
+
+def _chat_conn(conn=None):
+    conn, own = _c(conn)
+    for stmt in _CHAT_SCHEMA.strip().split(";"):
+        if stmt.strip():
+            conn.execute(stmt)
+    return conn, own
+
+
+def valid_conversation(url: str) -> bool:
+    """A conversation URL, not an arbitrary page. Fail closed on anything else."""
+    return bool(_CHAT_RE.match((url or "").strip()))
+
+
+def active_chat(conn=None) -> dict:
+    """The current wake target. Read fresh on every wake — never cached in code or a unit."""
+    conn, own = _chat_conn(conn)
+    try:
+        r = conn.execute("SELECT conversation,bound_at,bound_by,note FROM wake_target "
+                         "WHERE id=1").fetchone()
+        if not r or not (r[0] or "").strip():
+            return {"bound": False, "reason": "no_active_control_chat"}
+        if not valid_conversation(r[0]):
+            return {"bound": False, "reason": "active_chat_invalid", "conversation": r[0]}
+        return {"bound": True, "conversation": r[0], "bound_at": r[1], "bound_by": r[2],
+                "note": r[3]}
+    finally:
+        if own:
+            conn.close()
+
+
+def bind_chat(conversation: str, *, by: str = "owner", note: str = "", conn=None,
+              now: Optional[float] = None) -> dict:
+    """Point the bridge at a different conversation. Atomic, audited, no content stored."""
+    now = now if now is not None else now_ts()
+    url = (conversation or "").strip()
+    if not valid_conversation(url):
+        return {"ok": False, "reason": "not_a_conversation_url", "conversation": url[:120]}
+    conn, own = _chat_conn(conn)
+    try:
+        prev = conn.execute("SELECT conversation FROM wake_target WHERE id=1").fetchone()
+        previous = (prev[0] if prev else "") or ""
+        conn.execute(
+            "INSERT INTO wake_target (id,conversation,bound_at,bound_ts,bound_by,note) "
+            "VALUES (1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET conversation=excluded.conversation,"
+            "bound_at=excluded.bound_at, bound_ts=excluded.bound_ts, bound_by=excluded.bound_by,"
+            "note=excluded.note", (url, now_iso(), now, by, note[:200]))
+        # Audit records the POINTER moving. Never any conversation content.
+        conn.execute("INSERT INTO wake_bind_audit (ts,at,action,conversation,previous,by,note) "
+                     "VALUES (?,?,?,?,?,?,?)",
+                     (now, now_iso(), "rebind" if previous else "bind", url, previous, by,
+                      note[:200]))
+        conn.commit()
+        return {"ok": True, "conversation": url, "previous": previous or None,
+                "action": "rebind" if previous else "bind"}
+    finally:
+        if own:
+            conn.close()
+
+
+def bind_history(limit: int = 20, conn=None) -> list:
+    conn, own = _chat_conn(conn)
+    try:
+        conn.row_factory = __import__("sqlite3").Row
+        return [dict(r) for r in conn.execute(
+            "SELECT at,action,conversation,previous,by,note FROM wake_bind_audit "
+            "ORDER BY id DESC LIMIT ?", (limit,))]
     finally:
         if own:
             conn.close()
