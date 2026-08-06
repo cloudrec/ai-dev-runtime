@@ -5,7 +5,20 @@ Authoritative sources this builds on (not a new design):
 `reports/SAME_CHAT_PINNER_STATUS.md`, `core/control_plane/cto.py`, `core/os_task_queue.py`,
 `core/continuation_governor.py`, `core/commander_autopilot.py`.
 
-Status: **PLAN — nothing in phases 1-7 implemented yet.** Written 2026-08-06.
+Status as of 2026-08-06: **phases 2, 3 and 5 are BUILT, TESTED AND DEPLOYED.** Phases 1, 4,
+6 and the 24h acceptance are each blocked on an owner decision, not on engineering.
+
+| phase | state | commit |
+|---|---|---|
+| 2 — event bus + executive skeleton | deployed; draining signals on the live tick | `6b9b491`, `f1b7bb1` |
+| 3 — observation breadth | deployed; services + sustained resource pressure | `b5c231c` |
+| 5 — tier policy + budgets | deployed; tier 0 free, no silent escalation | `0e10cdc` |
+| 1 — MCP CTO inbox exposure | blocked: `/opt/seo` container rebuild + `RUNTIME_TOKEN` | — |
+| 4 — portfolio brain | blocked: permitted autonomous-work set | — |
+| 6 — wake bridge | server half unblocked; browser leg needs one-time ChatGPT login | — |
+| 7 — 24h acceptance | needs 1, 4, 6 | — |
+
+Suite at the last deploy: **1545 passed, 0 failed**.
 
 ---
 
