@@ -168,12 +168,78 @@ no data migration, nothing to undo in any database. Backups of the pre-change fi
 both databases: `backups/session_recovery_fix_20260807-042911/`
 (`PRAGMA integrity_check` → `ok`).
 
-## 7. Next steps (not done in this iteration)
+## 7. Live activation — post-restart evidence
 
-1. **A restart of `ai-runtime.service` is required to activate this.** The running process
-   (PID 758325, started 02:46:56 CEST) holds the old `session_recovery` in memory and will
-   keep re-reviving until it is restarted. Deliberately not done here.
-2. **One stray pane is still live**: `mess-qa-automation:0.0`, pid 842031, sitting in
-   `/root` on the trust prompt. It is the artifact of the last bad revival, not a real
-   agent. It should be killed, and `direct_agent_lifecycle` still records
-   `mess-qa-automation:0.0` with `cwd=/root` from it. Left in place pending owner approval.
+The fix was activated by a restart at **05:26:34 CEST** (03:26:34Z). That restart was
+performed by a concurrent session, not by this work; the journal records
+Stopping/Stopped/Started at 05:26:28–05:26:34 and `NRestarts=0`.
+
+| Check | Value |
+|---|---|
+| `ai-runtime.service` | `active (running)`, **PID 1089088**, started **Fri 2026-08-07 05:26:34 CEST** |
+| `/api/v1/health` | **200** |
+| `/policy/decisions`, `/policy/overrides`, `/policy/explain` | **200** |
+| `schema_version` | **9** |
+| DB path | `/root/ai-dev-runtime/control_plane.db` |
+| `managed_sessions.yaml` → `mess-qa-automation:0.0` | `cwd: /opt/mess` |
+| Duplicate `we:` dedup_keys | **0** · control plane reports `dup=0` |
+
+**The fix made its first live decision five seconds after start.** At
+`2026-08-07T03:26:39.986571Z`:
+
+```
+mess-qa-automation:0.0  quarantine  ok=0  crash_loop_cap_reached  {"used": 8, "cap": 3}
+```
+
+That is defect (4) closing in production: `recent_recoveries()` now counts every revive
+attempt, so the eight accumulated failures finally reached the cap of three and the target
+was quarantined. Under the old counting it reported zero, forever. `cp-canary:0.0` was
+quarantined by the same pass (`used=3`).
+
+```
+session_quarantine
+  cp-canary:0.0           2026-08-07T03:26:39.267609Z  crash loop: 3 recoveries within 21600s
+  mess-qa-automation:0.0  2026-08-07T03:26:39.976836Z  crash loop: 8 recoveries within 21600s
+```
+
+**Observation window.** Control-plane tick interval is 30 s. Across **12 consecutive ticks
+(361 s, 03:28:53Z → 03:34:24Z)**:
+
+```
+mess_panes=0   recovery_rows=9 (unchanged)   lifecycle_alive=0     ×12
+```
+
+No automatic resurrection. Since the restart, `session_recovery` has logged **no revive
+attempt at all** — only the two quarantine decisions above.
+
+### The pane now running is an explicit resume, not a resurrection
+
+A live `mess-qa-automation:0.0` exists again (PID 1110931, cwd `/opt/mess`, started
+05:34:39 CEST). Its origin was established before drawing any conclusion:
+
+| Evidence | Finding |
+|---|---|
+| Audit `agent_control.jsonl` @ `2026-08-07T03:34:40.498658Z` | `action: agent_resume, resumed: true, conversation_id: d03d2b75-…, cwd: /opt/mess` |
+| `service.log` | `POST /api/v1/agents/resume HTTP/1.1 200 OK` from client 172.20.0.2 |
+| `session_recovery` since restart | **no revive row** — only the quarantine decisions |
+| `session_quarantine` | mess entry **still in force**, so the automatic path stays closed |
+| Conversation id | `d03d2b75-…`, the current MESS conversation in use since 2026-08-06 22:24 — **not** the stale `406eab3c-…`, which appears in no live process |
+| cwd | `/opt/mess` — the authoritative project directory, not `/root` |
+
+Conclusion: created through the **explicit owner/MCP resume API**, with a valid project
+directory and a current conversation. By the stated criterion this is **not a regression** —
+the runtime did not revive a completed, no-open-work target. It also demonstrates live that
+the explicit resume path still works while the automatic path remains quarantined.
+
+## 8. Next steps (not done in this iteration)
+
+1. ~~A restart is required to activate this.~~ **Done** — see section 7. Activated at
+   05:26:34 CEST; the old PID 758325 is gone.
+2. ~~A stray pane is live in `/root`.~~ **Gone.** No process anywhere now runs the stale
+   conversation `406eab3c-…`, and `direct_agent_lifecycle` records `cwd=/opt/mess`.
+3. **Two targets are quarantined and will not recover until cleared**:
+   `mess-qa-automation:0.0` (used=8) and `cp-canary:0.0` (used=3). This is the fix working
+   — it stopped a real loop — but it is a live owner blocker. Whether `cp-canary` is
+   genuinely broken or merely accumulated failures under the old counting is unverified.
+   Clearing is an owner decision; nothing here does it automatically.
+4. **Nothing is pushed.** All commits are local.
