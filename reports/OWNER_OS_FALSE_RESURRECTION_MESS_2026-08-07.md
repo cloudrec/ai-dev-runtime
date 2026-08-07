@@ -231,7 +231,77 @@ directory and a current conversation. By the stated criterion this is **not a re
 the runtime did not revive a completed, no-open-work target. It also demonstrates live that
 the explicit resume path still works while the automatic path remains quarantined.
 
-## 8. Next steps (not done in this iteration)
+## 8. The second quarantine: `cp-canary:0.0` — read-only findings
+
+The same pass quarantined `cp-canary:0.0` at `2026-08-07T03:26:39.279542Z` with
+`{"used": 3, "cap": 3}`. It is a different situation from MESS and deserves stating
+separately, because the two look identical in the log and are not.
+
+**The three attempts in the 6 h window** (window opens `2026-08-06T21:26:39Z`):
+
+| Timestamp | action | ok | reason | pid started |
+|---|---|---|---|---|
+| 2026-08-06T21:57:46.619232Z | revive | 0 | verify_failed | 370461 |
+| 2026-08-06T23:51:41.546315Z | revive | 0 | verify_failed | 622678 |
+| 2026-08-07T00:47:05.337779Z | revive | 0 | verify_failed | 758414 |
+
+**Every one of them started the session correctly.** All three carry the identical check
+vector — six of seven true, one false:
+
+```
+pane_present ✓  pane_alive ✓  is_claude ✓  cwd_matches ✓  has_pid ✓
+single_pane_for_cwd ✓         prompt_ready ✗
+```
+
+`cwd_matches: true` against `/root/cp-canary-v2`, a real directory with no registry
+divergence, and a real PID each time. This is the exact opposite of the MESS failures,
+which failed on `cwd_matches` and landed in `/root`. cp-canary never had the defect this
+report is about. Its recoveries failed only because the prompt-readiness regex did not
+match inside the ~10 s verification window — a **false negative on a session that came up
+correctly**, not a crash.
+
+**They were not even per-agent deaths.** Each cp-canary attempt is paired with a MESS
+attempt about seven seconds later, in the same sweep:
+
+```
+21:57:46 cp-canary   21:57:53 mess
+23:51:41 cp-canary   23:51:48 mess
+00:47:05 cp-canary   00:47:12 mess
+```
+
+Two unrelated projects going dead simultaneously, three times, is the tmux server losing
+all its sessions — not two applications crashing in lockstep. After 00:47 cp-canary was
+never revived again (its pane stayed alive), while MESS was revived five more times
+because its pane kept dying in `/root`.
+
+All three rows **predate the fix** (deployed 03:26:34Z). The quarantine is therefore
+retroactive: the corrected counting rule applied to a window containing only attempts made
+under the old behaviour. The same is true of the MESS `used=8`.
+
+### Recommendation: **SAFE_TO_CLEAR_LATER**
+
+Evidence for: no crash occurred; all three failures were verification false negatives on
+correctly-started sessions; the project directory is correct and exists; all three attempts
+predate the fix and cannot recur under it in the same form.
+
+Why clearing changes nothing operationally today: `cp-canary:0.0` has **no active ledger
+task** (`has_authoritative_work` → `no_active_task`) and no live pane. With the fix in
+place, recovery would refuse it with `no_open_work` even if the quarantine were lifted. So
+clearing is safe but also currently inert.
+
+Residual risks, stated plainly:
+
+* The `prompt_ready` false negative is **not fixed** by this work. If cp-canary later has
+  an open task and its pane dies, recovery can start it correctly and still record
+  `verify_failed`; three of those would re-quarantine it. The correct follow-up is the
+  readiness check, not the quarantine.
+* **Why the tmux server lost every session three times is unknown** and is not answered by
+  any data in `session_recovery`, `direct_agent_lifecycle` or the audit log. Until that is
+  understood, clearing the quarantine removes a brake without removing the cause.
+
+Nothing was cleared, and no canary session was started, to reach this finding.
+
+## 9. Next steps (not done in this iteration)
 
 1. ~~A restart is required to activate this.~~ **Done** — see section 7. Activated at
    05:26:34 CEST; the old PID 758325 is gone.
