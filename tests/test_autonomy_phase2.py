@@ -212,6 +212,7 @@ def test_deliberate_stop_is_never_undone(monkeypatch):
 
 
 def test_successful_recovery_verifies_before_reporting_ok(monkeypatch):
+    _interrupted_mid_task(monkeypatch)
     calls = []
     monkeypatch.setattr(sr, "pane_state", lambda t: {"target": t, "dead": True})
     monkeypatch.setattr(sr, "_capture", lambda *a, **k: "❯ ")
@@ -227,7 +228,18 @@ def test_successful_recovery_verifies_before_reporting_ok(monkeypatch):
     assert any("claude --resume conv-1" in " ".join(c) for c in calls)
 
 
+def _interrupted_mid_task(monkeypatch):
+    """A session that died with work still open — the case recovery exists for.
+
+    Recovery now requires an open ledger task, so a test that means "this session was
+    interrupted" has to say so. Without it the refusal is `no_open_work`, which is the
+    2026-08-07 fix working, not a broken test.
+    """
+    monkeypatch.setattr(sr, "has_authoritative_work",
+                        lambda t: {"open": True, "task_id": "t-1", "reason": "active_task"})
+
 def test_failed_verification_is_not_reported_as_recovered(monkeypatch):
+    _interrupted_mid_task(monkeypatch)
     monkeypatch.setattr(sr, "pane_state", lambda t: {"target": t, "dead": True})
     monkeypatch.setattr(sr, "_capture", lambda *a, **k: "")
     monkeypatch.setattr(sr, "live_claude_for_cwd", lambda cwd, exclude_target="": [])
@@ -278,6 +290,7 @@ def test_quarantined_target_is_not_retried(monkeypatch):
 
 
 def test_recovery_authorises_no_new_work(monkeypatch):
+    _interrupted_mid_task(monkeypatch)
     monkeypatch.setattr(sr, "pane_state", lambda t: {"target": t, "dead": True})
     monkeypatch.setattr(sr, "_capture", lambda *a, **k: "❯ ")
     monkeypatch.setattr(sr, "live_claude_for_cwd", lambda cwd, exclude_target="": [])

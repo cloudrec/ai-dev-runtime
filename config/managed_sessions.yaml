@@ -23,7 +23,10 @@ sessions:
 
   - target: mess-qa-automation:0.0
     session: mess-qa-automation
-    cwd: /opt/mess-qa-automation
+    # Must match `cwd` for this target in project_queues.yaml. It did not: this said
+    # /opt/mess-qa-automation, which does not exist, and recovery started Claude in /root.
+    # The code now takes the project config as authority, but the drift is fixed here too.
+    cwd: /opt/mess
     conversation_id: 406eab3c-66f4-4a35-b1cf-4a0f657480fc
     resume_shape: "claude --resume {conversation_id}"
     enabled: true

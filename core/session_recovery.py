@@ -132,16 +132,66 @@ def is_quarantined(target: str, conn=None) -> Optional[dict]:
 
 
 def recent_recoveries(target: str, window_secs: float, conn=None) -> int:
+    """EVERY revive attempt inside the window, successful or not.
+
+    Counting only `ok=1` made the crash-loop cap unreachable for the one shape that needs
+    it most: a target that fails verification every single time. Live 2026-08-06/07,
+    `mess-qa-automation:0.0` was revived five times across nine hours, each attempt logged
+    `verify_failed`, each attempt invisible to the cap — so neither the backoff nor the
+    quarantine ever engaged. A failed respawn is exactly what a crash loop is made of.
+    """
     own = conn is None
     conn = conn or _db()
     try:
         r = conn.execute(
             "SELECT count(*) FROM session_recovery WHERE target=? AND action='revive' "
-            "AND ok=1 AND ts_epoch > ?", (target, time.time() - window_secs)).fetchone()
+            "AND ts_epoch > ?", (target, time.time() - window_secs)).fetchone()
         return int(r[0]) if r else 0
     finally:
         if own:
             conn.close()
+
+
+def authoritative_cwd(target: str, entry: Optional[dict] = None) -> dict:
+    """Where this target's project ACTUALLY lives.
+
+    The governor's project config is the authority on a project directory; the recovery
+    registry is a separate file that can drift from it and did. Live: `project_queues.yaml`
+    said `/opt/mess` while `managed_sessions.yaml` said `/opt/mess-qa-automation`, a
+    directory that does not exist. Nothing reconciled the two, so recovery ran on the wrong
+    one.
+
+    Returns the resolved directory plus the divergence, so a refusal can name it.
+    """
+    registry_cwd = (entry or {}).get("cwd") or ""
+    governed = ""
+    try:
+        from core import continuation_governor as cg
+        governed = ((cg.load_config() or {}).get(target) or {}).get("cwd") or ""
+    except Exception:  # noqa: BLE001 — an unreadable governor config must not grant a path
+        governed = ""
+    resolved = governed or registry_cwd
+    return {"cwd": resolved, "governed": governed, "registry": registry_cwd,
+            "diverged": bool(governed and registry_cwd and
+                             os.path.realpath(governed) != os.path.realpath(registry_cwd)),
+            "exists": bool(resolved) and os.path.isdir(resolved)}
+
+
+def has_authoritative_work(target: str) -> dict:
+    """Is there a real, open reason to bring this session back?
+
+    A dead pane is not by itself a reason. `mess-qa-automation:0.0` was resurrected with no
+    open ledger task at all — the work had finished. Recovery exists to survive an
+    accidental kill mid-task, not to reopen completed work.
+    """
+    try:
+        from core import os_task_queue as q
+        task = q.active_task(target)
+    except Exception:  # noqa: BLE001 — fail CLOSED: unknown ledger is not a licence
+        return {"open": False, "task_id": "", "reason": "ledger_unavailable"}
+    if task:
+        return {"open": True, "task_id": task.get("id", ""), "reason": "active_task"}
+    return {"open": False, "task_id": "", "reason": "no_active_task"}
 
 
 def deliberate_stop(target: str, tail: str = "") -> bool:
@@ -197,8 +247,14 @@ def verify_recovered(target: str, cwd: str) -> dict:
 
 
 def recover(target: str, *, registry: Optional[dict] = None, conn=None,
-            run_fn=None, sleep=time.sleep, now: Optional[float] = None) -> dict:
-    """Revive one registered dead session. Every refusal is explained and logged."""
+            run_fn=None, sleep=time.sleep, now: Optional[float] = None,
+            explicit: bool = False) -> dict:
+    """Revive one registered dead session. Every refusal is explained and logged.
+
+    `explicit=True` is an owner/MCP-initiated resume: it still requires a real project
+    directory, but it does not require an open ledger task, because the owner asking IS
+    the reason. Automatic watchdog recovery leaves it False.
+    """
     now = now if now is not None else time.time()
     own = conn is None
     conn = conn or _db()
@@ -215,11 +271,32 @@ def recover(target: str, *, registry: Optional[dict] = None, conn=None,
         if q:
             return {"recovered": False, "reason": "quarantined", "since": q["since"]}
 
-        cwd = entry.get("cwd") or ""
+        # ── WHERE: the governor's project dir wins over the recovery registry ──
+        # Resolved before anything else, because every later proof (duplicate detection,
+        # the tmux -c, the verification) is only as good as this path.
+        loc = authoritative_cwd(target, entry)
+        cwd = loc["cwd"]
+        if loc["diverged"]:
+            _log(conn, target, "note", True, "registry_cwd_diverged_from_project_config",
+                 {"governed": loc["governed"], "registry": loc["registry"]})
+        if not cwd:
+            _log(conn, target, "refuse", False, "no_project_dir", loc)
+            return {"recovered": False, "reason": "no_project_dir", "cwd_resolution": loc}
+        if not os.path.isdir(cwd):
+            # FAIL CLOSED. `tmux new-session -c <missing>` does NOT fail — it returns rc=0
+            # and silently starts the pane in the server's default directory, which is
+            # /root. That is how a MESS session came up in /root on a stale conversation
+            # and sat on the trust prompt. A path we cannot stand in is not a path we start
+            # a session in.
+            _log(conn, target, "refuse", False, "project_dir_missing", loc)
+            return {"recovered": False, "reason": "project_dir_missing",
+                    "cwd_resolution": loc, "owner_blocker": True}
+
         p = pane_state(target)
         if not p.get("missing") and not p.get("dead"):
             _log(conn, target, "skip", True, "already_alive")
             return {"recovered": False, "reason": "already_alive"}
+
 
         tail = _capture(target, 30)
         if deliberate_stop(target, tail):
@@ -247,6 +324,21 @@ def recover(target: str, *, registry: Optional[dict] = None, conn=None,
                  {"used": used, "cap": cap})
             return {"recovered": False, "reason": "quarantined_crash_loop",
                     "used": used, "cap": cap, "owner_blocker": True}
+
+        # ── WHY: a dead pane is not a reason; open work is ──
+        # Last gate before acting, deliberately: the refusals above are stronger statements
+        # about this target (the owner stopped it, a live pane already serves this project,
+        # it is crash-looping) and each deserves to be the reported reason. `explicit` is
+        # the owner/MCP resume path — the owner asking IS the reason — and skips only this
+        # check, never the project-directory proof above.
+        if not explicit:
+            work = has_authoritative_work(target)
+            if not work["open"]:
+                _log(conn, target, "refuse", False, f"no_open_work:{work['reason']}", work)
+                return {"recovered": False, "reason": "no_open_work",
+                        "detail": work,
+                        "note": "recovery restores interrupted work; it does not reopen "
+                                "work that finished"}
 
         # exponential backoff on repeated attempts within the window
         base = float(limits.get("backoff_base_secs") or 60)
@@ -277,11 +369,20 @@ def recover(target: str, *, registry: Optional[dict] = None, conn=None,
             sleep(4)
 
         v = verify_recovered(target, cwd)
+        torn_down = False
+        if not v["ok"] and not v["checks"].get("cwd_matches", True):
+            # We started this pane and it came up in the wrong directory. Leaving it is how
+            # a "failed" recovery still produced a live Claude sitting in /root on a stale
+            # conversation, which the next discovery pass then recorded as a real agent.
+            # A recovery that cannot prove itself cleans up after itself.
+            run(["kill-session", "-t", session])
+            torn_down = True
         _log(conn, target, "revive", bool(v["ok"]), "verified" if v["ok"] else "verify_failed",
-             {"how": how, "checks": v["checks"], "summary_choice": choice, "pid": v.get("pid")})
+             {"how": how, "checks": v["checks"], "summary_choice": choice, "pid": v.get("pid"),
+              "torn_down": torn_down, "cwd_resolution": loc})
         return {"recovered": bool(v["ok"]), "reason": "verified" if v["ok"] else "verify_failed",
                 "how": how, "verify": v, "summary_choice": choice,
-                "conversation_id": conv,
+                "conversation_id": conv, "torn_down": torn_down,
                 "note": "recovery restores the session only; it authorises no new work"}
     finally:
         if own:
