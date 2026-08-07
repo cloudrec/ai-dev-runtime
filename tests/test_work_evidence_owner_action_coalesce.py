@@ -9,9 +9,14 @@ have to act on ("this work is partial") never changed.
 The rule these tests pin down: evidence is never lost, delivery is.
 
 * every material rewrite still reaches the CTO inbox as its own event;
-* at most one owner-action delivery / wake per meaning per 30 minutes;
-* anything that changes the MEANING — classification, task correlation, stage pointer,
-  a rise in severity — re-opens delivery at once rather than waiting out the window;
+* at most one owner-action delivery / wake per MEANING — project + report + semantic
+  reason — per 30 minutes, and a meaning the owner has not been told inside that window
+  is never suppressed;
+* a state the owner has not just heard — partial → blocked, blocked → done — is delivered
+  at once rather than waiting out someone else's window, as are a changed task
+  correlation, a moved stage pointer and a rise in severity;
+* a report that FLAPS between two states it has already delivered is not an endless
+  doorbell: each state owns its own window;
 * the window is durable, so a restart cannot turn a redeploy into a fresh round of wakes;
 * informational events and commit evidence are never suppressed at all.
 """
@@ -44,6 +49,9 @@ Shipped.
 ## Part 2 — auto-update — **BLOCKED**
 BLOCKED ON an owner credential. Work cannot continue.
 """
+
+# Same meaning as BLOCKED, different bytes — the other half of a flap.
+BLOCKED_REWRITTEN = BLOCKED + "\n<!-- saved again, note added -->\n"
 
 PLAIN = """# MESS — weekly inventory
 
@@ -150,6 +158,90 @@ def test_every_rewrite_is_still_its_own_inbox_event(known, tmp_path):
     assert len(set(keys)) == 3, "each material change needs its own audit identity"
 
 
+def test_repeats_advance_suppressed_count_and_last_seen(known, tmp_path):
+    """A coalesced repeat is counted and dated — silence must still be observable."""
+    em = _Emitter()
+    seen = []
+    for i, text in enumerate((PARTIAL, PARTIAL_REWRITTEN, PARTIAL_REWRITTEN_2)):
+        _write(tmp_path, text)
+        _scan(_projects(known), em, now=10_000.0 + i * 2 * MIN)
+        conn = store.connect()
+        try:
+            seen.append(conn.execute(
+                "SELECT suppressed_count,last_seen_at,last_push_at FROM work_evidence_push "
+                "WHERE evidence_key=?",
+                ("report:mess:reports/MESS_AUTO_UPDATE.md",)).fetchone())
+        finally:
+            conn.close()
+
+    assert [r[0] for r in seen] == [0, 1, 2], "each repeat must increment suppressed_count"
+    assert seen[0][1] < seen[1][1] < seen[2][1], "last_seen must move on every repeat"
+    assert seen[0][2] == seen[1][2] == seen[2][2], (
+        "last_push_at must NOT move on a suppressed repeat, or the window would never end")
+
+
+# ── the flap: meanings the owner already heard ───────────────────────────────
+def test_a_flapping_report_does_not_re_wake_for_meanings_already_delivered(known, tmp_path):
+    """v8 regression. The window is per MEANING, so a toggle is not an infinite doorbell.
+
+    Keyed on the report alone, `partial → blocked → partial → blocked` each read as "the
+    classification changed" and delivered — four interruptions in fifteen minutes for two
+    decisions the owner had already been told. Each meaning now owns its own 30 minutes.
+    """
+    em = _Emitter()
+    for off, text in ((0 * MIN, PARTIAL), (5 * MIN, BLOCKED),
+                      (10 * MIN, PARTIAL_REWRITTEN), (15 * MIN, BLOCKED_REWRITTEN)):
+        _write(tmp_path, text)
+        _scan(_projects(known), em, now=10_000.0 + off)
+
+    assert len(em.events) == 4, "every save is still its own piece of evidence"
+    assert len(em.wakes()) == 2, [
+        (e.get("severity"), e["payload"].get("owner_action_delivery_reason"),
+         e["payload"].get("coalesced_reason")) for e in em.events]
+    assert [e["payload"]["owner_action_delivery_reason"] for e in em.wakes()] == \
+        ["first_time", "classification_changed"]
+    for repeat in em.events[2:]:
+        assert repeat["payload"]["coalesced_reason"] == "coalesced_same_meaning"
+
+
+def test_the_stopped_incomplete_finding_coalesces_too(known, tmp_path):
+    """`work_stopped_incomplete` is the second owner-action path and gates identically.
+
+    An agent that goes idle on unfinished work raises it alongside the partial event, so an
+    ungated stopped-finding would have doubled every one of the live interruptions.
+    """
+    em = _Emitter()
+    for i, text in enumerate((PARTIAL, PARTIAL_REWRITTEN, PARTIAL_REWRITTEN_2)):
+        _write(tmp_path, text)
+        _scan(_projects(known), em, now=10_000.0 + i * 4 * MIN, state="idle")
+
+    stopped = em.of_type(we.EVENT_STOPPED)
+    assert len(stopped) == 3, "each save is still evidence that work stopped half-done"
+    assert [e["owner_action_required"] for e in stopped] == [True, False, False]
+    assert stopped[-1]["payload"]["suppressed_count"] == 2
+    assert len(em.wakes()) == 2, "one partial + one stopped, not six"
+
+
+def test_each_distinct_meaning_keeps_its_own_window(known, tmp_path):
+    """Two meanings, two windows — neither one's cooldown silences the other."""
+    em = _Emitter()
+    _write(tmp_path, PARTIAL)
+    _scan(_projects(known), em, now=10_000.0)
+    _write(tmp_path, BLOCKED)
+    _scan(_projects(known), em, now=10_000.0 + 1 * MIN)
+    assert len(em.wakes()) == 2
+
+    conn = store.connect()
+    try:
+        rows = conn.execute(
+            "SELECT meaning_key,last_push_at FROM work_evidence_push WHERE evidence_key=?",
+            ("report:mess:reports/MESS_AUTO_UPDATE.md",)).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 2, f"one row per meaning; got {rows}"
+    assert all(r[1] for r in rows), "both meanings really were delivered"
+
+
 # ── reopening delivery ───────────────────────────────────────────────────────
 def test_a_repeat_after_the_cooldown_is_news_again(known, tmp_path):
     em = _Emitter()
@@ -176,10 +268,13 @@ def test_a_change_of_classification_reopens_delivery_immediately(known, tmp_path
         "classification_changed"
 
 
-def test_partial_then_done_then_partial_is_heard_again(known, tmp_path):
-    """A relapse must be audible even though the signature matches the first partial.
+def test_partial_then_done_then_partial_inside_the_window_is_not_a_second_wake(
+        known, tmp_path):
+    """A relapse the owner has ALREADY been told about does not interrupt him twice.
 
-    This only works because the informational `done` event updates the stored meaning.
+    The intermediate `done` never woke anyone — a completed report is informational, at
+    severity `info`. So the last thing the owner was told about this report is "partial",
+    six minutes ago, and the relapse restates it. All three events are in the inbox.
     """
     em = _Emitter()
     _write(tmp_path, PARTIAL)
@@ -189,9 +284,23 @@ def test_partial_then_done_then_partial_is_heard_again(known, tmp_path):
     _write(tmp_path, PARTIAL_REWRITTEN)
     _scan(_projects(known), em, now=10_000.0 + 6 * MIN)
 
-    assert len(em.wakes()) == 2, "going partial again after done is a new decision"
-    assert em.wakes()[1]["payload"]["owner_action_delivery_reason"] == \
-        "classification_changed"
+    assert len(em.wakes()) == 1, "the owner already knows this report is partial"
+    assert len(em.events) == 3, "every state the report passed through is still evidence"
+    assert em.of_type(we.EVENT_PARTIAL)[-1]["payload"]["coalesced"] is True
+
+
+def test_a_relapse_after_the_window_is_heard_again(known, tmp_path):
+    """Same sequence, past the cooldown: silence is bounded at 30 minutes, not permanent."""
+    em = _Emitter()
+    _write(tmp_path, PARTIAL)
+    _scan(_projects(known), em, now=10_000.0)
+    _write(tmp_path, "# MESS — auto-update\n\nAll parts **DONE**. Shipped and verified.\n")
+    _scan(_projects(known), em, now=10_000.0 + 3 * MIN)
+    _write(tmp_path, PARTIAL_REWRITTEN)
+    _scan(_projects(known), em, now=10_000.0 + 31 * MIN)
+
+    assert len(em.wakes()) == 2
+    assert em.wakes()[1]["payload"]["owner_action_delivery_reason"] == "cooldown_expired"
 
 
 def test_a_new_stage_pointer_reopens_delivery(known, tmp_path):
@@ -248,12 +357,63 @@ def test_the_coalesce_state_is_a_real_durable_row(known, tmp_path):
     conn = store.connect()
     try:
         row = conn.execute(
-            "SELECT project,kind,last_push_at,suppressed_count FROM work_evidence_push "
-            "WHERE meaning_key=?", ("report:mess:reports/MESS_AUTO_UPDATE.md",)).fetchone()
+            "SELECT project,kind,last_push_at,suppressed_count,meaning_key,last_seen_at "
+            "FROM work_evidence_push WHERE evidence_key=?",
+            ("report:mess:reports/MESS_AUTO_UPDATE.md",)).fetchone()
     finally:
         conn.close()
     assert row is not None, "no durable row -> the window would die with the process"
     assert row[0] == "mess" and row[2], "a delivery must stamp last_push_at"
+    assert row[5], "a delivery is also an observation"
+    # The window belongs to the report AND what it says, not to the report alone.
+    assert row[4].startswith("report:mess:reports/MESS_AUTO_UPDATE.md|"), row[4]
+    assert we.EVENT_PARTIAL in row[4], row[4]
+
+
+def test_a_live_v8_cooldown_survives_the_upgrade_to_v9(tmp_path, monkeypatch):
+    """The deploy that ships v9 must not itself become a round of owner wakes.
+
+    A v8 row is keyed by the report alone. Dropping those rows on upgrade would make every
+    live cooldown read as `first_time` on the next 5-minute tick — the exact interruption
+    this table exists to prevent, caused by the fix for it. They are re-keyed instead.
+    """
+    db = tmp_path / "v8.db"
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(db))
+    store.init_db().close()
+
+    # Rewind an existing row to its v8 shape: no evidence_key, key = the report alone.
+    conn = store.connect()
+    try:
+        conn.execute(
+            "INSERT INTO work_evidence_push(meaning_key,project,target,ref,kind,class_sig,"
+            "task_id,stage_pointer,severity,last_push_at,last_event_id,suppressed_count,"
+            "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("report:mess:reports/MESS_AUTO_UPDATE.md", "mess", "mess-qa-automation:0.0",
+             "reports/MESS_AUTO_UPDATE.md", we.EVENT_PARTIAL,
+             f"{we.EVENT_PARTIAL}|not_started,partial|", "", "stage_09", "high",
+             "2026-08-07T00:00:00+00:00", 41, 0, "2026-08-07T00:00:00+00:00"))
+        conn.execute("UPDATE work_evidence_push SET evidence_key=NULL, last_seen_at=NULL")
+        conn.execute("UPDATE schema_meta SET version=8 WHERE id=1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    store.init_db().close()
+
+    conn = store.connect()
+    try:
+        row = conn.execute(
+            "SELECT meaning_key,evidence_key,last_push_at,last_seen_at,last_event_id "
+            "FROM work_evidence_push").fetchone()
+    finally:
+        conn.close()
+    assert store.schema_version() == 9
+    assert row[0] == (f"report:mess:reports/MESS_AUTO_UPDATE.md|"
+                      f"{we.EVENT_PARTIAL}|not_started,partial|"), row[0]
+    assert row[1] == "report:mess:reports/MESS_AUTO_UPDATE.md"
+    assert row[2] == "2026-08-07T00:00:00+00:00", "the live cooldown must survive intact"
+    assert row[3] == "2026-08-07T00:00:00+00:00", "last_seen backfills from updated_at"
+    assert row[4] == 41, "the event it coalesces with is not forgotten"
 
 
 # ── no over-reach ────────────────────────────────────────────────────────────

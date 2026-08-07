@@ -170,24 +170,47 @@ def _iso_at(now: Optional[float]) -> str:
     return datetime.fromtimestamp(now, tz=timezone.utc).isoformat()
 
 
-def _owner_action_gate(meaning_key: str, *, class_sig: str, task_id: str,
+def _meaning_key(evidence_key: str, class_sig: str) -> str:
+    """The identity a cooldown is scoped to: this report AND what it currently says.
+
+    Keying on the report alone (v8) bounded a stream of identical saves but not a report
+    that FLAPS. `partial → blocked → partial → blocked` then read as "the classification
+    changed" four times and woke the owner four times, for two decisions he had already
+    been told. With the meaning IN the key, each decision owns its own window and a
+    flap-back is what it actually is: the same thing, said again.
+    """
+    return f"{evidence_key}|{class_sig}"
+
+
+def _owner_action_gate(evidence_key: str, *, class_sig: str, task_id: str,
                        stage_pointer: str, severity: str, now: float, conn=None) -> dict:
     """May this owner-action finding interrupt the owner AGAIN?
 
     Fail-closed toward being heard: every reason to believe the situation is genuinely
     different re-opens delivery immediately. Only the exact same meaning, inside the
     cooldown, is coalesced — and even then the event itself is still recorded.
+
+    The one invariant worth stating outright: nothing is EVER suppressed unless the owner
+    was told THAT SAME THING inside the cooldown. A new meaning always gets through.
     """
     conn, own = _c(conn)
     try:
+        key = _meaning_key(evidence_key, class_sig)
         r = conn.execute(
             "SELECT class_sig,task_id,stage_pointer,severity,last_push_at,last_event_id,"
             "suppressed_count FROM work_evidence_push WHERE meaning_key=?",
-            (meaning_key,)).fetchone()
+            (key,)).fetchone()
         if not r:
-            return {"deliver": True, "reason": "first_time", "suppressed_count": 0,
-                    "prior_event_id": 0}
-        prev_sig, prev_task, prev_stage, prev_sev, last_push_at, last_eid, sup = r
+            # Never delivered under this meaning. Distinguish the two ways that happens, so
+            # the payload can say WHY the owner is being woken: a report nobody has raised
+            # before, or one whose state genuinely moved (partial → blocked, blocked → done).
+            sibling = conn.execute(
+                "SELECT 1 FROM work_evidence_push WHERE evidence_key=? AND meaning_key<>? "
+                "AND last_push_at IS NOT NULL LIMIT 1", (evidence_key, key)).fetchone()
+            return {"deliver": True,
+                    "reason": "classification_changed" if sibling else "first_time",
+                    "suppressed_count": 0, "prior_event_id": 0}
+        _prev_sig, prev_task, prev_stage, prev_sev, last_push_at, last_eid, sup = r
         sup = int(sup or 0)
         prior = int(last_eid or 0)
         if not last_push_at:
@@ -195,9 +218,9 @@ def _owner_action_gate(meaning_key: str, *, class_sig: str, task_id: str,
             # An undelivered finding has not interrupted anyone, so it is still owed one.
             return {"deliver": True, "reason": "not_yet_delivered",
                     "suppressed_count": sup, "prior_event_id": prior}
-        if (prev_sig or "") != class_sig:
-            return {"deliver": True, "reason": "classification_changed",
-                    "suppressed_count": sup, "prior_event_id": prior}
+        # No classification check here: the classification IS the key, so reaching this row
+        # already means the meaning matched. What follows are the ways the SAME meaning can
+        # still describe a materially different situation.
         if (prev_task or "") != (task_id or ""):
             return {"deliver": True, "reason": "task_correlation_changed",
                     "suppressed_count": sup, "prior_event_id": prior}
@@ -219,43 +242,26 @@ def _owner_action_gate(meaning_key: str, *, class_sig: str, task_id: str,
             conn.close()
 
 
-def _meaning_columns(meaning_key: str, *, project: str, target: str, ref: str, kind: str,
-                     class_sig: str, task_id: str, stage_pointer: str, severity: str,
-                     conn) -> None:
-    """Upsert only what a finding MEANS, never the delivery counters.
-
-    Called for informational report events too. Without it a report that goes
-    partial → done → partial would compare its new signature against the stale `partial`
-    left behind before the `done`, conclude nothing had changed, and silently coalesce a
-    genuine relapse.
-    """
+def _meaning_columns(meaning_key: str, *, evidence_key: str, project: str, target: str,
+                     ref: str, kind: str, class_sig: str, task_id: str, stage_pointer: str,
+                     severity: str, seen_at: str, conn) -> None:
+    """Upsert what a finding MEANS and when it was last OBSERVED, never the delivery
+    counters. `last_seen_at` moves on every repeat, delivered or coalesced, so the row
+    answers "is this still happening?" independently of "was the owner told?"."""
     ts = now_iso()
     conn.execute(
-        "INSERT INTO work_evidence_push(meaning_key,project,target,ref,kind,class_sig,"
-        "task_id,stage_pointer,severity,last_push_at,last_event_id,suppressed_count,"
-        "updated_at) VALUES(?,?,?,?,?,?,?,?,?,NULL,0,0,?) "
-        "ON CONFLICT(meaning_key) DO UPDATE SET class_sig=excluded.class_sig,"
+        "INSERT INTO work_evidence_push(meaning_key,evidence_key,project,target,ref,kind,"
+        "class_sig,task_id,stage_pointer,severity,last_push_at,last_event_id,"
+        "suppressed_count,last_seen_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,NULL,0,0,?,?) "
+        "ON CONFLICT(meaning_key) DO UPDATE SET evidence_key=excluded.evidence_key,"
         "task_id=excluded.task_id,stage_pointer=excluded.stage_pointer,"
-        "severity=excluded.severity,kind=excluded.kind,updated_at=excluded.updated_at",
-        (meaning_key, project, target, ref, kind, class_sig, task_id, stage_pointer,
-         severity, ts))
+        "severity=excluded.severity,kind=excluded.kind,ref=excluded.ref,"
+        "last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at",
+        (meaning_key, evidence_key, project, target, ref, kind, class_sig, task_id,
+         stage_pointer, severity, seen_at, ts))
 
 
-def _meaning_touch(meaning_key: str, *, project: str, target: str, ref: str, kind: str,
-                   class_sig: str, task_id: str, stage_pointer: str, severity: str,
-                   conn=None) -> None:
-    conn, own = _c(conn)
-    try:
-        _meaning_columns(meaning_key, project=project, target=target, ref=ref, kind=kind,
-                         class_sig=class_sig, task_id=task_id,
-                         stage_pointer=stage_pointer, severity=severity, conn=conn)
-        conn.commit()
-    finally:
-        if own:
-            conn.close()
-
-
-def _owner_action_record(meaning_key: str, *, project: str, target: str, ref: str,
+def _owner_action_record(evidence_key: str, *, project: str, target: str, ref: str,
                          kind: str, class_sig: str, task_id: str, stage_pointer: str,
                          severity: str, delivered: bool, event_id: int,
                          suppressed_count: int, now: float = None, conn=None) -> None:
@@ -263,18 +269,20 @@ def _owner_action_record(meaning_key: str, *, project: str, target: str, ref: st
     suppressed repeat can never extend the window that is suppressing it."""
     conn, own = _c(conn)
     try:
-        _meaning_columns(meaning_key, project=project, target=target, ref=ref, kind=kind,
-                         class_sig=class_sig, task_id=task_id,
-                         stage_pointer=stage_pointer, severity=severity, conn=conn)
+        key = _meaning_key(evidence_key, class_sig)
+        _meaning_columns(key, evidence_key=evidence_key, project=project, target=target,
+                         ref=ref, kind=kind, class_sig=class_sig, task_id=task_id,
+                         stage_pointer=stage_pointer, severity=severity,
+                         seen_at=_iso_at(now), conn=conn)
         if delivered:
             conn.execute(
                 "UPDATE work_evidence_push SET last_push_at=?,last_event_id=?,"
                 "suppressed_count=0 WHERE meaning_key=?",
-                (_iso_at(now), int(event_id or 0), meaning_key))
+                (_iso_at(now), int(event_id or 0), key))
         else:
             conn.execute(
                 "UPDATE work_evidence_push SET suppressed_count=? WHERE meaning_key=?",
-                (int(suppressed_count), meaning_key))
+                (int(suppressed_count), key))
         conn.commit()
     finally:
         if own:
@@ -488,10 +496,9 @@ def scan(projects: Optional[dict] = None, *, emit_fn: Callable = None,
             payload = {"report": rel, "markers": cls, "headline": headline,
                        "agent_state": state, "open_task": task_id,
                        "stage_pointer_moved": False}
-            # The owner is interrupted for MEANING, not for bytes. `ev_id` keys the report
-            # itself (not the event kind), so a report that flips partial → done → partial
-            # is compared against its own previous meaning rather than against a separate
-            # per-kind row that would never see the flip.
+            # The owner is interrupted for MEANING, not for bytes: the window is scoped to
+            # this report AND what it currently says, so a re-save is silent while a genuine
+            # change of state is heard at once.
             gate = None
             deliver = False
             if owner_action:
@@ -550,12 +557,8 @@ def scan(projects: Optional[dict] = None, *, emit_fn: Callable = None,
                     severity=severity, delivered=deliver,
                     event_id=(res or {}).get("event_id", 0),
                     suppressed_count=gate["suppressed_count"], now=now, conn=conn)
-            else:
-                # Informational reports are never suppressed, but their meaning is still
-                # recorded so the NEXT partial is measured against the truth.
-                _meaning_touch(ev_id, project=project, target=target, ref=rel, kind=kind,
-                               class_sig=class_sig, task_id=task_id,
-                               stage_pointer=stage_pointer, severity=severity, conn=conn)
+            # Informational reports need no row at all: with the meaning in the key, a later
+            # partial cannot be measured against a stale signature — it simply has its own.
             emitted.append({"target": target, "kind": kind, "ref": path,
                             "event_id": (res or {}).get("event_id"), "markers": cls,
                             "first_time": first_time,

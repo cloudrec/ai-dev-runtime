@@ -12,7 +12,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Identity of THIS process run. Delivery health is evidence-scoped to a runtime: a proof
 # recorded by a PREVIOUS process (before a restart/redeploy) is history, not a live claim
@@ -209,24 +209,37 @@ CREATE TABLE IF NOT EXISTS work_evidence (
     fingerprint TEXT, first_seen_at TEXT, last_seen_at TEXT, event_id INTEGER);
 CREATE INDEX IF NOT EXISTS ix_work_evidence_project ON work_evidence(project, kind);
 
--- (v8) One row per owner-action MEANING — project + report + event kind — not per set of
--- bytes. `work_evidence` already fingerprints content so a rewritten report is news again;
--- that is correct for the audit trail and wrong for the owner, who was woken three times in
--- sixteen minutes for one piece of work being saved three times. This table is what makes a
--- repeat interruption suppressible while every material change still reaches the inbox.
+-- (v8) One row per owner-action MEANING — not per set of bytes. `work_evidence` already
+-- fingerprints content so a rewritten report is news again; that is correct for the audit
+-- trail and wrong for the owner, who was woken three times in sixteen minutes for one piece
+-- of work being saved three times. This table is what makes a repeat interruption
+-- suppressible while every material change still reaches the inbox.
+--
+-- (v9) The MEANING is `project + report + semantic reason` — `meaning_key` is
+-- `<evidence_key>|<class_sig>`, and `evidence_key` keeps the report it belongs to. v8 kept a
+-- single row per REPORT holding its latest classification, which bounded a stream of
+-- identical saves but not a report that FLAPS: partial → blocked → partial → blocked each
+-- read as "the classification changed" and woke the owner every time — four interruptions in
+-- fifteen minutes for two decisions he had already been told. Giving every meaning its own
+-- window keeps the invariant that matters: nothing is ever suppressed unless the owner was
+-- told THAT SAME THING within the cooldown.
 --
 -- Durable ON PURPOSE: an in-memory timer would forget the cooldown across the 5-minute tick
 -- and, worse, across a restart — turning a redeploy into a fresh round of owner wakes. The
--- comparison columns (not just the timestamp) are stored so a change of MEANING — a
--- different classification, task or stage — can re-open delivery immediately instead of
+-- comparison columns (not just the timestamp) are stored so a change within one meaning — a
+-- different task or stage, a rise in severity — can re-open delivery immediately instead of
 -- waiting out a cooldown that no longer describes the situation.
 CREATE TABLE IF NOT EXISTS work_evidence_push (
-    meaning_key TEXT PRIMARY KEY, project TEXT, target TEXT, ref TEXT, kind TEXT,
-    class_sig TEXT, task_id TEXT, stage_pointer TEXT, severity TEXT,
+    meaning_key TEXT PRIMARY KEY, evidence_key TEXT, project TEXT, target TEXT, ref TEXT,
+    kind TEXT, class_sig TEXT, task_id TEXT, stage_pointer TEXT, severity TEXT,
     last_push_at TEXT, last_event_id INTEGER DEFAULT 0,
-    suppressed_count INTEGER DEFAULT 0, updated_at TEXT);
+    suppressed_count INTEGER DEFAULT 0, last_seen_at TEXT, updated_at TEXT);
 CREATE INDEX IF NOT EXISTS ix_work_evidence_push_project
     ON work_evidence_push(project, kind);
+-- NOTE: the index on `evidence_key` is created AFTER the ALTERs below, not here. This
+-- script runs first, and on an existing DB `CREATE TABLE IF NOT EXISTS` is a no-op — so a
+-- v8 table is still missing the column an index here would name, and `init_db` would raise
+-- `no such column: evidence_key` on every start against a live database.
 """
 
 
@@ -253,6 +266,9 @@ def init_db(conn: sqlite3.Connection | None = None) -> sqlite3.Connection:
         # was written by an older build carries no proof for this runtime, so it must not
         # come back green on upgrade.
         "channel": ["state TEXT DEFAULT 'unverified'", "proof_epoch TEXT", "last_proof TEXT"],
+        # v9: the owner-action window is per MEANING, so the row needs to remember which
+        # report it belongs to, and when this meaning was last observed (not just delivered).
+        "work_evidence_push": ["evidence_key TEXT", "last_seen_at TEXT"],
     }
     added = set()
     for table, cols in _V2_COLS.items():
@@ -269,6 +285,22 @@ def init_db(conn: sqlite3.Connection | None = None) -> sqlite3.Connection:
         # `verified` true for a channel that had never delivered anything).
         conn.execute("UPDATE channel SET last_ok_at=NULL "
                      "WHERE name='owner_push' AND last_proof IS NULL")
+    # v8 → v9 re-key. A v8 row is keyed by the report alone; the v9 key is
+    # `<report>|<class_sig>`. Rewriting those rows (rather than dropping them) is what keeps
+    # a LIVE cooldown alive across the deploy — a fresh key would read as `first_time` and
+    # let the upgrade itself wake the owner for work he was told about minutes earlier: the
+    # exact interruption this table exists to prevent, caused by the fix for it.
+    #
+    # Conditioned on the DATA, not on whether the ALTER above happened to fire, so it is
+    # idempotent and still correct if the column arrived by any other route. `evidence_key`
+    # is NOT NULL on every row v9 writes, so a converged DB matches nothing.
+    conn.execute("UPDATE work_evidence_push SET evidence_key=meaning_key, "
+                 "last_seen_at=COALESCE(last_seen_at, updated_at), "
+                 "meaning_key=meaning_key || '|' || COALESCE(class_sig,'') "
+                 "WHERE evidence_key IS NULL")
+    # Safe only now that the column is guaranteed to exist on old and new DBs alike.
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_work_evidence_push_evidence "
+                 "ON work_evidence_push(evidence_key)")
     row = conn.execute("SELECT version FROM schema_meta WHERE id=1").fetchone()
     if not row:
         conn.execute("INSERT INTO schema_meta(id,version,updated_at) VALUES(1,?,?)",
