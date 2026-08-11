@@ -28,6 +28,12 @@ COMPOSER_SEL = "#prompt-textarea, div[contenteditable='true'][id='prompt-textare
 # matching, which would break the moment the UI is in another language.
 SEND_SEL = ("button[data-testid='send-button'], form button[type='submit'], "
             "[data-testid*='send']")
+# The message the page decided to keep. A cleared composer only proves the page ACCEPTED the
+# keystrokes locally — it is emptied optimistically, before the turn is committed, so three
+# earlier "deliveries" cleared the composer and left no message behind. The turn node is the
+# first structure that exists only once the conversation actually gained the message, so
+# delivery is judged by its COUNT rising, never by the composer emptying.
+USER_TURN_SEL = "[data-message-author-role='user']"
 
 
 def _http(path: str):
@@ -102,13 +108,31 @@ class _Session:
             pass
 
 
+def _record_delivery(source: str, event_id: Optional[int], res: dict) -> dict:
+    """Persist the outcome of an attempt — the failures above all, since those are the ones
+    that must stay unacknowledged and be retried."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, "/root/ai-dev-runtime")
+        from core import wake_bridge as _wb
+        _wb.record_delivery(source, event_id=event_id, delivered=bool(res.get("ok")),
+                            reason=str(res.get("reason", "")))
+    except Exception:  # noqa: BLE001 — a missing recorder must never turn into a false success
+        pass
+    return res
+
+
 def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown",
                   event_id: Optional[int] = None, claim: bool = True) -> dict:
-    """Locate the composer structurally, verify it, insert the phrase, verify, send.
+    """Locate the composer structurally, verify it, insert the phrase, send, verify DELIVERY.
 
     Returns {"ok": bool, "reason": str}. Every refusal names its cause so a silent failure is
     impossible — the previous implementation reported success three times without ever
     confirming a keystroke landed.
+
+    `ok` now means the bound conversation gained a new user turn. A cleared composer is
+    necessary but NOT sufficient: the page empties it optimistically, so a send that failed
+    after acceptance looked identical to one that worked.
     """
     # FAIL CLOSED at the single choke point. Any caller — companion, operator, a script —
     # must claim the slot, so no path can submit outside the global cooldown.
@@ -123,6 +147,27 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "reason": f"claim_unavailable:{type(e).__name__}"}
 
+    # The claim is spent from here on, so every outcome past this line is a delivery attempt
+    # and is recorded as one — success and failure alike.
+    return _record_delivery(source, event_id, _attempt(conversation_url, phrase,
+                                                       source=source, event_id=event_id))
+
+
+def _latch_submitted(source: str, event_id: Optional[int]) -> None:
+    """Record that the phrase was FIRED, before we know whether it landed."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, "/root/ai-dev-runtime")
+        from core import wake_bridge as _wb
+        _wb.mark_submitted(event_id, source=source)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
+             event_id: Optional[int] = None) -> dict:
+    """The submission itself, once the slot is claimed. Split out so that every exit path
+    below is recorded by exactly one caller instead of each remembering to do it."""
     target = find_target(conversation_url)
     if not target:
         # The page may simply be on another ChatGPT URL (a restart lands on the root). Take
@@ -162,6 +207,11 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
         n = s.count(COMPOSER_SEL)
         if n != 1:
             return {"ok": False, "reason": f"composer_ambiguous_or_absent:{n}"}
+        # The baseline the delivery proof is measured against. Taken BEFORE anything is
+        # typed, so a turn that was already on screen can never be mistaken for ours.
+        turns_before = s.count(USER_TURN_SEL)
+        if turns_before < 0:
+            return {"ok": False, "reason": "user_turn_count_unavailable"}
         # Focus by element identity, then CONFIRM focus. A focus call that silently fails is
         # exactly how the phrase went nowhere before.
         s.call("Runtime.evaluate",
@@ -184,6 +234,10 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
         enabled = s.boolean(
             f"(function(){{const b=document.querySelector({SEND_SEL!r});"
             f"return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';}})()")
+        # LATCH FIRST. Everything below can send the phrase, and everything below can also
+        # fail to observe that it did. Whichever way the verification lands, this event must
+        # never be offered for submission a second time.
+        _latch_submitted(source, event_id)
         if enabled is True:
             s.call("Runtime.evaluate",
                    {"expression": f"document.querySelector({SEND_SEL!r}).click()"})
@@ -196,16 +250,24 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
                         "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13,
                         "text": "\r" if t == "char" else ""})
 
-        # Confirm the composer emptied — the page's own signal that it accepted the message.
+        # Two separate facts, in order. The composer emptying says the page took the
+        # keystrokes; only the turn count rising says the conversation kept the message.
         import time
+        cleared = False
         for _ in range(10):
             time.sleep(1)
-            cleared = s.boolean(
-                f"(function(){{const c=document.querySelector({COMPOSER_SEL!r});"
-                f"return !c || c.textContent.length === 0;}})()")
-            if cleared is True:
-                return {"ok": True, "reason": "submitted_and_composer_cleared"}
-        return {"ok": False, "reason": "composer_did_not_clear_after_send"}
+            if not cleared:
+                cleared = s.boolean(
+                    f"(function(){{const c=document.querySelector({COMPOSER_SEL!r});"
+                    f"return !c || c.textContent.length === 0;}})()") is True
+            if cleared and s.count(USER_TURN_SEL) > turns_before:
+                return {"ok": True, "reason": "submitted_and_user_turn_appeared"}
+        if not cleared:
+            return {"ok": False, "reason": "composer_did_not_clear_after_send"}
+        # The composer emptied and nothing arrived. This is the exact shape of the silent
+        # failure this check exists for: it must NOT be acknowledged, so the wake stays
+        # pending and is retried after the cooldown.
+        return {"ok": False, "reason": "user_turn_not_observed_after_send"}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": f"cdp_error:{type(e).__name__}"}
     finally:

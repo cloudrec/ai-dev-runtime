@@ -38,6 +38,57 @@ KILL_SWITCH = os.getenv("WAKE_BRIDGE_KILL_SWITCH", "0") not in ("0", "", "false"
 COOLDOWN_SECS = int(os.getenv("WAKE_BRIDGE_COOLDOWN_SECS", "900"))
 # Only these severities are ever worth a wake.
 WAKE_SEVERITIES = {"critical", "high"}
+
+# ── event eligibility ───────────────────────────────────────────────────────
+# Severity and `owner_action_required` remain the two independent authorities they always
+# were. What they missed is a class of event that is unmistakably significant yet carries
+# neither: `owner_gate_opened` is emitted at info severity with owner_action_required=0, so
+# the owner was never woken for a gate that exists precisely to ask them something.
+#
+# These sets are ADDITIVE. Nothing that woke before stops waking; a type listed here becomes
+# eligible on its own, and a type listed as routine is only ever refused when severity and
+# owner_action_required have already declined to speak for it.
+WAKE_EVENT_TYPES = frozenset({
+    # waiting on the owner / a decision is required
+    "owner_gate_opened", "agent_owner_decision", "agent_waiting_owner",
+    "owner_decision_required", "agent_blocked_on_owner", "needs_owner_payload",
+    # failure, death, blocker
+    "agent_dead", "agent_process_failed", "agent_crash_loop", "session_quarantined",
+    "governor_blocker", "stage_blocked_external", "task_failed", "action_blocked",
+    "notification_dead_letter", "notification_channel_down", "notifications_red",
+    # an owner-directed task reaching its end
+    "task_completed", "work_stopped_incomplete",
+})
+
+# Routine traffic: progress chatter, verification echoes and no-change reports. Naming them
+# turns "not_significant" into an auditable reason instead of a silent fallthrough.
+ROUTINE_EVENT_TYPES = frozenset({
+    "agent_state", "action_verified", "action_deferred_pending_input",
+    "work_partial_completion", "work_commits_without_stage_progress",
+    "work_report_published", "owner_gate_answered", "blocker_resolved",
+    "context_rotated", "false_idle_corrected", "new_agent_discovered",
+    "verified_record_contradicted",
+})
+
+
+def is_significant(*, event_type: str = "", severity: str = "",
+                   owner_action_required: bool = False) -> dict:
+    """Is this event worth interrupting a human for? Returns the reason either way.
+
+    Order matters: the two pre-existing authorities are consulted first, so this function can
+    only ever ADD eligibility. `ROUTINE_EVENT_TYPES` is checked last for exactly that reason —
+    a routine type that somehow arrives at critical severity still wakes.
+    """
+    t = (event_type or "").strip()
+    if severity in WAKE_SEVERITIES:
+        return {"significant": True, "reason": "severity_at_wake_threshold"}
+    if owner_action_required:
+        return {"significant": True, "reason": "owner_action_required"}
+    if t in WAKE_EVENT_TYPES:
+        return {"significant": True, "reason": "significant_event_type"}
+    if t in ROUTINE_EVENT_TYPES:
+        return {"significant": False, "reason": "routine_event_type"}
+    return {"significant": False, "reason": "severity_below_wake_threshold"}
 # The ONLY text the companion may submit. No event content, ever.
 WAKE_PHRASE = os.getenv(
     "WAKE_BRIDGE_PHRASE",
@@ -66,7 +117,7 @@ def _enabled() -> tuple:
 
 
 def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
-                owner_action_required: bool = False, conn=None,
+                owner_action_required: bool = False, event_type: str = "", conn=None,
                 now: Optional[float] = None) -> dict:
     """Answer, with a recorded reason either way. Never raises for control flow."""
     now = now if now is not None else now_ts()
@@ -75,8 +126,10 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
         return {"wake": False, "reason": "kill_switch_engaged"}
     if not enabled:
         return {"wake": False, "reason": "bridge_disabled"}
-    if severity not in WAKE_SEVERITIES and not owner_action_required:
-        return {"wake": False, "reason": "severity_below_wake_threshold"}
+    sig = is_significant(event_type=event_type, severity=severity,
+                         owner_action_required=owner_action_required)
+    if not sig["significant"]:
+        return {"wake": False, "reason": sig["reason"]}
     # FAIL CLOSED on the target. With no valid active chat there is nowhere to wake, and
     # guessing a conversation would be exactly the arbitrary behaviour this design forbids.
     target = active_chat(conn=conn)
@@ -148,7 +201,17 @@ def health(conn=None, now: Optional[float] = None) -> dict:
         total = conn.execute("SELECT COUNT(*) FROM wake_audit WHERE decision='wake'"
                              ).fetchone()[0]
         last_age = (now - float(r[0])) if r else None
+        # A wake that was decided but never delivered is the failure mode this reports on.
+        conn.execute(_DELIVERY_SCHEMA)
+        d = conn.execute("SELECT at,delivered,reason FROM wake_delivery "
+                         "ORDER BY id DESC LIMIT 1").fetchone()
+        failed = conn.execute(
+            "SELECT COUNT(*) FROM wake_delivery WHERE delivered=0").fetchone()[0]
         return {"enabled": enabled, "kill_switch": kill,
+                "last_delivery_at": (d[0] if d else None),
+                "last_delivery_ok": (bool(d[1]) if d else None),
+                "last_delivery_reason": (d[2] if d else None),
+                "deliveries_failed_total": int(failed),
                 "cooldown_secs": COOLDOWN_SECS,
                 "wakes_total": int(total),
                 "last_wake_at": (r[1] if r else None),
@@ -267,8 +330,15 @@ def pending_wake(conn=None) -> dict:
         return {"pending": False, "reason": target.get("reason", "no_active_control_chat")}
     conn, own = _conn(conn)
     try:
-        r = conn.execute("SELECT event_id FROM wake_audit WHERE decision='wake' AND "
-                         "acknowledged=0 ORDER BY id ASC LIMIT 1").fetchone()
+        # A phrase already fired for this event is never offered again, even if the
+        # verification that followed was inconclusive. Unacknowledged means "we never got
+        # proof", not "it definitely did not arrive" — and only the latter would justify
+        # sending a second copy into the owner's chat.
+        conn.execute(_SUBMIT_SCHEMA)
+        r = conn.execute("SELECT a.event_id FROM wake_audit a WHERE a.decision='wake' AND "
+                         "a.acknowledged=0 AND NOT EXISTS "
+                         "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
+                         "ORDER BY a.id ASC LIMIT 1").fetchone()
         if not r:
             return {"pending": False, "reason": "nothing_to_wake_for"}
         return {"pending": True, "event_id": int(r[0]),
@@ -320,6 +390,106 @@ def claim_send(source: str, event_id: Optional[int] = None, conn=None,
                      (now, now_iso(), source, int(event_id or 0), int(res[0]), res[1]))
         conn.commit()
         return {"allowed": res[0], "reason": res[1], "source": source}
+    finally:
+        if own:
+            conn.close()
+
+
+# ── delivery outcomes ───────────────────────────────────────────────────────
+# `wake_send` records that a slot was CLAIMED; it says nothing about whether the phrase then
+# arrived. That gap is how a run of failures could look identical to a run of successes. This
+# table closes it: one row per attempt past the claim, carrying the verdict.
+_DELIVERY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wake_delivery (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL, at TEXT, source TEXT, event_id INTEGER, delivered INTEGER, reason TEXT
+)
+"""
+
+# The phrase left our hands. Recorded the moment the send is FIRED, before anything is known
+# about whether the page kept it — because that is the only honest boundary for "may already
+# be in the chat". Verification that comes later can say delivered or not; it can never make
+# an already-submitted phrase un-sent.
+_SUBMIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wake_submitted (
+    event_id INTEGER PRIMARY KEY, ts REAL, at TEXT, source TEXT
+)
+"""
+
+
+def mark_submitted(event_id: Optional[int], source: str = "", conn=None,
+                   now: Optional[float] = None) -> None:
+    """Fail-closed idempotency latch. Called BEFORE the outcome is known.
+
+    The verification added in the delivery patch false-negatived on messages that had in fact
+    arrived: the event stayed unacknowledged, the companion retried, and the owner got the
+    same wake twice — 27 of 49 events, ~60 duplicate sends. Ambiguity must resolve to "assume
+    it went", never to "send it again". The CTO inbox still holds the event either way, so a
+    genuinely lost wake costs latency, not correctness.
+    """
+    if not event_id:
+        return
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        conn.execute(_SUBMIT_SCHEMA)
+        conn.execute("INSERT OR IGNORE INTO wake_submitted (event_id,ts,at,source) "
+                     "VALUES (?,?,?,?)", (int(event_id), now, now_iso(), source))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def was_submitted(event_id: Optional[int], conn=None) -> bool:
+    if not event_id:
+        return False
+    conn, own = _c(conn)
+    try:
+        conn.execute(_SUBMIT_SCHEMA)
+        return conn.execute("SELECT 1 FROM wake_submitted WHERE event_id=?",
+                            (int(event_id),)).fetchone() is not None
+    finally:
+        if own:
+            conn.close()
+
+
+def record_delivery(source: str, *, event_id: Optional[int] = None, delivered: bool = False,
+                    reason: str = "", conn=None, now: Optional[float] = None) -> int:
+    """Persist what actually happened. A failure stays UNACKNOWLEDGED by construction — the
+    caller only acknowledges on success — so the wake remains pending and is retried."""
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        conn.execute(_DELIVERY_SCHEMA)
+        cur = conn.execute(
+            "INSERT INTO wake_delivery (ts,at,source,event_id,delivered,reason) "
+            "VALUES (?,?,?,?,?,?)",
+            (now, now_iso(), source, int(event_id or 0), 1 if delivered else 0,
+             str(reason)[:160]))
+        conn.commit()
+        return int(cur.lastrowid)
+    finally:
+        if own:
+            conn.close()
+
+
+def last_delivery(event_id: Optional[int] = None, conn=None) -> Optional[dict]:
+    """The most recent attempt, overall or for one event."""
+    conn, own = _c(conn)
+    try:
+        conn.execute(_DELIVERY_SCHEMA)
+        if event_id is None:
+            r = conn.execute("SELECT at,source,event_id,delivered,reason FROM wake_delivery "
+                             "ORDER BY id DESC LIMIT 1").fetchone()
+        else:
+            r = conn.execute("SELECT at,source,event_id,delivered,reason FROM wake_delivery "
+                             "WHERE event_id=? ORDER BY id DESC LIMIT 1",
+                             (int(event_id),)).fetchone()
+        if not r:
+            return None
+        return {"at": r[0], "source": r[1], "event_id": int(r[2]),
+                "delivered": bool(r[3]), "reason": r[4]}
     finally:
         if own:
             conn.close()

@@ -69,8 +69,13 @@ def emit(source: str, type: str, *, project_id: str = "", agent_id: str = "",
         # bridge_disabled" row and the audit trail would be noise before it was ever used.
         try:
             from core import wake_bridge as _wb
-            if _wb._enabled()[0] and (severity in _PUSH_SEVERITIES or owner_action_required):
-                _d = _wb.should_wake(event_id=eid, severity=severity,
+            # Eligibility lives in the bridge, not here. The old inline test was severity or
+            # owner_action_required, which meant an `owner_gate_opened` — info severity, no
+            # owner_action flag — could never reach the bridge at all, however long it waited.
+            if _wb._enabled()[0] and _wb.is_significant(
+                    event_type=type, severity=severity,
+                    owner_action_required=owner_action_required)["significant"]:
+                _d = _wb.should_wake(event_id=eid, severity=severity, event_type=type,
                                      correlation_id=correlation_id,
                                      owner_action_required=owner_action_required, conn=conn)
                 _wb.record(_d, event_id=eid, severity=severity,

@@ -104,22 +104,27 @@ def main() -> None:
                 # Structural CDP path first: it can VERIFY. The keyboard path cannot
                 # confirm a keystroke reached the composer, which is how three earlier
                 # wakes reported success without delivering anything.
+                res = {"ok": False, "reason": "not_attempted"}
                 try:
                     from cdp_composer import submit_phrase
                     res = submit_phrase(p["conversation"], p["phrase"],
                                         source="companion", event_id=p["event_id"])
                     ok = bool(res.get("ok"))
-                    if not ok:
-                        print(f"cdp refused: {res.get('reason')}", flush=True)
                 except Exception as e:  # noqa: BLE001
-                    print(f"cdp unavailable: {type(e).__name__}", flush=True)
+                    res = {"ok": False, "reason": f"cdp_unavailable:{type(e).__name__}"}
                     ok = False
                 if ok:
-                    # Acknowledge so the same event can never be submitted twice.
+                    # Acknowledge ONLY on verified delivery. Anything else leaves the wake
+                    # pending, which is what makes a failed submission retryable instead of
+                    # silently consumed.
                     wb.acknowledge(p["event_id"])
-                    print(f"submitted wake for event {p['event_id']}", flush=True)
+                    print(f"delivered wake for event {p['event_id']}: {res.get('reason')}",
+                          flush=True)
                 else:
-                    print("no browser window; will retry", flush=True)
+                    # The old text claimed "no browser window" for every failure, including
+                    # a plain cooldown refusal, which sent three investigations the wrong way.
+                    print(f"not delivered for event {p['event_id']}; stays pending "
+                          f"({res.get('reason')})", flush=True)
         except Exception as e:  # noqa: BLE001
             print(f"companion error: {str(e)[:160]}", flush=True)
         time.sleep(POLL_SECS)
