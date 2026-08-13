@@ -13,7 +13,7 @@ restart, and above all no hunt for a hardcoded URL.
 
 This document exists because that hunt kept happening. A chat fills up, the owner opens a
 new one, and the next session starts by grepping the server for the old link. There is
-nothing to grep. Читайте дальше только если нужно понять, почему.
+nothing to grep. Read on only if you need to know why.
 
 ---
 
@@ -120,7 +120,7 @@ field shows the new ID, the rebind is live.
 
 ### 4. Non-destructive smoke test
 
-Проверяет путь до самого композера, **ничего не печатая и не отправляя** в чат:
+Checks the path all the way to the composer, **typing nothing and sending nothing** into the chat:
 
 ```bash
 venv/bin/python - <<'PY'
