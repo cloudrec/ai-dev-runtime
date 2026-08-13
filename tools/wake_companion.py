@@ -108,7 +108,8 @@ def main() -> None:
                 try:
                     from cdp_composer import submit_phrase
                     res = submit_phrase(p["conversation"], p["phrase"],
-                                        source="companion", event_id=p["event_id"])
+                                        source="companion", event_id=p["event_id"],
+                                        actionable=bool(p.get("actionable")))
                     ok = bool(res.get("ok"))
                 except Exception as e:  # noqa: BLE001
                     res = {"ok": False, "reason": f"cdp_unavailable:{type(e).__name__}"}

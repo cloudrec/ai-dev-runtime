@@ -123,7 +123,8 @@ def _record_delivery(source: str, event_id: Optional[int], res: dict) -> dict:
 
 
 def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown",
-                  event_id: Optional[int] = None, claim: bool = True) -> dict:
+                  event_id: Optional[int] = None, claim: bool = True,
+                  actionable: bool = False) -> dict:
     """Locate the composer structurally, verify it, insert the phrase, send, verify DELIVERY.
 
     Returns {"ok": bool, "reason": str}. Every refusal names its cause so a silent failure is
@@ -141,7 +142,7 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
             import sys as _sys
             _sys.path.insert(0, "/root/ai-dev-runtime")
             from core import wake_bridge as _wb
-            c = _wb.claim_send(source, event_id=event_id)
+            c = _wb.claim_send(source, event_id=event_id, actionable=actionable)
             if not c.get("allowed"):
                 return {"ok": False, "reason": f"not_claimed:{c.get('reason')}"}
         except Exception as e:  # noqa: BLE001

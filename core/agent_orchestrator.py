@@ -736,6 +736,22 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         except Exception:  # noqa: BLE001
             pass
 
+        # Actionable waiting transition: the SAME edge as above, but published as a durable
+        # CTO event so the wake bridge is consulted. The commander mirror above reaches the
+        # legacy notifier only; a live agent that stopped and is waiting for a response had
+        # no CTO event at all, so wake selection could not see the stall (2026-08-13 03:58).
+        # Deduped by target + progress fingerprint inside the module: steady waiting is
+        # announced once, and waiting again after new progress is a new event.
+        try:
+            from core.control_plane import waiting_transitions as _wt
+            _wt.observe(target=key, prev_state=prev.get("state"), cur_state=state,
+                        project=rec["project"] or session,
+                        conversation_id=str(rec.get("conversation_id") or ""),
+                        progress=agent.get("_tail") or "",
+                        evidence=agent.get("_tail") or "")
+        except Exception:  # noqa: BLE001 — observation must never break the sweep
+            pass
+
         # Source-side retraction: an agent ACTIVE/COMPLETED again → retract its still-
         # unacked stale condition events so the notifier never delivers a contradicted
         # alert (the notifier's pre-delivery revalidation stays as a second barrier).

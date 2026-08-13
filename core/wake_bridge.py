@@ -34,8 +34,12 @@ from core.control_plane.store import now_iso, now_ts
 ENABLED = os.getenv("WAKE_BRIDGE_ENABLED", "0") not in ("0", "", "false", "no")
 # Overrides everything, including an explicit enable.
 KILL_SWITCH = os.getenv("WAKE_BRIDGE_KILL_SWITCH", "0") not in ("0", "", "false", "no")
-# Minimum gap between ANY two wakes, however distinct the events.
+# Minimum gap between ANY two GENERIC wakes, however distinct the events.
 COOLDOWN_SECS = int(os.getenv("WAKE_BRIDGE_COOLDOWN_SECS", "900"))
+# Minimum gap between two ACTIONABLE wakes — a much shorter floor, for the reason given
+# under ACTIONABLE_EVENT_TYPES below. Short is not absent: a flapping agent still cannot
+# turn into a burst of pokes.
+ACTIONABLE_COOLDOWN_SECS = int(os.getenv("WAKE_BRIDGE_ACTIONABLE_COOLDOWN_SECS", "60"))
 # Only these severities are ever worth a wake.
 WAKE_SEVERITIES = {"critical", "high"}
 
@@ -49,6 +53,8 @@ WAKE_SEVERITIES = {"critical", "high"}
 # eligible on its own, and a type listed as routine is only ever refused when severity and
 # owner_action_required have already declined to speak for it.
 WAKE_EVENT_TYPES = frozenset({
+    # an existing live agent that stopped and is waiting for a response RIGHT NOW
+    "agent_waiting_input", "agent_needs_response", "agent_prompt_needs_response",
     # waiting on the owner / a decision is required
     "owner_gate_opened", "agent_owner_decision", "agent_waiting_owner",
     "owner_decision_required", "agent_blocked_on_owner", "needs_owner_payload",
@@ -71,6 +77,31 @@ ROUTINE_EVENT_TYPES = frozenset({
 })
 
 
+# ── the actionable class ────────────────────────────────────────────────────
+# An EXISTING live agent that has stopped and is waiting for a response right now. This is a
+# different KIND of thing from everything above, and the distinction is the whole point of
+# this patch:
+#
+#   * the generic classes are HISTORY — a durable record the assistant reads whenever it next
+#     looks. Delivering one 40 minutes late costs nothing, which is why they share a 900s
+#     floor and drain oldest-first.
+#   * an actionable event is a pane BLOCKED right now. Every minute it queues behind a
+#     multi-day backlog is a minute of work not happening.
+#
+# On 2026-08-13 03:58 payorch-sbp-resumed entered waiting_input and Owner OS had no event for
+# it at all: the only trace was `new_agent_discovered` at info severity, skipped for
+# `cooldown_active`. Meanwhile event 3746 — from Aug 11 — was delivered at 04:09:57, having
+# consumed the one send the global cooldown allows. The owner pinged the chat by hand.
+ACTIONABLE_EVENT_TYPES = frozenset({
+    "agent_waiting_input", "agent_needs_response", "agent_prompt_needs_response",
+})
+
+
+def is_actionable(event_type: str = "") -> bool:
+    """A live agent waiting for a response now, as opposed to a durable record of history."""
+    return (event_type or "").strip() in ACTIONABLE_EVENT_TYPES
+
+
 def is_significant(*, event_type: str = "", severity: str = "",
                    owner_action_required: bool = False) -> dict:
     """Is this event worth interrupting a human for? Returns the reason either way.
@@ -78,8 +109,14 @@ def is_significant(*, event_type: str = "", severity: str = "",
     Order matters: the two pre-existing authorities are consulted first, so this function can
     only ever ADD eligibility. `ROUTINE_EVENT_TYPES` is checked last for exactly that reason —
     a routine type that somehow arrives at critical severity still wakes.
+
+    The actionable class is named ahead of them purely so the AUDIT says which authority
+    spoke. It admits nothing that `WAKE_EVENT_TYPES` would not have admitted anyway.
     """
     t = (event_type or "").strip()
+    if is_actionable(t):
+        return {"significant": True, "reason": "actionable_waiting_transition",
+                "actionable": True}
     if severity in WAKE_SEVERITIES:
         return {"significant": True, "reason": "severity_at_wake_threshold"}
     if owner_action_required:
@@ -102,10 +139,42 @@ CREATE TABLE IF NOT EXISTS wake_audit (
 )
 """
 
+# Columns added after the table shipped. A live control-plane DB already holds the old
+# shape, so they are applied by migration rather than by editing _SCHEMA — which only ever
+# runs for a database that does not exist yet.
+_AUDIT_COLUMNS = (
+    ("event_type", "TEXT"),
+    ("actionable", "INTEGER DEFAULT 0"),
+    # Coalescing: a superseded row is retired from selection but never deleted.
+    ("superseded_by", "INTEGER"),
+    ("superseded_at", "TEXT"),
+    ("superseded_reason", "TEXT"),
+)
+
+# Why a generic wake stopped being offered, kept as its own append-only record. The audit
+# has to survive independently of the row it retired: "the queue got shorter" must always
+# be answerable with which ids were folded into which, and when.
+_COALESCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wake_coalesce_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL, at TEXT, wake_audit_id INTEGER, event_id INTEGER,
+    superseded_by_audit_id INTEGER, superseded_by_event_id INTEGER, reason TEXT
+)
+"""
+
+
+def _migrate(conn) -> None:
+    have = {r[1] for r in conn.execute("PRAGMA table_info(wake_audit)")}
+    for name, decl in _AUDIT_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE wake_audit ADD COLUMN {name} {decl}")
+
 
 def _conn(conn=None):
     conn, own = _c(conn)
     conn.execute(_SCHEMA)
+    _migrate(conn)
+    conn.execute(_COALESCE_SCHEMA)
     return conn, own
 
 
@@ -138,37 +207,62 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
 
     conn, own = _conn(conn)
     try:
+        actionable = is_actionable(event_type)
+        # Exactly-once per event, unchanged and checked FIRST for both classes. Bypassing the
+        # generic cooldown below must never become bypassing dedupe.
         prior = conn.execute(
             "SELECT id,acknowledged FROM wake_audit WHERE event_id=? AND decision='wake' "
             "ORDER BY id DESC LIMIT 1", (int(event_id),)).fetchone()
         if prior:
             return {"wake": False, "reason": "already_woke_for_this_event",
-                    "acknowledged": bool(prior[1])}
+                    "acknowledged": bool(prior[1]), "actionable": actionable}
+        if actionable:
+            # The generic floor is deliberately NOT consulted. A blocked pane waiting out a
+            # cooldown earned by a two-day-old backlog entry is the exact stall this fixes.
+            # Its own floor still applies, so distinct actionable events cannot burst.
+            last_a = conn.execute(
+                "SELECT ts FROM wake_audit WHERE decision='wake' AND actionable=1 "
+                "ORDER BY id DESC LIMIT 1").fetchone()
+            if last_a and (now - float(last_a[0] or 0)) < ACTIONABLE_COOLDOWN_SECS:
+                wait = int(ACTIONABLE_COOLDOWN_SECS - (now - float(last_a[0])))
+                return {"wake": False, "reason": "actionable_cooldown_active",
+                        "wait_secs": wait, "actionable": True}
+            return {"wake": True, "reason": "actionable_waiting_transition",
+                    "actionable": True, "phrase": WAKE_PHRASE,
+                    "conversation": target["conversation"]}
         last = conn.execute(
             "SELECT ts FROM wake_audit WHERE decision='wake' ORDER BY id DESC LIMIT 1"
         ).fetchone()
         if last and (now - float(last[0] or 0)) < COOLDOWN_SECS:
             wait = int(COOLDOWN_SECS - (now - float(last[0])))
-            return {"wake": False, "reason": "cooldown_active", "wait_secs": wait}
+            return {"wake": False, "reason": "cooldown_active", "wait_secs": wait,
+                    "actionable": False}
         return {"wake": True, "reason": "urgent_event_not_yet_signalled",
+                "actionable": False,
                 "phrase": WAKE_PHRASE, "conversation": target["conversation"]}
     finally:
         if own:
             conn.close()
 
 
-def record(decision: dict, *, event_id: int, severity: str = "",
+def record(decision: dict, *, event_id: int, severity: str = "", event_type: str = "",
            correlation_id: str = "", conn=None, now: Optional[float] = None) -> int:
     """Every decision is audited, including the refusals — a bridge that only records its
-    successes cannot be debugged when it stays silent."""
+    successes cannot be debugged when it stays silent.
+
+    The class is persisted alongside the decision, because selection later has to rank by it
+    and a class recomputed at read time would drift the moment the type sets changed.
+    """
     now = now if now is not None else now_ts()
+    actionable = bool(decision.get("actionable", is_actionable(event_type)))
     conn, own = _conn(conn)
     try:
         cur = conn.execute(
-            "INSERT INTO wake_audit (ts,at,event_id,correlation_id,severity,decision,reason) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO wake_audit (ts,at,event_id,correlation_id,severity,decision,reason,"
+            "event_type,actionable) VALUES (?,?,?,?,?,?,?,?,?)",
             (now, now_iso(), int(event_id), correlation_id, severity,
-             "wake" if decision.get("wake") else "skip", str(decision.get("reason"))[:160]))
+             "wake" if decision.get("wake") else "skip", str(decision.get("reason"))[:160],
+             (event_type or "").strip(), 1 if actionable else 0))
         conn.commit()
         return int(cur.lastrowid)
     finally:
@@ -315,7 +409,7 @@ def bind_history(limit: int = 20, conn=None) -> list:
             conn.close()
 
 
-def pending_wake(conn=None) -> dict:
+def pending_wake(conn=None, now: Optional[float] = None) -> dict:
     """The oldest decided-but-unacknowledged wake, with the CURRENT target.
 
     The companion asks this; it never decides for itself. The conversation is resolved at
@@ -335,14 +429,82 @@ def pending_wake(conn=None) -> dict:
         # proof", not "it definitely did not arrive" — and only the latter would justify
         # sending a second copy into the owner's chat.
         conn.execute(_SUBMIT_SCHEMA)
-        r = conn.execute("SELECT a.event_id FROM wake_audit a WHERE a.decision='wake' AND "
-                         "a.acknowledged=0 AND NOT EXISTS "
+        # Fold the generic backlog down to its newest member first, so the queue offered
+        # below is at most "every actionable event, then ONE generic catch-up".
+        coalesced = coalesce_generic_backlog(conn=conn, now=now)
+        # Actionable first, then oldest — the only ordering change. Within a class the old
+        # oldest-first behaviour is untouched, so nothing is starved, it is merely outranked.
+        r = conn.execute("SELECT a.event_id, COALESCE(a.actionable,0) FROM wake_audit a "
+                         "WHERE a.decision='wake' AND a.acknowledged=0 "
+                         "AND a.superseded_by IS NULL AND NOT EXISTS "
                          "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
-                         "ORDER BY a.id ASC LIMIT 1").fetchone()
+                         "ORDER BY COALESCE(a.actionable,0) DESC, a.id ASC LIMIT 1").fetchone()
         if not r:
-            return {"pending": False, "reason": "nothing_to_wake_for"}
-        return {"pending": True, "event_id": int(r[0]),
-                "conversation": target["conversation"], "phrase": WAKE_PHRASE}
+            return {"pending": False, "reason": "nothing_to_wake_for",
+                    "coalesced": coalesced["superseded_event_ids"]}
+        return {"pending": True, "event_id": int(r[0]), "actionable": bool(r[1]),
+                "conversation": target["conversation"], "phrase": WAKE_PHRASE,
+                "coalesced": coalesced["superseded_event_ids"]}
+    finally:
+        if own:
+            conn.close()
+
+
+def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
+    """Fold every pending GENERIC wake but the newest into that newest one.
+
+    The phrase is fixed and carries no event content — it says "go read Owner OS". So N
+    queued generic wakes are N copies of one identical instruction, and draining them at one
+    per 900s is how a two-day-old event came to be delivered at 04:09:57 ahead of everything
+    that mattered. Collapsing them costs nothing: the CTO inbox still holds every event, and
+    the surviving wake tells the assistant to read all of them.
+
+    Superseded rows are RETIRED, never deleted — the row keeps its supersedes pointer and a
+    second append-only record names which id absorbed it. Actionable wakes are never touched:
+    each one is a distinct blocked pane, not a duplicate of a generic instruction.
+    """
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        conn.execute(_SUBMIT_SCHEMA)
+        rows = conn.execute(
+            "SELECT a.id, a.event_id FROM wake_audit a WHERE a.decision='wake' "
+            "AND a.acknowledged=0 AND a.superseded_by IS NULL AND COALESCE(a.actionable,0)=0 "
+            "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
+            "ORDER BY a.id ASC").fetchall()
+        if len(rows) < 2:
+            return {"superseded": 0, "superseded_event_ids": [],
+                    "kept_event_id": (int(rows[0][1]) if rows else None)}
+        keep_audit_id, keep_event_id = int(rows[-1][0]), int(rows[-1][1])
+        reason = "coalesced_into_newest_generic_wake"
+        superseded = []
+        for aid, eid in rows[:-1]:
+            conn.execute("UPDATE wake_audit SET superseded_by=?, superseded_at=?, "
+                         "superseded_reason=? WHERE id=?",
+                         (keep_audit_id, now_iso(), reason, int(aid)))
+            conn.execute(
+                "INSERT INTO wake_coalesce_audit (ts,at,wake_audit_id,event_id,"
+                "superseded_by_audit_id,superseded_by_event_id,reason) VALUES (?,?,?,?,?,?,?)",
+                (now, now_iso(), int(aid), int(eid), keep_audit_id, keep_event_id, reason))
+            superseded.append(int(eid))
+        conn.commit()
+        return {"superseded": len(superseded), "superseded_event_ids": superseded,
+                "kept_event_id": keep_event_id, "reason": reason}
+    finally:
+        if own:
+            conn.close()
+
+
+def coalesce_history(limit: int = 50, conn=None) -> list:
+    """Which generic wakes were folded into which, and when. The durable half of the audit."""
+    conn, own = _conn(conn)
+    try:
+        rows = conn.execute(
+            "SELECT at,wake_audit_id,event_id,superseded_by_audit_id,superseded_by_event_id,"
+            "reason FROM wake_coalesce_audit ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [{"at": r[0], "wake_audit_id": r[1], "event_id": r[2],
+                 "superseded_by_audit_id": r[3], "superseded_by_event_id": r[4],
+                 "reason": r[5]} for r in rows]
     finally:
         if own:
             conn.close()
@@ -356,8 +518,15 @@ CREATE TABLE IF NOT EXISTS wake_send (
 """
 
 
+def _migrate_send(conn) -> None:
+    """As with wake_audit: a live DB predates the column, so add it rather than assume it."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(wake_send)")}
+    if "actionable" not in have:
+        conn.execute("ALTER TABLE wake_send ADD COLUMN actionable INTEGER DEFAULT 0")
+
+
 def claim_send(source: str, event_id: Optional[int] = None, conn=None,
-               now: Optional[float] = None) -> dict:
+               actionable: bool = False, now: Optional[float] = None) -> dict:
     """The single choke point every submission must pass, whatever called it.
 
     The owner saw the wake phrase twice. Neither was a duplicate of the same event: one came
@@ -367,16 +536,31 @@ def claim_send(source: str, event_id: Optional[int] = None, conn=None,
 
     Every attempt is recorded, allowed or not, so an out-of-band send is visible even when
     it is refused.
+
+    `actionable` claims are measured against the actionable floor and against PRIOR
+    ACTIONABLE SENDS only. Deciding to wake for a blocked pane and then refusing the send on
+    a generic cooldown would move the stall from the decision to the delivery and fix
+    nothing; the choke point itself has to know the two classes apart. It remains a choke
+    point — the actionable floor still applies, and every attempt is still recorded.
     """
     now = now if now is not None else now_ts()
     enabled, kill = _enabled()
     conn, own = _c(conn)
     try:
         conn.execute(_SEND_SCHEMA)
+        _migrate_send(conn)
         if kill:
             res = (False, "kill_switch_engaged")
         elif not enabled:
             res = (False, "bridge_disabled")
+        elif actionable:
+            r = conn.execute("SELECT ts FROM wake_send WHERE allowed=1 AND "
+                             "COALESCE(actionable,0)=1 ORDER BY id DESC LIMIT 1").fetchone()
+            if r and (now - float(r[0] or 0)) < ACTIONABLE_COOLDOWN_SECS:
+                res = (False, f"actionable_cooldown_active:"
+                              f"{int(ACTIONABLE_COOLDOWN_SECS - (now - float(r[0])))}s")
+            else:
+                res = (True, "claimed_actionable")
         else:
             r = conn.execute("SELECT ts FROM wake_send WHERE allowed=1 "
                              "ORDER BY id DESC LIMIT 1").fetchone()
@@ -385,11 +569,13 @@ def claim_send(source: str, event_id: Optional[int] = None, conn=None,
                               f"{int(COOLDOWN_SECS - (now - float(r[0])))}s")
             else:
                 res = (True, "claimed")
-        conn.execute("INSERT INTO wake_send (ts,at,source,event_id,allowed,reason) "
-                     "VALUES (?,?,?,?,?,?)",
-                     (now, now_iso(), source, int(event_id or 0), int(res[0]), res[1]))
+        conn.execute("INSERT INTO wake_send (ts,at,source,event_id,allowed,reason,actionable) "
+                     "VALUES (?,?,?,?,?,?,?)",
+                     (now, now_iso(), source, int(event_id or 0), int(res[0]), res[1],
+                      1 if actionable else 0))
         conn.commit()
-        return {"allowed": res[0], "reason": res[1], "source": source}
+        return {"allowed": res[0], "reason": res[1], "source": source,
+                "actionable": bool(actionable)}
     finally:
         if own:
             conn.close()
