@@ -6,11 +6,13 @@
 set -euo pipefail
 cd /root/ai-dev-runtime
 case "${1:-show}" in
-  bind)
+  bind|rebind)
     [ -n "${2:-}" ] || { echo "usage: owner-os-chat bind https://chatgpt.com/c/<id>"; exit 2; }
-    ./venv/bin/python -c "
-from core import wake_bridge as wb
-import json; print(json.dumps(wb.bind_chat('''$2''', by='owner'), indent=1))"
+    # Delegates to the canonical script so bind through this wrapper gets the same
+    # validation, point backup and PASS/FAIL verification as calling it directly.
+    # See docs/OWNER_OS_CHAT_REBIND.md.
+    shift
+    exec ./venv/bin/python tools/rebind_chat.py "$@"
     ;;
   show)
     ./venv/bin/python -c "
@@ -23,5 +25,6 @@ from core import wake_bridge as wb
 for h in wb.bind_history():
     print(f\"{h['at'][:19]}  {h['action']:6}  {h['conversation']}  (was: {h['previous'] or '-'})\")"
     ;;
-  *) echo "usage: owner-os-chat {show|bind <url>|history}"; exit 2 ;;
+  *) echo "usage: owner-os-chat {show|bind <url>|history}"
+     echo "runbook: docs/OWNER_OS_CHAT_REBIND.md"; exit 2 ;;
 esac
