@@ -552,6 +552,17 @@ async def bind_wake_route(req: WakeRouteBindReq, request: Request,
     return res
 
 
+@router.get("/control-plane/wake/chats", operation_id="list_chat_inventory")
+async def list_chat_inventory(active_only: bool = False, _: bool = Depends(_auth)):
+    """The chat inventory: every ChatGPT conversation the companion browser has actually
+    observed — title, first/last seen, writability evidence, inferred route, liveness —
+    plus the current route registry, so inventory and routing are one read. Read-only."""
+    from core import chat_registry as cr
+    from core import wake_routes as wr
+    return {"chats": cr.list_chats(active_only=active_only),
+            "routes": wr.list_routes(), "fallback_route": wr.FALLBACK_ROUTE}
+
+
 @router.get("/control-plane/wake/routes/resolve", operation_id="resolve_wake_route")
 async def resolve_wake_route(project_id: str = "", source: str = "", agent_id: str = "",
                              _: bool = Depends(_auth)):

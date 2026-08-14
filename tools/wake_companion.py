@@ -21,6 +21,37 @@ sys.path.insert(0, "/root/ai-dev-runtime")
 sys.path.insert(0, "/root/ai-dev-runtime/tools")
 
 POLL_SECS = int(os.getenv("COMPANION_POLL_SECS", "20"))
+# Inventory the ChatGPT tabs every N ticks (default ~5 minutes at 20s polls).
+DISCOVERY_EVERY_TICKS = int(os.getenv("COMPANION_DISCOVERY_TICKS", "15"))
+CDP_LIST_URL = os.getenv("COMPANION_CDP_LIST_URL", "http://127.0.0.1:9222/json/list")
+
+
+def discover_chats() -> dict:
+    """Inventory the ChatGPT conversations visible as browser tabs.
+
+    Reads ONLY the CDP page list (URL + title) — the same surface the delivery path
+    already touches; no history, nothing outside chatgpt.com. Discovered chats are
+    upserted into the chat registry; a route is auto-bound only when
+    `chat_registry.consider_auto_bind` finds deterministic evidence, and every refusal
+    reason is its answer, not an exception.
+    """
+    import json as _json
+    import urllib.request
+    from core import chat_registry as cr
+    try:
+        with urllib.request.urlopen(CDP_LIST_URL, timeout=8) as r:
+            tabs = _json.loads(r.read().decode())
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": f"cdp_list_unavailable:{type(e).__name__}"}
+    res = cr.discover_from_tabs(tabs)
+    for d in res.get("discovered", []):
+        title = next((t.get("title") or "" for t in tabs
+                      if (t.get("url") or "").split("?")[0].rstrip("/") ==
+                      d["conversation"]), "")
+        b = cr.consider_auto_bind(d["conversation"], title=title)
+        if b.get("bound"):
+            print(f"auto-bound route {b['route_key']} -> {b['conversation']}", flush=True)
+    return {"ok": True, "discovered": [d["conversation"] for d in res.get("discovered", [])]}
 
 
 def tick(wb) -> dict:
@@ -63,11 +94,15 @@ def tick(wb) -> dict:
 
 def main() -> None:
     from core import wake_bridge as wb
+    n = 0
     while True:
         try:
             tick(wb)
+            if n % DISCOVERY_EVERY_TICKS == 0:
+                discover_chats()
         except Exception as e:  # noqa: BLE001
             print(f"companion error: {str(e)[:160]}", flush=True)
+        n += 1
         time.sleep(POLL_SECS)
 
 

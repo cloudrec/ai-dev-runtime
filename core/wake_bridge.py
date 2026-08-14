@@ -719,6 +719,20 @@ def record_delivery(source: str, *, event_id: Optional[int] = None, delivered: b
              str(reason)[:160], (conversation or "").strip()[:200],
              (route_key or "").strip()[:64]))
         conn.commit()
+        # Delivery outcomes are the strongest liveness evidence there is; feed them to the
+        # chat registry. A verified delivery proves writable; a send that FIRED and was
+        # refused by the page proves dead. Timeouts and pre-send refusals prove neither.
+        try:
+            from core import chat_registry as _cr
+            if conversation:
+                if delivered:
+                    _cr.upsert_chat(conversation, source="delivery", writable=True,
+                                    conn=conn, now=now)
+                elif str(reason) == "composer_did_not_clear_after_send":
+                    _cr.mark_dead(conversation, reason=str(reason)[:160], conn=conn,
+                                  now=now)
+        except Exception:  # noqa: BLE001 — registry bookkeeping must never break delivery
+            pass
         return int(cur.lastrowid)
     finally:
         if own:

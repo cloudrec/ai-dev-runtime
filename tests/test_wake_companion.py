@@ -118,6 +118,37 @@ def test_the_route_key_is_carried_through_to_the_delivery_ledger(composer):
     assert r["route_key"] == "mess"
 
 
+def test_discovery_inventories_tabs_and_offers_titles_to_auto_bind(monkeypatch):
+    """Discovery reads only the CDP tab list and hands each discovered conversation with
+    its title to the registry's fail-closed auto-bind — it decides nothing itself."""
+    import io, json, urllib.request
+    tabs = [{"type": "page", "url": "https://chatgpt.com/c/mess-work", "title": "mess"}]
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: io.BytesIO(json.dumps(tabs).encode()))
+    seen = {}
+    import core.chat_registry as cr
+    monkeypatch.setattr(cr, "discover_from_tabs",
+                        lambda t: {"discovered": [{"conversation":
+                                                   "https://chatgpt.com/c/mess-work",
+                                                   "action": "discovered"}]})
+    monkeypatch.setattr(cr, "consider_auto_bind",
+                        lambda conversation, title="": seen.update(
+                            {"conversation": conversation, "title": title}) or
+                        {"bound": False, "reason": "no_project_marker_in_title"})
+    r = wc.discover_chats()
+    assert r["ok"] is True
+    assert seen == {"conversation": "https://chatgpt.com/c/mess-work", "title": "mess"}
+
+
+def test_discovery_failure_is_an_answer_not_a_crash(monkeypatch):
+    import urllib.request
+    def _boom(*a, **k):
+        raise OSError("cdp down")
+    monkeypatch.setattr(urllib.request, "urlopen", _boom)
+    r = wc.discover_chats()
+    assert r["ok"] is False and "cdp_list_unavailable" in r["reason"]
+
+
 def test_there_is_no_keyboard_fallback_path():
     """The xdotool path is not dormant — it is gone. Typing into the focused window is how
     a phrase lands in the wrong chat."""

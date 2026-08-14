@@ -189,6 +189,18 @@ def route_history(limit: int = 50, conn=None) -> list:
             conn.close()
 
 
+def _chat_dead(conn, url: str) -> bool:
+    """Has the chat registry recorded this conversation as dead (a fired send the page
+    refused)? Read directly — `core.chat_registry` imports this module, so the check
+    cannot go through it. A missing registry table means nothing is known dead."""
+    try:
+        r = conn.execute("SELECT active FROM chat_registry WHERE conversation=?",
+                         ((url or "").rstrip("/"),)).fetchone()
+        return bool(r) and not r[0]
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _legacy_target(conn) -> str:
     """The pre-registry single wake_target row. Read-only migration bridge — this module
     never writes it, and resolution consults it only when the registry has no owner-os
@@ -213,20 +225,27 @@ def resolve(*, project_id: str = "", source: str = "", agent_id: str = "",
     key = route_key_for_event(project_id, source, agent_id)
     conn, own = _conn(conn)
     try:
+        fallback_reason = f"unmapped_route:{key}" if key != FALLBACK_ROUTE else "owner_os_route"
         r = get_route(key, conn=conn)
         if r and valid_conversation(r["conversation"]):
-            reason = "explicit_route" if key != FALLBACK_ROUTE else "owner_os_route"
-            return {"bound": True, "conversation": r["conversation"], "route_key": key,
-                    "route_reason": reason}
-        unmapped = f"unmapped_route:{key}" if key != FALLBACK_ROUTE else "owner_os_route"
+            if not _chat_dead(conn, r["conversation"]):
+                reason = "explicit_route" if key != FALLBACK_ROUTE else "owner_os_route"
+                return {"bound": True, "conversation": r["conversation"], "route_key": key,
+                        "route_reason": reason}
+            # The bound chat is recorded dead. Events must not be lost into it, and must
+            # not vanish either: fall back to owner-os with the deadness named.
+            fallback_reason = f"dead_route:{key}"
+            if key == FALLBACK_ROUTE:
+                return {"bound": False, "reason": f"dead_route:{key}", "route_key": key}
         fb = get_route(FALLBACK_ROUTE, conn=conn)
-        if fb and valid_conversation(fb["conversation"]):
+        if fb and valid_conversation(fb["conversation"]) and \
+                not _chat_dead(conn, fb["conversation"]):
             return {"bound": True, "conversation": fb["conversation"],
-                    "route_key": FALLBACK_ROUTE, "route_reason": unmapped}
+                    "route_key": FALLBACK_ROUTE, "route_reason": fallback_reason}
         legacy = _legacy_target(conn)
-        if valid_conversation(legacy):
+        if valid_conversation(legacy) and not _chat_dead(conn, legacy):
             return {"bound": True, "conversation": legacy, "route_key": FALLBACK_ROUTE,
-                    "route_reason": f"{unmapped}:legacy_single_target"}
+                    "route_reason": f"{fallback_reason}:legacy_single_target"}
         return {"bound": False, "reason": "no_route_bound", "route_key": key}
     finally:
         if own:
