@@ -364,10 +364,6 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         enabled = s.boolean(
             f"(function(){{const b=document.querySelector({SEND_SEL!r});"
             f"return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';}})()")
-        # LATCH FIRST. Everything below can send the phrase, and everything below can also
-        # fail to observe that it did. Whichever way the verification lands, this event must
-        # never be offered for submission a second time.
-        _latch_submitted(source, event_id)
         if enabled is True:
             s.call("Runtime.evaluate",
                    {"expression": f"document.querySelector({SEND_SEL!r}).click()"})
@@ -391,6 +387,11 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                 cleared = s.boolean(
                     f"(function(){{const c=document.querySelector({COMPOSER_SEL!r});"
                     f"return !c || c.textContent.length === 0;}})()") is True
+                if cleared:
+                    # THE LATCH BOUNDARY. A cleared composer means the page took the
+                    # phrase — from here on it may be in the chat, so this event must
+                    # never be submitted again, whatever verification says below.
+                    _latch_submitted(source, event_id)
             if not cleared:
                 continue
             if s.count(USER_TURN_SEL) > turns_before:
@@ -400,6 +401,15 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                     and last_id_now != last_id_before):
                 return {"ok": True, "reason": "submitted_and_user_turn_id_advanced"}
         if not cleared:
+            # The phrase is still SITTING IN THE COMPOSER — provably not sent (event
+            # 4214: a settling page refused the click and the old pre-fire latch then
+            # consumed the event forever). No latch; clear the draft so the retry
+            # starts clean, and let the backoff bring the event around again.
+            s.call("Runtime.evaluate",
+                   {"expression":
+                    f"(function(){{const c=document.querySelector({COMPOSER_SEL!r});"
+                    f"if(c){{c.innerHTML='';"
+                    f"c.dispatchEvent(new Event('input',{{bubbles:true}}));}}}})()"})
             return {"ok": False, "reason": "composer_did_not_clear_after_send"}
         # The composer emptied and nothing arrived. This is the exact shape of the silent
         # failure this check exists for: it must NOT be acknowledged, so the wake stays

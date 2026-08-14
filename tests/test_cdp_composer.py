@@ -158,6 +158,39 @@ def test_an_unreadable_id_baseline_falls_back_to_the_count_alone(wired):
     assert r["ok"] is False and r["reason"] == "user_turn_not_observed_after_send"
 
 
+# ── the latch boundary: cleared composer, not the click (event 4214) ───────
+def test_an_unsent_phrase_does_not_latch_and_the_retry_delivers_exactly_once(wired,
+                                                                             monkeypatch):
+    """The 4214 shape: the click was refused, the phrase stayed visibly IN the composer —
+    provably unsent — yet the old pre-fire latch consumed the event forever. Now: no
+    latch, the draft is cleared for a clean retry, and the successful retry both latches
+    and delivers, exactly once."""
+    latched = []
+    monkeypatch.setattr(cdp, "_latch_submitted", lambda src, eid: latched.append(eid))
+    s = wired({"n": 1}, bools=[True, True, True] + [False] * 40, turns=[0] + [1] * 40)
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False, event_id=9)
+    assert r["ok"] is False and r["reason"] == "composer_did_not_clear_after_send"
+    assert latched == [], "an unsent phrase must not latch"
+    assert any("innerHTML=''" in e for e in s.exprs), "the stale draft must be cleared"
+    # the retry succeeds and latches
+    wired({"n": 1}, bools=[True, True, True, True], turns=[1, 2])
+    r2 = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False, event_id=9)
+    assert r2["ok"] is True
+    assert latched == [9], "success latches exactly once"
+
+
+def test_a_cleared_composer_latches_even_when_the_turn_is_not_observed(wired,
+                                                                       monkeypatch):
+    """Ambiguity still resolves to 'assume it went': once the page took the phrase, the
+    event may never be submitted again — that rule stopped ~60 duplicate wakes."""
+    latched = []
+    monkeypatch.setattr(cdp, "_latch_submitted", lambda src, eid: latched.append(eid))
+    wired({"n": 1}, bools=[True, True, True, True], turns=[0] + [0] * 40)
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False, event_id=8)
+    assert r["ok"] is False and r["reason"] == "user_turn_not_observed_after_send"
+    assert latched == [8]
+
+
 def test_the_sidebar_scan_reads_links_and_never_sends(monkeypatch):
     """Sidebar discovery is a pure read: same-origin /c/ anchors (href + title), bounded,
     deduped — and it must be structurally incapable of typing or clicking."""
