@@ -69,6 +69,7 @@ def _no_waiting(monkeypatch):
 def wired(monkeypatch):
     def _mk(counts=None, bools=None, turns=None, ids=None):
         s = _S(counts, bools, turns, ids)
+        monkeypatch.setattr(cdp, "page_responsive", lambda t, timeout=8.0: True)
         monkeypatch.setattr(cdp, "find_target",
                             lambda url: {"webSocketDebuggerUrl": "ws://x"})
         monkeypatch.setattr(cdp, "_Session", lambda ws: s)
@@ -259,6 +260,7 @@ def test_it_navigates_to_the_bound_conversation_when_the_tab_is_elsewhere(monkey
             return super().call(method, params)
 
     nav = _Nav({"n": 1}, bools=[True, True, True, True])
+    monkeypatch.setattr(cdp, "page_responsive", lambda t, timeout=8.0: True)
     monkeypatch.setattr(cdp, "find_target", _ft)
     monkeypatch.setattr(cdp, "find_chatgpt_page", lambda: {"webSocketDebuggerUrl": "ws://x"})
     monkeypatch.setattr(cdp, "_Session", lambda ws: nav)

@@ -274,3 +274,49 @@ def test_a_submitted_event_is_never_redecided():
     wb.mark_submitted(222, source="out-of-band")              # someone already sent it
     p = wb.pending_wake(now=70_200.0)
     assert p["pending"] is False
+
+
+# ── a failed delivery benches the event, it does not own the line (event 4214) ─
+def test_a_failing_event_backs_off_and_the_next_actionable_gets_its_turn():
+    """113 retries against one wedged page starved the actionable behind it. After a
+    failure, the failing event steps aside for RETRY_BACKOFF_SECS."""
+    wr.bind_route(wr.FALLBACK_ROUTE, OWNER)
+    _decide(301, "", now=80_000.0)
+    _decide(302, "", now=80_100.0)
+    p = wb.pending_wake(now=80_200.0)
+    assert p["event_id"] == 301                              # oldest first, as ever
+    wb.record_delivery("companion", event_id=301, delivered=False,
+                       reason="cdp_error:WebSocketTimeoutException",
+                       conversation=OWNER, route_key="owner-os", now=80_210.0)
+    p2 = wb.pending_wake(now=80_220.0)
+    assert p2["pending"] and p2["event_id"] == 302, "the line must move on"
+
+
+def test_the_benched_event_returns_after_the_backoff_window():
+    wr.bind_route(wr.FALLBACK_ROUTE, OWNER)
+    _decide(311, "", now=90_000.0)
+    wb.record_delivery("companion", event_id=311, delivered=False,
+                       reason="cdp_error:WebSocketTimeoutException",
+                       conversation=OWNER, route_key="owner-os", now=90_010.0)
+    assert wb.pending_wake(now=90_100.0)["pending"] is False  # benched
+    p = wb.pending_wake(now=90_010.0 + wb.RETRY_BACKOFF_SECS + 5)
+    assert p["pending"] and p["event_id"] == 311              # retried, not lost
+
+
+def test_transient_failure_then_success_is_one_delivery_and_no_duplicate():
+    """The retry that finally lands must be the ONLY submission: a pre-send failure sets
+    no latch, and success both latches and acknowledges."""
+    wr.bind_route(wr.FALLBACK_ROUTE, OWNER)
+    _decide(321, "", now=100_000.0)
+    wb.record_delivery("companion", event_id=321, delivered=False,
+                       reason="renderer_unresponsive",
+                       conversation=OWNER, route_key="owner-os", now=100_010.0)
+    assert wb.was_submitted(321) is False                     # nothing fired yet
+    later = 100_010.0 + wb.RETRY_BACKOFF_SECS + 5
+    assert wb.pending_wake(now=later)["event_id"] == 321
+    wb.mark_submitted(321, source="companion")
+    wb.record_delivery("companion", event_id=321, delivered=True,
+                       reason="submitted_and_user_turn_appeared",
+                       conversation=OWNER, route_key="owner-os", now=later + 10)
+    wb.acknowledge(321)
+    assert wb.pending_wake(now=later + 20)["pending"] is False

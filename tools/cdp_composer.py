@@ -16,6 +16,7 @@ Fail closed everywhere: ambiguity (zero or several matches) is a refusal, never 
 from __future__ import annotations
 
 import json
+import urllib.parse
 import urllib.request
 from typing import Optional
 
@@ -37,9 +38,68 @@ SEND_SEL = ("button[data-testid='send-button'], form button[type='submit'], "
 USER_TURN_SEL = "[data-message-author-role='user']"
 
 
-def _http(path: str):
-    with urllib.request.urlopen(f"http://{CDP_HOST}:{CDP_PORT}{path}", timeout=8) as r:
-        return json.loads(r.read().decode())
+def _http(path: str, method: str = "GET"):
+    req = urllib.request.Request(f"http://{CDP_HOST}:{CDP_PORT}{path}", method=method)
+    with urllib.request.urlopen(req, timeout=8) as r:
+        body = r.read().decode()
+        return json.loads(body) if body.strip() else {}
+
+
+def page_responsive(target: dict, timeout: float = 8.0) -> bool:
+    """Can this page's renderer answer a trivial evaluate at all?
+
+    The 4214 incident: the owner-os tab's main thread wedged for hours, every delivery
+    attempt died in WebSocketTimeout — 113 in a row — and no per-call timeout could help,
+    because the renderer itself had stopped answering. This probe is the cheap question
+    asked BEFORE spending a claimed send on a dead page."""
+    s = None
+    try:
+        import websocket
+        ws = websocket.create_connection(target["webSocketDebuggerUrl"],
+                                         timeout=timeout, suppress_origin=True)
+        try:
+            ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                                "params": {"expression": "1+1", "returnByValue": True}}))
+            msg = json.loads(ws.recv())
+            return ((msg.get("result") or {}).get("result") or {}).get("value") == 2
+        finally:
+            ws.close()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict]:
+    """Replace a wedged renderer with a fresh tab on the SAME bound conversation.
+
+    Browser-level HTTP endpoints (/json/new, /json/close) are handled by the browser
+    process and keep working when a renderer hangs — which is exactly when the CDP
+    session channel does not. The new tab opens directly on the bound URL, so the
+    exact-route guarantee is untouched; the wedged tab is closed only AFTER the
+    replacement exists, so a failed recovery cannot leave us with no ChatGPT tab at all."""
+    import time
+    try:
+        try:
+            fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}",
+                          method="PUT")
+        except Exception:  # noqa: BLE001 — pre-111 Chrome used GET here
+            fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}")
+        if not fresh.get("id"):
+            return None
+        for _ in range(15):
+            time.sleep(2)
+            t = find_target(conversation_url)
+            if t and t.get("id") == fresh.get("id") and page_responsive(t):
+                break
+        else:
+            return None
+        if old_target.get("id") and old_target["id"] != fresh["id"]:
+            try:
+                _http(f"/json/close/{old_target['id']}")
+            except Exception:  # noqa: BLE001 — a zombie tab is worse to fight than to leave
+                pass
+        return find_target(conversation_url)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def find_target(conversation_url: str) -> Optional[dict]:
@@ -249,6 +309,13 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                 break
         if not target:
             return {"ok": False, "reason": "could_not_open_bound_conversation"}
+    # A wedged renderer answers nothing, ever; detect it BEFORE burning the attempt on a
+    # guaranteed timeout, and replace the tab at browser level (the 4214 incident: 113
+    # identical WebSocketTimeouts against one hung page).
+    if not page_responsive(target):
+        target = recover_wedged_tab(target, conversation_url)
+        if not target:
+            return {"ok": False, "reason": "renderer_unresponsive"}
     s = None
     try:
         s = _Session(target["webSocketDebuggerUrl"])

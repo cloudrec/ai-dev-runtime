@@ -40,6 +40,11 @@ COOLDOWN_SECS = int(os.getenv("WAKE_BRIDGE_COOLDOWN_SECS", "900"))
 # under ACTIONABLE_EVENT_TYPES below. Short is not absent: a flapping agent still cannot
 # turn into a burst of pokes.
 ACTIONABLE_COOLDOWN_SECS = int(os.getenv("WAKE_BRIDGE_ACTIONABLE_COOLDOWN_SECS", "60"))
+# An event whose delivery just FAILED steps out of the selection line for this long. The
+# 4214 incident: one event retried a wedged page 113 times over 2.5 hours, consuming an
+# actionable claim each time, and the younger actionable behind it (4313) never got a
+# single attempt. Backoff breaks the hot loop AND the head-of-line blockade at once.
+RETRY_BACKOFF_SECS = int(os.getenv("WAKE_BRIDGE_RETRY_BACKOFF_SECS", "300"))
 # Only these severities are ever worth a wake.
 WAKE_SEVERITIES = {"critical", "high"}
 
@@ -499,12 +504,19 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         coalesced = coalesce_generic_backlog(conn=conn, now=now)
         # Actionable first, then oldest — the only ordering change. Within a class the old
         # oldest-first behaviour is untouched, so nothing is starved, it is merely outranked.
+        conn.execute(_DELIVERY_SCHEMA)
         r = conn.execute("SELECT a.event_id, COALESCE(a.actionable,0), "
                          "COALESCE(a.project_id,'') FROM wake_audit a "
                          "WHERE a.decision='wake' AND a.acknowledged=0 "
                          "AND a.superseded_by IS NULL AND NOT EXISTS "
                          "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
-                         "ORDER BY COALESCE(a.actionable,0) DESC, a.id ASC LIMIT 1").fetchone()
+                         # a fresh delivery failure benches the event for the backoff
+                         # window, so the next-in-line is tried instead of starving
+                         "AND NOT EXISTS (SELECT 1 FROM wake_delivery d "
+                         "  WHERE d.event_id=a.event_id AND d.delivered=0 AND d.ts > ?) "
+                         "ORDER BY COALESCE(a.actionable,0) DESC, a.id ASC LIMIT 1",
+                         ((now if now is not None else now_ts()) - RETRY_BACKOFF_SECS,)
+                         ).fetchone()
         if not r:
             return {"pending": False, "reason": "nothing_to_wake_for",
                     "coalesced": coalesced["superseded_event_ids"]}

@@ -67,6 +67,7 @@ class _S:
 
 def _wire(monkeypatch, *, bools, turns):
     s = _S(bools, turns)
+    monkeypatch.setattr(cdp, "page_responsive", lambda t, timeout=8.0: True)
     monkeypatch.setattr(cdp, "find_target", lambda url: {"webSocketDebuggerUrl": "ws://x"})
     monkeypatch.setattr(cdp, "_Session", lambda ws: s)
     return s
