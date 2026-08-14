@@ -41,6 +41,16 @@ from core.control_plane.store import now_iso, now_ts
 # One deliberate reminder for an unresolved owner-needed item. 0 disables reminders.
 REMINDER_SECS = int(os.getenv("AGENT_WATCH_REMINDER_SECS", "3600"))
 
+
+def excluded_targets() -> set:
+    """Explicitly configured targets the watcher must not observe — narrow and
+    auditable, meant for the watcher's own maintenance pane: an agent that edits and
+    restarts the watcher rests between tool calls with finish vocabulary on screen
+    (event 4096), and no text classifier can tell that apart from a real finish. Read
+    at CALL time so a unit drop-in change takes effect on restart without a code edit."""
+    return {t.strip() for t in os.getenv("AGENT_WATCH_EXCLUDE_TARGETS", "").split(",")
+            if t.strip()}
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_watch_state (
     target TEXT PRIMARY KEY,
@@ -246,9 +256,13 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
     conn, own = _conn(conn)
     try:
         emitted, skipped = [], []
+        excluded = excluded_targets()
         for a in agents:
             target = a.get("target") or ""
             if not target:
+                continue
+            if target in excluded:
+                skipped.append({"target": target, "why": "excluded_target"})
                 continue
             tail = ""
             try:
@@ -331,7 +345,8 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
         present = {a.get("target") for a in agents}
         for target, prev_cls, n_cls in conn.execute(
                 "SELECT target, cls, notified_cls FROM agent_watch_state").fetchall():
-            if target in present or prev_cls in ("crashed", "idle", "completed"):
+            if target in present or target in excluded \
+                    or prev_cls in ("crashed", "idle", "completed"):
                 continue
             if n_cls == "crashed":
                 continue

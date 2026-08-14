@@ -253,6 +253,47 @@ def test_a_fingerprint_migration_does_not_renotify_an_unresolved_blocker():
     assert r2["skipped"][0]["why"] == "already_notified"
 
 
+MAINTENANCE_REST = ("All tests passed. Commit c07f42e done. Delivery proof completed. "
+                    "3 shells running in background for verification.")
+
+
+def test_an_excluded_target_never_emits(monkeypatch):
+    """The watcher-maintenance pane (event 4096): explicitly excluded, narrow and
+    auditable — never observed, whatever its screen says."""
+    monkeypatch.setenv("AGENT_WATCH_EXCLUDE_TARGETS", "fable-wake-fix:0.0")
+    emit = _Emit()
+    t = "fable-wake-fix:0.0"
+    _scan([_agent(t, "/root/ai-dev-runtime", state="working")], {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, "/root/ai-dev-runtime", state="waiting_owner")],
+              {t: PROMPT_TAIL}, emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+    assert any(s["why"] == "excluded_target" for s in r["skipped"])
+    # nor does its disappearance count as a crash
+    r2 = _scan([], {}, emit, now=1200.0)
+    assert r2["emitted"] == [] and emit.calls == []
+
+
+def test_exclusion_is_per_target_not_per_directory(monkeypatch):
+    """Another agent in the same repo stays fully observable."""
+    monkeypatch.setenv("AGENT_WATCH_EXCLUDE_TARGETS", "fable-wake-fix:0.0")
+    emit = _Emit()
+    t = "runtime-helper:0.0"
+    r = _scan([_agent(t, "/root/ai-dev-runtime", state="waiting_owner")],
+              {t: PROMPT_TAIL}, emit)
+    assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
+
+
+def test_finish_words_with_background_activity_still_do_not_complete():
+    """Defense in depth beyond exclusion: a maintenance-shaped rest screen — finish
+    vocabulary plus running background shells — is continuation, not completion."""
+    emit = _Emit()
+    t = "some-agent:0.0"
+    _scan([_agent(t, "/opt/mess", state="working")], {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, "/opt/mess", state="idle")], {t: MAINTENANCE_REST}, emit,
+              now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+
+
 def test_genuinely_working_never_alerts():
     emit = _Emit()
     for now in (1000.0, 1020.0, 1040.0):
