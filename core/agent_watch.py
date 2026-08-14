@@ -80,41 +80,84 @@ _CRASH_RE = re.compile(
 _VOLATILE = re.compile(r"\d+")
 _WS = re.compile(r"\s+")
 
+# tmux/Claude-CLI chrome: box borders, status bars, input-box furniture, hints. These are
+# DISPLAY, not agent output — they must appear in no digest, no excerpt, no evidence.
+_UI_LINE_RE = re.compile(
+    r"^\s*(?:[─│╭╮╰╯═┌┐└┘┤├]+.*|❯.*|\?\s+for shortcuts.*|⏵⏵.*|\[caveman\].*"
+    r"|.*shift\+tab to cycle.*|.*new task\?\s*/clear.*|.*esc to interrupt.*"
+    r"|✻.*|✽.*|·.*)\s*$", re.IGNORECASE)
+# Evidence that work is NOT finished, whatever old checkmarks are on screen: running
+# shells, open/in-progress task counts, explicit continuation talk.
+_CONTINUATION_RE = re.compile(
+    r"(still running|shells? (?:are )?running|background (?:shell|task|process)"
+    r"|in progress|\bopen\b|todo|continu(?:e|ing)|next step|остал(?:ось|ись)"
+    r"|продолж|в процессе)", re.IGNORECASE)
+# Inventory states that mean ACTIVE — text may never override these into waiting/done.
+_ACTIVE_STATES = frozenset({"working", "shell_running"})
+# Inventory states in which a decision menu is credible.
+_PROMPT_STATES = frozenset({"waiting_owner", "waiting_input", "idle", "unknown", ""})
+
+
+def _meaningful_lines(tail: str) -> list:
+    """The CURRENT response region: strip tmux/CLI chrome, keep real output lines."""
+    out = []
+    for ln in (tail or "").splitlines():
+        s = ln.strip()
+        if not s or _UI_LINE_RE.match(s):
+            continue
+        out.append(s)
+    return out
+
+
+def _bottom_region(tail: str, lines: int = 10) -> str:
+    """The last meaningful lines nearest the prompt — classification and fingerprints
+    look ONLY here, never at arbitrary scrollback history."""
+    return " ".join(_meaningful_lines(tail)[-lines:])
+
 
 def digest_of(text: str) -> str:
-    """Identity of the tail REGION: lowercased, whitespace collapsed, digits stripped so
-    a ticking counter or spinner frame does not mint a new fingerprint every poll."""
+    """Identity of the bottom region: lowercased, whitespace collapsed, digits stripped
+    so a ticking counter or spinner frame does not mint a new fingerprint every poll."""
     norm = _WS.sub(" ", _VOLATILE.sub("#", (text or "").lower())).strip()[-800:]
     return hashlib.sha256(norm.encode()).hexdigest()[:16]
 
 
-def _tail_region(tail: str, lines: int = 18) -> str:
-    kept = [ln for ln in (tail or "").splitlines() if ln.strip()]
-    return "\n".join(kept[-lines:])
+def excerpt_of(tail: str, limit: int = 300) -> str:
+    """`concise last meaningful line(s)` — chrome-free, bounded."""
+    return " ".join(_meaningful_lines(tail)[-3:])[-limit:]
 
 
-def excerpt_of(tail: str, limit: int = 280) -> str:
-    """A compact human excerpt: the last meaningful lines, never raw pane noise."""
-    return _tail_region(tail, 8)[-limit:]
-
-
-def classify(tail: str, *, alive: bool = True, is_agent: bool = True,
+def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool = True,
              prev_cls: str = "") -> dict:
-    """The pane tail -> one class. Text evidence outranks upstream state metadata."""
+    """(inventory state, current bottom region) -> one class.
+
+    The structured `agent_list` state is trusted FIRST: an agent the inventory calls
+    working is working, and no stale phrase anywhere in scrollback may reclassify it —
+    that exact contamination flagged the watcher's own maintenance pane as blocked
+    because its scrollback QUOTED a blocker sentence. Text evidence then refines the
+    at-rest states, and completion additionally demands the absence of continuation
+    evidence: "4 shells still running" or "1 in progress, 4 open" is not done.
+    """
     if not alive or not is_agent:
         return {"cls": "crashed", "reason": "process_gone"}
-    # The pane wraps sentences across lines; collapse whitespace so "Waiting for\n
-    # migration instructions" is the same evidence as the unwrapped sentence.
-    region = _WS.sub(" ", _tail_region(tail))
+    st = (state or "").strip()
+    region = _bottom_region(tail)
+    if st in _ACTIVE_STATES:
+        return {"cls": "working", "reason": f"inventory_state_{st}"}
     if _CRASH_RE.search(region):
         return {"cls": "crashed", "reason": "crash_text"}
-    if _OWNER_PROMPT_RE.search(region):
-        return {"cls": "owner_prompt", "reason": "decision_prompt_on_screen"}
-    if _WORKING_RE.search(region):
+    if _WORKING_RE.search(_WS.sub(" ", tail[-400:] if tail else "")):
+        # The live interrupt affordance sits in the chrome we strip; check it raw.
         return {"cls": "working", "reason": "active_execution_evidence"}
+    if st in _PROMPT_STATES and _OWNER_PROMPT_RE.search(region):
+        return {"cls": "owner_prompt", "reason": "decision_prompt_at_bottom"}
     if _BLOCKER_RE.search(region):
-        return {"cls": "blocker", "reason": "paused_waiting_text"}
+        return {"cls": "blocker", "reason": "paused_waiting_text_at_bottom"}
     if prev_cls == "working":
+        if _CONTINUATION_RE.search(region):
+            # Came to rest but its own words say the work is not finished. Stay
+            # "working" so a REAL finish later is still a fresh transition.
+            return {"cls": "working", "reason": "continuation_evidence_at_rest"}
         return {"cls": "completed", "reason": "came_to_rest_after_work"}
     return {"cls": "idle", "reason": "no_signal"}
 
@@ -199,10 +242,10 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 "SELECT cls,digest,notified_cls,notified_digest,notified_ts "
                 "FROM agent_watch_state WHERE target=?", (target,)).fetchone()
             prev_cls = row[0] if row else ""
-            c = classify(tail, alive=bool(a.get("alive")),
+            c = classify(tail, state=a.get("state", ""), alive=bool(a.get("alive")),
                          is_agent=bool(a.get("is_agent")), prev_cls=prev_cls)
             cls = c["cls"]
-            dg = digest_of(_tail_region(tail)) if cls != "crashed" else "gone"
+            dg = digest_of(_bottom_region(tail)) if cls != "crashed" else "gone"
             # Persist the observation first — the record of what IS outlives any
             # decision about whether to announce it.
             conn.execute(
@@ -219,7 +262,13 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 skipped.append({"target": target, "why": f"class_{cls}"})
                 continue
             n_cls, n_dg, n_ts = (row[2], row[3], row[4]) if row else ("", "", 0)
-            if n_cls == cls and n_dg == dg:
+            # Completed and crashed dedupe on CLASS alone: one rest period is one
+            # completion, however the on-screen text drifts between scans — the 4070/4071
+            # double was a digest drifting across an unchanged rest. Waiting classes keep
+            # digest sensitivity, because a NEW question genuinely is a new event.
+            already = (n_cls == cls if cls in ("completed", "crashed")
+                       else (n_cls == cls and n_dg == dg))
+            if already:
                 overdue = (REMINDER_SECS and cls in ("owner_prompt", "blocker")
                            and (now - float(n_ts or 0)) >= REMINDER_SECS)
                 if not overdue:

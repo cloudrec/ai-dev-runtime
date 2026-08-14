@@ -1,10 +1,13 @@
-"""Agent watch: real pane states become owner notifications, without spam.
+"""Agent watch: real pane states become owner notifications, without spam or lies.
 
-Modelled on the live 2026-08-14 failure: gaika-ext-audit paused awaiting migration
-instructions, gaika-ip-seal at a literal permission menu — and zero notifications,
-because nothing read the pane text. Every test drives scan() with injected inventory,
-tails and an emit recorder; the classes, dedup, re-arm, restart and routing rules are
-the contract.
+Two generations of live failure are pinned here. First: gaika-ext-audit paused awaiting
+migration instructions, gaika-ip-seal at a literal permission menu — zero notifications,
+because nothing read pane text. Second, after the first fix: false completions for agents
+whose own summaries said "4 shells still running" / "1 in progress, 4 open", a stale
+quoted blocker phrase flagging the actively-working maintenance pane, and one completion
+emitted twice across a restart. The rules under test: inventory state first, current
+bottom region only, continuation evidence suppresses completion, class-level dedupe for
+terminal classes, restart replays nothing.
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ Development paused at safe checkpoint.
 Waiting for migration instructions from the owner."""
 
 WORKING_TAIL = "✻ Compacting… (esc to interrupt · 32.1k tokens)"
-IDLE_TAIL = "All checks passed. Report written to reports/AUDIT.md.\n>"
+IDLE_TAIL = "All checks passed. Report written to reports/AUDIT.md."
 
 
 @pytest.fixture(autouse=True)
@@ -46,19 +49,21 @@ class _Emit:
         return {"event_id": self._n}
 
 
-def _agent(target="gaika-ext-audit:0.0", cwd="/opt/gaika-drop", alive=True):
+def _agent(target="gaika-ext-audit:0.0", cwd="/opt/gaika-drop", alive=True,
+           state="waiting_input"):
     return {"target": target, "cwd": cwd, "claude_cwd": cwd,
-            "alive": alive, "is_agent": True}
+            "alive": alive, "is_agent": True, "state": state}
 
 
 def _scan(agents, tails, emit, now=1000.0):
     return aw.scan(agents=agents, read_fn=lambda t: tails[t], emit_fn=emit, now=now)
 
 
-# ── the five classes ────────────────────────────────────────────────────────
+# ── the classes ─────────────────────────────────────────────────────────────
 def test_a_permission_prompt_is_an_actionable_owner_event():
     emit = _Emit()
-    r = _scan([_agent("ip-seal:0.0", "/opt/clients-help-landing")],
+    r = _scan([_agent("ip-seal:0.0", "/opt/clients-help-landing",
+                      state="waiting_owner")],
               {"ip-seal:0.0": PROMPT_TAIL}, emit)
     assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
     call = emit.calls[0]
@@ -74,18 +79,26 @@ def test_paused_waiting_for_instructions_is_an_actionable_blocker():
     assert emit.calls[0]["type"] == "agent_waiting_input"
 
 
-def test_coming_to_rest_after_work_is_a_completion():
+def test_line_wrapped_blocker_text_is_still_evidence():
+    wrapped = "Development paused. Waiting for\n  migration\n  instructions."
     emit = _Emit()
-    _scan([_agent()], {"gaika-ext-audit:0.0": WORKING_TAIL}, emit)
+    r = _scan([_agent()], {"gaika-ext-audit:0.0": wrapped}, emit)
+    assert [e["class"] for e in r["emitted"]] == ["blocker"]
+
+
+def test_coming_to_rest_after_work_is_one_completion():
+    emit = _Emit()
+    _scan([_agent(state="working")], {"gaika-ext-audit:0.0": WORKING_TAIL}, emit)
     assert emit.calls == []                      # working is not news
-    r = _scan([_agent()], {"gaika-ext-audit:0.0": IDLE_TAIL}, emit, now=1100.0)
+    r = _scan([_agent(state="waiting_input")], {"gaika-ext-audit:0.0": IDLE_TAIL},
+              emit, now=1100.0)
     assert [e["class"] for e in r["emitted"]] == ["completed"]
     assert emit.calls[0]["type"] == "task_completed"
 
 
 def test_a_vanished_working_pane_is_a_critical_crash():
     emit = _Emit()
-    _scan([_agent()], {"gaika-ext-audit:0.0": WORKING_TAIL}, emit)
+    _scan([_agent(state="working")], {"gaika-ext-audit:0.0": WORKING_TAIL}, emit)
     r = _scan([], {}, emit, now=1100.0)          # pane gone from inventory
     assert [e["class"] for e in r["emitted"]] == ["crashed"]
     assert emit.calls[0]["type"] == "agent_process_failed"
@@ -94,25 +107,94 @@ def test_a_vanished_working_pane_is_a_critical_crash():
 
 def test_a_pane_that_left_from_rest_is_not_a_crash():
     emit = _Emit()
-    _scan([_agent()], {"gaika-ext-audit:0.0": IDLE_TAIL}, emit)
+    _scan([_agent(state="idle")], {"gaika-ext-audit:0.0": IDLE_TAIL}, emit)
     r = _scan([], {}, emit, now=1100.0)
     assert r["emitted"] == [] and emit.calls == []
+
+
+# ── the observed false positives, verbatim ─────────────────────────────────
+GAIKA_VIDEO_REST = """Mux render pipeline checkpoint written.
+Summary: 4 shells still running, QA pass next, then UA/EN localisation.
+Continue after mux completes."""
+
+JOBHUNTER_REST = "Status: 6 tasks (1 done, 1 in progress, 4 open). Next: wallet flows."
+
+FABLE_STALE = """The owner reported the blocker text was:
+"Development paused... Waiting for migration instructions."
+Now editing core/agent_watch.py to fix the classifier."""
+
+
+def test_still_running_shells_suppress_completion():
+    """gaika-video, live: came to rest while its own summary said the work continues."""
+    emit = _Emit()
+    _scan([_agent("gaika-video:0.0", "/opt/gaika-video", state="working")],
+          {"gaika-video:0.0": WORKING_TAIL}, emit)
+    r = _scan([_agent("gaika-video:0.0", "/opt/gaika-video", state="waiting_input")],
+              {"gaika-video:0.0": GAIKA_VIDEO_REST}, emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+
+
+def test_open_and_in_progress_tasks_suppress_completion():
+    """jobhunter, live: 1 in progress and 4 open is not done."""
+    emit = _Emit()
+    _scan([_agent("jh:0.0", "/opt/jobhunter-ai", state="working")],
+          {"jh:0.0": WORKING_TAIL}, emit)
+    r = _scan([_agent("jh:0.0", "/opt/jobhunter-ai", state="waiting_input")],
+              {"jh:0.0": JOBHUNTER_REST}, emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+
+
+def test_a_suppressed_completion_still_fires_when_the_work_actually_finishes():
+    emit = _Emit()
+    t = "gaika-video:0.0"
+    _scan([_agent(t, "/opt/gaika-video", state="working")], {t: WORKING_TAIL}, emit)
+    _scan([_agent(t, "/opt/gaika-video", state="waiting_input")],
+          {t: GAIKA_VIDEO_REST}, emit, now=1100.0)         # suppressed, stays working
+    r = _scan([_agent(t, "/opt/gaika-video", state="waiting_input")],
+              {t: "Render finished. Final report saved."}, emit, now=1200.0)
+    assert [e["class"] for e in r["emitted"]] == ["completed"]
+
+
+def test_a_stale_quoted_blocker_never_overrides_a_working_state():
+    """The watcher's own maintenance pane, live: scrollback QUOTED a blocker sentence
+    while the inventory said working. Inventory state wins; nothing is emitted."""
+    emit = _Emit()
+    r = _scan([_agent("fable-wake-fix:0.0", "/root/ai-dev-runtime", state="working")],
+              {"fable-wake-fix:0.0": FABLE_STALE}, emit)
+    assert r["emitted"] == [] and emit.calls == []
+
+
+def test_an_unchanged_completion_survives_a_restart_and_text_drift_without_a_second_event():
+    """chemmy, live: 4070 then 4071 — the rest-screen text drifted between scans and the
+    digest minted a 'new' completion. Terminal classes dedupe on class, not digest."""
+    emit = _Emit()
+    t = "chemmy-fast:0.0"
+    _scan([_agent(t, "/opt/mess", state="working")], {t: WORKING_TAIL}, emit)
+    _scan([_agent(t, "/opt/mess", state="waiting_input")],
+          {t: "Release 0196 built. All done."}, emit, now=1100.0)
+    assert len(emit.calls) == 1
+    emit2 = _Emit()                                        # companion restarted
+    r = _scan([_agent(t, "/opt/mess", state="waiting_input")],
+              {t: "Release 0196 built. All done. (screen redrew, timestamp moved)"},
+              emit2, now=1200.0)
+    assert r["emitted"] == [] and emit2.calls == []
 
 
 def test_genuinely_working_never_alerts():
     emit = _Emit()
     for now in (1000.0, 1020.0, 1040.0):
-        r = _scan([_agent()], {"gaika-ext-audit:0.0": WORKING_TAIL}, emit, now=now)
+        r = _scan([_agent(state="working")], {"gaika-ext-audit:0.0": WORKING_TAIL},
+                  emit, now=now)
         assert r["emitted"] == []
     assert emit.calls == []
 
 
-# ── dedup / re-arm / reminder / restart ────────────────────────────────────
+# ── dedup / re-arm / reminder / restart for waiting classes ────────────────
 def test_an_unchanged_prompt_is_never_resent():
     emit = _Emit()
     tails = {"gaika-ext-audit:0.0": PROMPT_TAIL}
-    _scan([_agent()], tails, emit)
-    r2 = _scan([_agent()], tails, emit, now=1020.0)
+    _scan([_agent(state="waiting_owner")], tails, emit)
+    r2 = _scan([_agent(state="waiting_owner")], tails, emit, now=1020.0)
     assert r2["emitted"] == [] and len(emit.calls) == 1
     assert r2["skipped"][0]["why"] == "already_notified"
 
@@ -126,9 +208,9 @@ def test_spinner_churn_does_not_mint_a_new_fingerprint():
 def test_resume_then_the_same_prompt_again_re_arms():
     emit = _Emit()
     t = "gaika-ext-audit:0.0"
-    _scan([_agent()], {t: PROMPT_TAIL}, emit)
-    _scan([_agent()], {t: WORKING_TAIL}, emit, now=1050.0)     # resumed
-    r = _scan([_agent()], {t: PROMPT_TAIL}, emit, now=1100.0)  # blocked AGAIN
+    _scan([_agent(state="waiting_owner")], {t: PROMPT_TAIL}, emit)
+    _scan([_agent(state="working")], {t: WORKING_TAIL}, emit, now=1050.0)  # resumed
+    r = _scan([_agent(state="waiting_owner")], {t: PROMPT_TAIL}, emit, now=1100.0)
     assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
     assert len(emit.calls) == 2
 
@@ -137,24 +219,30 @@ def test_an_unresolved_owner_item_gets_one_reminder_after_the_interval(monkeypat
     monkeypatch.setattr(aw, "REMINDER_SECS", 600)
     emit = _Emit()
     tails = {"gaika-ext-audit:0.0": PROMPT_TAIL}
-    _scan([_agent()], tails, emit, now=1000.0)
-    assert _scan([_agent()], tails, emit, now=1300.0)["emitted"] == []
-    r = _scan([_agent()], tails, emit, now=1700.0)             # interval elapsed
+    _scan([_agent(state="waiting_owner")], tails, emit, now=1000.0)
+    assert _scan([_agent(state="waiting_owner")], tails, emit,
+                 now=1300.0)["emitted"] == []
+    r = _scan([_agent(state="waiting_owner")], tails, emit, now=1700.0)
     assert len(r["emitted"]) == 1 and len(emit.calls) == 2
 
 
 def test_restart_does_not_replay_an_already_notified_prompt():
-    """The watch state lives in the database: a fresh process seeing the same prompt has
-    nothing new to say."""
     emit = _Emit()
     tails = {"gaika-ext-audit:0.0": BLOCKER_TAIL}
     _scan([_agent()], tails, emit)
-    emit2 = _Emit()                                            # "restarted" companion
+    emit2 = _Emit()                                        # "restarted" companion
     r = _scan([_agent()], tails, emit2, now=1030.0)
     assert r["emitted"] == [] and emit2.calls == []
 
 
-# ── routing ────────────────────────────────────────────────────────────────
+# ── summaries and routing ──────────────────────────────────────────────────
+def test_the_excerpt_is_chrome_free_and_bounded():
+    ex = aw.excerpt_of(PROMPT_TAIL)
+    assert len(ex) <= 300
+    for ch in "╭╮╰╯─│❯":
+        assert ch not in ex, ex
+
+
 def test_the_project_comes_from_the_cwd_and_rides_on_the_event():
     emit = _Emit()
     _scan([_agent("gaika-ext-audit:0.0", "/opt/gaika-drop")],
@@ -164,7 +252,8 @@ def test_the_project_comes_from_the_cwd_and_rides_on_the_event():
 
 def test_an_unmapped_cwd_falls_back_to_owner_os_explicitly():
     emit = _Emit()
-    _scan([_agent("mystery:0.0", cwd="")], {"mystery:0.0": PROMPT_TAIL}, emit)
+    _scan([_agent("mystery:0.0", cwd="", state="waiting_owner")],
+          {"mystery:0.0": PROMPT_TAIL}, emit)
     call = emit.calls[0]
     assert call["project_id"] == ""
     assert "owner-os" in call["payload"]["project"]
@@ -172,7 +261,8 @@ def test_an_unmapped_cwd_falls_back_to_owner_os_explicitly():
 
 def test_two_agents_route_to_their_own_projects_without_cross_talk():
     emit = _Emit()
-    agents = [_agent("a1:0.0", "/opt/gaika-drop"), _agent("a2:0.0", "/opt/mess")]
+    agents = [_agent("a1:0.0", "/opt/gaika-drop"),
+              _agent("a2:0.0", "/opt/mess", state="waiting_owner")]
     _scan(agents, {"a1:0.0": BLOCKER_TAIL, "a2:0.0": PROMPT_TAIL}, emit)
     routed = {c["agent_id"]: c["project_id"] for c in emit.calls}
     assert routed == {"a1:0.0": "gaika-drop", "a2:0.0": "mess"}
