@@ -228,22 +228,27 @@ def resolve(*, project_id: str = "", source: str = "", agent_id: str = "",
         fallback_reason = f"unmapped_route:{key}" if key != FALLBACK_ROUTE else "owner_os_route"
         r = get_route(key, conn=conn)
         if r and valid_conversation(r["conversation"]):
-            if not _chat_dead(conn, r["conversation"]):
+            if key == FALLBACK_ROUTE or not _chat_dead(conn, r["conversation"]):
+                # The owner-os route is exempt from dead-gating BY DESIGN: it is the
+                # last resort, and refusing it deadlocks the whole notifier — dead mark
+                # blocks sends, so no send can ever revive it. A wrong transient mark on
+                # a PROJECT chat merely reroutes to owner-os; the same mark on owner-os
+                # must not silence everything. Deadness is still visible in the reason.
                 reason = "explicit_route" if key != FALLBACK_ROUTE else "owner_os_route"
+                if key == FALLBACK_ROUTE and _chat_dead(conn, r["conversation"]):
+                    reason = "owner_os_route:despite_dead_mark"
                 return {"bound": True, "conversation": r["conversation"], "route_key": key,
                         "route_reason": reason}
-            # The bound chat is recorded dead. Events must not be lost into it, and must
-            # not vanish either: fall back to owner-os with the deadness named.
             fallback_reason = f"dead_route:{key}"
-            if key == FALLBACK_ROUTE:
-                return {"bound": False, "reason": f"dead_route:{key}", "route_key": key}
         fb = get_route(FALLBACK_ROUTE, conn=conn)
-        if fb and valid_conversation(fb["conversation"]) and \
-                not _chat_dead(conn, fb["conversation"]):
+        if fb and valid_conversation(fb["conversation"]):
+            reason = fallback_reason
+            if _chat_dead(conn, fb["conversation"]):
+                reason += ":despite_dead_mark"
             return {"bound": True, "conversation": fb["conversation"],
-                    "route_key": FALLBACK_ROUTE, "route_reason": fallback_reason}
+                    "route_key": FALLBACK_ROUTE, "route_reason": reason}
         legacy = _legacy_target(conn)
-        if valid_conversation(legacy) and not _chat_dead(conn, legacy):
+        if valid_conversation(legacy):
             return {"bound": True, "conversation": legacy, "route_key": FALLBACK_ROUTE,
                     "route_reason": f"{fallback_reason}:legacy_single_target"}
         return {"bound": False, "reason": "no_route_bound", "route_key": key}

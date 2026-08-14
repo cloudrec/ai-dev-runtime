@@ -729,8 +729,19 @@ def record_delivery(source: str, *, event_id: Optional[int] = None, delivered: b
                     _cr.upsert_chat(conversation, source="delivery", writable=True,
                                     conn=conn, now=now)
                 elif str(reason) == "composer_did_not_clear_after_send":
-                    _cr.mark_dead(conversation, reason=str(reason)[:160], conn=conn,
-                                  now=now)
+                    # ONE refusal is not death — a busy page can eat a send transiently,
+                    # and a hasty dead-mark on the owner-os chat silenced the whole
+                    # notifier for two hours. Two CONSECUTIVE fired-and-refused sends to
+                    # the same conversation are the threshold.
+                    last2 = conn.execute(
+                        "SELECT delivered, reason FROM wake_delivery WHERE conversation=? "
+                        "ORDER BY id DESC LIMIT 2", ((conversation or "").strip(),)
+                    ).fetchall()
+                    if (len(last2) == 2 and all(
+                            not d and r == "composer_did_not_clear_after_send"
+                            for d, r in last2)):
+                        _cr.mark_dead(conversation, reason=str(reason)[:160], conn=conn,
+                                      now=now)
         except Exception:  # noqa: BLE001 — registry bookkeeping must never break delivery
             pass
         return int(cur.lastrowid)

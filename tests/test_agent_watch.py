@@ -197,6 +197,62 @@ def test_an_unchanged_completion_survives_a_restart_and_text_drift_without_a_sec
     assert r["emitted"] == [] and emit2.calls == []
 
 
+CHEMMY_MENU_REST = """Scope work is staged and ready.
+What should I do next?
+ 1. Wait for their signal (Recommended)
+ 2. Give me a disjoint scope I can own end-to-end
+ 3. Stand down entirely
+ 4. Type something else
+ 5. Chat about this"""
+
+
+def test_waiting_owner_with_a_choice_menu_is_a_prompt_never_a_completion():
+    """chemmy, live (event 4088): a strategy menu after substantive work read like a
+    finish. waiting_owner outranks completion, always."""
+    emit = _Emit()
+    t = "chemmy-fast:0.0"
+    _scan([_agent(t, "/opt/mess", state="working")], {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, "/opt/mess", state="waiting_owner")],
+              {t: CHEMMY_MENU_REST}, emit, now=1100.0)
+    assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
+    assert emit.calls[-1]["type"] == "agent_prompt_needs_response"
+
+
+def test_a_generic_numbered_menu_is_a_prompt_even_without_yes_no_wording():
+    emit = _Emit()
+    r = _scan([_agent(state="waiting_input")],
+              {"gaika-ext-audit:0.0": CHEMMY_MENU_REST}, emit)
+    assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
+
+
+def test_idle_after_work_without_a_stated_finish_is_not_a_completion():
+    """jobhunter, live (event 4086): UI metadata said idle while the plan text still
+    read 'Decide honest payout stance + finish worker UX…'. Quietness is never done."""
+    emit = _Emit()
+    t = "jh:0.0"
+    _scan([_agent(t, "/opt/jobhunter-ai", state="working")], {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, "/opt/jobhunter-ai", state="idle")],
+              {t: "Plan: Decide honest payout stance + polish worker UX next."},
+              emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+
+
+def test_a_fingerprint_migration_does_not_renotify_an_unresolved_blocker():
+    """events 4084/4085, live: a classifier deploy changed the digest scheme and every
+    unresolved blocker re-announced. Same agent, same class, still unresolved, digest
+    moved -> adopt silently."""
+    emit = _Emit()
+    t = "gaika-ext-audit:0.0"
+    _scan([_agent()], {t: BLOCKER_TAIL}, emit)
+    assert len(emit.calls) == 1
+    drifted = BLOCKER_TAIL + "\nMinor extra status line the redraw added."
+    r = _scan([_agent()], {t: drifted}, emit, now=1200.0)
+    assert r["emitted"] == [] and len(emit.calls) == 1
+    # and the stored fingerprint moved with it, so the next scan is quiet too
+    r2 = _scan([_agent()], {t: drifted}, emit, now=1400.0)
+    assert r2["skipped"][0]["why"] == "already_notified"
+
+
 def test_genuinely_working_never_alerts():
     emit = _Emit()
     for now in (1000.0, 1020.0, 1040.0):

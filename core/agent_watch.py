@@ -99,6 +99,15 @@ _CONTINUATION_RE = re.compile(
 _ACTIVE_STATES = frozenset({"working", "shell_running"})
 # Inventory states in which a decision menu is credible.
 _PROMPT_STATES = frozenset({"waiting_owner", "waiting_input", "idle", "unknown", ""})
+# A numbered choice menu — "1. <option> ... 2. <option>" — whatever the option wording.
+# Event 4088 was a five-option strategy menu with none of the yes/no vocabulary.
+_MENU_RE = re.compile(r"\b1\.\s+\S.{0,300}?\b2\.\s+\S")
+# POSITIVE final evidence. Completion is never inferred from mere quietness: idle after
+# work with no finish statement stays un-announced (event 4086 was "idle" from UI
+# metadata while an internal task list sat half-open).
+_FINISH_RE = re.compile(
+    r"(finish(?:ed)?\b|complet(?:e|ed)\b|\ball done\b|\bdone[.!]|final report"
+    r"|all (?:checks|tests) pass(?:ed)?|завершен[оа]?|готово)", re.IGNORECASE)
 
 
 def _meaningful_lines(tail: str) -> list:
@@ -152,16 +161,23 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
     if _WORKING_RE.search(_WS.sub(" ", tail[-400:] if tail else "")):
         # The live interrupt affordance sits in the chrome we strip; check it raw.
         return {"cls": "working", "reason": "active_execution_evidence"}
-    if st in _PROMPT_STATES and _OWNER_PROMPT_RE.search(region):
+    # waiting_owner ALWAYS outranks completion: the inventory says a human is being
+    # asked, and event 4088 proved a choice menu can follow substantive work and read
+    # like a finish. A menu in any at-rest state is likewise a question, not an ending.
+    if st == "waiting_owner":
+        return {"cls": "owner_prompt", "reason": "inventory_waiting_owner"}
+    if st in _PROMPT_STATES and (_OWNER_PROMPT_RE.search(region)
+                                 or _MENU_RE.search(region)):
         return {"cls": "owner_prompt", "reason": "decision_prompt_at_bottom"}
     if _BLOCKER_RE.search(region):
         return {"cls": "blocker", "reason": "paused_waiting_text_at_bottom"}
     if prev_cls == "working":
-        if _CONTINUATION_RE.search(region):
-            # Came to rest but its own words say the work is not finished. Stay
-            # "working" so a REAL finish later is still a fresh transition.
-            return {"cls": "working", "reason": "continuation_evidence_at_rest"}
-        return {"cls": "completed", "reason": "came_to_rest_after_work"}
+        if _CONTINUATION_RE.search(region) or not _FINISH_RE.search(region):
+            # Came to rest, but either its own words say the work continues, or it
+            # never SAID it finished. Stay "working" so a real, stated finish later is
+            # still a fresh transition — quietness alone is never a completion.
+            return {"cls": "working", "reason": "no_positive_finish_evidence"}
+        return {"cls": "completed", "reason": "stated_finish_at_rest"}
     return {"cls": "idle", "reason": "no_signal"}
 
 
@@ -271,6 +287,15 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             # digest sensitivity, because a NEW question genuinely is a new event.
             already = (n_cls == cls if cls in ("completed", "crashed")
                        else (n_cls == cls and n_dg == dg))
+            if (not already and n_cls == cls and n_dg != dg
+                    and (now - float(n_ts or 0)) < REMINDER_SECS):
+                # Same class, same agent, still unresolved, only the fingerprint moved —
+                # a watcher upgrade or cosmetic redraw, not a new fact (events 4084/4085
+                # were exactly this after a classifier deploy). Adopt the new digest
+                # silently; the reminder interval still guards true staleness.
+                conn.execute("UPDATE agent_watch_state SET notified_digest=? "
+                             "WHERE target=?", (dg, target))
+                already = True
             if already:
                 overdue = (REMINDER_SECS and cls in ("owner_prompt", "blocker")
                            and (now - float(n_ts or 0)) >= REMINDER_SECS)

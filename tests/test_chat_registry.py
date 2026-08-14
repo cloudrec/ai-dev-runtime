@@ -143,19 +143,41 @@ def test_a_dead_bound_route_falls_back_to_owner_os_with_a_named_reason():
     assert r["route_reason"] == "dead_route:mess"
 
 
-def test_a_dead_owner_os_route_refuses_rather_than_guessing():
+def test_a_dead_marked_owner_os_route_still_delivers_and_names_the_mark():
+    """The last resort is exempt from dead-gating BY DESIGN: a dead mark blocks sends,
+    so no send could ever revive it — refusing here silenced the whole notifier for two
+    hours on 2026-08-14. Deliver, and say why."""
     wr.bind_route(wr.FALLBACK_ROUTE, OWNER)
     cr.mark_dead(OWNER, reason="composer_did_not_clear_after_send")
     r = wr.resolve(project_id="")
-    assert r["bound"] is False and r["reason"] == "dead_route:owner-os"
+    assert r["bound"] is True and r["conversation"] == OWNER
+    assert r["route_reason"] == "owner_os_route:despite_dead_mark"
 
 
-def test_a_refused_send_marks_the_chat_dead_via_the_delivery_ledger():
+def test_one_refused_send_is_not_death_two_consecutive_are():
+    """A busy page can eat one send transiently. Death takes two in a row."""
+    wb.record_delivery("companion", event_id=70, delivered=False,
+                       reason="composer_did_not_clear_after_send",
+                       conversation=MESS, route_key="mess")
+    assert cr.is_dead(MESS) is False
     wb.record_delivery("companion", event_id=71, delivered=False,
                        reason="composer_did_not_clear_after_send",
                        conversation=MESS, route_key="mess")
     assert cr.is_dead(MESS) is True
     assert cr.list_chats()[0]["dead_reason"] == "composer_did_not_clear_after_send"
+
+
+def test_a_success_between_refusals_resets_the_death_count():
+    wb.record_delivery("companion", event_id=72, delivered=False,
+                       reason="composer_did_not_clear_after_send",
+                       conversation=MESS, route_key="mess")
+    wb.record_delivery("companion", event_id=73, delivered=True,
+                       reason="submitted_and_user_turn_appeared",
+                       conversation=MESS, route_key="mess")
+    wb.record_delivery("companion", event_id=74, delivered=False,
+                       reason="composer_did_not_clear_after_send",
+                       conversation=MESS, route_key="mess")
+    assert cr.is_dead(MESS) is False
 
 
 def test_a_timeout_is_not_death():
