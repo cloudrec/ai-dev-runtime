@@ -247,11 +247,31 @@ PROJECT_ALIASES = {
 
 _WORD = r"[a-z0-9а-яё.\-]"
 
+# Combination rules: EVERY token in a tuple must appear (token-bounded) for the combo to
+# count as a marker. This exists for projects whose vocabulary is made of generic words —
+# `корзина` alone names nothing, but `корзина` together with `gaika`/`гайка`/`атб`+`варус`
+# is the GAIKA Basket chat and nothing else. A generic word must never appear here alone.
+PROJECT_ALIAS_COMBOS = {
+    "gaika-drop": (("корзин", "gaika"), ("корзин", "гайка"), ("корзин", "атб", "варус"),
+                   ("basket", "gaika")),
+}
+
+
+def _token_present(text: str, token: str) -> bool:
+    """Token-bounded on the left; the right boundary tolerates Cyrillic inflection for
+    Cyrillic stems (`корзин` matches `корзины`), while Latin tokens stay exact."""
+    t = re.escape(token.lower())
+    tail = "" if re.search(r"[а-яё]$", token.lower()) else rf"(?!{_WORD})"
+    return bool(re.search(rf"(?<!{_WORD}){t}{tail}", (text or "").lower()))
+
 
 def _alias_matches(title: str, key: str) -> bool:
     t = (title or "").lower()
     for alias in PROJECT_ALIASES.get(key, (key,)):
         if re.search(rf"(?<!{_WORD}){re.escape(alias.lower())}(?!{_WORD})", t):
+            return True
+    for combo in PROJECT_ALIAS_COMBOS.get(key, ()):
+        if all(_token_present(t, tok) for tok in combo):
             return True
     return False
 

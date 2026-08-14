@@ -217,6 +217,32 @@ def test_an_alias_is_token_bounded_too():
     assert r["bound"] is False and r["reason"] == "no_project_marker_in_title"
 
 
+# ── combination markers: generic words only count together ─────────────────
+def test_a_generic_word_alone_never_binds():
+    """`корзина` names nothing by itself — that is exactly the guess the combo rule
+    exists to prevent."""
+    for title in ("Разработка корзины", "корзина покупок", "Сравнение корзин"):
+        r = cr.consider_auto_bind(MESS, title=title)
+        assert r["bound"] is False, title
+        assert r["reason"] == "no_project_marker_in_title"
+
+
+def test_the_gaika_basket_combination_is_strong_evidence():
+    r = cr.consider_auto_bind(MESS, title="GAIKA корзина план")
+    assert r["bound"] is True and r["route_key"] == "gaika-drop"
+
+
+def test_the_atb_varus_basket_combination_is_strong_evidence():
+    r = cr.consider_auto_bind(MESS, title="Корзины АТБ и Варус сравнение")
+    assert r["bound"] is True and r["route_key"] == "gaika-drop"
+
+
+def test_a_combo_plus_another_project_marker_is_still_ambiguity():
+    r = cr.consider_auto_bind(MESS, title="GAIKA корзина и ВИДЕО")
+    assert r["bound"] is False and r["reason"] == "ambiguous_project_markers"
+    assert sorted(r["candidates"]) == ["gaika-drop", "gaika-video"]
+
+
 # ── continuation: dead old + strong new = auto-rebind; healthy old = never ─
 def test_a_dead_route_with_a_strong_new_chat_is_auto_rebound_with_audit():
     wr.bind_route("mess", MESS)
