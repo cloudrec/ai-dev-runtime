@@ -175,6 +175,68 @@ def test_a_verified_delivery_proves_writable_and_revives_the_row():
     assert row["writable"] is True and row["active"] is True and row["dead_reason"] == ""
 
 
+# ── sidebar discovery: the account-visible surface ─────────────────────────
+def test_a_chat_created_on_another_device_is_discovered_from_sidebar_links():
+    """No server tab ever existed for this conversation — it arrives as a sidebar link
+    once ChatGPT syncs the account, and that alone must be enough to inventory it."""
+    res = cr.discover_from_links([
+        {"url": "https://chatgpt.com/c/phone-created-chat", "title": "НОВЫЙ ПРОЕКТ"},
+        {"url": "https://chatgpt.com/c/another-chat/", "title": "ChatGPT"},  # generic title
+        {"url": "https://example.com/c/evil", "title": "x"},                 # wrong host
+    ])
+    urls = [d["conversation"] for d in res["discovered"]]
+    assert "https://chatgpt.com/c/phone-created-chat" in urls
+    assert "https://chatgpt.com/c/another-chat" in urls
+    assert not any("example.com" in u for u in urls)
+    rows = {r["conversation"]: r for r in cr.list_chats()}
+    assert rows["https://chatgpt.com/c/phone-created-chat"]["title"] == "НОВЫЙ ПРОЕКТ"
+    assert rows["https://chatgpt.com/c/phone-created-chat"]["source"] == "sidebar_discovery"
+
+
+# ── curated aliases: owner vocabulary, still fail-closed ───────────────────
+def test_a_curated_alias_is_strong_evidence():
+    r = cr.consider_auto_bind(MESS, title="МЕССЕНДЖЕР")
+    assert r["bound"] is True and r["route_key"] == "mess"
+
+
+def test_the_payments_alias_binds_payment_orchestrator():
+    url = "https://chatgpt.com/c/payments-chat"
+    r = cr.consider_auto_bind(url, title="ПЛАТЁЖКА 2")
+    assert r["bound"] is True and r["route_key"] == "payment-orchestrator"
+
+
+def test_two_alias_hits_are_still_ambiguity():
+    r = cr.consider_auto_bind(MESS, title="ПЛАТЁЖКА и ВИДЕО общий план")
+    assert r["bound"] is False and r["reason"] == "ambiguous_project_markers"
+    assert sorted(r["candidates"]) == ["gaika-video", "payment-orchestrator"]
+
+
+def test_an_alias_is_token_bounded_too():
+    """`видео` must not fire inside `видеонаблюдение`-style words."""
+    r = cr.consider_auto_bind(MESS, title="видеонаблюдение план")
+    assert r["bound"] is False and r["reason"] == "no_project_marker_in_title"
+
+
+# ── continuation: dead old + strong new = auto-rebind; healthy old = never ─
+def test_a_dead_route_with_a_strong_new_chat_is_auto_rebound_with_audit():
+    wr.bind_route("mess", MESS)
+    cr.mark_dead(MESS, reason="composer_did_not_clear_after_send")
+    newer = "https://chatgpt.com/c/mess-continued"
+    r = cr.consider_auto_bind(newer, title="МЕССЕНДЖЕР продолжение")
+    assert r["bound"] is True and r["continuation"] is True and r["previous"] == MESS
+    assert wr.get_route("mess")["conversation"] == newer
+    hist = [h for h in wr.route_history() if h["route_key"] == "mess"][0]
+    assert hist["previous"] == MESS and "recorded dead" in hist["note"]
+
+
+def test_a_healthy_route_is_never_replaced_by_a_newer_chat():
+    wr.bind_route("mess", MESS)
+    r = cr.consider_auto_bind("https://chatgpt.com/c/mess-newer",
+                              title="МЕССЕНДЖЕР новый")
+    assert r["bound"] is False and r["reason"] == "route_already_bound"
+    assert wr.get_route("mess")["conversation"] == MESS
+
+
 # ── explicit continuation rebind stays available and audited ────────────────
 def test_explicit_rebind_still_moves_a_route_and_records_the_previous_chat():
     wr.bind_route("mess", MESS)

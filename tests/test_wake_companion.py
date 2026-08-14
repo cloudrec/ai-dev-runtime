@@ -118,6 +118,12 @@ def test_the_route_key_is_carried_through_to_the_delivery_ledger(composer):
     assert r["route_key"] == "mess"
 
 
+def _stub_sidebar(monkeypatch, result):
+    mod = types.ModuleType("cdp_composer")
+    mod.list_sidebar_conversations = lambda *a, **k: result
+    monkeypatch.setitem(sys.modules, "cdp_composer", mod)
+
+
 def test_discovery_inventories_tabs_and_offers_titles_to_auto_bind(monkeypatch):
     """Discovery reads only the CDP tab list and hands each discovered conversation with
     its title to the registry's fail-closed auto-bind — it decides nothing itself."""
@@ -125,6 +131,8 @@ def test_discovery_inventories_tabs_and_offers_titles_to_auto_bind(monkeypatch):
     tabs = [{"type": "page", "url": "https://chatgpt.com/c/mess-work", "title": "mess"}]
     monkeypatch.setattr(urllib.request, "urlopen",
                         lambda *a, **k: io.BytesIO(json.dumps(tabs).encode()))
+    _stub_sidebar(monkeypatch, {"ok": False, "reason": "no_chatgpt_page_open",
+                                "conversations": []})
     seen = {}
     import core.chat_registry as cr
     monkeypatch.setattr(cr, "discover_from_tabs",
@@ -138,6 +146,32 @@ def test_discovery_inventories_tabs_and_offers_titles_to_auto_bind(monkeypatch):
     r = wc.discover_chats()
     assert r["ok"] is True
     assert seen == {"conversation": "https://chatgpt.com/c/mess-work", "title": "mess"}
+
+
+def test_sidebar_conversations_reach_the_registry_and_auto_bind(monkeypatch):
+    """A chat with NO server tab — created on the owner's phone — arrives via the sidebar
+    scan and must flow into inventory and the fail-closed auto-bind exactly like a tab."""
+    import io, json, urllib.request
+    monkeypatch.setattr(urllib.request, "urlopen",
+                        lambda *a, **k: io.BytesIO(json.dumps([]).encode()))
+    _stub_sidebar(monkeypatch, {"ok": True, "conversations": [
+        {"url": "https://chatgpt.com/c/phone-chat", "title": "МЕССЕНДЖЕР"}]})
+    offered, linked = [], []
+    import core.chat_registry as cr
+    monkeypatch.setattr(cr, "discover_from_tabs", lambda t: {"discovered": []})
+    monkeypatch.setattr(cr, "discover_from_links",
+                        lambda links, **k: (linked.extend(links) or
+                                            {"discovered": [{"conversation": l["url"],
+                                                             "action": "discovered",
+                                                             "title": l["title"]}
+                                                            for l in links]}))
+    monkeypatch.setattr(cr, "consider_auto_bind",
+                        lambda conversation, title="": offered.append(
+                            (conversation, title)) or {"bound": False, "reason": "x"})
+    r = wc.discover_chats()
+    assert r["ok"] is True and r["sidebar"] is True
+    assert linked == [{"url": "https://chatgpt.com/c/phone-chat", "title": "МЕССЕНДЖЕР"}]
+    assert offered == [("https://chatgpt.com/c/phone-chat", "МЕССЕНДЖЕР")]
 
 
 def test_discovery_failure_is_an_answer_not_a_crash(monkeypatch):

@@ -157,6 +157,43 @@ def test_an_unreadable_id_baseline_falls_back_to_the_count_alone(wired):
     assert r["ok"] is False and r["reason"] == "user_turn_not_observed_after_send"
 
 
+def test_the_sidebar_scan_reads_links_and_never_sends(monkeypatch):
+    """Sidebar discovery is a pure read: same-origin /c/ anchors (href + title), bounded,
+    deduped — and it must be structurally incapable of typing or clicking."""
+    import json as _json
+
+    class _Side(_S):
+        def call(self, method, params=None):
+            self.exprs.append((method, (params or {}).get("expression", "")))
+            if method == "Runtime.evaluate":
+                return {"result": {"value": _json.dumps([
+                    {"href": "/c/abc-123", "title": "МЕССЕНДЖЕР"},
+                    {"href": "/c/def-456/", "title": "ВИДЕО"},
+                ])}}
+            return {}
+
+    s = _Side()
+    monkeypatch.setattr(cdp, "find_chatgpt_page",
+                        lambda: {"webSocketDebuggerUrl": "ws://x"})
+    monkeypatch.setattr(cdp, "_Session", lambda ws: s)
+    r = cdp.list_sidebar_conversations(limit=50)
+    assert r["ok"] is True
+    assert r["conversations"] == [
+        {"url": "https://chatgpt.com/c/abc-123", "title": "МЕССЕНДЖЕР"},
+        {"url": "https://chatgpt.com/c/def-456", "title": "ВИДЕО"},
+    ]
+    assert s.inserted == [], "the sidebar scan may never type"
+    for method, expr in s.exprs:
+        assert method in ("Runtime.enable", "Runtime.evaluate"), method
+        assert "click" not in expr and "Input." not in expr
+
+
+def test_the_sidebar_scan_fails_safe_without_a_page(monkeypatch):
+    monkeypatch.setattr(cdp, "find_chatgpt_page", lambda: None)
+    r = cdp.list_sidebar_conversations()
+    assert r["ok"] is False and r["conversations"] == []
+
+
 def test_the_id_probe_reads_an_attribute_never_content():
     """The real expression behind last_attr: getAttribute of an opaque id, no text APIs."""
     captured = {}

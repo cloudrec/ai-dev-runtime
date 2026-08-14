@@ -138,6 +138,44 @@ def _record_delivery(source: str, event_id: Optional[int], res: dict,
     return res
 
 
+def list_sidebar_conversations(limit: int = 100) -> dict:
+    """Read-only: the conversation links ChatGPT's own sidebar currently shows.
+
+    This is the account-visible surface — a chat created on the owner's phone appears
+    here once the web app syncs it, even though no server tab was ever open on it. Reads
+    ONLY same-origin anchors under /c/ (href + link text, which is the chat's title);
+    never navigates, never types, never touches history or other domains. A page without
+    a mounted sidebar simply yields nothing — fail safe, not fail loud.
+    """
+    t = find_chatgpt_page()
+    if not t:
+        return {"ok": False, "reason": "no_chatgpt_page_open", "conversations": []}
+    s = None
+    try:
+        s = _Session(t["webSocketDebuggerUrl"])
+        s.call("Runtime.enable")
+        expr = ("(function(){const seen={};const out=[];"
+                "for(const a of document.querySelectorAll('a[href^=\"/c/\"]')){"
+                f"if(out.length>={int(limit)})break;"
+                "const h=(a.getAttribute('href')||'').split('?')[0].split('#')[0];"
+                "if(!/^\\/c\\/[A-Za-z0-9-]+\\/?$/.test(h)||seen[h])continue;seen[h]=1;"
+                "out.push({href:h,title:(a.textContent||'').trim().slice(0,200)});}"
+                "return JSON.stringify(out);})()")
+        r = s.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
+        raw = ((r.get("result") or {}).get("value"))
+        if not isinstance(raw, str):
+            return {"ok": False, "reason": "sidebar_unreadable", "conversations": []}
+        items = json.loads(raw)
+        convs = [{"url": "https://chatgpt.com" + i["href"].rstrip("/"),
+                  "title": i.get("title") or ""} for i in items]
+        return {"ok": True, "conversations": convs}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "reason": f"cdp_error:{type(e).__name__}", "conversations": []}
+    finally:
+        if s:
+            s.close()
+
+
 def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown",
                   event_id: Optional[int] = None, claim: bool = True,
                   actionable: bool = False, route_key: str = "") -> dict:

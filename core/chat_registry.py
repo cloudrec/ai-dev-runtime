@@ -163,6 +163,28 @@ def list_chats(active_only: bool = False, conn=None) -> list:
             conn.close()
 
 
+def discover_from_links(links: list, *, source: str = "sidebar_discovery", conn=None,
+                        now: Optional[float] = None) -> dict:
+    """Inventory conversation links from ChatGPT's own sidebar / conversation list.
+
+    `links` are {url, title} dicts read from same-origin `/c/` anchors in the logged-in
+    page — the account-visible surface, so a chat created on another device appears here
+    once the web app syncs it, without any server tab ever opening it. Only valid
+    conversation URLs are recorded; nothing is opened and nothing is sent."""
+    seen = []
+    for it in links or []:
+        url = (it.get("url") or "").split("?")[0].split("#")[0].rstrip("/")
+        if not wake_routes.valid_conversation(url):
+            continue
+        title = (it.get("title") or "").strip()
+        if title.lower() in ("chatgpt", ""):
+            title = ""
+        r = upsert_chat(url, title=title, source=source, conn=conn, now=now)
+        if r.get("ok"):
+            seen.append({"conversation": url, "action": r["action"], "title": title})
+    return {"discovered": seen}
+
+
 def discover_from_tabs(tabs: list, conn=None, now: Optional[float] = None) -> dict:
     """Inventory the ChatGPT conversations visible in a CDP page list.
 
@@ -210,15 +232,50 @@ def _title_matches(title: str, key: str) -> bool:
     return bool(re.search(rf"(?<![a-z0-9]){re.escape(key)}(?![a-z0-9])", title.lower()))
 
 
+# Explicit owner-curated project markers, beyond the bare route key. Each entry is a
+# small closed list — an alias earns its place here from OBSERVED owner usage (the chat
+# titles the owner actually writes), never from similarity. Matching is still
+# token-bounded, so `видео` does not fire inside another word.
+PROJECT_ALIASES = {
+    "mess": ("mess", "chemmy", "мессенджер", "хемми"),
+    "gaika-video": ("gaika-video", "видео"),
+    "payment-orchestrator": ("payment-orchestrator", "платёжка", "платежка",
+                             "payment.clients.help", "sbp", "сбп"),
+    "jobhunter-ai": ("jobhunter-ai", "jobhunter"),
+    "gaika-drop": ("gaika-drop", "гайка-корзина", "gaika basket"),
+}
+
+_WORD = r"[a-z0-9а-яё.\-]"
+
+
+def _alias_matches(title: str, key: str) -> bool:
+    t = (title or "").lower()
+    for alias in PROJECT_ALIASES.get(key, (key,)):
+        if re.search(rf"(?<!{_WORD}){re.escape(alias.lower())}(?!{_WORD})", t):
+            return True
+    return False
+
+
+def match_projects(title: str, known_keys: set) -> list:
+    """Every project the title names, via exact key token OR curated alias. The caller
+    binds only when this list has exactly one member — two markers is ambiguity."""
+    keys = set(known_keys) | set(PROJECT_ALIASES)
+    keys.discard(wake_routes.FALLBACK_ROUTE)
+    return sorted(k for k in keys
+                  if _title_matches(title or "", k) or _alias_matches(title or "", k))
+
+
 def consider_auto_bind(conversation: str, *, title: str = "", conn=None,
                        now: Optional[float] = None) -> dict:
     """Bind a project route to a discovered chat ONLY on deterministic evidence.
 
     Requirements, all of them: the chat is a valid conversation and not known dead; its
-    title names exactly ONE known project key as an explicit token; that route is
-    currently UNBOUND. Anything else — zero matches, two matches, an existing binding,
-    the owner-os key — is a refusal with the reason recorded. Rebinding an existing route
-    stays a purely explicit act (owner CLI/MCP), never an inference.
+    title names exactly ONE project, by exact key token or curated alias
+    (`PROJECT_ALIASES`); and the route is either UNBOUND, or bound to a chat that is
+    RECORDED DEAD — the continuation case: the old doorbell provably refuses sends and
+    the owner has titled a new chat with that project's marker. A healthy existing
+    binding is never replaced, however new the chat; zero matches, two matches and the
+    owner-os key are refusals with the reason recorded.
     """
     now = now if now is not None else now_ts()
     url = (conversation or "").strip().rstrip("/")
@@ -228,26 +285,37 @@ def consider_auto_bind(conversation: str, *, title: str = "", conn=None,
     try:
         if is_dead(url, conn=conn):
             return {"bound": False, "reason": "chat_known_dead"}
-        matches = sorted(k for k in _known_project_keys(conn)
-                         if _title_matches(title or "", k))
+        matches = match_projects(title or "", _known_project_keys(conn))
         if not matches:
             return {"bound": False, "reason": "no_project_marker_in_title"}
         if len(matches) > 1:
             return {"bound": False, "reason": "ambiguous_project_markers",
                     "candidates": matches}
         key = matches[0]
-        if wake_routes.get_route(key, conn=conn):
-            return {"bound": False, "reason": "route_already_bound", "route_key": key}
-        res = wake_routes.bind_route(
-            key, url, by="auto-discovery",
-            note=f"auto-bound: title names project '{key}' unambiguously", conn=conn,
-            now=now)
+        existing = wake_routes.get_route(key, conn=conn)
+        continuation = False
+        if existing:
+            if not is_dead(existing["conversation"], conn=conn):
+                return {"bound": False, "reason": "route_already_bound", "route_key": key}
+            # Continuation: the bound chat is proven dead (a fired send the page refused)
+            # and the new chat carries this project's marker unambiguously. Audited as a
+            # rebind with the previous URL preserved, like every other pointer move.
+            continuation = True
+        note = (f"auto-rebound: previous chat recorded dead "
+                f"({existing['conversation']}); new chat titled for '{key}'"
+                if continuation else
+                f"auto-bound: title names project '{key}' unambiguously")
+        res = wake_routes.bind_route(key, url, by="auto-discovery", note=note, conn=conn,
+                                     now=now)
         if not res.get("ok"):
             return {"bound": False, "reason": res.get("reason"), "route_key": key}
         upsert_chat(url, title=title, inferred_route=key, confidence="strong",
-                    evidence=f"title token match: {key}", source="auto-bind", conn=conn,
-                    now=now)
-        return {"bound": True, "route_key": key, "conversation": url}
+                    evidence=("continuation of dead route" if continuation
+                              else f"title marker match: {key}"),
+                    source="auto-bind", conn=conn, now=now)
+        return {"bound": True, "route_key": key, "conversation": url,
+                "continuation": continuation,
+                "previous": (existing["conversation"] if existing else None)}
     finally:
         if own:
             conn.close()

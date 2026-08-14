@@ -44,14 +44,32 @@ def discover_chats() -> dict:
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": f"cdp_list_unavailable:{type(e).__name__}"}
     res = cr.discover_from_tabs(tabs)
-    for d in res.get("discovered", []):
-        title = next((t.get("title") or "" for t in tabs
-                      if (t.get("url") or "").split("?")[0].rstrip("/") ==
-                      d["conversation"]), "")
-        b = cr.consider_auto_bind(d["conversation"], title=title)
+    candidates = [(d["conversation"],
+                   next((t.get("title") or "" for t in tabs
+                         if (t.get("url") or "").split("?")[0].rstrip("/") ==
+                         d["conversation"]), ""))
+                  for d in res.get("discovered", [])]
+    # Account-visible surface: the sidebar of the logged-in page lists conversations the
+    # ACCOUNT has, including chats created on the owner's other devices that never had a
+    # server tab. Read-only DOM scan; failure is an answer, never a crash.
+    sidebar = {"ok": False, "reason": "not_attempted", "conversations": []}
+    try:
+        from cdp_composer import list_sidebar_conversations
+        sidebar = list_sidebar_conversations()
+    except Exception as e:  # noqa: BLE001
+        sidebar = {"ok": False, "reason": f"cdp_unavailable:{type(e).__name__}",
+                   "conversations": []}
+    if sidebar.get("ok"):
+        side = cr.discover_from_links(sidebar["conversations"])
+        candidates += [(d["conversation"], d.get("title") or "")
+                       for d in side.get("discovered", [])]
+    for conversation, title in candidates:
+        b = cr.consider_auto_bind(conversation, title=title)
         if b.get("bound"):
-            print(f"auto-bound route {b['route_key']} -> {b['conversation']}", flush=True)
-    return {"ok": True, "discovered": [d["conversation"] for d in res.get("discovered", [])]}
+            kind = "auto-rebound (continuation)" if b.get("continuation") else "auto-bound"
+            print(f"{kind} route {b['route_key']} -> {b['conversation']}", flush=True)
+    return {"ok": True, "discovered": [c for c, _ in candidates],
+            "sidebar": sidebar.get("ok"), "sidebar_reason": sidebar.get("reason")}
 
 
 def tick(wb) -> dict:
