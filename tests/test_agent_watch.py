@@ -1,0 +1,178 @@
+"""Agent watch: real pane states become owner notifications, without spam.
+
+Modelled on the live 2026-08-14 failure: gaika-ext-audit paused awaiting migration
+instructions, gaika-ip-seal at a literal permission menu — and zero notifications,
+because nothing read the pane text. Every test drives scan() with injected inventory,
+tails and an emit recorder; the classes, dedup, re-arm, restart and routing rules are
+the contract.
+"""
+from __future__ import annotations
+
+import pytest
+
+from core import agent_watch as aw
+
+PROMPT_TAIL = """╭───────────────────────────────╮
+ Bash command: rm -rf build/
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again
+   3. No, and tell Claude what to do differently
+╰───────────────────────────────╯"""
+
+BLOCKER_TAIL = """Migration analysis finished.
+Development paused at safe checkpoint.
+Waiting for migration instructions from the owner."""
+
+WORKING_TAIL = "✻ Compacting… (esc to interrupt · 32.1k tokens)"
+IDLE_TAIL = "All checks passed. Report written to reports/AUDIT.md.\n>"
+
+
+@pytest.fixture(autouse=True)
+def _iso(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    yield
+
+
+class _Emit:
+    def __init__(self):
+        self.calls = []
+        self._n = 0
+
+    def __call__(self, source, etype, **kw):
+        self._n += 1
+        self.calls.append({"source": source, "type": etype, **kw})
+        return {"event_id": self._n}
+
+
+def _agent(target="gaika-ext-audit:0.0", cwd="/opt/gaika-drop", alive=True):
+    return {"target": target, "cwd": cwd, "claude_cwd": cwd,
+            "alive": alive, "is_agent": True}
+
+
+def _scan(agents, tails, emit, now=1000.0):
+    return aw.scan(agents=agents, read_fn=lambda t: tails[t], emit_fn=emit, now=now)
+
+
+# ── the five classes ────────────────────────────────────────────────────────
+def test_a_permission_prompt_is_an_actionable_owner_event():
+    emit = _Emit()
+    r = _scan([_agent("ip-seal:0.0", "/opt/clients-help-landing")],
+              {"ip-seal:0.0": PROMPT_TAIL}, emit)
+    assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
+    call = emit.calls[0]
+    assert call["type"] == "agent_prompt_needs_response"
+    assert call["owner_action_required"] is True and call["severity"] == "high"
+    assert "Do you want to proceed" in call["payload"]["excerpt"]
+
+
+def test_paused_waiting_for_instructions_is_an_actionable_blocker():
+    emit = _Emit()
+    r = _scan([_agent()], {"gaika-ext-audit:0.0": BLOCKER_TAIL}, emit)
+    assert [e["class"] for e in r["emitted"]] == ["blocker"]
+    assert emit.calls[0]["type"] == "agent_waiting_input"
+
+
+def test_coming_to_rest_after_work_is_a_completion():
+    emit = _Emit()
+    _scan([_agent()], {"gaika-ext-audit:0.0": WORKING_TAIL}, emit)
+    assert emit.calls == []                      # working is not news
+    r = _scan([_agent()], {"gaika-ext-audit:0.0": IDLE_TAIL}, emit, now=1100.0)
+    assert [e["class"] for e in r["emitted"]] == ["completed"]
+    assert emit.calls[0]["type"] == "task_completed"
+
+
+def test_a_vanished_working_pane_is_a_critical_crash():
+    emit = _Emit()
+    _scan([_agent()], {"gaika-ext-audit:0.0": WORKING_TAIL}, emit)
+    r = _scan([], {}, emit, now=1100.0)          # pane gone from inventory
+    assert [e["class"] for e in r["emitted"]] == ["crashed"]
+    assert emit.calls[0]["type"] == "agent_process_failed"
+    assert emit.calls[0]["severity"] == "critical"
+
+
+def test_a_pane_that_left_from_rest_is_not_a_crash():
+    emit = _Emit()
+    _scan([_agent()], {"gaika-ext-audit:0.0": IDLE_TAIL}, emit)
+    r = _scan([], {}, emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+
+
+def test_genuinely_working_never_alerts():
+    emit = _Emit()
+    for now in (1000.0, 1020.0, 1040.0):
+        r = _scan([_agent()], {"gaika-ext-audit:0.0": WORKING_TAIL}, emit, now=now)
+        assert r["emitted"] == []
+    assert emit.calls == []
+
+
+# ── dedup / re-arm / reminder / restart ────────────────────────────────────
+def test_an_unchanged_prompt_is_never_resent():
+    emit = _Emit()
+    tails = {"gaika-ext-audit:0.0": PROMPT_TAIL}
+    _scan([_agent()], tails, emit)
+    r2 = _scan([_agent()], tails, emit, now=1020.0)
+    assert r2["emitted"] == [] and len(emit.calls) == 1
+    assert r2["skipped"][0]["why"] == "already_notified"
+
+
+def test_spinner_churn_does_not_mint_a_new_fingerprint():
+    a = aw.digest_of("Waiting for input (32 seconds elapsed)")
+    b = aw.digest_of("Waiting for input (95 seconds elapsed)")
+    assert a == b
+
+
+def test_resume_then_the_same_prompt_again_re_arms():
+    emit = _Emit()
+    t = "gaika-ext-audit:0.0"
+    _scan([_agent()], {t: PROMPT_TAIL}, emit)
+    _scan([_agent()], {t: WORKING_TAIL}, emit, now=1050.0)     # resumed
+    r = _scan([_agent()], {t: PROMPT_TAIL}, emit, now=1100.0)  # blocked AGAIN
+    assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
+    assert len(emit.calls) == 2
+
+
+def test_an_unresolved_owner_item_gets_one_reminder_after_the_interval(monkeypatch):
+    monkeypatch.setattr(aw, "REMINDER_SECS", 600)
+    emit = _Emit()
+    tails = {"gaika-ext-audit:0.0": PROMPT_TAIL}
+    _scan([_agent()], tails, emit, now=1000.0)
+    assert _scan([_agent()], tails, emit, now=1300.0)["emitted"] == []
+    r = _scan([_agent()], tails, emit, now=1700.0)             # interval elapsed
+    assert len(r["emitted"]) == 1 and len(emit.calls) == 2
+
+
+def test_restart_does_not_replay_an_already_notified_prompt():
+    """The watch state lives in the database: a fresh process seeing the same prompt has
+    nothing new to say."""
+    emit = _Emit()
+    tails = {"gaika-ext-audit:0.0": BLOCKER_TAIL}
+    _scan([_agent()], tails, emit)
+    emit2 = _Emit()                                            # "restarted" companion
+    r = _scan([_agent()], tails, emit2, now=1030.0)
+    assert r["emitted"] == [] and emit2.calls == []
+
+
+# ── routing ────────────────────────────────────────────────────────────────
+def test_the_project_comes_from_the_cwd_and_rides_on_the_event():
+    emit = _Emit()
+    _scan([_agent("gaika-ext-audit:0.0", "/opt/gaika-drop")],
+          {"gaika-ext-audit:0.0": BLOCKER_TAIL}, emit)
+    assert emit.calls[0]["project_id"] == "gaika-drop"
+
+
+def test_an_unmapped_cwd_falls_back_to_owner_os_explicitly():
+    emit = _Emit()
+    _scan([_agent("mystery:0.0", cwd="")], {"mystery:0.0": PROMPT_TAIL}, emit)
+    call = emit.calls[0]
+    assert call["project_id"] == ""
+    assert "owner-os" in call["payload"]["project"]
+
+
+def test_two_agents_route_to_their_own_projects_without_cross_talk():
+    emit = _Emit()
+    agents = [_agent("a1:0.0", "/opt/gaika-drop"), _agent("a2:0.0", "/opt/mess")]
+    _scan(agents, {"a1:0.0": BLOCKER_TAIL, "a2:0.0": PROMPT_TAIL}, emit)
+    routed = {c["agent_id"]: c["project_id"] for c in emit.calls}
+    assert routed == {"a1:0.0": "gaika-drop", "a2:0.0": "mess"}

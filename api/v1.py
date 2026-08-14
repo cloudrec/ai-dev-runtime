@@ -563,6 +563,14 @@ async def list_chat_inventory(active_only: bool = False, _: bool = Depends(_auth
             "routes": wr.list_routes(), "fallback_route": wr.FALLBACK_ROUTE}
 
 
+@router.get("/control-plane/wake/alerts", operation_id="list_agent_alerts")
+async def list_agent_alerts(limit: int = 30, _: bool = Depends(_auth)):
+    """Agent-derived owner alerts (source=agent_watch): waiting prompts, blockers,
+    completions, crashes — the history behind the wakes. Read-only."""
+    from core import agent_watch
+    return {"alerts": agent_watch.recent_alerts(limit=max(1, min(int(limit), 100)))}
+
+
 @router.get("/control-plane/wake/routes/resolve", operation_id="resolve_wake_route")
 async def resolve_wake_route(project_id: str = "", source: str = "", agent_id: str = "",
                              _: bool = Depends(_auth)):

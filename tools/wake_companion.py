@@ -110,12 +110,33 @@ def tick(wb) -> dict:
             "reason": res.get("reason")}
 
 
+AGENT_WATCH_ENABLED = os.getenv("AGENT_WATCH_ENABLED", "1") not in ("0", "", "false")
+
+
+def watch_agents() -> dict:
+    """One agent-watch pass: live tmux agents -> CTO events for owner-relevant
+    transitions. Runs at the poll cadence (~20s) because a pane sitting at a permission
+    prompt is a minute-scale problem, not a five-minute one."""
+    from core import agent_watch
+    r = agent_watch.scan()
+    for e in r.get("emitted", []):
+        print(f"agent-watch: {e['class']} {e['target']} "
+              f"[{e['project'] or 'unmapped->owner-os'}] event {e['event_id']}",
+              flush=True)
+    return r
+
+
 def main() -> None:
     from core import wake_bridge as wb
     n = 0
     while True:
         try:
             tick(wb)
+            if AGENT_WATCH_ENABLED:
+                try:
+                    watch_agents()
+                except Exception as e:  # noqa: BLE001
+                    print(f"agent-watch error: {str(e)[:160]}", flush=True)
             if n % DISCOVERY_EVERY_TICKS == 0:
                 discover_chats()
         except Exception as e:  # noqa: BLE001
