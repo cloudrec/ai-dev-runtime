@@ -57,6 +57,9 @@ CREATE TABLE IF NOT EXISTS agent_watch_state (
     cls TEXT, digest TEXT, at TEXT, ts REAL,
     notified_cls TEXT, notified_digest TEXT, notified_at TEXT, notified_ts REAL,
     emissions INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS agent_alert_invalid (
+    event_id INTEGER PRIMARY KEY, at TEXT, ts REAL, by TEXT, reason TEXT
 )
 """
 
@@ -93,9 +96,11 @@ _WS = re.compile(r"\s+")
 # tmux/Claude-CLI chrome: box borders, status bars, input-box furniture, hints. These are
 # DISPLAY, not agent output — they must appear in no digest, no excerpt, no evidence.
 _UI_LINE_RE = re.compile(
-    r"^\s*(?:[─│╭╮╰╯═┌┐└┘┤├]+.*|❯.*|\?\s+for shortcuts.*|⏵⏵.*|\[caveman\].*"
+    r"^\s*(?:[─│╭╮╰╯═┌┐└┘┤├]+.*|❯(?!\s*\d+\.).*|\?\s+for shortcuts.*|⏵⏵.*|\[caveman\].*"
     r"|.*shift\+tab to cycle.*|.*new task\?\s*/clear.*|.*esc to interrupt.*"
     r"|✻.*|✽.*|·.*)\s*$", re.IGNORECASE)
+# NOTE: `❯` lines are chrome (the composer) EXCEPT `❯ 1.` — a selected menu option is
+# part of the question being asked.
 # Evidence that work is NOT finished, whatever old checkmarks are on screen: running
 # shells, open/in-progress task counts, explicit continuation talk.
 _CONTINUATION_RE = re.compile(
@@ -144,9 +149,26 @@ def digest_of(text: str) -> str:
     return hashlib.sha256(norm.encode()).hexdigest()[:16]
 
 
-def excerpt_of(tail: str, limit: int = 300) -> str:
-    """`concise last meaningful line(s)` — chrome-free, bounded."""
-    return " ".join(_meaningful_lines(tail)[-3:])[-limit:]
+# Menu navigation footer — display furniture, never part of the question.
+_FOOTER_RE = re.compile(r"(enter to select|↑/↓|↑ ?↓|esc to cancel|tab to cycle)",
+                        re.IGNORECASE)
+
+
+def excerpt_of(tail: str, limit: int = 300, cls: str = "") -> str:
+    """`concise last meaningful line(s)` — chrome-free, bounded.
+
+    For a prompt, the excerpt must carry the QUESTION AND ITS OPTIONS, not the widget
+    footer: event 4100's summary was "4. Type something. 5. Chat about this Enter to
+    select…" — the two throwaway options and the navigation hint, everything except what
+    the owner was actually being asked."""
+    lines = [ln for ln in _meaningful_lines(tail) if not _FOOTER_RE.search(ln)]
+    if cls == "owner_prompt":
+        first_opt = next((i for i, ln in enumerate(lines)
+                          if re.match(r"^❯?\s*1\.\s+\S", ln)), None)
+        if first_opt is not None:
+            start = max(0, first_opt - 2)          # the question usually sits just above
+            return " ".join(lines[start:first_opt + 6])[:limit]
+    return " ".join(lines[-3:])[-limit:]
 
 
 def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool = True,
@@ -226,7 +248,9 @@ _EVENT_FOR = {
 
 def _conn(conn=None):
     conn, own = _c(conn)
-    conn.execute(_SCHEMA)
+    for stmt in _SCHEMA.strip().split(";"):
+        if stmt.strip():
+            conn.execute(stmt)
     return conn, own
 
 
@@ -319,8 +343,7 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                     continue
             etype, severity, oar = _EVENT_FOR[cls]
             project = project_for(a, conn=conn)
-            ex = excerpt_of(tail) if cls != "crashed" else (excerpt_of(tail) or
-                                                           "process gone from pane")
+            ex = excerpt_of(tail, cls=cls) or "process gone from pane"
             ev = emit_fn(
                 "agent_watch", etype, project_id=project, agent_id=target,
                 severity=severity, owner_action_required=oar,
@@ -379,16 +402,46 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             conn.close()
 
 
-def recent_alerts(limit: int = 30, conn=None) -> list:
-    """The agent-derived alert history, for the notifications surface."""
-    conn, own = _c(conn)
+def mark_invalid(event_id: int, *, reason: str, by: str = "owner", conn=None,
+                 now: Optional[float] = None) -> dict:
+    """Retire a proven-false alert from the DEFAULT view. The event row itself is never
+    touched — the audit trail keeps every mistake — this is a labelled overlay, exactly
+    like wake coalescing: retired, never deleted."""
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
     try:
-        rows = conn.execute(
-            "SELECT id, ts, type, project_id, agent_id, severity, action_taken "
-            "FROM event WHERE source='agent_watch' ORDER BY id DESC LIMIT ?",
-            (limit,)).fetchall()
-        return [{"event_id": r[0], "at": r[1], "type": r[2], "project": r[3],
-                 "agent": r[4], "severity": r[5], "summary": r[6]} for r in rows]
+        conn.execute("INSERT OR REPLACE INTO agent_alert_invalid "
+                     "(event_id, at, ts, by, reason) VALUES (?,?,?,?,?)",
+                     (int(event_id), now_iso(), now, by, reason[:200]))
+        conn.commit()
+        return {"ok": True, "event_id": int(event_id), "reason": reason[:200]}
+    finally:
+        if own:
+            conn.close()
+
+
+def recent_alerts(limit: int = 30, include_invalid: bool = False, conn=None) -> list:
+    """The agent-derived alert history, for the notifications surface. Alerts marked
+    invalid are omitted from the default view — a woken assistant reading notifications
+    must see current truth, not retired mistakes — and remain reachable with
+    include_invalid=True for audit."""
+    conn, own = _conn(conn)
+    try:
+        q = ("SELECT e.id, e.ts, e.type, e.project_id, e.agent_id, e.severity, "
+             "e.action_taken, i.reason FROM event e "
+             "LEFT JOIN agent_alert_invalid i ON i.event_id = e.id "
+             "WHERE e.source='agent_watch' ")
+        if not include_invalid:
+            q += "AND i.event_id IS NULL "
+        rows = conn.execute(q + "ORDER BY e.id DESC LIMIT ?", (limit,)).fetchall()
+        out = []
+        for r in rows:
+            item = {"event_id": r[0], "at": r[1], "type": r[2], "project": r[3],
+                    "agent": r[4], "severity": r[5], "summary": r[6]}
+            if r[7]:
+                item["invalid"] = r[7]
+            out.append(item)
+        return out
     finally:
         if own:
             conn.close()

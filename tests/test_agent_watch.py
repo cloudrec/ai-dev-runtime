@@ -353,8 +353,38 @@ def test_restart_does_not_replay_an_already_notified_prompt():
 def test_the_excerpt_is_chrome_free_and_bounded():
     ex = aw.excerpt_of(PROMPT_TAIL)
     assert len(ex) <= 300
-    for ch in "╭╮╰╯─│❯":
+    for ch in "╭╮╰╯─│":
         assert ch not in ex, ex
+
+
+def test_a_menu_excerpt_carries_the_question_and_options_not_the_footer():
+    """event 4100's summary was the widget footer. The excerpt must say what is being
+    asked: the question line and the real options."""
+    tail = CHEMMY_MENU_REST + "\n Enter to select · ↑/↓ to navigate · Esc to cancel"
+    ex = aw.excerpt_of(tail, cls="owner_prompt")
+    assert "Wait for their signal" in ex
+    assert "Stand down entirely" in ex
+    assert "What should I do next" in ex
+    assert "Enter to select" not in ex and "↑/↓" not in ex
+    assert len(ex) <= 300
+
+
+def test_invalid_marked_alerts_leave_the_default_view_but_stay_auditable():
+    """Historical false positives must not confuse a woken assistant reading
+    notifications; the audit path keeps them."""
+    emit = _Emit()
+    _scan([_agent(state="waiting_owner")], {"gaika-ext-audit:0.0": PROMPT_TAIL}, emit)
+    # a real event row to retire: write one through the CTO inbox
+    from core.control_plane.cto import emit as cto_emit
+    ev = cto_emit("agent_watch", "task_completed", project_id="mess",
+                  agent_id="x:0.0", severity="info", push=False,
+                  action_taken="false completion for the test")
+    eid = ev["event_id"]
+    assert any(a["event_id"] == eid for a in aw.recent_alerts())
+    aw.mark_invalid(eid, reason="proven false: agent was still working")
+    assert not any(a["event_id"] == eid for a in aw.recent_alerts())
+    hist = [a for a in aw.recent_alerts(include_invalid=True) if a["event_id"] == eid]
+    assert hist and hist[0]["invalid"].startswith("proven false")
 
 
 def test_the_project_comes_from_the_cwd_and_rides_on_the_event():
