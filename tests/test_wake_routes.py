@@ -320,3 +320,61 @@ def test_transient_failure_then_success_is_one_delivery_and_no_duplicate():
                        conversation=OWNER, route_key="owner-os", now=later + 10)
     wb.acknowledge(321)
     assert wb.pending_wake(now=later + 20)["pending"] is False
+
+
+# ── one agent, one pending ring (incident 2026-08-14: 17 stale copies) ─────
+def test_older_actionables_for_the_same_agent_are_superseded_by_the_newest():
+    wr.bind_route(wr.FALLBACK_ROUTE, OWNER)
+    for eid, t in ((401, 110_000.0), (402, 110_100.0), (403, 110_200.0)):
+        d = wb.should_wake(event_id=eid, severity="high",
+                           event_type="agent_waiting_input", project_id="",
+                           correlation_id="agentwatch:gv:0.0", now=t)
+        wb.record(d, event_id=eid, severity="high", event_type="agent_waiting_input",
+                  project_id="", correlation_id="agentwatch:gv:0.0", now=t)
+    p = wb.pending_wake(now=110_300.0)
+    assert p["pending"] and p["event_id"] == 403, "the NEWEST copy is the queue"
+    import sqlite3, os
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    retired = conn.execute(
+        "SELECT COUNT(*) FROM wake_audit WHERE event_id IN (401,402) "
+        "AND superseded_reason='superseded_by_newer_actionable_same_agent'").fetchone()[0]
+    audited = conn.execute(
+        "SELECT COUNT(*) FROM wake_coalesce_audit WHERE event_id IN (401,402)").fetchone()[0]
+    assert retired == 2 and audited == 2, "retired with provenance, never deleted"
+
+
+def test_a_stale_copy_cannot_head_of_line_block_a_fresh_event_of_another_agent():
+    """The 4400 shape: stale duplicates of agent A queued ahead of agent B's fresh event.
+    After supersede, B waits behind exactly ONE ring of A, not seventeen."""
+    wr.bind_route(wr.FALLBACK_ROUTE, OWNER)
+    for eid, t in ((411, 120_000.0), (412, 120_100.0), (413, 120_200.0)):
+        d = wb.should_wake(event_id=eid, severity="high",
+                           event_type="agent_waiting_input", project_id="",
+                           correlation_id="waiting:agentA:0.0", now=t)
+        wb.record(d, event_id=eid, severity="high", event_type="agent_waiting_input",
+                  project_id="", correlation_id="waiting:agentA:0.0", now=t)
+    d = wb.should_wake(event_id=414, severity="high", event_type="agent_waiting_input",
+                       project_id="", correlation_id="agentwatch:agentB:0.0",
+                       now=120_300.0)
+    wb.record(d, event_id=414, severity="high", event_type="agent_waiting_input",
+              project_id="", correlation_id="agentwatch:agentB:0.0", now=120_300.0)
+    p1 = wb.pending_wake(now=120_400.0)
+    assert p1["event_id"] == 413                       # A's newest, not A's oldest
+    wb.mark_submitted(413, source="test"); wb.acknowledge(413)
+    p2 = wb.pending_wake(now=120_500.0)
+    assert p2["event_id"] == 414                       # B is next, immediately
+
+
+def test_the_waiting_and_agentwatch_prefixes_group_as_one_agent():
+    wr.bind_route(wr.FALLBACK_ROUTE, OWNER)
+    for eid, corr, t in ((421, "waiting:same:0.0", 130_000.0),
+                         (422, "agentwatch:same:0.0", 130_100.0)):
+        d = wb.should_wake(event_id=eid, severity="high",
+                           event_type="agent_waiting_input", project_id="",
+                           correlation_id=corr, now=t)
+        wb.record(d, event_id=eid, severity="high", event_type="agent_waiting_input",
+                  project_id="", correlation_id=corr, now=t)
+    p = wb.pending_wake(now=130_200.0)
+    assert p["event_id"] == 422
+    wb.mark_submitted(422, source="test"); wb.acknowledge(422)
+    assert wb.pending_wake(now=130_300.0)["pending"] is False

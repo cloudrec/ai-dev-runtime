@@ -478,6 +478,57 @@ def _redecide_cooldown_skips(conn, now: float) -> list:
     return woken
 
 
+def _agent_key_of(correlation_id: str) -> str:
+    """The stable agent identity inside a correlation id. Both emitters tag their events
+    with the pane target — `waiting:<target>` and `agentwatch:<target>` — so the target
+    is the semantic identity; an unrecognized correlation is its own key, and an empty
+    one is no key at all (never grouped)."""
+    c = (correlation_id or "").strip()
+    for prefix in ("waiting:", "agentwatch:"):
+        if c.startswith(prefix):
+            return c[len(prefix):]
+    return c
+
+
+def _supersede_stale_actionables(conn, now: float) -> list:
+    """One agent, one pending doorbell ring. An actionable wake means "this agent is
+    waiting NOW"; a newer wake for the same agent describes the same or a newer now, so
+    every older unserved copy is obsolete the moment it exists — and during the
+    2026-08-14 incident seventeen such copies queued ahead of fresh events, each
+    consuming a claim slot in turn. Older copies are RETIRED with the same audited
+    supersede mechanics as generic coalescing: pointer kept, provenance row written,
+    nothing deleted."""
+    rows = conn.execute(
+        "SELECT a.id, a.event_id, a.correlation_id FROM wake_audit a "
+        "WHERE a.decision='wake' AND a.acknowledged=0 AND a.superseded_by IS NULL "
+        "AND COALESCE(a.actionable,0)=1 AND NOT EXISTS "
+        "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
+        "ORDER BY a.event_id ASC").fetchall()
+    groups: dict = {}
+    for aid, eid, corr in rows:
+        key = _agent_key_of(corr)
+        if key:
+            groups.setdefault(key, []).append((aid, eid))
+    superseded = []
+    reason = "superseded_by_newer_actionable_same_agent"
+    for key, members in groups.items():
+        if len(members) < 2:
+            continue
+        keep_aid, keep_eid = members[-1]
+        for aid, eid in members[:-1]:
+            conn.execute("UPDATE wake_audit SET superseded_by=?, superseded_at=?, "
+                         "superseded_reason=? WHERE id=?",
+                         (keep_aid, now_iso(), reason, int(aid)))
+            conn.execute(
+                "INSERT INTO wake_coalesce_audit (ts,at,wake_audit_id,event_id,"
+                "superseded_by_audit_id,superseded_by_event_id,reason) VALUES (?,?,?,?,?,?,?)",
+                (now, now_iso(), int(aid), int(eid), keep_aid, keep_eid, reason))
+            superseded.append(int(eid))
+    if superseded:
+        conn.commit()
+    return superseded
+
+
 def pending_wake(conn=None, now: Optional[float] = None) -> dict:
     """The oldest decided-but-unacknowledged wake, with the target resolved for ITS route.
 
@@ -498,6 +549,9 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         conn.execute(_SUBMIT_SCHEMA)
         # Cooldown refusals get a second hearing once the floor has cleared.
         _redecide_cooldown_skips(conn, now if now is not None else now_ts())
+        # One agent, one pending ring: older unserved actionables for the same agent are
+        # retired so a stale copy can never head-of-line block a fresh event.
+        _supersede_stale_actionables(conn, now if now is not None else now_ts())
         # Fold the generic backlog down to its newest member PER ROUTE first: N generic
         # wakes for one chat are one instruction, but wakes for different chats are not
         # copies of each other and are never folded across routes.
