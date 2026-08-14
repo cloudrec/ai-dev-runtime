@@ -42,14 +42,37 @@ from core.control_plane.store import now_iso, now_ts
 REMINDER_SECS = int(os.getenv("AGENT_WATCH_REMINDER_SECS", "3600"))
 
 
-def excluded_targets() -> set:
-    """Explicitly configured targets the watcher must not observe — narrow and
-    auditable, meant for the watcher's own maintenance pane: an agent that edits and
-    restarts the watcher rests between tool calls with finish vocabulary on screen
-    (event 4096), and no text classifier can tell that apart from a real finish. Read
-    at CALL time so a unit drop-in change takes effect on restart without a code edit."""
-    return {t.strip() for t in os.getenv("AGENT_WATCH_EXCLUDE_TARGETS", "").split(",")
-            if t.strip()}
+# Maintenance suppression is TEMPORARY by construction. The v4 static env exclusion
+# fixed self-observation (event 4096) and then hid a REAL owner prompt on the same pane
+# the moment maintenance ended — a permanent blind spot. A suppression row carries an
+# expiry; once it lapses, the pane is a normal agent again and its next prompt alerts.
+def suppress(target: str, *, ttl_secs: int, reason: str, by: str = "owner", conn=None,
+             now: Optional[float] = None) -> dict:
+    """Suppress one target for a bounded time. Audited, idempotent, self-expiring."""
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        until = now + max(0, int(ttl_secs))
+        conn.execute("INSERT OR REPLACE INTO agent_watch_suppress "
+                     "(target, until_ts, at, by, reason) VALUES (?,?,?,?,?)",
+                     ((target or "").strip(), until, now_iso(), by, reason[:200]))
+        conn.commit()
+        return {"ok": True, "target": target, "until_ts": until}
+    finally:
+        if own:
+            conn.close()
+
+
+def is_suppressed(target: str, conn=None, now: Optional[float] = None) -> bool:
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        r = conn.execute("SELECT until_ts FROM agent_watch_suppress WHERE target=?",
+                         ((target or "").strip(),)).fetchone()
+        return bool(r) and float(r[0] or 0) > now
+    finally:
+        if own:
+            conn.close()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_watch_state (
@@ -60,6 +83,9 @@ CREATE TABLE IF NOT EXISTS agent_watch_state (
 );
 CREATE TABLE IF NOT EXISTS agent_alert_invalid (
     event_id INTEGER PRIMARY KEY, at TEXT, ts REAL, by TEXT, reason TEXT
+);
+CREATE TABLE IF NOT EXISTS agent_watch_suppress (
+    target TEXT PRIMARY KEY, until_ts REAL, at TEXT, by TEXT, reason TEXT
 )
 """
 
@@ -280,13 +306,12 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
     conn, own = _conn(conn)
     try:
         emitted, skipped = [], []
-        excluded = excluded_targets()
         for a in agents:
             target = a.get("target") or ""
             if not target:
                 continue
-            if target in excluded:
-                skipped.append({"target": target, "why": "excluded_target"})
+            if is_suppressed(target, conn=conn, now=now):
+                skipped.append({"target": target, "why": "suppressed_maintenance"})
                 continue
             tail = ""
             try:
@@ -368,7 +393,7 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
         present = {a.get("target") for a in agents}
         for target, prev_cls, n_cls in conn.execute(
                 "SELECT target, cls, notified_cls FROM agent_watch_state").fetchall():
-            if target in present or target in excluded \
+            if target in present or is_suppressed(target, conn=conn, now=now) \
                     or prev_cls in ("crashed", "idle", "completed"):
                 continue
             if n_cls == "crashed":

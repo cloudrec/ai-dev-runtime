@@ -257,30 +257,52 @@ MAINTENANCE_REST = ("All tests passed. Commit c07f42e done. Delivery proof compl
                     "3 shells running in background for verification.")
 
 
-def test_an_excluded_target_never_emits(monkeypatch):
-    """The watcher-maintenance pane (event 4096): explicitly excluded, narrow and
-    auditable — never observed, whatever its screen says."""
-    monkeypatch.setenv("AGENT_WATCH_EXCLUDE_TARGETS", "fable-wake-fix:0.0")
+def test_a_suppressed_maintenance_pane_never_emits_while_the_guard_is_active():
+    """The watcher-maintenance pane (event 4096): suppressed with an EXPIRY, never a
+    permanent blind spot — not observed, and not a crash when it vanishes."""
     emit = _Emit()
     t = "fable-wake-fix:0.0"
+    aw.suppress(t, ttl_secs=600, reason="watcher maintenance session", now=1000.0)
     _scan([_agent(t, "/root/ai-dev-runtime", state="working")], {t: WORKING_TAIL}, emit)
     r = _scan([_agent(t, "/root/ai-dev-runtime", state="waiting_owner")],
               {t: PROMPT_TAIL}, emit, now=1100.0)
     assert r["emitted"] == [] and emit.calls == []
-    assert any(s["why"] == "excluded_target" for s in r["skipped"])
-    # nor does its disappearance count as a crash
+    assert any(s["why"] == "suppressed_maintenance" for s in r["skipped"])
     r2 = _scan([], {}, emit, now=1200.0)
     assert r2["emitted"] == [] and emit.calls == []
 
 
-def test_exclusion_is_per_target_not_per_directory(monkeypatch):
-    """Another agent in the same repo stays fully observable."""
-    monkeypatch.setenv("AGENT_WATCH_EXCLUDE_TARGETS", "fable-wake-fix:0.0")
+def test_the_same_target_alerts_exactly_once_after_the_guard_expires():
+    """v4's regression, inverted: maintenance ends, the pane later presents a REAL owner
+    prompt — it must alert, exactly once, and a restart must not duplicate it."""
     emit = _Emit()
+    t = "fable-wake-fix:0.0"
+    aw.suppress(t, ttl_secs=600, reason="watcher maintenance session", now=1000.0)
+    r0 = _scan([_agent(t, "/root/ai-dev-runtime", state="waiting_owner")],
+               {t: PROMPT_TAIL}, emit, now=1100.0)
+    assert r0["emitted"] == []                              # guard active
+    r1 = _scan([_agent(t, "/root/ai-dev-runtime", state="waiting_owner")],
+               {t: PROMPT_TAIL}, emit, now=1700.0)          # guard expired
+    assert [e["class"] for e in r1["emitted"]] == ["owner_prompt"]
+    assert len(emit.calls) == 1
+    emit2 = _Emit()                                         # companion restarted
+    r2 = _scan([_agent(t, "/root/ai-dev-runtime", state="waiting_owner")],
+               {t: PROMPT_TAIL}, emit2, now=1800.0)
+    assert r2["emitted"] == [] and emit2.calls == []
+
+
+def test_suppression_is_per_target_not_per_directory():
+    """Another agent in the same repo stays fully observable."""
+    emit = _Emit()
+    aw.suppress("fable-wake-fix:0.0", ttl_secs=600, reason="maintenance", now=1000.0)
     t = "runtime-helper:0.0"
     r = _scan([_agent(t, "/root/ai-dev-runtime", state="waiting_owner")],
               {t: PROMPT_TAIL}, emit)
     assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
+
+
+def test_the_reminder_cadence_default_is_one_hour():
+    assert aw.REMINDER_SECS == 3600
 
 
 def test_finish_words_with_background_activity_still_do_not_complete():
