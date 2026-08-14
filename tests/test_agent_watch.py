@@ -144,6 +144,23 @@ def test_open_and_in_progress_tasks_suppress_completion():
     assert r["emitted"] == [] and emit.calls == []
 
 
+JOBHUNTER_TODO_REST = ("to merge/deploy on your end. Decide honest payout stance + "
+                       "finish worker UX… ⎿  ◼ Decide honest … ◻ Audit + verify… "
+                       "◻ Full QA sweep … ◻ Merge, deploy … ◻ Write final re… "
+                       "… +1 completed")
+
+
+def test_open_todo_checkboxes_suppress_completion():
+    """jobhunter, live again (event 4086): the CLI todo widget at rest with unchecked
+    boxes is open work, not a finish."""
+    emit = _Emit()
+    t = "jh:0.0"
+    _scan([_agent(t, "/opt/jobhunter-ai", state="working")], {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, "/opt/jobhunter-ai", state="idle")],
+              {t: JOBHUNTER_TODO_REST}, emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+
+
 def test_a_suppressed_completion_still_fires_when_the_work_actually_finishes():
     emit = _Emit()
     t = "gaika-video:0.0"

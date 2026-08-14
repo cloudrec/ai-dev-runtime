@@ -91,7 +91,10 @@ _UI_LINE_RE = re.compile(
 _CONTINUATION_RE = re.compile(
     r"(still running|shells? (?:are )?running|background (?:shell|task|process)"
     r"|in progress|\bopen\b|todo|continu(?:e|ing)|next step|остал(?:ось|ись)"
-    r"|продолж|в процессе)", re.IGNORECASE)
+    r"|продолж|в процессе"
+    # An unchecked box in the CLI's todo widget is an open task by definition — the
+    # jobhunter false completion (event 4086) showed exactly this shape at rest.
+    r"|[◻☐]|\[ \])", re.IGNORECASE)
 # Inventory states that mean ACTIVE — text may never override these into waiting/done.
 _ACTIVE_STATES = frozenset({"working", "shell_running"})
 # Inventory states in which a decision menu is credible.
