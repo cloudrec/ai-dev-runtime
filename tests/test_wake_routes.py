@@ -226,3 +226,51 @@ def test_one_event_wakes_at_most_one_conversation():
     wr.bind_route("mess", "https://chatgpt.com/c/mess-rotated")
     again = wb.pending_wake()
     assert again["pending"] is False, "a submitted event is never offered to any chat again"
+
+
+# ── cooldown refusals get a second hearing (live event 4187) ───────────────
+def test_a_cooldown_skipped_actionable_wakes_once_the_floor_clears():
+    """An actionable event that arrived 11s behind another actionable send was skipped
+    and had no path back until the hourly reminder. pending_wake re-decides it."""
+    wr.bind_route(wr.FALLBACK_ROUTE, OWNER)
+    _decide(201, "", now=50_000.0)                          # consumes the actionable floor
+    wb.mark_submitted(201, source="test"); wb.acknowledge(201)
+    d = wb.should_wake(event_id=202, severity="high", event_type="agent_waiting_input",
+                       project_id="", now=50_010.0)          # 10s later: floor active
+    assert d["reason"] == "actionable_cooldown_active"
+    wb.record(d, event_id=202, severity="high", event_type="agent_waiting_input",
+              project_id="", now=50_010.0)
+    assert wb.pending_wake(now=50_020.0)["pending"] is False  # floor still running
+    p = wb.pending_wake(now=50_120.0)                         # floor cleared
+    assert p["pending"] is True and p["event_id"] == 202
+    assert p["conversation"] == OWNER
+
+
+def test_redeciding_a_running_cooldown_mints_no_audit_spam():
+    wr.bind_route(wr.FALLBACK_ROUTE, OWNER)
+    _decide(211, "", now=60_000.0)
+    wb.mark_submitted(211, source="test"); wb.acknowledge(211)
+    d = wb.should_wake(event_id=212, severity="high", event_type="agent_waiting_input",
+                       project_id="", now=60_010.0)
+    wb.record(d, event_id=212, severity="high", event_type="agent_waiting_input",
+              project_id="", now=60_010.0)
+    import sqlite3, os
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    before = conn.execute("SELECT COUNT(*) FROM wake_audit WHERE event_id=212").fetchone()[0]
+    for t in (60_020.0, 60_030.0, 60_040.0):                 # floor still active
+        wb.pending_wake(now=t)
+    after = conn.execute("SELECT COUNT(*) FROM wake_audit WHERE event_id=212").fetchone()[0]
+    assert after == before, "a floor still running must not mint audit rows per poll"
+
+
+def test_a_submitted_event_is_never_redecided():
+    wr.bind_route(wr.FALLBACK_ROUTE, OWNER)
+    _decide(221, "", now=70_000.0)
+    wb.mark_submitted(221, source="test"); wb.acknowledge(221)
+    d = wb.should_wake(event_id=222, severity="high", event_type="agent_waiting_input",
+                       project_id="", now=70_010.0)
+    wb.record(d, event_id=222, severity="high", event_type="agent_waiting_input",
+              project_id="", now=70_010.0)
+    wb.mark_submitted(222, source="out-of-band")              # someone already sent it
+    p = wb.pending_wake(now=70_200.0)
+    assert p["pending"] is False

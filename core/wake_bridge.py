@@ -438,6 +438,41 @@ def bind_history(limit: int = 20, conn=None) -> list:
             conn.close()
 
 
+def _redecide_cooldown_skips(conn, now: float) -> list:
+    """A decision refused ONLY for a cooldown is not a verdict, it is bad timing.
+
+    Event 4187 (a live agent prompt) landed 11 seconds after another actionable send,
+    was skipped `actionable_cooldown_active`, and then had no path back: selection serves
+    only decision='wake' rows, so the event stayed silent until the hourly reminder.
+    Here, cooldown skips are re-decided once their event is still unserved; a re-decision
+    is RECORDED only when it changes the answer (a wake, or a different refusal), so a
+    floor still running does not mint an audit row per poll.
+    """
+    rows = conn.execute(
+        "SELECT a.event_id, a.severity, a.event_type, COALESCE(a.project_id,''), "
+        "a.correlation_id FROM wake_audit a WHERE a.id IN ("
+        "  SELECT MAX(id) FROM wake_audit WHERE decision='skip' "
+        "  AND reason IN ('cooldown_active','actionable_cooldown_active') "
+        "  AND ts > ? GROUP BY event_id) "
+        "AND NOT EXISTS (SELECT 1 FROM wake_audit w WHERE w.event_id=a.event_id "
+        "               AND w.decision='wake') "
+        "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id)",
+        (now - 86400,)).fetchall()
+    woken = []
+    for event_id, severity, etype, project, corr in rows:
+        d = should_wake(event_id=int(event_id), severity=severity or "",
+                        event_type=etype or "", correlation_id=corr or "",
+                        project_id=project, conn=conn, now=now)
+        if d.get("wake") or d.get("reason") not in (
+                "cooldown_active", "actionable_cooldown_active"):
+            record(d, event_id=int(event_id), severity=severity or "",
+                   event_type=etype or "", correlation_id=corr or "",
+                   project_id=project, conn=conn, now=now)
+            if d.get("wake"):
+                woken.append(int(event_id))
+    return woken
+
+
 def pending_wake(conn=None, now: Optional[float] = None) -> dict:
     """The oldest decided-but-unacknowledged wake, with the target resolved for ITS route.
 
@@ -456,6 +491,8 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         # proof", not "it definitely did not arrive" — and only the latter would justify
         # sending a second copy into the owner's chat.
         conn.execute(_SUBMIT_SCHEMA)
+        # Cooldown refusals get a second hearing once the floor has cleared.
+        _redecide_cooldown_skips(conn, now if now is not None else now_ts())
         # Fold the generic backlog down to its newest member PER ROUTE first: N generic
         # wakes for one chat are one instruction, but wakes for different chats are not
         # copies of each other and are never folded across routes.
