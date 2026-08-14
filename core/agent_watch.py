@@ -133,7 +133,7 @@ _WS = re.compile(r"\s+")
 _UI_LINE_RE = re.compile(
     r"^\s*(?:[─│╭╮╰╯═┌┐└┘┤├╌┄┈]+.*|❯(?!\s*\d+\.).*|\?\s+for shortcuts.*|⏵⏵.*|\[caveman\].*"
     r"|.*shift\+tab to cycle.*|.*new task\?\s*/clear.*|.*esc to interrupt.*"
-    r"|[✻✽✶✳*]\s*\S+…\s*$|✻.*|✽.*|·.*"
+    r"|[✻✽✶✳✢✣✤✥✦✧✨*]\s*\S+…\s*$|✻.*|✽.*|·.*"
     # the running-subagent widget rows and their token/duration counters (event 4255's
     # entire "summary" was three of these)
     r"|[◯●◉]\s.*|↓?\s*\d+(?:\.\d+)?k\b.*)\s*$", re.IGNORECASE)
@@ -153,7 +153,13 @@ _CONTINUATION_RE = re.compile(
     r"|[◯◉]\s|↓\s*\d+(?:\.\d+)?k|\b\d+m\s+\d+s\b"
     # "running" in any rendering — including the column-mangled "runn ing" that event
     # 4300 wore — is a progress fragment, never a finish.
-    r"|\brunning\b|\brunn\s+ing\b)", re.IGNORECASE)
+    r"|\brunning\b|\brunn\s+ing\b"
+    # Conditional future intent is a QUESTION wearing a period (event 4485: "I'll
+    # proceed. Otherwise the ... is complete." awaits the owner's objection), and an
+    # interrupted shell notice (event 4456: '... was stopped') is an incident, not an
+    # ending.
+    r"|\bi'?ll (?:proceed|continue)\b|\bi will (?:proceed|continue)\b|\botherwise\b"
+    r"|\bif you\b|\bunless\b|\bwas stopped\b)", re.IGNORECASE)
 # Inventory states that mean ACTIVE — text may never override these into waiting/done.
 _ACTIVE_STATES = frozenset({"working", "shell_running"})
 # Inventory states in which a decision menu is credible.
@@ -241,8 +247,10 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
     # very bottom of the raw pane is execution in flight (event 4281 completed on one).
     # Only the last three raw lines count: a stale spinner higher up must not suppress a
     # genuine prompt menu sitting at the bottom (the 4187 shape).
+    # The CLI's spinner cycles through a family of star glyphs; event 4456 wore
+    # `✢ Transfiguring…`, one member the earlier class missed.
     raw_bottom = [ln for ln in (tail or "").splitlines() if ln.strip()][-3:]
-    if any(re.search(r"[✻✽✶✳]\s*\S+…", ln) for ln in raw_bottom):
+    if any(re.search(r"[✻✽✶✳✢✣✤✥✦✧✨]\s*\S+…", ln) for ln in raw_bottom):
         return {"cls": "working", "reason": "active_spinner_at_bottom"}
     # waiting_owner ALWAYS outranks completion: the inventory says a human is being
     # asked, and event 4088 proved a choice menu can follow substantive work and read

@@ -419,6 +419,33 @@ def test_finish_evidence_must_be_in_the_final_lines_not_the_scrollback():
     assert [e["class"] for e in r2["emitted"]] == ["completed"]
 
 
+GAIKA_TRANSFIGURING_REST = 'закончится. complete" was stopped\n✢ Transfiguring…'
+PAYORCH_CONDITIONAL_REST = "I'll proceed. Otherwise the non-gated remediation is complete."
+
+
+def test_every_spinner_glyph_family_member_means_working():
+    """gaika-video, live (event 4456): the spinner wore ✢, one glyph outside the earlier
+    class, next to a QUOTED 'complete' and a stopped-shell notice. Working, not done."""
+    emit = _Emit()
+    t = "gaika-video:0.0"
+    _scan([_agent(t, "/opt/gaika-video", state="working")], {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, "/opt/gaika-video", state="idle")],
+              {t: GAIKA_TRANSFIGURING_REST}, emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+
+
+def test_conditional_future_intent_is_not_a_completion():
+    """payorch, live (event 4485): "I'll proceed. Otherwise ... is complete." awaits the
+    owner's objection — a question wearing a period."""
+    emit = _Emit()
+    t = "payorch-live-buttons:0.0"
+    _scan([_agent(t, "/opt/payment-orchestrator", state="working")],
+          {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, "/opt/payment-orchestrator", state="idle")],
+              {t: PAYORCH_CONDITIONAL_REST}, emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+
+
 def test_genuinely_working_never_alerts():
     emit = _Emit()
     for now in (1000.0, 1020.0, 1040.0):
