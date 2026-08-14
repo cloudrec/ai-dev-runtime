@@ -122,9 +122,12 @@ _WS = re.compile(r"\s+")
 # tmux/Claude-CLI chrome: box borders, status bars, input-box furniture, hints. These are
 # DISPLAY, not agent output — they must appear in no digest, no excerpt, no evidence.
 _UI_LINE_RE = re.compile(
-    r"^\s*(?:[─│╭╮╰╯═┌┐└┘┤├]+.*|❯(?!\s*\d+\.).*|\?\s+for shortcuts.*|⏵⏵.*|\[caveman\].*"
+    r"^\s*(?:[─│╭╮╰╯═┌┐└┘┤├╌┄┈]+.*|❯(?!\s*\d+\.).*|\?\s+for shortcuts.*|⏵⏵.*|\[caveman\].*"
     r"|.*shift\+tab to cycle.*|.*new task\?\s*/clear.*|.*esc to interrupt.*"
-    r"|✻.*|✽.*|·.*)\s*$", re.IGNORECASE)
+    r"|[✻✽✶✳*]\s*\S+…\s*$|✻.*|✽.*|·.*"
+    # the running-subagent widget rows and their token/duration counters (event 4255's
+    # entire "summary" was three of these)
+    r"|[◯●◉]\s.*|↓?\s*\d+(?:\.\d+)?k\b.*)\s*$", re.IGNORECASE)
 # NOTE: `❯` lines are chrome (the composer) EXCEPT `❯ 1.` — a selected menu option is
 # part of the question being asked.
 # Evidence that work is NOT finished, whatever old checkmarks are on screen: running
@@ -135,7 +138,10 @@ _CONTINUATION_RE = re.compile(
     r"|продолж|в процессе"
     # An unchecked box in the CLI's todo widget is an open task by definition — the
     # jobhunter false completion (event 4086) showed exactly this shape at rest.
-    r"|[◻☐]|\[ \])", re.IGNORECASE)
+    r"|[◻☐]|\[ \]"
+    # Running-subagent widget rows and live token counters (events 4255/4281): visible
+    # subagents ARE work in flight, whatever the parent pane's state metadata says.
+    r"|[◯◉]\s|↓\s*\d+(?:\.\d+)?k|\b\d+m\s+\d+s\b)", re.IGNORECASE)
 # Inventory states that mean ACTIVE — text may never override these into waiting/done.
 _ACTIVE_STATES = frozenset({"working", "shell_running"})
 # Inventory states in which a decision menu is credible.
@@ -219,6 +225,13 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
     if _WORKING_RE.search(_WS.sub(" ", tail[-400:] if tail else "")):
         # The live interrupt affordance sits in the chrome we strip; check it raw.
         return {"cls": "working", "reason": "active_execution_evidence"}
+    # An ACTIVE spinner — "✶ Dilly-dallying…", a verb with a trailing ellipsis — at the
+    # very bottom of the raw pane is execution in flight (event 4281 completed on one).
+    # Only the last three raw lines count: a stale spinner higher up must not suppress a
+    # genuine prompt menu sitting at the bottom (the 4187 shape).
+    raw_bottom = [ln for ln in (tail or "").splitlines() if ln.strip()][-3:]
+    if any(re.search(r"[✻✽✶✳]\s*\S+…", ln) for ln in raw_bottom):
+        return {"cls": "working", "reason": "active_spinner_at_bottom"}
     # waiting_owner ALWAYS outranks completion: the inventory says a human is being
     # asked, and event 4088 proved a choice menu can follow substantive work and read
     # like a finish. A menu in any at-rest state is likewise a question, not an ending.

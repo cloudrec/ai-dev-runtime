@@ -316,6 +316,63 @@ def test_finish_words_with_background_activity_still_do_not_complete():
     assert r["emitted"] == [] and emit.calls == []
 
 
+CHEMMY_SUBAGENT_REST = """Audit dispatched to three reviewers.
+◯ general-purpose 2m 30s · ↓ 122.9k
+◯ general-purpose t2m 21s · ↓ 97.4k
+◯ general-purpose  2m 14s · ↓ 97.2k"""
+
+PAYORCH_SPINNER_REST = "Report saved to INTEGRITY_AUDIT_2026-08-13.md\n✶ Dilly-dallying…"
+
+GAIKA_BOX_PROMPT = ("Latest blocked action: Blocked by classifier\n"
+                    + "╌" * 120 + "\n"
+                    "Do you want to proceed?\n ❯ 1. Yes\n   2. Yes, and don't ask again\n"
+                    "   3. No")
+
+
+def test_running_subagent_widget_rows_suppress_completion():
+    """chemmy, live (event 4255): three running subagents ARE work in flight — and their
+    widget rows are chrome, never a summary."""
+    emit = _Emit()
+    t = "chemmy-fast:0.0"
+    _scan([_agent(t, "/opt/mess", state="working")], {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, "/opt/mess", state="idle")], {t: CHEMMY_SUBAGENT_REST},
+              emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+    assert "◯" not in aw.excerpt_of(CHEMMY_SUBAGENT_REST)
+
+
+def test_an_active_spinner_at_the_bottom_suppresses_completion():
+    """payorch, live (event 4281): '✶ Dilly-dallying…' is execution in flight, even when
+    a finish-sounding report line sits just above it."""
+    emit = _Emit()
+    t = "payorch-live-buttons:0.0"
+    _scan([_agent(t, "/opt/payment-orchestrator", state="working")],
+          {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, "/opt/payment-orchestrator", state="idle")],
+              {t: PAYORCH_SPINNER_REST}, emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+
+
+def test_a_stale_spinner_above_a_menu_does_not_suppress_the_prompt():
+    """The 4187 shape: an old spinner remnant higher in the pane, a live menu at the
+    bottom. The prompt must still alert."""
+    tail = "✶ Frolicking…\nsome earlier output line\n" + CHEMMY_MENU_REST
+    emit = _Emit()
+    r = _scan([_agent(state="waiting_owner")], {"gaika-ext-audit:0.0": tail}, emit)
+    assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
+
+
+def test_dashed_box_lines_never_reach_a_prompt_summary():
+    """gaika-video, live (event 4279): the summary was a wall of ╌. The question and
+    options must survive; the ruler must not."""
+    emit = _Emit()
+    r = _scan([_agent("gaika-video:0.0", "/opt/gaika-video", state="waiting_owner")],
+              {"gaika-video:0.0": GAIKA_BOX_PROMPT}, emit)
+    assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
+    ex = emit.calls[0]["payload"]["excerpt"]
+    assert "Do you want to proceed" in ex and "╌" not in ex
+
+
 def test_genuinely_working_never_alerts():
     emit = _Emit()
     for now in (1000.0, 1020.0, 1040.0):
