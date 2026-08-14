@@ -178,9 +178,10 @@ def test_the_backup_holds_only_the_pointer_tables():
     _run(NEW)
     path = rc.backup_pointer()
     body = open(path, encoding="utf-8").read()
+    pointer_tables = ("wake_target", "wake_bind_audit", "wake_route", "wake_route_audit")
     for line in body.splitlines():
         if line.startswith(("CREATE TABLE", "INSERT INTO")):
-            assert "wake_target" in line or "wake_bind_audit" in line
+            assert any(t in line for t in pointer_tables), line
 
 
 def test_no_backup_flag_skips_the_dump(tmp_path):

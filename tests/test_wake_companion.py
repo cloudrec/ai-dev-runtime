@@ -43,9 +43,11 @@ def composer(monkeypatch):
     mod = types.ModuleType("cdp_composer")
     mod.result = {"ok": True, "reason": "submitted_and_user_turn_appeared"}
 
-    def submit_phrase(conversation, phrase, *, source, event_id, actionable=False):
+    def submit_phrase(conversation, phrase, *, source, event_id, actionable=False,
+                      route_key=""):
         calls.append({"conversation": conversation, "phrase": phrase,
-                      "source": source, "event_id": event_id, "actionable": actionable})
+                      "source": source, "event_id": event_id, "actionable": actionable,
+                      "route_key": route_key})
         return mod.result
 
     mod.submit_phrase = submit_phrase
@@ -54,9 +56,9 @@ def composer(monkeypatch):
     return mod
 
 
-def _pending(event_id, conversation, actionable=False):
+def _pending(event_id, conversation, actionable=False, route_key="owner-os"):
     return {"pending": True, "event_id": event_id, "conversation": conversation,
-            "phrase": "PHRASE", "actionable": actionable}
+            "phrase": "PHRASE", "actionable": actionable, "route_key": route_key}
 
 
 def test_nothing_pending_means_nothing_submitted(composer):
@@ -107,6 +109,13 @@ def test_the_actionable_class_is_carried_through_to_the_claim(composer):
     b = _Bridge([_pending(5, "https://chatgpt.com/c/a", actionable=True)])
     wc.tick(b)
     assert composer.calls[0]["actionable"] is True
+
+
+def test_the_route_key_is_carried_through_to_the_delivery_ledger(composer):
+    b = _Bridge([_pending(6, "https://chatgpt.com/c/mess-work", route_key="mess")])
+    r = wc.tick(b)
+    assert composer.calls[0]["route_key"] == "mess"
+    assert r["route_key"] == "mess"
 
 
 def test_there_is_no_keyboard_fallback_path():

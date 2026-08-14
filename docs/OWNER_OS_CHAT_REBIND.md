@@ -1,15 +1,31 @@
 # Owner OS — rebinding the wake bridge to a new ChatGPT chat
 
-**New chat? Run one command:**
+**New OWNER-OS control chat? Run one command:**
 
 ```bash
 cd /root/ai-dev-runtime
 tools/rebind_chat.py https://chatgpt.com/c/<conversation-id>
 ```
 
-It prints `PASS` when the bridge is verified to be bound to that conversation, `FAIL` and
-exit code 1 otherwise. Nothing else needs to change — no service edit, no `.env` edit, no
-restart, and above all no hunt for a hardcoded URL.
+**Binding a PROJECT's work chat (multi-chat routing)? One command, one route:**
+
+```bash
+tools/rebind_chat.py https://chatgpt.com/c/<conversation-id> --route <project-id>
+# e.g. --route mess          (MESS / Chemmy)
+#      --route gaika-drop    (GAIKA Basket / extension)
+#      --route gaika-video   (GAIKA video/media)
+#      --route payment-orchestrator
+tools/rebind_chat.py --routes    # show the whole registry
+```
+
+The route key is the event's `project_id` exactly as it appears in the event log. An event
+whose project has an explicit route wakes THAT conversation; an event whose project has no
+route wakes the owner-os control chat, recorded with reason `unmapped_route:<key>` — never
+silently, and never some other project's chat. Nothing bound at all means nothing is sent.
+
+It prints `PASS` when the binding is verified by a fresh resolve, `FAIL` and exit code 1
+otherwise. Nothing else needs to change — no service edit, no `.env` edit, no restart, and
+above all no hunt for a hardcoded URL.
 
 This document exists because that hunt kept happening. A chat fills up, the owner opens a
 new one, and the next session starts by grepping the server for the old link. There is
@@ -21,10 +37,11 @@ nothing to grep. Read on only if you need to know why.
 
 | | |
 |---|---|
-| **Where the target lives** | `control_plane.db` → table `wake_target`, row `id = 1`, column `conversation` |
-| **Who may write it** | `core/wake_bridge.py` → `bind_chat()` — nothing else |
-| **Who reads it** | `core/wake_bridge.py` → `active_chat()`, called from `should_wake()` and `pending_wake()` |
-| **Audit of every move** | table `wake_bind_audit` (new URL, previous URL, who, when, note) |
+| **Where routes live** | `control_plane.db` → table `wake_route`, one row per route key (project id); the owner-os control chat is route key `owner-os` |
+| **Who may write them** | `core/wake_routes.py` → `bind_route()` (projects) and `core/wake_bridge.py` → `bind_chat()` (owner-os; also keeps the legacy `wake_target` row in lockstep) — nothing else |
+| **Who reads them** | `core/wake_routes.py` → `resolve()`, called per event from `should_wake()` and `pending_wake()` |
+| **Audit of every move** | tables `wake_route_audit` and `wake_bind_audit` (new URL, previous URL, who, when, note) |
+| **Legacy `wake_target` row** | migration bridge only — read when the registry has no owner-os route; never universal routing |
 
 There is exactly one row and exactly one writer. `active_chat()` is called **on every wake
 decision and every companion tick** — the pointer is never cached in code, never baked into

@@ -42,10 +42,11 @@ from datetime import datetime, timezone
 sys.path.insert(0, "/root/ai-dev-runtime")
 
 from core import wake_bridge as wb  # noqa: E402
+from core import wake_routes  # noqa: E402
 from core.control_plane.store import db_path  # noqa: E402
 
-# The pointer and its audit trail. Deliberately NOT the whole database.
-_BACKUP_TABLES = ("wake_target", "wake_bind_audit")
+# The pointers and their audit trails. Deliberately NOT the whole database.
+_BACKUP_TABLES = ("wake_target", "wake_bind_audit", "wake_route", "wake_route_audit")
 _BACKUP_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            ".ai-runtime-backups", "wake_target")
 
@@ -134,11 +135,57 @@ def rebind(url: str, *, by: str = "owner", note: str = "", dry_run: bool = False
     return 0
 
 
+def rebind_route(key: str, url: str, *, by: str = "owner", note: str = "",
+                 dry_run: bool = False, do_backup: bool = True, out=None) -> int:
+    """Bind one PROJECT route. Same shape as `rebind`: validate, show, backup, write via
+    the canonical API, verify by a fresh resolve. Exit 0 only on that evidence."""
+    def say(msg: str = "") -> None:
+        print(msg, file=out or sys.stdout)
+
+    k = wake_routes.normalize_key(key)
+    if not k:
+        say(f"FAIL: not a route key: {key[:64]!r} (expected e.g. mess, payment-orchestrator)")
+        return 1
+    url = (url or "").strip()
+    if not wake_routes.valid_conversation(url):
+        say(f"FAIL: not a conversation URL: {url[:120]}")
+        say("       expected: https://chatgpt.com/c/<id>")
+        return 1
+    cur = wake_routes.get_route(k)
+    say(f"route         : {k}")
+    say(f"current target: {cur['conversation'] if cur else '(none)'}")
+    say(f"new target    : {url}")
+    if dry_run:
+        say("dry-run: key and URL are valid; nothing written.")
+        return 0
+    if do_backup:
+        say(f"backup        : {backup_pointer()}")
+    res = wake_routes.bind_route(k, url, by=by, note=note)
+    if not res.get("ok"):
+        say(f"FAIL: bind_route refused: {res.get('reason')}")
+        return 1
+    say(f"bind          : {res['action']} (previous: {res.get('previous') or '-'})")
+    after = wake_routes.resolve(project_id=k)
+    if not (after.get("bound") and after["conversation"].rstrip("/") == url.rstrip("/")
+            and after["route_key"] == k):
+        say(f"FAIL: resolve({k}) returned {after}")
+        return 1
+    say(f"verified      : {after['conversation']} (route_reason={after['route_reason']})")
+    say(f"PASS: events for project '{k}' now wake this conversation.")
+    say("      owner-os-wake-companion picks it up on its next tick (<=20s); no restart.")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="rebind_chat.py",
-        description="Rebind the Owner OS wake bridge to a new ChatGPT conversation.")
+        description="Rebind Owner OS wake routing: the owner-os control chat by default, "
+                    "or one project route with --route.")
     p.add_argument("url", nargs="?", help="https://chatgpt.com/c/<id>")
+    p.add_argument("--route", default="", metavar="KEY",
+                   help="bind this PROJECT route (event project_id, e.g. mess, gaika-drop, "
+                        "payment-orchestrator) instead of the owner-os control chat")
+    p.add_argument("--routes", action="store_true", help="print the route registry and exit")
     p.add_argument("--show", action="store_true", help="print the current target and exit")
     p.add_argument("--history", action="store_true", help="print the rebind audit and exit")
     p.add_argument("--by", default="owner", help="who requested it (audit field)")
@@ -147,6 +194,15 @@ def main(argv=None) -> int:
     p.add_argument("--no-backup", action="store_true", help="skip the point backup")
     a = p.parse_args(argv)
 
+    if a.routes:
+        rows = wake_routes.list_routes()
+        if not rows:
+            print("(no routes bound — everything falls back to the owner-os target)")
+        for r in rows:
+            print(f"{r['route_key']:24} {r['conversation']}  bound {r['bound_at'][:19]} "
+                  f"by {r['bound_by']}")
+        print(f"fallback route key: {wake_routes.FALLBACK_ROUTE}")
+        return 0
     if a.show:
         print(f"current target: {_fmt_target(wb.active_chat())}")
         return 0
@@ -154,9 +210,15 @@ def main(argv=None) -> int:
         for h in wb.bind_history():
             print(f"{h['at'][:19]}  {h['action']:6}  {h['conversation']}  "
                   f"(was: {h['previous'] or '-'})")
+        for h in wake_routes.route_history():
+            print(f"{h['at'][:19]}  {h['action']:6}  [{h['route_key']}] "
+                  f"{h['conversation'] or '-'}  (was: {h['previous'] or '-'})")
         return 0
     if not a.url:
-        p.error("a conversation URL is required (or use --show / --history)")
+        p.error("a conversation URL is required (or use --show / --history / --routes)")
+    if a.route and wake_routes.normalize_key(a.route) != wake_routes.FALLBACK_ROUTE:
+        return rebind_route(a.route, a.url, by=a.by, note=a.note, dry_run=a.dry_run,
+                            do_backup=not a.no_backup)
     return rebind(a.url, by=a.by, note=a.note, dry_run=a.dry_run,
                   do_backup=not a.no_backup)
 

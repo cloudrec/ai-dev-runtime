@@ -24,11 +24,11 @@ event and the Telegram tier still carries the urgent ones.
 from __future__ import annotations
 
 import os
-import re
 from typing import Optional
 
 from core.control_plane.api import _c
 from core.control_plane.store import now_iso, now_ts
+from core import wake_routes
 
 # Opt-in. Nothing wakes anything until the owner turns this on.
 ENABLED = os.getenv("WAKE_BRIDGE_ENABLED", "0") not in ("0", "", "false", "no")
@@ -149,6 +149,9 @@ _AUDIT_COLUMNS = (
     ("superseded_by", "INTEGER"),
     ("superseded_at", "TEXT"),
     ("superseded_reason", "TEXT"),
+    # Routing: the event's project, kept so the target can be re-resolved FRESH at
+    # delivery time. Rows from before the column exist as NULL and route to owner-os.
+    ("project_id", "TEXT"),
 )
 
 # Why a generic wake stopped being offered, kept as its own append-only record. The audit
@@ -186,7 +189,8 @@ def _enabled() -> tuple:
 
 
 def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
-                owner_action_required: bool = False, event_type: str = "", conn=None,
+                owner_action_required: bool = False, event_type: str = "",
+                project_id: str = "", agent_id: str = "", conn=None,
                 now: Optional[float] = None) -> dict:
     """Answer, with a recorded reason either way. Never raises for control flow."""
     now = now if now is not None else now_ts()
@@ -199,11 +203,13 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
                          owner_action_required=owner_action_required)
     if not sig["significant"]:
         return {"wake": False, "reason": sig["reason"]}
-    # FAIL CLOSED on the target. With no valid active chat there is nowhere to wake, and
-    # guessing a conversation would be exactly the arbitrary behaviour this design forbids.
-    target = active_chat(conn=conn)
+    # FAIL CLOSED on the target, resolved for THIS event's route — a MESS event is judged
+    # against the MESS chat, never against whatever chat happens to be the owner-os one.
+    # Guessing a conversation would be exactly the arbitrary behaviour this design forbids.
+    target = wake_routes.resolve(project_id=project_id, agent_id=agent_id, conn=conn)
     if not target.get("bound"):
-        return {"wake": False, "reason": target.get("reason", "no_active_control_chat")}
+        return {"wake": False, "reason": target.get("reason", "no_route_bound"),
+                "route_key": target.get("route_key")}
 
     conn, own = _conn(conn)
     try:
@@ -229,7 +235,9 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
                         "wait_secs": wait, "actionable": True}
             return {"wake": True, "reason": "actionable_waiting_transition",
                     "actionable": True, "phrase": WAKE_PHRASE,
-                    "conversation": target["conversation"]}
+                    "conversation": target["conversation"],
+                    "route_key": target["route_key"],
+                    "route_reason": target["route_reason"]}
         last = conn.execute(
             "SELECT ts FROM wake_audit WHERE decision='wake' ORDER BY id DESC LIMIT 1"
         ).fetchone()
@@ -239,19 +247,24 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
                     "actionable": False}
         return {"wake": True, "reason": "urgent_event_not_yet_signalled",
                 "actionable": False,
-                "phrase": WAKE_PHRASE, "conversation": target["conversation"]}
+                "phrase": WAKE_PHRASE, "conversation": target["conversation"],
+                "route_key": target["route_key"], "route_reason": target["route_reason"]}
     finally:
         if own:
             conn.close()
 
 
 def record(decision: dict, *, event_id: int, severity: str = "", event_type: str = "",
-           correlation_id: str = "", conn=None, now: Optional[float] = None) -> int:
+           correlation_id: str = "", project_id: str = "", conn=None,
+           now: Optional[float] = None) -> int:
     """Every decision is audited, including the refusals — a bridge that only records its
     successes cannot be debugged when it stays silent.
 
     The class is persisted alongside the decision, because selection later has to rank by it
-    and a class recomputed at read time would drift the moment the type sets changed.
+    and a class recomputed at read time would drift the moment the type sets changed. The
+    project is persisted for the same reason a target URL is NOT: the route key must survive
+    to delivery time, and the conversation must be re-resolved there — a URL frozen at
+    decision time is exactly the stale-target hijack this design forbids.
     """
     now = now if now is not None else now_ts()
     actionable = bool(decision.get("actionable", is_actionable(event_type)))
@@ -259,10 +272,11 @@ def record(decision: dict, *, event_id: int, severity: str = "", event_type: str
     try:
         cur = conn.execute(
             "INSERT INTO wake_audit (ts,at,event_id,correlation_id,severity,decision,reason,"
-            "event_type,actionable) VALUES (?,?,?,?,?,?,?,?,?)",
+            "event_type,actionable,project_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (now, now_iso(), int(event_id), correlation_id, severity,
              "wake" if decision.get("wake") else "skip", str(decision.get("reason"))[:160],
-             (event_type or "").strip(), 1 if actionable else 0))
+             (event_type or "").strip(), 1 if actionable else 0,
+             (project_id or "").strip()))
         conn.commit()
         return int(cur.lastrowid)
     finally:
@@ -337,14 +351,6 @@ CREATE TABLE IF NOT EXISTS wake_bind_audit (
 )
 """
 
-# Exactly a conversation: one of the two real ChatGPT hosts, the /c/ path, one id segment.
-# The previous pattern fail-opened three ways — it matched https://chat.com/... (host typo),
-# https://chatgpt.openai.com/... (nonexistent host), and any single top-level path such as
-# https://chatgpt.com/gpts because /c/ was optional. A pointer that is not a conversation
-# must be refused at bind time, not discovered at wake time.
-_CHAT_RE = re.compile(r"^https://(chatgpt\.com|chat\.openai\.com)/c/[A-Za-z0-9\-]+/?$")
-
-
 def _chat_conn(conn=None):
     conn, own = _c(conn)
     for stmt in _CHAT_SCHEMA.strip().split(";"):
@@ -354,22 +360,33 @@ def _chat_conn(conn=None):
 
 
 def valid_conversation(url: str) -> bool:
-    """A conversation URL, not an arbitrary page. Fail closed on anything else."""
-    return bool(_CHAT_RE.match((url or "").strip()))
+    """A conversation URL, not an arbitrary page. Fail closed on anything else. One rule,
+    owned by the route registry; re-exported here so every old caller keeps the same door."""
+    return wake_routes.valid_conversation(url)
 
 
 def active_chat(conn=None) -> dict:
-    """The current wake target. Read fresh on every wake — never cached in code or a unit."""
+    """The OWNER-OS control chat. Read fresh on every wake — never cached in code or a unit.
+
+    Registry first: the owner-os route in `wake_route` is canonical. The single
+    `wake_target` row remains as a migration bridge for a database the registry has not
+    touched yet; `bind_chat` keeps both in lockstep, so they cannot diverge through any
+    supported path.
+    """
     conn, own = _chat_conn(conn)
     try:
-        r = conn.execute("SELECT conversation,bound_at,bound_by,note FROM wake_target "
-                         "WHERE id=1").fetchone()
-        if not r or not (r[0] or "").strip():
+        r = wake_routes.get_route(wake_routes.FALLBACK_ROUTE, conn=conn)
+        if r and valid_conversation(r["conversation"]):
+            return {"bound": True, "conversation": r["conversation"],
+                    "bound_at": r["bound_at"], "bound_by": r["bound_by"], "note": r["note"]}
+        row = conn.execute("SELECT conversation,bound_at,bound_by,note FROM wake_target "
+                           "WHERE id=1").fetchone()
+        if not row or not (row[0] or "").strip():
             return {"bound": False, "reason": "no_active_control_chat"}
-        if not valid_conversation(r[0]):
-            return {"bound": False, "reason": "active_chat_invalid", "conversation": r[0]}
-        return {"bound": True, "conversation": r[0], "bound_at": r[1], "bound_by": r[2],
-                "note": r[3]}
+        if not valid_conversation(row[0]):
+            return {"bound": False, "reason": "active_chat_invalid", "conversation": row[0]}
+        return {"bound": True, "conversation": row[0], "bound_at": row[1], "bound_by": row[2],
+                "note": row[3]}
     finally:
         if own:
             conn.close()
@@ -377,7 +394,9 @@ def active_chat(conn=None) -> dict:
 
 def bind_chat(conversation: str, *, by: str = "owner", note: str = "", conn=None,
               now: Optional[float] = None) -> dict:
-    """Point the bridge at a different conversation. Atomic, audited, no content stored."""
+    """Point the OWNER-OS route at a different conversation. Atomic, audited, no content
+    stored. Writes the canonical registry row AND the legacy wake_target row in the same
+    transaction, so a reader of either sees the same pointer — one procedure, no divergence."""
     now = now if now is not None else now_ts()
     url = (conversation or "").strip()
     if not valid_conversation(url):
@@ -396,6 +415,9 @@ def bind_chat(conversation: str, *, by: str = "owner", note: str = "", conn=None
                      "VALUES (?,?,?,?,?,?,?)",
                      (now, now_iso(), "rebind" if previous else "bind", url, previous, by,
                       note[:200]))
+        # The canonical registry row, same transaction (bind_route commits on this conn).
+        wake_routes.bind_route(wake_routes.FALLBACK_ROUTE, url, by=by, note=note, conn=conn,
+                               now=now)
         conn.commit()
         return {"ok": True, "conversation": url, "previous": previous or None,
                 "action": "rebind" if previous else "bind"}
@@ -417,18 +439,16 @@ def bind_history(limit: int = 20, conn=None) -> list:
 
 
 def pending_wake(conn=None, now: Optional[float] = None) -> dict:
-    """The oldest decided-but-unacknowledged wake, with the CURRENT target.
+    """The oldest decided-but-unacknowledged wake, with the target resolved for ITS route.
 
     The companion asks this; it never decides for itself. The conversation is resolved at
-    read time from the rotatable pointer, so a rebind between decision and submission sends
-    to the new chat rather than a stale one.
+    read time from the route registry — per event, from the project persisted at decision
+    time — so a rebind between decision and submission sends to the new chat rather than a
+    stale one, and a MESS wake can never ride to the payments chat.
     """
     enabled, kill = _enabled()
     if kill or not enabled:
         return {"pending": False, "reason": "kill_switch_engaged" if kill else "bridge_disabled"}
-    target = active_chat(conn=conn)
-    if not target.get("bound"):
-        return {"pending": False, "reason": target.get("reason", "no_active_control_chat")}
     conn, own = _conn(conn)
     try:
         # A phrase already fired for this event is never offered again, even if the
@@ -436,12 +456,14 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         # proof", not "it definitely did not arrive" — and only the latter would justify
         # sending a second copy into the owner's chat.
         conn.execute(_SUBMIT_SCHEMA)
-        # Fold the generic backlog down to its newest member first, so the queue offered
-        # below is at most "every actionable event, then ONE generic catch-up".
+        # Fold the generic backlog down to its newest member PER ROUTE first: N generic
+        # wakes for one chat are one instruction, but wakes for different chats are not
+        # copies of each other and are never folded across routes.
         coalesced = coalesce_generic_backlog(conn=conn, now=now)
         # Actionable first, then oldest — the only ordering change. Within a class the old
         # oldest-first behaviour is untouched, so nothing is starved, it is merely outranked.
-        r = conn.execute("SELECT a.event_id, COALESCE(a.actionable,0) FROM wake_audit a "
+        r = conn.execute("SELECT a.event_id, COALESCE(a.actionable,0), "
+                         "COALESCE(a.project_id,'') FROM wake_audit a "
                          "WHERE a.decision='wake' AND a.acknowledged=0 "
                          "AND a.superseded_by IS NULL AND NOT EXISTS "
                          "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
@@ -449,8 +471,15 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         if not r:
             return {"pending": False, "reason": "nothing_to_wake_for",
                     "coalesced": coalesced["superseded_event_ids"]}
+        # FAIL CLOSED per event: an event whose route cannot be resolved offers nothing,
+        # rather than borrowing whichever chat another event would have used.
+        target = wake_routes.resolve(project_id=r[2], conn=conn)
+        if not target.get("bound"):
+            return {"pending": False, "reason": target.get("reason", "no_route_bound"),
+                    "event_id": int(r[0]), "route_key": target.get("route_key")}
         return {"pending": True, "event_id": int(r[0]), "actionable": bool(r[1]),
                 "conversation": target["conversation"], "phrase": WAKE_PHRASE,
+                "route_key": target["route_key"], "route_reason": target["route_reason"],
                 "coalesced": coalesced["superseded_event_ids"]}
     finally:
         if own:
@@ -458,13 +487,18 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
 
 
 def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
-    """Fold every pending GENERIC wake but the newest into that newest one.
+    """Fold every pending GENERIC wake but the newest into that newest one, PER ROUTE.
 
     The phrase is fixed and carries no event content — it says "go read Owner OS". So N
-    queued generic wakes are N copies of one identical instruction, and draining them at one
-    per 900s is how a two-day-old event came to be delivered at 04:09:57 ahead of everything
-    that mattered. Collapsing them costs nothing: the CTO inbox still holds every event, and
-    the surviving wake tells the assistant to read all of them.
+    queued generic wakes FOR THE SAME CHAT are N copies of one identical instruction, and
+    draining them at one per 900s is how a two-day-old event came to be delivered at
+    04:09:57 ahead of everything that mattered. Collapsing them costs nothing: the CTO
+    inbox still holds every event, and the surviving wake tells the assistant to read all
+    of them.
+
+    Grouping is by ROUTE KEY, never globally: a MESS wake and a payments wake go to
+    different conversations, so folding one into the other would silently drop a chat's
+    only doorbell ring. Within a route the old behaviour is unchanged.
 
     Superseded rows are RETIRED, never deleted — the row keeps its supersedes pointer and a
     second append-only record names which id absorbed it. Actionable wakes are never touched:
@@ -475,28 +509,36 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
     try:
         conn.execute(_SUBMIT_SCHEMA)
         rows = conn.execute(
-            "SELECT a.id, a.event_id FROM wake_audit a WHERE a.decision='wake' "
+            "SELECT a.id, a.event_id, COALESCE(a.project_id,'') FROM wake_audit a "
+            "WHERE a.decision='wake' "
             "AND a.acknowledged=0 AND a.superseded_by IS NULL AND COALESCE(a.actionable,0)=0 "
             "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
             "ORDER BY a.id ASC").fetchall()
-        if len(rows) < 2:
-            return {"superseded": 0, "superseded_event_ids": [],
-                    "kept_event_id": (int(rows[0][1]) if rows else None)}
-        keep_audit_id, keep_event_id = int(rows[-1][0]), int(rows[-1][1])
+        groups: dict = {}
+        for aid, eid, project in rows:
+            groups.setdefault(wake_routes.route_key_for_event(project), []).append((aid, eid))
+        superseded, kept = [], []
         reason = "coalesced_into_newest_generic_wake"
-        superseded = []
-        for aid, eid in rows[:-1]:
-            conn.execute("UPDATE wake_audit SET superseded_by=?, superseded_at=?, "
-                         "superseded_reason=? WHERE id=?",
-                         (keep_audit_id, now_iso(), reason, int(aid)))
-            conn.execute(
-                "INSERT INTO wake_coalesce_audit (ts,at,wake_audit_id,event_id,"
-                "superseded_by_audit_id,superseded_by_event_id,reason) VALUES (?,?,?,?,?,?,?)",
-                (now, now_iso(), int(aid), int(eid), keep_audit_id, keep_event_id, reason))
-            superseded.append(int(eid))
-        conn.commit()
+        for key, members in groups.items():
+            if len(members) < 2:
+                kept.append(int(members[0][1]))
+                continue
+            keep_audit_id, keep_event_id = int(members[-1][0]), int(members[-1][1])
+            kept.append(keep_event_id)
+            for aid, eid in members[:-1]:
+                conn.execute("UPDATE wake_audit SET superseded_by=?, superseded_at=?, "
+                             "superseded_reason=? WHERE id=?",
+                             (keep_audit_id, now_iso(), reason, int(aid)))
+                conn.execute(
+                    "INSERT INTO wake_coalesce_audit (ts,at,wake_audit_id,event_id,"
+                    "superseded_by_audit_id,superseded_by_event_id,reason) VALUES (?,?,?,?,?,?,?)",
+                    (now, now_iso(), int(aid), int(eid), keep_audit_id, keep_event_id, reason))
+                superseded.append(int(eid))
+        if superseded:
+            conn.commit()
         return {"superseded": len(superseded), "superseded_event_ids": superseded,
-                "kept_event_id": keep_event_id, "reason": reason}
+                "kept_event_id": (kept[-1] if kept else None), "kept_event_ids": kept,
+                "reason": reason}
     finally:
         if own:
             conn.close()
@@ -607,6 +649,8 @@ def _migrate_delivery(conn) -> None:
     have = {r[1] for r in conn.execute("PRAGMA table_info(wake_delivery)")}
     if "conversation" not in have:
         conn.execute("ALTER TABLE wake_delivery ADD COLUMN conversation TEXT DEFAULT ''")
+    if "route_key" not in have:
+        conn.execute("ALTER TABLE wake_delivery ADD COLUMN route_key TEXT DEFAULT ''")
 
 # The phrase left our hands. Recorded the moment the send is FIRED, before anything is known
 # about whether the page kept it — because that is the only honest boundary for "may already
@@ -657,22 +701,23 @@ def was_submitted(event_id: Optional[int], conn=None) -> bool:
 
 
 def record_delivery(source: str, *, event_id: Optional[int] = None, delivered: bool = False,
-                    reason: str = "", conversation: str = "", conn=None,
-                    now: Optional[float] = None) -> int:
+                    reason: str = "", conversation: str = "", route_key: str = "",
+                    conn=None, now: Optional[float] = None) -> int:
     """Persist what actually happened. A failure stays UNACKNOWLEDGED by construction — the
     caller only acknowledges on success — so the wake remains pending and is retried.
-    `conversation` is the target the attempt resolved to, kept so a wrong- or stale-chat
-    delivery is provable (or refutable) from state alone."""
+    `conversation` and `route_key` are what the attempt resolved to, kept so a wrong- or
+    stale-chat delivery is provable (or refutable) from state alone."""
     now = now if now is not None else now_ts()
     conn, own = _c(conn)
     try:
         conn.execute(_DELIVERY_SCHEMA)
         _migrate_delivery(conn)
         cur = conn.execute(
-            "INSERT INTO wake_delivery (ts,at,source,event_id,delivered,reason,conversation) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO wake_delivery (ts,at,source,event_id,delivered,reason,conversation,"
+            "route_key) VALUES (?,?,?,?,?,?,?,?)",
             (now, now_iso(), source, int(event_id or 0), 1 if delivered else 0,
-             str(reason)[:160], (conversation or "").strip()[:200]))
+             str(reason)[:160], (conversation or "").strip()[:200],
+             (route_key or "").strip()[:64]))
         conn.commit()
         return int(cur.lastrowid)
     finally:
@@ -686,7 +731,8 @@ def last_delivery(event_id: Optional[int] = None, conn=None) -> Optional[dict]:
     try:
         conn.execute(_DELIVERY_SCHEMA)
         _migrate_delivery(conn)
-        sel = "SELECT at,source,event_id,delivered,reason,conversation FROM wake_delivery "
+        sel = ("SELECT at,source,event_id,delivered,reason,conversation,route_key "
+               "FROM wake_delivery ")
         if event_id is None:
             r = conn.execute(sel + "ORDER BY id DESC LIMIT 1").fetchone()
         else:
@@ -695,7 +741,8 @@ def last_delivery(event_id: Optional[int] = None, conn=None) -> Optional[dict]:
         if not r:
             return None
         return {"at": r[0], "source": r[1], "event_id": int(r[2]),
-                "delivered": bool(r[3]), "reason": r[4], "conversation": r[5]}
+                "delivered": bool(r[3]), "reason": r[4], "conversation": r[5],
+                "route_key": r[6]}
     finally:
         if own:
             conn.close()

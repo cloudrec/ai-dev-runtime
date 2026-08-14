@@ -121,16 +121,18 @@ class _Session:
 
 
 def _record_delivery(source: str, event_id: Optional[int], res: dict,
-                     conversation: str = "") -> dict:
+                     conversation: str = "", route_key: str = "") -> dict:
     """Persist the outcome of an attempt — the failures above all, since those are the ones
-    that must stay unacknowledged and be retried. The conversation the attempt resolved to
-    is recorded alongside, so "which chat did this send go to" is answerable from state."""
+    that must stay unacknowledged and be retried. The conversation and route the attempt
+    resolved to are recorded alongside, so "which chat did this send go to, and why" is
+    answerable from state."""
     try:
         import sys as _sys
         _sys.path.insert(0, "/root/ai-dev-runtime")
         from core import wake_bridge as _wb
         _wb.record_delivery(source, event_id=event_id, delivered=bool(res.get("ok")),
-                            reason=str(res.get("reason", "")), conversation=conversation)
+                            reason=str(res.get("reason", "")), conversation=conversation,
+                            route_key=route_key)
     except Exception:  # noqa: BLE001 — a missing recorder must never turn into a false success
         pass
     return res
@@ -138,7 +140,7 @@ def _record_delivery(source: str, event_id: Optional[int], res: dict,
 
 def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown",
                   event_id: Optional[int] = None, claim: bool = True,
-                  actionable: bool = False) -> dict:
+                  actionable: bool = False, route_key: str = "") -> dict:
     """Locate the composer structurally, verify it, insert the phrase, send, verify DELIVERY.
 
     Returns {"ok": bool, "reason": str}. Every refusal names its cause so a silent failure is
@@ -166,7 +168,7 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
     # and is recorded as one — success and failure alike.
     return _record_delivery(source, event_id, _attempt(conversation_url, phrase,
                                                        source=source, event_id=event_id),
-                            conversation=conversation_url)
+                            conversation=conversation_url, route_key=route_key)
 
 
 def _latch_submitted(source: str, event_id: Optional[int]) -> None:

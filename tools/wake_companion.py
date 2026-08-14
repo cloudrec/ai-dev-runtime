@@ -40,7 +40,8 @@ def tick(wb) -> dict:
         from cdp_composer import submit_phrase
         res = submit_phrase(p["conversation"], p["phrase"],
                             source="companion", event_id=p["event_id"],
-                            actionable=bool(p.get("actionable")))
+                            actionable=bool(p.get("actionable")),
+                            route_key=p.get("route_key", ""))
         ok = bool(res.get("ok"))
     except Exception as e:  # noqa: BLE001
         res = {"ok": False, "reason": f"cdp_unavailable:{type(e).__name__}"}
@@ -49,13 +50,15 @@ def tick(wb) -> dict:
         # Acknowledge ONLY on verified delivery. Anything else leaves the wake pending,
         # which is what makes a failed submission retryable instead of silently consumed.
         wb.acknowledge(p["event_id"])
-        print(f"delivered wake for event {p['event_id']} to {p['conversation']}: "
+        print(f"delivered wake for event {p['event_id']} "
+              f"[route {p.get('route_key', '?')}] to {p['conversation']}: "
               f"{res.get('reason')}", flush=True)
     else:
         print(f"not delivered for event {p['event_id']}; stays pending "
               f"({res.get('reason')})", flush=True)
     return {"acted": True, "ok": ok, "event_id": p["event_id"],
-            "conversation": p["conversation"], "reason": res.get("reason")}
+            "conversation": p["conversation"], "route_key": p.get("route_key", ""),
+            "reason": res.get("reason")}
 
 
 def main() -> None:

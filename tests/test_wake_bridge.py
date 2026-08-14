@@ -143,12 +143,13 @@ def test_a_broken_bridge_never_breaks_event_recording(monkeypatch):
 # ── the rotatable active control chat ──────────────────────────────────────
 def test_no_active_chat_fails_closed():
     """With nowhere to wake, guessing a conversation would be exactly the arbitrary
-    behaviour this design forbids."""
+    behaviour this design forbids. Both the registry and the legacy row must be empty —
+    bind_chat keeps them in lockstep, so clearing one alone is not an unbound state."""
     import sqlite3, os
     c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
-    c.execute("DELETE FROM wake_target"); c.commit()
+    c.execute("DELETE FROM wake_target"); c.execute("DELETE FROM wake_route"); c.commit()
     d = wb.should_wake(event_id=100, severity="critical")
-    assert d["wake"] is False and d["reason"] == "no_active_control_chat"
+    assert d["wake"] is False and d["reason"] == "no_route_bound"
 
 
 def test_binding_a_chat_enables_waking_and_returns_the_target():
@@ -177,11 +178,12 @@ def test_only_a_conversation_url_may_be_bound(bad):
 
 
 def test_an_invalid_stored_target_fails_closed(tmp_path, monkeypatch):
-    """Corruption must not become a wake at an arbitrary URL."""
+    """Corruption must not become a wake at an arbitrary URL — wherever it is stored."""
     import sqlite3, os
     wb.bind_chat("https://chatgpt.com/c/good")
     c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
     c.execute("UPDATE wake_target SET conversation='https://evil.example/x' WHERE id=1")
+    c.execute("UPDATE wake_route SET conversation='https://evil.example/x'")
     c.commit()
     assert wb.active_chat()["reason"] == "active_chat_invalid"
     assert wb.should_wake(event_id=103, severity="critical")["wake"] is False
