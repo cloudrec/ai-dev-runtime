@@ -16,12 +16,16 @@ spec.loader.exec_module(cdp)
 class _S:
     """Fake CDP session recording every expression sent."""
 
-    def __init__(self, counts=None, bools=None, turns=None):
+    def __init__(self, counts=None, bools=None, turns=None, ids=None):
         self.counts = counts or {}
         self.bools = list(bools or [])
         # Successive answers to "how many user turns are on the page". Default models a
         # healthy send: none before, one after.
         self.turns = list(turns or [])
+        # Successive answers to "the opaque id of the newest user turn". Default is a page
+        # where the id never changes, so the count alone decides — the pre-existing tests
+        # keep their meaning.
+        self.ids = list(ids or [])
         self._turn_calls = 0
         self.exprs = []
         self.inserted = []
@@ -47,6 +51,9 @@ class _S:
             return 0 if self._turn_calls == 1 else 1
         return self.counts.get("n", 1)
 
+    def last_attr(self, selector, attr):
+        return self.ids.pop(0) if self.ids else ""
+
     def close(self):
         pass
 
@@ -60,8 +67,8 @@ def _no_waiting(monkeypatch):
 
 @pytest.fixture
 def wired(monkeypatch):
-    def _mk(counts=None, bools=None, turns=None):
-        s = _S(counts, bools, turns)
+    def _mk(counts=None, bools=None, turns=None, ids=None):
+        s = _S(counts, bools, turns, ids)
         monkeypatch.setattr(cdp, "find_target",
                             lambda url: {"webSocketDebuggerUrl": "ws://x"})
         monkeypatch.setattr(cdp, "_Session", lambda ws: s)
@@ -119,6 +126,55 @@ def test_delivery_needs_the_turn_count_to_rise(wired):
     wired({"n": 1}, bools=[True, True, True, True], turns=[2, 3])
     r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
     assert r["ok"] is True and r["reason"] == "submitted_and_user_turn_appeared"
+
+
+# ── the virtualized long chat: count flat, newest id changed ───────────────
+def test_a_flat_count_with_a_new_last_turn_id_is_still_delivery(wired):
+    """The false negative that marked 25 real deliveries failed in one night: ChatGPT
+    unmounts old turns as the chat grows, so a new turn mounting at the bottom evicts one
+    at the top and the COUNT never moves. The newest turn's opaque id changing is the
+    virtualization-proof signal that the conversation gained our message."""
+    wired({"n": 1}, bools=[True, True, True, True], turns=[9] + [9] * 40,
+          ids=["uuid-old", "uuid-new"])
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is True and r["reason"] == "submitted_and_user_turn_id_advanced"
+
+
+def test_a_flat_count_and_an_unchanged_id_is_still_a_failure(wired):
+    """Both signals silent means no delivery may be claimed."""
+    wired({"n": 1}, bools=[True, True, True, True], turns=[9] + [9] * 40,
+          ids=["uuid-old"] + ["uuid-old"] * 40)
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is False and r["reason"] == "user_turn_not_observed_after_send"
+
+
+def test_an_unreadable_id_baseline_falls_back_to_the_count_alone(wired):
+    """If the baseline id could not be read there is nothing to compare against; a later id
+    must never be trusted, so only the count may prove delivery."""
+    s = wired({"n": 1}, bools=[True, True, True, True], turns=[9] + [9] * 40)
+    s.last_attr = lambda selector, attr: None
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is False and r["reason"] == "user_turn_not_observed_after_send"
+
+
+def test_the_id_probe_reads_an_attribute_never_content():
+    """The real expression behind last_attr: getAttribute of an opaque id, no text APIs."""
+    captured = {}
+
+    class _C(cdp._Session):
+        def __init__(self):
+            pass
+
+        def call(self, method, params=None):
+            captured["expr"] = (params or {}).get("expression", "")
+            return {"result": {"value": "uuid-1"}}
+
+    v = _C().last_attr(cdp.USER_TURN_SEL, "data-message-id")
+    assert v == "uuid-1"
+    e = captured["expr"]
+    assert "getAttribute" in e and "data-message-id" in e
+    for banned in ("textContent", "innerText", "innerHTML", "document.title"):
+        assert banned not in e, e
 
 
 def test_a_turn_that_was_already_there_is_not_counted_as_ours(wired):

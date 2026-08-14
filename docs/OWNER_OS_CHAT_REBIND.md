@@ -118,6 +118,18 @@ Step 2 is the one that matters: `pending_wake()` is the exact call the companion
 the `conversation` field it returns is the exact URL the companion will submit into. If that
 field shows the new ID, the rebind is live.
 
+After any delivery, the question "which chat did that send actually go to" is answerable
+from state alone — every `wake_delivery` row records the conversation the attempt resolved
+to at submission time:
+
+```bash
+sqlite3 /root/ai-dev-runtime/control_plane.db \
+  "SELECT at, event_id, delivered, reason, conversation FROM wake_delivery ORDER BY id DESC LIMIT 5"
+```
+
+A row whose `conversation` is not the currently bound URL is a send that happened before
+the rebind, never after it: the target is resolved fresh per tick and per attempt.
+
 ### 4. Non-destructive smoke test
 
 Checks the path all the way to the composer, **typing nothing and sending nothing** into the chat:

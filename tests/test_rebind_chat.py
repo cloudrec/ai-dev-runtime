@@ -54,6 +54,11 @@ def test_conversation_urls_are_accepted(url):
     "https://chatgpt.com/c/abc?share=1",                  # query string
     "https://chatgpt.com/c/abc/extra",                    # deeper path
     "javascript:alert(1)",
+    # The three shapes the old pattern fail-opened on. A pointer that is not a
+    # conversation must be refused at bind time, not discovered at wake time.
+    "https://chat.com/c/abc",                             # host typo the old regex matched
+    "https://chatgpt.openai.com/c/abc",                   # nonexistent hybrid host
+    "https://chatgpt.com/gpts",                           # a page, not a conversation
 ])
 def test_anything_that_is_not_a_conversation_url_is_refused(url):
     """Fail closed. A bad URL must be rejected BEFORE the pointer is touched."""

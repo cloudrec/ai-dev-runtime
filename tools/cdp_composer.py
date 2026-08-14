@@ -1,8 +1,9 @@
 """CDP composer locator — structure only, never content.
 
-Every expression evaluated here returns a BOOLEAN or a COUNT. Nothing returns message text,
-chat titles, history, or any other page content, and nothing is logged beyond those booleans.
-The one string ever sent into the page is the fixed wake phrase.
+Every expression evaluated here returns a BOOLEAN, a COUNT, or an OPAQUE message-id
+attribute (`data-message-id`, a UUID the page assigns — metadata, not content). Nothing
+returns message text, chat titles, history, or any other page content, and nothing is
+logged beyond those values. The one string ever sent into the page is the fixed wake phrase.
 
 Why CDP at all: AT-SPI does not expose Chrome's tree in this headless setup (Chrome registers
 on the a11y bus but reports childCount = -1), and clicking a hardcoded pixel silently failed —
@@ -101,6 +102,17 @@ class _Session:
         v = ((r.get("result") or {}).get("value"))
         return int(v) if isinstance(v, (int, float)) else -1
 
+    def last_attr(self, selector: str, attr: str) -> Optional[str]:
+        """The named ATTRIBUTE of the last element matching the selector — an opaque id,
+        never text. Returns None when unreadable, "" when absent; both fail closed at the
+        caller, which must then rely on the count alone."""
+        expr = (f"(function(){{const n=document.querySelectorAll({selector!r});"
+                f"if(!n.length)return '';"
+                f"return n[n.length-1].getAttribute({attr!r})||'';}})()")
+        r = self.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
+        v = ((r.get("result") or {}).get("value"))
+        return v if isinstance(v, str) else None
+
     def close(self):
         try:
             self.ws.close()
@@ -108,15 +120,17 @@ class _Session:
             pass
 
 
-def _record_delivery(source: str, event_id: Optional[int], res: dict) -> dict:
+def _record_delivery(source: str, event_id: Optional[int], res: dict,
+                     conversation: str = "") -> dict:
     """Persist the outcome of an attempt — the failures above all, since those are the ones
-    that must stay unacknowledged and be retried."""
+    that must stay unacknowledged and be retried. The conversation the attempt resolved to
+    is recorded alongside, so "which chat did this send go to" is answerable from state."""
     try:
         import sys as _sys
         _sys.path.insert(0, "/root/ai-dev-runtime")
         from core import wake_bridge as _wb
         _wb.record_delivery(source, event_id=event_id, delivered=bool(res.get("ok")),
-                            reason=str(res.get("reason", "")))
+                            reason=str(res.get("reason", "")), conversation=conversation)
     except Exception:  # noqa: BLE001 — a missing recorder must never turn into a false success
         pass
     return res
@@ -151,7 +165,8 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
     # The claim is spent from here on, so every outcome past this line is a delivery attempt
     # and is recorded as one — success and failure alike.
     return _record_delivery(source, event_id, _attempt(conversation_url, phrase,
-                                                       source=source, event_id=event_id))
+                                                       source=source, event_id=event_id),
+                            conversation=conversation_url)
 
 
 def _latch_submitted(source: str, event_id: Optional[int]) -> None:
@@ -213,6 +228,13 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         turns_before = s.count(USER_TURN_SEL)
         if turns_before < 0:
             return {"ok": False, "reason": "user_turn_count_unavailable"}
+        # Second, virtualization-proof baseline: the OPAQUE id of the newest user turn.
+        # ChatGPT unmounts old turns as the conversation grows, so in a long chat a new
+        # turn mounting at the bottom can evict one at the top and leave the COUNT flat —
+        # which made 25 genuine deliveries in a row read as failures. The newest turn is
+        # always mounted, so its id CHANGING is proof a new turn arrived even when the
+        # count never moves. An id is metadata; no content is read.
+        last_id_before = s.last_attr(USER_TURN_SEL, "data-message-id")
         # Focus by element identity, then CONFIRM focus. A focus call that silently fails is
         # exactly how the phrase went nowhere before.
         s.call("Runtime.evaluate",
@@ -252,7 +274,8 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                         "text": "\r" if t == "char" else ""})
 
         # Two separate facts, in order. The composer emptying says the page took the
-        # keystrokes; only the turn count rising says the conversation kept the message.
+        # keystrokes; only a new turn — count risen, OR the newest turn's id changed under
+        # a flat count (virtualized long chat) — says the conversation kept the message.
         import time
         cleared = False
         for _ in range(10):
@@ -261,8 +284,14 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                 cleared = s.boolean(
                     f"(function(){{const c=document.querySelector({COMPOSER_SEL!r});"
                     f"return !c || c.textContent.length === 0;}})()") is True
-            if cleared and s.count(USER_TURN_SEL) > turns_before:
+            if not cleared:
+                continue
+            if s.count(USER_TURN_SEL) > turns_before:
                 return {"ok": True, "reason": "submitted_and_user_turn_appeared"}
+            last_id_now = s.last_attr(USER_TURN_SEL, "data-message-id")
+            if (last_id_before is not None and last_id_now
+                    and last_id_now != last_id_before):
+                return {"ok": True, "reason": "submitted_and_user_turn_id_advanced"}
         if not cleared:
             return {"ok": False, "reason": "composer_did_not_clear_after_send"}
         # The composer emptied and nothing arrived. This is the exact shape of the silent

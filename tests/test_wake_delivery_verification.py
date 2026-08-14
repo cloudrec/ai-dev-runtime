@@ -58,6 +58,9 @@ class _S:
             return self.turns.pop(0) if self.turns else 0
         return 1
 
+    def last_attr(self, selector, attr):
+        return ""          # id never changes here; the count alone decides
+
     def close(self):
         pass
 
@@ -101,6 +104,17 @@ def test_a_failed_delivery_stays_unacknowledged_but_is_not_retried(monkeypatch):
     assert wb.last_delivery(102)["delivered"] is False      # honest evidence kept
     assert wb.was_submitted(102) is True                    # but the phrase did leave
     assert wb.pending_wake()["pending"] is False            # so it is never offered again
+
+
+def test_the_delivery_row_names_the_conversation_it_resolved_to(monkeypatch):
+    """Every attempt records WHICH chat it went to, so "did a wake land in a stale chat"
+    is answerable from state instead of from memory or log archaeology."""
+    _wire(monkeypatch, bools=[True, True, True, True], turns=[3, 4])
+    _decide_wake(150)
+    cdp.submit_phrase("https://chatgpt.com/c/delivery-test-chat", "P",
+                      source="companion", event_id=150)
+    row = wb.last_delivery(150)
+    assert row["conversation"] == "https://chatgpt.com/c/delivery-test-chat"
 
 
 def test_a_verified_delivery_is_recorded_as_delivered(monkeypatch):

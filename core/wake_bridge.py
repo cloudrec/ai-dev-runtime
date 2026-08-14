@@ -297,7 +297,8 @@ def health(conn=None, now: Optional[float] = None) -> dict:
         last_age = (now - float(r[0])) if r else None
         # A wake that was decided but never delivered is the failure mode this reports on.
         conn.execute(_DELIVERY_SCHEMA)
-        d = conn.execute("SELECT at,delivered,reason FROM wake_delivery "
+        _migrate_delivery(conn)
+        d = conn.execute("SELECT at,delivered,reason,conversation FROM wake_delivery "
                          "ORDER BY id DESC LIMIT 1").fetchone()
         failed = conn.execute(
             "SELECT COUNT(*) FROM wake_delivery WHERE delivered=0").fetchone()[0]
@@ -305,6 +306,7 @@ def health(conn=None, now: Optional[float] = None) -> dict:
                 "last_delivery_at": (d[0] if d else None),
                 "last_delivery_ok": (bool(d[1]) if d else None),
                 "last_delivery_reason": (d[2] if d else None),
+                "last_delivery_conversation": (d[3] if d else None),
                 "deliveries_failed_total": int(failed),
                 "cooldown_secs": COOLDOWN_SECS,
                 "wakes_total": int(total),
@@ -335,7 +337,12 @@ CREATE TABLE IF NOT EXISTS wake_bind_audit (
 )
 """
 
-_CHAT_RE = re.compile(r"^https://chat(gpt)?\.(com|openai\.com)/(c/)?[A-Za-z0-9\-]+/?$")
+# Exactly a conversation: one of the two real ChatGPT hosts, the /c/ path, one id segment.
+# The previous pattern fail-opened three ways — it matched https://chat.com/... (host typo),
+# https://chatgpt.openai.com/... (nonexistent host), and any single top-level path such as
+# https://chatgpt.com/gpts because /c/ was optional. A pointer that is not a conversation
+# must be refused at bind time, not discovered at wake time.
+_CHAT_RE = re.compile(r"^https://(chatgpt\.com|chat\.openai\.com)/c/[A-Za-z0-9\-]+/?$")
 
 
 def _chat_conn(conn=None):
@@ -592,6 +599,15 @@ CREATE TABLE IF NOT EXISTS wake_delivery (
 )
 """
 
+
+def _migrate_delivery(conn) -> None:
+    """The live DB predates the column; add it rather than assume it. `conversation` is the
+    bound target URL the attempt resolved to — the owner's rotatable pointer, never content —
+    so every delivery row answers "which chat did this send actually go to"."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(wake_delivery)")}
+    if "conversation" not in have:
+        conn.execute("ALTER TABLE wake_delivery ADD COLUMN conversation TEXT DEFAULT ''")
+
 # The phrase left our hands. Recorded the moment the send is FIRED, before anything is known
 # about whether the page kept it — because that is the only honest boundary for "may already
 # be in the chat". Verification that comes later can say delivered or not; it can never make
@@ -641,18 +657,22 @@ def was_submitted(event_id: Optional[int], conn=None) -> bool:
 
 
 def record_delivery(source: str, *, event_id: Optional[int] = None, delivered: bool = False,
-                    reason: str = "", conn=None, now: Optional[float] = None) -> int:
+                    reason: str = "", conversation: str = "", conn=None,
+                    now: Optional[float] = None) -> int:
     """Persist what actually happened. A failure stays UNACKNOWLEDGED by construction — the
-    caller only acknowledges on success — so the wake remains pending and is retried."""
+    caller only acknowledges on success — so the wake remains pending and is retried.
+    `conversation` is the target the attempt resolved to, kept so a wrong- or stale-chat
+    delivery is provable (or refutable) from state alone."""
     now = now if now is not None else now_ts()
     conn, own = _c(conn)
     try:
         conn.execute(_DELIVERY_SCHEMA)
+        _migrate_delivery(conn)
         cur = conn.execute(
-            "INSERT INTO wake_delivery (ts,at,source,event_id,delivered,reason) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO wake_delivery (ts,at,source,event_id,delivered,reason,conversation) "
+            "VALUES (?,?,?,?,?,?,?)",
             (now, now_iso(), source, int(event_id or 0), 1 if delivered else 0,
-             str(reason)[:160]))
+             str(reason)[:160], (conversation or "").strip()[:200]))
         conn.commit()
         return int(cur.lastrowid)
     finally:
@@ -665,17 +685,17 @@ def last_delivery(event_id: Optional[int] = None, conn=None) -> Optional[dict]:
     conn, own = _c(conn)
     try:
         conn.execute(_DELIVERY_SCHEMA)
+        _migrate_delivery(conn)
+        sel = "SELECT at,source,event_id,delivered,reason,conversation FROM wake_delivery "
         if event_id is None:
-            r = conn.execute("SELECT at,source,event_id,delivered,reason FROM wake_delivery "
-                             "ORDER BY id DESC LIMIT 1").fetchone()
+            r = conn.execute(sel + "ORDER BY id DESC LIMIT 1").fetchone()
         else:
-            r = conn.execute("SELECT at,source,event_id,delivered,reason FROM wake_delivery "
-                             "WHERE event_id=? ORDER BY id DESC LIMIT 1",
+            r = conn.execute(sel + "WHERE event_id=? ORDER BY id DESC LIMIT 1",
                              (int(event_id),)).fetchone()
         if not r:
             return None
         return {"at": r[0], "source": r[1], "event_id": int(r[2]),
-                "delivered": bool(r[3]), "reason": r[4]}
+                "delivered": bool(r[3]), "reason": r[4], "conversation": r[5]}
     finally:
         if own:
             conn.close()

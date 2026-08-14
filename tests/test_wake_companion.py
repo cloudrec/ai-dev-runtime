@@ -1,8 +1,16 @@
-"""Wake companion submission: no fixed coordinates, fail closed at every step."""
+"""Wake companion: one delivery path, canonical target resolved fresh on every tick.
+
+The keyboard/xdotool fallback is gone by design — it typed into whatever window happened to
+be focused, which is exactly how a phrase could land in the wrong chat, and it could never
+verify a keystroke arrived. These tests pin the companion to the only safe shape: ask the
+bridge, submit through `cdp_composer.submit_phrase` with the conversation the bridge
+resolved THIS tick, acknowledge only on verified delivery.
+"""
 from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 
 import pytest
 
@@ -13,95 +21,99 @@ sys.modules["wake_companion"] = wc
 spec.loader.exec_module(wc)
 
 
-class _X:
-    """Records every xdotool call so the test can assert on what was attempted."""
+class _Bridge:
+    """Fake wake_bridge: scripted pending answers, records acknowledgements."""
 
-    def __init__(self, active="W1", frames=None):
-        self.calls = []
-        self.active = active
-        self.frames = list(frames or ["a", "b", "c"])
+    def __init__(self, answers):
+        self.answers = list(answers)
+        self.acked = []
 
-    def __call__(self, *args, timeout=15):
-        self.calls.append(args)
-        class R:
-            stdout = ""
-        if args and args[0] == "search":
-            R.stdout = "W1\n"
-        if args and args[0] == "getactivewindow":
-            R.stdout = self.active
-        return R
+    def pending_wake(self):
+        return self.answers.pop(0) if self.answers else {"pending": False,
+                                                         "reason": "nothing_to_wake_for"}
 
-    def frame(self):
-        return self.frames.pop(0) if self.frames else "z"
+    def acknowledge(self, event_id):
+        self.acked.append(event_id)
 
 
 @pytest.fixture
-def x(monkeypatch):
-    stub = _X()
-    monkeypatch.setattr(wc, "_x", stub)
-    monkeypatch.setattr(wc, "_frame_signature", stub.frame)
-    monkeypatch.setattr(wc, "time", type("T", (), {"sleep": staticmethod(lambda s: None)}))
-    return stub
+def composer(monkeypatch):
+    """Stub cdp_composer capturing every submission; result is settable per test."""
+    calls = []
+    mod = types.ModuleType("cdp_composer")
+    mod.result = {"ok": True, "reason": "submitted_and_user_turn_appeared"}
+
+    def submit_phrase(conversation, phrase, *, source, event_id, actionable=False):
+        calls.append({"conversation": conversation, "phrase": phrase,
+                      "source": source, "event_id": event_id, "actionable": actionable})
+        return mod.result
+
+    mod.submit_phrase = submit_phrase
+    mod.calls = calls
+    monkeypatch.setitem(sys.modules, "cdp_composer", mod)
+    return mod
 
 
-def test_no_fixed_coordinates_are_ever_used(x):
-    """Clicking a hardcoded pixel was the fragile part: a layout change sent the phrase
-    nowhere and a click cannot be verified."""
-    wc.submit("PHRASE", "https://chatgpt.com/c/abc")
-    flat = [" ".join(c) for c in x.calls]
-    assert not any("mousemove" in f or "click" in f for f in flat), flat
+def _pending(event_id, conversation, actionable=False):
+    return {"pending": True, "event_id": event_id, "conversation": conversation,
+            "phrase": "PHRASE", "actionable": actionable}
 
 
-def test_it_refuses_when_the_window_is_not_focused(monkeypatch):
-    stub = _X(active="SOMETHING-ELSE")
-    monkeypatch.setattr(wc, "_x", stub)
-    monkeypatch.setattr(wc, "_frame_signature", stub.frame)
-    monkeypatch.setattr(wc, "time", type("T", (), {"sleep": staticmethod(lambda s: None)}))
-    assert wc.submit("PHRASE", "https://chatgpt.com/c/abc") is False
-    assert not any("Return" in " ".join(c) for c in stub.calls), \
-        "nothing may be submitted into an unfocused window"
+def test_nothing_pending_means_nothing_submitted(composer):
+    b = _Bridge([{"pending": False, "reason": "nothing_to_wake_for"}])
+    r = wc.tick(b)
+    assert r["acted"] is False
+    assert composer.calls == []
+    assert b.acked == []
 
 
-def test_it_refuses_when_typing_changed_nothing(monkeypatch):
-    """Identical frames before and after typing mean the keystrokes went nowhere; pressing
-    Enter would submit into the void and report success."""
-    stub = _X(frames=["same", "same"])
-    monkeypatch.setattr(wc, "_x", stub)
-    monkeypatch.setattr(wc, "_frame_signature", stub.frame)
-    monkeypatch.setattr(wc, "time", type("T", (), {"sleep": staticmethod(lambda s: None)}))
-    assert wc.submit("PHRASE", "https://chatgpt.com/c/abc") is False
+def test_the_submission_uses_the_conversation_the_bridge_resolved(composer):
+    b = _Bridge([_pending(7, "https://chatgpt.com/c/bound-target")])
+    r = wc.tick(b)
+    assert composer.calls[0]["conversation"] == "https://chatgpt.com/c/bound-target"
+    assert composer.calls[0]["phrase"] == "PHRASE"
+    assert r["ok"] is True and b.acked == [7]
 
 
-def test_it_clears_the_line_after_refusing_to_submit(monkeypatch):
-    """A refused attempt must not leave half-typed text sitting in the composer."""
-    stub = _X(frames=["same", "same"])
-    monkeypatch.setattr(wc, "_x", stub)
-    monkeypatch.setattr(wc, "_frame_signature", stub.frame)
-    monkeypatch.setattr(wc, "time", type("T", (), {"sleep": staticmethod(lambda s: None)}))
-    wc.submit("PHRASE", "https://chatgpt.com/c/abc")
-    flat = [" ".join(c) for c in stub.calls]
-    assert any("ctrl+a" in f for f in flat) and any("Delete" in f for f in flat)
+def test_a_rebind_between_ticks_reaches_the_new_chat_with_no_restart(composer):
+    """The stale-chat regression: the target is re-resolved every tick, never cached, so
+    the tick after a rebind submits into the NEW conversation."""
+    b = _Bridge([_pending(1, "https://chatgpt.com/c/old-one"),
+                 _pending(2, "https://chatgpt.com/c/new-one")])
+    wc.tick(b)
+    wc.tick(b)
+    assert [c["conversation"] for c in composer.calls] == [
+        "https://chatgpt.com/c/old-one", "https://chatgpt.com/c/new-one"]
 
 
-def test_it_does_not_claim_success_when_the_screen_never_changed(monkeypatch):
-    stub = _X(frames=["a", "b", "b"])   # typing changed it, Return did not
-    monkeypatch.setattr(wc, "_x", stub)
-    monkeypatch.setattr(wc, "_frame_signature", stub.frame)
-    monkeypatch.setattr(wc, "time", type("T", (), {"sleep": staticmethod(lambda s: None)}))
-    assert wc.submit("PHRASE", "https://chatgpt.com/c/abc") is False
+def test_an_unverified_delivery_is_never_acknowledged(composer):
+    composer.result = {"ok": False, "reason": "user_turn_not_observed_after_send"}
+    b = _Bridge([_pending(9, "https://chatgpt.com/c/a")])
+    r = wc.tick(b)
+    assert r["ok"] is False
+    assert b.acked == [], "acknowledge only on verified delivery"
 
 
-def test_a_healthy_submission_navigates_to_the_bound_conversation(x):
-    ok = wc.submit("PHRASE", "https://chatgpt.com/c/target-123")
-    flat = [" ".join(c) for c in x.calls]
-    assert ok is True
-    assert any("target-123" in f for f in flat), "must navigate to the BOUND conversation"
-    assert any("PHRASE" in f for f in flat)
+def test_a_missing_composer_fails_closed_without_acknowledging(monkeypatch):
+    monkeypatch.setitem(sys.modules, "cdp_composer", None)  # import raises
+    b = _Bridge([_pending(3, "https://chatgpt.com/c/a")])
+    r = wc.tick(b)
+    assert r["acted"] is True and r["ok"] is False
+    assert "cdp_unavailable" in r["reason"]
+    assert b.acked == []
 
 
-def test_only_the_fixed_phrase_is_ever_typed(x):
-    wc.submit("THE ONLY PHRASE", "https://chatgpt.com/c/abc")
-    typed = [c for c in x.calls if c and c[0] == "type"]
-    payloads = [c[-1] for c in typed]
-    assert "THE ONLY PHRASE" in payloads
-    assert all(p == "THE ONLY PHRASE" or p.startswith("https://") for p in payloads), payloads
+def test_the_actionable_class_is_carried_through_to_the_claim(composer):
+    b = _Bridge([_pending(5, "https://chatgpt.com/c/a", actionable=True)])
+    wc.tick(b)
+    assert composer.calls[0]["actionable"] is True
+
+
+def test_there_is_no_keyboard_fallback_path():
+    """The xdotool path is not dormant — it is gone. Typing into the focused window is how
+    a phrase lands in the wrong chat."""
+    import inspect
+    src = inspect.getsource(wc)
+    for banned in ("xdotool", "windowactivate", "getactivewindow", "ctrl+l"):
+        assert banned not in src, f"keyboard fallback resurfacing: {banned}"
+    assert not hasattr(wc, "submit")
