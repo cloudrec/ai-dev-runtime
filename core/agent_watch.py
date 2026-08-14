@@ -141,7 +141,10 @@ _CONTINUATION_RE = re.compile(
     r"|[◻☐]|\[ \]"
     # Running-subagent widget rows and live token counters (events 4255/4281): visible
     # subagents ARE work in flight, whatever the parent pane's state metadata says.
-    r"|[◯◉]\s|↓\s*\d+(?:\.\d+)?k|\b\d+m\s+\d+s\b)", re.IGNORECASE)
+    r"|[◯◉]\s|↓\s*\d+(?:\.\d+)?k|\b\d+m\s+\d+s\b"
+    # "running" in any rendering — including the column-mangled "runn ing" that event
+    # 4300 wore — is a progress fragment, never a finish.
+    r"|\brunning\b|\brunn\s+ing\b)", re.IGNORECASE)
 # Inventory states that mean ACTIVE — text may never override these into waiting/done.
 _ACTIVE_STATES = frozenset({"working", "shell_running"})
 # Inventory states in which a decision menu is credible.
@@ -243,10 +246,14 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
     if _BLOCKER_RE.search(region):
         return {"cls": "blocker", "reason": "paused_waiting_text_at_bottom"}
     if prev_cls == "working":
-        if _CONTINUATION_RE.search(region) or not _FINISH_RE.search(region):
-            # Came to rest, but either its own words say the work continues, or it
-            # never SAID it finished. Stay "working" so a real, stated finish later is
-            # still a fresh transition — quietness alone is never a completion.
+        # Finish evidence must sit in the FINAL response lines, not anywhere in the
+        # region: event 4300 "completed" on finish vocabulary from scrollback while the
+        # actual last line was a mangled progress fragment.
+        final = _WS.sub(" ", " ".join(_meaningful_lines(tail)[-3:]))
+        if _CONTINUATION_RE.search(region) or not _FINISH_RE.search(final):
+            # Came to rest, but either its own words say the work continues, or its
+            # closing lines never SAID it finished. Stay "working" so a real, stated
+            # finish later is still a fresh transition — quietness alone never completes.
             return {"cls": "working", "reason": "no_positive_finish_evidence"}
         return {"cls": "completed", "reason": "stated_finish_at_rest"}
     return {"cls": "idle", "reason": "no_signal"}

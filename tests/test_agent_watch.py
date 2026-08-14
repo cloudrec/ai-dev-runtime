@@ -373,6 +373,35 @@ def test_dashed_box_lines_never_reach_a_prompt_summary():
     assert "Do you want to proceed" in ex and "╌" not in ex
 
 
+def test_a_mangled_running_fragment_never_completes():
+    """fable, live (event 4300): the pane's last line was the column-wrapped progress
+    fragment 're on scr een: runn ing' while finish vocabulary sat in scrollback above.
+    Neither half may produce a completion."""
+    emit = _Emit()
+    t = "fable-wake-fix:0.0"
+    _scan([_agent(t, "/root/ai-dev-runtime", state="working")], {t: WORKING_TAIL}, emit)
+    tail = "All tests passed. Commit done earlier.\nre on scr\neen: runn\ning"
+    r = _scan([_agent(t, "/root/ai-dev-runtime", state="idle")], {t: tail},
+              emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+
+
+def test_finish_evidence_must_be_in_the_final_lines_not_the_scrollback():
+    emit = _Emit()
+    t = "a:0.0"
+    _scan([_agent(t, "/opt/mess", state="working")], {t: WORKING_TAIL}, emit)
+    tail = ("Phase 1 completed successfully.\n"      # old news, higher up
+            "line\nline\nline\n"
+            "Now examining the remaining edge cases.")
+    r = _scan([_agent(t, "/opt/mess", state="idle")], {t: tail}, emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+    # and a stated finish in the CLOSING lines still completes
+    r2 = _scan([_agent(t, "/opt/mess", state="idle")],
+               {t: "Edge cases handled.\nFinal report saved. All done."},
+               emit, now=1200.0)
+    assert [e["class"] for e in r2["emitted"]] == ["completed"]
+
+
 def test_genuinely_working_never_alerts():
     emit = _Emit()
     for now in (1000.0, 1020.0, 1040.0):
