@@ -89,6 +89,15 @@ CREATE TABLE IF NOT EXISTS agent_watch_suppress (
 )
 """
 
+_STATE_COLUMNS = (("miss_count", "INTEGER DEFAULT 0"),)
+
+
+def _migrate_state(conn) -> None:
+    have = {r[1] for r in conn.execute("PRAGMA table_info(agent_watch_state)")}
+    for name, decl in _STATE_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE agent_watch_state ADD COLUMN {name} {decl}")
+
 # ── classification ──────────────────────────────────────────────────────────
 # A permission/decision menu: the Claude CLI's numbered prompt, or an explicit question
 # aimed at a human. Checked FIRST — an imperfect upstream state must not hide a literal
@@ -297,6 +306,7 @@ def _conn(conn=None):
     for stmt in _SCHEMA.strip().split(";"):
         if stmt.strip():
             conn.execute(stmt)
+    _migrate_state(conn)
     return conn, own
 
 
@@ -411,10 +421,24 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
         # longer lists it (a dead pane has no Claude, so is_agent filtering hides it). A
         # pane that vanished from rest just left; only interrupted work is news.
         present = {a.get("target") for a in agents}
-        for target, prev_cls, n_cls in conn.execute(
-                "SELECT target, cls, notified_cls FROM agent_watch_state").fetchall():
+        if present:
+            conn.execute("UPDATE agent_watch_state SET miss_count=0 WHERE target IN (%s)"
+                         % ",".join("?" * len(present)), tuple(present))
+        for target, prev_cls, n_cls, misses in conn.execute(
+                "SELECT target, cls, notified_cls, COALESCE(miss_count,0) "
+                "FROM agent_watch_state").fetchall():
             if target in present or is_suppressed(target, conn=conn, now=now) \
                     or prev_cls in ("crashed", "idle", "completed"):
+                continue
+            if misses < 1:
+                # ONE missed scan is not a death: a busy Claude process can drop out of
+                # the inventory for a single sweep (event 4393 declared this session's
+                # own live pane crashed on exactly that). Two consecutive absences are
+                # the threshold; presence resets the count.
+                conn.execute("UPDATE agent_watch_state SET miss_count=1 WHERE target=?",
+                             (target,))
+                conn.commit()
+                skipped.append({"target": target, "why": "absent_once_waiting_confirm"})
                 continue
             if n_cls == "crashed":
                 continue

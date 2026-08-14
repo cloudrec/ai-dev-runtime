@@ -96,13 +96,30 @@ def test_coming_to_rest_after_work_is_one_completion():
     assert emit.calls[0]["type"] == "task_completed"
 
 
-def test_a_vanished_working_pane_is_a_critical_crash():
+def test_a_vanished_working_pane_is_a_critical_crash_after_two_missed_scans():
     emit = _Emit()
     _scan([_agent(state="working")], {"gaika-ext-audit:0.0": WORKING_TAIL}, emit)
-    r = _scan([], {}, emit, now=1100.0)          # pane gone from inventory
-    assert [e["class"] for e in r["emitted"]] == ["crashed"]
+    r1 = _scan([], {}, emit, now=1100.0)         # first miss: waiting for confirmation
+    assert r1["emitted"] == [] and emit.calls == []
+    r2 = _scan([], {}, emit, now=1120.0)         # second consecutive miss: crash
+    assert [e["class"] for e in r2["emitted"]] == ["crashed"]
     assert emit.calls[0]["type"] == "agent_process_failed"
     assert emit.calls[0]["severity"] == "critical"
+
+
+def test_a_single_missed_scan_is_not_a_crash():
+    """event 4393: this session's own live pane dropped out of one inventory sweep while
+    its Claude process was busy, and was declared crashed. Presence resets the count."""
+    emit = _Emit()
+    t = "fable-wake-fix:0.0"
+    _scan([_agent(t, "/root/ai-dev-runtime", state="working")], {t: WORKING_TAIL}, emit)
+    _scan([], {}, emit, now=1100.0)                              # one miss
+    r = _scan([_agent(t, "/root/ai-dev-runtime", state="working")],
+              {t: WORKING_TAIL}, emit, now=1120.0)               # it is back
+    assert r["emitted"] == [] and emit.calls == []
+    _scan([], {}, emit, now=1140.0)                              # miss again: count reset
+    r2 = _scan([], {}, emit, now=1160.0)
+    assert [e["class"] for e in r2["emitted"]] == ["crashed"]    # two in a row now
 
 
 def test_a_pane_that_left_from_rest_is_not_a_crash():
