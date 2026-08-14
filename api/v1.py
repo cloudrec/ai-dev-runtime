@@ -515,6 +515,52 @@ async def control_plane_wake_health(_: bool = Depends(_auth)):
     return wb.health()
 
 
+# ── wake route registry: the multi-chat routing table, manageable from the chat ─────
+# Before these existed, binding a project's work chat meant a server CLI session. A chat
+# the owner is already in can now bind itself: the owner pastes the conversation URL, the
+# assistant calls bind_wake_route. Validation and audit live in core.wake_routes — the API
+# adds nothing but transport, so there is still exactly one writer path.
+
+@router.get("/control-plane/wake/routes", operation_id="list_wake_routes")
+async def list_wake_routes(_: bool = Depends(_auth)):
+    """The wake route registry: which ChatGPT conversation each project's events wake.
+    Read-only; no secrets — route keys, conversation URLs and bind audit fields only."""
+    from core import wake_routes as wr
+    return {"routes": wr.list_routes(), "fallback_route": wr.FALLBACK_ROUTE}
+
+
+class WakeRouteBindReq(BaseModel):
+    route_key: str
+    conversation_url: str
+    note: str = ""
+    actor: Optional[str] = None      # self-declared caller name, audit only
+
+
+@router.post("/control-plane/wake/routes/bind", operation_id="bind_wake_route")
+async def bind_wake_route(req: WakeRouteBindReq, request: Request,
+                          _: bool = Depends(_auth)):
+    """Bind or rebind ONE route to ONE ChatGPT conversation URL. Owner-directed config
+    mutation: strict URL validation, idempotent (re-binding the held URL is a no-op),
+    audited with the caller identity. Fails closed with 400 before any write on a
+    malformed key or URL — never guesses either."""
+    from core import wake_routes as wr
+    actor, _src = caller_identity(request, req.actor)
+    res = wr.bind_route(req.route_key, req.conversation_url, by=actor,
+                        note=req.note or "")
+    if not res.get("ok"):
+        raise HTTPException(status_code=400, detail=res)
+    return res
+
+
+@router.get("/control-plane/wake/routes/resolve", operation_id="resolve_wake_route")
+async def resolve_wake_route(project_id: str = "", source: str = "", agent_id: str = "",
+                             _: bool = Depends(_auth)):
+    """Read-only: which conversation an event with this metadata would wake, and why
+    (explicit_route / owner_os_route / unmapped_route:<key> / not bound). Changes nothing."""
+    from core import wake_routes as wr
+    return wr.resolve(project_id=project_id, source=source, agent_id=agent_id)
+
+
 @router.get("/control-plane/registry")
 async def control_plane_registry(_: bool = Depends(_auth)):
     """The auto-discovered AgentRegistry (visibility never depends on an allowlist)."""
