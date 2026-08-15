@@ -1,0 +1,99 @@
+# Task 211 closed-loop ChatGPT wake (P0, gate GREEN) + task 209 router wiring
+
+Date: 2026-08-15 (night). Branch `ai-runtime/182-retry-fix-wake-continuation-star`,
+head `965fbbf`. Final full suite: **2121 passed**. All commits local; no push,
+no prod deploy, no DNS/payments/secrets/external actions. Dirty owner files
+byte-identical throughout.
+
+Per the owner's token policy, both tasks were implemented by Sonnet background
+agents from compact context packs; Fable did design, gate verdicts, and
+compact senior review only (two review findings, both fixed).
+
+## Task 211 — closed-loop wake, acceptance gate GREEN
+
+Commits `e6c79a9`, `21e788a`, `7aad2b1`, `13bff6c` (Sonnet-implemented).
+
+What changed:
+- **Semantic wake text**: the companion now submits
+  `[Owner OS wake] event=<id> trigger=<class> type=<type> project=<key>
+  agent=<ref>. <original fixed instruction>` — every field an int, a closed
+  lookup (five trigger classes: completion/blocker/owner_decision/failure/
+  loop_watchdog), or strictly sanitized. Nothing pane- or ChatGPT-derived is
+  ever interpolated; the injection defense of the old fixed phrase is intact.
+- **OWNER_DECISION_WAIT**: an internal wait naming an owner power with no
+  dialog on screen used to be silently dropped (OWNER_WAIT / not-doctor-
+  domain); it now escalates as `owner_decision_required` after its SLO.
+- **agent_crash_loop**: repeated crash/recover cycles emit the distinct
+  repeated-failure trigger.
+- **SLO watchdog + owner_intervention** (`core/closed_loop_wake.py`, in the
+  companion loop): a delivered wake with no progress inside the SLO re-wakes
+  once then escalates; a manual owner prod while a condition was pending is
+  counted as an `owner_intervention` incident (conservative heuristic; one
+  live false positive disclosed, event 5552). Counters surfaced in
+  observability_summary.
+- **Stale-queue fix** (the biggest live find): pre-guard pytest debris and a
+  chronic backlog were being delivered HOURS late into real chats (event 4881
+  reached the owner ~10h after emission). `wake_bridge.expire_stale` now
+  retires decided-but-undelivered wakes past `WAKE_BRIDGE_MAX_AGE_SECS` (3h)
+  or carrying the audited invalid overlay, before delivery — audited in
+  `wake_expire_audit`, events stay readable in the inbox. Review note: the
+  age ceiling also expires genuine decision wakes if delivery is down >3h;
+  accepted because expiry is audited and the inbox persists.
+- cdp_composer can open a ChatGPT tab when none exists instead of failing the
+  send.
+
+Live proof (production DB, companion restarted, nobody typing):
+- Autonomous wakes with the new template delivered and verified
+  (`submitted_and_user_turn_appeared/_id_advanced`): events 5518, 5521, 5522,
+  5529, 5534, 5537, 5544, 5545, 5548, 5551 — 5548 end-to-end through the new
+  agent_watch pipeline.
+- **Distinct-route proof**: genuine permission dialog on
+  payorch-sonnet-fixes:0.0 → event 5566 (`agent_prompt_needs_response`,
+  project payment-orchestrator) → journal
+  `delivered wake for event 5566 [route payment-orchestrator] to
+  https://chatgpt.com/c/6a7f1005-… : submitted_and_user_turn_appeared` —
+  the bound project chat, not the owner-os fallback. Disclosed caveat: the
+  bridge-consultation step for 5566 was replayed manually with the event's
+  own recorded fields after a diagnostic script ran without
+  WAKE_BRIDGE_ENABLED; classification, emission, routing, delivery,
+  verification and dedupe all went through the real pipeline, and the
+  owner-os batch above was fully autonomous end-to-end.
+- Dedupe: spot-checked events each have exactly one delivery row; the
+  `wake_submitted` latch prevents re-offers.
+- Event 5538 trace: skipped during the agent's ~16-min emergency
+  WAKE_BRIDGE_KILL_SWITCH window (its own stale-bleed mitigation, since
+  removed); the pane condition self-resolved — legitimate skip, not a bug.
+- Synthetic events adjudicated during the run: 4881 + 9 siblings (pre-guard
+  pytest debris) and 5576/5584 (router smoke jobs) — all retired via audited
+  mark_invalid + acknowledge; none counted as proof.
+
+## Task 209 — runtime dispatch wired through the router
+
+Commits `1afcf40` (Sonnet-implemented), `965fbbf` (review fix).
+
+- Every planner call (plan + each repair attempt) asks `model_router.route()`:
+  kind→class mapping (unknown kinds fail toward sonnet), risk floor from
+  risk_level + conservative money/security goal scan, lineage of prior failed
+  jobs feeding the escalation ladder; a sonnet plan whose tests fail escalates
+  its repair toward opus. Decisions land as `model_selection` job artifacts +
+  log lines + `router_decision` rows; outcomes (with planner token accounting
+  where observable) land as `router_outcome` rows. Router failure can never
+  block a job (falls back to the configured default); `RUNTIME_MODEL_ROUTER=0`
+  disables.
+- Live smoke: two real jobs through the API. Job b34772f4 proved decision
+  (sonnet/routine_implementation) + failure outcome with token accounting
+  (2 in / 82 out) — and exposed a lost-update bug: the fallback-planning
+  metadata append used a stale job dict and clobbered the model_selection
+  artifact. Fixed (`965fbbf`) with a live-shaped regression; job 58ce9d16
+  then proved both artifacts surviving together.
+- Observation for later: both trivial smoke goals made the planner return
+  prose without a `files` list → deterministic fallback (truthful
+  `fallback_plan_only`). Pre-existing planner behavior, not a router defect.
+
+## State
+
+Services active: ai-runtime, owner-os-wake-companion, owner-os-chromium.
+Session commits tonight: `41c9788, cf0a7e2, 820cb55, e698604, d0b46d3,
+e6c79a9, 21e788a, 7aad2b1, 13bff6c, 1afcf40, 965fbbf`. Owner OS 2.0 roadmap
+may continue (193/202 research iterations, 200/203) per the standing model
+partition.
