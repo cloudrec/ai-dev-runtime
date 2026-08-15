@@ -24,7 +24,11 @@ projects:
     cwd: /opt/mess
     required_sources:
       - /opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md
-      - /opt/mess/reports/PROJECT_STATE.md
+      # /opt/mess/reports/PROJECT_STATE.md removed 2026-08-15: the mess agent
+      # reorganized its reports and the file no longer exists on disk. The
+      # authoritative pointer below is the durable queue (see note), so the
+      # governor loses nothing; a dangling required_source only fails the
+      # config-coherence test and every runtime job gated on the repo suite.
     # The owner's agent created the durable machine-readable queue during V8; it — not
     # PROJECT_STATE alone — is authoritative.
     authoritative_pointer: /opt/mess/design/v1/REDESIGN_EXECUTION_QUEUE.md
