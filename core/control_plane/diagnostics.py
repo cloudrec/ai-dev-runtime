@@ -736,6 +736,25 @@ def log_growth_report(*, now: Optional[float] = None, rate_window_secs: float = 
     }
 
 
+def closed_loop_wake_report(*, now: Optional[float] = None, conn=None) -> dict:
+    """Task 211 status surface: wakes actually delivered (real ChatGPT user turns) by
+    trigger class, the owner_intervention metric, and loop-SLO breach counts. Read-only,
+    additive — a small wrapper over `core.closed_loop_wake.counters`."""
+    now = now if now is not None else time.time()
+    from core import closed_loop_wake as _clw
+    own = conn is None
+    if conn is None:
+        from core.control_plane.store import connect, init_db
+        conn = connect()
+        init_db(conn)
+    try:
+        c = _clw.counters(conn=conn, now=now)
+    finally:
+        if own:
+            conn.close()
+    return {"metric": "closed_loop_wake", **c, "status": "green"}
+
+
 def observability_summary(*, now: Optional[float] = None) -> dict:
     """Combined read-only view. `all_clear` is true when there are no ACTIVE failures,
     regardless of historical totals — so a green system is not flagged by stale counters."""
@@ -759,6 +778,13 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     consistency = consistency_report(now=now)
     restartc = restart_consistency_report(now=now)
     growth = log_growth_report(now=now)
+    try:
+        closed_loop_wake = closed_loop_wake_report(now=now)
+    except Exception as e:  # noqa: BLE001 — additive; must never blind the rest
+        closed_loop_wake = {"metric": "closed_loop_wake", "error": str(e)[:200],
+                            "wakes_delivered_by_trigger_class": {},
+                            "wakes_delivered_total": 0, "owner_intervention_count": 0,
+                            "loop_slo_rewoken": 0, "loop_slo_escalated": 0}
     active = notif["active"] + jobs["active"]
     # consolidated reasons the aggregate is red (empty ⇒ green) — so a consumer sees WHICH
     # check failed without parsing every sub-report.
@@ -812,6 +838,7 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         "open_gate_backlog": gates["open_total"],
         "owner_gate_sla_breaches": gates["breached_count"],   # advisory: overdue owner decisions
         "owner_gate_escalate": gates["escalate"],             # not red — owner action, not a fault
+        "closed_loop_wake": closed_loop_wake,                 # task 211: additive, not red/green
         "all_clear": healthy,
         "status": "green" if healthy else "red",
         "checked_at": (datetime.fromtimestamp(now, timezone.utc).isoformat()),

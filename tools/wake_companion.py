@@ -99,6 +99,17 @@ def tick(wb) -> dict:
         # Acknowledge ONLY on verified delivery. Anything else leaves the wake pending,
         # which is what makes a failed submission retryable instead of silently consumed.
         wb.acknowledge(p["event_id"])
+        if p.get("actionable"):
+            # SLO watchdog (task 211): start tracking THIS confirmed real user turn so
+            # a re-wake/escalation fires if the agent never moves. Best-effort — the
+            # companion's core loop must never break because of the watchdog.
+            try:
+                from core import closed_loop_wake
+                closed_loop_wake.register_delivery(
+                    event_id=p["event_id"], target=p.get("agent_id", ""),
+                    project_id=p.get("route_key", ""))
+            except Exception:  # noqa: BLE001
+                pass
         print(f"delivered wake for event {p['event_id']} "
               f"[route {p.get('route_key', '?')}] to {p['conversation']}: "
               f"{res.get('reason')}", flush=True)
@@ -131,6 +142,24 @@ def watch_agents() -> dict:
 
 
 STALL_DOCTOR_ENABLED = os.getenv("STALL_DOCTOR_ENABLED", "1") not in ("0", "", "false")
+CLOSED_LOOP_WATCH_ENABLED = os.getenv("CLOSED_LOOP_WATCH_ENABLED", "1") not in (
+    "0", "", "false")
+
+
+def watch_closed_loop() -> dict:
+    """One SLO-watchdog pass: a wake that was delivered (real user turn confirmed) but
+    produced no observed progress gets re-woken once, then escalated. Task 211 — the
+    part of the closed loop neither the bridge nor the doctor covers alone."""
+    from core import closed_loop_wake
+    r = closed_loop_wake.slo_scan()
+    for e in r.get("rewoken", []):
+        print(f"closed-loop-watch: re-woke {e['target']} for stalled event "
+              f"{e['event_id']} (new event {e.get('rewoken_event_id')})", flush=True)
+    for e in r.get("escalated", []):
+        print(f"closed-loop-watch: escalated {e['target']} — no progress after "
+              f"re-wake (event {e['event_id']} -> {e.get('escalated_event_id')})",
+              flush=True)
+    return r
 
 
 def doctor_agents() -> dict:
@@ -186,6 +215,11 @@ def main() -> None:
                     doctor_agents()
                 except Exception as e:  # noqa: BLE001
                     print(f"stall-doctor error: {str(e)[:160]}", flush=True)
+            if CLOSED_LOOP_WATCH_ENABLED and n % RUNTIME_WATCH_EVERY_TICKS == 0:
+                try:
+                    watch_closed_loop()
+                except Exception as e:  # noqa: BLE001
+                    print(f"closed-loop-watch error: {str(e)[:160]}", flush=True)
             if n % DISCOVERY_EVERY_TICKS == 0:
                 discover_chats()
         except Exception as e:  # noqa: BLE001
