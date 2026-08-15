@@ -23,11 +23,23 @@ def _isolated_db(tmp_path, monkeypatch):
     yield
 
 
-def test_flags_off_by_default_before_and_after_harness():
-    # harness must not leave the actuator armed
-    assert act.ENABLED is False
-    sim.run_canary("sim:0.0", SAFE)
-    assert act.ENABLED is False and act.CANARY_AGENTS == frozenset()
+def test_flags_off_by_default_before_and_after_harness(monkeypatch):
+    # harness must not leave the actuator armed. "Default" means a CLEAN env:
+    # under the live service the canary drop-ins deliberately arm the actuator
+    # (CONTROL_PLANE_ACTUATOR_ENABLED=1), and a runtime job's worktree suite
+    # inherits that env — this test measures the code's defaults, not the
+    # host's configuration, so the flags are cleared for its duration.
+    import importlib
+    monkeypatch.delenv("CONTROL_PLANE_ACTUATOR_ENABLED", raising=False)
+    monkeypatch.delenv("CONTROL_PLANE_CANARY_AGENTS", raising=False)
+    importlib.reload(act)
+    try:
+        assert act.ENABLED is False
+        sim.run_canary("sim:0.0", SAFE)
+        assert act.ENABLED is False and act.CANARY_AGENTS == frozenset()
+    finally:
+        monkeypatch.undo()
+        importlib.reload(act)
 
 
 # ── full path PASS ───────────────────────────────────────────────────────────
