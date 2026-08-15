@@ -394,6 +394,13 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             if cls == "working" and row and row[2]:
                 conn.execute("UPDATE agent_watch_state SET notified_cls='', "
                              "notified_digest='' WHERE target=?", (target,))
+            # RECOVERY RECONCILES THE RECORD. A pane announced crashed that is now
+            # observed ALIVE (event 5123: payorch declared dead at 09:11, visibly
+            # working minutes later) must not leave a critical crash alert standing
+            # as current truth. The event row is never touched — the alert is retired
+            # via the audited invalid overlay, exactly like a proven-false alert.
+            if row and row[2] == "crashed" and a.get("alive") and cls != "crashed":
+                _reconcile_recovered_crash(conn, target, now)
             if cls not in _EVENT_FOR:
                 skipped.append({"target": target, "why": f"class_{cls}"})
                 continue
@@ -493,6 +500,33 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
     finally:
         if own:
             conn.close()
+
+
+def _reconcile_recovered_crash(conn, target: str, now: float) -> list:
+    """Retire crash alerts contradicted by the pane being alive again. Marks every
+    un-invalidated agent_process_failed event for this target invalid (audited
+    overlay, event rows untouched) and acknowledges their pending wakes so a
+    recovered process cannot keep paging as dead."""
+    retired = []
+    try:
+        rows = conn.execute(
+            "SELECT e.id FROM event e LEFT JOIN agent_alert_invalid i "
+            "ON i.event_id = e.id WHERE e.source='agent_watch' "
+            "AND e.type='agent_process_failed' AND e.agent_id=? "
+            "AND i.event_id IS NULL ORDER BY e.id DESC LIMIT 5", (target,)).fetchall()
+        for (eid,) in rows:
+            mark_invalid(eid, reason=f"process observed alive at {now_iso()} — "
+                                     "transient/recovered, not a current crash",
+                         by="agent_watch", conn=conn, now=now)
+            try:
+                from core import wake_bridge
+                wake_bridge.acknowledge(eid, conn=conn, now=now)
+            except Exception:  # noqa: BLE001
+                pass
+            retired.append(eid)
+    except Exception:  # noqa: BLE001 — reconciliation must never break the sweep
+        pass
+    return retired
 
 
 def mark_invalid(event_id: int, *, reason: str, by: str = "owner", conn=None,

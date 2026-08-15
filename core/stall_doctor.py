@@ -1,0 +1,370 @@
+"""Stall Doctor — the supervisor layer that ends "the owner had to look at the
+terminal and ping each chat" (live acceptance incident 2026-08-15 ~12:27).
+
+Three at-rest wait shapes, each with a distinct safe policy:
+
+  LOST_CONTINUATION   an actionable instruction is already QUEUED in the
+                      composer while the agent sits waiting_input/idle
+                      (gaika-video: 'Proceed with the opening fix…' — nobody
+                      pressed Enter). Doctor re-submits the owner's OWN line
+                      (Enter only, never authors content) when it is
+                      provenance-safe; otherwise escalates.
+  CHILD_WORKFLOW_WAIT the pane says it waits for a child workflow and the
+                      child's progress counter is visible (jobhunter:
+                      'Waiting for 1 dynamic workflow… ◯ fable-second-pass-
+                      audit 38/71'). While the counter MOVES the doctor is
+                      silent; a static child past its SLO gets a safe
+                      diagnose-and-continue nudge.
+  INTERNAL_WAIT       the pane waits on an internal gate/test/build result
+                      (payorch: 'Waiting for gate results before pushing').
+                      NOT automatically an owner decision: the doctor nudges
+                      the agent to check its own gate and continue the safe
+                      local path. Only a wait naming an owner/approval/prod
+                      power escalates.
+
+Fail-closed rules, in order of authority:
+  * a pane in waiting_owner or showing a permission dialog is agent_watch's
+    domain — the doctor never touches it and never answers dialogs;
+  * ANY observed progress (bottom-region digest moved, child counter moved,
+    working state) resets the episode — a busy agent is never nudged;
+  * authored nudge texts must pass the continuation-watchdog allowlist
+    classifier (is_safe_continuation) — they are composed from its closed
+    vocabulary and verified at runtime anyway;
+  * a queued line is re-submitted only when ASCII-evaluable, not a dialog
+    answer, and free of the destructive/live/credential denylist — the exact
+    lessons of the 2026-08-03 auto-Enter incident. Anything else escalates.
+  * loop guard: at most MAX_ACTIONS_PER_EPISODE per (target, digest) episode,
+    with ACTION_COOLDOWN_SECS between actions; every action is ledgered
+    durably and audited as a CTO event.
+
+Delivery uses the continuation watchdog's hardened deliver_and_verify (lease,
+five-proof verification, one bounded Enter retry) — no new transport.
+"""
+from __future__ import annotations
+
+import os
+import re
+from typing import Callable, Optional
+
+from core.control_plane.api import _c
+from core.control_plane.store import now_iso, now_ts
+
+ENABLED = os.getenv("STALL_DOCTOR_ENABLED", "1") not in ("0", "", "false", "no")
+# Comma list of targets, or "all". The owner's 2026-08-15 instruction makes
+# universal safe continuation the default; "" disables actuation (observe-only).
+ACTUATE = os.getenv("STALL_DOCTOR_ACTUATE", "all")
+WAIT_SLO_SECS = int(os.getenv("STALL_DOCTOR_SLO_SECS", "300"))
+CHILD_SLO_SECS = int(os.getenv("STALL_DOCTOR_CHILD_SLO_SECS", "900"))
+ACTION_COOLDOWN_SECS = int(os.getenv("STALL_DOCTOR_COOLDOWN_SECS", "1800"))
+MAX_ACTIONS_PER_EPISODE = int(os.getenv("STALL_DOCTOR_MAX_ACTIONS", "2"))
+
+LOST_CONTINUATION = "LOST_CONTINUATION"
+CHILD_WORKFLOW_WAIT = "CHILD_WORKFLOW_WAIT"
+INTERNAL_WAIT = "INTERNAL_WAIT"
+OWNER_WAIT = "OWNER_WAIT"
+NONE = "NONE"
+
+_CHILD_WAIT_RE = re.compile(
+    r"waiting for \d+ (?:dynamic )?workflows?|workflow to finish", re.I)
+_CHILD_PROGRESS_RE = re.compile(r"[◯◉]\s*(\S+)\s+(\d+)\s*/\s*(\d+)")
+_INTERNAL_WAIT_RE = re.compile(
+    r"waiting (?:for|on) (?:the )?(?:gate|test|ci|suite|build|pipeline|results?|"
+    r"checks?|verification|scan)", re.I)
+# a wait that NAMES an owner power is a real owner decision, not an internal wait
+_OWNER_POWER_RE = re.compile(
+    r"(owner|approval|approve|permission|decision|разреш|подтверд|прод\b|"
+    r"production|\bprod\b|merge|\bdns\b|secret|payment|deploy)", re.I)
+
+# provenance gate for re-submitting an ALREADY-QUEUED line (Enter only)
+_EVALUABLE_RE = re.compile(r"^[\x09\x0a\x0d\x20-\x7e]*$")
+_DIALOG_ANSWER_RE = re.compile(
+    r"^\s*(\d{1,2}[.)]?|y|yes|n|no|ok|okay|да|нет|д|н)\s*[.!]?\s*$", re.I)
+
+# authored nudges — composed strictly from the watchdog's closed safe vocabulary
+NUDGE_INTERNAL = ("Continue: check the test suite checks and proceed with the "
+                  "next safe step only.")
+NUDGE_CHILD = ("Continue: check the running task progress and proceed with the "
+               "next safe step.")
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS stall_doctor_state (
+    target TEXT PRIMARY KEY,
+    shape TEXT, digest TEXT, first_ts REAL,
+    actions INTEGER DEFAULT 0, last_action_ts REAL, escalated INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS stall_doctor_action (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target TEXT, shape TEXT, action TEXT, digest TEXT,
+    delivered INTEGER, detail TEXT, at TEXT, ts REAL
+)
+"""
+
+
+def _conn(conn=None):
+    conn, own = _c(conn)
+    for stmt in _SCHEMA.strip().split(";"):
+        if stmt.strip():
+            conn.execute(stmt)
+    return conn, own
+
+
+def may_submit_queued(text: str) -> tuple[bool, str]:
+    """Provenance gate for pressing Enter on an already-typed line."""
+    from core.agent_continuation_watchdog import _FORBIDDEN_RE
+    t = (text or "").strip()
+    if not t:
+        return False, "empty"
+    if len(t) > 400:
+        return False, "too_long_to_evaluate"
+    if not _EVALUABLE_RE.match(t):
+        return False, "non_ascii_unevaluable"
+    if _DIALOG_ANSWER_RE.match(t):
+        return False, "would_answer_a_dialog"
+    if _FORBIDDEN_RE.search(t):
+        return False, "forbidden_token"
+    return True, "queued_line_provenance_safe"
+
+
+def classify_wait(tail: str, *, state: str = "", pending: str = "") -> dict:
+    """(pane tail, inventory state, queued input) -> wait shape + evidence."""
+    from core import agent_watch
+    st = (state or "").strip()
+    region = agent_watch._bottom_region(tail)
+    raw = tail or ""
+    if st == "waiting_owner" or agent_watch._OWNER_PROMPT_RE.search(region) \
+            or agent_watch._MENU_RE.search(region):
+        return {"shape": OWNER_WAIT, "evidence": "owner_prompt_or_menu"}
+    if st in ("working", "shell_running"):
+        return {"shape": NONE, "evidence": f"inventory_state_{st}"}
+    child = None
+    m = _CHILD_PROGRESS_RE.search(raw)
+    if m:
+        child = {"name": m.group(1), "done": int(m.group(2)), "total": int(m.group(3))}
+    if _CHILD_WAIT_RE.search(raw):
+        return {"shape": CHILD_WORKFLOW_WAIT, "child": child,
+                "evidence": "child_workflow_wait_text"}
+    if (pending or "").strip():
+        return {"shape": LOST_CONTINUATION, "evidence": "queued_input_at_rest"}
+    m2 = _INTERNAL_WAIT_RE.search(region)
+    if m2:
+        if _OWNER_POWER_RE.search(region):
+            return {"shape": OWNER_WAIT, "evidence": "wait_names_owner_power"}
+        return {"shape": INTERNAL_WAIT, "evidence": f"internal_wait:{m2.group(0)[:40]}"}
+    return {"shape": NONE, "evidence": "no_wait_signal"}
+
+
+def _digest(tail: str, child: Optional[dict]) -> str:
+    """Episode identity. The child counter is deliberately INCLUDED raw (not
+    digit-stripped): a moving counter must read as progress, not as the same
+    episode."""
+    from core import agent_watch
+    base = agent_watch.digest_of(agent_watch._bottom_region(tail))
+    if child:
+        base += f":{child['name']}:{child['done']}/{child['total']}"
+    return base
+
+
+def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
+           actions_used: int = 0, since_last_action: float = 1e9,
+           child: Optional[dict] = None) -> dict:
+    """Pure policy. Returns {action, reason} — fully testable."""
+    if shape in (NONE, OWNER_WAIT):
+        return {"action": "none",
+                "reason": "not_doctor_domain" if shape == OWNER_WAIT else "no_wait"}
+    slo = CHILD_SLO_SECS if shape == CHILD_WORKFLOW_WAIT else WAIT_SLO_SECS
+    if age_secs < slo:
+        return {"action": "none", "reason": f"within_slo_{slo}s"}
+    if actions_used >= MAX_ACTIONS_PER_EPISODE:
+        return {"action": "escalate", "reason": "loop_guard_exhausted"}
+    if since_last_action < ACTION_COOLDOWN_SECS:
+        return {"action": "none", "reason": "action_cooldown"}
+    if shape == LOST_CONTINUATION:
+        ok, why = may_submit_queued(pending)
+        if ok:
+            return {"action": "submit_queued", "reason": why}
+        return {"action": "escalate", "reason": f"queued_line_not_submittable:{why}"}
+    if shape == CHILD_WORKFLOW_WAIT:
+        return {"action": "nudge", "text": NUDGE_CHILD,
+                "reason": "child_workflow_static_past_slo"}
+    return {"action": "nudge", "text": NUDGE_INTERNAL,
+            "reason": "internal_wait_past_slo"}
+
+
+def _actuation_allowed(target: str) -> bool:
+    a = (ACTUATE or "").strip()
+    if not a:
+        return False
+    if a.lower() == "all":
+        return True
+    return target in {t.strip() for t in a.split(",") if t.strip()}
+
+
+def _deliver(target: str, cwd: str, *, action: str, text: str) -> dict:
+    """Hardened transport: lease + deliver_and_verify (five proofs, one bounded
+    Enter retry). `submit` presses Enter on the existing line; `deliver` sends
+    an authored nudge that must pass the allowlist classifier — verified here
+    at runtime, not only at authoring time."""
+    from core import agent_continuation_watchdog as cw
+    from core.control_plane import api as cp
+    if action == "deliver" and not cw.is_safe_continuation(text):
+        return {"ok": False, "reason": "nudge_failed_safety_classifier"}
+    lease = cp.acquire_lease(f"agent:{target}", "stall_doctor", ttl_secs=120)
+    try:
+        ctrl = cw.Controller()
+        out = cw.deliver_and_verify(ctrl, target=target, cwd=cwd, action=action,
+                                    step_text=text, expected_pending=text)
+        ok = bool((out.get("verify") or {}).get("ok"))
+        return {"ok": ok, "verify": out.get("verify")}
+    finally:
+        try:
+            cp.release_lease(f"agent:{target}", (lease or {}).get("lease_id"))
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
+         pending_fn: Optional[Callable] = None, deliver_fn: Optional[Callable] = None,
+         emit_fn: Optional[Callable] = None, conn=None,
+         now: Optional[float] = None) -> dict:
+    """One doctor pass over the live agents. Injectable for tests."""
+    now = now if now is not None else now_ts()
+    if not ENABLED:
+        return {"acted": [], "skipped": [], "reason": "doctor_disabled"}
+    if agents is None:
+        from core import agent_control
+        agents = [a for a in agent_control.agent_list().get("agents", [])
+                  if a.get("is_agent") and a.get("alive")]
+    if read_fn is None:
+        from core import agent_control
+
+        def read_fn(target):  # noqa: F811
+            return agent_control.agent_read(target, 60).get("output", "")
+    if pending_fn is None:
+        from core import agent_control
+
+        def pending_fn(target, tail, cwd):  # noqa: F811
+            return agent_control.pending_input_text(target, tail, cwd=cwd) or ""
+    if deliver_fn is None:
+        deliver_fn = _deliver
+    if emit_fn is None:
+        from core.control_plane.cto import emit as emit_fn  # noqa: F811
+
+    conn, own = _conn(conn)
+    try:
+        acted, skipped = [], []
+        for a in agents:
+            target = a.get("target") or ""
+            if not target:
+                continue
+            cwd = a.get("claude_cwd") or a.get("cwd") or ""
+            try:
+                tail = read_fn(target)
+            except Exception:  # noqa: BLE001
+                skipped.append({"target": target, "why": "unreadable"})
+                continue
+            pending = ""
+            try:
+                pending = pending_fn(target, tail, cwd)
+            except Exception:  # noqa: BLE001
+                pass
+            c = classify_wait(tail, state=a.get("state", ""), pending=pending)
+            shape = c["shape"]
+            dg = _digest(tail, c.get("child"))
+            row = conn.execute(
+                "SELECT shape, digest, first_ts, actions, last_action_ts, escalated "
+                "FROM stall_doctor_state WHERE target=?", (target,)).fetchone()
+            if shape in (NONE, OWNER_WAIT):
+                conn.execute("DELETE FROM stall_doctor_state WHERE target=?", (target,))
+                conn.commit()
+                skipped.append({"target": target, "why": f"shape_{shape}"})
+                continue
+            if row and row[0] == shape and row[1] == dg:
+                first_ts, actions, last_ts, escalated = row[2], row[3], row[4] or 0, row[5]
+            else:
+                # new episode OR progress (digest moved — a moving child counter
+                # lands here every time it ticks, resetting the clock)
+                first_ts, actions, last_ts, escalated = now, 0, 0, 0
+                conn.execute(
+                    "INSERT INTO stall_doctor_state (target, shape, digest, first_ts,"
+                    " actions, last_action_ts, escalated) VALUES (?,?,?,?,0,0,0)"
+                    " ON CONFLICT(target) DO UPDATE SET shape=excluded.shape,"
+                    " digest=excluded.digest, first_ts=excluded.first_ts, actions=0,"
+                    " last_action_ts=0, escalated=0", (target, shape, dg, now))
+                conn.commit()
+            d = decide(shape, pending=pending, age_secs=now - first_ts,
+                       actions_used=actions, since_last_action=now - (last_ts or 0),
+                       child=c.get("child"))
+            if d["action"] == "none":
+                skipped.append({"target": target, "shape": shape, "why": d["reason"]})
+                continue
+            project = _project_of(a, conn)
+            if d["action"] == "escalate":
+                if escalated:
+                    skipped.append({"target": target, "shape": shape,
+                                    "why": "already_escalated"})
+                    continue
+                ev = emit_fn(
+                    "stall_doctor", "agent_waiting_input", project_id=project,
+                    agent_id=target, severity="high", owner_action_required=True,
+                    payload={"target": target, "shape": shape, "reason": d["reason"],
+                             "pending": (pending or "")[:200], "digest": dg},
+                    action_taken=(f"{target}: {shape} needs the owner — {d['reason']} "
+                                  f"({(pending or '')[:80]})"),
+                    correlation_id=f"waiting:{target}",
+                    dedup_key=f"doctor:{target}:{shape}:{dg}",
+                    dedup_window_secs=86400, conn=conn)
+                conn.execute("UPDATE stall_doctor_state SET escalated=1 WHERE target=?",
+                             (target,))
+                self_log(conn, target, shape, "escalate", dg, False, d["reason"], now)
+                conn.commit()
+                acted.append({"target": target, "shape": shape, "action": "escalate",
+                              "event_id": (ev or {}).get("event_id")})
+                continue
+            if not _actuation_allowed(target):
+                skipped.append({"target": target, "shape": shape,
+                                "why": "actuation_not_allowed"})
+                continue
+            if d["action"] == "submit_queued":
+                res = deliver_fn(target, cwd, action="submit", text=pending)
+            else:
+                res = deliver_fn(target, cwd, action="deliver", text=d["text"])
+            ok = bool(res.get("ok"))
+            conn.execute(
+                "UPDATE stall_doctor_state SET actions=actions+1, last_action_ts=?"
+                " WHERE target=?", (now, target))
+            self_log(conn, target, shape, d["action"], dg, ok,
+                     f"{d['reason']}; verify={res.get('reason') or ok}", now)
+            emit_fn(
+                "stall_doctor", "stall_doctor_action", project_id=project,
+                agent_id=target, severity="info", owner_action_required=False,
+                payload={"target": target, "shape": shape, "action": d["action"],
+                         "delivered": ok, "reason": d["reason"], "digest": dg,
+                         "pending": (pending or "")[:120]},
+                action_taken=(f"doctor {d['action']} on {target} ({shape}): "
+                              f"delivered={ok}"),
+                correlation_id=f"doctor:{target}",
+                dedup_key=f"doctor:{target}:{shape}:{dg}:{d['action']}:{int(now)}",
+                dedup_window_secs=60, conn=conn)
+            conn.commit()
+            acted.append({"target": target, "shape": shape, "action": d["action"],
+                          "delivered": ok})
+        return {"acted": acted, "skipped": skipped, "agents_seen": len(agents)}
+    finally:
+        if own:
+            conn.close()
+
+
+def self_log(conn, target, shape, action, digest, delivered, detail, now) -> None:
+    conn.execute(
+        "INSERT INTO stall_doctor_action (target, shape, action, digest, delivered,"
+        " detail, at, ts) VALUES (?,?,?,?,?,?,?,?)",
+        (target, shape, action, digest, int(bool(delivered)), (detail or "")[:300],
+         now_iso(), now))
+
+
+def _project_of(agent: dict, conn) -> str:
+    try:
+        from core import agent_watch
+        return agent_watch.project_for(agent, conn=conn)
+    except Exception:  # noqa: BLE001
+        return ""

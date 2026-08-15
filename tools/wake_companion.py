@@ -130,6 +130,21 @@ def watch_agents() -> dict:
     return r
 
 
+STALL_DOCTOR_ENABLED = os.getenv("STALL_DOCTOR_ENABLED", "1") not in ("0", "", "false")
+
+
+def doctor_agents() -> dict:
+    """One stall-doctor pass: at-rest wait shapes -> safe auto-continuation or a
+    genuine owner escalation. The owner must never have to read terminals to
+    find a pane holding its own next instruction."""
+    from core import stall_doctor
+    r = stall_doctor.scan()
+    for e in r.get("acted", []):
+        print(f"stall-doctor: {e['action']} {e['target']} ({e['shape']}) "
+              f"delivered={e.get('delivered', '-')}", flush=True)
+    return r
+
+
 def watch_runtime() -> dict:
     """One runtime pass: stalled-job detection (evidence-based, deduped) plus the
     bounded supervisor recovery sweep. Runs HERE, outside the ai-runtime service
@@ -166,6 +181,11 @@ def main() -> None:
                     watch_runtime()
                 except Exception as e:  # noqa: BLE001
                     print(f"runtime-watch error: {str(e)[:160]}", flush=True)
+            if STALL_DOCTOR_ENABLED and n % RUNTIME_WATCH_EVERY_TICKS == 0:
+                try:
+                    doctor_agents()
+                except Exception as e:  # noqa: BLE001
+                    print(f"stall-doctor error: {str(e)[:160]}", flush=True)
             if n % DISCOVERY_EVERY_TICKS == 0:
                 discover_chats()
         except Exception as e:  # noqa: BLE001

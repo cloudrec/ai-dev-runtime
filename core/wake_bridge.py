@@ -83,6 +83,9 @@ ROUTINE_EVENT_TYPES = frozenset({
     # the terminal states that matter arrive as task_failed / action_blocked /
     # owner_decision_required / task_completed and wake through those.
     "runtime_job_state", "runtime_job_retried",
+    # stall-doctor auto-actions: the whole point is that the owner is NOT woken;
+    # genuine escalations arrive as agent_waiting_input and wake through that.
+    "stall_doctor_action",
 })
 
 

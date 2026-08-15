@@ -254,6 +254,40 @@ def test_idle_after_work_without_a_stated_finish_is_not_a_completion():
     assert r["emitted"] == [] and emit.calls == []
 
 
+def test_recovered_process_retires_its_crash_alert():
+    """Event 5123, live: payorch-live-buttons was declared crashed at 09:11 and
+    was visibly working minutes later — the critical crash alert stood as
+    current truth. A pane observed ALIVE again must retire its crash alerts
+    via the audited invalid overlay (event rows untouched)."""
+    from core.control_plane.api import append_event
+    emit = _Emit()
+    t = "payorch-live-buttons:0.0"
+    # the pane vanishes twice while tracked -> crash announced
+    _scan([_agent(t, "/opt/payment-orchestrator", state="working")],
+          {t: WORKING_TAIL}, emit)
+    _scan([], {}, emit, now=1100.0)
+    r = _scan([], {}, emit, now=1200.0)
+    assert [e["class"] for e in r["emitted"]] == ["crashed"]
+    # a REAL event row for the crash (the fake emitter bypasses the event log)
+    eid = append_event("agent_watch", "agent_process_failed", agent_id=t,
+                       severity="critical", owner_action_required=True)
+    # the process is back and demonstrably alive
+    _scan([_agent(t, "/opt/payment-orchestrator", state="working")],
+          {t: WORKING_TAIL}, emit, now=1300.0)
+    from core.control_plane.api import _c
+    conn, own = _c(None)
+    try:
+        row = conn.execute("SELECT reason FROM agent_alert_invalid WHERE event_id=?",
+                           (eid,)).fetchone()
+    finally:
+        if own:
+            conn.close()
+    assert row and "alive" in row[0]
+    # retired from the default alert view, still auditable
+    assert eid not in {a["event_id"] for a in aw.recent_alerts()}
+    assert eid in {a["event_id"] for a in aw.recent_alerts(include_invalid=True)}
+
+
 def test_tool_completion_telemetry_is_never_a_task_finish():
     """Event 5051, live: the bootstrap agent's pane showed the harness notice
     `Background command "Wait for 193 monitor output" completed (exit code 0)`
