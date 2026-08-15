@@ -79,6 +79,10 @@ ROUTINE_EVENT_TYPES = frozenset({
     "work_report_published", "owner_gate_answered", "blocker_resolved",
     "context_rotated", "false_idle_corrected", "new_agent_discovered",
     "verified_record_contradicted",
+    # runtime job lifecycle chatter: durable history, never a wake on its own —
+    # the terminal states that matter arrive as task_failed / action_blocked /
+    # owner_decision_required / task_completed and wake through those.
+    "runtime_job_state", "runtime_job_retried",
 })
 
 

@@ -636,6 +636,14 @@ async def control_plane_observability(_: bool = Depends(_auth)):
     return diagnostics.observability_summary()
 
 
+@router.get("/runtime/status")
+async def runtime_status(_: bool = Depends(_auth)):
+    """Runtime job blockers beside the tmux agent view: active jobs with liveness
+    evidence, watchdog stall verdicts, open approvals, recent failures with cause."""
+    from core.control_plane import diagnostics
+    return diagnostics.runtime_blockers_report()
+
+
 class AckReq(BaseModel):
     ids: list[int]
 

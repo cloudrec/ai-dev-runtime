@@ -111,6 +111,10 @@ def tick(wb) -> dict:
 
 
 AGENT_WATCH_ENABLED = os.getenv("AGENT_WATCH_ENABLED", "1") not in ("0", "", "false")
+RUNTIME_WATCH_ENABLED = os.getenv("RUNTIME_WATCH_ENABLED", "1") not in ("0", "", "false")
+# The runtime watchdog is a minute-scale concern like agent watch, but jobs move
+# slower than panes; every 3rd tick (~60s) is plenty and keeps DB churn down.
+RUNTIME_WATCH_EVERY_TICKS = int(os.getenv("RUNTIME_WATCH_EVERY_TICKS", "3"))
 
 
 def watch_agents() -> dict:
@@ -126,6 +130,26 @@ def watch_agents() -> dict:
     return r
 
 
+def watch_runtime() -> dict:
+    """One runtime pass: stalled-job detection (evidence-based, deduped) plus the
+    bounded supervisor recovery sweep. Runs HERE, outside the ai-runtime service
+    process, precisely so a dead or wedged service cannot take its own watchdog
+    down with it — the job store on disk stays readable either way."""
+    from core import runtime_supervisor, runtime_watchdog
+    r = runtime_watchdog.scan()
+    for e in r.get("emitted", []):
+        print(f"runtime-watch: {e['reason']} job {e['job_id'][:8]} "
+              f"({e['status']}) event {e['event_id']}", flush=True)
+    try:
+        s = runtime_supervisor.scan()
+        for e in s.get("retried", []):
+            print(f"runtime-supervisor: retried job {e['job_id'][:8]} "
+                  f"as {e.get('retry_job_id', '')[:8]} ({e.get('class')})", flush=True)
+    except Exception as e:  # noqa: BLE001 — recovery must never break detection
+        print(f"runtime-supervisor error: {str(e)[:160]}", flush=True)
+    return r
+
+
 def main() -> None:
     from core import wake_bridge as wb
     n = 0
@@ -137,6 +161,11 @@ def main() -> None:
                     watch_agents()
                 except Exception as e:  # noqa: BLE001
                     print(f"agent-watch error: {str(e)[:160]}", flush=True)
+            if RUNTIME_WATCH_ENABLED and n % RUNTIME_WATCH_EVERY_TICKS == 0:
+                try:
+                    watch_runtime()
+                except Exception as e:  # noqa: BLE001
+                    print(f"runtime-watch error: {str(e)[:160]}", flush=True)
             if n % DISCOVERY_EVERY_TICKS == 0:
                 discover_chats()
         except Exception as e:  # noqa: BLE001

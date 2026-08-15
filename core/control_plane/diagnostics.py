@@ -97,6 +97,70 @@ def runtime_job_failure_report(*, now: Optional[float] = None,
     return rep
 
 
+def runtime_blockers_report(*, now: Optional[float] = None,
+                            recent_window_secs: float = 86400,
+                            jobs_db: str = None, conn=None) -> dict:
+    """Runtime job blockers, mission-control shaped: every non-terminal job with
+    its liveness evidence, stall verdicts from the runtime watchdog's persisted
+    state, and recent terminal failures with their causes — so runtime blockers
+    sit beside tmux agent blockers in one view. Read-only."""
+    now = now if now is not None else time.time()
+    path = jobs_db or _jobs_db()
+    terminal = ("completed", "failed", "cancelled", "blocked", "rolled_back",
+                "fallback_plan_only")
+    jc = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    jc.row_factory = sqlite3.Row
+    try:
+        active_rows = jc.execute(
+            "SELECT id, task_id, project_path, status, goal, heartbeat_at, updated_at "
+            "FROM jobs WHERE status NOT IN (%s) ORDER BY created_at DESC LIMIT 50"
+            % ",".join("?" * len(terminal)), terminal).fetchall()
+        failed_rows = jc.execute(
+            "SELECT id, task_id, project_path, status, error, finished_at "
+            "FROM jobs WHERE status IN ('failed','blocked') "
+            "ORDER BY coalesce(finished_at, updated_at) DESC LIMIT 20").fetchall()
+    finally:
+        jc.close()
+
+    from core import runtime_watchdog
+    def _age(iso):
+        try:
+            return round(now - datetime.fromisoformat(iso).timestamp()) if iso else None
+        except ValueError:
+            return None
+    active = []
+    for r in active_rows:
+        j = dict(r)
+        verdict = runtime_watchdog.stall_evidence(j, now)
+        active.append({
+            "job_id": j["id"], "task_id": j["task_id"], "status": j["status"],
+            "project_path": j["project_path"], "goal": (j["goal"] or "")[:120],
+            "heartbeat_age_secs": _age(j["heartbeat_at"]),
+            "updated_age_secs": _age(j["updated_at"]),
+            "stalled": bool(verdict), "stall_detail": (verdict or {}).get("detail", ""),
+        })
+    recent_failed = []
+    for r in failed_rows:
+        age = _age(r["finished_at"])
+        if age is not None and age > recent_window_secs:
+            continue
+        recent_failed.append({
+            "job_id": r["id"], "task_id": r["task_id"], "status": r["status"],
+            "project_path": r["project_path"], "error": (r["error"] or "")[:300],
+            "finished_age_secs": age,
+        })
+    stalled = [a for a in active if a["stalled"]]
+    return {
+        "metric": "runtime_blockers",
+        "active_jobs": active, "stalled_jobs": stalled,
+        "stalled_count": len(stalled),
+        "waiting_approval": [a for a in active if a["status"] == "waiting_approval"],
+        "recent_failed": recent_failed,
+        "note": ("no runtime blockers" if not stalled and not recent_failed
+                 else "runtime jobs need attention"),
+    }
+
+
 def notification_history_report(*, now: Optional[float] = None,
                                 active_window_secs: float = 3600, conn=None) -> dict:
     """Distinguish current failure STATE from cumulative failure HISTORY. A raw history
@@ -679,6 +743,12 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
     notif = notification_failure_report(now=now)
     notif_hist = notification_history_report(now=now)
     jobs = runtime_job_failure_report(now=now)
+    try:
+        blockers = runtime_blockers_report(now=now)
+    except Exception as e:  # noqa: BLE001 — an unreadable jobs DB must not blind the rest
+        blockers = {"metric": "runtime_blockers", "error": str(e)[:200],
+                    "stalled_count": 0, "stalled_jobs": [], "active_jobs": [],
+                    "waiting_approval": [], "recent_failed": []}
     registry = registry_health_report(now=now)
     gates = owner_gate_report(now=now)
     leases = lease_report(now=now)
@@ -709,11 +779,14 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         red_reasons.append("consistency_violation")
     if not restartc["restart_safe"]:
         red_reasons.append("restart_unsafe")
+    if blockers["stalled_count"]:
+        red_reasons.append(f"runtime_jobs_stalled={blockers['stalled_count']}")
     healthy = not red_reasons
     return {
         "notifications": notif,
         "notification_history": notif_hist,
         "runtime_jobs": jobs,
+        "runtime_blockers": blockers,
         "registry_health": registry,
         "open_owner_gates": gates,
         "resource_leases": leases,
