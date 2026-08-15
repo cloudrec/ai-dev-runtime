@@ -104,9 +104,21 @@ def emit_transition(job: dict, status: str, *, prev_status: str = "",
         conn=conn)
 
 
+def _pytest_without_sandbox() -> bool:
+    """True when we are inside a pytest run that has NOT redirected the control
+    plane DB. Emitting there would write test-fixture jobs into the LIVE event
+    log — which actually happened on 2026-08-15: a runtime job's repo-suite run
+    inside a worktree used an old conftest (no CONTROL_PLANE_DB pin) while its
+    hardcoded sys.path imported the live hooked modules, and 126 debris events
+    for project 'repo' landed in production and queued wakes."""
+    return bool(os.getenv("PYTEST_CURRENT_TEST")) and not os.getenv("CONTROL_PLANE_DB")
+
+
 def safe_emit_transition(job: dict, status: str, *, prev_status: str = "") -> None:
     """The swallow-everything wrapper the job store calls inline."""
     try:
+        if _pytest_without_sandbox():
+            return
         emit_transition(job, status, prev_status=prev_status)
     except Exception:  # noqa: BLE001 — event emission must never break a job write
         pass

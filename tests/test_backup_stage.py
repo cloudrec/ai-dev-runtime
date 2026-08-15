@@ -186,10 +186,29 @@ def test_incomplete_temp_cleanup_on_entry(tmp_path):
     bdir.mkdir(exist_ok=True)
     stale = bdir / "backup_20000101_000000_000000.tar.gz.tmp"
     stale.write_bytes(b"partial garbage")
+    # a leftover from a CRASHED run is old by definition — age it past the guard
+    old = time.time() - BackupEngine._STALE_TMP_SECS - 5
+    os.utime(stale, (old, old))
     eng = BackupEngine(str(repo))
     eng.snapshot(reason="test")            # cleans stale temp on entry
     assert not stale.exists()
     assert not any(p.name.endswith(".tmp") for p in bdir.iterdir())
+
+
+def test_fresh_tmp_of_concurrent_snapshot_is_not_deleted(tmp_path):
+    """2026-08-15 regression: two runtime jobs on one project snapshot at once;
+    the second's entry-cleanup deleted the first's in-progress tmp, and the
+    first's os.replace() failed with ENOENT. A FRESH tmp is a live snapshot in
+    flight, never debris."""
+    repo = _repo(tmp_path)
+    bdir = repo / ".ai-runtime-backups"
+    bdir.mkdir(exist_ok=True)
+    inflight = bdir / "backup_20260815_094639_038792.tar.gz.tmp"
+    inflight.write_bytes(b"another job is writing this right now")
+    eng = BackupEngine(str(repo))
+    meta = eng.snapshot(reason="concurrent job")
+    assert inflight.exists(), "entry-cleanup must not touch a fresh concurrent tmp"
+    assert meta.get("id")
 
 
 def test_failed_backup_removes_its_temp_and_keeps_last_valid(tmp_path, monkeypatch):

@@ -114,6 +114,25 @@ def test_reap_orphaned_emits_failed_event(cp):
     assert got["status"] == "failed" and "orphaned" in got["error"]
 
 
+def test_pytest_without_sandbox_never_writes_live_db(monkeypatch):
+    """2026-08-15 leak: a worktree repo-suite run with an old conftest (no
+    CONTROL_PLANE_DB pin) imported the live hooked job_store and wrote 126
+    debris events into production. Inside pytest with no sandboxed control
+    plane DB, emission must refuse."""
+    monkeypatch.delenv("CONTROL_PLANE_DB", raising=False)
+    assert runtime_events._pytest_without_sandbox()  # PYTEST_CURRENT_TEST is set
+
+    called = []
+    monkeypatch.setattr(runtime_events, "emit_transition",
+                        lambda *a, **k: called.append(1))
+    runtime_events.safe_emit_transition({"id": "x", "project_path": "/tmp/r"}, "failed")
+    assert not called
+    # with the sandbox pinned, emission proceeds
+    monkeypatch.setenv("CONTROL_PLANE_DB", "/tmp/sandbox.db")
+    runtime_events.safe_emit_transition({"id": "x", "project_path": "/tmp/r"}, "failed")
+    assert called
+
+
 def test_emission_failure_never_breaks_job_write(cp, monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("control plane down")

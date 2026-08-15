@@ -218,13 +218,27 @@ class BackupEngine:
 
     # ---- внутренние ----
 
+    # A tmp file younger than this is treated as another live snapshot in
+    # flight, never as stale debris. Two runtime jobs on the same project
+    # snapshot concurrently (2026-08-15: jobs dd6ee850/e4a1b151 started ~1s
+    # apart; the second's entry-cleanup deleted the first's in-progress tmp and
+    # its os.replace() died with ENOENT). Comfortably above _BACKUP_TIMEOUT.
+    _STALE_TMP_SECS = 900
+
     def _cleanup_stale_temp(self) -> None:
         """Remove leftover *.tar.gz.tmp from a previously crashed/aborted backup.
-        Only ever touches temp files — existing valid backups are preserved."""
+        Only ever touches temp files old enough that no live snapshot can still
+        be writing them — existing valid backups are preserved."""
         try:
+            cutoff = time.time() - self._STALE_TMP_SECS
             for fn in os.listdir(self.backup_dir):
                 if fn.startswith("backup_") and fn.endswith(".tar.gz.tmp"):
-                    self._safe_remove(os.path.join(self.backup_dir, fn))
+                    p = os.path.join(self.backup_dir, fn)
+                    try:
+                        if os.path.getmtime(p) < cutoff:
+                            self._safe_remove(p)
+                    except OSError:
+                        pass
         except OSError:
             pass
 
