@@ -13,6 +13,7 @@ import subprocess
 import threading
 
 from core import ai_planner, git_write, job_kinds, job_store, job_validation
+from core import job_workspace
 from core import policy_engine
 from core.backup_engine import BackupEngine
 from core.file_engine import FileEngine
@@ -35,6 +36,12 @@ _READ_ONLY_RE = re.compile(
 # comfortably under job_store._HEARTBEAT_STALE_SECS (20s) so a live job never
 # looks orphaned to recover_interrupted(), even during a long silent test run.
 _HEARTBEAT_INTERVAL_SECS = int(os.getenv("RUNTIME_HEARTBEAT_INTERVAL_SECS", "5"))
+# Isolated per-job worktrees (core.job_workspace). ON by default: checking out a
+# work branch inside the live project tree is the defect that failed
+# OWNER-151/180/182/192/193/200 on owner dirty files. Read at call time so the
+# toggle works without a reload.
+def _isolated_workspaces() -> bool:
+    return os.getenv("RUNTIME_ISOLATED_WORKSPACES", "1") not in ("0", "", "false", "no")
 
 
 def _idx(level: str) -> int:
@@ -435,8 +442,20 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
 
     # Paths this job brought into existence, tracked so a rollback can undo them.
     created_paths: list[str] = []
+    # Set by the branch stage when the job runs in an isolated worktree. Kept in a
+    # dict so _rollback (defined before the branch stage runs) sees the final value.
+    ws: dict = {"workspace": None}
 
     def _rollback(reason: str):
+        # An isolated job never modified the primary tree, so there is nothing to
+        # restore there — restoring the pre-job snapshot over the live tree would
+        # actually DESTROY owner edits made while the job ran. Discarding the
+        # worktree is the whole rollback.
+        if ws["workspace"]:
+            job_store.append_log(job_id, "warn",
+                                 f"rolled back ({reason}) — isolated worktree discarded, "
+                                 f"primary tree untouched")
+            return
         try:
             backup.rollback(backup_meta["id"])
             job_store.append_log(job_id, "warn", f"rolled back ({reason})")
@@ -454,24 +473,61 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
                                  f"workspace hygiene: removed {len(removed)} file(s) created by this "
                                  f"job so they cannot poison later jobs: {removed}")
 
-    # 3) BRANCH
+    # 3) BRANCH — in an ISOLATED worktree, never a checkout inside the live tree.
+    # The direct `checkout -b` in the shared working tree is what failed
+    # OWNER-151/180/182/192/193/200 with "Your local changes ... would be
+    # overwritten by checkout" whenever the owner had dirty files; the worktree
+    # path leaves the primary tree — dirty files included — byte-for-byte alone.
     branch = None
+    work_pp = pp
     if git_write.is_repo(pp):
         job_store.update_job(job_id, status="branching")
         try:
             git_write.fetch(pp)
             base = git_write.resolve_base_branch(pp, job["base_branch"])
             job_store.append_log(job_id, "info", f"base branch resolved: {base}")
-            branch = git_write.create_work_branch(pp, job.get("task_id"), job["goal"] or "", base)
-            job_store.append_log(job_id, "info", f"work branch: {branch}")
+            if _isolated_workspaces():
+                created = job_workspace.create(pp, job_id, job.get("task_id"),
+                                               job["goal"] or "", base)
+                ws["workspace"] = created
+                branch = created["branch"]
+                work_pp = created["path"]
+                job_store.append_log(job_id, "info",
+                                     f"work branch: {branch} (isolated worktree {work_pp})")
+            else:
+                branch = git_write.create_work_branch(pp, job.get("task_id"), job["goal"] or "", base)
+                job_store.append_log(job_id, "info", f"work branch: {branch}")
         except git_write.GitWriteError as e:
             _finish(job_id, "failed", error=f"branch failed: {e}")
             return
 
+    # Stages 4-8 operate on `work_pp`: the isolated worktree when one exists,
+    # otherwise the project tree itself (non-repo projects, or isolation off).
+    # The worktree is removed on EVERY exit path — its branch and commits
+    # survive; only the scratch directory goes.
+    try:
+        _run_work_stages(job_id, job, pp, work_pp, plan, kind, branch, tests_ctx={
+            "fallback_used": fallback_used, "rollback": _rollback,
+            "created_paths": created_paths, "heartbeat": _heartbeat})
+    finally:
+        if ws["workspace"]:
+            removed = job_workspace.remove(pp, ws["workspace"]["path"])
+            job_store.append_log(job_id, "info",
+                                 f"isolated worktree removed: {removed} "
+                                 f"({ws['workspace']['path']})")
+
+
+def _run_work_stages(job_id: str, job: dict, pp: str, work_pp: str, plan: dict,
+                     kind: str, branch, tests_ctx: dict) -> None:
+    fallback_used = tests_ctx["fallback_used"]
+    _rollback = tests_ctx["rollback"]
+    created_paths = tests_ctx["created_paths"]
+    _heartbeat = tests_ctx["heartbeat"]
+
     # 4) EDIT
     job_store.update_job(job_id, status="editing")
     try:
-        changed = _apply_files(pp, plan["files"])
+        changed = _apply_files(work_pp, plan["files"])
         created_paths.extend(changed)
         job_store.update_job(job_id, changed_files=changed)
         job_store.append_log(job_id, "info", f"applied {len(changed)} file operation(s)")
@@ -489,7 +545,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     job_store.update_job(job_id, status="testing")
 
     if not job_kinds.requires_repo_tests(kind):
-        validation = job_validation.validate(kind, pp, plan, changed, run_commands=_run_tests)
+        validation = job_validation.validate(kind, work_pp, plan, changed, run_commands=_run_tests)
         job_store.update_job(job_id, validation=validation, tests={
             "ok": validation["ok"], "results": [], "skipped_repo_suite": True,
             "reason": f"kind={kind} is validated by {validation['validation_kind']}",
@@ -510,7 +566,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         job_store.append_log(job_id, "info", f"task validation passed ({validation['validation_kind']})")
         tests = {"ok": True, "results": [], "skipped_repo_suite": True}
     else:
-        tests = _run_tests(pp, plan.get("test_commands") or [])
+        tests = _run_tests(work_pp, plan.get("test_commands") or [])
         attempt = 0
         # When a fallback plan is in use the provider planner is known-broken —
         # re-invoking it for a repair attempt would just fail/time out again, so skip
@@ -522,8 +578,8 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
                 fails = "\n".join(r["output"][-500:] for r in tests["results"] if not r["passed"])
                 repair = ai_planner.plan(job["goal"] or "", (job["instructions"] or "") +
                                          f"\n\nThe previous attempt FAILED tests:\n{fails}\nFix it.",
-                                         pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat)
-                repair_changed = _apply_files(pp, repair["files"])
+                                         work_pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat)
+                repair_changed = _apply_files(work_pp, repair["files"])
                 created_paths.extend(repair_changed)
                 by_path = {c["path"]: c for c in changed}
                 by_path.update({c["path"]: c for c in repair_changed})
@@ -533,7 +589,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
             except Exception as e:  # noqa: BLE001
                 job_store.append_log(job_id, "error", f"repair failed: {e}")
                 break
-            tests = _run_tests(pp, plan.get("test_commands") or [])
+            tests = _run_tests(work_pp, plan.get("test_commands") or [])
         job_store.update_job(job_id, tests=tests, validation={
             "ok": tests["ok"], "validation_kind": job_kinds.validation_kind_for(kind),
             "repo_suite_used": True,
@@ -561,9 +617,9 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     elif branch and job.get("auto_commit", True):
         job_store.update_job(job_id, status="committing")
         try:
-            git_write.add_paths(pp, [c["path"] for c in changed if c["operation"] != "delete"] +
+            git_write.add_paths(work_pp, [c["path"] for c in changed if c["operation"] != "delete"] +
                                 [c["path"] for c in changed if c["operation"] == "delete"])
-            secrets = git_write.scan_staged_for_secrets(pp)
+            secrets = git_write.scan_staged_for_secrets(work_pp)
             if secrets:
                 _rollback("secret in staged diff")
                 _finish(job_id, "failed", error=f"aborted: {secrets}")
@@ -571,8 +627,9 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
             tcount = sum(1 for r in tests.get("results", []) if r["passed"])
             msg = (f"feat(runtime): {plan.get('summary','autonomous change')}\n\n"
                    f"Task: OWNER-{job.get('task_id')}\nRuntime job: {job_id}\nTests: {tcount} passed")
-            commit_hash = git_write.commit(pp, msg)
-            git_info.update({"commit": commit_hash, "remote": git_write.remote_url(pp)})
+            commit_hash = git_write.commit(work_pp, msg)
+            git_info.update({"commit": commit_hash, "remote": git_write.remote_url(work_pp),
+                             "isolated_workspace": work_pp != pp})
             job_store.append_log(job_id, "info", f"committed {commit_hash} on {branch}")
         except git_write.GitWriteError as e:
             _rollback("commit error")
@@ -583,7 +640,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     if branch and job.get("auto_push") and _idx(job["autonomy_level"]) >= _idx("execute_safe"):
         job_store.update_job(job_id, status="pushing")
         try:
-            res = git_write.push(pp, branch)
+            res = git_write.push(work_pp, branch)
             git_info["pushed"] = True
             job_store.append_log(job_id, "info", f"pushed {branch}")
         except git_write.GitWriteError as e:

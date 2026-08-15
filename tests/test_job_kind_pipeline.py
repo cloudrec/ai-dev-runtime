@@ -119,7 +119,11 @@ def test_content_job_is_not_failed_by_a_broken_repo_test_suite(repo, tmp_path, m
     assert final["outcome"] == job_kinds.CONTENT_COMPLETE
     assert final["validation"]["repo_suite_used"] is False
     assert "python3 -m pytest -q" in final["validation"]["dropped_repo_suite_commands"]
-    assert (repo / "posts.md").exists()
+    # isolated-workspace model: the content lands on the job's work branch
+    branch = (final.get("git_info") or {}).get("branch")
+    shown = subprocess.run(["git", "-C", str(repo), "show", f"{branch}:posts.md"],
+                           capture_output=True, text=True)
+    assert shown.returncode == 0 and shown.stdout == "# post one\n"
 
 
 def test_code_change_job_is_still_gated_on_the_repo_suite(repo, tmp_path, monkeypatch):

@@ -27,6 +27,15 @@ def _git(path, *args):
     subprocess.run(["git", "-C", str(path)] + list(args), check=True, capture_output=True, text=True)
 
 
+def _branch_file(repo, job, rel):
+    """Job output under the isolated-workspace model: the committed content on
+    the job's work branch (the primary tree is deliberately untouched)."""
+    branch = ((job.get("git_info") or {}).get("branch")) or ""
+    p = subprocess.run(["git", "-C", str(repo), "show", f"{branch}:{rel}"],
+                       capture_output=True, text=True)
+    return p.stdout if p.returncode == 0 else None
+
+
 @pytest.fixture
 def repo(tmp_path):
     r = tmp_path / "repo"
@@ -92,7 +101,10 @@ def test_an_approved_owner_gated_job_passes_preflight_but_still_owes_live_eviden
     the service is proven live. Approval buys permission to act, never a green result."""
     final = _run(repo, monkeypatch, tmp_path,
                  "systemctl restart the api service", approval_required=False)
-    assert (repo / "note.md").exists(), "preflight allowed the work to proceed"
+    # Isolated-workspace model: the work lands as a commit on the job's branch,
+    # never as an edit to the primary tree.
+    assert _branch_file(repo, final, "note.md") == "x\n", \
+        "preflight allowed the work to proceed"
     rows = policy_engine.decisions(task_id=final["id"])
     pre = [r for r in rows if r["phase"] == "preflight"]
     assert pre and pre[0]["decision"] == policy_engine.ALLOW
@@ -104,7 +116,9 @@ def test_an_ordinary_change_still_completes(repo, tmp_path, monkeypatch):
     """Non-regression: the policy layer must not break a normal, safe, evidenced job."""
     final = _run(repo, monkeypatch, tmp_path, "add a short note file to the repo")
     assert final["status"] == "completed", final.get("error")
-    assert (repo / "note.md").exists()
+    assert _branch_file(repo, final, "note.md") == "x\n"
+    # and the primary tree stays exactly as the owner left it
+    assert not (repo / "note.md").exists()
 
 
 # ── the decision is durable and inspectable ────────────────────────────────

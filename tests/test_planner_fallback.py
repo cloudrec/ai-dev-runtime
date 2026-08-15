@@ -300,10 +300,15 @@ def test_no_secrets_in_stored_diagnostics(tmp_path, monkeypatch):
     assert final["status"] == "fallback_plan_only", final.get("error")
     blob = str(final["plan"]) + str(final["artifacts"]) + str(final["logs"])
     assert "sk-ant-SUPERSECRET_TOKEN" not in blob
-    # and the committed fallback doc on disk must be clean too
-    doc = repo / final["plan"]["files"][0]["path"]
-    assert "sk-ant-SUPERSECRET_TOKEN" not in doc.read_text()
-    assert "[redacted]" in doc.read_text()
+    # and the committed fallback doc must be clean too. Isolated-workspace
+    # model: the doc lives on the job's work branch, not in the primary tree.
+    branch = (final.get("git_info") or {}).get("branch")
+    shown = subprocess.run(
+        ["git", "-C", str(repo), "show", f"{branch}:{final['plan']['files'][0]['path']}"],
+        capture_output=True, text=True)
+    assert shown.returncode == 0, shown.stderr
+    assert "sk-ant-SUPERSECRET_TOKEN" not in shown.stdout
+    assert "[redacted]" in shown.stdout
 
 
 # ── E2E: existing dirty workspace preserved across a fallback job ─────────────
