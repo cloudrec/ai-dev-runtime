@@ -354,7 +354,8 @@ def _sanitize_raw(text: str, cap: int = 4000) -> str:
 
 
 def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
-        timeout: int | None = None, heartbeat_cb=None, kind: str | None = None) -> dict:
+        timeout: int | None = None, heartbeat_cb=None, kind: str | None = None,
+        model: str | None = None) -> dict:
     """heartbeat_cb(elapsed_seconds), if given, is called roughly every
     RUNTIME_PLAN_HEARTBEAT_SECS while the provider call is still running, so
     long-running plans surface progress instead of going silent until they
@@ -362,6 +363,9 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
 
     `kind` is the job kind (see core.job_kinds). A non-code kind is allowed to
     produce a plan with no file operations; code changes still must touch a file.
+
+    `model`, if given (e.g. from core.model_router), overrides RUNTIME_CLAUDE_MODEL
+    for this call only — same override precedence as smoke()'s `model` param.
     """
     if not available():
         raise PlannerError("provider_not_configured")
@@ -380,9 +384,10 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
     except Exception:
         listing = "(unavailable)"
     prompt = _build_prompt(goal, instructions, project_path, allowed_paths, listing)
+    use_model = model or _MODEL or None
     cmd = [_CLAUDE, "-p"]
-    if _MODEL:
-        cmd += ["--model", _MODEL]
+    if use_model:
+        cmd += ["--model", use_model]
     # The planner only ever needs to emit text — it must never act. `--tools ""`
     # is what actually stops the CLI going agentic on task-shaped instructions.
     # `--setting-sources ""` and `--strict-mcp-config` stop the operator's live

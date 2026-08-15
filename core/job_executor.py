@@ -14,6 +14,7 @@ import threading
 
 from core import ai_planner, git_write, job_kinds, job_store, job_validation
 from core import job_workspace
+from core import model_router
 from core import policy_engine
 from core.backup_engine import BackupEngine
 from core.file_engine import FileEngine
@@ -42,6 +43,124 @@ _HEARTBEAT_INTERVAL_SECS = int(os.getenv("RUNTIME_HEARTBEAT_INTERVAL_SECS", "5")
 # toggle works without a reload.
 def _isolated_workspaces() -> bool:
     return os.getenv("RUNTIME_ISOLATED_WORKSPACES", "1") not in ("0", "", "false", "no")
+
+
+# ── task-209 model router wiring ─────────────────────────────────────────────
+# Dispatches every planner call (initial plan + each bounded repair attempt)
+# through core.model_router instead of the single static RUNTIME_CLAUDE_MODEL.
+# ON by default; read at call time like the other env toggles in this file.
+# The router itself never blocks a job: any failure here falls back to
+# ai_planner's own default (RUNTIME_CLAUDE_MODEL / provider default).
+def _router_enabled() -> bool:
+    return os.getenv("RUNTIME_MODEL_ROUTER", "1") not in ("0", "", "false", "no")
+
+
+# job kind -> model_router task_class. Kinds not listed here fall through to
+# the raw kind string (route() then applies its own unknown-class default:
+# sonnet, non-strict — fail toward cheap, never toward expensive).
+_KIND_TASK_CLASS = {
+    job_kinds.CODE_CHANGE: "routine_implementation",
+    job_kinds.OPERATIONAL: "routine_implementation",
+    job_kinds.CONTENT_PRODUCTION: "docs",
+    job_kinds.DEPLOYMENT: "release_design",
+    job_kinds.DATA_HANDOFF: "context_pack",
+    job_kinds.CONTEXT_RESTORE: "context_pack",
+}
+
+
+def _task_class_for_kind(kind: str | None) -> str:
+    return _KIND_TASK_CLASS.get(kind, "")
+
+
+_MONEY_RE = re.compile(r"(payment|billing|invoice|refund|wallet|payout|money)", re.I)
+_SECURITY_RE = re.compile(r"(secret|credential|password|token|api[_ -]?key|security|auth)", re.I)
+
+
+def _risk_for_job(job: dict) -> str:
+    """money wins over security if both fire; job.risk_level high/critical always
+    floors to "high" regardless of goal/instructions text."""
+    if (job.get("risk_level") or "") in ("high", "critical"):
+        return "high"
+    text = f"{job.get('goal') or ''} {job.get('instructions') or ''}".lower()
+    if _MONEY_RE.search(text):
+        return "money"
+    if _SECURITY_RE.search(text):
+        return "security"
+    return "normal"
+
+
+def _lineage_attempts(job: dict) -> list:
+    """Prior FAILED runtime jobs for the same task_id, created before this job,
+    as model_router prior_attempts. Bound to the 5 most recent. Never raises —
+    lineage inspection must never break dispatch."""
+    try:
+        task_id = job.get("task_id")
+        if not task_id:
+            return []
+        this_id = job.get("id")
+        created_at = job.get("created_at") or ""
+        out = []
+        # list_jobs() is ordered created_at DESC, so the first matches found are
+        # already the most recent — no separate sort needed.
+        for j in job_store.list_jobs(limit=200):
+            if j.get("id") == this_id or j.get("task_id") != task_id:
+                continue
+            if j.get("status") != "failed":
+                continue
+            if created_at and (j.get("created_at") or "") >= created_at:
+                continue
+            model_name = None
+            for art in reversed(j.get("artifacts") or []):
+                if isinstance(art, dict) and isinstance(art.get("model_selection"), dict):
+                    model_name = art["model_selection"].get("model")
+                    break
+            if not model_name:
+                continue
+            out.append({"model": model_name, "outcome": "failure"})
+            if len(out) >= 5:
+                break
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _route_model(job: dict, kind: str | None, *, extra_attempts=(), stage: str = "plan"):
+    """Decide + record a model for one planner call. Returns
+    (model_id_or_None, decision_id_or_None, model_name_or_None). Disabled router
+    or ANY failure here returns (None, None, None) — the caller then passes
+    model=None into ai_planner.plan(), which falls back to its own configured
+    default. Router availability must never fail or block a job."""
+    if not _router_enabled():
+        return (None, None, None)
+    job_id = job.get("id")
+    try:
+        task_class = _task_class_for_kind(kind) or (kind or "unknown")
+        risk = _risk_for_job(job)
+        attempts = list(_lineage_attempts(job)) + list(extra_attempts)
+        decision = model_router.route(
+            task_class, risk=risk, prior_attempts=attempts,
+            context_pack=f"planner-prompt:{stage} (goal+instructions+file-listing<=80 lines)",
+            task_ref=f"runtimejob:{job_id}:{stage}")
+        cur = job_store.get_job(job_id) or job
+        job_store.update_job(job_id, artifacts=(cur.get("artifacts") or []) + [{
+            "model_selection": {
+                "stage": stage, "decision_id": decision["decision_id"],
+                "model": decision["model"], "model_id": decision["model_id"],
+                "reason": decision["reason"], "task_class": task_class, "risk": risk,
+            },
+        }])
+        job_store.append_log(job_id, "info",
+                             f"model routing ({stage}): {task_class}/{risk} -> "
+                             f"{decision['model']} [decision {decision['decision_id']}] "
+                             f"{decision['reason'][:120]}")
+        return (decision["model_id"], decision["decision_id"], decision["model"])
+    except Exception:  # noqa: BLE001 — routing must never fail or block a job
+        try:
+            job_store.append_log(job_id, "warn",
+                                 "model routing unavailable — planner uses configured default")
+        except Exception:  # noqa: BLE001
+            pass
+        return (None, None, None)
 
 
 def _idx(level: str) -> int:
@@ -329,9 +448,10 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         job_store.append_log(job_id, "info", f"planning… still running ({int(elapsed)}s elapsed)")
 
     fallback_used = False
+    m_id, m_dec, m_name = _route_model(job, kind)
     try:
         plan = ai_planner.plan(job["goal"] or "", job["instructions"] or "", pp, job.get("allowed_paths") or [],
-                               heartbeat_cb=_heartbeat, kind=kind)
+                               heartbeat_cb=_heartbeat, kind=kind, model=m_id)
     except ai_planner.PlannerError as e:
         reason = str(e)
         # No provider at all -> genuinely cannot proceed; stay blocked (a
@@ -352,6 +472,16 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
             "duration_ms": getattr(e, "duration_ms", None),
             "timed_out": bool(getattr(e, "timed_out", False)),
         }
+        if m_dec:
+            try:
+                _tok = diag.get("tokens")
+                model_router.record_outcome(
+                    m_dec, outcome="failure",
+                    tokens_in=(_tok.get("input_tokens") or 0) if isinstance(_tok, dict) else 0,
+                    tokens_out=(_tok.get("output_tokens") or 0) if isinstance(_tok, dict) else 0,
+                    note=reason[:200])
+            except Exception:  # noqa: BLE001 — routing outcome recording must never block a job
+                pass
         job_store.append_log(job_id, "warn",
                              f"planner failed ({reason[:120]}) — building deterministic fallback plan")
         try:
@@ -371,6 +501,12 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         }])
         job_store.append_log(job_id, "info",
                              "fallback plan generated — continuing to execution (no planner retry)")
+    else:
+        if m_dec:
+            try:
+                model_router.record_outcome(m_dec, outcome="success", note="plan produced")
+            except Exception:  # noqa: BLE001 — routing outcome recording must never block a job
+                pass
     job_store.update_job(job_id, plan=plan, risk_level=plan.get("risk_level", job["risk_level"]))
     if fallback_used:
         job_store.append_log(job_id, "info", f"FALLBACK PLAN in use ({len(plan['files'])} safe file op)")
@@ -508,7 +644,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     try:
         _run_work_stages(job_id, job, pp, work_pp, plan, kind, branch, tests_ctx={
             "fallback_used": fallback_used, "rollback": _rollback,
-            "created_paths": created_paths, "heartbeat": _heartbeat})
+            "created_paths": created_paths, "heartbeat": _heartbeat, "plan_model_name": m_name})
     finally:
         if ws["workspace"]:
             removed = job_workspace.remove(pp, ws["workspace"]["path"])
@@ -523,6 +659,7 @@ def _run_work_stages(job_id: str, job: dict, pp: str, work_pp: str, plan: dict,
     _rollback = tests_ctx["rollback"]
     created_paths = tests_ctx["created_paths"]
     _heartbeat = tests_ctx["heartbeat"]
+    plan_model_name = tests_ctx.get("plan_model_name")
 
     # 4) EDIT
     job_store.update_job(job_id, status="editing")
@@ -574,11 +711,20 @@ def _run_work_stages(job_id: str, job: dict, pp: str, work_pp: str, plan: dict,
         while not tests["ok"] and attempt < _MAX_REPAIRS and not fallback_used:
             attempt += 1
             job_store.append_log(job_id, "warn", f"tests failed — repair attempt {attempt}")
+            # Real escalation ladder: a sonnet plan whose tests fail escalates the
+            # repair attempt toward opus (model_router's escalation ladder), via
+            # the prior plan-stage outcome fed in as an extra prior_attempt.
+            r_id, r_dec, _r_name = _route_model(
+                job, kind,
+                extra_attempts=([{"model": plan_model_name, "outcome": "failure"}]
+                                if plan_model_name else []),
+                stage=f"repair{attempt}")
             try:
                 fails = "\n".join(r["output"][-500:] for r in tests["results"] if not r["passed"])
                 repair = ai_planner.plan(job["goal"] or "", (job["instructions"] or "") +
                                          f"\n\nThe previous attempt FAILED tests:\n{fails}\nFix it.",
-                                         work_pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat)
+                                         work_pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat,
+                                         model=r_id)
                 repair_changed = _apply_files(work_pp, repair["files"])
                 created_paths.extend(repair_changed)
                 by_path = {c["path"]: c for c in changed}
@@ -590,6 +736,12 @@ def _run_work_stages(job_id: str, job: dict, pp: str, work_pp: str, plan: dict,
                 job_store.append_log(job_id, "error", f"repair failed: {e}")
                 break
             tests = _run_tests(work_pp, plan.get("test_commands") or [])
+            if r_dec:
+                try:
+                    model_router.record_outcome(
+                        r_dec, outcome="success" if tests["ok"] else "failure")
+                except Exception:  # noqa: BLE001 — routing outcome recording must never block a job
+                    pass
         job_store.update_job(job_id, tests=tests, validation={
             "ok": tests["ok"], "validation_kind": job_kinds.validation_kind_for(kind),
             "repo_suite_used": True,
