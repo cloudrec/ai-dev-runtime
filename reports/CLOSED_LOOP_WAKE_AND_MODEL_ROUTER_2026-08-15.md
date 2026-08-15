@@ -97,3 +97,23 @@ Session commits tonight: `41c9788, cf0a7e2, 820cb55, e698604, d0b46d3,
 e6c79a9, 21e788a, 7aad2b1, 13bff6c, 1afcf40, 965fbbf`. Owner OS 2.0 roadmap
 may continue (193/202 research iterations, 200/203) per the standing model
 partition.
+
+## Post-gate follow-up: SLO watchdog resolution blindness + self-feed (b4b0433)
+
+Live operation surfaced two watchdog defects within an hour of the gate:
+watches never checked whether their condition had RESOLVED (runtimejob targets
+are terminal-blind and pane-less, so every runtime-job wake became a
+guaranteed false positive), and loop-watchdog/escalation events registered
+themselves as new watches (second-generation rewakes observed live:
+5597→5612, 5599→5614). Six artifact events total (5597, 5599, 5611, 5612,
+5613, 5614), each retired at sight with audited notes — no retries, no
+duplicate dispatch, jobs verified terminal every time.
+
+Fix (Sonnet, senior-reviewed): register_delivery refuses loop_watchdog-class
+events; deregister_resolved() silently retires watches whose original event
+carries the invalid overlay, whose runtimejob is terminal, or whose pane is
+observed working — run at the top of every scan and used for the one-time
+cleanup (12 stale rows deregistered via the code path on first tick, no raw
+SQL). 8 new regressions; full suite 2129 green; companion restarted
+23:24 CEST; three-plus ticks journal-quiet on all retired chains, verified
+independently. Head `b4b0433`.
