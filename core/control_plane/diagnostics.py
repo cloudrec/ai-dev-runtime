@@ -784,7 +784,8 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         closed_loop_wake = {"metric": "closed_loop_wake", "error": str(e)[:200],
                             "wakes_delivered_by_trigger_class": {},
                             "wakes_delivered_total": 0, "owner_intervention_count": 0,
-                            "loop_slo_rewoken": 0, "loop_slo_escalated": 0}
+                            "loop_slo_rewoken": 0, "loop_slo_escalated": 0,
+                            "loop_slo_resolved": 0}
     active = notif["active"] + jobs["active"]
     # consolidated reasons the aggregate is red (empty ⇒ green) — so a consumer sees WHICH
     # check failed without parsing every sub-report.

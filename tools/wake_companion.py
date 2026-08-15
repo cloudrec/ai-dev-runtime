@@ -107,7 +107,8 @@ def tick(wb) -> dict:
                 from core import closed_loop_wake
                 closed_loop_wake.register_delivery(
                     event_id=p["event_id"], target=p.get("agent_id", ""),
-                    project_id=p.get("route_key", ""))
+                    project_id=p.get("route_key", ""),
+                    event_type=p.get("event_type", ""))
             except Exception:  # noqa: BLE001
                 pass
         print(f"delivered wake for event {p['event_id']} "
@@ -152,6 +153,9 @@ def watch_closed_loop() -> dict:
     part of the closed loop neither the bridge nor the doctor covers alone."""
     from core import closed_loop_wake
     r = closed_loop_wake.slo_scan()
+    for e in r.get("deregistered", []):
+        print(f"closed-loop-watch: deregistered {e['target'] or '(no target)'} "
+              f"for event {e['event_id']} — {e['reason']}", flush=True)
     for e in r.get("rewoken", []):
         print(f"closed-loop-watch: re-woke {e['target']} for stalled event "
               f"{e['event_id']} (new event {e.get('rewoken_event_id')})", flush=True)

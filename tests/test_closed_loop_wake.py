@@ -478,3 +478,206 @@ def test_diagnostics_closed_loop_wake_counters_are_additive(conn):
 
     summary = diagnostics.observability_summary()
     assert "closed_loop_wake" in summary
+
+
+# ── watchdog resolution-blindness / self-feeding chain (2026-08-15) ─────────
+# Live incident: event 5548 (owner_prompt) was delivered, re-woken as 5563, and that
+# rewake was ITSELF registered as a new watch — which re-woke AGAIN as 5595, an
+# unbounded chain rate-limited only by the SLO window. Separately, runtime-job watches
+# (5576, then again 5584) were re-woken (5597, then 5599) even though the underlying
+# job had already gone terminal and the original wake had already been retired —
+# because nothing ever re-checked whether the condition a watch exists for was still
+# true. Both classes of fix live in `register_delivery` (never watch our own
+# watchdog output) and `deregister_resolved` (silently retire a watch whose condition
+# already resolved, checked proactively every scan, not just as a rewake gate).
+class _Emit:
+    def __init__(self):
+        self.calls = []
+        self._n = 9000
+
+    def __call__(self, source, etype, **kw):
+        self._n += 1
+        self.calls.append({"source": source, "type": etype, **kw})
+        return {"event_id": self._n}
+
+
+def test_register_delivery_never_watches_loop_watchdog_events(conn):
+    """(a) A `wake_loop_no_progress`/`wake_loop_stalled` delivery must never itself
+    become a new watch row — that IS the self-feeding chain."""
+    clw.register_delivery(event_id=100, target="x:0.0", project_id="mess",
+                          event_type="wake_loop_no_progress", conn=conn, now=NOW)
+    clw.register_delivery(event_id=101, target="x:0.0", project_id="mess",
+                          event_type="wake_loop_stalled", conn=conn, now=NOW)
+    n = conn.execute("SELECT COUNT(*) FROM wake_loop_watch").fetchone()[0]
+    assert n == 0
+    # an ordinary trigger class still registers normally
+    clw.register_delivery(event_id=102, target="x:0.0", project_id="mess",
+                          event_type="agent_waiting_input", conn=conn, now=NOW)
+    assert conn.execute("SELECT COUNT(*) FROM wake_loop_watch").fetchone()[0] == 1
+
+
+def test_rewake_event_does_not_spawn_a_second_generation_rewake(conn):
+    """(c) The 5548 -> 5563 -> 5595 chain: a REWAKE event, once delivered, must not
+    itself become a new watch. Exercised the way it actually happens live: slo_scan
+    emits the rewake, and the companion's own `register_delivery` call for that
+    delivery (with the rewake's real event_type) must be a no-op."""
+    emit = _Emit()
+    clw.register_delivery(event_id=200, target="capacity-blockchain:0.0",
+                          project_id="owner-os", event_type="agent_prompt_needs_response",
+                          conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    rewake_event_id = r["rewoken"][0]["rewoken_event_id"]
+    assert emit.calls[-1]["type"] == "wake_loop_no_progress"
+
+    # the companion "delivers" the rewake and calls register_delivery exactly as
+    # tools/wake_companion.py does, carrying the rewake's OWN event_type
+    clw.register_delivery(event_id=rewake_event_id, target="capacity-blockchain:0.0",
+                          project_id="owner-os", event_type="wake_loop_no_progress",
+                          conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 5)
+    row = conn.execute("SELECT 1 FROM wake_loop_watch WHERE event_id=?",
+                       (rewake_event_id,)).fetchone()
+    assert row is None, "a rewake event must never become a second watch"
+
+    # only the ONE original watch exists, and it can still escalate on its own clock —
+    # the chain is broken, not the terminal escalation path
+    r2 = clw.slo_scan(conn=conn, now=NOW + 2 * clw.WAKE_LOOP_SLO_SECS + 60, emit_fn=emit)
+    assert [e["event_id"] for e in r2["escalated"]] == [200]
+
+
+def test_5576_5597_runtime_job_terminal_plus_invalid_overlay_deregisters(conn):
+    """(b) The exact 5576->5597 shape: a runtimejob watch whose original event was
+    marked invalid (agent_watch's audited overlay) AND whose job is terminal. The
+    next scan must deregister it SILENTLY — no wake_loop_no_progress, nothing emitted."""
+    emit = _Emit()
+    clw.register_delivery(event_id=300, target="runtimejob:b34772f4",
+                          project_id="owner-os", event_type="owner_decision_required",
+                          conn=conn, now=NOW)
+    conn.execute("CREATE TABLE IF NOT EXISTS agent_alert_invalid (event_id INTEGER "
+                "PRIMARY KEY, at TEXT, ts REAL, by TEXT, reason TEXT)")
+    conn.execute("INSERT INTO agent_alert_invalid (event_id, at, ts, by, reason) "
+                "VALUES (300, 'now', ?, 'owner_os', 'job terminal, wake retired')",
+                (NOW,))
+    conn.commit()
+
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r["rewoken"] and not r["escalated"]
+    assert [d["event_id"] for d in r["deregistered"]] == [300]
+    assert r["deregistered"][0]["reason"] == "event_marked_invalid"
+    assert emit.calls == [], "a resolved watch must emit nothing at all"
+
+    row = conn.execute("SELECT resolved, resolved_reason FROM wake_loop_watch "
+                       "WHERE event_id=300").fetchone()
+    assert row == (1, "event_marked_invalid")
+
+    # stays quiet forever after — never reconsidered once resolved
+    r2 = clw.slo_scan(conn=conn, now=NOW + 5 * clw.WAKE_LOOP_SLO_SECS, emit_fn=emit)
+    assert not r2["rewoken"] and not r2["escalated"] and not r2["deregistered"]
+    assert emit.calls == []
+
+
+def test_5584_5599_runtime_job_terminal_without_overlay_deregisters(conn, monkeypatch, tmp_path):
+    """(b) The SECOND live instance: 5584 -> 5599. This one was never marked invalid —
+    only the underlying job went terminal (fallback_plan_only). Resolution must be
+    caught by the runtime-job-terminal check alone, with no overlay involved."""
+    monkeypatch.setenv("RUNTIME_DB", str(tmp_path / "jobs.db"))
+    from core import job_store
+    monkeypatch.setattr(job_store, "_DB", str(tmp_path / "jobs.db"))
+    job_store.init_db()
+    job = job_store.create_job(goal="router smoke test", instructions="x",
+                               project_path="/opt/payment-orchestrator")
+    job_store.update_job(job["id"], status="fallback_plan_only")
+
+    emit = _Emit()
+    target = f"runtimejob:{job['id'][:8]}"
+    clw.register_delivery(event_id=301, target=target, project_id="owner-os",
+                          event_type="owner_decision_required", conn=conn, now=NOW)
+
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r["rewoken"] and not r["escalated"]
+    assert [d["event_id"] for d in r["deregistered"]] == [301]
+    assert r["deregistered"][0]["reason"] == "runtime_job_terminal"
+    assert emit.calls == []
+
+
+def test_runtime_job_still_in_flight_is_not_resolved(conn, monkeypatch, tmp_path):
+    """A runtime job that has NOT reached a terminal status must still re-wake
+    normally — the fix must not silence every runtimejob watch, only resolved ones.
+
+    Uses REAL wall-clock time (not the fixed `NOW` fixture constant): job_store's
+    own lifecycle mirroring (`_emit_transition`) writes a REAL-timestamped CTO event
+    for this target as a side effect of `create_job`/`update_job`, and `_progress_since`
+    correctly treats that as progress — a synthetic `NOW` far in the past would make
+    that real event look like it landed AFTER an equally-synthetic `delivered_ts`,
+    which is a clock-mismatch test artifact, not the behavior under test here."""
+    from core.control_plane.store import now_ts
+    monkeypatch.setenv("RUNTIME_DB", str(tmp_path / "jobs2.db"))
+    from core import job_store
+    monkeypatch.setattr(job_store, "_DB", str(tmp_path / "jobs2.db"))
+    job_store.init_db()
+    job = job_store.create_job(goal="still working", instructions="x")
+    job_store.update_job(job["id"], status="editing")
+
+    t0 = now_ts()
+    emit = _Emit()
+    target = f"runtimejob:{job['id'][:8]}"
+    clw.register_delivery(event_id=302, target=target, project_id="owner-os",
+                          event_type="owner_decision_required", conn=conn, now=t0)
+    r = clw.slo_scan(conn=conn, now=t0 + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r["deregistered"]
+    assert [e["event_id"] for e in r["rewoken"]] == [302]
+
+
+def test_pane_alive_and_working_deregisters_silently(conn):
+    """A tmux-pane watch whose agent is CURRENTLY observed working already moved on
+    by itself — no wake needed, nothing to escalate."""
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_watch_state (target TEXT PRIMARY KEY, "
+        "cls TEXT, digest TEXT, at TEXT, ts REAL, notified_cls TEXT, "
+        "notified_digest TEXT, notified_at TEXT, notified_ts REAL, "
+        "emissions INTEGER DEFAULT 0)")
+    conn.execute("INSERT INTO agent_watch_state (target, cls) VALUES (?, 'working')",
+                ("chemmy-fast:0.0",))
+    conn.commit()
+
+    emit = _Emit()
+    clw.register_delivery(event_id=303, target="chemmy-fast:0.0", project_id="mess",
+                          event_type="agent_waiting_input", conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r["rewoken"] and not r["escalated"]
+    assert r["deregistered"][0]["reason"] == "pane_alive_and_working"
+    assert emit.calls == []
+
+
+def test_deregister_is_proactive_not_only_a_rewake_gate(conn):
+    """Resolution is checked on EVERY scan, not only when a rewake/escalate would
+    otherwise fire — a watch resolves the instant its condition is proven false, not
+    900s later."""
+    clw.register_delivery(event_id=304, target="runtimejob:deadbeef", project_id="owner-os",
+                          event_type="owner_decision_required", conn=conn, now=NOW)
+    conn.execute("CREATE TABLE IF NOT EXISTS agent_alert_invalid (event_id INTEGER "
+                "PRIMARY KEY, at TEXT, ts REAL, by TEXT, reason TEXT)")
+    conn.execute("INSERT INTO agent_alert_invalid (event_id, at, ts, by, reason) "
+                "VALUES (304, 'now', ?, 'owner_os', 'retired')", (NOW,))
+    conn.commit()
+    emit = _Emit()
+    # well within the SLO window — a rewake would never fire yet either way, but
+    # deregistration must happen regardless
+    r = clw.slo_scan(conn=conn, now=NOW + 5, emit_fn=emit)
+    assert [d["event_id"] for d in r["deregistered"]] == [304]
+    assert emit.calls == []
+
+
+def test_deregister_resolved_is_directly_callable_for_one_time_cleanup(conn):
+    """The one-time production cleanup path: `deregister_resolved` on its own, not
+    only as a side effect of `slo_scan`."""
+    clw.register_delivery(event_id=305, target="runtimejob:cafef00d", project_id="owner-os",
+                          event_type="owner_decision_required", conn=conn, now=NOW)
+    conn.execute("CREATE TABLE IF NOT EXISTS agent_alert_invalid (event_id INTEGER "
+                "PRIMARY KEY, at TEXT, ts REAL, by TEXT, reason TEXT)")
+    conn.execute("INSERT INTO agent_alert_invalid (event_id, at, ts, by, reason) "
+                "VALUES (305, 'now', ?, 'owner_os', 'retired')", (NOW,))
+    conn.commit()
+    out = clw.deregister_resolved(conn=conn, now=NOW)
+    assert [d["event_id"] for d in out] == [305]
+    row = conn.execute("SELECT resolved FROM wake_loop_watch WHERE event_id=305").fetchone()
+    assert row == (1,)

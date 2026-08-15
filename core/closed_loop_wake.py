@@ -41,25 +41,168 @@ CREATE TABLE IF NOT EXISTS owner_intervention_log (
 )
 """
 
+# Columns added after the table shipped — a live DB predates them, so migrate rather
+# than assume. `resolved` is the SILENT deregistration path: the watch stops being
+# considered by slo_scan without ever emitting anything (unlike `escalated`, which is
+# a terminal state reached BY emitting).
+_WATCH_COLUMNS = (
+    ("resolved", "INTEGER DEFAULT 0"),
+    ("resolved_reason", "TEXT"),
+    ("resolved_ts", "REAL"),
+)
+
+
+def _migrate_watch(conn) -> None:
+    have = {r[1] for r in conn.execute("PRAGMA table_info(wake_loop_watch)")}
+    for name, decl in _WATCH_COLUMNS:
+        if name not in have:
+            conn.execute(f"ALTER TABLE wake_loop_watch ADD COLUMN {name} {decl}")
+
 
 def _conn(conn=None):
     conn, own = _c(conn)
     for stmt in _SCHEMA.strip().split(";"):
         if stmt.strip():
             conn.execute(stmt)
+    _migrate_watch(conn)
     return conn, own
+
+
+# A runtime job has no pane and therefore no `agent_watch_state` row, ever — under
+# `_progress_since`'s definition (a newer event) a stuck job that keeps re-emitting
+# ITS OWN "still waiting" chatter would never look like progress either, but the real
+# bug this guards is different: a job that went TERMINAL needs no further wake at all,
+# and `_progress_since` has no way to know that. Statuses mirror job_store.STATUSES
+# minus the in-flight ones (draft/waiting_approval/queued/planning/.../deploying).
+_RUNTIME_JOB_TERMINAL_STATUSES = frozenset({
+    "completed", "failed", "cancelled", "rolled_back", "blocked", "fallback_plan_only",
+})
+_RUNTIME_JOB_TARGET_PREFIX = "runtimejob:"
+
+
+def _runtime_job_terminal(target: str) -> bool:
+    """Is the job behind this `runtimejob:<8-hex-prefix>` target ALREADY terminal?
+
+    `agent_id`/target values for runtime jobs carry only the first 8 hex chars of the
+    job id (see runtime_watchdog.py / runtime_events.py / runtime_supervisor.py — all
+    three truncate the same way), never the full uuid, so this is a PREFIX match
+    against the jobs store, not `job_store.get_job` (exact id). Read-only, against
+    job_store's own configured DB path (so it follows RUNTIME_DB in tests exactly the
+    way job_store itself does); any failure to read reads as "not confirmed terminal"
+    — a job store this module cannot see must never be treated as resolved."""
+    prefix = target[len(_RUNTIME_JOB_TARGET_PREFIX):]
+    if not prefix:
+        return False
+    try:
+        import sqlite3
+        from core import job_store
+        jconn = sqlite3.connect(job_store._DB, timeout=5)
+        try:
+            row = jconn.execute(
+                "SELECT status FROM jobs WHERE id LIKE ? LIMIT 1",
+                (prefix + "%",)).fetchone()
+        finally:
+            jconn.close()
+        return bool(row) and row[0] in _RUNTIME_JOB_TERMINAL_STATUSES
+    except Exception:  # noqa: BLE001 — never let a job-store read block resolution
+        return False
+
+
+def _resolution_reason(conn, *, event_id: int, target: str) -> Optional[str]:
+    """Has the condition THIS watch exists for already resolved? Three independent
+    signals, any one of which is sufficient:
+
+      * the original event carries agent_watch's audited invalid-alert overlay — a
+        recovered crash, a resolved stall episode, or an owner/coordinator manually
+        retiring a known-bad row (2026-08-15: the 5576->5597 incident — a runtime job
+        that went terminal, and whose original wake was already retired, still got
+        re-woken because nothing ever checked);
+      * the target is a runtime job (`runtimejob:<id>`) that has since reached a
+        terminal status — a job has no pane, so `_progress_since` can NEVER see
+        progress for one; every runtimejob watch is a guaranteed future false positive
+        unless resolution is checked directly against the jobs store;
+      * the target is a live tmux pane currently observed WORKING by agent_watch — the
+        agent already moved on by itself.
+
+    Returns the reason string when resolved, else None. Checked BEFORE any
+    progress/SLO logic, on every scan, for every open watch — proactive, not just a
+    gate in front of the rewake/escalate action.
+    """
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM agent_alert_invalid WHERE event_id=?", (event_id,)).fetchone()
+        if row:
+            return "event_marked_invalid"
+    except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
+        pass
+    if not target:
+        return None
+    if target.startswith(_RUNTIME_JOB_TARGET_PREFIX):
+        if _runtime_job_terminal(target):
+            return "runtime_job_terminal"
+        return None
+    try:
+        row = conn.execute(
+            "SELECT cls FROM agent_watch_state WHERE target=?", (target,)).fetchone()
+        if row and row[0] == "working":
+            return "pane_alive_and_working"
+    except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
+        pass
+    return None
+
+
+def deregister_resolved(*, conn=None, now: Optional[float] = None) -> list:
+    """Proactively retire every OPEN watch whose underlying condition already
+    resolved — SILENTLY: `resolved=1` is set, nothing is emitted. Distinct from
+    `escalated`, which is a terminal state reached BY emitting; this is the state
+    reached by NOT needing to. Called at the top of every `slo_scan`, and callable on
+    its own for a one-time cleanup of rows a prior scan already got wrong."""
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        rows = conn.execute(
+            "SELECT event_id, target FROM wake_loop_watch "
+            "WHERE escalated=0 AND COALESCE(resolved,0)=0").fetchall()
+        deregistered = []
+        for event_id, target in rows:
+            reason = _resolution_reason(conn, event_id=event_id, target=target or "")
+            if not reason:
+                continue
+            conn.execute(
+                "UPDATE wake_loop_watch SET resolved=1, resolved_reason=?, "
+                "resolved_ts=? WHERE event_id=?", (reason, now, event_id))
+            deregistered.append({"event_id": int(event_id), "target": target or "",
+                                 "reason": reason})
+        if deregistered:
+            conn.commit()
+        return deregistered
+    finally:
+        if own:
+            conn.close()
 
 
 # ── SLO watchdog ─────────────────────────────────────────────────────────────
 def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
-                      conn=None, now: Optional[float] = None) -> None:
+                      event_type: str = "", conn=None, now: Optional[float] = None) -> None:
     """Start SLO tracking for a wake that a companion delivery just confirmed landed
     (a real ChatGPT user turn). Idempotent — a re-delivery of the same event id (which
     should never happen past the submission latch, but this must never crash if it
-    does) leaves the original tracking row alone."""
+    does) leaves the original tracking row alone.
+
+    NEVER registers a `loop_watchdog`-class delivery (`wake_loop_no_progress` /
+    `wake_loop_stalled`) — those are the watchdog's OWN re-wake/escalation events.
+    Before this check existed, every re-wake spawned a fresh watch that could itself
+    re-wake, an unbounded self-feeding chain rate-limited only by the SLO window
+    (2026-08-15: 5548 -> rewake 5563 -> rewake 5595 -> ...). `event_type` is the one
+    piece of context that answers "is this delivery ITSELF a watchdog artifact" —
+    trigger class is a closed lookup, so this can never be tricked by pane content.
+    """
+    from core import wake_bridge as wb
     now = now if now is not None else now_ts()
     conn, own = _conn(conn)
     try:
+        if wb.trigger_class_for(event_type) == wb.TRIGGER_CLASS_LOOP_WATCHDOG:
+            return
         conn.execute(
             "INSERT OR IGNORE INTO wake_loop_watch (event_id,target,project_id,"
             "delivered_ts,delivered_at) VALUES (?,?,?,?,?)",
@@ -88,17 +231,20 @@ def _progress_since(conn, target: str, since_ts: float) -> bool:
 
 def slo_scan(*, conn=None, now: Optional[float] = None,
             emit_fn: Optional[Callable] = None) -> dict:
-    """One pass: for every tracked delivery with no progress past the SLO, re-wake
-    once; for one still stalled a further SLO window after the re-wake, escalate."""
+    """One pass: retire every already-resolved watch silently first, then for every
+    REMAINING tracked delivery with no progress past the SLO, re-wake once; for one
+    still stalled a further SLO window after the re-wake, escalate."""
     now = now if now is not None else now_ts()
     if emit_fn is None:
         from core.control_plane.cto import emit as emit_fn  # noqa: F811
     conn, own = _conn(conn)
     try:
+        deregistered = deregister_resolved(conn=conn, now=now)
         rewoken, escalated = [], []
         rows = conn.execute(
             "SELECT event_id, target, project_id, delivered_ts, rewoken, rewoken_ts, "
-            "escalated FROM wake_loop_watch WHERE escalated=0").fetchall()
+            "escalated FROM wake_loop_watch WHERE escalated=0 "
+            "AND COALESCE(resolved,0)=0").fetchall()
         for eid, target, project_id, delivered_ts, is_rewoken, rewoken_ts, is_escalated in rows:
             if not target:
                 continue
@@ -144,7 +290,7 @@ def slo_scan(*, conn=None, now: Optional[float] = None,
             conn.commit()
             escalated.append({"event_id": eid, "escalated_event_id": new_eid,
                               "target": target})
-        return {"rewoken": rewoken, "escalated": escalated}
+        return {"rewoken": rewoken, "escalated": escalated, "deregistered": deregistered}
     finally:
         if own:
             conn.close()
@@ -234,12 +380,16 @@ def counters(*, conn=None, now: Optional[float] = None) -> dict:
             "SELECT COUNT(*) FROM wake_loop_watch WHERE rewoken=1").fetchone()[0]
         escalated = conn.execute(
             "SELECT COUNT(*) FROM wake_loop_watch WHERE escalated=1").fetchone()[0]
+        resolved = conn.execute(
+            "SELECT COUNT(*) FROM wake_loop_watch WHERE COALESCE(resolved,0)=1"
+        ).fetchone()[0]
         return {
             "wakes_delivered_by_trigger_class": by_trigger,
             "wakes_delivered_total": sum(by_trigger.values()),
             "owner_intervention_count": int(owner_intervention_count),
             "loop_slo_rewoken": int(rewoken),
             "loop_slo_escalated": int(escalated),
+            "loop_slo_resolved": int(resolved),
             "loop_slo_secs": WAKE_LOOP_SLO_SECS,
         }
     finally:
