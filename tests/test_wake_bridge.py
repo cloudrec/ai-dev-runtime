@@ -98,13 +98,19 @@ def test_health_reports_freshness_and_ack_state():
     assert wb.health()["last_wake_acknowledged"] is True
 
 
-def test_the_phrase_carries_no_event_content():
-    """The companion submits one fixed phrase; leaking event text would make this a channel."""
-    d = wb.should_wake(event_id=60, severity="critical",
+def test_the_phrase_carries_no_free_pane_text():
+    """Task 211: the phrase now carries SYSTEM-composed context (event id, trigger class,
+    project, agent ref) so ChatGPT can act on it directly — but never anything that passed
+    through a pane or a free-form field like correlation_id."""
+    d = wb.should_wake(event_id=60, severity="critical", event_type="task_failed",
+                       project_id="mess", agent_id="mess-agent:0.0",
                        correlation_id="secret-correlation-value")
-    assert d["phrase"] == wb.WAKE_PHRASE
     assert "secret-correlation-value" not in d["phrase"]
-    assert "60" not in d["phrase"]
+    assert "event=60" in d["phrase"]
+    assert "trigger=failure" in d["phrase"]
+    assert "project=mess" in d["phrase"]
+    assert "agent=mess-agent:0.0" in d["phrase"]
+    assert d["phrase"].endswith(wb.WAKE_PHRASE)
 
 
 # ── integration: consulted only when enabled ───────────────────────────────
@@ -157,7 +163,7 @@ def test_binding_a_chat_enables_waking_and_returns_the_target():
     d = wb.should_wake(event_id=101, severity="critical")
     assert d["wake"] is True
     assert d["conversation"] == "https://chatgpt.com/c/aaaa-1111"
-    assert d["phrase"] == wb.WAKE_PHRASE
+    assert d["phrase"].endswith(wb.WAKE_PHRASE) and "event=101" in d["phrase"]
 
 
 def test_rebinding_moves_the_target_without_touching_anything_else():

@@ -80,7 +80,8 @@ def emit(source: str, type: str, *, project_id: str = "", agent_id: str = "",
                                      owner_action_required=owner_action_required,
                                      project_id=project_id, agent_id=agent_id, conn=conn)
                 _wb.record(_d, event_id=eid, severity=severity, event_type=type,
-                           correlation_id=correlation_id, project_id=project_id, conn=conn)
+                           correlation_id=correlation_id, project_id=project_id,
+                           agent_id=agent_id, conn=conn)
         except Exception:  # noqa: BLE001 — the bridge must never break event recording
             pass
         return {"event_id": eid, "pushed": bool(pushed), "notification": pushed}

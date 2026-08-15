@@ -24,6 +24,7 @@ event and the Telegram tier still carries the urgent ones.
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from core.control_plane.api import _c
@@ -69,6 +70,9 @@ WAKE_EVENT_TYPES = frozenset({
     "notification_dead_letter", "notification_channel_down", "notifications_red",
     # an owner-directed task reaching its end
     "task_completed", "work_stopped_incomplete",
+    # closed-loop wake watchdog (task 211): a delivered wake produced no observed
+    # progress within the SLO window, and the terminal escalation after that.
+    "wake_loop_no_progress", "wake_loop_stalled",
 })
 
 # Routine traffic: progress chatter, verification echoes and no-change reports. Naming them
@@ -86,6 +90,10 @@ ROUTINE_EVENT_TYPES = frozenset({
     # stall-doctor auto-actions: the whole point is that the owner is NOT woken;
     # genuine escalations arrive as agent_waiting_input and wake through that.
     "stall_doctor_action",
+    # a metric, not a wake trigger: the closed loop already failed the owner once
+    # (they typed directly into the pane) by the time this is recorded — waking
+    # them again for the fact they already acted on would be noise, not help.
+    "owner_intervention",
 })
 
 
@@ -106,6 +114,11 @@ ROUTINE_EVENT_TYPES = frozenset({
 # consumed the one send the global cooldown allows. The owner pinged the chat by hand.
 ACTIONABLE_EVENT_TYPES = frozenset({
     "agent_waiting_input", "agent_needs_response", "agent_prompt_needs_response",
+    # task 211: a decision only the owner can take, an agent stuck in repeated
+    # failure, and the closed-loop watchdog's own re-wake/escalation — all three
+    # are "a live agent needs a response right now", the exact definition above.
+    "owner_decision_required", "agent_crash_loop",
+    "wake_loop_no_progress", "wake_loop_stalled",
 })
 
 
@@ -138,10 +151,92 @@ def is_significant(*, event_type: str = "", severity: str = "",
     if t in ROUTINE_EVENT_TYPES:
         return {"significant": False, "reason": "routine_event_type"}
     return {"significant": False, "reason": "severity_below_wake_threshold"}
-# The ONLY text the companion may submit. No event content, ever.
+# The base instruction. What used to be the ENTIRE submitted text (task 211 extends it
+# with system-authored context fields below — never with anything read from a pane).
 WAKE_PHRASE = os.getenv(
     "WAKE_BRIDGE_PHRASE",
     "Проверь новые события Owner OS через MCP и продолжи разрешённую работу.")
+
+
+# ── contextual wake text (task 211) ─────────────────────────────────────────
+# The companion used to submit ONE fixed phrase, carrying zero event content — by design,
+# per the module docstring's injection defense: nothing typed into ChatGPT may ever be text
+# that passed through a pane. That defense is preserved exactly as designed; what changes is
+# that the phrase now also carries a handful of SYSTEM-composed identifiers — the event id,
+# a closed-vocabulary trigger class, the route's project key, and a sanitized agent
+# reference — so ChatGPT's own next turn (via MCP) can go straight to the right event
+# instead of re-reading the whole inbox. None of these fields is ever pane free text: the
+# event id is an integer, the trigger class comes from a fixed lookup table, the project key
+# is validated by `wake_routes.normalize_key`, and the agent ref is stripped to a narrow
+# identifier charset below.
+TRIGGER_CLASS_COMPLETION = "completion"
+TRIGGER_CLASS_BLOCKER = "blocker"
+TRIGGER_CLASS_OWNER_DECISION = "owner_decision"
+TRIGGER_CLASS_FAILURE = "failure"
+TRIGGER_CLASS_LOOP_WATCHDOG = "loop_watchdog"
+TRIGGER_CLASS_EVENT = "event"
+
+_TRIGGER_CLASS_BY_EVENT_TYPE = {
+    "task_completed": TRIGGER_CLASS_COMPLETION,
+    "work_stopped_incomplete": TRIGGER_CLASS_COMPLETION,
+    "agent_waiting_input": TRIGGER_CLASS_BLOCKER,
+    "agent_needs_response": TRIGGER_CLASS_BLOCKER,
+    "agent_prompt_needs_response": TRIGGER_CLASS_BLOCKER,
+    "agent_blocked_on_owner": TRIGGER_CLASS_BLOCKER,
+    "owner_gate_opened": TRIGGER_CLASS_OWNER_DECISION,
+    "agent_owner_decision": TRIGGER_CLASS_OWNER_DECISION,
+    "agent_waiting_owner": TRIGGER_CLASS_OWNER_DECISION,
+    "owner_decision_required": TRIGGER_CLASS_OWNER_DECISION,
+    "needs_owner_payload": TRIGGER_CLASS_OWNER_DECISION,
+    "agent_dead": TRIGGER_CLASS_FAILURE,
+    "agent_process_failed": TRIGGER_CLASS_FAILURE,
+    "agent_crash_loop": TRIGGER_CLASS_FAILURE,
+    "session_quarantined": TRIGGER_CLASS_FAILURE,
+    "task_failed": TRIGGER_CLASS_FAILURE,
+    "wake_loop_no_progress": TRIGGER_CLASS_LOOP_WATCHDOG,
+    "wake_loop_stalled": TRIGGER_CLASS_LOOP_WATCHDOG,
+}
+
+
+def trigger_class_for(event_type: str = "") -> str:
+    """Which of the five task-211 trigger classes this event type means. A closed
+    lookup, never inferred from anything pane-derived."""
+    return _TRIGGER_CLASS_BY_EVENT_TYPE.get((event_type or "").strip(), TRIGGER_CLASS_EVENT)
+
+
+_TOKEN_RE = re.compile(r"[^A-Za-z0-9_]")
+_AGENT_REF_RE = re.compile(r"[^A-Za-z0-9_:.\-]")
+
+
+def _sanitize_token(text: str, limit: int = 40) -> str:
+    """A closed-vocabulary identifier, defensively re-stripped even though callers only
+    ever pass event types the code itself defined — never text read from a pane."""
+    return _TOKEN_RE.sub("", (text or "").strip())[:limit]
+
+
+def _sanitize_agent_ref(agent_id: str, limit: int = 80) -> str:
+    """The tmux target / agent ref: an operator-chosen identifier, not pane content, but
+    still narrowed to a safe identifier charset before it is typed into ChatGPT."""
+    return _AGENT_REF_RE.sub("", (agent_id or "").strip())[:limit] or "unknown"
+
+
+def compose_phrase(*, event_id, event_type: str = "", project_id: str = "",
+                   agent_id: str = "", trigger_class: str = "") -> str:
+    """The ONLY text the companion may submit, extended with system-authored context.
+
+    Every field is either a number, drawn from a closed lookup table, or run through a
+    validator/sanitizer — never free text echoed from an agent pane or a ChatGPT reply.
+    """
+    tc = (trigger_class or trigger_class_for(event_type) or TRIGGER_CLASS_EVENT)
+    et = _sanitize_token(event_type) or "unknown"
+    proj = wake_routes.normalize_key(project_id) or wake_routes.FALLBACK_ROUTE
+    agent = _sanitize_agent_ref(agent_id)
+    try:
+        eid = int(event_id)
+    except (TypeError, ValueError):
+        eid = 0
+    return (f"[Owner OS wake] event={eid} trigger={tc} type={et} project={proj} "
+            f"agent={agent}. {WAKE_PHRASE}")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS wake_audit (
@@ -164,6 +259,9 @@ _AUDIT_COLUMNS = (
     # Routing: the event's project, kept so the target can be re-resolved FRESH at
     # delivery time. Rows from before the column exist as NULL and route to owner-os.
     ("project_id", "TEXT"),
+    # task 211: the agent ref, persisted alongside project_id for the same reason —
+    # the wake TEXT is composed fresh at delivery time and needs it there.
+    ("agent_id", "TEXT"),
 )
 
 # Why a generic wake stopped being offered, kept as its own append-only record. The audit
@@ -246,7 +344,9 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
                 return {"wake": False, "reason": "actionable_cooldown_active",
                         "wait_secs": wait, "actionable": True}
             return {"wake": True, "reason": "actionable_waiting_transition",
-                    "actionable": True, "phrase": WAKE_PHRASE,
+                    "actionable": True,
+                    "phrase": compose_phrase(event_id=event_id, event_type=event_type,
+                                             project_id=project_id, agent_id=agent_id),
                     "conversation": target["conversation"],
                     "route_key": target["route_key"],
                     "route_reason": target["route_reason"]}
@@ -259,7 +359,9 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
                     "actionable": False}
         return {"wake": True, "reason": "urgent_event_not_yet_signalled",
                 "actionable": False,
-                "phrase": WAKE_PHRASE, "conversation": target["conversation"],
+                "phrase": compose_phrase(event_id=event_id, event_type=event_type,
+                                         project_id=project_id, agent_id=agent_id),
+                "conversation": target["conversation"],
                 "route_key": target["route_key"], "route_reason": target["route_reason"]}
     finally:
         if own:
@@ -267,7 +369,7 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
 
 
 def record(decision: dict, *, event_id: int, severity: str = "", event_type: str = "",
-           correlation_id: str = "", project_id: str = "", conn=None,
+           correlation_id: str = "", project_id: str = "", agent_id: str = "", conn=None,
            now: Optional[float] = None) -> int:
     """Every decision is audited, including the refusals — a bridge that only records its
     successes cannot be debugged when it stays silent.
@@ -284,11 +386,11 @@ def record(decision: dict, *, event_id: int, severity: str = "", event_type: str
     try:
         cur = conn.execute(
             "INSERT INTO wake_audit (ts,at,event_id,correlation_id,severity,decision,reason,"
-            "event_type,actionable,project_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "event_type,actionable,project_id,agent_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (now, now_iso(), int(event_id), correlation_id, severity,
              "wake" if decision.get("wake") else "skip", str(decision.get("reason"))[:160],
              (event_type or "").strip(), 1 if actionable else 0,
-             (project_id or "").strip()))
+             (project_id or "").strip(), (agent_id or "").strip()[:200]))
         conn.commit()
         return int(cur.lastrowid)
     finally:
@@ -462,7 +564,7 @@ def _redecide_cooldown_skips(conn, now: float) -> list:
     """
     rows = conn.execute(
         "SELECT a.event_id, a.severity, a.event_type, COALESCE(a.project_id,''), "
-        "a.correlation_id FROM wake_audit a WHERE a.id IN ("
+        "a.correlation_id, COALESCE(a.agent_id,'') FROM wake_audit a WHERE a.id IN ("
         "  SELECT MAX(id) FROM wake_audit WHERE decision='skip' "
         "  AND reason IN ('cooldown_active','actionable_cooldown_active') "
         "  AND ts > ? GROUP BY event_id) "
@@ -471,15 +573,15 @@ def _redecide_cooldown_skips(conn, now: float) -> list:
         "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id)",
         (now - 86400,)).fetchall()
     woken = []
-    for event_id, severity, etype, project, corr in rows:
+    for event_id, severity, etype, project, corr, agent_id in rows:
         d = should_wake(event_id=int(event_id), severity=severity or "",
                         event_type=etype or "", correlation_id=corr or "",
-                        project_id=project, conn=conn, now=now)
+                        project_id=project, agent_id=agent_id, conn=conn, now=now)
         if d.get("wake") or d.get("reason") not in (
                 "cooldown_active", "actionable_cooldown_active"):
             record(d, event_id=int(event_id), severity=severity or "",
                    event_type=etype or "", correlation_id=corr or "",
-                   project_id=project, conn=conn, now=now)
+                   project_id=project, agent_id=agent_id, conn=conn, now=now)
             if d.get("wake"):
                 woken.append(int(event_id))
     return woken
@@ -567,7 +669,8 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         # oldest-first behaviour is untouched, so nothing is starved, it is merely outranked.
         conn.execute(_DELIVERY_SCHEMA)
         r = conn.execute("SELECT a.event_id, COALESCE(a.actionable,0), "
-                         "COALESCE(a.project_id,'') FROM wake_audit a "
+                         "COALESCE(a.project_id,''), COALESCE(a.event_type,''), "
+                         "COALESCE(a.agent_id,'') FROM wake_audit a "
                          "WHERE a.decision='wake' AND a.acknowledged=0 "
                          "AND a.superseded_by IS NULL AND NOT EXISTS "
                          "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
@@ -587,8 +690,13 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         if not target.get("bound"):
             return {"pending": False, "reason": target.get("reason", "no_route_bound"),
                     "event_id": int(r[0]), "route_key": target.get("route_key")}
-        return {"pending": True, "event_id": int(r[0]), "actionable": bool(r[1]),
-                "conversation": target["conversation"], "phrase": WAKE_PHRASE,
+        event_id, actionable, project_id, event_type, agent_id = r
+        return {"pending": True, "event_id": int(event_id), "actionable": bool(actionable),
+                "conversation": target["conversation"],
+                "phrase": compose_phrase(event_id=event_id, event_type=event_type,
+                                         project_id=project_id, agent_id=agent_id),
+                "trigger_class": trigger_class_for(event_type),
+                "agent_id": agent_id, "event_type": event_type,
                 "route_key": target["route_key"], "route_reason": target["route_reason"],
                 "coalesced": coalesced["superseded_event_ids"]}
     finally:

@@ -105,8 +105,20 @@ def test_working_and_owner_prompt_are_not_doctor_domain():
 
 
 def test_wait_naming_an_owner_power_escalates_not_nudges():
+    """Task 211 regression (e): an internal wait that NAMES an owner power (no live
+    dialog on screen) must classify distinctly from a real dialog/menu (OWNER_WAIT,
+    agent_watch's domain) and must actually escalate through scan(), not be silently
+    dropped as 'not_doctor_domain' the way OWNER_WAIT is."""
     t = "Waiting for gate results — owner approval needed before deploy."
-    assert sd.classify_wait(t, state="idle")["shape"] == sd.OWNER_WAIT
+    c = sd.classify_wait(t, state="idle")
+    assert c["shape"] == sd.OWNER_DECISION_WAIT
+    assert c["shape"] != sd.OWNER_WAIT
+
+    emit, dlv = Emit(), Deliver()
+    ag = [_agent(target="payorch-live:0.0", cwd="/opt/payorch")]
+    tails = {"payorch-live:0.0": t}
+    r1 = _scan(ag, tails, {}, emit, dlv, conn=sqlite3.connect(":memory:"), now=NOW)
+    assert not r1["acted"], "quiet within the SLO"
 
 
 # ── provenance gate for queued lines ────────────────────────────────────────

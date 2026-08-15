@@ -41,6 +41,12 @@ from core.control_plane.store import now_iso, now_ts
 # One deliberate reminder for an unresolved owner-needed item. 0 disables reminders.
 REMINDER_SECS = int(os.getenv("AGENT_WATCH_REMINDER_SECS", "3600"))
 
+# task 211 trigger class "repeated failure": N crashes for the SAME agent inside one
+# rolling window is a crash LOOP, not just a crash — distinct from a single incident,
+# and worth its own wake (agent_crash_loop) on top of the ordinary crash alert.
+CRASH_LOOP_THRESHOLD = int(os.getenv("AGENT_WATCH_CRASH_LOOP_THRESHOLD", "3"))
+CRASH_LOOP_WINDOW_SECS = int(os.getenv("AGENT_WATCH_CRASH_LOOP_WINDOW_SECS", "3600"))
+
 
 # Maintenance suppression is TEMPORARY by construction. The v4 static env exclusion
 # fixed self-observation (event 4096) and then hid a REAL owner prompt on the same pane
@@ -334,6 +340,34 @@ def _conn(conn=None):
     return conn, own
 
 
+def _check_crash_loop(conn, emit_fn, *, project: str, target: str, now: float) -> Optional[int]:
+    """Repeated-failure trigger class: count `agent_process_failed` for THIS target in
+    the rolling window (the durable event log itself, not a separate counter that a
+    restart could lose) and, at threshold, emit the distinct `agent_crash_loop` event.
+    Dedup keys on the window bucket, so one loop episode wakes once per window, not
+    once per crash inside it."""
+    try:
+        n = conn.execute(
+            "SELECT COUNT(*) FROM event WHERE source='agent_watch' "
+            "AND type='agent_process_failed' AND agent_id=? AND ts_epoch > ?",
+            (target, now - CRASH_LOOP_WINDOW_SECS)).fetchone()[0]
+    except Exception:  # noqa: BLE001 — crash-loop detection must never break the sweep
+        return None
+    if n < CRASH_LOOP_THRESHOLD:
+        return None
+    ev = emit_fn(
+        "agent_watch", "agent_crash_loop", project_id=project, agent_id=target,
+        severity="critical", owner_action_required=True,
+        payload={"target": target, "crash_count_window": n,
+                 "window_secs": CRASH_LOOP_WINDOW_SECS,
+                 "project": project or "(unmapped -> owner-os)"},
+        action_taken=f"{target}: {n} crashes in {CRASH_LOOP_WINDOW_SECS}s — repeated failure",
+        correlation_id=f"agentwatch:{target}",
+        dedup_key=f"agentwatch:{target}:crash_loop:{int(now // CRASH_LOOP_WINDOW_SECS)}",
+        dedup_window_secs=CRASH_LOOP_WINDOW_SECS, conn=conn)
+    return (ev or {}).get("event_id")
+
+
 def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
          emit_fn: Optional[Callable] = None, conn=None,
          now: Optional[float] = None) -> dict:
@@ -392,6 +426,17 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             # asked; if the very same prompt appears again later, that is a new event, not
             # a duplicate of the old one.
             if cls == "working" and row and row[2]:
+                # task 211 owner_intervention metric: a resume with no proof the wake for
+                # THIS notification was ever delivered by the companion means a human
+                # typed into the pane directly — conservative, best-effort, never fatal
+                # to the sweep.
+                try:
+                    from core import closed_loop_wake as _clw
+                    _clw.detect_owner_intervention(
+                        target=target, prev_notified_cls=row[2],
+                        project_id=project_for(a, conn=conn), conn=conn, now=now)
+                except Exception:  # noqa: BLE001
+                    pass
                 conn.execute("UPDATE agent_watch_state SET notified_cls='', "
                              "notified_digest='' WHERE target=?", (target,))
             # RECOVERY RECONCILES THE RECORD. A pane announced crashed that is now
@@ -445,6 +490,8 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 "UPDATE agent_watch_state SET notified_cls=?, notified_digest=?, "
                 "notified_at=?, notified_ts=?, emissions=emissions+1 WHERE target=?",
                 (cls, dg, now_iso(), now, target))
+            if cls == "crashed":
+                _check_crash_loop(conn, emit_fn, project=project, target=target, now=now)
             conn.commit()
             emitted.append({"target": target, "class": cls, "project": project,
                             "event_id": (ev or {}).get("event_id")})
@@ -493,6 +540,7 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 "notified_cls='crashed', notified_digest='gone', notified_at=?, "
                 "notified_ts=?, emissions=emissions+1 WHERE target=?",
                 (now_iso(), now, target))
+            _check_crash_loop(conn, emit_fn, project=project, target=target, now=now)
             emitted.append({"target": target, "class": "crashed", "project": project,
                             "event_id": (ev or {}).get("event_id")})
         conn.commit()

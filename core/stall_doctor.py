@@ -72,6 +72,12 @@ LOST_CONTINUATION = "LOST_CONTINUATION"
 CHILD_WORKFLOW_WAIT = "CHILD_WORKFLOW_WAIT"
 INTERNAL_WAIT = "INTERNAL_WAIT"
 OWNER_WAIT = "OWNER_WAIT"
+# task 211, regression (e): an internal wait whose text NAMES an owner power (prod,
+# merge, approval, ...) with no live dialog on screen. This is NOT agent_watch's domain
+# (there is no menu/prompt to see) and it is NOT a safe-nudge internal wait either — it
+# is a genuine decision only the owner (via ChatGPT) can make. Kept distinct from
+# OWNER_WAIT, which stays reserved for an actual dialog/menu on screen.
+OWNER_DECISION_WAIT = "OWNER_DECISION_WAIT"
 NONE = "NONE"
 
 _CHILD_WAIT_RE = re.compile(
@@ -174,7 +180,8 @@ def classify_wait(tail: str, *, state: str = "", pending: str = "") -> dict:
     m2 = _INTERNAL_WAIT_RE.search(region)
     if m2:
         if _OWNER_POWER_RE.search(region):
-            return {"shape": OWNER_WAIT, "evidence": "wait_names_owner_power"}
+            return {"shape": OWNER_DECISION_WAIT,
+                    "evidence": "wait_names_owner_power"}
         return {"shape": INTERNAL_WAIT, "evidence": f"internal_wait:{m2.group(0)[:40]}"}
     return {"shape": NONE, "evidence": "no_wait_signal"}
 
@@ -202,6 +209,12 @@ def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
            else WAIT_SLO_SECS)
     if age_secs < slo:
         return {"action": "none", "reason": f"within_slo_{slo}s"}
+    if shape == OWNER_DECISION_WAIT:
+        # Never a nudge candidate — there is no safe local step for a wait that names an
+        # owner power, so this goes straight to escalation the moment the SLO elapses.
+        # scan() guards re-escalation via its own `escalated` flag, so this is safe to
+        # return on every subsequent pass without a loop-guard/cooldown of its own.
+        return {"action": "escalate", "reason": "internal_wait_names_owner_power"}
     if actions_used >= MAX_ACTIONS_PER_EPISODE:
         return {"action": "escalate", "reason": "loop_guard_exhausted"}
     cooldown = ACTION_COOLDOWN_SECS if last_action_ok else FAILED_RETRY_COOLDOWN_SECS
@@ -345,8 +358,14 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                     skipped.append({"target": target, "shape": shape,
                                     "why": "already_escalated"})
                     continue
+                # OWNER_DECISION_WAIT names a real owner power (deploy/merge/prod/...) —
+                # a distinct event TYPE from a plain blocked-pane ping, so the wake text
+                # and any downstream routing can tell "needs a decision" apart from
+                # "needs a response". Every other escalate shape keeps the original type.
+                etype = ("owner_decision_required" if shape == OWNER_DECISION_WAIT
+                         else "agent_waiting_input")
                 ev = emit_fn(
-                    "stall_doctor", "agent_waiting_input", project_id=project,
+                    "stall_doctor", etype, project_id=project,
                     agent_id=target, severity="high", owner_action_required=True,
                     payload={"target": target, "shape": shape, "reason": d["reason"],
                              "pending": (pending or "")[:200], "digest": dg},
@@ -410,7 +429,8 @@ def _retire_stale_escalation(conn, target: str, now: float, *, why: str) -> list
         rows = conn.execute(
             "SELECT e.id FROM event e LEFT JOIN agent_alert_invalid i "
             "ON i.event_id = e.id WHERE e.source='stall_doctor' "
-            "AND e.type='agent_waiting_input' AND e.agent_id=? "
+            "AND e.type IN ('agent_waiting_input','owner_decision_required') "
+            "AND e.agent_id=? "
             "AND i.event_id IS NULL ORDER BY e.id DESC LIMIT 5", (target,)).fetchall()
         for (eid,) in rows:
             agent_watch.mark_invalid(
