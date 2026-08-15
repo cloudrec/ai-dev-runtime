@@ -113,11 +113,33 @@ def test_wait_naming_an_owner_power_escalates_not_nudges():
 
 def test_may_submit_queued_gate():
     assert sd.may_submit_queued(GAIKA_PENDING)[0] is True
-    assert sd.may_submit_queued("дай финальные ссылки")[0] is False       # non-ASCII
     assert sd.may_submit_queued("1")[0] is False                           # dialog answer
     assert sd.may_submit_queued("yes")[0] is False
+    assert sd.may_submit_queued("да")[0] is False                          # ru dialog answer
     assert sd.may_submit_queued("proceed and push to origin")[0] is False  # forbidden
     assert sd.may_submit_queued("")[0] is False
+
+
+def test_russian_owner_instruction_is_evaluable_and_submittable():
+    """Second gaika-video incident (2026-08-15): a benign RUSSIAN queued
+    instruction sat 10+ minutes because the old gate refused ALL non-ASCII.
+    Russian is evaluable — the watchdog denylist carries its destructive
+    stems — so benign Russian submits, destructive Russian never does."""
+    ok, why = sd.may_submit_queued(
+        "Продолжай по инструкции: почини вступление, затем проверь "
+        "публичные ссылки UA и EN.")
+    assert ok, why
+    assert sd.may_submit_queued("дай финальные ссылки RU и EN")[0] is True
+    # the 2026-08-03 incident text itself stays refused
+    assert sd.may_submit_queued("удали старый scratchpad")[0] is False
+    # destructive / live / power stems in Russian and English stay refused
+    for bad in ("задеплой на прод", "переведи деньги на кошелек",
+                "merge the branch to main", "мердж в main",
+                "останови все сервисы", "запушь ветку"):
+        got, why = sd.may_submit_queued(bad)
+        assert got is False, f"{bad!r} must not auto-submit ({why})"
+    # scripts the denylists cannot read stay unevaluable
+    assert sd.may_submit_queued("继续执行任务")[0] is False
 
 
 # ── shape A: lost continuation ──────────────────────────────────────────────
@@ -130,8 +152,8 @@ def test_lost_continuation_resubmits_after_slo(conn):
     # first sight: episode opens, within SLO -> quiet
     r1 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW)
     assert not r1["acted"] and not dlv.calls
-    # past SLO with no progress -> Enter on the owner's own line
-    r2 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.WAIT_SLO_SECS + 1)
+    # past the queued-line SLO with no progress -> Enter on the owner's own line
+    r2 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
     assert [a["action"] for a in r2["acted"]] == ["submit_queued"]
     assert dlv.calls[0]["action"] == "submit" and dlv.calls[0]["text"] == GAIKA_PENDING
     # the auto-action is audited, not woken
@@ -139,19 +161,37 @@ def test_lost_continuation_resubmits_after_slo(conn):
     assert emit.calls[-1]["owner_action_required"] is False
 
 
+def test_russian_lost_continuation_end_to_end_submits(conn):
+    """The EXACT second-incident shape: Russian benign instruction queued,
+    agent waiting_input, no progress — must be auto-submitted, not escalated
+    and not left for the owner to find in the terminal."""
+    emit, dlv = Emit(), Deliver()
+    ru = "Продолжай по инструкции: почини вступление, затем проверь ссылки UA и EN."
+    ag = [_agent()]
+    tails = {"gaika-video:0.0": GAIKA_TAIL}
+    pend = {"gaika-video:0.0": ru}
+    _scan(ag, tails, pend, emit, dlv, conn, now=NOW)
+    r = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
+    assert [a["action"] for a in r["acted"]] == ["submit_queued"]
+    assert dlv.calls[0]["action"] == "submit" and dlv.calls[0]["text"] == ru
+    # audited, no owner wake
+    assert emit.calls[-1]["type"] == "stall_doctor_action"
+    assert all(not c.get("owner_action_required") for c in emit.calls)
+
+
 def test_unsubmittable_queued_line_escalates_once(conn):
     emit, dlv = Emit(), Deliver()
     ag = [_agent()]
     tails = {"gaika-video:0.0": GAIKA_TAIL}
-    pend = {"gaika-video:0.0": "дай финальные ссылки RU/EN"}
+    pend = {"gaika-video:0.0": "удали старый scratchpad и перезапусти сервис"}
     _scan(ag, tails, pend, emit, dlv, conn, now=NOW)
-    r = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.WAIT_SLO_SECS + 1)
+    r = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
     assert [a["action"] for a in r["acted"]] == ["escalate"]
     assert emit.calls[-1]["type"] == "agent_waiting_input"
     assert emit.calls[-1]["owner_action_required"] is True
     assert not dlv.calls
     # and only once — the escalation does not repeat every tick
-    r2 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.WAIT_SLO_SECS + 60)
+    r2 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 60)
     assert not r2["acted"]
 
 

@@ -54,6 +54,11 @@ ENABLED = os.getenv("STALL_DOCTOR_ENABLED", "1") not in ("0", "", "false", "no")
 # universal safe continuation the default; "" disables actuation (observe-only).
 ACTUATE = os.getenv("STALL_DOCTOR_ACTUATE", "all")
 WAIT_SLO_SECS = int(os.getenv("STALL_DOCTOR_SLO_SECS", "300"))
+# A queued line at rest is EXPLICIT intent already sitting in the composer; the
+# 2026-08-15 second gaika-video incident showed 300s + tick cadence reads as
+# "10+ minutes of nothing" to the owner. Re-submitting the owner's own line is
+# cheap and loop-guarded, so it earns a tighter clock.
+QUEUED_SLO_SECS = int(os.getenv("STALL_DOCTOR_QUEUED_SLO_SECS", "120"))
 CHILD_SLO_SECS = int(os.getenv("STALL_DOCTOR_CHILD_SLO_SECS", "900"))
 ACTION_COOLDOWN_SECS = int(os.getenv("STALL_DOCTOR_COOLDOWN_SECS", "1800"))
 MAX_ACTIONS_PER_EPISODE = int(os.getenv("STALL_DOCTOR_MAX_ACTIONS", "2"))
@@ -75,10 +80,20 @@ _OWNER_POWER_RE = re.compile(
     r"(owner|approval|approve|permission|decision|разреш|подтверд|прод\b|"
     r"production|\bprod\b|merge|\bdns\b|secret|payment|deploy)", re.I)
 
-# provenance gate for re-submitting an ALREADY-QUEUED line (Enter only)
-_EVALUABLE_RE = re.compile(r"^[\x09\x0a\x0d\x20-\x7e]*$")
+# provenance gate for re-submitting an ALREADY-QUEUED line (Enter only).
+# EVALUABLE means every character belongs to a script the denylists can read:
+# ASCII plus Cyrillic (the owner writes Russian; cw._FORBIDDEN_RE carries the
+# Russian destructive stems, so Russian IS evaluable — the second gaika-video
+# incident, 2026-08-15, was a benign Russian instruction dead-ending into an
+# escalation purely because of the old blanket non-ASCII refusal). CJK or any
+# other script stays unevaluable → escalate, never submit.
+_EVALUABLE_RE = re.compile(r"^[\x09\x0a\x0d\x20-\x7eЀ-ӿ«»—–…·№]*$")
 _DIALOG_ANSWER_RE = re.compile(
     r"^\s*(\d{1,2}[.)]?|y|yes|n|no|ok|okay|да|нет|д|н)\s*[.!]?\s*$", re.I)
+# Supplementary stems the watchdog denylist lacks; merge is an owner power.
+_EXTRA_FORBIDDEN_RE = re.compile(
+    r"(\bmerge\b|мерж|мердж|\bубей|убить|останов(и|ите)\b|выключ|запуш|пушни"
+    r"|\bоплат|платеж|платёж|бюджет|потрать|спиши)", re.I)
 
 # authored nudges — composed strictly from the watchdog's closed safe vocabulary
 NUDGE_INTERNAL = ("Continue: check the test suite checks and proceed with the "
@@ -117,10 +132,10 @@ def may_submit_queued(text: str) -> tuple[bool, str]:
     if len(t) > 400:
         return False, "too_long_to_evaluate"
     if not _EVALUABLE_RE.match(t):
-        return False, "non_ascii_unevaluable"
+        return False, "unevaluable_script"
     if _DIALOG_ANSWER_RE.match(t):
         return False, "would_answer_a_dialog"
-    if _FORBIDDEN_RE.search(t):
+    if _FORBIDDEN_RE.search(t) or _EXTRA_FORBIDDEN_RE.search(t):
         return False, "forbidden_token"
     return True, "queued_line_provenance_safe"
 
@@ -171,7 +186,9 @@ def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
     if shape in (NONE, OWNER_WAIT):
         return {"action": "none",
                 "reason": "not_doctor_domain" if shape == OWNER_WAIT else "no_wait"}
-    slo = CHILD_SLO_SECS if shape == CHILD_WORKFLOW_WAIT else WAIT_SLO_SECS
+    slo = (CHILD_SLO_SECS if shape == CHILD_WORKFLOW_WAIT
+           else QUEUED_SLO_SECS if shape == LOST_CONTINUATION
+           else WAIT_SLO_SECS)
     if age_secs < slo:
         return {"action": "none", "reason": f"within_slo_{slo}s"}
     if actions_used >= MAX_ACTIONS_PER_EPISODE:
