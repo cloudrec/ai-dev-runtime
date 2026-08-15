@@ -798,3 +798,125 @@ async def agents_phase_rollback(req: PhaseRollbackReq, _: bool = Depends(_auth))
     un-sent, but the phase is no longer treated as dispatched)."""
     from core import agent_phase_advance
     return agent_phase_advance.rollback(req.session, req.phase_id)
+
+
+# ── Venture Radar (task 193) + Business Analyzer (task 202) ─────────────────
+# Canonical core surfaces; the seo-backend adapter renders/forwards only.
+# Refusals are 409 + exact reason, like fabric/contracts.
+
+def _venture_call(fn, *args, **kw):
+    from core.business_analyzer import AnalyzerError
+    from core.venture_radar import RadarError
+    try:
+        return fn(*args, **kw)
+    except (RadarError, AnalyzerError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+class RadarCandidateCreate(BaseModel):
+    mode: str
+    title: str
+    card: dict
+
+
+class RadarCardUpdate(BaseModel):
+    card: dict
+
+
+class VentureTransition(BaseModel):
+    to_state: str
+    by: str
+    note: str = ""
+
+
+@router.get("/radar/candidates")
+async def radar_candidates(state: Optional[str] = None, _: bool = Depends(_auth)):
+    from core import venture_radar
+    return {"candidates": venture_radar.ranked(state=state)}
+
+
+@router.post("/radar/candidates")
+async def radar_candidate_create(req: RadarCandidateCreate, _: bool = Depends(_auth)):
+    from core import venture_radar
+    return _venture_call(venture_radar.propose, req.mode, req.title, req.card)
+
+
+@router.get("/radar/candidates/{candidate_id}")
+async def radar_candidate_get(candidate_id: str, _: bool = Depends(_auth)):
+    from core import venture_radar
+    return _venture_call(venture_radar.get, candidate_id)
+
+
+@router.post("/radar/candidates/{candidate_id}/card")
+async def radar_candidate_update(candidate_id: str, req: RadarCardUpdate,
+                                 _: bool = Depends(_auth)):
+    from core import venture_radar
+    return _venture_call(venture_radar.update_card, candidate_id, req.card)
+
+
+@router.post("/radar/candidates/{candidate_id}/transition")
+async def radar_candidate_transition(candidate_id: str, req: VentureTransition,
+                                     _: bool = Depends(_auth)):
+    from core import venture_radar
+    return _venture_call(venture_radar.transition, candidate_id, req.to_state,
+                         by=req.by, note=req.note)
+
+
+@router.post("/radar/seed")
+async def radar_seed(_: bool = Depends(_auth)):
+    from core import venture_radar
+    return venture_radar.seed_default()
+
+
+class AnalyzerCardCreate(BaseModel):
+    title: str
+    card: dict
+
+
+class AnalyzerRescore(BaseModel):
+    scores: dict
+
+
+class AnalyzerCombine(BaseModel):
+    assets: list
+    max_size: int = 3
+
+
+@router.get("/analyzer/cards")
+async def analyzer_cards(state: Optional[str] = None, _: bool = Depends(_auth)):
+    from core import business_analyzer
+    return {"cards": business_analyzer.ranked(state=state)}
+
+
+@router.post("/analyzer/cards")
+async def analyzer_card_create(req: AnalyzerCardCreate, _: bool = Depends(_auth)):
+    from core import business_analyzer
+    return _venture_call(business_analyzer.record, req.title, req.card)
+
+
+@router.get("/analyzer/cards/{card_id}")
+async def analyzer_card_get(card_id: str, _: bool = Depends(_auth)):
+    from core import business_analyzer
+    return _venture_call(business_analyzer.get, card_id)
+
+
+@router.post("/analyzer/cards/{card_id}/rescore")
+async def analyzer_card_rescore(card_id: str, req: AnalyzerRescore,
+                                _: bool = Depends(_auth)):
+    from core import business_analyzer
+    return _venture_call(business_analyzer.rescore, card_id, req.scores)
+
+
+@router.post("/analyzer/cards/{card_id}/transition")
+async def analyzer_card_transition(card_id: str, req: VentureTransition,
+                                   _: bool = Depends(_auth)):
+    from core import business_analyzer
+    return _venture_call(business_analyzer.transition, card_id, req.to_state,
+                         by=req.by, note=req.note)
+
+
+@router.post("/analyzer/combine")
+async def analyzer_combine(req: AnalyzerCombine, _: bool = Depends(_auth)):
+    from core import business_analyzer
+    return {"combinations": _venture_call(business_analyzer.combine, req.assets,
+                                          max_size=req.max_size)}

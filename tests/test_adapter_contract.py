@@ -33,6 +33,14 @@ CONTRACT_PATHS = [
     "/api/v1/fabric/agents/{ref}/result", "/api/v1/fabric/start-or-resume",
     "/api/v1/fabric/contracts", "/api/v1/fabric/contracts/{contract_id}",
     "/api/v1/fabric/contracts/{contract_id}/transition",
+    # venture radar (task 193)
+    "/api/v1/radar/candidates", "/api/v1/radar/candidates/{candidate_id}",
+    "/api/v1/radar/candidates/{candidate_id}/card",
+    "/api/v1/radar/candidates/{candidate_id}/transition", "/api/v1/radar/seed",
+    # business analyzer (task 202)
+    "/api/v1/analyzer/cards", "/api/v1/analyzer/cards/{card_id}",
+    "/api/v1/analyzer/cards/{card_id}/rescore",
+    "/api/v1/analyzer/cards/{card_id}/transition", "/api/v1/analyzer/combine",
 ]
 
 
@@ -81,3 +89,16 @@ def test_refusals_are_409_with_reason():
         asyncio.run(v1.fabric_status("bogus-ref", _=True))
     assert e.value.status_code == 409
     assert "bad agent ref" in str(e.value.detail)
+
+
+def test_venture_refusals_are_409_with_reason():
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(v1.radar_candidate_create(v1.RadarCandidateCreate(
+            mode="moonshot", title="x", card={}), _=True))
+    assert e.value.status_code == 409 and "unknown mode" in str(e.value.detail)
+    with pytest.raises(HTTPException) as e2:
+        asyncio.run(v1.analyzer_card_create(v1.AnalyzerCardCreate(
+            title="x", card={"source_code": "lifted"}), _=True))
+    assert e2.value.status_code == 409
+    assert "public behavior only" in str(e2.value.detail)

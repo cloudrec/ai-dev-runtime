@@ -29,6 +29,17 @@ Agent Fabric: `GET /fabric/agents`, `GET /fabric/agents/{ref}/status|result`,
 `GET|POST /fabric/contracts`, `GET /fabric/contracts/{id}` (with history),
 `POST /fabric/contracts/{id}/transition`.
 
+Venture Radar (task 193): `GET|POST /radar/candidates`,
+`GET /radar/candidates/{id}`, `POST /radar/candidates/{id}/card|transition`,
+`POST /radar/seed`. Candidate cards use the closed CARD_FIELDS vocabulary;
+APPROVED/REJECTED/BUILDING transitions require `by="owner"` (forwarded owner
+decisions only).
+
+Business Analyzer (task 202): `GET|POST /analyzer/cards`,
+`GET /analyzer/cards/{id}`, `POST /analyzer/cards/{id}/rescore|transition`,
+`POST /analyzer/combine`. Seven fixed score axes, each requiring a written
+rationale; build/spend/publish/outreach states are owner-only.
+
 Refs: `tmux:<session:pane>` / `runtime:<job-uuid>`. Fabric states use the Task
 Contract vocabulary (WORKING/BLOCKED/OWNER_DECISION/AGENT_DONE/VERIFYING/
 VERIFICATION_FAILED/VERIFIED_DONE + CREATED/CANCELLED).
