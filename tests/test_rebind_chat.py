@@ -234,7 +234,7 @@ def test_the_wake_path_resolves_the_new_target_without_a_restart(monkeypatch):
     wb.bind_chat(OLD)
     d = wb.should_wake(event_id=1, severity="critical", now=1000.0)
     wb.record(d, event_id=1, severity="critical", now=1000.0)
-    assert wb.pending_wake()["conversation"] == OLD
+    assert wb.pending_wake(now=1000.0)["conversation"] == OLD
 
     assert _run(NEW)[0] == 0
-    assert wb.pending_wake()["conversation"] == NEW
+    assert wb.pending_wake(now=1000.0)["conversation"] == NEW

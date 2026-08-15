@@ -46,6 +46,16 @@ ACTIONABLE_COOLDOWN_SECS = int(os.getenv("WAKE_BRIDGE_ACTIONABLE_COOLDOWN_SECS",
 # actionable claim each time, and the younger actionable behind it (4313) never got a
 # single attempt. Backoff breaks the hot loop AND the head-of-line blockade at once.
 RETRY_BACKOFF_SECS = int(os.getenv("WAKE_BRIDGE_RETRY_BACKOFF_SECS", "300"))
+# A decided-but-undelivered wake older than this is stale: "this agent is waiting NOW"
+# stops being true after hours of silence, and "read Owner OS" stops being useful once
+# the backlog it points at is ancient history. The 2026-08-15 incident this guards:
+# events decided days earlier (a chronically broken delivery path, plus ~10 pytest-debris
+# rows that leaked into the live event table before a sandbox guard landed) sat
+# unacknowledged and were served FRESH the moment delivery started working again —
+# real project chats got poked with hours- to days-old "wake up" pokes with no bearing
+# on current pane state. Selection excludes anything older than this ceiling instead of
+# ever delivering it late; `expire_stale` retires it the same audited way coalescing does.
+MAX_WAKE_AGE_SECS = int(os.getenv("WAKE_BRIDGE_MAX_AGE_SECS", "10800"))
 # Only these severities are ever worth a wake.
 WAKE_SEVERITIES = {"critical", "high"}
 
@@ -638,6 +648,79 @@ def _supersede_stale_actionables(conn, now: float) -> list:
     return superseded
 
 
+_EXPIRE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wake_expire_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL, at TEXT, event_id INTEGER, reason TEXT, age_secs REAL
+)
+"""
+
+
+def _invalid_event_ids(conn, event_ids: list) -> set:
+    """Cross-reference `agent_watch`'s audited invalid-alert overlay — a proven-false
+    alert (recovered crash, resolved stall episode, or an owner/coordinator manually
+    retiring known-bad rows) must never be delivered late just because nothing had
+    acknowledged it yet. That table is owned by agent_watch, not this module; reading it
+    here is read-only and defensive — a DB that predates the overlay table (or one where
+    it has not been created yet) reports no invalid ids rather than raising."""
+    if not event_ids:
+        return set()
+    try:
+        placeholders = ",".join("?" * len(event_ids))
+        rows = conn.execute(
+            f"SELECT event_id FROM agent_alert_invalid WHERE event_id IN ({placeholders})",
+            tuple(int(e) for e in event_ids)).fetchall()
+        return {int(r[0]) for r in rows}
+    except Exception:  # noqa: BLE001 — table may not exist in this DB yet
+        return set()
+
+
+def expire_stale(conn=None, now: Optional[float] = None) -> list:
+    """Retire (acknowledge) every decided-but-undelivered wake that is either past
+    `MAX_WAKE_AGE_SECS` or has since been marked invalid by agent_watch/stall_doctor's
+    audited overlay. Retirement uses the SAME mechanism as a normal acknowledgement —
+    the event stays fully readable in the durable CTO inbox; only the doorbell stops.
+    Every retirement is itself audited (`wake_expire_audit`), so "why did this old
+    event never wake anyone" stays answerable from state alone.
+    """
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        conn.execute(_EXPIRE_SCHEMA)
+        conn.execute(_SUBMIT_SCHEMA)
+        rows = conn.execute(
+            "SELECT event_id, ts FROM wake_audit WHERE decision='wake' AND acknowledged=0 "
+            "AND superseded_by IS NULL AND NOT EXISTS "
+            "(SELECT 1 FROM wake_submitted s WHERE s.event_id=wake_audit.event_id)"
+        ).fetchall()
+        if not rows:
+            return []
+        event_ids = [int(r[0]) for r in rows]
+        invalid_ids = _invalid_event_ids(conn, event_ids)
+        expired = []
+        for event_id, ts in rows:
+            age = now - float(ts or 0)
+            if event_id in invalid_ids:
+                reason = "marked_invalid"
+            elif age > MAX_WAKE_AGE_SECS:
+                reason = "stale_past_max_age"
+            else:
+                continue
+            conn.execute("UPDATE wake_audit SET acknowledged=1, acknowledged_at=? "
+                         "WHERE event_id=? AND decision='wake'", (now_iso(), event_id))
+            conn.execute(
+                "INSERT INTO wake_expire_audit (ts,at,event_id,reason,age_secs) "
+                "VALUES (?,?,?,?,?)", (now, now_iso(), int(event_id), reason, age))
+            expired.append({"event_id": int(event_id), "reason": reason,
+                            "age_secs": int(age)})
+        if expired:
+            conn.commit()
+        return expired
+    finally:
+        if own:
+            conn.close()
+
+
 def pending_wake(conn=None, now: Optional[float] = None) -> dict:
     """The oldest decided-but-unacknowledged wake, with the target resolved for ITS route.
 
@@ -656,6 +739,10 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         # proof", not "it definitely did not arrive" — and only the latter would justify
         # sending a second copy into the owner's chat.
         conn.execute(_SUBMIT_SCHEMA)
+        # Stale or proven-invalid wakes are retired BEFORE anything else is considered —
+        # a days-old actionable event must never be selected fresh just because delivery
+        # only now started working again.
+        expire_stale(conn=conn, now=now if now is not None else now_ts())
         # Cooldown refusals get a second hearing once the floor has cleared.
         _redecide_cooldown_skips(conn, now if now is not None else now_ts())
         # One agent, one pending ring: older unserved actionables for the same agent are

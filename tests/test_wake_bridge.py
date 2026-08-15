@@ -212,6 +212,79 @@ def test_bind_audit_records_the_move_and_no_conversation_content():
         "the audit stores the pointer move only — never message content"
 
 
+# ── stale/invalid wakes never deliver late (2026-08-15 incident) ───────────
+# ~10 pytest-debris events (project_id LIKE 'test_%') leaked into the live event table
+# before a sandbox guard landed; hours later, once delivery started working again, they
+# were served FRESH — real project chats got poked with stale, hours-old "wake up" text
+# that had no bearing on current pane state. This is the exact "stale queue blocking
+# delivery" failure mode task 211 names; `expire_stale` (called from `pending_wake`
+# itself) is the fix: a decided wake is retired, never delivered, once it is either too
+# old or proven invalid.
+def test_a_wake_past_the_max_age_is_retired_not_delivered_late():
+    wb.bind_chat("https://chatgpt.com/c/aged-out")
+    d = wb.should_wake(event_id=500, severity="critical", now=1000.0)
+    wb.record(d, event_id=500, severity="critical", now=1000.0)
+    # Still within the ceiling: delivered normally.
+    assert wb.pending_wake(now=1000.0 + wb.MAX_WAKE_AGE_SECS - 1)["event_id"] == 500
+    # Past the ceiling: never offered, retired instead — a fresh wake decided at
+    # roughly the SAME real time as a delayed check must not compete with a decision
+    # that is now hours to days old.
+    d2 = wb.should_wake(event_id=500, severity="critical",
+                        now=1000.0 + wb.MAX_WAKE_AGE_SECS + 1)
+    # the prior wake is still unacknowledged, so the bridge itself would refuse a
+    # second decision for the same event — expiry works on the ORIGINAL decision.
+    assert d2["wake"] is False and d2["reason"] == "already_woke_for_this_event"
+    p = wb.pending_wake(now=1000.0 + wb.MAX_WAKE_AGE_SECS + 1)
+    assert p["pending"] is False
+    row = wb.health(now=1000.0 + wb.MAX_WAKE_AGE_SECS + 1)
+    assert row["last_wake_event_id"] == 500  # the audit trail still remembers it
+
+
+def test_expire_stale_retires_only_what_is_actually_stale():
+    wb.bind_chat("https://chatgpt.com/c/still-fresh")
+    d = wb.should_wake(event_id=501, severity="critical", now=2000.0)
+    wb.record(d, event_id=501, severity="critical", now=2000.0)
+    expired = wb.expire_stale(now=2000.0 + 60)
+    assert expired == [], "a fresh wake must never be expired"
+    expired2 = wb.expire_stale(now=2000.0 + wb.MAX_WAKE_AGE_SECS + 1)
+    assert [e["event_id"] for e in expired2] == [501]
+    assert expired2[0]["reason"] == "stale_past_max_age"
+
+
+def test_a_wake_marked_invalid_is_retired_before_delivery_regardless_of_age():
+    """The 'invalid_overlay' half of the fix: agent_watch/stall_doctor (or an owner
+    manually retiring known-bad rows) mark an event invalid; pending_wake must never
+    serve it even one second later, whatever its age."""
+    import sqlite3
+    wb.bind_chat("https://chatgpt.com/c/should-not-fire")
+    d = wb.should_wake(event_id=502, severity="critical", now=3000.0)
+    wb.record(d, event_id=502, severity="critical", now=3000.0)
+    import os
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    conn.execute("CREATE TABLE IF NOT EXISTS agent_alert_invalid (event_id INTEGER "
+                "PRIMARY KEY, at TEXT, ts REAL, by TEXT, reason TEXT)")
+    conn.execute("INSERT INTO agent_alert_invalid (event_id, at, ts, by, reason) "
+                "VALUES (502, 'now', 3000.0, 'owner', 'confirmed stale/synthetic')")
+    conn.commit()
+    conn.close()
+    p = wb.pending_wake(now=3005.0)   # five seconds later — well within any age ceiling
+    assert p["pending"] is False
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    row = c.execute("SELECT reason FROM wake_expire_audit WHERE event_id=502").fetchone()
+    assert row and row[0] == "marked_invalid"
+
+
+def test_expiry_never_touches_an_already_delivered_wake():
+    """Only decided-but-UNdelivered wakes are candidates — a phrase already latched as
+    submitted must never be reconsidered for expiry (it is not late, it already went)."""
+    wb.bind_chat("https://chatgpt.com/c/delivered")
+    d = wb.should_wake(event_id=503, severity="critical", now=4000.0)
+    wb.record(d, event_id=503, severity="critical", now=4000.0)
+    wb.mark_submitted(503, source="companion")
+    expired = wb.expire_stale(now=4000.0 + wb.MAX_WAKE_AGE_SECS + 1)
+    assert expired == []
+
+
 # ── the global send choke point ────────────────────────────────────────────
 def test_only_one_submission_is_allowed_inside_the_cooldown():
     """The owner saw the phrase TWICE. Neither was a duplicate of the same event: one came

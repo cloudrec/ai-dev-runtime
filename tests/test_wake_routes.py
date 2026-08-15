@@ -79,12 +79,12 @@ def test_two_projects_wakes_are_offered_with_two_distinct_conversations():
     wr.bind_route("payment-orchestrator", PAY)
     _decide(11, "mess", now=10_000.0)
     _decide(12, "payment-orchestrator", now=10_100.0)
-    first = wb.pending_wake()
+    first = wb.pending_wake(now=10_100.0)
     assert first["pending"] and first["event_id"] == 11
     assert first["conversation"] == MESS and first["route_key"] == "mess"
     wb.mark_submitted(11, source="test")
     wb.acknowledge(11)
-    second = wb.pending_wake()
+    second = wb.pending_wake(now=10_100.0)
     assert second["pending"] and second["event_id"] == 12
     assert second["conversation"] == PAY and second["route_key"] == "payment-orchestrator"
     assert first["conversation"] != second["conversation"]
@@ -96,7 +96,7 @@ def test_a_stale_cached_target_cannot_hijack_a_later_event():
     wr.bind_route("mess", MESS)
     _decide(21, "mess", now=20_000.0)
     wr.bind_route("mess", "https://chatgpt.com/c/mess-rotated")
-    p = wb.pending_wake()
+    p = wb.pending_wake(now=20_000.0)
     assert p["conversation"] == "https://chatgpt.com/c/mess-rotated"
 
 
@@ -112,7 +112,7 @@ def test_an_unresolvable_route_offers_nothing_rather_than_borrowing_a_chat():
     wr.bind_route("mess", MESS)
     _decide(31, "mess", now=30_000.0)
     wr.unbind_route("mess")                 # and no owner-os fallback exists
-    p = wb.pending_wake()
+    p = wb.pending_wake(now=30_000.0)
     assert p["pending"] is False and p["reason"] == "no_route_bound"
 
 
@@ -199,10 +199,10 @@ def test_generic_wakes_are_never_folded_across_routes():
     assert sorted(res["superseded_event_ids"]) == [41, 43]
     assert sorted(res["kept_event_ids"]) == [42, 44]
     # The survivors resolve to their own chats.
-    first = wb.pending_wake()
+    first = wb.pending_wake(now=40_100.0)
     assert first["event_id"] == 42 and first["conversation"] == MESS
     wb.mark_submitted(42, source="test"); wb.acknowledge(42)
-    second = wb.pending_wake()
+    second = wb.pending_wake(now=40_100.0)
     assert second["event_id"] == 44 and second["conversation"] == OWNER
 
 
@@ -220,11 +220,11 @@ def test_one_event_wakes_at_most_one_conversation():
     rebind after a send cannot produce a second copy elsewhere."""
     wr.bind_route("mess", MESS)
     _decide(61, "mess", now=60_000.0)
-    p = wb.pending_wake()
+    p = wb.pending_wake(now=60_000.0)
     assert isinstance(p["conversation"], str)
     wb.mark_submitted(61, source="test")
     wr.bind_route("mess", "https://chatgpt.com/c/mess-rotated")
-    again = wb.pending_wake()
+    again = wb.pending_wake(now=60_000.0)
     assert again["pending"] is False, "a submitted event is never offered to any chat again"
 
 

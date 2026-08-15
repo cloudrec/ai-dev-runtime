@@ -129,7 +129,7 @@ def test_a_fresh_actionable_wake_outranks_a_multi_day_backlog():
     fresh = _wake(3921, event_type="agent_waiting_input", severity="high", now=old + 10)
     assert fresh["wake"] is True and fresh["actionable"] is True
 
-    p = wb.pending_wake()
+    p = wb.pending_wake(now=old + 10)
     assert p["pending"] is True
     assert p["event_id"] == 3921, "the blocked pane must be offered before two-day-old history"
     assert p["actionable"] is True
@@ -181,7 +181,7 @@ def test_stale_generic_wakes_coalesce_into_the_newest_with_a_durable_audit():
     assert sorted(res["superseded_event_ids"]) == [3746, 3801]
     assert res["kept_event_id"] == 3899
 
-    p = wb.pending_wake()
+    p = wb.pending_wake(now=now)
     assert p["event_id"] == 3899, "one generic wake means: read every current Owner OS event"
 
     hist = wb.coalesce_history()
@@ -197,16 +197,18 @@ def test_coalescing_never_touches_actionable_wakes():
                  now=1000.0 + wb.ACTIONABLE_COOLDOWN_SECS + 1)["wake"] is True
     res = wb.coalesce_generic_backlog()
     assert res["superseded"] == 0
-    assert wb.pending_wake()["event_id"] == 5001      # oldest actionable first, none retired
+    # oldest actionable first, none retired
+    p = wb.pending_wake(now=1000.0 + wb.ACTIONABLE_COOLDOWN_SECS + 1)
+    assert p["event_id"] == 5001
 
 
 # ── the pre-existing idempotency guarantees still hold ─────────────────────
 def test_the_submission_latch_still_prevents_a_duplicate_actionable_send():
     """df24ecf: a fired phrase is never offered again, however the verification landed."""
     assert _wake(6001, event_type="agent_waiting_input", severity="high", now=1000.0)["wake"] is True
-    assert wb.pending_wake()["event_id"] == 6001
+    assert wb.pending_wake(now=1000.0)["event_id"] == 6001
     wb.mark_submitted(6001, source="companion")
-    assert wb.pending_wake()["pending"] is False
+    assert wb.pending_wake(now=1000.0)["pending"] is False
 
 
 def test_an_actionable_claim_is_not_refused_by_the_generic_send_cooldown():
