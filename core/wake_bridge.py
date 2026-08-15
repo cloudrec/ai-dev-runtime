@@ -571,17 +571,37 @@ def _redecide_cooldown_skips(conn, now: float) -> list:
     Here, cooldown skips are re-decided once their event is still unserved; a re-decision
     is RECORDED only when it changes the answer (a wake, or a different refusal), so a
     floor still running does not mint an audit row per poll.
+
+    Event 4619 (2026-08-15 incident): emitted 2026-08-14T21:46Z, skipped `cooldown_active`
+    within the same second, sat unserved, and THIS function re-decided it to `wake`
+    almost 24h later — the `ts > now-86400` window here is keyed on the SKIP DECISION's
+    own timestamp, which for a skip minted at emission time is (by construction) always
+    within 86400s of "now" for roughly the event's first 24 hours of existence. That
+    window is wider than `MAX_WAKE_AGE_SECS` (the delivery-side staleness ceiling), so it
+    could mint a FRESH wake decision for an event already past that ceiling — and
+    `expire_stale` runs BEFORE this function on the same tick, so the newly-minted row
+    would not be caught until the FOLLOWING tick, by which point selection may already
+    have delivered it. Bounding the redecision window itself to `MAX_WAKE_AGE_SECS`
+    closes the gap at its source: an event that could never survive `expire_stale` is
+    never handed a fresh decision to survive with in the first place. Joined against the
+    EVENT's own `ts_epoch` (not the skip's ts) for the same reason `expire_stale` now is —
+    a replayed/re-decided row can never make the event itself younger.
     """
     rows = conn.execute(
         "SELECT a.event_id, a.severity, a.event_type, COALESCE(a.project_id,''), "
-        "a.correlation_id, COALESCE(a.agent_id,'') FROM wake_audit a WHERE a.id IN ("
+        "a.correlation_id, COALESCE(a.agent_id,'') FROM wake_audit a "
+        "LEFT JOIN event e ON e.id = a.event_id WHERE a.id IN ("
         "  SELECT MAX(id) FROM wake_audit WHERE decision='skip' "
         "  AND reason IN ('cooldown_active','actionable_cooldown_active') "
         "  AND ts > ? GROUP BY event_id) "
+        # No matching event row (a test/edge case that decided directly, bypassing the
+        # durable log) means the event's age is UNKNOWN — that must never itself block
+        # a redecision that would otherwise have fired; only a CONFIRMED old event does.
+        "AND (e.ts_epoch IS NULL OR e.ts_epoch > ?) "
         "AND NOT EXISTS (SELECT 1 FROM wake_audit w WHERE w.event_id=a.event_id "
         "               AND w.decision='wake') "
         "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id)",
-        (now - 86400,)).fetchall()
+        (now - 86400, now - MAX_WAKE_AGE_SECS)).fetchall()
     woken = []
     for event_id, severity, etype, project, corr, agent_id in rows:
         d = should_wake(event_id=int(event_id), severity=severity or "",
@@ -682,6 +702,20 @@ def expire_stale(conn=None, now: Optional[float] = None) -> list:
     the event stays fully readable in the durable CTO inbox; only the doorbell stops.
     Every retirement is itself audited (`wake_expire_audit`), so "why did this old
     event never wake anyone" stays answerable from state alone.
+
+    Staleness is checked against TWO independent clocks, either one sufficient:
+
+      * the wake DECISION's own age (`stale_past_max_age`) — a decision minted long
+        ago and never delivered (a chronically broken delivery path);
+      * the underlying EVENT's own emission age (`event_older_than_max_age`) — event
+        4619 (2026-08-15 incident): emitted 2026-08-14T21:46Z, skipped `cooldown_active`
+        within the same second, then RE-DECIDED to `wake` almost 24h later by
+        `_redecide_cooldown_skips` (a skip refused only for timing is re-considered
+        while its event is still "recent" by ITS OWN 24h window) — the fresh decision
+        timestamp made a day-old event look brand new to the decision-age check alone,
+        and it was delivered ~24h late. The event's own `ts_epoch` (from the durable
+        event log, joined by id) is the clock a replayed/re-decided row can never
+        fake: whatever re-minted the decision, the event itself did not get younger.
     """
     now = now if now is not None else now_ts()
     conn, own = _conn(conn)
@@ -689,30 +723,42 @@ def expire_stale(conn=None, now: Optional[float] = None) -> list:
         conn.execute(_EXPIRE_SCHEMA)
         conn.execute(_SUBMIT_SCHEMA)
         rows = conn.execute(
-            "SELECT event_id, ts FROM wake_audit WHERE decision='wake' AND acknowledged=0 "
-            "AND superseded_by IS NULL AND NOT EXISTS "
-            "(SELECT 1 FROM wake_submitted s WHERE s.event_id=wake_audit.event_id)"
+            "SELECT a.event_id, a.ts, e.ts_epoch FROM wake_audit a "
+            "LEFT JOIN event e ON e.id = a.event_id "
+            "WHERE a.decision='wake' AND a.acknowledged=0 "
+            "AND a.superseded_by IS NULL AND NOT EXISTS "
+            "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id)"
         ).fetchall()
         if not rows:
             return []
         event_ids = [int(r[0]) for r in rows]
         invalid_ids = _invalid_event_ids(conn, event_ids)
         expired = []
-        for event_id, ts in rows:
-            age = now - float(ts or 0)
+        for event_id, decision_ts, event_ts_epoch in rows:
+            decision_age = now - float(decision_ts or 0)
+            # A missing event row (should not happen — the event log is append-only
+            # and never deletes) means the event-age signal is UNKNOWN, not old: the
+            # check is skipped entirely rather than silently falling back to the
+            # decision's own ts, which would relabel an ordinary `stale_past_max_age`
+            # retirement as `event_older_than_max_age` on no real evidence.
+            event_age = (now - float(event_ts_epoch)) if event_ts_epoch is not None else None
             if event_id in invalid_ids:
                 reason = "marked_invalid"
-            elif age > MAX_WAKE_AGE_SECS:
+            elif event_age is not None and event_age > MAX_WAKE_AGE_SECS:
+                reason = "event_older_than_max_age"
+            elif decision_age > MAX_WAKE_AGE_SECS:
                 reason = "stale_past_max_age"
             else:
                 continue
+            age_for_audit = event_age if event_age is not None else decision_age
             conn.execute("UPDATE wake_audit SET acknowledged=1, acknowledged_at=? "
                          "WHERE event_id=? AND decision='wake'", (now_iso(), event_id))
             conn.execute(
                 "INSERT INTO wake_expire_audit (ts,at,event_id,reason,age_secs) "
-                "VALUES (?,?,?,?,?)", (now, now_iso(), int(event_id), reason, age))
+                "VALUES (?,?,?,?,?)",
+                (now, now_iso(), int(event_id), reason, age_for_audit))
             expired.append({"event_id": int(event_id), "reason": reason,
-                            "age_secs": int(age)})
+                            "age_secs": int(age_for_audit)})
         if expired:
             conn.commit()
         return expired
@@ -745,6 +791,14 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         expire_stale(conn=conn, now=now if now is not None else now_ts())
         # Cooldown refusals get a second hearing once the floor has cleared.
         _redecide_cooldown_skips(conn, now if now is not None else now_ts())
+        # A second pass, deliberately redundant with the one above: a re-decision can
+        # mint a FRESH wake row for an event that is not fresh at all (event 4619), and
+        # that new row must never survive to selection below on the SAME tick just
+        # because the first expire_stale ran before it existed. `_redecide_cooldown_skips`
+        # is now itself bounded by event age, so this should be a no-op in the steady
+        # state; it stays as the structural backstop for whatever re-decision path is
+        # added next and forgets to check.
+        expire_stale(conn=conn, now=now if now is not None else now_ts())
         # One agent, one pending ring: older unserved actionables for the same agent are
         # retired so a stale copy can never head-of-line block a fresh event.
         _supersede_stale_actionables(conn, now if now is not None else now_ts())

@@ -285,6 +285,110 @@ def test_expiry_never_touches_an_already_delivered_wake():
     assert expired == []
 
 
+def _insert_event(event_id: int, *, ts_epoch: float, type: str = "notification_dead_letter",
+                  correlation_id: str = "") -> None:
+    """A real `event` row with a CONTROLLED ts_epoch — `append_event` always stamps
+    real wall-clock time, so the old-event regression below (which needs a
+    day-old EVENT under a freshly-minted decision) inserts directly, the same way
+    the rest of this file manipulates wake_audit/wake_delivery directly."""
+    import os
+    import sqlite3
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    c.execute(
+        "INSERT INTO event (id,ts,ts_epoch,source,type,correlation_id,severity,"
+        "owner_action_required) VALUES (?,?,?,?,?,?,?,?)",
+        (event_id, "2026-08-14T21:46:40+00:00", ts_epoch, "notifier", type,
+         correlation_id, "info", 0))
+    c.commit()
+    c.close()
+
+
+# ── event-age ceiling (2026-08-15, event 4619) ──────────────────────────────
+# A day-old event, skipped `cooldown_active` within the same second, got RE-DECIDED to
+# `wake` ~24h later by `_redecide_cooldown_skips` (a skip refused only for timing gets a
+# second hearing) and was delivered a full day late: `expire_stale` keyed staleness off
+# the DECISION's ts, and a freshly-minted decision always reads as young by that clock
+# alone, however ancient the event underneath it. Fixed on two independent fronts: (1)
+# `expire_stale` also checks the EVENT's own `ts_epoch`, joined by id — a replayed
+# decision can never make the event itself younger; (2) `_redecide_cooldown_skips` no
+# longer even ATTEMPTS a redecision once the event itself is already past
+# `MAX_WAKE_AGE_SECS`, closing the gap at its source rather than relying solely on the
+# next tick's expiry pass to clean up after it.
+def test_an_old_event_with_a_freshly_minted_wake_decision_is_retired_not_delivered():
+    """The exact 4619 shape: OLD event, decision minted (or re-decided) just now."""
+    wb.bind_chat("https://chatgpt.com/c/old-event-fresh-decision")
+    now = 100_000.0
+    old_event_ts = now - wb.MAX_WAKE_AGE_SECS - 3600  # a day-old event, event-age terms
+    _insert_event(4619, ts_epoch=old_event_ts, type="notification_dead_letter")
+    d = wb.should_wake(event_id=4619, severity="high", event_type="notification_dead_letter",
+                       now=now)
+    assert d["wake"] is True, "the decision itself is minted fresh, exactly like the incident"
+    wb.record(d, event_id=4619, severity="high", event_type="notification_dead_letter", now=now)
+
+    expired = wb.expire_stale(now=now)
+    assert [e["event_id"] for e in expired] == [4619]
+    assert expired[0]["reason"] == "event_older_than_max_age"
+
+    p = wb.pending_wake(now=now)
+    assert p["pending"] is False, "an old event must never be delivered just because its wake decision is fresh"
+
+
+def test_redecide_never_mints_a_fresh_wake_for_an_event_past_the_max_age():
+    """The root cause itself: `_redecide_cooldown_skips` (the only backlog-reconciler
+    path that re-decides an already-skipped event) must refuse to even attempt a
+    redecision once the event is already past `MAX_WAKE_AGE_SECS` — the ORIGINAL skip
+    stands, no new wake_audit row is ever minted for it. Exercised through
+    `pending_wake`, the real production call path (it is what invokes the redecision
+    on every tick), rather than the private function directly."""
+    wb.bind_chat("https://chatgpt.com/c/redecide-old-event")
+    now = 200_000.0
+    old_event_ts = now - wb.MAX_WAKE_AGE_SECS - 3600
+    _insert_event(4620, ts_epoch=old_event_ts, type="notification_dead_letter")
+    # the ORIGINAL skip, minted at emission time (cooldown_active) — same shape as the
+    # live incident, where the skip's own ts was fresh relative to the event at the time
+    d0 = {"wake": False, "reason": "cooldown_active"}
+    wb.record(d0, event_id=4620, severity="high", event_type="notification_dead_letter",
+             now=old_event_ts)
+
+    assert wb.pending_wake(now=now)["pending"] is False
+
+    import sqlite3, os
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    rows = c.execute("SELECT decision FROM wake_audit WHERE event_id=4620").fetchall()
+    assert [r[0] for r in rows] == ["skip"], "no new decision — the redecision never fired"
+
+
+def test_a_genuinely_fresh_skip_still_gets_its_second_hearing():
+    """Positive control on the fix itself: a skip whose EVENT is still recent (well
+    within MAX_WAKE_AGE_SECS) must still be redecided once its cooldown clears — the
+    event-age bound must not silently break the 4187 behavior this function exists for."""
+    wb.bind_chat("https://chatgpt.com/c/redecide-fresh-event")
+    now = 300_000.0
+    fresh_event_ts = now - 30  # 30s old — nowhere near the ceiling
+    _insert_event(4621, ts_epoch=fresh_event_ts, type="agent_waiting_input",
+                 correlation_id="")
+    d0 = {"wake": False, "reason": "actionable_cooldown_active", "actionable": True}
+    wb.record(d0, event_id=4621, severity="high", event_type="agent_waiting_input",
+             now=fresh_event_ts)
+    p = wb.pending_wake(now=now)
+    assert p["pending"] is True and p["event_id"] == 4621
+
+
+def test_a_fresh_event_with_a_fresh_decision_still_delivers_normally():
+    """Positive control: the fix must never touch the ordinary, healthy path — a
+    brand-new event, decided immediately, is still offered for delivery at once."""
+    wb.bind_chat("https://chatgpt.com/c/fresh-event-fresh-decision")
+    now = 400_000.0
+    _insert_event(4622, ts_epoch=now, type="task_completed")
+    d = wb.should_wake(event_id=4622, severity="high", event_type="task_completed", now=now)
+    assert d["wake"] is True
+    wb.record(d, event_id=4622, severity="high", event_type="task_completed", now=now)
+    expired = wb.expire_stale(now=now + 5)
+    assert expired == []
+    p = wb.pending_wake(now=now + 5)
+    assert p["pending"] is True and p["event_id"] == 4622
+
+
 # ── the global send choke point ────────────────────────────────────────────
 def test_only_one_submission_is_allowed_inside_the_cooldown():
     """The owner saw the phrase TWICE. Neither was a duplicate of the same event: one came
