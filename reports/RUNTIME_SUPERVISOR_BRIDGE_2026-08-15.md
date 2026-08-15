@@ -108,6 +108,30 @@ survival, pytest live-DB guard.
   errors — backend deps live in the baked Docker image). Any host-run
   code_change job there fails validation regardless of isolation.
 
+## Final green-path proof (job eda37d2c, task OWNER-193)
+
+After the timeout raise (RUNTIME_TEST_TIMEOUT=600) and the canary-sim env fix,
+redispatch #3 ran the ENTIRE pipeline clean: queued → planning (planner
+returned non-JSON → deterministic fallback) → backing_up → branching (isolated
+worktree off the deployed feature line) → editing → testing (**repo suite
+green in the worktree: 1977 passed**) → committing (commit 402e179 on branch
+`ai-runtime/193-owner-os-2-0-venture-radar-0eacda4`) → terminal
+`fallback_plan_only` — truthful, never a false "completed". Every transition
+is in the live event log (ids 5062-5073, routed owner-os), terminal event
+`work_stopped_incomplete`. Worktree removed, zero leftovers; dirty files
+byte-identical throughout.
+
+## False-completion regression (event 5051)
+
+During this very pass, agent-watch announced THIS bootstrap agent
+task_completed off the harness notice `Background command "...monitor output"
+completed (exit code 0)` — a shell exiting, not the agent finishing.
+Fixed in 8db1498: `_TOOL_COMPLETION_RE` bars command/monitor/subprocess
+completion telemetry from ever satisfying the positive-finish requirement;
+genuine stated finishes still complete (positive control test). The false
+alert was retired via the audited `mark_invalid` overlay (event row
+untouched) and its pending wake acknowledged; companion restarted.
+
 ## Remaining material issues
 
 1. `/opt/seo` jobs need container-aware validation (or a non-code job kind);
