@@ -644,6 +644,116 @@ async def runtime_status(_: bool = Depends(_auth)):
     return diagnostics.runtime_blockers_report()
 
 
+# ── Agent Fabric v1 (task OWNER-192): one view + lifecycle gateway ───────────
+class FabricSend(BaseModel):
+    text: str
+    idempotency_key: Optional[str] = None
+
+
+class FabricStart(BaseModel):
+    project_dir: str
+    conversation_id: Optional[str] = None
+
+
+class FabricStop(BaseModel):
+    confirm: bool = False
+    idempotency_key: Optional[str] = None
+
+
+class FabricContractCreate(BaseModel):
+    contract: dict
+    task_id: Optional[int] = None
+    agent_ref: str = ""
+    project: str = ""
+
+
+class FabricTransition(BaseModel):
+    to_state: str
+    by: str = "api"
+    evidence: Optional[dict] = None
+
+
+def _fabric_call(fn, *args, **kw):
+    from core.agent_fabric import FabricError
+    from core.task_contract import ContractError
+    try:
+        return fn(*args, **kw)
+    except (FabricError, ContractError) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+@router.get("/fabric/agents")
+async def fabric_agents(include_terminal: bool = False, _: bool = Depends(_auth)):
+    from core import agent_fabric
+    return agent_fabric.list_agents(include_terminal_jobs=include_terminal)
+
+
+@router.get("/fabric/agents/{ref:path}/status")
+async def fabric_status(ref: str, _: bool = Depends(_auth)):
+    from core import agent_fabric
+    return _fabric_call(agent_fabric.status, ref)
+
+
+@router.post("/fabric/agents/{ref:path}/send")
+async def fabric_send(ref: str, req: FabricSend, _: bool = Depends(_auth)):
+    from core import agent_fabric
+    return _fabric_call(agent_fabric.send, ref, req.text,
+                        idempotency_key=req.idempotency_key)
+
+
+@router.post("/fabric/agents/{ref:path}/stop")
+async def fabric_stop(ref: str, req: FabricStop, _: bool = Depends(_auth)):
+    from core import agent_fabric
+    return _fabric_call(agent_fabric.stop, ref, confirm=req.confirm,
+                        idempotency_key=req.idempotency_key)
+
+
+@router.get("/fabric/agents/{ref:path}/result")
+async def fabric_result(ref: str, _: bool = Depends(_auth)):
+    from core import agent_fabric
+    return _fabric_call(agent_fabric.result, ref)
+
+
+@router.post("/fabric/start-or-resume")
+async def fabric_start(req: FabricStart, _: bool = Depends(_auth)):
+    from core import agent_fabric
+    pp = _validate_project_path(req.project_dir)
+    return _fabric_call(agent_fabric.start_or_resume, pp,
+                        conversation_id=req.conversation_id)
+
+
+@router.get("/fabric/contracts")
+async def fabric_contracts(state: Optional[str] = None,
+                           task_id: Optional[int] = None,
+                           _: bool = Depends(_auth)):
+    from core import task_contract
+    return {"contracts": task_contract.list_contracts(state=state, task_id=task_id)}
+
+
+@router.post("/fabric/contracts")
+async def fabric_contract_create(req: FabricContractCreate, _: bool = Depends(_auth)):
+    from core import task_contract
+    return _fabric_call(task_contract.create, req.contract, task_id=req.task_id,
+                        agent_ref=req.agent_ref, project=req.project, by="api")
+
+
+@router.get("/fabric/contracts/{contract_id}")
+async def fabric_contract_get(contract_id: str, _: bool = Depends(_auth)):
+    from core import task_contract
+    c = task_contract.get(contract_id)
+    if not c:
+        raise HTTPException(status_code=404, detail="not found")
+    return {**c, "history": task_contract.history(contract_id)}
+
+
+@router.post("/fabric/contracts/{contract_id}/transition")
+async def fabric_contract_transition(contract_id: str, req: FabricTransition,
+                                     _: bool = Depends(_auth)):
+    from core import task_contract
+    return _fabric_call(task_contract.transition, contract_id, req.to_state,
+                        by=req.by, evidence=req.evidence)
+
+
 class AckReq(BaseModel):
     ids: list[int]
 
