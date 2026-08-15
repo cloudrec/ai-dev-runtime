@@ -116,6 +116,36 @@ ef3e1b97, 10f334f0, 38aafece).
 3. **stall_doctor_state rows for dead panes** (payorch-sbp-resumed) linger
    harmlessly; a sweep for vanished targets is a candidate next cleanup.
 
+## Model router — task 209 (e698604, added same evening)
+
+`core/model_router.py` — the standing cost-aware routing policy, decide-and-
+record only (dispatch stays the caller's job):
+- Partition: **sonnet** default (routine implementation, tests, docs, repo
+  inspection, deterministic bugfixes, context packs, monitoring, repetitive
+  analysis, clear-finding implementation); **opus** (architecture, ambiguous
+  cross-system root cause, money/security/high-risk, migration/release
+  design, senior review); **fable** only (hardest unresolved bugs,
+  adversarial/final deep audits, tier disagreement). Unknown classes fail
+  toward cheap; `strict=True` refuses.
+- Risk floor money/security/high ⇒ never below opus. Ladder: sonnet
+  failure/uncertain → opus; opus failure/uncertain/disagreement → fable.
+  Fable findings implement back at sonnet unless the risk floor holds or
+  sonnet already failed that unit (loop guard — senior-review fix).
+- Context-pack economics: opus/fable decisions flag `requires_context_pack`
+  and advise a sonnet-generated compact pack; expensive models never reread
+  huge conversations.
+- `router_decision`/`router_outcome` ledger + `effectiveness()` per
+  model+class (success rate, tokens, usd, retries) — the Agent Reputation
+  feed. `/api/v1/router/*` pinned in the adapter contract; Night Shift's
+  `core/model_routing.py` untouched.
+- The build itself followed the policy: a Sonnet subagent implemented from a
+  compact context-pack spec (~60k subagent tokens); Fable did design and
+  senior review only, catching the de-escalation loop. Live smoke: routine →
+  sonnet; security+failures → fable with pack advisory; outcome recorded;
+  effectiveness aggregates; strict unknown class → 409. Suite: **2073
+  passed**. Memory updated: task-209 partition recorded, old "no Fable" note
+  marked superseded.
+
 ## Task order status
 
 192 Agent Fabric ✅ · 193 Venture Radar core ✅ (this commit; research/UI
