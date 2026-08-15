@@ -61,6 +61,11 @@ WAIT_SLO_SECS = int(os.getenv("STALL_DOCTOR_SLO_SECS", "300"))
 QUEUED_SLO_SECS = int(os.getenv("STALL_DOCTOR_QUEUED_SLO_SECS", "120"))
 CHILD_SLO_SECS = int(os.getenv("STALL_DOCTOR_CHILD_SLO_SECS", "900"))
 ACTION_COOLDOWN_SECS = int(os.getenv("STALL_DOCTOR_COOLDOWN_SECS", "1800"))
+# A delivery that FAILED verification proves nothing about the pane; waiting the
+# full success-cooldown before the bounded retry (gaika-presentation, 2026-08-15
+# 10:28, verify=False then 30 idle minutes) just stretches the stall. Failed
+# actions retry on a short clock; the loop guard still caps total attempts.
+FAILED_RETRY_COOLDOWN_SECS = int(os.getenv("STALL_DOCTOR_FAILED_RETRY_SECS", "180"))
 MAX_ACTIONS_PER_EPISODE = int(os.getenv("STALL_DOCTOR_MAX_ACTIONS", "2"))
 
 LOST_CONTINUATION = "LOST_CONTINUATION"
@@ -105,7 +110,8 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stall_doctor_state (
     target TEXT PRIMARY KEY,
     shape TEXT, digest TEXT, first_ts REAL,
-    actions INTEGER DEFAULT 0, last_action_ts REAL, escalated INTEGER DEFAULT 0
+    actions INTEGER DEFAULT 0, last_action_ts REAL, escalated INTEGER DEFAULT 0,
+    last_action_ok INTEGER DEFAULT 1
 );
 CREATE TABLE IF NOT EXISTS stall_doctor_action (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -120,6 +126,11 @@ def _conn(conn=None):
     for stmt in _SCHEMA.strip().split(";"):
         if stmt.strip():
             conn.execute(stmt)
+    try:  # pre-column deployments carry the old shape
+        conn.execute("ALTER TABLE stall_doctor_state ADD COLUMN "
+                     "last_action_ok INTEGER DEFAULT 1")
+    except Exception:  # noqa: BLE001
+        pass
     return conn, own
 
 
@@ -181,7 +192,7 @@ def _digest(tail: str, child: Optional[dict]) -> str:
 
 def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
            actions_used: int = 0, since_last_action: float = 1e9,
-           child: Optional[dict] = None) -> dict:
+           child: Optional[dict] = None, last_action_ok: bool = True) -> dict:
     """Pure policy. Returns {action, reason} — fully testable."""
     if shape in (NONE, OWNER_WAIT):
         return {"action": "none",
@@ -193,8 +204,11 @@ def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
         return {"action": "none", "reason": f"within_slo_{slo}s"}
     if actions_used >= MAX_ACTIONS_PER_EPISODE:
         return {"action": "escalate", "reason": "loop_guard_exhausted"}
-    if since_last_action < ACTION_COOLDOWN_SECS:
-        return {"action": "none", "reason": "action_cooldown"}
+    cooldown = ACTION_COOLDOWN_SECS if last_action_ok else FAILED_RETRY_COOLDOWN_SECS
+    if since_last_action < cooldown:
+        return {"action": "none",
+                "reason": "action_cooldown" if last_action_ok
+                else "failed_action_cooldown"}
     if shape == LOST_CONTINUATION:
         ok, why = may_submit_queued(pending)
         if ok:
@@ -288,29 +302,40 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             shape = c["shape"]
             dg = _digest(tail, c.get("child"))
             row = conn.execute(
-                "SELECT shape, digest, first_ts, actions, last_action_ts, escalated "
-                "FROM stall_doctor_state WHERE target=?", (target,)).fetchone()
+                "SELECT shape, digest, first_ts, actions, last_action_ts, escalated,"
+                " last_action_ok FROM stall_doctor_state WHERE target=?",
+                (target,)).fetchone()
             if shape in (NONE, OWNER_WAIT):
+                if row and row[5]:
+                    _retire_stale_escalation(conn, target, now,
+                                             why=f"shape_now_{shape}")
                 conn.execute("DELETE FROM stall_doctor_state WHERE target=?", (target,))
                 conn.commit()
                 skipped.append({"target": target, "why": f"shape_{shape}"})
                 continue
             if row and row[0] == shape and row[1] == dg:
                 first_ts, actions, last_ts, escalated = row[2], row[3], row[4] or 0, row[5]
+                last_ok = bool(row[6] if row[6] is not None else 1)
             else:
                 # new episode OR progress (digest moved — a moving child counter
                 # lands here every time it ticks, resetting the clock)
+                if row and row[5]:
+                    # the escalated episode resolved itself; its owner ping is stale
+                    _retire_stale_escalation(conn, target, now, why="episode_moved")
                 first_ts, actions, last_ts, escalated = now, 0, 0, 0
+                last_ok = True
                 conn.execute(
                     "INSERT INTO stall_doctor_state (target, shape, digest, first_ts,"
-                    " actions, last_action_ts, escalated) VALUES (?,?,?,?,0,0,0)"
+                    " actions, last_action_ts, escalated, last_action_ok)"
+                    " VALUES (?,?,?,?,0,0,0,1)"
                     " ON CONFLICT(target) DO UPDATE SET shape=excluded.shape,"
                     " digest=excluded.digest, first_ts=excluded.first_ts, actions=0,"
-                    " last_action_ts=0, escalated=0", (target, shape, dg, now))
+                    " last_action_ts=0, escalated=0, last_action_ok=1",
+                    (target, shape, dg, now))
                 conn.commit()
             d = decide(shape, pending=pending, age_secs=now - first_ts,
                        actions_used=actions, since_last_action=now - (last_ts or 0),
-                       child=c.get("child"))
+                       child=c.get("child"), last_action_ok=last_ok)
             if d["action"] == "none":
                 skipped.append({"target": target, "shape": shape, "why": d["reason"]})
                 continue
@@ -347,8 +372,8 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 res = deliver_fn(target, cwd, action="deliver", text=d["text"])
             ok = bool(res.get("ok"))
             conn.execute(
-                "UPDATE stall_doctor_state SET actions=actions+1, last_action_ts=?"
-                " WHERE target=?", (now, target))
+                "UPDATE stall_doctor_state SET actions=actions+1, last_action_ts=?,"
+                " last_action_ok=? WHERE target=?", (now, int(ok), target))
             self_log(conn, target, shape, d["action"], dg, ok,
                      f"{d['reason']}; verify={res.get('reason') or ok}", now)
             emit_fn(
@@ -369,6 +394,39 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
     finally:
         if own:
             conn.close()
+
+
+def _retire_stale_escalation(conn, target: str, now: float, *, why: str) -> list:
+    """Retire doctor escalations contradicted by the episode resolving on its
+    own (pane working again, or the composer/digest moved on). Same overlay
+    discipline as agent_watch crash reconciliation: the event row is never
+    touched — mark_invalid + wake acknowledge, so the owner stops being paged
+    for a stall that no longer exists (chemmy-fast, 2026-08-15 17:10, resumed
+    minutes after its escalation and the actionable ping stayed live)."""
+    retired = []
+    try:
+        from core import agent_watch, wake_bridge
+        agent_watch._conn(conn)  # ensure the invalid-overlay table exists
+        rows = conn.execute(
+            "SELECT e.id FROM event e LEFT JOIN agent_alert_invalid i "
+            "ON i.event_id = e.id WHERE e.source='stall_doctor' "
+            "AND e.type='agent_waiting_input' AND e.agent_id=? "
+            "AND i.event_id IS NULL ORDER BY e.id DESC LIMIT 5", (target,)).fetchall()
+        for (eid,) in rows:
+            agent_watch.mark_invalid(
+                eid, reason=f"stall episode resolved ({why}) at {now_iso()} — "
+                            "pane moved on without the owner",
+                by="stall_doctor", conn=conn, now=now)
+            try:
+                wake_bridge.acknowledge(eid, conn=conn, now=now)
+            except Exception:  # noqa: BLE001
+                pass
+            self_log(conn, target, "", "retire_escalation", "", True,
+                     f"{why}; event={eid}", now)
+            retired.append(eid)
+    except Exception:  # noqa: BLE001 — reconciliation must never break the sweep
+        pass
+    return retired
 
 
 def self_log(conn, target, shape, action, digest, delivered, detail, now) -> None:

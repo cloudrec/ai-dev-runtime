@@ -297,3 +297,118 @@ def test_progress_resets_episode_and_rearm(conn):
     # a later identical stall is a NEW episode with a fresh SLO clock
     r2 = _scan(ag, {t: GAIKA_TAIL}, pend, emit, dlv, conn, now=NOW + 120)
     assert not r2["acted"]
+
+# ── stale escalation retirement (chemmy-fast 2026-08-15 17:10) ──────────────
+
+BAD_PENDING = "удали старый scratchpad и перезапусти сервис"
+
+
+def _escalate_for_real(conn, now=NOW):
+    """Drive a real escalation through the real event pipeline (sandbox DB)."""
+    from core.control_plane.cto import emit
+    from core.control_plane.store import init_db
+    init_db(conn)
+    dlv = Deliver()
+    ag = [_agent()]
+    tails = {"gaika-video:0.0": GAIKA_TAIL}
+    pend = {"gaika-video:0.0": BAD_PENDING}
+    sd.scan(agents=ag, read_fn=lambda t: tails[t],
+            pending_fn=lambda t, tail, cwd: pend.get(t, ""),
+            deliver_fn=dlv, emit_fn=emit, conn=conn, now=now)
+    r = sd.scan(agents=ag, read_fn=lambda t: tails[t],
+                pending_fn=lambda t, tail, cwd: pend.get(t, ""),
+                deliver_fn=dlv, emit_fn=emit, conn=conn,
+                now=now + sd.QUEUED_SLO_SECS + 1)
+    assert [a["action"] for a in r["acted"]] == ["escalate"]
+    eid = r["acted"][0]["event_id"]
+    assert eid
+    return eid
+
+
+def _is_invalid(conn, eid):
+    from core import agent_watch
+    agent_watch._conn(conn)  # overlay table may not exist if nothing retired
+    return conn.execute("SELECT 1 FROM agent_alert_invalid WHERE event_id=?",
+                        (eid,)).fetchone() is not None
+
+
+def test_escalation_retired_when_pane_resumes(conn):
+    """chemmy-fast live case: escalated on an unsubmittable queued line, then
+    resumed working minutes later — the actionable owner ping must be retired
+    (invalid overlay + wake ack), not left paging for a stall that is gone."""
+    from core.control_plane.cto import emit
+    eid = _escalate_for_real(conn)
+    working = [_agent(state="working")]
+    sd.scan(agents=working, read_fn=lambda t: GAIKA_TAIL,
+            pending_fn=lambda t, tail, cwd: "", deliver_fn=Deliver(),
+            emit_fn=emit, conn=conn, now=NOW + sd.QUEUED_SLO_SECS + 120)
+    assert _is_invalid(conn, eid), "stale escalation not retired on resume"
+    led = conn.execute("SELECT action, delivered FROM stall_doctor_action "
+                       "WHERE action='retire_escalation'").fetchone()
+    assert led is not None
+
+
+def test_escalation_retired_when_episode_moves_on(conn):
+    """Digest moved (composer/pane changed) while the escalation stood — the
+    old ping describes a state that no longer exists; retire it."""
+    from core.control_plane.cto import emit
+    eid = _escalate_for_real(conn)
+    moved_tail = GAIKA_TAIL.replace("All link checks documented.",
+                                    "Now verifying the deployed links instead.")
+    assert sd._digest(moved_tail, None) != sd._digest(GAIKA_TAIL, None)
+    sd.scan(agents=[_agent()], read_fn=lambda t: moved_tail,
+            pending_fn=lambda t, tail, cwd: GAIKA_PENDING, deliver_fn=Deliver(),
+            emit_fn=emit, conn=conn, now=NOW + sd.QUEUED_SLO_SECS + 120)
+    assert _is_invalid(conn, eid), "stale escalation not retired on digest move"
+
+
+def test_standing_escalation_is_not_retired(conn):
+    """Positive control: while the SAME unsubmittable stall persists, the
+    escalation stays valid — retirement only fires on real resolution."""
+    from core.control_plane.cto import emit
+    eid = _escalate_for_real(conn)
+    sd.scan(agents=[_agent()], read_fn=lambda t: GAIKA_TAIL,
+            pending_fn=lambda t, tail, cwd: BAD_PENDING, deliver_fn=Deliver(),
+            emit_fn=emit, conn=conn, now=NOW + sd.QUEUED_SLO_SECS + 120)
+    assert not _is_invalid(conn, eid), "live escalation wrongly retired"
+
+
+# ── failed-delivery fast retry (gaika-presentation 2026-08-15 10:28) ────────
+
+def test_failed_delivery_retries_on_short_clock(conn):
+    """A verify=False delivery proves nothing about the pane; the bounded
+    retry must come after FAILED_RETRY_COOLDOWN_SECS, not the full success
+    cooldown (gaika-presentation sat ~30 idle minutes)."""
+    emit, dlv = Emit(), Deliver(ok=False)
+    t = "payorch-live-buttons:0.0"
+    ag = [_agent(t, "/opt/payment-orchestrator", state="idle")]
+    tails = {t: PAYORCH_TAIL}
+    _scan(ag, tails, {}, emit, dlv, conn, now=NOW)
+    base = NOW + sd.WAIT_SLO_SECS + 1
+    r1 = _scan(ag, tails, {}, emit, dlv, conn, now=base)
+    assert [a["action"] for a in r1["acted"]] == ["nudge"] and len(dlv.calls) == 1
+    # still inside the failed-retry window -> quiet, with the failed reason
+    r2 = _scan(ag, tails, {}, emit, dlv, conn,
+               now=base + sd.FAILED_RETRY_COOLDOWN_SECS - 10)
+    assert not r2["acted"]
+    assert any(s.get("why") == "failed_action_cooldown" for s in r2["skipped"])
+    # past the short clock (far inside the long one) -> bounded retry fires
+    r3 = _scan(ag, tails, {}, emit, dlv, conn,
+               now=base + sd.FAILED_RETRY_COOLDOWN_SECS + 1)
+    assert [a["action"] for a in r3["acted"]] == ["nudge"] and len(dlv.calls) == 2
+
+
+def test_successful_delivery_keeps_long_cooldown(conn):
+    """Positive control: after a VERIFIED delivery the long cooldown holds —
+    the short clock is only for failures."""
+    emit, dlv = Emit(), Deliver(ok=True)
+    t = "payorch-live-buttons:0.0"
+    ag = [_agent(t, "/opt/payment-orchestrator", state="idle")]
+    tails = {t: PAYORCH_TAIL}
+    _scan(ag, tails, {}, emit, dlv, conn, now=NOW)
+    base = NOW + sd.WAIT_SLO_SECS + 1
+    _scan(ag, tails, {}, emit, dlv, conn, now=base)
+    r = _scan(ag, tails, {}, emit, dlv, conn,
+              now=base + sd.FAILED_RETRY_COOLDOWN_SECS + 1)
+    assert not r["acted"] and len(dlv.calls) == 1
+    assert any(s.get("why") == "action_cooldown" for s in r["skipped"])
