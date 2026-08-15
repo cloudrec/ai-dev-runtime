@@ -118,6 +118,32 @@ def find_target(conversation_url: str) -> Optional[dict]:
     return None
 
 
+def open_chatgpt_page(conversation_url: str) -> Optional[dict]:
+    """Open a FRESH tab directly on the bound conversation when NO ChatGPT tab exists at
+    all — the browser-level `/json/new` endpoint, same one `recover_wedged_tab` already
+    uses for a wedged renderer, so this adds no new transport, only the missing case
+    where there was no renderer to recover in the first place. The owner's existing
+    logged-in browser profile carries the session; this only asks the browser to point
+    a tab at the URL, never touches credentials."""
+    import time
+    try:
+        try:
+            fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}",
+                          method="PUT")
+        except Exception:  # noqa: BLE001 — pre-111 Chrome used GET here
+            fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}")
+        if not fresh.get("id"):
+            return None
+        for _ in range(15):
+            time.sleep(2)
+            t = find_target(conversation_url)
+            if t and t.get("id") == fresh.get("id") and page_responsive(t):
+                return t
+        return find_target(conversation_url)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def find_chatgpt_page() -> Optional[dict]:
     """Any open ChatGPT page, matched on host only — never on title or content."""
     for t in _http("/json/list"):
@@ -292,23 +318,29 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # some other chat.
         target = find_chatgpt_page()
         if not target:
-            return {"ok": False, "reason": "no_chatgpt_page_open"}
-        s0 = None
-        try:
-            s0 = _Session(target["webSocketDebuggerUrl"])
-            s0.call("Page.enable")
-            s0.call("Page.navigate", {"url": conversation_url})
-        finally:
-            if s0:
-                s0.close()
-        import time
-        for _ in range(15):
-            time.sleep(2)
-            target = find_target(conversation_url)
-            if target:
-                break
-        if not target:
-            return {"ok": False, "reason": "could_not_open_bound_conversation"}
+            # No ChatGPT tab exists anywhere in this browser — nothing to navigate.
+            # Open one directly on the bound conversation at the browser level, exactly
+            # as the wedged-renderer recovery path already does.
+            target = open_chatgpt_page(conversation_url)
+            if not target:
+                return {"ok": False, "reason": "no_chatgpt_page_open"}
+        else:
+            s0 = None
+            try:
+                s0 = _Session(target["webSocketDebuggerUrl"])
+                s0.call("Page.enable")
+                s0.call("Page.navigate", {"url": conversation_url})
+            finally:
+                if s0:
+                    s0.close()
+            import time
+            for _ in range(15):
+                time.sleep(2)
+                target = find_target(conversation_url)
+                if target:
+                    break
+            if not target:
+                return {"ok": False, "reason": "could_not_open_bound_conversation"}
     # A wedged renderer answers nothing, ever; detect it BEFORE burning the attempt on a
     # guaranteed timeout, and replace the tab at browser level (the 4214 incident: 113
     # identical WebSocketTimeouts against one hung page).
