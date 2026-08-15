@@ -117,3 +117,18 @@ cleanup (12 stale rows deregistered via the code path on first tick, no raw
 SQL). 8 new regressions; full suite 2129 green; companion restarted
 23:24 CEST; three-plus ticks journal-quiet on all retired chains, verified
 independently. Head `b4b0433`.
+
+## Follow-up 2: event-age ceiling (52f47bf)
+
+Event 4619 (emitted Aug 14, skipped for cooldown at emission) was re-decided
+to `wake` ~24h later by `_redecide_cooldown_skips` — whose recency window
+keyed off the SKIP's timestamp — and the fresh decision made a day-old event
+invisible to expire_stale's decision-age clock: delivered ~24h late. Fix:
+staleness now checks two independent clocks (decision age AND the event's own
+ts_epoch from the durable log — a replayed decision cannot make the event
+younger), the redecider is bounded by event age at the source, and a second
+expire pass inside pending_wake backstops any future re-decision path.
+5 regressions incl. the exact 4619 shape + fresh positive controls; full
+suite 2133 green; companion restarted 00:00Z, journal quiet. Telegram
+dead-letters (786) confirmed as the pre-existing known-red push channel —
+owner decision item, not a delivery defect.
