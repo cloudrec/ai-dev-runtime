@@ -173,6 +173,18 @@ _MENU_RE = re.compile(r"\b1\.\s+\S.{0,300}?\b2\.\s+\S")
 _FINISH_RE = re.compile(
     r"(finish(?:ed)?\b|complet(?:e|ed)\b|\ball done\b|\bdone[.!]|final report"
     r"|all (?:checks|tests) pass(?:ed)?|завершен[оа]?|готово)", re.IGNORECASE)
+# TOOL/HARNESS telemetry wearing finish vocabulary. Event 5051: a live working
+# agent was announced task_completed because its pane showed `Background command
+# "…monitor output" completed (exit code 0)` — a SHELL exiting, not the agent
+# finishing. A completion notice about a command/monitor/subprocess is progress
+# telemetry by definition; it can never satisfy the positive-finish requirement,
+# whatever finish words it contains.
+_TOOL_COMPLETION_RE = re.compile(
+    r"(\(exit code \d+\)|exit(?:ed)? with code|\breturn code\b"
+    r"|background (?:command|task|shell).{0,80}?(?:completed|finished|was stopped)"
+    r"|command (?:completed|finished|exited)"
+    r"|monitor .{0,60}?(?:stream ended|completed)"
+    r"|task-notification|<system-reminder>)", re.IGNORECASE)
 
 
 def _meaningful_lines(tail: str) -> list:
@@ -272,6 +284,10 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
             # closing lines never SAID it finished. Stay "working" so a real, stated
             # finish later is still a fresh transition — quietness alone never completes.
             return {"cls": "working", "reason": "no_positive_finish_evidence"}
+        if _TOOL_COMPLETION_RE.search(final):
+            # The finish vocabulary belongs to a command/monitor/subprocess notice
+            # (event 5051): a shell exiting is not the agent finishing its task.
+            return {"cls": "working", "reason": "tool_completion_is_not_task_finish"}
         return {"cls": "completed", "reason": "stated_finish_at_rest"}
     return {"cls": "idle", "reason": "no_signal"}
 

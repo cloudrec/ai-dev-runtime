@@ -254,6 +254,41 @@ def test_idle_after_work_without_a_stated_finish_is_not_a_completion():
     assert r["emitted"] == [] and emit.calls == []
 
 
+def test_tool_completion_telemetry_is_never_a_task_finish():
+    """Event 5051, live: the bootstrap agent's pane showed the harness notice
+    `Background command "Wait for 193 monitor output" completed (exit code 0)`
+    while the agent was demonstrably mid-task — and was announced
+    task_completed. A shell/monitor/subprocess completing is telemetry, never
+    the agent finishing."""
+    emit = _Emit()
+    t = "owneros-runtime-supervisor-bootstrap:0.0"
+    _scan([_agent(t, "/root/ai-dev-runtime", state="working")], {t: WORKING_TAIL}, emit)
+    tool_rest = ('Background command "Wait for 193 monitor output" completed '
+                 "(exit code 0)")
+    r = _scan([_agent(t, "/root/ai-dev-runtime", state="idle")], {t: tool_rest},
+              emit, now=1100.0)
+    assert r["emitted"] == [] and emit.calls == []
+    # more shapes from the same family
+    for rest in ('Monitor "terminal state of job" stream ended',
+                 "process exited with code 0",
+                 "Command finished. return code 0"):
+        r = _scan([_agent(t, "/root/ai-dev-runtime", state="idle")], {t: rest},
+                  emit, now=1200.0)
+        assert r["emitted"] == [], rest
+    assert emit.calls == []
+
+
+def test_a_real_stated_finish_still_completes_after_tool_noise():
+    """Positive control: the guard must not eat genuine completions."""
+    emit = _Emit()
+    t = "owneros-runtime-supervisor-bootstrap:0.0"
+    _scan([_agent(t, "/root/ai-dev-runtime", state="working")], {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, "/root/ai-dev-runtime", state="idle")],
+              {t: "All checks passed. Final report written to reports/BRIDGE.md."},
+              emit, now=1100.0)
+    assert [e["class"] for e in r["emitted"]] == ["completed"]
+
+
 def test_a_fingerprint_migration_does_not_renotify_an_unresolved_blocker():
     """events 4084/4085, live: a classifier deploy changed the digest scheme and every
     unresolved blocker re-announced. Same agent, same class, still unresolved, digest
