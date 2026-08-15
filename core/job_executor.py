@@ -494,7 +494,11 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
             return
         fallback_used = True
         # Mark in job metadata that fallback planning was used + preserve accounting.
-        job_store.update_job(job_id, artifacts=(job.get("artifacts") or []) + [{
+        # Re-fetch: the in-memory `job` predates the plan stage, and appending from
+        # it silently drops artifacts recorded since (the model_selection artifact
+        # was lost exactly this way on job b34772f4, 2026-08-15).
+        _cur = job_store.get_job(job_id) or job
+        job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
             "fallback_planning": True, "reason": reason[:200],
             "timed_out": diag["timed_out"], "tokens": diag["tokens"],
             "cost_usd": diag["cost_usd"], "duration_ms": diag["duration_ms"],

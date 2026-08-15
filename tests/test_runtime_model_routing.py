@@ -322,3 +322,36 @@ def test_executor_plan_stage_router_disabled_passes_model_none(tmp_path, monkeyp
     final = job_store.get_job(job["id"])
     assert captured["model"] is None
     assert final["status"] == "completed", final.get("error")
+
+
+def test_fallback_planning_preserves_model_selection_artifact(tmp_path, monkeypatch):
+    """Live regression (job b34772f4): when the planner fails and the fallback
+    plan kicks in, the fallback-metadata append must not clobber the
+    model_selection artifact recorded moments earlier by _route_model."""
+    import core.job_executor as jx
+    from core import ai_planner, job_store
+
+    proj = tmp_path / "p"
+    proj.mkdir()
+    (proj / "README.md").write_text("x\n")
+    import subprocess
+    subprocess.run(["git", "init", "-q"], cwd=proj, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=proj, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", "init"], cwd=proj, check=True)
+
+    monkeypatch.setenv("RUNTIME_MODEL_ROUTER", "1")
+    monkeypatch.setattr(ai_planner, "available", lambda: True)
+
+    def broken_plan(*a, **k):
+        raise ai_planner.PlannerError("plan missing 'files' list")
+
+    monkeypatch.setattr(ai_planner, "plan", broken_plan)
+    job = job_store.create_job(goal="tiny note", project_path=str(proj),
+                               autonomy_level="suggest", kind="code_change")
+    jx.execute(job["id"])
+    j = job_store.get_job(job["id"])
+    arts = j.get("artifacts") or []
+    assert any(isinstance(a, dict) and "model_selection" in a for a in arts), \
+        f"model_selection artifact lost: {arts}"
+    assert any(isinstance(a, dict) and a.get("fallback_planning") for a in arts)
