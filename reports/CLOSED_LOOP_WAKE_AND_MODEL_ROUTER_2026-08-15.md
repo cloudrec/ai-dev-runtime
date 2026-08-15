@@ -132,3 +132,18 @@ expire pass inside pending_wake backstops any future re-decision path.
 suite 2133 green; companion restarted 00:00Z, journal quiet. Telegram
 dead-letters (786) confirmed as the pre-existing known-red push channel —
 owner decision item, not a delivery defect.
+
+## Reconciliations 2026-08-16 (read-only)
+
+- 5607 (notifications_red, critical): hourly re-announcement of the standing
+  push-channel red (series 5485/5540/5607) — the known Telegram owner-decision
+  item; no new condition. 5543/5557 (notification_dead_letter): both
+  channel=telegram after 5 attempts, for payorch conditions whose ChatGPT
+  wakes DID deliver — Telegram leg only, not a wake defect. No delivery
+  config or external channel touched.
+- Diagnostic staleness noted, deliberately unfixed: red_reason
+  `actuation_scope_breach` flags two soak-era panes (arbitrage2-opus,
+  mess-qa-automation, last cp_action Aug 5/7, panes gone) — the all-time
+  ledger check vs the current canary allowlist can never self-clear; a
+  time-window or allowlist-era fix is a future deliberate change to a safety
+  check, not a bug fix to rush.
