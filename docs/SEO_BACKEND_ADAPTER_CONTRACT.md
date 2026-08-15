@@ -40,6 +40,13 @@ Business Analyzer (task 202): `GET|POST /analyzer/cards`,
 `POST /analyzer/combine`. Seven fixed score axes, each requiring a written
 rationale; build/spend/publish/outreach states are owner-only.
 
+## Model router (task 209)
+
+`POST /router/route`, `POST /router/outcome`, `GET /router/effectiveness`,
+`GET /router/policy`. Routing decisions and outcomes are recorded here; the
+adapter renders effectiveness and forwards outcomes, it never re-implements
+the policy.
+
 Refs: `tmux:<session:pane>` / `runtime:<job-uuid>`. Fabric states use the Task
 Contract vocabulary (WORKING/BLOCKED/OWNER_DECISION/AGENT_DONE/VERIFYING/
 VERIFICATION_FAILED/VERIFIED_DONE + CREATED/CANCELLED).

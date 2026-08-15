@@ -41,6 +41,9 @@ CONTRACT_PATHS = [
     "/api/v1/analyzer/cards", "/api/v1/analyzer/cards/{card_id}",
     "/api/v1/analyzer/cards/{card_id}/rescore",
     "/api/v1/analyzer/cards/{card_id}/transition", "/api/v1/analyzer/combine",
+    # model router (task 209)
+    "/api/v1/router/route", "/api/v1/router/outcome",
+    "/api/v1/router/effectiveness", "/api/v1/router/policy",
 ]
 
 
@@ -102,3 +105,12 @@ def test_venture_refusals_are_409_with_reason():
             title="x", card={"source_code": "lifted"}), _=True))
     assert e2.value.status_code == 409
     assert "public behavior only" in str(e2.value.detail)
+
+
+def test_router_refusals_are_409_with_reason():
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(v1.router_route(v1.RouterRoute(
+            task_class="bogus_class", strict=True), _=True))
+    assert e.value.status_code == 409
+    assert "unknown task_class" in str(e.value.detail)

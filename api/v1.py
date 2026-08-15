@@ -920,3 +920,63 @@ async def analyzer_combine(req: AnalyzerCombine, _: bool = Depends(_auth)):
     from core import business_analyzer
     return {"combinations": _venture_call(business_analyzer.combine, req.assets,
                                           max_size=req.max_size)}
+
+
+# ── Model Router (task 209) ──────────────────────────────────────────────────
+# Standing cost-aware routing policy: decides and records, never dispatches.
+# The adapter renders effectiveness and forwards outcomes only.
+
+def _router_call(fn, *args, **kw):
+    from core.model_router import RouterError
+    try:
+        return fn(*args, **kw)
+    except RouterError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+class RouterRoute(BaseModel):
+    task_class: str
+    risk: str = "normal"
+    prior_attempts: list = []
+    context_pack: str = ""
+    task_ref: str = ""
+    strict: bool = False
+
+
+class RouterOutcome(BaseModel):
+    decision_id: int
+    outcome: str
+    tokens_in: int = 0
+    tokens_out: int = 0
+    usd: float = 0.0
+    retries: int = 0
+    note: str = ""
+
+
+@router.post("/router/route")
+async def router_route(req: RouterRoute, _: bool = Depends(_auth)):
+    from core import model_router
+    return _router_call(model_router.route, req.task_class, risk=req.risk,
+                        prior_attempts=req.prior_attempts, context_pack=req.context_pack,
+                        task_ref=req.task_ref, strict=req.strict)
+
+
+@router.post("/router/outcome")
+async def router_outcome(req: RouterOutcome, _: bool = Depends(_auth)):
+    from core import model_router
+    return _router_call(model_router.record_outcome, req.decision_id,
+                        outcome=req.outcome, tokens_in=req.tokens_in,
+                        tokens_out=req.tokens_out, usd=req.usd, retries=req.retries,
+                        note=req.note)
+
+
+@router.get("/router/effectiveness")
+async def router_effectiveness(days: int = 30, _: bool = Depends(_auth)):
+    from core import model_router
+    return model_router.effectiveness(days=days)
+
+
+@router.get("/router/policy")
+async def router_policy(_: bool = Depends(_auth)):
+    from core import model_router
+    return model_router.policy()
