@@ -1,0 +1,19 @@
+[Unit]
+Description=Run the Owner OS fleet health monitor every 5 minutes
+
+[Timer]
+# 5 minutes matches payorch-replication-monitor.timer's cadence: this watches
+# live-traffic infrastructure (edges, RU-PROD), not a slow-moving thing like a TLS
+# certificate. With FAIL_THRESHOLD=3 consecutive failures, a real DOWN alert fires
+# 10-15 minutes after true failure onset — fast enough to page a human, slow enough
+# that one blip never pages.
+OnCalendar=*:0/5
+RandomizedDelaySec=30s
+AccuracySec=10s
+# Catch up after downtime, same reasoning as the other Owner OS/payorch monitors: a
+# monitor that silently skips checks while the host was off is the failure mode this
+# exists to prevent.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

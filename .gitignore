@@ -42,3 +42,6 @@ agent_control.db
 control_plane.db
 control_plane.db-*
 checkpoints/
+
+# fleet health monitor runtime state (per-host consecutive fail/ok counts)
+state/fleet_health_state.json

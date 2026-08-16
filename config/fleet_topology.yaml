@@ -1,0 +1,74 @@
+# Managed fleet for server-down Telegram alerting (core/fleet_health.py).
+#
+# Addresses are NOT secret (they already appear in /etc/systemd/system/*.service
+# IPAddressAllow= lines and multiple /opt/payment-orchestrator reports/docs) and are
+# cross-verified against:
+#   - /opt/payment-orchestrator/docs/INFRASTRUCTURE_TOPOLOGY.md (canonical roles)
+#   - /usr/local/sbin/payorch-replication-monitor.sh (RU-PROD / RU-2 IPs)
+#   - /etc/systemd/system/payorch-cert-monitor.service IPAddressAllow= (edge IPs +
+#     management's own public IP)
+#   - /opt/payment-orchestrator/reports/FOURTH_SERVER_FI_EDGE_2026-08-10.md,
+#     PHASE_00_PLAN.md (management host identity, vmi3293429)
+#
+# Checks are service-aware (HTTP/HTTPS status or TCP port), never ICMP-only, per
+# reports/SERVER_DOWN_TELEGRAM_ALERTS_2026-08-16.md.
+#
+# Change gate: this file only feeds READ-ONLY probes (GET requests, TCP connect). It
+# must never be given write/mutating endpoints, and adding a host here grants that
+# host no new inbound exposure.
+
+hosts:
+  - id: management
+    label: "Management / control plane"
+    ip: "84.247.139.105"
+    role: "control plane, this host (vmi3293429)"
+    checks:
+      - type: tcp
+        port: 22
+
+  - id: ru_prod
+    label: "RU-PROD (primary)"
+    ip: "77.110.113.202"
+    role: "application + PostgreSQL + Redis, payment provider origin"
+    checks:
+      - type: http
+        port: 80
+        path: "/"
+        host: "77.110.113.202"
+        expect_status: 200
+      - type: tcp
+        port: 22
+
+  - id: ru2
+    label: "RU-2 (redundancy peer)"
+    ip: "5.45.82.124"
+    role: "passive standby of RU-PROD"
+    checks:
+      - type: tcp
+        port: 22
+
+  - id: nl_edge
+    label: "NL edge"
+    ip: "37.1.216.133"
+    role: "nginx reverse proxy + TLS + WireGuard endpoint (foreign/default traffic)"
+    checks:
+      - type: https
+        port: 443
+        path: "/health/live"
+        host: "payment.blagopay.xyz"
+        expect_status: 200
+      - type: tcp
+        port: 22
+
+  - id: fi_edge
+    label: "FI edge (Helsinki)"
+    ip: "185.75.135.63"
+    role: "second foreign edge, mirrors NL edge, not yet in DNS"
+    checks:
+      - type: https
+        port: 443
+        path: "/health/live"
+        host: "payment.blagopay.xyz"
+        expect_status: 200
+      - type: tcp
+        port: 22
