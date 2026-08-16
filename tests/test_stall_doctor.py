@@ -424,3 +424,51 @@ def test_successful_delivery_keeps_long_cooldown(conn):
               now=base + sd.FAILED_RETRY_COOLDOWN_SECS + 1)
     assert not r["acted"] and len(dlv.calls) == 1
     assert any(s.get("why") == "action_cooldown" for s in r["skipped"])
+
+
+# ── vanished-pane row pruning (payorch-sbp-resumed / payorch-fresh-sonnet,
+# 2026-08-16: stale rows survived a full day because the scan loop only
+# revisits targets still present in the live agent list) ────────────────────
+
+def test_prune_removes_row_for_vanished_pane(conn):
+    emit, dlv = Emit(), Deliver()
+    t = "payorch-live-buttons:0.0"
+    ag = [_agent(t, "/opt/payment-orchestrator", state="idle")]
+    tails = {t: PAYORCH_TAIL}
+    _scan(ag, tails, {}, emit, dlv, conn, now=NOW)
+    assert conn.execute("SELECT 1 FROM stall_doctor_state WHERE target=?",
+                        (t,)).fetchone()
+    # pane gone entirely -> a scan over a DIFFERENT live agent must still
+    # prune the orphaned row, not just leave it forever
+    other = "gaika-video:0.0"
+    r = _scan([_agent(other)], {other: GAIKA_TAIL}, {other: GAIKA_PENDING},
+              emit, dlv, conn, now=NOW + 3600)
+    assert t in r["pruned"]
+    assert not conn.execute("SELECT 1 FROM stall_doctor_state WHERE target=?",
+                            (t,)).fetchone()
+
+
+def test_prune_retires_stale_escalation_first(conn):
+    """A vanished pane that was mid-escalation must not leave its owner ping
+    live — same discipline as the resume/episode-move retirement paths."""
+    eid = _escalate_for_real(conn)
+    r = sd.scan(agents=[_agent("gaika-presentation:0.0")],
+                read_fn=lambda t: GAIKA_TAIL,
+                pending_fn=lambda t, tail, cwd: "", deliver_fn=Deliver(),
+                emit_fn=Emit(), conn=conn, now=NOW + sd.QUEUED_SLO_SECS + 3600)
+    assert "gaika-video:0.0" in r["pruned"]
+    assert _is_invalid(conn, eid), "vanished pane's escalation not retired"
+
+
+def test_prune_skipped_when_live_agent_list_is_empty(conn):
+    """An empty `agents` list is more likely a transient agent_list() hiccup
+    than every pane vanishing at once — don't wipe state on that ambiguity."""
+    emit, dlv = Emit(), Deliver()
+    t = "payorch-live-buttons:0.0"
+    ag = [_agent(t, "/opt/payment-orchestrator", state="idle")]
+    tails = {t: PAYORCH_TAIL}
+    _scan(ag, tails, {}, emit, dlv, conn, now=NOW)
+    r = _scan([], {}, {}, emit, dlv, conn, now=NOW + 3600)
+    assert r["pruned"] == []
+    assert conn.execute("SELECT 1 FROM stall_doctor_state WHERE target=?",
+                        (t,)).fetchone()

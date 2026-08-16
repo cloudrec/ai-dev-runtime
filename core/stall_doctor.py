@@ -295,7 +295,28 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
 
     conn, own = _conn(conn)
     try:
-        acted, skipped = [], []
+        acted, skipped, pruned = [], [], []
+        # Rows for panes that vanished entirely (closed/renamed, never sent NONE/
+        # OWNER_WAIT to clear their own row) never get revisited by the loop below —
+        # it only walks the CURRENT live `agents` list. Prune them here so state
+        # doesn't accumulate forever (payorch-sbp-resumed / payorch-fresh-sonnet,
+        # 2026-08-16: rows survived a full day after their panes were gone).
+        # Skip only when the live list itself is empty — that's more likely a
+        # transient agent_list() hiccup than every pane vanishing at once, and
+        # wiping every row on that ambiguity is not a safe bet.
+        live_targets = {a.get("target") for a in agents if a.get("target")}
+        if live_targets:
+            for (t, escalated) in conn.execute(
+                    "SELECT target, escalated FROM stall_doctor_state").fetchall():
+                if t in live_targets:
+                    continue
+                if escalated:
+                    _retire_stale_escalation(conn, t, now, why="pane_vanished")
+                conn.execute("DELETE FROM stall_doctor_state WHERE target=?", (t,))
+                self_log(conn, t, "", "prune_vanished", "", True,
+                         "pane no longer in live agent list", now)
+                conn.commit()
+                pruned.append(t)
         for a in agents:
             target = a.get("target") or ""
             if not target:
@@ -409,7 +430,8 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             conn.commit()
             acted.append({"target": target, "shape": shape, "action": d["action"],
                           "delivered": ok})
-        return {"acted": acted, "skipped": skipped, "agents_seen": len(agents)}
+        return {"acted": acted, "skipped": skipped, "agents_seen": len(agents),
+                "pruned": pruned}
     finally:
         if own:
             conn.close()

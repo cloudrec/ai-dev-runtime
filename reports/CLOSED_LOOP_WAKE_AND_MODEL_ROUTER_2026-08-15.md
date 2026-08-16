@@ -147,3 +147,15 @@ owner decision item, not a delivery defect.
   ledger check vs the current canary allowlist can never self-clear; a
   time-window or allowlist-era fix is a future deliberate change to a safety
   check, not a bug fix to rush.
+
+## Reconciliation 2026-08-16T04:18Z (read-only)
+
+- 5723 (notifications_red, critical): payload byte-identical (minus
+  `checked_at`) to 5258..5710 series — same `owner_push` reason
+  ("telegram send failed: HTTP Error 400: Bad Request") and same
+  `same_chat_wake` unavailable reason. Standing hourly re-announcement of
+  the known Telegram owner-decision item, not a new condition. No
+  `resolve_blocker`/gate mutation applied: `notifications_red` is an
+  owner-decision (external channel) gate, not a SYSTEM blocker kind
+  (`core/control_plane/resolutions.py` explicitly excludes these from
+  auto-resolution). No delivery config or external channel touched.
