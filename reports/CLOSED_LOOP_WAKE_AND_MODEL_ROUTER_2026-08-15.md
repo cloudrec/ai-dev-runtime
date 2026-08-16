@@ -194,3 +194,13 @@ record the real reason on its next cycle instead of the generic HTTP code.
 **The red condition itself remains an external/owner-decision gate**
 (Telegram bot/chat configuration) — this fix makes it diagnosable, it does
 not resolve it. No delivery config or external channel touched.
+
+## Deploy 2026-08-16T08:08 CEST
+
+`ai-runtime.service` and `owner-os-wake-companion.service` restarted at
+08:08:22 CEST to pick up 74dd1e0/c3773c9/50b85fe (task-213 escalation gate,
+stall_doctor vanished-pane prune, delivery HTTPError body capture). Both
+active immediately (new PIDs 1621463 / 1621433). Confirmed live: the two
+stale `stall_doctor_state` rows (payorch-sbp-resumed, payorch-fresh-sonnet)
+were pruned on the very first post-restart scan — table is now empty of
+stale entries. No other services touched.
