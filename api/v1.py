@@ -941,6 +941,7 @@ class RouterRoute(BaseModel):
     context_pack: str = ""
     task_ref: str = ""
     strict: bool = False
+    escalation_reason: Optional[dict] = None
 
 
 class RouterOutcome(BaseModel):
@@ -958,7 +959,8 @@ async def router_route(req: RouterRoute, _: bool = Depends(_auth)):
     from core import model_router
     return _router_call(model_router.route, req.task_class, risk=req.risk,
                         prior_attempts=req.prior_attempts, context_pack=req.context_pack,
-                        task_ref=req.task_ref, strict=req.strict)
+                        task_ref=req.task_ref, strict=req.strict,
+                        escalation_reason=req.escalation_reason)
 
 
 @router.post("/router/outcome")

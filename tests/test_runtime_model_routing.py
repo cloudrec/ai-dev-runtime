@@ -254,16 +254,62 @@ def test_deescalation_clear_finding_with_prior_fable_success_routes_sonnet():
     assert out["model"] == model_router.SONNET
 
 
-def test_route_model_escalates_to_opus_after_sonnet_failure(monkeypatch):
+def test_route_model_escalation_ladder_without_reason_stays_on_sonnet(monkeypatch):
+    """task 213 hard gate: automated job dispatch never sets escalation_reason,
+    so a sonnet-failure ladder trigger (routine load/perf work retrying) must
+    NOT reach opus — it de-escalates to sonnet instead of silently spending
+    on the expensive tier."""
     monkeypatch.setenv("RUNTIME_MODEL_ROUTER", "1")
     job = job_store.create_job(project_path="/tmp", goal="g", instructions="",
                                kind=job_kinds.CODE_CHANGE)
     m_id, m_dec, m_name = job_executor._route_model(
         job, job_kinds.CODE_CHANGE,
         extra_attempts=[{"model": "sonnet", "outcome": "failure"}])
+    assert m_name == model_router.SONNET
+    assert m_id == model_router.MODEL_IDS[model_router.SONNET]
+    assert m_dec is not None
+    final = job_store.get_job(job["id"])
+    sels = [a for a in (final["artifacts"] or [])
+           if isinstance(a, dict) and isinstance(a.get("model_selection"), dict)]
+    assert sels[-1]["model_selection"]["requested_model"] == model_router.OPUS
+    assert sels[-1]["model_selection"]["escalation_valid"] is False
+
+
+def test_route_model_with_valid_escalation_reason_reaches_opus(monkeypatch):
+    """The one legitimate path to opus: the job itself carries a structured,
+    valid escalation_reason (an owner/agent explicitly justifying the tier)."""
+    monkeypatch.setenv("RUNTIME_MODEL_ROUTER", "1")
+    job = job_store.create_job(project_path="/tmp", goal="g", instructions="",
+                               kind=job_kinds.CODE_CHANGE)
+    job["escalation_reason"] = {
+        "category": "high_ambiguity",
+        "evidence": "two sonnet attempts failed with conflicting root causes",
+        "expected_benefit": "opus can reconcile the conflicting diagnoses",
+    }
+    m_id, m_dec, m_name = job_executor._route_model(
+        job, job_kinds.CODE_CHANGE,
+        extra_attempts=[{"model": "sonnet", "outcome": "failure"}])
     assert m_name == model_router.OPUS
     assert m_id == model_router.MODEL_IDS[model_router.OPUS]
     assert m_dec is not None
+
+
+@pytest.mark.parametrize("kind,goal,instructions", [
+    (job_kinds.OPERATIONAL, "run the routine load test suite", ""),
+    (job_kinds.CODE_CHANGE, "apply the concrete post-audit fix", "finding is unambiguous"),
+    (job_kinds.CONTENT_PRODUCTION, "write repo inspection docs", ""),
+])
+def test_routine_dispatch_kinds_never_reach_opus_or_fable(monkeypatch, kind, goal, instructions):
+    """task 213: routine implementation / load-perf / docs / repo-inspection /
+    concrete-fix dispatch must route to sonnet even when the job carries a
+    money/security/high risk_level — no escalation_reason means no expensive
+    tier, full stop."""
+    monkeypatch.setenv("RUNTIME_MODEL_ROUTER", "1")
+    job = job_store.create_job(project_path="/tmp", goal=goal, instructions=instructions,
+                               kind=kind, risk_level="critical")
+    m_id, m_dec, m_name = job_executor._route_model(job, kind)
+    assert m_name == model_router.SONNET
+    assert m_id == model_router.MODEL_IDS[model_router.SONNET]
 
 
 # ── ai_planner.plan() `model` kwarg ──────────────────────────────────────────

@@ -129,7 +129,14 @@ def _route_model(job: dict, kind: str | None, *, extra_attempts=(), stage: str =
     (model_id_or_None, decision_id_or_None, model_name_or_None). Disabled router
     or ANY failure here returns (None, None, None) — the caller then passes
     model=None into ai_planner.plan(), which falls back to its own configured
-    default. Router availability must never fail or block a job."""
+    default. Router availability must never fail or block a job.
+
+    `job["escalation_reason"]`, if set, is the ONLY way an opus/fable-eligible
+    class actually dispatches at that tier (task 213 hard gate in
+    core.model_router) — ordinary/automated dispatch never sets it, so
+    routine/load/perf/docs/repo-inspection/concrete-fix jobs always land on
+    sonnet even if their task_class or risk floor would otherwise reach for
+    a pricier model."""
     if not _router_enabled():
         return (None, None, None)
     job_id = job.get("id")
@@ -137,16 +144,20 @@ def _route_model(job: dict, kind: str | None, *, extra_attempts=(), stage: str =
         task_class = _task_class_for_kind(kind) or (kind or "unknown")
         risk = _risk_for_job(job)
         attempts = list(_lineage_attempts(job)) + list(extra_attempts)
+        escalation_reason = job.get("escalation_reason")
         decision = model_router.route(
             task_class, risk=risk, prior_attempts=attempts,
             context_pack=f"planner-prompt:{stage} (goal+instructions+file-listing<=80 lines)",
-            task_ref=f"runtimejob:{job_id}:{stage}")
+            task_ref=f"runtimejob:{job_id}:{stage}",
+            escalation_reason=escalation_reason if isinstance(escalation_reason, dict) else None)
         cur = job_store.get_job(job_id) or job
         job_store.update_job(job_id, artifacts=(cur.get("artifacts") or []) + [{
             "model_selection": {
                 "stage": stage, "decision_id": decision["decision_id"],
                 "model": decision["model"], "model_id": decision["model_id"],
                 "reason": decision["reason"], "task_class": task_class, "risk": risk,
+                "requested_model": decision.get("requested_model"),
+                "escalation_valid": decision.get("escalation_valid"),
             },
         }])
         job_store.append_log(job_id, "info",

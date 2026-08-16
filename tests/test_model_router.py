@@ -8,7 +8,7 @@ import sqlite3
 import pytest
 
 from core.model_router import (
-    SONNET, OPUS, FABLE, MODEL_IDS, PARTITION,
+    SONNET, OPUS, FABLE, MODEL_IDS, PARTITION, ESCALATION_CATEGORIES,
     RouterError, route, record_outcome, effectiveness, policy,
 )
 
@@ -25,12 +25,26 @@ def conn(tmp_path):
     c.close()
 
 
+def _escalation(model, **overrides):
+    """A valid escalation_reason for `model` (opus/fable) — task 213."""
+    from core.model_router import ESCALATION_CATEGORIES
+    reason = {
+        "category": ESCALATION_CATEGORIES[model][0],
+        "evidence": "sonnet attempt failed twice on this exact unit; see decision 1,2",
+        "expected_benefit": "resolves the blocking failure without another round-trip",
+    }
+    reason.update(overrides)
+    return reason
+
+
 # ── partition coverage ───────────────────────────────────────────────────────
 
 def test_every_class_maps_to_its_model(conn):
     for model, classes in PARTITION.items():
         for cls in classes:
-            out = route(cls, conn=conn)
+            kw = ({"escalation_reason": _escalation(model), "context_pack": "pack"}
+                  if model in (OPUS, FABLE) else {})
+            out = route(cls, conn=conn, **kw)
             assert out["model"] == model, f"{cls} expected {model}, got {out['model']}"
             assert out["model_id"] == MODEL_IDS[model]
 
@@ -50,14 +64,16 @@ def test_unknown_class_strict_refuses(conn):
 
 @pytest.mark.parametrize("risk", ["money", "security", "high"])
 def test_risk_floors_sonnet_class_to_opus(conn, risk):
-    out = route("tests", risk=risk, conn=conn)
+    out = route("tests", risk=risk, conn=conn,
+               escalation_reason=_escalation(OPUS), context_pack="pack")
     assert out["model"] == OPUS
     assert "floors to opus" in out["reason"]
 
 
 def test_risk_floor_never_lowers_fable(conn):
     # a class already at fable stays at fable even with a risk floor
-    out = route("hardest_unresolved_bug", risk="security", conn=conn)
+    out = route("hardest_unresolved_bug", risk="security", conn=conn,
+               escalation_reason=_escalation(FABLE), context_pack="pack")
     assert out["model"] == FABLE
 
 
@@ -74,19 +90,22 @@ def test_invalid_risk_refused(conn):
 # ── escalation ladder ─────────────────────────────────────────────────────────
 
 def test_sonnet_failure_escalates_to_opus(conn):
-    out = route("tests", prior_attempts=[{"model": SONNET, "outcome": "failure"}], conn=conn)
+    out = route("tests", prior_attempts=[{"model": SONNET, "outcome": "failure"}], conn=conn,
+               escalation_reason=_escalation(OPUS), context_pack="pack")
     assert out["model"] == OPUS
     assert "sonnet_insufficient" in out["reason"]
 
 
 def test_sonnet_uncertain_escalates_to_opus(conn):
-    out = route("tests", prior_attempts=[{"model": SONNET, "outcome": "uncertain"}], conn=conn)
+    out = route("tests", prior_attempts=[{"model": SONNET, "outcome": "uncertain"}], conn=conn,
+               escalation_reason=_escalation(OPUS), context_pack="pack")
     assert out["model"] == OPUS
 
 
 def test_opus_failure_escalates_to_fable(conn):
     out = route("architecture",
-                prior_attempts=[{"model": OPUS, "outcome": "failure"}], conn=conn)
+                prior_attempts=[{"model": OPUS, "outcome": "failure"}], conn=conn,
+                escalation_reason=_escalation(FABLE), context_pack="pack")
     assert out["model"] == FABLE
     assert "escalate_to_fable" in out["reason"]
 
@@ -95,7 +114,7 @@ def test_sonnet_opus_disagreement_escalates_to_fable(conn):
     out = route("tests", prior_attempts=[
         {"model": SONNET, "outcome": "disagreement"},
         {"model": OPUS, "outcome": "disagreement"},
-    ], conn=conn)
+    ], conn=conn, escalation_reason=_escalation(FABLE), context_pack="pack")
     assert out["model"] == FABLE
 
 
@@ -122,7 +141,7 @@ def test_clear_finding_deescalates_to_sonnet_after_fable_attempts(conn):
 def test_clear_finding_held_at_opus_when_risk_money(conn):
     out = route("clear_finding_implementation", risk="money", prior_attempts=[
         {"model": OPUS, "outcome": "failure"},
-    ], conn=conn)
+    ], conn=conn, escalation_reason=_escalation(OPUS), context_pack="pack")
     assert out["model"] == OPUS
 
 
@@ -192,7 +211,8 @@ def test_bad_outcome_refused(conn):
 def test_effectiveness_aggregates_per_model_and_class(conn):
     d1 = route("tests", conn=conn)["decision_id"]
     d2 = route("tests", conn=conn)["decision_id"]
-    d3 = route("architecture", conn=conn)["decision_id"]
+    d3 = route("architecture", conn=conn,
+              escalation_reason=_escalation(OPUS), context_pack="pack")["decision_id"]
 
     record_outcome(d1, outcome="success", tokens_in=10, tokens_out=5, usd=0.01, conn=conn)
     record_outcome(d2, outcome="failure", tokens_in=20, tokens_out=10, usd=0.02, conn=conn)
@@ -241,15 +261,134 @@ def test_clear_finding_does_not_deescalate_past_its_own_sonnet_failure(conn):
     from core import model_router as mr
     r = mr.route("clear_finding_implementation",
                  prior_attempts=[{"model": "sonnet", "outcome": "failure"}],
-                 conn=conn)
+                 conn=conn, escalation_reason=_escalation(OPUS), context_pack="pack")
     assert r["model"] == "opus"
     r2 = mr.route("clear_finding_implementation",
                   prior_attempts=[{"model": "sonnet", "outcome": "failure"},
                                   {"model": "opus", "outcome": "uncertain"}],
-                  conn=conn)
+                  conn=conn, escalation_reason=_escalation(FABLE), context_pack="pack")
     assert r2["model"] == "fable"
     # a sonnet SUCCESS on a different aspect does not block de-escalation
     r3 = mr.route("clear_finding_implementation",
                   prior_attempts=[{"model": "fable", "outcome": "success"}],
                   conn=conn)
     assert r3["model"] == "sonnet"
+
+
+# ── task 213: HARD escalation gate ───────────────────────────────────────────
+# Opus/Fable eligibility from the partition/risk-floor/ladder above is
+# necessary but not sufficient — dispatch also needs a valid, structured
+# escalation_reason (+ context_pack). Missing/invalid on ANY path (base
+# class, risk floor, escalation ladder) de-escalates to sonnet; it never
+# raises, so routine dispatch is never blocked, just never expensive.
+
+def test_no_escalation_reason_denies_opus_class(conn):
+    out = route("architecture", conn=conn)
+    assert out["model"] == SONNET
+    assert out["requested_model"] == OPUS
+    assert out["escalation_valid"] is False
+    assert "hard gate de-escalates to sonnet (requested opus)" in out["reason"]
+
+
+def test_no_escalation_reason_denies_fable_class(conn):
+    out = route("hardest_unresolved_bug", conn=conn)
+    assert out["model"] == SONNET
+    assert out["requested_model"] == FABLE
+    assert out["escalation_valid"] is False
+
+
+def test_risk_floor_without_escalation_reason_still_lands_on_sonnet(conn):
+    """A money/security/high risk floor is real, but it does not itself
+    substitute for a recorded justification — never silently run the
+    expensive tier just because the floor fired."""
+    out = route("tests", risk="money", conn=conn)
+    assert out["model"] == SONNET
+    assert out["requested_model"] == OPUS
+    assert "floors to opus" in out["reason"]
+    assert "hard gate de-escalates to sonnet" in out["reason"]
+
+
+def test_escalation_ladder_without_escalation_reason_still_lands_on_sonnet(conn):
+    out = route("tests", prior_attempts=[{"model": SONNET, "outcome": "failure"}], conn=conn)
+    assert out["model"] == SONNET
+    assert out["requested_model"] == OPUS
+
+
+def test_wrong_category_for_tier_denied(conn):
+    """A fable-only category can't justify opus, and vice versa."""
+    out = route("architecture", conn=conn,
+               escalation_reason=_escalation(FABLE), context_pack="pack")
+    assert out["model"] == SONNET
+    assert out["escalation_valid"] is False
+
+
+def test_empty_evidence_denied(conn):
+    out = route("architecture", conn=conn, context_pack="pack",
+               escalation_reason=_escalation(OPUS, evidence=""))
+    assert out["model"] == SONNET
+
+
+def test_empty_expected_benefit_denied(conn):
+    out = route("architecture", conn=conn, context_pack="pack",
+               escalation_reason=_escalation(OPUS, expected_benefit="  "))
+    assert out["model"] == SONNET
+
+
+def test_missing_context_pack_denies_opus_even_with_valid_reason(conn):
+    out = route("architecture", conn=conn, escalation_reason=_escalation(OPUS))
+    assert out["model"] == SONNET
+    assert out["escalation_valid"] is False
+
+
+def test_valid_escalation_reason_grants_opus(conn):
+    out = route("architecture", conn=conn,
+               escalation_reason=_escalation(OPUS), context_pack="delta pack ref")
+    assert out["model"] == OPUS
+    assert out["requested_model"] == OPUS
+    assert out["escalation_valid"] is True
+    assert "hard gate" not in out["reason"]
+
+
+def test_valid_escalation_reason_grants_fable(conn):
+    out = route("hardest_unresolved_bug", conn=conn,
+               escalation_reason=_escalation(FABLE), context_pack="delta pack ref")
+    assert out["model"] == FABLE
+    assert out["escalation_valid"] is True
+
+
+def test_concrete_fix_deescalates_to_sonnet_even_with_opus_eligible_history(conn):
+    """clear_finding_implementation (a 'concrete post-audit fix') must land on
+    sonnet by default — the class-level de-escalation already does this, and
+    the hard gate does not reopen the door without its own justification."""
+    out = route("clear_finding_implementation",
+               prior_attempts=[{"model": OPUS, "outcome": "failure"}], conn=conn)
+    assert out["model"] == SONNET
+
+
+def test_escalation_gate_never_raises(conn):
+    """Fail-toward-cheap, not fail-toward-blocked: a garbage escalation_reason
+    is a denial, not an exception."""
+    out = route("architecture", conn=conn, escalation_reason="not a dict",
+               context_pack="pack")
+    assert out["model"] == SONNET
+
+
+def test_escalation_audit_fields_persisted(conn):
+    out = route("architecture", conn=conn,
+               escalation_reason=_escalation(OPUS), context_pack="delta pack ref")
+    row = conn.execute(
+        "SELECT requested_model, escalation_category, escalation_evidence,"
+        " escalation_expected_benefit, escalation_valid FROM router_decision WHERE id=?",
+        (out["decision_id"],)).fetchone()
+    assert row[0] == OPUS
+    assert row[1] == ESCALATION_CATEGORIES[OPUS][0]
+    assert row[2] and row[3]
+    assert row[4] == 1
+
+
+def test_sonnet_class_never_needs_escalation_reason(conn):
+    """Sonnet-tier work is never gated — only opus/fable requests are."""
+    out = route("routine_implementation", conn=conn)
+    assert out["model"] == SONNET
+    assert out["requested_model"] == SONNET
+    assert out["escalation_valid"] is True

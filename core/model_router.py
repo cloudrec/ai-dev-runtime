@@ -10,6 +10,12 @@ The decision + outcome ledger is the feed for the future Agent Reputation
 routing work: once enough (model, task_class) history exists, routing can
 condition on measured success rate instead of the static partition below.
 
+task 213 adds a HARD escalation gate on top of the partition/risk-floor/
+ladder logic below: reaching opus or fable ALSO requires a structured,
+auditable `escalation_reason` (+ context_pack); missing/invalid de-escalates
+to sonnet on every path, never silently dispatching the expensive tier. See
+ESCALATION_CATEGORIES / _validate_escalation / route()'s docstring.
+
 NOTE: this is NOT core/model_routing.py. That module is the separate Night
 Shift budget policy (spend caps across a run) and is untouched by this one.
 """
@@ -52,6 +58,42 @@ _RISK_FLOOR_VALUES = ("money", "security", "high")
 _OUTCOME_VALUES = ("success", "failure", "uncertain", "disagreement")
 _RECORD_OUTCOMES = ("success", "failure", "retry", "escalated")
 
+# task 213 — HARD escalation gate. Opus/Fable are class-eligible per PARTITION
+# above, but dispatch to either tier ALSO requires a structured, auditable
+# escalation_reason: a closed-vocabulary category (why THIS tier, not a
+# freeform excuse), non-empty evidence (prior attempts / concrete findings),
+# a non-empty expected_benefit, and a non-empty context_pack (the compact
+# delta pack — the model must never be asked to reread a huge session to
+# earn its own escalation). Missing/invalid on ANY path — base class, risk
+# floor, or the failure/disagreement ladder — de-escalates to Sonnet. This is
+# deliberate, not a bug: the module's own standing philosophy is fail-toward-
+# cheap (see route()'s docstring), and task 213 extends that philosophy to
+# cover the expensive tiers too. It never raises/blocks the caller — same
+# "routing must never fail or block a job" contract job_executor relies on.
+ESCALATION_CATEGORIES = {
+    OPUS: ("architecture", "high_ambiguity", "high_risk", "senior_reasoning"),
+    FABLE: ("hardest_unresolved", "adversarial_audit", "final_critical_audit"),
+}
+
+
+def _validate_escalation(model: str, escalation_reason, context_pack: str) -> tuple[bool, str]:
+    """True/"" if `model` (opus/fable) is cleared to dispatch; else (False, why)."""
+    if model not in (OPUS, FABLE):
+        return True, ""
+    if not isinstance(escalation_reason, dict):
+        return False, "escalation_reason missing"
+    category = escalation_reason.get("category")
+    if category not in ESCALATION_CATEGORIES[model]:
+        return False, (f"escalation_reason.category {category!r} invalid for {model}; "
+                       f"must be one of {ESCALATION_CATEGORIES[model]}")
+    if not (escalation_reason.get("evidence") or "").strip():
+        return False, "escalation_reason.evidence required (prior attempts / concrete findings)"
+    if not (escalation_reason.get("expected_benefit") or "").strip():
+        return False, "escalation_reason.expected_benefit required"
+    if not (context_pack or "").strip():
+        return False, "context_pack (compact delta pack reference) required"
+    return True, ""
+
 _LADDER_DESCRIPTION = [
     "sonnet failure/uncertain -> at least opus (sonnet_insufficient)",
     "opus failure/uncertain/disagreement, or sonnet+opus disagreeing -> fable "
@@ -76,6 +118,15 @@ CREATE TABLE IF NOT EXISTS router_outcome (
     note TEXT, at TEXT, ts REAL
 )
 """
+# task 213 escalation-gate audit columns, added to pre-existing router_decision
+# rows via best-effort ALTER (same idiom as stall_doctor's last_action_ok).
+_ESCALATION_COLUMNS = (
+    ("requested_model", "TEXT"),
+    ("escalation_category", "TEXT"),
+    ("escalation_evidence", "TEXT"),
+    ("escalation_expected_benefit", "TEXT"),
+    ("escalation_valid", "INTEGER DEFAULT 0"),
+)
 
 
 class RouterError(Exception):
@@ -87,6 +138,11 @@ def _conn(conn=None):
     for stmt in _SCHEMA.strip().split(";"):
         if stmt.strip():
             conn.execute(stmt)
+    for name, coltype in _ESCALATION_COLUMNS:
+        try:
+            conn.execute(f"ALTER TABLE router_decision ADD COLUMN {name} {coltype}")
+        except Exception:  # noqa: BLE001 — column already present
+            pass
     return conn, own
 
 
@@ -110,11 +166,19 @@ def _validate_prior_attempts(prior_attempts) -> list:
 
 def route(task_class: str, *, risk: str = "normal", prior_attempts=None,
           context_pack: str = "", task_ref: str = "", strict: bool = False,
-          conn=None) -> dict:
+          escalation_reason: Optional[dict] = None, conn=None) -> dict:
     """Decide a model for a unit of work and RECORD the decision durably.
 
     Order: base class -> risk floor -> escalation ladder -> de-escalation
-    for clear_finding_implementation -> context-pack economics -> record.
+    for clear_finding_implementation -> HARD escalation gate (task 213) ->
+    context-pack economics -> record.
+
+    `escalation_reason`, if the policy above lands on opus/fable, must be a
+    dict with a category from ESCALATION_CATEGORIES[model], non-empty
+    `evidence`, and non-empty `expected_benefit` — plus a non-empty
+    `context_pack`. Missing/invalid de-escalates to sonnet; never raises
+    (routing must never fail or block a job) and never silently keeps the
+    expensive tier.
     """
     if risk not in _RISK_VALUES:
         raise RouterError(f"unknown risk {risk!r}; valid: {_RISK_VALUES}")
@@ -160,19 +224,39 @@ def route(task_class: str, *, risk: str = "normal", prior_attempts=None,
             model = SONNET
             reason += "; fable findings implement at sonnet unless high-risk"
 
-    # 5. context-pack economics — advisory only, never blocks
-    requires_context_pack = model in (OPUS, FABLE)
+    # 5. HARD escalation gate (task 213) — requested_model is the tier every
+    # step above computed; requires_context_pack below stays keyed to IT (not
+    # the possibly-gated final `model`) so a denied escalation still surfaces
+    # "this class of work wants a context pack" rather than hiding it.
+    requested_model = model
+    escalation_valid, escalation_problem = _validate_escalation(
+        requested_model, escalation_reason, context_pack)
+    if requested_model in (OPUS, FABLE) and not escalation_valid:
+        model = SONNET
+        reason += (f"; escalation_reason invalid ({escalation_problem}) -> "
+                   f"hard gate de-escalates to sonnet (requested {requested_model})")
+
+    # 6. context-pack economics — advisory only, never blocks by itself (the
+    # hard gate above already blocked on it when escalation was requested)
+    requires_context_pack = requested_model in (OPUS, FABLE)
     context_pack_missing = requires_context_pack and not (context_pack or "").strip()
     if context_pack_missing:
         reason += "; generate a compact context pack with sonnet first"
 
+    ereason = escalation_reason if isinstance(escalation_reason, dict) else {}
     conn, own = _conn(conn)
     try:
         cur = conn.execute(
             "INSERT INTO router_decision (task_ref,task_class,risk,model,model_id,"
-            "reason,context_pack,requires_context_pack,at,ts) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "reason,context_pack,requires_context_pack,at,ts,requested_model,"
+            "escalation_category,escalation_evidence,escalation_expected_benefit,"
+            "escalation_valid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (task_ref, task_class, risk, model, MODEL_IDS[model], reason,
-             context_pack or "", int(requires_context_pack), now_iso(), now_ts()))
+             context_pack or "", int(requires_context_pack), now_iso(), now_ts(),
+             requested_model, ereason.get("category") or "",
+             (ereason.get("evidence") or "")[:500],
+             (ereason.get("expected_benefit") or "")[:500],
+             int(escalation_valid)))
         conn.commit()
         return {
             "decision_id": cur.lastrowid,
@@ -181,6 +265,8 @@ def route(task_class: str, *, risk: str = "normal", prior_attempts=None,
             "reason": reason,
             "requires_context_pack": requires_context_pack,
             "context_pack_missing": context_pack_missing,
+            "requested_model": requested_model,
+            "escalation_valid": escalation_valid,
         }
     finally:
         if own:
@@ -275,4 +361,5 @@ def effectiveness(days: int = 30, conn=None) -> dict:
 
 def policy() -> dict:
     """Static dump for the adapter UI to render — no DB access needed."""
-    return {"partition": PARTITION, "model_ids": MODEL_IDS, "ladder": list(_LADDER_DESCRIPTION)}
+    return {"partition": PARTITION, "model_ids": MODEL_IDS, "ladder": list(_LADDER_DESCRIPTION),
+            "escalation_categories": ESCALATION_CATEGORIES}
