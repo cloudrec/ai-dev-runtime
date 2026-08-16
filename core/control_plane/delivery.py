@@ -187,6 +187,7 @@ def _send_owner_push(message: str) -> tuple:
         return (False, None, "owner_push credentials unset (TELEGRAM_BOT_TOKEN/CHAT_ID)")
     try:
         import json as _json
+        import urllib.error
         import urllib.parse
         import urllib.request
         data = urllib.parse.urlencode({"chat_id": chat, "text": message[:4000]}).encode()
@@ -198,6 +199,17 @@ def _send_owner_push(message: str) -> tuple:
             mid = (body.get("result") or {}).get("message_id")
             return (True, f"telegram:{mid}", None)
         return (False, None, f"telegram rejected: {str(body)[:160]}")
+    except urllib.error.HTTPError as e:
+        # Telegram's actual reason lives in the error response BODY ("description"),
+        # never in str(e) — that's just "HTTP Error 400: Bad Request" for every 4xx,
+        # indistinguishable whether the cause is a bad chat_id, an unstarted bot, a
+        # malformed request, or something else entirely. Read it so a red owner_push
+        # is diagnosable instead of a generic code-and-nothing-else.
+        try:
+            detail = _json.loads(e.read().decode() or "{}").get("description") or str(e)
+        except Exception:  # noqa: BLE001
+            detail = str(e)
+        return (False, None, f"telegram send failed: {detail}")
     except Exception as e:  # noqa: BLE001
         return (False, None, f"telegram send failed: {e}")
 

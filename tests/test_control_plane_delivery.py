@@ -108,6 +108,47 @@ def test_same_chat_receipt_flips_verified_complete(monkeypatch):
     assert st["same_chat_wake_complete"] is True                     # only after a real E2E turn
 
 
+def test_owner_push_http_error_surfaces_telegram_description(monkeypatch):
+    """A rejected Telegram send raises urllib.error.HTTPError; str(e) alone is always
+    the generic 'HTTP Error 400: Bad Request' for every 4xx. The real cause is in the
+    response body's `description` field — this must reach the recorded error, not be
+    discarded (event 5709/5723 series: root cause was undiagnosable from the recorded
+    text alone)."""
+    import io
+    import urllib.error
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
+
+    def _raise(*_a, **_k):
+        body = b'{"ok": false, "error_code": 400, "description": "Bad Request: chat not found"}'
+        raise urllib.error.HTTPError("https://api.telegram.org/x", 400, "Bad Request",
+                                     {}, io.BytesIO(body))
+
+    monkeypatch.setattr("urllib.request.urlopen", _raise)
+    ok, rc, err = delivery._send_owner_push("hi")
+    assert ok is False and rc is None
+    assert "chat not found" in err
+    assert err != "telegram send failed: HTTP Error 400: Bad Request"
+
+
+def test_owner_push_http_error_falls_back_when_body_unparseable(monkeypatch):
+    import io
+    import urllib.error
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "tok")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "chat")
+
+    def _raise(*_a, **_k):
+        raise urllib.error.HTTPError("https://api.telegram.org/x", 400, "Bad Request",
+                                     {}, io.BytesIO(b"not json"))
+
+    monkeypatch.setattr("urllib.request.urlopen", _raise)
+    ok, rc, err = delivery._send_owner_push("hi")
+    assert ok is False and rc is None
+    assert "HTTP Error 400" in err
+
+
 def test_adapters_make_no_network_call_when_unconfigured(monkeypatch):
     for v in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "CONTROL_PLANE_SAMECHAT_WAKE_URL"):
         monkeypatch.delenv(v, raising=False)

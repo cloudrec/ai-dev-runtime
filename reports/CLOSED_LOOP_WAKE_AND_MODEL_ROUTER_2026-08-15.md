@@ -159,3 +159,38 @@ owner decision item, not a delivery defect.
   owner-decision (external channel) gate, not a SYSTEM blocker kind
   (`core/control_plane/resolutions.py` explicitly excludes these from
   auto-resolution). No delivery config or external channel touched.
+
+## Event 5709 + fix: telegram error detail was being discarded (2026-08-16)
+
+5709 (notifications_red, critical, ts 02:17:54Z) is the same standing series
+— confirmed byte-identical payload to 5258..5723 (minus `checked_at`).
+
+While inspecting it, found a real code defect in
+`core/control_plane/delivery.py::_send_owner_push`: the generic
+`except Exception as e: ... f"telegram send failed: {e}"` catches
+`urllib.error.HTTPError` too, and `str(HTTPError)` is always the generic
+`"HTTP Error 400: Bad Request"` — Telegram's actual reason (a `description`
+field, e.g. "chat not found" vs. something else) lives in the error
+response BODY, which was never read. Every recorded owner_push failure to
+date (including 5709/5723's `"telegram send failed: HTTP Error 400: Bad
+Request"`) carried no more diagnostic information than the HTTP status
+code alone — the real root cause was never recorded anywhere, live or
+historical.
+
+Fix: catch `urllib.error.HTTPError` specifically, read+parse its body, and
+use `description` when present (falls back to `str(e)` if the body isn't
+parseable JSON). Non-owner-gated, no credentials/config touched, no
+network behavior changed except reading a response body Python already
+receives. Tests: 2 new cases in `tests/test_control_plane_delivery.py`
+(description surfaced when the body parses; graceful fallback to the old
+generic message when it doesn't) — both green, plus the existing 25
+delivery/notifier tests unaffected.
+
+A live diagnostic send to capture the *actual* current `description` from
+Telegram was attempted and correctly denied by the permission classifier
+(a real external network call using live credentials, appropriately
+gated) — deferred to the standing automated hourly probe, which will now
+record the real reason on its next cycle instead of the generic HTTP code.
+**The red condition itself remains an external/owner-decision gate**
+(Telegram bot/chat configuration) — this fix makes it diagnosable, it does
+not resolve it. No delivery config or external channel touched.
