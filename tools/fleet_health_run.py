@@ -41,7 +41,11 @@ def main() -> int:
                        reminder_interval_secs=reminder_interval)
 
     for r in summary["results"]:
-        alert_note = f" ALERT={r['alert']['kind']} sent={r['sent']}" if r["alert"] else ""
+        alert_note = ""
+        if r["alert"]:
+            alert_note = f" ALERT={r['alert']['kind']} sent={r['sent']}"
+            if r.get("wake_fallback"):
+                alert_note += f" wake_fallback=event:{r['wake_fallback'].get('event_id')}"
         print(f"[fleet-health] {r['host_id']}: {r['state']} — {r['probe']['summary']}{alert_note}")
 
     return 1 if summary["any_down"] else 0

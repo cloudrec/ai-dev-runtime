@@ -216,3 +216,112 @@ def test_probe_host_never_touches_a_real_server_when_mocked(tmp_path, monkeypatc
                               state_path=state_path)
     assert summary["any_down"] is True
     assert calls == []
+
+
+# ------------------------------------------------------------ ChatGPT-wake fallback
+# Added after discovering the 2026-08-18 19:35-20:00 UTC RU-PROD outage's DOWN and
+# RECOVERED alerts both failed Telegram delivery with nowhere else to go — unlike the
+# rest of Owner OS, this module had no fallback. These tests cover the fix.
+
+def test_wake_fallback_not_called_when_telegram_succeeds(tmp_path):
+    fallback_calls = []
+    for _ in range(fh.DEFAULT_FAIL_THRESHOLD):
+        fh.run_once([HOST], probe_fn=lambda h: {"ok": False, "checks": [], "summary": "down"},
+                   send_fn=lambda m: (True, "telegram:1", None),
+                   wake_fallback_fn=lambda host, alert: fallback_calls.append((host, alert)) or {"event_id": 1},
+                   state_path=str(tmp_path / "state.json"))
+    assert fallback_calls == [], "a working Telegram send must never trigger the fallback"
+
+
+def test_wake_fallback_called_when_telegram_fails(tmp_path):
+    fallback_calls = []
+    for _ in range(fh.DEFAULT_FAIL_THRESHOLD):
+        fh.run_once([HOST], probe_fn=lambda h: {"ok": False, "checks": [], "summary": "down"},
+                   send_fn=lambda m: (False, None, "telegram send failed: Bad Request: chat not found"),
+                   wake_fallback_fn=lambda host, alert: fallback_calls.append((host, alert)) or {"event_id": 42},
+                   state_path=str(tmp_path / "state.json"))
+    assert len(fallback_calls) == 1
+    host, alert = fallback_calls[0]
+    assert host["id"] == "test_host"
+    assert alert["kind"] == "down"
+
+
+def test_wake_fallback_result_recorded_in_run_once_results(tmp_path):
+    for _ in range(fh.DEFAULT_FAIL_THRESHOLD):
+        summary = fh.run_once([HOST], probe_fn=lambda h: {"ok": False, "checks": [], "summary": "down"},
+                              send_fn=lambda m: (False, None, "err"),
+                              wake_fallback_fn=lambda host, alert: {"event_id": 99},
+                              state_path=str(tmp_path / "state.json"))
+    down_result = [r for r in summary["results"] if r["alert"]][0]
+    assert down_result["wake_fallback"] == {"event_id": 99}
+
+
+def test_wake_fallback_disabled_still_dead_letters_cleanly(tmp_path):
+    """wake_fallback_fn=None must not break the run — Telegram-only behavior preserved."""
+    for _ in range(fh.DEFAULT_FAIL_THRESHOLD):
+        summary = fh.run_once([HOST], probe_fn=lambda h: {"ok": False, "checks": [], "summary": "down"},
+                              send_fn=lambda m: (False, None, "err"),
+                              wake_fallback_fn=None,
+                              state_path=str(tmp_path / "state.json"))
+    down_result = [r for r in summary["results"] if r["alert"]][0]
+    assert down_result["wake_fallback"] is None
+    assert summary["any_down"] is True
+
+
+def test_emit_wake_fallback_uses_cto_emit_and_returns_its_result(monkeypatch):
+    """Isolated unit test of emit_wake_fallback itself, stubbing cto.emit so no real
+    control_plane.db write happens here — that's covered by the control-plane test
+    suite's own conventions."""
+    calls = []
+
+    def fake_emit(source, type_, *, severity, owner_action_required, payload,
+                 action_taken, dedup_key, dedup_window_secs):
+        calls.append(locals())
+        return {"event_id": 7}
+
+    import core.control_plane.cto as cto_module
+    monkeypatch.setattr(cto_module, "emit", fake_emit)
+
+    alert = {"kind": "down", "detail": "tcp:22 failed", "first_fail_ts": 1000.0,
+             "duration_secs": 30.0}
+    result = fh.emit_wake_fallback(HOST, alert)
+
+    assert result == {"event_id": 7}
+    assert len(calls) == 1
+    c = calls[0]
+    assert c["source"] == "fleet_health"
+    assert c["type_"] == "fleet_host_down"
+    assert c["severity"] == "critical"
+    assert c["owner_action_required"] is True
+    assert c["payload"]["host_id"] == "test_host"
+    assert c["dedup_key"] == f"fleet:test_host:down:1000"
+
+
+def test_emit_wake_fallback_recovered_is_high_not_critical(monkeypatch):
+    calls = []
+
+    def fake_emit(source, type_, *, severity, owner_action_required, **kw):
+        calls.append({"severity": severity, "owner_action_required": owner_action_required,
+                      "type_": type_})
+        return {"event_id": 8}
+
+    import core.control_plane.cto as cto_module
+    monkeypatch.setattr(cto_module, "emit", fake_emit)
+
+    alert = {"kind": "recovered", "detail": "up", "first_fail_ts": 1000.0, "duration_secs": 30.0}
+    fh.emit_wake_fallback(HOST, alert)
+
+    assert calls[0]["severity"] == "high"
+    assert calls[0]["owner_action_required"] is False
+    assert calls[0]["type_"] == "fleet_host_recovered"
+
+
+def test_emit_wake_fallback_never_raises_when_cto_unavailable(monkeypatch):
+    """control_plane may be unavailable in some contexts — must degrade to None, not
+    crash the probe run."""
+    import sys
+    monkeypatch.setitem(sys.modules, "core.control_plane.cto", None)
+    alert = {"kind": "down", "detail": "x", "first_fail_ts": 1.0, "duration_secs": 1.0}
+    # None in sys.modules makes `from ... import emit` raise ImportError — exercised here.
+    result = fh.emit_wake_fallback(HOST, alert)
+    assert result is None

@@ -9,6 +9,14 @@ This module is that missing channel, reusing the SAME Telegram transport Owner O
 already has proven working (`core.control_plane.delivery._send_owner_push`,
 `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` in `configs/.env`) instead of a new bot.
 
+If Telegram itself is down (as it has been since before this module existed), the
+alert does not simply vanish: `emit_wake_fallback` records it through Owner OS's
+durable event log and ChatGPT-wake path (`core.control_plane.cto.emit` /
+`core.wake_bridge`) — the SAME fallback every other Owner OS notification already
+gets. Added 2026-08-20 after discovering the 2026-08-18 19:35-20:00 UTC RU-PROD
+outage's DOWN and RECOVERED alerts had both failed Telegram delivery and, until then,
+had nowhere else to go.
+
 State is a small JSON file, deliberately NOT `control_plane.db` — this monitor is not
 one of the Owner OS agent-control-plane workers and has no reason to take the
 advisory-lock path those 11 workers share; keeping its state file-private avoids any
@@ -270,10 +278,48 @@ def save_state(path: str, state: dict) -> None:
     os.replace(tmp, path)
 
 
+def send_telegram(message: str) -> tuple:
+    """The one real transport this module uses — Owner OS's already-proven Telegram
+    push (`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`), not a second bot."""
+    from core.control_plane.delivery import _send_owner_push
+    return _send_owner_push(message)
+
+
+def emit_wake_fallback(host: dict, alert: dict) -> Optional[dict]:
+    """Record a DOWN/RECOVERED/reminder alert through Owner OS's durable event log and
+    ChatGPT-wake path when the primary Telegram send did not deliver — this is the gap
+    that let the 2026-08-18 19:35-20:00 UTC RU-PROD outage's DOWN and RECOVERED alerts
+    disappear with zero owner-visible trace: `send_telegram` failed both times and
+    nothing else was watching. Reuses the SAME `cto.emit()`/`wake_bridge` machinery
+    every other Owner OS notification already goes through (agent_waiting_input,
+    notification_dead_letter, ...) rather than inventing a second wake mechanism.
+    Best-effort and silent on failure — a broken fallback must never break the probe
+    run itself, and control_plane may be unavailable in some contexts (isolated tests,
+    a bare install without the rest of Owner OS)."""
+    try:
+        from core.control_plane.cto import emit
+    except Exception:  # noqa: BLE001
+        return None
+    kind = alert["kind"]
+    severity = "high" if kind == "recovered" else "critical"
+    dedup_key = f"fleet:{host['id']}:{kind}:{int(alert.get('first_fail_ts') or 0)}"
+    try:
+        return emit("fleet_health", f"fleet_host_{kind}", severity=severity,
+                    owner_action_required=(kind != "recovered"),
+                    payload={"host_id": host["id"], "label": host.get("label"),
+                             "ip": host.get("ip"), "role": host.get("role"),
+                             "detail": alert.get("detail")},
+                    action_taken=format_alert(host, alert), dedup_key=dedup_key,
+                    dedup_window_secs=3600)
+    except Exception:  # noqa: BLE001 — never let the fallback break the probe run
+        return None
+
+
 # ------------------------------------------------------------------------------- run
 
 def run_once(hosts: list, *, probe_fn: Callable = probe_host,
             send_fn: Optional[Callable[[str], tuple]] = None,
+            wake_fallback_fn: Optional[Callable[[dict, dict], Optional[dict]]] = emit_wake_fallback,
             state_path: str = DEFAULT_STATE_PATH,
             now_fn: Callable[[], float] = time.time,
             fail_threshold: int = DEFAULT_FAIL_THRESHOLD,
@@ -297,22 +343,22 @@ def run_once(hosts: list, *, probe_fn: Callable = probe_host,
                                          reminder_interval_secs=reminder_interval_secs)
         state[hid] = new_state
         sent = None
+        wake_fallback = None
         if alert is not None:
             msg = format_alert(host, alert)
             if send_fn is not None:
                 sent = send_fn(msg)
             else:
                 sent = (False, None, "no send_fn configured")
+            # Telegram is still the primary, preferred path (immediate, no cooldown).
+            # The fallback only fires when it did NOT deliver, so a working Telegram
+            # send never gets a redundant second delivery.
+            if not sent[0] and wake_fallback_fn is not None:
+                wake_fallback = wake_fallback_fn(host, alert)
         if new_state["state"] == "down":
             any_down = True
         results.append({"host_id": hid, "state": new_state["state"],
-                        "probe": probe_result, "alert": alert, "sent": sent})
+                        "probe": probe_result, "alert": alert, "sent": sent,
+                        "wake_fallback": wake_fallback})
     save_state(state_path, state)
     return {"results": results, "any_down": any_down}
-
-
-def send_telegram(message: str) -> tuple:
-    """The one real transport this module uses — Owner OS's already-proven Telegram
-    push (`TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID`), not a second bot."""
-    from core.control_plane.delivery import _send_owner_push
-    return _send_owner_push(message)
