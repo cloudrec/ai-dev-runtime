@@ -211,7 +211,8 @@ def _save_health(conn, h: dict) -> None:
     conn.commit()
 
 
-def health(load_config: Optional[Callable] = None) -> dict:
+def health(load_config: Optional[Callable] = None,
+           live_sessions: Optional[Callable] = None) -> dict:
     """Watchdog health + last action. Flags MISCONFIGURATION when zero eligible
     (managed-auto) sessions are configured — otherwise a watchdog that can never
     act would falsely look healthy (the arbitrage2-opus incident)."""
@@ -234,11 +235,47 @@ def health(load_config: Optional[Callable] = None) -> dict:
             base.update({"last_run_at": r[0], "last_action": r[1], "agents_checked": r[2],
                          "submitted": r[3], "verified": r[4], "retried": r[5],
                          "blocked": r[6], "errors": r[7]})
+        # COVERAGE, not just configuration. The original warning caught "zero
+        # sessions configured" (the arbitrage2-opus incident). The next step of the
+        # same blind spot is a watchdog with sessions configured that are not
+        # RUNNING: it checks nothing, reports ok, and the owner believes idle agents
+        # are being continued automatically while every live one sits outside its
+        # allowlist. Coverage is therefore measured against the live inventory.
+        # The inventory is INJECTED, like every other side effect in this module:
+        # health() must stay pure and hermetic, so it reports coverage only when a
+        # caller supplies the live sessions (the API does). Without it, the
+        # configuration-level checks below still apply.
+        live, live_error = None, None
+        if live_sessions is not None:
+            try:
+                live = {str(x).split(":")[0] for x in (live_sessions() or set()) if x}
+            except Exception as e:  # noqa: BLE001 — health never depends on tmux
+                live_error = f"{type(e).__name__}: {str(e)[:80]}"
+        if live is not None:
+            eligible_live = sorted(live & set(elig))
+            unmanaged_live = sorted(live - set(elig))
+            base.update({"live_agent_sessions": len(live),
+                         "eligible_live": eligible_live,
+                         "unmanaged_live": unmanaged_live,
+                         "coverage": f"{len(eligible_live)}/{len(live)}"})
+        else:
+            eligible_live, unmanaged_live = [], []
+        if live_error:
+            base["live_inventory_error"] = live_error
+
         # Misconfiguration: enabled but nothing it is allowed to act on.
         if ENABLED and len(elig) == 0:
             base["status"] = "warning"
             base["warning"] = "no_eligible_sessions: watchdog enabled but no managed-auto " \
                               "session is configured — it can never act (misconfiguration)"
+        elif ENABLED and live and not eligible_live:
+            # Configured, running, and covering nothing that exists.
+            base["status"] = "warning"
+            base["warning"] = (
+                f"covering_nothing: {len(live)} live agent session(s) and none is "
+                f"managed-auto, so no idle agent can be continued automatically — "
+                f"unmanaged: {', '.join(unmanaged_live[:8])}"
+                + (" …" if len(unmanaged_live) > 8 else ""))
         else:
             base["status"] = "ok"
         return base

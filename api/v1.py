@@ -504,9 +504,21 @@ async def agents_direct_lifecycle_metrics(_: bool = Depends(_auth)):
 @router.get("/agents/continuation-watchdog/health")
 async def agents_continuation_watchdog_health(_: bool = Depends(_auth)):
     """Continuation-watchdog health + last action (last run, agents checked,
-    submitted / verified / retried / blocked / errors). Read-only."""
+    submitted / verified / retried / blocked / errors) plus COVERAGE against the
+    live agent inventory. Read-only.
+
+    The inventory is injected here rather than read inside health(), which stays
+    pure: coverage is what says whether the watchdog is actually protecting the
+    agents that exist, as opposed to merely being configured. A watchdog with
+    sessions configured that are not running checks nothing and used to report
+    ok."""
     from core import agent_continuation_watchdog as _cw
-    return _cw.health()
+
+    def _live():
+        return {a.get("target") for a in agent_control.agent_list().get("agents", [])
+                if a.get("is_agent") and a.get("target")}
+
+    return _cw.health(live_sessions=_live)
 
 
 # ── Control Plane V2 (CTO inbox + registry + delivery health) ────────────────

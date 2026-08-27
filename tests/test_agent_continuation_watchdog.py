@@ -365,3 +365,71 @@ def test_health_ok_when_eligible_session_present():
     h = cw.health(load_config=lambda: _cfg({"arbitrage2-opus": {"mode": "auto"}}))
     assert h["status"] == "ok" and h["eligible_count"] >= 1
     assert "arbitrage2-opus" in h["eligible_sessions"]
+
+
+# ── coverage, not just configuration ───────────────────────────────────────
+# The existing warning catches "zero managed-auto sessions configured". The next
+# step of that same blind spot is sessions configured that are NOT RUNNING: the
+# watchdog checks nothing, reports ok, and the owner believes idle agents are
+# being continued automatically while every live agent sits outside the
+# allowlist. That was the live state: 4 configured, 0 alive, 12 live agents.
+
+def _health_with(monkeypatch, *, configured, live):
+    from core import agent_continuation_watchdog as cw
+    monkeypatch.setattr(cw, "eligible_sessions", lambda _lc: set(configured))
+    monkeypatch.setattr(cw, "ENABLED", True)
+    return cw.health(load_config=lambda: {},
+                     live_sessions=lambda: {f"{s}:0.0" for s in live})
+
+
+def test_configured_sessions_that_are_not_running_are_flagged(monkeypatch):
+    h = _health_with(monkeypatch, configured=["cp-canary", "job"],
+                     live=["gaika-ext-audit", "payorch-monitor-clean"])
+    assert h["status"] == "warning"
+    assert h["warning"].startswith("covering_nothing")
+    assert h["coverage"] == "0/2"
+    assert "gaika-ext-audit" in h["unmanaged_live"]
+
+
+def test_real_coverage_reports_ok(monkeypatch):
+    h = _health_with(monkeypatch, configured=["cp-canary", "job"],
+                     live=["cp-canary", "gaika-ext-audit"])
+    assert h["status"] == "ok"
+    assert h["eligible_live"] == ["cp-canary"]
+    assert h["unmanaged_live"] == ["gaika-ext-audit"]
+    assert h["coverage"] == "1/2"
+
+
+def test_no_live_agents_at_all_is_not_an_alarm(monkeypatch):
+    """Nothing running is quiet, not broken."""
+    h = _health_with(monkeypatch, configured=["cp-canary"], live=[])
+    assert h["status"] == "ok"
+    assert h["coverage"] == "0/0"
+
+
+def test_zero_configured_still_reports_the_original_misconfiguration(monkeypatch):
+    h = _health_with(monkeypatch, configured=[], live=["gaika-ext-audit"])
+    assert h["status"] == "warning"
+    assert h["warning"].startswith("no_eligible_sessions")
+
+
+def test_a_broken_tmux_inventory_never_breaks_health(monkeypatch):
+    from core import agent_continuation_watchdog as cw
+
+    def boom():
+        raise RuntimeError("tmux gone")
+    monkeypatch.setattr(cw, "eligible_sessions", lambda _lc: {"cp-canary"})
+    monkeypatch.setattr(cw, "ENABLED", True)
+    h = cw.health(load_config=lambda: {}, live_sessions=boom)
+    assert h["status"] == "ok"
+    assert "live_inventory_error" in h
+
+
+def test_without_an_injected_inventory_health_stays_hermetic(monkeypatch):
+    """No caller-supplied inventory means no tmux call and no coverage claim."""
+    from core import agent_continuation_watchdog as cw
+    monkeypatch.setattr(cw, "eligible_sessions", lambda _lc: {"cp-canary"})
+    monkeypatch.setattr(cw, "ENABLED", True)
+    h = cw.health(load_config=lambda: {})
+    assert h["status"] == "ok"
+    assert "coverage" not in h

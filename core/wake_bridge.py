@@ -446,6 +446,104 @@ def acknowledge(event_id: int, conn=None, now: Optional[float] = None) -> dict:
             conn.close()
 
 
+# ── pipeline observability ──────────────────────────────────────────────────
+# `health()` answers "did we wake recently, and did it land?". That is not enough
+# to notice the pipeline STOPPING, and the gap was demonstrated live: event 9870
+# was decided for the gaika-drop chat and sat undelivered for fifteen minutes
+# while health looked perfectly green, because a DIFFERENT chat had just been
+# delivered to. Nothing on the surface said "something decided is not moving".
+#
+# These thresholds bound "not moving". A pending wake older than
+# WAKE_STUCK_PENDING_SECS is stuck; and if the companion has not even ATTEMPTED a
+# claim within WAKE_COMPANION_SILENT_SECS while work is pending, the deliverer
+# itself is down — a distinct failure from "delivery was refused", and the one
+# that used to be invisible because the last successful delivery kept looking
+# recent enough.
+STUCK_PENDING_SECS = int(os.getenv("WAKE_STUCK_PENDING_SECS", "600"))
+COMPANION_SILENT_SECS = int(os.getenv("WAKE_COMPANION_SILENT_SECS", "300"))
+CONSECUTIVE_FAILURE_LIMIT = int(os.getenv("WAKE_CONSECUTIVE_FAILURE_LIMIT", "3"))
+
+
+def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
+    """Is the wake pipeline MOVING? Read-only; emits nothing.
+
+    Deliberately emits no event: the wake path feeding itself is a failure this
+    system has already had (the self-feeding rewake chain), so this reports and
+    lets a caller decide. Every number comes from the audit tables that already
+    exist.
+    """
+    now = now if now is not None else now_ts()
+    enabled, kill = _enabled()
+    conn, own = _conn(conn)
+    try:
+        conn.execute(_SUBMIT_SCHEMA)
+        conn.execute(_DELIVERY_SCHEMA)
+        conn.execute(_SEND_SCHEMA)
+        _migrate_send(conn)
+        pending = conn.execute(
+            "SELECT event_id, COALESCE(route_key,''), ts FROM wake_audit "
+            "WHERE decision='wake' AND acknowledged=0 AND superseded_by IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=wake_audit.event_id) "
+            "ORDER BY id ASC").fetchall()
+        oldest_age = int(now - float(pending[0][2])) if pending else 0
+        oldest_route = (pending[0][1] or wake_routes.FALLBACK_ROUTE) if pending else None
+
+        # The companion writes a wake_send row on EVERY claim attempt, allowed or
+        # refused, so its silence is the cleanest liveness signal available.
+        last_send = conn.execute("SELECT ts FROM wake_send ORDER BY id DESC LIMIT 1").fetchone()
+        claim_age = int(now - float(last_send[0])) if last_send else None
+
+        tail = conn.execute("SELECT delivered FROM wake_delivery ORDER BY id DESC "
+                            "LIMIT ?", (CONSECUTIVE_FAILURE_LIMIT,)).fetchall()
+        consecutive_failures = 0
+        for (ok,) in tail:
+            if ok:
+                break
+            consecutive_failures += 1
+
+        # Per-route backlog: a single blocked chat must be nameable, not averaged
+        # away behind a healthy total.
+        by_route: dict = {}
+        for _eid, rk, ts in pending:
+            key = rk or wake_routes.FALLBACK_ROUTE
+            age = int(now - float(ts))
+            by_route[key] = max(by_route.get(key, 0), age)
+
+        reasons = []
+        if kill:
+            reasons.append("kill_switch_engaged")
+        if not enabled:
+            reasons.append("bridge_disabled")
+        if pending and oldest_age > STUCK_PENDING_SECS:
+            reasons.append(f"pending_wake_stuck:{oldest_route}:{oldest_age}s")
+        if pending and claim_age is not None and claim_age > COMPANION_SILENT_SECS:
+            reasons.append(f"companion_silent:{claim_age}s_with_{len(pending)}_pending")
+        if pending and claim_age is None:
+            reasons.append("companion_never_claimed")
+        if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
+            reasons.append(f"consecutive_delivery_failures:{consecutive_failures}")
+
+        status = "ok"
+        if reasons:
+            status = "stuck" if any(r.startswith(("pending_wake_stuck", "companion_silent",
+                                                  "companion_never_claimed",
+                                                  "consecutive_delivery_failures"))
+                                    for r in reasons) else "disabled"
+        return {"status": status, "reasons": reasons,
+                "pending_count": len(pending),
+                "pending_oldest_age_secs": oldest_age,
+                "pending_oldest_route": oldest_route,
+                "pending_by_route": by_route,
+                "last_claim_attempt_age_secs": claim_age,
+                "consecutive_delivery_failures": consecutive_failures,
+                "thresholds": {"stuck_pending_secs": STUCK_PENDING_SECS,
+                               "companion_silent_secs": COMPANION_SILENT_SECS,
+                               "consecutive_failure_limit": CONSECUTIVE_FAILURE_LIMIT}}
+    finally:
+        if own:
+            conn.close()
+
+
 def health(conn=None, now: Optional[float] = None) -> dict:
     """Freshness the owner can check: is it on, when did it last wake, was that acknowledged?"""
     now = now if now is not None else now_ts()
@@ -477,6 +575,7 @@ def health(conn=None, now: Optional[float] = None) -> dict:
                 "last_wake_acknowledged": (bool(r[3]) if r else None),
                 "last_wake_age_secs": (int(last_age) if last_age is not None else None),
                 "phrase": WAKE_PHRASE,
+                "pipeline": pipeline_health(conn=conn, now=now),
                 "note": "accelerator only — the CTO inbox holds every event regardless"}
     finally:
         if own:
