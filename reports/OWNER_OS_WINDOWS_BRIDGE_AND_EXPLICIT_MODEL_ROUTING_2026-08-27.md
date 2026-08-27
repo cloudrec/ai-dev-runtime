@@ -548,3 +548,31 @@ Not yet claimed: the four steps are each proven but were not observed in CAUSAL
 order (that continuation preceded that wake). A watcher is capturing an ordered
 cycle; correlated events are not a causal chain, and mistaking one for the other
 is what produced the false positive in the first place.
+
+## End-to-end chain PROVEN in causal order — event 9997
+
+| # | Step | Evidence |
+| --- | --- | --- |
+| 1 | real actionable event | `waiting_transitions -> agent_waiting_input` on `gaika-server:0.0` |
+| 2 | correct route | `gaika-extension` -> the owner-supplied GAIKA conversation |
+| 3 | durable user message | delivered 20:42:21; conversation turns 2/2 -> 3/3, message persisted |
+| 4 | assistant began, unprompted | `submitted_and_assistant_started_generating` |
+| 5 | continuation reached the agent | 20:43:03 `agent_answer` -> `gaika-server:0.0`, key `gaika-phase-executor-wiring-20260827-9997` |
+| 6 | agent STARTED, did not queue | `submitted=True, queued=False, pane_changed=True`; pane working, empty input line, no queue hint |
+
+42 seconds from wake delivery to scoped work landing on the agent, with no owner
+input at any step.
+
+What makes this causal rather than coincidental is the idempotency key: it
+carries **9997**, the id of the wake event the assistant had just reviewed. An
+earlier continuation (20:31:18) looked like part of a chain but preceded its
+wake, and was deliberately NOT claimed as proof.
+
+Deliveries under the corrected criterion: 5 of 5 with the assistant proven to
+start, across `gaika-extension`, `jobhunter-ai`, `owner-os` and `mess`. Zero
+honest failures observed so far.
+
+**Conclusion: there is no platform boundary here.** A wake creates a real,
+persisted user turn in the bound conversation and the assistant runs on it. The
+supervisor fallback stays dormant, because the failure mode it exists for is —
+measured honestly — not occurring.
