@@ -483,3 +483,68 @@ Commits `16104fc`, `77cc0c9`, `6b1a022`, `bafd0fc`, `98875e1`, `5bff12a`.
    capacity-blockchain, diamond-auction, gaika-presentation, gaika-server,
    justice-revive-sonnet, owner-os-opus-windows. Binding a route needs the owner
    to say WHICH conversation belongs to each project.
+
+---
+
+# Wake proof criterion corrected — 2026-08-27 20:30 UTC
+
+## The false positive
+
+I reported events 9968 and 9973 as end-to-end proof on the strength of
+`submitted_and_user_turn_appeared`. The owner corrected it: on the conversation
+side no assistant turn had started, he had to type manually, and both agents were
+found stopped.
+
+He was right, and the DOM confirmed it: the bound GAIKA conversation held **two**
+user turns while **three** deliveries into it had been recorded successful.
+
+The old criterion proved the PAGE rendered our text — composer cleared, a
+`[data-message-author-role='user']` element present. That is client-side DOM and
+says nothing about backend acceptance, persistence, or the assistant running. A
+wake exists to make the reviewer RUN; that is what success had to mean, and did
+not.
+
+## The fix
+
+Verification now continues past the user turn and requires evidence that
+generation began: the streaming/stop control, a new assistant turn, or the newest
+assistant turn's id advancing (virtualization-proof). Silence for 45s is reported
+as `user_turn_landed_but_assistant_never_started_in_45s`, ok=false,
+delivered=false — never retried by resending, because the message is already in
+the chat and latched; a resend would duplicate the turn. The closed-loop watchdog
+re-wakes and escalates instead.
+
+`7c6bec1`. 7 new regression tests reproduce the exact false positive; 4 existing
+tests asserting the disproven criterion were updated; 256 tests pass.
+
+## What the corrected verifier then showed
+
+There is **no platform boundary**: an injected turn does make the assistant run.
+
+| Delivery | Route | Reason |
+| --- | --- | --- |
+| 20:30:27 | jobhunter-ai | `submitted_and_assistant_started_generating` |
+| 20:31:38 ev 9993 | **gaika-extension** | `submitted_and_assistant_started_generating` |
+| 20:33:17 | owner-os | `submitted_and_assistant_started_generating` |
+
+3 of 3 with the assistant proven to start, 0 honest failures so far. Event 9993
+was independently checked against the conversation: turn counts moved 2/2 -> 3
+user + 3 assistant with streaming active, so the message PERSISTED and a
+response was generated. Its origin was a real `waiting_transitions ->
+agent_waiting_input` on `gaika-server:0.0`.
+
+Historic totals under the old criterion — 75 `user_turn_appeared` and 15
+`user_turn_id_advanced` — must be read as UNVERIFIED, not as failures: they
+proved DOM insertion only, and an unknown subset of them never ran.
+
+## Outbound half
+
+20:31:18 `agent_answer` -> `gaika-server:0.0` (`api:bearer` via python-httpx —
+the MCP/ChatGPT side sending scoped work), after which the agent was observed
+working with an empty input line and no queued-message hint. The `agent_send`
+busy gate is holding in the live case that motivated it.
+
+Not yet claimed: the four steps are each proven but were not observed in CAUSAL
+order (that continuation preceded that wake). A watcher is capturing an ordered
+cycle; correlated events are not a causal chain, and mistaking one for the other
+is what produced the false positive in the first place.
