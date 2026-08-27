@@ -407,3 +407,32 @@ def test_a_dead_companion_is_caught_while_the_work_is_still_fresh(conn):
     h = wake_bridge.pipeline_health(conn=conn, now=NOW)
     assert h["status"] == "stuck"
     assert any(r.startswith("companion_silent") for r in h["reasons"])
+
+
+def test_an_event_benched_after_a_failed_delivery_is_not_counted_as_pending(conn):
+    """The selector benches an event for RETRY_BACKOFF_SECS after a failed
+    delivery and moves to the next in line. Health must model the same
+    eligibility, or it describes a queue nobody is trying to drain and can call
+    the pipeline stuck while the backoff is doing its job."""
+    _pending_wake(conn, event_id=55, route="mess", actionable=0,
+                  ts=NOW - wake_bridge.STUCK_PENDING_SECS - 300)
+    conn.execute("INSERT INTO wake_delivery (ts,at,source,event_id,delivered,reason,"
+                 "conversation,route_key) VALUES (?,?,'companion',55,0,'failed','c','mess')",
+                 (NOW - 30, "2026-08-27T18:00:00+00:00"))
+    conn.commit()
+    h = wake_bridge.pipeline_health(conn=conn, now=NOW)
+    assert h["pending_count"] == 0
+    assert h["benched_after_failure"] == 1
+    assert not any(r.startswith("pending_wake_stuck") for r in h["reasons"])
+
+
+def test_once_the_backoff_expires_the_event_counts_again(conn):
+    _pending_wake(conn, event_id=56, route="mess", actionable=0,
+                  ts=NOW - wake_bridge.STUCK_PENDING_SECS - 300)
+    conn.execute("INSERT INTO wake_delivery (ts,at,source,event_id,delivered,reason,"
+                 "conversation,route_key) VALUES (?,?,'companion',56,0,'failed','c','mess')",
+                 (NOW - wake_bridge.RETRY_BACKOFF_SECS - 60, "2026-08-27T18:00:00+00:00"))
+    conn.commit()
+    h = wake_bridge.pipeline_health(conn=conn, now=NOW)
+    assert h["pending_count"] == 1
+    assert h["benched_after_failure"] == 0

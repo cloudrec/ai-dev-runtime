@@ -480,12 +480,24 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
         conn.execute(_DELIVERY_SCHEMA)
         conn.execute(_SEND_SCHEMA)
         _migrate_send(conn)
+        # The SAME eligibility the selector uses, including the backoff that
+        # benches an event after a failed delivery. Counting a benched event as
+        # pending would let health call the pipeline stuck while the selector is
+        # correctly waiting out that event's retry window - an alarm describing a
+        # queue nobody is actually trying to drain.
         pending = conn.execute(
             "SELECT event_id, COALESCE(route_key,''), ts, COALESCE(actionable,0) "
             "FROM wake_audit "
             "WHERE decision='wake' AND acknowledged=0 AND superseded_by IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=wake_audit.event_id) "
-            "ORDER BY id ASC").fetchall()
+            "AND NOT EXISTS (SELECT 1 FROM wake_delivery d WHERE d.event_id=wake_audit.event_id "
+            "                AND d.delivered=0 AND d.ts > ?) "
+            "ORDER BY id ASC", (now - RETRY_BACKOFF_SECS,)).fetchall()
+        benched = conn.execute(
+            "SELECT COUNT(*) FROM wake_audit WHERE decision='wake' AND acknowledged=0 "
+            "AND superseded_by IS NULL AND EXISTS (SELECT 1 FROM wake_delivery d "
+            "  WHERE d.event_id=wake_audit.event_id AND d.delivered=0 AND d.ts > ?)",
+            (now - RETRY_BACKOFF_SECS,)).fetchone()[0]
         oldest_age = int(now - float(pending[0][2])) if pending else 0
         oldest_route = (pending[0][1] or wake_routes.FALLBACK_ROUTE) if pending else None
 
@@ -589,6 +601,7 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
                 "stuck_routes": dict(stuck_routes),
                 "waiting_routes": dict(waiting_routes),
                 "pending_count": len(pending),
+                "benched_after_failure": int(benched),
                 "pending_oldest_age_secs": oldest_age,
                 "pending_oldest_route": oldest_route,
                 "pending_by_route": by_route,
