@@ -200,6 +200,13 @@ def watch_runtime() -> dict:
 
 def main() -> None:
     from core import wake_bridge as wb
+    # Announce this process and the code it started with, so a deploy that
+    # restarts the API but not this companion is DETECTABLE instead of silently
+    # delivering to the wrong chat with stale routing logic.
+    try:
+        wb.register_worker("wake_companion")
+    except Exception as e:  # noqa: BLE001
+        print(f"worker registration failed: {str(e)[:120]}", flush=True)
     n = 0
     while True:
         try:

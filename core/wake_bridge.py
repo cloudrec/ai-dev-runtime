@@ -522,14 +522,20 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
             reasons.append("companion_never_claimed")
         if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
             reasons.append(f"consecutive_delivery_failures:{consecutive_failures}")
+        skew = worker_skew(conn=conn, now=now)
+        for w in skew:
+            reasons.append(f"worker_running_stale_code:{w['worker']}:"
+                           f"started_{w['started_at_age_secs']}s_ago")
 
         status = "ok"
         if reasons:
             status = "stuck" if any(r.startswith(("pending_wake_stuck", "companion_silent",
                                                   "companion_never_claimed",
-                                                  "consecutive_delivery_failures"))
+                                                  "consecutive_delivery_failures",
+                                                  "worker_running_stale_code"))
                                     for r in reasons) else "disabled"
         return {"status": status, "reasons": reasons,
+                "worker_skew": skew,
                 "pending_count": len(pending),
                 "pending_oldest_age_secs": oldest_age,
                 "pending_oldest_route": oldest_route,
@@ -539,6 +545,81 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
                 "thresholds": {"stuck_pending_secs": STUCK_PENDING_SECS,
                                "companion_silent_secs": COMPANION_SILENT_SECS,
                                "consecutive_failure_limit": CONSECUTIVE_FAILURE_LIMIT}}
+    finally:
+        if own:
+            conn.close()
+
+
+# ── deployer version skew ───────────────────────────────────────────────────
+# The wake companion is a SEPARATE long-running process that imports this module
+# at startup. Restarting the API alone therefore leaves the deliverer running the
+# OLD code, and that is not theoretical: after the routing fix went live, the API
+# decided a wake for the gaika-drop chat while the stale companion delivered it
+# to owner-os and logged `[route owner-os]` for it. Same database, two versions
+# of the truth, wrong chat.
+#
+# A worker records when it started; if this module's source is NEWER than that,
+# the worker is running code that no longer exists on disk and must be restarted.
+# No hashing and no version string to keep in sync - the file's own mtime is the
+# fact that matters.
+_WORKER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wake_worker (
+    worker TEXT PRIMARY KEY, pid INTEGER, started_ts REAL, started_at TEXT,
+    last_seen_ts REAL, last_seen_at TEXT
+)
+"""
+
+
+def _module_mtime() -> float:
+    """Newest mtime across the modules a deliverer actually runs."""
+    newest = 0.0
+    here = os.path.dirname(os.path.abspath(__file__))
+    for rel in ("wake_bridge.py", "wake_routes.py"):
+        try:
+            newest = max(newest, os.path.getmtime(os.path.join(here, rel)))
+        except OSError:
+            pass
+    return newest
+
+
+def register_worker(worker: str, conn=None, now: Optional[float] = None) -> dict:
+    """A deliverer announces itself. Called on start and refreshed as it runs."""
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        conn.execute(_WORKER_SCHEMA)
+        row = conn.execute("SELECT started_ts FROM wake_worker WHERE worker=?",
+                           (worker,)).fetchone()
+        if row:
+            conn.execute("UPDATE wake_worker SET last_seen_ts=?, last_seen_at=? "
+                         "WHERE worker=?", (now, now_iso(), worker))
+        else:
+            conn.execute("INSERT INTO wake_worker (worker,pid,started_ts,started_at,"
+                         "last_seen_ts,last_seen_at) VALUES (?,?,?,?,?,?)",
+                         (worker, os.getpid(), now, now_iso(), now, now_iso()))
+        conn.commit()
+        return {"worker": worker, "started_ts": (row[0] if row else now)}
+    finally:
+        if own:
+            conn.close()
+
+
+def worker_skew(conn=None, now: Optional[float] = None) -> list:
+    """Workers whose start predates the code they are supposed to be running."""
+    now = now if now is not None else now_ts()
+    code_mtime = _module_mtime()
+    conn, own = _c(conn)
+    try:
+        conn.execute(_WORKER_SCHEMA)
+        out = []
+        for worker, started, last_seen in conn.execute(
+                "SELECT worker, started_ts, last_seen_ts FROM wake_worker"):
+            if started and code_mtime > float(started):
+                out.append({"worker": worker,
+                            "started_at_age_secs": int(now - float(started)),
+                            "code_newer_by_secs": int(code_mtime - float(started)),
+                            "last_seen_age_secs": int(now - float(last_seen or 0))})
+        return out
     finally:
         if own:
             conn.close()

@@ -247,3 +247,45 @@ def test_a_failing_health_call_never_kills_the_loop(monkeypatch):
         pass
     assert calls["n"] >= 2                      # kept going after the exception
     assert all("watch error" in m for _l, m in seen)
+
+
+# ── deployer version skew ──────────────────────────────────────────────────
+# The companion is a separate long-running process that imports wake_bridge at
+# startup, so restarting the API alone leaves the DELIVERER on old code. That is
+# not theoretical: after the routing fix went live, the API decided a wake for
+# the gaika-drop chat while the stale companion delivered it to owner-os and
+# logged `[route owner-os]`. Same database, two versions of the truth.
+
+def test_a_worker_started_before_the_current_code_is_flagged(conn, monkeypatch):
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 60)
+    skew = wake_bridge.worker_skew(conn=conn, now=NOW)
+    assert len(skew) == 1
+    assert skew[0]["worker"] == "wake_companion"
+    assert skew[0]["code_newer_by_secs"] > 0
+
+
+def test_a_worker_restarted_after_the_deploy_is_clean(conn, monkeypatch):
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 600)
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 60)
+    assert wake_bridge.worker_skew(conn=conn, now=NOW) == []
+
+
+def test_skew_makes_the_pipeline_report_stuck(conn, monkeypatch):
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 60)
+    h = wake_bridge.pipeline_health(conn=conn, now=NOW)
+    assert h["status"] == "stuck"
+    assert any(r.startswith("worker_running_stale_code:wake_companion") for r in h["reasons"])
+
+
+def test_re_registering_keeps_the_original_start_time(conn, monkeypatch):
+    """A heartbeat must not paper over the fact that the process is old."""
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 5)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 60)
+    assert len(wake_bridge.worker_skew(conn=conn, now=NOW)) == 1
+
+
+def test_no_registered_worker_reports_no_skew(conn):
+    assert wake_bridge.worker_skew(conn=conn, now=NOW) == []
