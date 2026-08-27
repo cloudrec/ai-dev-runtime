@@ -863,6 +863,31 @@ _STATE_ACTIVE_RUN_RE = re.compile(
     # it, so a long turn was only caught when a token counter shared the captured tail.
     r"|\(\d+m\s+\d+s\s*·"
     r"|[↑↓]\s*[\d.]+\s*k?\s*tokens\b)", re.I)
+# A monitoring-only session: the agent itself is at rest at the composer, but the
+# harness is running live background monitors for it. Claude Code renders these in the
+# FOOTER mode line as a counter: "⏵⏵ auto mode on · 2 monitors · ← 3 agents". That is
+# live state — the counter drops when a monitor is stopped or dies — so it is real work
+# in progress, exactly like the "· N shells ·" marker `_STATE_ACTIVE_RUN_RE` already
+# knows. Without it a session whose whole job IS to watch reads as `idle`, and `idle` is
+# a poke/continuation candidate (commander_autopilot.POKE_STATES,
+# agent_continuation_watchdog at_rest), so Owner OS saw a healthy watcher as stalled.
+#
+# NOT the prose form. A finished turn prints "✻ Sautéed for 1m 11s · done · 2 monitors
+# still running", which is FROZEN scrollback: it keeps claiming monitors after they have
+# stopped, and that is the stale evidence requirement this must not fall for. Two guards
+# separate the footer from the prose: the count and the word must share a line (the prose
+# form wraps, and wrap position is terminal-width dependent), and a following "still" is
+# rejected outright. A zero count is not a match — "0 monitors" is not work.
+#
+# Deliberately conservative: the leading "·" is required, so an unobserved footer variant
+# fails CLOSED (reads at-rest) rather than falsely reporting an idle agent as busy.
+_STATE_BACKGROUND_MONITOR_RE = re.compile(
+    r"·[ \t]*[1-9]\d*[ \t]+monitors?\b(?![ \t]+still)", re.I)
+# How much of the tail counts as "the current footer". The mode line is the LAST line of
+# the pane, so this only has to span the composer box below the last spinner line; keeping
+# it short is what stops a stale prose line higher up from being read as live.
+_MONITOR_FOOTER_TAIL = 400
+
 # Blocked on something outside the agent's control (vendor key, credentials, quota).
 # NARROW on purpose: generic words like "waiting for", "timed out", "network error",
 # "reconnect", "502/503" appear constantly in benign SHELL/tool output and must NOT
@@ -1080,6 +1105,17 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
     #    output higher up cannot trip it.
     if _STATE_EXTERNAL_RE.search(tail[-500:]):
         return "externally_blocked"
+    # 5) at rest at the composer, but live background monitors are running for this
+    #    session — monitoring IS the work, so this is `shell_running`, not `idle`.
+    #    Placed LAST on purpose: it can only ever upgrade what would have been `idle`.
+    #    Every stronger reading above still wins — a real dialog is still `waiting_owner`,
+    #    a staged line the owner must submit is still `waiting_input`, and a genuine
+    #    external block is still `externally_blocked`. `shell_running` is reused rather
+    #    than adding a public state: it already means "real work in progress, not idle and
+    #    not blocked", and every consumer (agent_orchestrator._ACTIVE, the continuation
+    #    watchdog's active skip, waiting_transitions.PROGRESS_STATES) already treats it so.
+    if _STATE_BACKGROUND_MONITOR_RE.search(tail[-_MONITOR_FOOTER_TAIL:]):
+        return "shell_running"
     return "idle"
 
 

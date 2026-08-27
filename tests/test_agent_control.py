@@ -649,3 +649,77 @@ def test_shell_running_and_waiting_input_and_no_false_external():
     # active run beats the new signals.
     assert ac.classify_state(True, True, "esc to interrupt", shell_running=True,
                              pending_input="x") == "working"
+
+
+# ── monitoring-only session must not read as a stall ────────────────────────
+# Owner OS repeatedly raised `agent_waiting_input`/idle for owner-os-opus-windows
+# while that session's whole job was running live background monitors. `idle` is a
+# poke/continuation candidate, so a healthy watcher looked stalled. The footer mode
+# line carries a live "· N monitors ·" counter, which is the same class of evidence
+# as the "· N shells ·" marker the active-run regex already knows.
+MONITOR_AT_REST = (
+    "  Repo untouched. Silent until something real.\n\n"
+    "✻ Brewed for 3m 58s · done 11:43 PM\n\n"
+    "─" * 40 + "\n"
+    "❯ \n"
+    + "─" * 40 + "\n"
+    "  [CAVEMAN]\n"
+    "  ⏵⏵ auto mode on · 2 monitors · ← 3 agents\n"
+)
+
+
+def test_active_monitors_with_idle_prompt_are_not_a_stall():
+    # (1) live monitors + an EMPTY composer is work in progress, not idle and never
+    # a false waiting_input.
+    state = ac.classify_state(True, True, MONITOR_AT_REST, pending_input="", shell_running=False)
+    assert state == "shell_running"
+    assert state != "waiting_input"
+    # singular renders as "1 monitor"
+    one = MONITOR_AT_REST.replace("2 monitors", "1 monitor")
+    assert ac.classify_state(True, True, one, pending_input="") == "shell_running"
+
+
+def test_genuine_pending_prompt_still_waiting_input_with_monitors_running():
+    # (2) monitors running does NOT mask a real staged line the owner must submit.
+    assert ac.classify_state(True, True, MONITOR_AT_REST,
+                             pending_input="keep monitoring") == "waiting_input"
+    # a real dialog still outranks the monitor signal too
+    dialog = MONITOR_AT_REST.replace("❯ \n", "❯ Do you want to proceed?\n")
+    assert ac.classify_state(True, True, dialog, pending_input="") == "waiting_owner"
+
+
+def test_no_monitors_idle_pane_stays_idle():
+    # (3) the signal must not leak into ordinary at-rest panes.
+    plain = MONITOR_AT_REST.replace(" · 2 monitors", "")
+    assert ac.classify_state(True, True, plain, pending_input="") == "idle"
+    assert ac.classify_state(True, True, IDLE_MESS, pending_input="") == "idle"
+
+
+def test_stale_or_crashed_monitor_evidence_does_not_count_as_active():
+    # (4) the FROZEN turn-summary line keeps claiming monitors after they have
+    # stopped or died. Only the live footer counter counts.
+    stale_prose = (
+        "  earlier report\n\n"
+        "✻ Sautéed for 1m 11s · done 11:46 PM · 2 monitors still running\n\n"
+        + "─" * 40 + "\n"
+        "❯ \n"
+        + "─" * 40 + "\n"
+        "  ⏵⏵ auto mode on · ← 3 agents\n"
+    )
+    assert ac.classify_state(True, True, stale_prose, pending_input="") == "idle"
+    # the wrapped form of the same prose (count and word split across lines)
+    wrapped = stale_prose.replace("· 2 monitors still running",
+                                  "· 2\n  monitors still running")
+    assert ac.classify_state(True, True, wrapped, pending_input="") == "idle"
+    # every monitor stopped: a zero counter is not work
+    assert ac.classify_state(True, True, MONITOR_AT_REST.replace("2 monitors", "0 monitors"),
+                             pending_input="") == "idle"
+    # a monitors counter buried in deep scrollback is not the current footer
+    buried = MONITOR_AT_REST + ("  filler line\n" * 60) + "❯ \n  ⏵⏵ auto mode on\n"
+    assert ac.classify_state(True, True, buried, pending_input="") == "idle"
+
+
+def test_monitor_signal_never_overrides_a_real_external_block():
+    blocked = MONITOR_AT_REST.replace("  [CAVEMAN]\n",
+                                      "  Blocked: vendor key required to continue\n")
+    assert ac.classify_state(True, True, blocked, pending_input="") == "externally_blocked"
