@@ -16,7 +16,8 @@ spec.loader.exec_module(cdp)
 class _S:
     """Fake CDP session recording every expression sent."""
 
-    def __init__(self, counts=None, bools=None, turns=None, ids=None):
+    def __init__(self, counts=None, bools=None, turns=None, ids=None,
+                 streaming=None, assistant=None):
         self.counts = counts or {}
         self.bools = list(bools or [])
         # Successive answers to "how many user turns are on the page". Default models a
@@ -26,6 +27,13 @@ class _S:
         # where the id never changes, so the count alone decides — the pre-existing tests
         # keep their meaning.
         self.ids = list(ids or [])
+        # Success now requires the ASSISTANT to start, not merely a user turn to
+        # render: three deliveries were reported successful into a conversation
+        # where nothing ever ran. Default models a healthy page where generation
+        # begins immediately, so the pre-existing tests keep their meaning.
+        self.streaming = list(streaming or [1])
+        self.assistant = list(assistant or [0])
+        self.assistant_ids = [""]
         self._turn_calls = 0
         self.exprs = []
         self.inserted = []
@@ -49,9 +57,18 @@ class _S:
                 return self.turns.pop(0)
             self._turn_calls += 1
             return 0 if self._turn_calls == 1 else 1
+        if selector == cdp.STREAMING_SEL:
+            return self.streaming.pop(0) if len(self.streaming) > 1 else self.streaming[0]
+        if selector == cdp.ASSISTANT_TURN_SEL:
+            return self.assistant.pop(0) if len(self.assistant) > 1 else self.assistant[0]
         return self.counts.get("n", 1)
 
     def last_attr(self, selector, attr):
+        # Selector-aware: the assistant lookup must not consume the script that
+        # models the USER turn ids (virtualization case).
+        if selector == cdp.ASSISTANT_TURN_SEL:
+            return self.assistant_ids.pop(0) if len(self.assistant_ids) > 1 \
+                else self.assistant_ids[0]
         return self.ids.pop(0) if self.ids else ""
 
     def close(self):
@@ -126,7 +143,7 @@ def test_a_cleared_composer_alone_is_not_delivery(wired):
 def test_delivery_needs_the_turn_count_to_rise(wired):
     wired({"n": 1}, bools=[True, True, True, True], turns=[2, 3])
     r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
-    assert r["ok"] is True and r["reason"] == "submitted_and_user_turn_appeared"
+    assert r["ok"] is True and r["reason"] == "submitted_and_assistant_started_generating"
 
 
 # ── the virtualized long chat: count flat, newest id changed ───────────────
@@ -138,7 +155,9 @@ def test_a_flat_count_with_a_new_last_turn_id_is_still_delivery(wired):
     wired({"n": 1}, bools=[True, True, True, True], turns=[9] + [9] * 40,
           ids=["uuid-old", "uuid-new"])
     r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
-    assert r["ok"] is True and r["reason"] == "submitted_and_user_turn_id_advanced"
+    # The user turn is detected through the id advance (the virtualization case
+    # this test exists for); success is then confirmed by the assistant starting.
+    assert r["ok"] is True and r["reason"].startswith("submitted_and_assistant")
 
 
 def test_a_flat_count_and_an_unchanged_id_is_still_a_failure(wired):
@@ -305,7 +324,9 @@ def test_it_navigates_to_the_bound_conversation_when_the_tab_is_elsewhere(monkey
 def test_a_healthy_submission_confirms_a_new_user_turn(wired):
     s = wired({"n": 1}, bools=[True, True, True, True])
     r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
-    assert r["ok"] is True and r["reason"] == "submitted_and_user_turn_appeared"
+    # The reason changed with the criterion: a rendered user turn is not proof the
+    # reviewer ran, so success now names the assistant starting.
+    assert r["ok"] is True and r["reason"] == "submitted_and_assistant_started_generating"
     assert s.inserted == ["PHRASE"], "only the fixed phrase is ever inserted"
 
 

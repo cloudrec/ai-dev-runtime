@@ -16,6 +16,8 @@ Fail closed everywhere: ambiguity (zero or several matches) is a refusal, never 
 from __future__ import annotations
 
 import json
+import os
+import time
 import urllib.parse
 import urllib.request
 from typing import Optional
@@ -36,6 +38,21 @@ SEND_SEL = ("button[data-testid='send-button'], form button[type='submit'], "
 # first structure that exists only once the conversation actually gained the message, so
 # delivery is judged by its COUNT rising, never by the composer emptying.
 USER_TURN_SEL = "[data-message-author-role='user']"
+# A user turn element appearing is CLIENT-SIDE evidence: the page rendered our text.
+# It does not prove the backend accepted the message, that it persisted, or that the
+# assistant ever ran. Three deliveries were reported successful into a conversation
+# that ended up holding two user turns, and the owner had to type manually because no
+# assistant turn had started. The wake exists to make the reviewer RUN, so the proof
+# has to be the assistant running.
+ASSISTANT_TURN_SEL = "[data-message-author-role='assistant']"
+# ChatGPT shows a stop control only while a response is generating; its presence is
+# the earliest positive evidence that generation actually began.
+STREAMING_SEL = ("button[data-testid='stop-button'], button[aria-label*='Stop'], "
+                 "button[data-testid='composer-speech-button-container'] ~ "
+                 "button[data-testid='stop-button']")
+# How long the assistant gets to START after our message lands. Generous: a slow
+# start is not a failure, only silence is.
+ASSISTANT_START_SECS = int(os.getenv("WAKE_ASSISTANT_START_SECS", "45"))
 
 
 def _http(path: str, method: str = "GET"):
@@ -308,6 +325,38 @@ def _latch_submitted(source: str, event_id: Optional[int]) -> None:
         pass
 
 
+def _await_assistant(s, asst_before: int, asst_id_before) -> dict:
+    """Did the assistant actually start after our message landed?
+
+    Three signals, any of which is positive proof that the backend accepted the
+    turn and generation began:
+      * a new assistant turn element (count risen), or
+      * the newest assistant turn's id changed (virtualization-proof, same trick
+        the user-turn check already uses), or
+      * the streaming/stop control is present, which ChatGPT renders only while a
+        response is being produced.
+
+    Silence for ASSISTANT_START_SECS is reported as a FAILURE, deliberately. The
+    message is already in the chat and the submission is latched, so it must never
+    be resent as a duplicate - the honest outcome is delivered=false with a reason
+    that names what did not happen, leaving the closed-loop watchdog to re-wake and
+    ultimately escalate.
+    """
+    deadline = time.time() + ASSISTANT_START_SECS
+    while time.time() < deadline:
+        if s.count(STREAMING_SEL) > 0:
+            return {"ok": True, "reason": "submitted_and_assistant_started_generating"}
+        if s.count(ASSISTANT_TURN_SEL) > asst_before:
+            return {"ok": True, "reason": "submitted_and_assistant_responded"}
+        asst_id_now = s.last_attr(ASSISTANT_TURN_SEL, "data-message-id")
+        if (asst_id_before is not None and asst_id_now
+                and asst_id_now != asst_id_before):
+            return {"ok": True, "reason": "submitted_and_assistant_turn_advanced"}
+        time.sleep(2)
+    return {"ok": False,
+            "reason": f"user_turn_landed_but_assistant_never_started_in_{ASSISTANT_START_SECS}s"}
+
+
 def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
              event_id: Optional[int] = None) -> dict:
     """The submission itself, once the slot is claimed. Split out so that every exit path
@@ -376,6 +425,9 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # always mounted, so its id CHANGING is proof a new turn arrived even when the
         # count never moves. An id is metadata; no content is read.
         last_id_before = s.last_attr(USER_TURN_SEL, "data-message-id")
+        # The same two baselines for the ASSISTANT side, taken before anything is typed.
+        asst_before = s.count(ASSISTANT_TURN_SEL)
+        asst_id_before = s.last_attr(ASSISTANT_TURN_SEL, "data-message-id")
         # Focus by element identity, then CONFIRM focus. A focus call that silently fails is
         # exactly how the phrase went nowhere before.
         s.call("Runtime.evaluate",
@@ -428,12 +480,17 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                     _latch_submitted(source, event_id)
             if not cleared:
                 continue
-            if s.count(USER_TURN_SEL) > turns_before:
-                return {"ok": True, "reason": "submitted_and_user_turn_appeared"}
-            last_id_now = s.last_attr(USER_TURN_SEL, "data-message-id")
-            if (last_id_before is not None and last_id_now
-                    and last_id_now != last_id_before):
-                return {"ok": True, "reason": "submitted_and_user_turn_id_advanced"}
+            user_turn_seen = s.count(USER_TURN_SEL) > turns_before
+            if not user_turn_seen:
+                last_id_now = s.last_attr(USER_TURN_SEL, "data-message-id")
+                user_turn_seen = bool(last_id_before is not None and last_id_now
+                                      and last_id_now != last_id_before)
+            if user_turn_seen:
+                # The message is in the page. Now the question that actually matters:
+                # did the assistant START? Until it does, the wake has delivered
+                # nothing the reviewer will act on, and saying otherwise is the false
+                # positive that let two agents sit stopped.
+                return _await_assistant(s, asst_before, asst_id_before)
         if not cleared:
             # The phrase is still SITTING IN THE COMPOSER — provably not sent (event
             # 4214: a settling page refused the click and the old pre-fire latch then

@@ -123,7 +123,10 @@ def test_a_verified_delivery_is_recorded_as_delivered(monkeypatch):
     _decide_wake(103)
     r = cdp.submit_phrase("https://chatgpt.com/c/delivery-test-chat", "P",
                           source="companion", event_id=103)
-    assert r["ok"] is True and r["reason"] == "submitted_and_user_turn_appeared"
+    # Success now means the assistant actually started; a rendered user turn was
+    # the false positive that let agents sit stopped.
+    assert r["ok"] is True
+    assert r["reason"].startswith("submitted_and_assistant")
     row = wb.last_delivery(103)
     assert row["delivered"] is True
 
