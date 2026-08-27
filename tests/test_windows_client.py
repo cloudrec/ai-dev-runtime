@@ -632,3 +632,17 @@ def test_inspect_honours_the_file_cap(cfg, workspace):
     assert len(out["files"]) == 5
     assert out["files_skipped"] >= 25
     assert out["file_count"] == len(out["files"]) + out["files_skipped"]
+
+
+def test_agent_version_is_reported_so_the_server_knows_the_build():
+    """`/windows/devices` shows agent_version; without a bump, an un-updated
+    device is indistinguishable from an updated one until a verb fails."""
+    assert agent.AGENT_VERSION == "0.2.0"
+    assert "workspace.inspect" in _agent_source()
+    assert "foreign_claude_in" in _agent_source()
+
+
+def _agent_source():
+    import pathlib
+    return (pathlib.Path(__file__).resolve().parent.parent / "clients" / "windows"
+            / "owner_os_agent.py").read_text(encoding="utf-8")

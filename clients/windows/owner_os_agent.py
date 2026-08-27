@@ -50,7 +50,10 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional
 
-AGENT_VERSION = "0.1.0"
+# Bumped whenever the device-side contract changes, so `/windows/devices` tells
+# the server WHICH build is out there. 0.2.0 adds workspace.inspect, the
+# foreign-Claude duplicate guard, external-session read, and `watch`.
+AGENT_VERSION = "0.2.0"
 USER_AGENT = f"owner-os-windows-agent/{AGENT_VERSION}"
 
 # Must match core.windows_bridge on the server.
