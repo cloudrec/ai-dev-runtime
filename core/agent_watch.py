@@ -127,12 +127,32 @@ _BLOCKER_RE = re.compile(
 _WORKING_RE = re.compile(
     r"(esc to interrupt|ctrl\+c to interrupt|running…)", re.IGNORECASE)
 # Process-level failure text in the tail (beyond the process simply being gone).
+# `killed` on its own is ordinary English ("the task was killed", "killed the
+# process idea") and it fired on prose. Real crash reports say WHAT was killed or
+# HOW: a signal, an OOM, a process, or the shell's own report at line start.
 _CRASH_RE = re.compile(
-    r"(traceback \(most recent call last\)|segmentation fault|killed\b|core dumped"
-    r"|claude.{0,20}(exited|crashed))", re.IGNORECASE)
+    r"(traceback \(most recent call last\)|segmentation fault|core dumped"
+    r"|killed by signal|signal \d+ \(sig[a-z]+\)|out of memory: killed"
+    r"|oom-killer|^\s*killed\s*$|process killed"
+    r"|claude.{0,20}(exited|crashed))", re.IGNORECASE | re.MULTILINE)
 
 _VOLATILE = re.compile(r"\d+")
 _WS = re.compile(r"\s+")
+
+# Claude Code HARNESS text rendered into the pane: system reminders and background
+# task notifications. This is the harness talking to the agent, not the agent
+# producing output, and it must be evidence for nothing — event 10002 declared this
+# very watcher's own pane `crashed` because a background-task notice mentioning
+# stopped tasks and `__orphan_summary__` scrolled through it while the pane was
+# demonstrably alive. Blocks are stripped whole: the giveaway markers sit on the
+# opening/closing lines, while the sentence that actually matched the crash
+# vocabulary sat in the middle with nothing to identify it.
+_HARNESS_OPEN_RE = re.compile(r"<\s*(system-reminder|task-notification)\s*>", re.IGNORECASE)
+_HARNESS_CLOSE_RE = re.compile(r"</\s*(system-reminder|task-notification)\s*>", re.IGNORECASE)
+# Single lines that are unmistakably harness chatter even outside a block.
+_HARNESS_LINE_RE = re.compile(
+    r"__orphan_summary__|\[SYSTEM NOTIFICATION|</?(task-id|tool-use-id|output-file"
+    r"|status|summary|event)\s*>|NOT USER INPUT", re.IGNORECASE)
 
 # tmux/Claude-CLI chrome: box borders, status bars, input-box furniture, hints. These are
 # DISPLAY, not agent output — they must appear in no digest, no excerpt, no evidence.
@@ -196,9 +216,20 @@ _TOOL_COMPLETION_RE = re.compile(
 def _meaningful_lines(tail: str) -> list:
     """The CURRENT response region: strip tmux/CLI chrome, keep real output lines."""
     out = []
+    in_harness = False
     for ln in (tail or "").splitlines():
         s = ln.strip()
-        if not s or _UI_LINE_RE.match(s):
+        # Harness blocks are dropped in their entirety, including any line between
+        # the tags: a mid-block sentence carries no marker of its own, which is
+        # exactly how "may have been stopped ... killed" became crash evidence.
+        if _HARNESS_OPEN_RE.search(s):
+            in_harness = True
+            continue
+        if in_harness:
+            if _HARNESS_CLOSE_RE.search(s):
+                in_harness = False
+            continue
+        if not s or _UI_LINE_RE.match(s) or _HARNESS_LINE_RE.search(s):
             continue
         out.append(s)
     return out
