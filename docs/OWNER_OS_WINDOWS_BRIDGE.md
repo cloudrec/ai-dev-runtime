@@ -64,7 +64,7 @@ curl -sS -X POST https://<owner-os>/api/v1/windows/enroll-code \
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1 `
-  -Server https://<owner-os> `
+  -Server http://polyinput-server.tail9bce4e.ts.net:8199 `
   -Code OOS-XXXXX-XXXXX-XXXXX `
   -WorkspacePath "C:\Users\0962871647\Desktop\GAIKA_Basket_Chrome_Extension_MVP_v0.1.0\gaika-basket-extension"
 ```
@@ -88,6 +88,46 @@ python "$env:ProgramData\OwnerOS\owner_os_agent.py" `
   --config "$env:ProgramData\OwnerOS\agent.json" `
   add-workspace --id another-project --path C:\path\to\project
 ```
+
+## 3.3 Reachability — Tailscale (how the PC finds the server)
+
+The runtime API listens on `172.17.0.1:8199` (a docker-bridge address) and is
+deliberately NOT published to the internet. The PC reaches it over the tailnet:
+
+```
+Windows PC ──WireGuard──▶ polyinput-server.tail9bce4e.ts.net:8199/api/v1/windows
+                          └─ tailscale serve ─▶ http://172.17.0.1:8199/api/v1/windows
+```
+
+Configured with one command, already applied on the server:
+
+```bash
+tailscale serve --bg --http=8199 --set-path=/api/v1/windows   http://172.17.0.1:8199/api/v1/windows
+```
+
+What that does and does not do:
+
+* **Tailnet only.** `tailscale serve` binds the Tailscale interface. Funnel
+  (public exposure) is off, and nothing was added to nginx, the firewall, the
+  routing table, DNS, or the exit-node/subnet-route settings.
+* **Minimal surface.** Only `/api/v1/windows/*` is mounted. `/api/v1/jobs`,
+  `/api/v1/agents` and even `/api/v1/health` return 404 over the tailnet — the
+  owner-only routes stay reachable exclusively on the internal address.
+* **Signatures survive it.** The proxy preserves the request path, so the
+  HMAC's path binding still verifies. Proven by enrolling a throwaway device
+  through the tailnet URL and completing a signed poll (device then revoked and
+  deleted).
+* **Plain HTTP is correct here.** Traffic inside the tailnet is already
+  WireGuard-encrypted and peer-authenticated, which is the guarantee TLS would
+  add, one layer down. `install.ps1` therefore accepts `http://` for `*.ts.net`
+  and `100.64.0.0/10` hosts and keeps refusing it everywhere else
+  (pinned by `tests/test_windows_client.py`).
+* **HTTPS instead, if wanted.** `tailscale cert` currently fails with *"your
+  Tailscale account does not support getting TLS certs"*. Enabling HTTPS
+  certificates in the Tailscale admin console (DNS → HTTPS Certificates) would
+  allow `tailscale serve --bg --https=443 ...` and an `https://` server URL.
+* **Rollback:** `tailscale serve --http=8199 off` — the bridge becomes
+  unreachable from the PC and nothing else changes.
 
 ## 4. Driving it from Owner OS
 

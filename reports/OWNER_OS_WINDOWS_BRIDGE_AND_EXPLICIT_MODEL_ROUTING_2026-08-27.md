@@ -244,3 +244,87 @@ choose one:
 Enrollment cannot be completed until one of those exists. Everything on the
 server side is otherwise ready and idle: no device is enrolled, and every
 `/windows/*` route is inert without one.
+
+---
+
+# Tailscale connectivity — 2026-08-27 18:2x UTC
+
+The ingress gate from the deployment record is now closed, without publishing
+anything to the internet.
+
+**Tailscale was already installed, logged in and running** on this server
+(`tailscale0` = `100.108.182.33`, tailnet `tail9bce4e.ts.net`, node
+`polyinput-server`). No login, no auth key and no device enrollment was needed
+or performed. The owner's Windows PC is **already a member of this tailnet**:
+`DESKTOP-23PUSRG` (`100.116.241.62`, last seen 13 days ago; an older record
+`100.95.119.118` also exists). It is currently offline.
+
+**HTTPS certs are unavailable on this account** — `tailscale cert` returns
+*"your Tailscale account does not support getting TLS certs"*, so
+`tailscale serve --https` is not possible. Enabling HTTPS certificates in the
+admin console is an owner/account decision and was not taken.
+
+**What was configured (one command, reversible):**
+
+```bash
+tailscale serve --bg --http=8199 --set-path=/api/v1/windows \
+  http://172.17.0.1:8199/api/v1/windows
+```
+
+`http://polyinput-server.tail9bce4e.ts.net:8199/api/v1/windows` → the runtime
+API, tailnet only.
+
+**Verified**
+
+| Check | Result |
+| --- | --- |
+| Enrollment through the tailnet proxy | works (throwaway device, then revoked + deleted) |
+| Signed poll through the proxy | **accepted** — the HMAC path binding survives the proxy |
+| `/api/v1/jobs`, `/agents`, `/health` over tailnet | **404** — only the device routes are mounted |
+| Funnel (public exposure) | off; serve reports "tailnet only" |
+| Routing table | byte-identical to the pre-change capture |
+| iptables rules | 0 before, 0 after |
+| Exit node / advertised routes / RouteAll / ShieldsUp | unchanged (empty / false) |
+| nginx | untouched, still no reference to 8199 |
+| Direct `172.17.0.1:8199` path | intact (`/health` ok) |
+| `ai-runtime.service` | NOT restarted (PID 4042415, NRestarts=0) |
+| Wake pipeline | enabled, kill switch off, last delivery ok |
+| Fabric | 23 agents, no errors |
+| Registry after cleanup | 0 devices, 0 workspaces, 0 open enrollment codes |
+
+**Client support.** `install.ps1` previously refused any non-HTTPS server. It
+now accepts `http://` for Tailscale addresses only (`*.ts.net` or
+`100.64.0.0/10`), because tailnet traffic is already WireGuard-encrypted and
+peer-authenticated — the same guarantee TLS provides, one layer down. Plain
+HTTP to anything else is still refused. The CGNAT range check is pinned by 11
+tests so the exception cannot quietly widen. The installer also pre-checks
+tailnet reachability and fails with a clear message if Tailscale is down on
+the PC.
+
+**Rollback:** `tailscale serve --http=8199 off`.
+
+## Next Windows step (owner)
+
+1. Bring `DESKTOP-23PUSRG` online and confirm Tailscale is up on it
+   (`tailscale status` should list `polyinput-server`).
+2. Copy `clients/windows/owner_os_agent.py` and `clients/windows/install.ps1`
+   to the PC.
+3. Mint a code on the server (single use, expires — mint it at install time):
+
+   ```bash
+   curl -sS -X POST http://172.17.0.1:8199/api/v1/windows/enroll-code \
+     -H "Authorization: Bearer $RUNTIME_TOKEN" -H 'Content-Type: application/json' \
+     -d '{"label":"owner windows pc","ttl_secs":3600}'
+   ```
+
+4. On the PC, in the folder holding both files:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File install.ps1 `
+     -Server http://polyinput-server.tail9bce4e.ts.net:8199 `
+     -Code OOS-XXXXX-XXXXX-XXXXX `
+     -WorkspacePath "C:\Users\0962871647\Desktop\GAIKA_Basket_Chrome_Extension_MVP_v0.1.0\gaika-basket-extension"
+   ```
+
+The device will then appear in `GET /api/v1/windows/devices` and as
+`win:win-<id>:gaika-basket-extension` in `GET /api/v1/fabric/agents`.

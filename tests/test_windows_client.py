@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import sys
 
@@ -336,3 +337,45 @@ def test_the_run_loop_backs_off_instead_of_exiting_when_the_server_is_down(cfg, 
     agent.Agent(cfg).run(once=True, log=lambda *_a: None)
     assert calls["n"] == 1
     assert sleeps == [1.0]      # backed off, did not raise
+
+
+# ── installer transport rule ────────────────────────────────────────────────
+# install.ps1 refuses plain HTTP with one principled exception: a Tailscale
+# address, where WireGuard already provides the encryption and peer
+# authentication TLS would add. That exception must not leak: an attacker-
+# chosen host outside the tailnet ranges has to stay refused. The regex is the
+# security-relevant part, so it is pinned here rather than trusted by eye.
+
+def _installer_tailnet_regex():
+    import pathlib
+    text = (pathlib.Path(__file__).resolve().parent.parent
+            / "clients" / "windows" / "install.ps1").read_text(encoding="utf-8")
+    line = next(ln for ln in text.splitlines() if "isTailnet = $true" in ln and "match" in ln)
+    return re.compile(line.split("'")[1].replace("\\\\", "\\"))
+
+
+@pytest.mark.parametrize("host", [
+    "100.64.0.1", "100.108.182.33", "100.127.255.254", "100.70.1.1", "100.119.9.9",
+])
+def test_installer_accepts_real_tailnet_addresses(host):
+    assert _installer_tailnet_regex().match(host)
+
+
+@pytest.mark.parametrize("host", [
+    "100.63.255.254",   # just below the CGNAT range
+    "100.128.0.1",      # just above it
+    "100.5.5.5",
+    "10.0.0.1",
+    "1100.64.0.1",      # must not match on a prefix
+    "evil.com",
+])
+def test_installer_refuses_everything_outside_the_tailnet_range(host):
+    assert not _installer_tailnet_regex().match(host)
+
+
+def test_installer_still_refuses_plain_http_generally():
+    import pathlib
+    text = (pathlib.Path(__file__).resolve().parent.parent
+            / "clients" / "windows" / "install.ps1").read_text(encoding="utf-8")
+    assert "Refusing to install against a non-HTTPS, non-Tailscale server" in text
+    assert "$Server -notmatch '^https://'" in text

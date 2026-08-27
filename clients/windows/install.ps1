@@ -22,9 +22,11 @@
       5. registers a Scheduled Task that runs the agent at logon and restarts
          it if it stops.
 
-    The agent makes OUTBOUND HTTPS connections only. No inbound port is opened
-    and no firewall rule is added; if this script ever asks you for one,
-    something is wrong.
+    The agent makes OUTBOUND connections only. No inbound port is opened and no
+    firewall rule is added; if this script ever asks you for one, something is
+    wrong. -Server must be HTTPS, or a Tailscale address (*.ts.net or a
+    100.64.0.0/10 tailnet IP), where WireGuard already provides the encryption
+    and peer authentication TLS would otherwise add.
 
 .NOTES
     Re-running is safe: enrollment is skipped when the device is already
@@ -77,9 +79,39 @@ if (-not $claude) {
     Write-Host "    claude at $($claude.Source)"
 }
 
+# Transport check. HTTPS is the normal requirement, with ONE principled
+# exception: a Tailscale address. Traffic to a *.ts.net MagicDNS name or a
+# 100.64.0.0/10 tailnet IP is already inside a WireGuard tunnel that both
+# encrypts it and authenticates the peer, so plain HTTP there is not clear
+# text on any wire — it is the same guarantee TLS would add, provided one
+# layer down. Plain HTTP to anything else is still refused.
+$serverHost = ([uri]$Server).Host
+$isTailnet = $false
+if ($serverHost -like "*.ts.net") { $isTailnet = $true }
+elseif ($serverHost -match '^100\.(6[4-9]|[7-9][0-9]|1[0-1][0-9]|12[0-7])\.') { $isTailnet = $true }
+
 if ($Server -notmatch '^https://') {
-    Write-Warn "Server URL is not HTTPS. The device secret and every command would travel in clear text."
-    if (-not $Force) { throw "Refusing to install against a non-HTTPS server (use -Force only for a local test)." }
+    if ($isTailnet) {
+        Write-Host "    transport: Tailscale ($serverHost) — WireGuard-encrypted, tailnet-only" -ForegroundColor Green
+    } else {
+        Write-Warn "Server URL is not HTTPS. The device secret and every command would travel in clear text."
+        if (-not $Force) { throw "Refusing to install against a non-HTTPS, non-Tailscale server (use -Force only for a local test)." }
+    }
+}
+
+if ($isTailnet) {
+    $ts = Get-Command tailscale -ErrorAction SilentlyContinue
+    if (-not $ts) {
+        Write-Warn "Server is a Tailscale address but the tailscale CLI was not found on PATH."
+        Write-Warn "Install Tailscale and sign in to the same tailnet:  winget install -e --id tailscale.tailscale"
+    } else {
+        Write-Step "Checking this machine can reach $serverHost over the tailnet"
+        $reach = Test-NetConnection -ComputerName $serverHost -Port ([uri]$Server).Port -InformationLevel Quiet -WarningAction SilentlyContinue
+        if (-not $reach) {
+            throw "Cannot reach $serverHost on the tailnet. Bring Tailscale up on this PC (tailscale up) and retry — enrollment cannot work until the tailnet path is live."
+        }
+        Write-Host "    tailnet path OK"
+    }
 }
 
 # ── 2. install files ────────────────────────────────────────────────────────
