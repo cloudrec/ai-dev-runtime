@@ -961,7 +961,8 @@ def coalesce_history(limit: int = 50, conn=None) -> list:
 _SEND_SCHEMA = """
 CREATE TABLE IF NOT EXISTS wake_send (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts REAL, at TEXT, source TEXT, event_id INTEGER, allowed INTEGER, reason TEXT
+    ts REAL, at TEXT, source TEXT, event_id INTEGER, allowed INTEGER, reason TEXT,
+    route_key TEXT
 )
 """
 
@@ -971,10 +972,13 @@ def _migrate_send(conn) -> None:
     have = {r[1] for r in conn.execute("PRAGMA table_info(wake_send)")}
     if "actionable" not in have:
         conn.execute("ALTER TABLE wake_send ADD COLUMN actionable INTEGER DEFAULT 0")
+    if "route_key" not in have:
+        conn.execute("ALTER TABLE wake_send ADD COLUMN route_key TEXT")
 
 
 def claim_send(source: str, event_id: Optional[int] = None, conn=None,
-               actionable: bool = False, now: Optional[float] = None) -> dict:
+               actionable: bool = False, now: Optional[float] = None,
+               route_key: str = "") -> dict:
     """The single choke point every submission must pass, whatever called it.
 
     The owner saw the wake phrase twice. Neither was a duplicate of the same event: one came
@@ -990,6 +994,13 @@ def claim_send(source: str, event_id: Optional[int] = None, conn=None,
     a generic cooldown would move the stall from the decision to the delivery and fix
     nothing; the choke point itself has to know the two classes apart. It remains a choke
     point — the actionable floor still applies, and every attempt is still recorded.
+
+    The cooldown is measured PER ROUTE, for the same reason the decision-layer floors
+    are: a claim is a slot in ONE chat. Measuring it globally re-imposed at the choke
+    point exactly the cross-chat suppression removed from the decision — a gaika-drop
+    wake sat 867 seconds behind an owner-os send that was never going to its chat. The
+    CLAIM itself stays global and every attempt is still recorded, so the out-of-band
+    duplicate this function exists to catch is caught exactly as before.
     """
     now = now if now is not None else now_ts()
     enabled, kill = _enabled()
@@ -1003,27 +1014,31 @@ def claim_send(source: str, event_id: Optional[int] = None, conn=None,
             res = (False, "bridge_disabled")
         elif actionable:
             r = conn.execute("SELECT ts FROM wake_send WHERE allowed=1 AND "
-                             "COALESCE(actionable,0)=1 ORDER BY id DESC LIMIT 1").fetchone()
+                             f"COALESCE(actionable,0)=1 AND {_ROUTE_MATCH} "
+                             "ORDER BY id DESC LIMIT 1",
+                             _route_params(route_key)).fetchone()
             if r and (now - float(r[0] or 0)) < ACTIONABLE_COOLDOWN_SECS:
                 res = (False, f"actionable_cooldown_active:"
                               f"{int(ACTIONABLE_COOLDOWN_SECS - (now - float(r[0])))}s")
             else:
                 res = (True, "claimed_actionable")
         else:
-            r = conn.execute("SELECT ts FROM wake_send WHERE allowed=1 "
-                             "ORDER BY id DESC LIMIT 1").fetchone()
+            r = conn.execute(f"SELECT ts FROM wake_send WHERE allowed=1 AND {_ROUTE_MATCH} "
+                             "ORDER BY id DESC LIMIT 1",
+                             _route_params(route_key)).fetchone()
             if r and (now - float(r[0] or 0)) < COOLDOWN_SECS:
                 res = (False, f"global_cooldown_active:"
                               f"{int(COOLDOWN_SECS - (now - float(r[0])))}s")
             else:
                 res = (True, "claimed")
-        conn.execute("INSERT INTO wake_send (ts,at,source,event_id,allowed,reason,actionable) "
-                     "VALUES (?,?,?,?,?,?,?)",
+        conn.execute("INSERT INTO wake_send (ts,at,source,event_id,allowed,reason,"
+                     "actionable,route_key) VALUES (?,?,?,?,?,?,?,?)",
                      (now, now_iso(), source, int(event_id or 0), int(res[0]), res[1],
-                      1 if actionable else 0))
+                      1 if actionable else 0, (route_key or "").strip()))
         conn.commit()
         return {"allowed": res[0], "reason": res[1], "source": source,
-                "actionable": bool(actionable)}
+                "actionable": bool(actionable),
+                "route_key": (route_key or "").strip()}
     finally:
         if own:
             conn.close()

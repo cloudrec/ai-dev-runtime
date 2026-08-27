@@ -282,7 +282,9 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
             import sys as _sys
             _sys.path.insert(0, "/root/ai-dev-runtime")
             from core import wake_bridge as _wb
-            c = _wb.claim_send(source, event_id=event_id, actionable=actionable)
+            # The claim is for a slot in THIS conversation, so it carries the route.
+            c = _wb.claim_send(source, event_id=event_id, actionable=actionable,
+                               route_key=route_key)
             if not c.get("allowed"):
                 return {"ok": False, "reason": f"not_claimed:{c.get('reason')}"}
         except Exception as e:  # noqa: BLE001

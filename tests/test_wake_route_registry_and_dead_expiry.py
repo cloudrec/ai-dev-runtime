@@ -306,3 +306,64 @@ def test_rows_without_a_stored_route_are_resolved_fresh(bridge):
     bridge.commit()
     out = wake_bridge.coalesce_generic_backlog(conn=bridge, now=now + 10)
     assert len(out["superseded_event_ids"]) == 1, out
+
+
+# ── 5. the send choke point is also per chat ───────────────────────────────
+# claim_send is the single gate every submission passes. Its cooldown was
+# global, so it re-imposed at the send layer exactly the cross-chat suppression
+# removed from the decision layer: a gaika-drop wake sat 867s behind an owner-os
+# send that was never going to its chat (observed live, event 9870).
+
+def test_a_claim_in_one_chat_does_not_block_another(bridge):
+    now = 1_800_000_000.0
+    a = wake_bridge.claim_send("test", event_id=1, conn=bridge, now=now,
+                               route_key="owner-os")
+    assert a["allowed"] is True
+    b = wake_bridge.claim_send("test", event_id=2, conn=bridge, now=now + 5,
+                               route_key="gaika-drop")
+    assert b["allowed"] is True, b["reason"]
+
+
+def test_a_second_claim_in_the_SAME_chat_is_still_refused(bridge):
+    now = 1_800_000_000.0
+    assert wake_bridge.claim_send("test", event_id=3, conn=bridge, now=now,
+                                  route_key="gaika-drop")["allowed"] is True
+    second = wake_bridge.claim_send("test", event_id=4, conn=bridge, now=now + 5,
+                                    route_key="gaika-drop")
+    assert second["allowed"] is False
+    assert "cooldown" in second["reason"]
+
+
+def test_the_actionable_floor_is_also_per_chat(bridge):
+    now = 1_800_000_000.0
+    assert wake_bridge.claim_send("t", event_id=5, conn=bridge, now=now,
+                                  actionable=True, route_key="owner-os")["allowed"]
+    other = wake_bridge.claim_send("t", event_id=6, conn=bridge, now=now + 5,
+                                   actionable=True, route_key="mess")
+    assert other["allowed"] is True
+    same = wake_bridge.claim_send("t", event_id=7, conn=bridge, now=now + 6,
+                                  actionable=True, route_key="mess")
+    assert same["allowed"] is False
+
+
+def test_every_attempt_is_still_recorded_allowed_or_not(bridge):
+    """The out-of-band duplicate this gate exists to catch must stay visible."""
+    now = 1_800_000_000.0
+    wake_bridge.claim_send("companion", event_id=8, conn=bridge, now=now,
+                           route_key="treasure")
+    wake_bridge.claim_send("rogue-script", event_id=8, conn=bridge, now=now + 1,
+                           route_key="treasure")
+    rows = bridge.execute("SELECT source, allowed, route_key FROM wake_send "
+                          "WHERE event_id=8 ORDER BY id").fetchall()
+    assert [r[0] for r in rows] == ["companion", "rogue-script"]
+    assert [r[1] for r in rows] == [1, 0]          # the second was refused, and recorded
+    assert all(r[2] == "treasure" for r in rows)
+
+
+def test_a_claim_without_a_route_counts_as_owner_os(bridge):
+    """Legacy callers pass no route; they must keep the owner-os floor."""
+    now = 1_800_000_000.0
+    assert wake_bridge.claim_send("legacy", event_id=9, conn=bridge, now=now)["allowed"]
+    blocked = wake_bridge.claim_send("legacy", event_id=10, conn=bridge, now=now + 5,
+                                     route_key="owner-os")
+    assert blocked["allowed"] is False
