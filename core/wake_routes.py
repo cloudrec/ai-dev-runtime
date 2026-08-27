@@ -10,6 +10,9 @@ This module is the canonical answer. One table, keyed by a stable ROUTE KEY — 
 deterministic and fail-closed:
 
     explicit route for the event's project      -> that conversation   (explicit_route)
+    event named a SESSION, registry knows its
+      project, and that project has a route     -> that conversation
+                                                   (explicit_route:via_agent_registry(<s>))
     no route for the project                    -> the owner-os route  (unmapped_route:<key>)
     no owner-os route either                    -> the legacy single wake_target row,
                                                    kept ONLY as a migration bridge
@@ -25,6 +28,7 @@ so the URL validator lives here and the bridge re-exports it.
 """
 from __future__ import annotations
 
+import os
 import re
 from typing import Optional
 
@@ -189,16 +193,58 @@ def route_history(limit: int = 50, conn=None) -> list:
             conn.close()
 
 
-def _chat_dead(conn, url: str) -> bool:
-    """Has the chat registry recorded this conversation as dead (a fired send the page
-    refused)? Read directly — `core.chat_registry` imports this module, so the check
-    cannot go through it. A missing registry table means nothing is known dead."""
+# How long a dead mark silences a PROJECT route before it earns one retry.
+#
+# A dead mark is only ever set after two consecutive fired-and-refused sends, which
+# is good evidence — but it is not permanent evidence, and the gate that acts on it
+# is self-locking: a dead route is never selected for delivery, and only a delivery
+# can clear the mark. gaika-video sat dead for twelve days on the strength of one
+# `composer_did_not_clear_after_send` pair, with every wake for that project silently
+# rerouted to the owner-os control chat. wake_bridge already recognised this trap and
+# exempted owner-os from dead-gating; project routes were left inside it.
+#
+# Expiry closes the loop without weakening the evidence rule: after the window the
+# route is offered again, exactly once per window. If the chat really is gone the next
+# two sends re-mark it and the clock restarts; if it was a transient page hiccup the
+# route heals itself with no owner action.
+DEAD_ROUTE_RETRY_SECS = int(os.getenv("WAKE_DEAD_ROUTE_RETRY_SECS", "3600"))
+
+
+def _dead_since(conn, url: str) -> Optional[float]:
+    """Epoch seconds when this conversation was marked dead, or None if it is live.
+    Falls back to `writable_checked_at` for rows written before `dead_at_ts` existed,
+    and to "dead but undatable" (0.0) when neither is readable."""
     try:
-        r = conn.execute("SELECT active FROM chat_registry WHERE conversation=?",
-                         ((url or "").rstrip("/"),)).fetchone()
-        return bool(r) and not r[0]
-    except Exception:  # noqa: BLE001
+        r = conn.execute("SELECT active, dead_at_ts, writable_checked_at FROM chat_registry "
+                         "WHERE conversation=?", ((url or "").rstrip("/"),)).fetchone()
+    except Exception:  # noqa: BLE001 — pre-migration DB: no dead_at_ts column
+        try:
+            r = conn.execute("SELECT active, NULL, writable_checked_at FROM chat_registry "
+                             "WHERE conversation=?", ((url or "").rstrip("/"),)).fetchone()
+        except Exception:  # noqa: BLE001
+            return None
+    if not r or r[0]:
+        return None
+    if r[1]:
+        return float(r[1])
+    if r[2]:
+        try:
+            from datetime import datetime
+            return datetime.fromisoformat(str(r[2])).timestamp()
+        except Exception:  # noqa: BLE001
+            return 0.0
+    return 0.0
+
+
+def _chat_dead(conn, url: str, *, now: Optional[float] = None) -> bool:
+    """Is this conversation dead RIGHT NOW — i.e. marked dead and still inside its
+    retry window? Read directly: `core.chat_registry` imports this module, so the
+    check cannot go through it. A missing registry table means nothing is known dead."""
+    since = _dead_since(conn, url)
+    if since is None:
         return False
+    now = now if now is not None else now_ts()
+    return (now - since) < DEAD_ROUTE_RETRY_SECS
 
 
 def _legacy_target(conn) -> str:
@@ -210,6 +256,47 @@ def _legacy_target(conn) -> str:
         return ((r[0] if r else "") or "").strip()
     except Exception:  # noqa: BLE001 — table may not exist in a fresh DB
         return ""
+
+
+def _registry_project(conn, key: str, agent_id: str = "") -> tuple:
+    """Ask the control plane's OWN agent registry which project a session belongs to.
+
+    Events do not always carry a project: `agent_watcher` labels a transition with the
+    tmux SESSION (`payorch-live-buttons`, `chemmy-fast`), while routes are bound to the
+    PROJECT (`payment-orchestrator`, `mess`). Those never matched, so every project
+    agent's wake fell back to the owner-os control chat and the owner had to relay it by
+    hand - the exact "stuchalka goes to the wrong chat" failure.
+
+    This is a lookup, not a guess: the mapping already exists in `agent.project_id`,
+    written by the discovery path from the pane's real cwd. Ambiguity is refused rather
+    than resolved - if one session name somehow carries two different projects, the
+    caller keeps the labelled owner-os fallback.
+
+    Returns (project_key, reason_suffix) or ("", "").
+    """
+    if not key:
+        return "", ""
+    session = key
+    candidates = set()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT project_id FROM agent WHERE session=? AND "
+            "COALESCE(project_id,'') <> ''", (session,)).fetchall()
+        candidates = {normalize_key(r[0]) for r in rows if normalize_key(r[0])}
+        if not candidates and agent_id:
+            # `agent_id` arrives as "<session>:<pane>"; the target column holds it verbatim.
+            rows = conn.execute(
+                "SELECT DISTINCT project_id FROM agent WHERE target=? AND "
+                "COALESCE(project_id,'') <> ''", (agent_id,)).fetchall()
+            candidates = {normalize_key(r[0]) for r in rows if normalize_key(r[0])}
+    except Exception:  # noqa: BLE001 - registry unavailable must not break routing
+        return "", ""
+    if len(candidates) != 1:
+        return "", (f":ambiguous_registry_project" if len(candidates) > 1 else "")
+    project = candidates.pop()
+    if project == session:
+        return "", ""
+    return project, f":via_agent_registry({session})"
 
 
 def resolve(*, project_id: str = "", source: str = "", agent_id: str = "",
@@ -227,6 +314,23 @@ def resolve(*, project_id: str = "", source: str = "", agent_id: str = "",
     try:
         fallback_reason = f"unmapped_route:{key}" if key != FALLBACK_ROUTE else "owner_os_route"
         r = get_route(key, conn=conn)
+        registry_suffix = ""
+        if not r and key != FALLBACK_ROUTE:
+            # The event named a session, not a project. Ask the registry which project
+            # that session belongs to, and route on THAT if it has a binding.
+            derived, registry_suffix = _registry_project(conn, key, agent_id)
+            if derived:
+                dr = get_route(derived, conn=conn)
+                if dr and valid_conversation(dr["conversation"]):
+                    if not _chat_dead(conn, dr["conversation"]):
+                        return {"bound": True, "conversation": dr["conversation"],
+                                "route_key": derived,
+                                "route_reason": f"explicit_route{registry_suffix}"}
+                    fallback_reason = f"dead_route:{derived}{registry_suffix}"
+                else:
+                    fallback_reason = f"unmapped_route:{key}{registry_suffix}"
+            elif registry_suffix:
+                fallback_reason = f"unmapped_route:{key}{registry_suffix}"
         if r and valid_conversation(r["conversation"]):
             if key == FALLBACK_ROUTE or not _chat_dead(conn, r["conversation"]):
                 # The owner-os route is exempt from dead-gating BY DESIGN: it is the

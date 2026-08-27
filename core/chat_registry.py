@@ -43,7 +43,8 @@ CREATE TABLE IF NOT EXISTS chat_registry (
     evidence TEXT DEFAULT '',
     source TEXT DEFAULT '',
     active INTEGER DEFAULT 1,
-    dead_reason TEXT DEFAULT ''
+    dead_reason TEXT DEFAULT '',
+    dead_at_ts REAL
 )
 """
 
@@ -81,7 +82,7 @@ def upsert_chat(conversation: str, *, title: str = "", source: str = "",
                 args += [1 if writable else 0, now_iso()]
                 if writable:
                     # A proven write supersedes an old death verdict.
-                    sets += ["active=1", "dead_reason=''"]
+                    sets += ["active=1", "dead_reason=''", "dead_at_ts=NULL"]
             if inferred_route:
                 sets.append("inferred_route=?"); args.append(inferred_route[:64])
             if confidence:
@@ -108,6 +109,19 @@ def upsert_chat(conversation: str, *, title: str = "", source: str = "",
             conn.close()
 
 
+_DEAD_AT_MIGRATION = ("dead_at_ts", "REAL")
+
+
+def _ensure_dead_at(conn) -> None:
+    """Additive: when the chat was marked dead. Needed so a dead mark can EXPIRE
+    instead of silencing a project route forever (see wake_routes.resolve)."""
+    try:
+        conn.execute(f"ALTER TABLE chat_registry ADD COLUMN {_DEAD_AT_MIGRATION[0]} "
+                     f"{_DEAD_AT_MIGRATION[1]}")
+    except Exception:  # noqa: BLE001 — already present
+        pass
+
+
 def mark_dead(conversation: str, *, reason: str, conn=None,
               now: Optional[float] = None) -> dict:
     """A send fired and the page refused it, or an equivalent proof. Recorded, never
@@ -116,17 +130,19 @@ def mark_dead(conversation: str, *, reason: str, conn=None,
     url = (conversation or "").strip().rstrip("/")
     conn, own = _conn(conn)
     try:
+        _ensure_dead_at(conn)
         cur = conn.execute(
             "UPDATE chat_registry SET active=0, writable=0, dead_reason=?, "
-            "writable_checked_at=?, last_seen=?, last_seen_ts=? WHERE conversation=?",
-            (reason[:160], now_iso(), now_iso(), now, url))
+            "writable_checked_at=?, last_seen=?, last_seen_ts=?, dead_at_ts=? "
+            "WHERE conversation=?",
+            (reason[:160], now_iso(), now_iso(), now, now, url))
         if cur.rowcount == 0:
             conn.execute(
                 "INSERT INTO chat_registry (conversation,first_seen,first_seen_ts,last_seen,"
-                "last_seen_ts,writable,writable_checked_at,active,dead_reason,source) "
-                "VALUES (?,?,?,?,?,0,?,0,?,?)",
+                "last_seen_ts,writable,writable_checked_at,active,dead_reason,source,"
+                "dead_at_ts) VALUES (?,?,?,?,?,0,?,0,?,?,?)",
                 (url, now_iso(), now, now_iso(), now, now_iso(), reason[:160],
-                 "delivery-failure"))
+                 "delivery-failure", now))
         conn.commit()
         return {"ok": True, "conversation": url, "dead_reason": reason[:160]}
     finally:

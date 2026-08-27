@@ -473,3 +473,121 @@ def test_no_english_account_names_survive_anywhere_in_the_acl_step():
     block = text[idx:idx + 1200]
     for name in ('"Administrators:', '"SYSTEM:', '"Users:', '"Everyone:'):
         assert name not in block, f"localized-name identity {name} still present"
+
+
+# ── one visible agent, never two ───────────────────────────────────────────
+# The owner wants to WATCH Claude work in the GAIKA folder. The bridge runs it
+# headlessly, so "watch" is a live transcript tail (one process, fully visible)
+# rather than a second interactive Claude. And if the owner does start Claude by
+# hand in an enrolled folder, the bridge must refuse to start a second one.
+
+def test_a_foreign_claude_in_the_workspace_blocks_a_second_one(cfg, workspace, monkeypatch):
+    monkeypatch.setattr(agent, "foreign_claude_in", lambda p: 4321)
+    with pytest.raises(agent.AgentError, match="outside Owner OS"):
+        agent.Agent(cfg).execute({"action": "agent.send",
+                                  "workspace_id": "gaika-basket",
+                                  "params": {"text": "hello"}})
+
+
+def test_no_foreign_process_means_normal_operation(cfg, fake_claude, monkeypatch):
+    monkeypatch.setattr(agent, "foreign_claude_in", lambda p: None)
+    out = agent.Agent(cfg).execute({"action": "agent.send",
+                                    "workspace_id": "gaika-basket",
+                                    "params": {"text": "hello"}})
+    assert out["reply"].startswith("fake reply to:")
+
+
+def test_detection_failure_never_blocks_a_send(cfg, fake_claude, monkeypatch):
+    """Best-effort by design: an unreadable process table must not produce a
+    false refusal that silences the bridge."""
+    def boom(_p):
+        raise OSError("no process table")
+    monkeypatch.setattr(agent, "_proc_cwd_windows", boom)
+    assert agent.foreign_claude_in("/definitely/not/a/real/path") is None
+
+
+def test_watch_is_a_subcommand_that_needs_an_enrolled_workspace(cfg, capsys):
+    assert agent.main(["--config", cfg.path, "watch", "--id", "not-enrolled"]) == 2
+    err = capsys.readouterr().err
+    assert "not enrolled" in err
+
+
+def test_watch_reads_the_same_transcript_the_runner_writes(cfg, fake_claude):
+    a = agent.Agent(cfg)
+    a.execute({"action": "agent.send", "workspace_id": "gaika-basket",
+               "params": {"text": "visible please"}})
+    import pathlib
+    log = pathlib.Path(cfg.path).parent / "state" / "gaika-basket.log"
+    assert log.exists()
+    assert "visible please" in log.read_text(encoding="utf-8")
+
+
+# ── reading the owner's own visible Claude session ─────────────────────────
+# The owner keeps a Claude open in the GAIKA folder (session "gaika-windows").
+# Windows has no tmux-style input injection, so the bridge cannot type into that
+# console — but the conversation is on disk, so Owner OS can still SEE it.
+# Reporting the workspace as "idle" while a visible session works in it would be
+# a lie; the bridge reports it, reads it, and refuses to start a second Claude.
+
+@pytest.fixture()
+def external_session(tmp_path, workspace, monkeypatch):
+    """Claude Code's own on-disk transcript for the enrolled folder.
+
+    The real encoding of the directory name has varied between Claude versions,
+    so the agent matches on a normalized slug of the path. The fixture therefore
+    uses one plausible encoding (separators -> '-') and the lookup must still
+    find it."""
+    home = tmp_path / "claudehome"
+    encoded = str(workspace).replace("\\", "-").replace("/", "-").replace(":", "-")
+    proj = home / "projects" / encoded
+    proj.mkdir(parents=True)
+    sid = "11111111-2222-3333-4444-555555555555"
+    (proj / f"{sid}.jsonl").write_text(
+        json.dumps({"type": "user", "message": {"content": "check the cart badge"}}) + "\n"
+        + json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Looking at manifest.json now"}]}}) + "\n",
+        encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home))
+    return {"session_id": sid, "dir": proj}
+
+
+def test_an_owner_started_session_is_discovered(cfg, workspace, external_session):
+    found = agent.external_session_file(str(workspace))
+    assert found and found.endswith(".jsonl")
+    out = agent.read_external_session(str(workspace), lines=20)
+    assert out["external_session"] is True
+    assert out["session_id"] == external_session["session_id"]
+    assert "check the cart badge" in out["output"]
+    assert "Looking at manifest.json" in out["output"]
+
+
+def test_status_reports_the_visible_session_instead_of_claiming_idle(
+        cfg, workspace, external_session, monkeypatch):
+    monkeypatch.setattr(agent, "foreign_claude_in", lambda p: 9999)
+    st = agent.Agent(cfg).execute({"action": "agent.status",
+                                   "workspace_id": "gaika-basket"})
+    assert st["state"] == "external_session"
+    assert st["controllable"] is False
+    assert st["pid"] == 9999
+    assert st["session_id"] == external_session["session_id"]
+
+
+def test_read_returns_the_owners_conversation_not_an_empty_buffer(
+        cfg, workspace, external_session, monkeypatch):
+    monkeypatch.setattr(agent, "foreign_claude_in", lambda p: 9999)
+    out = agent.Agent(cfg).execute({"action": "agent.read",
+                                    "workspace_id": "gaika-basket",
+                                    "params": {"lines": 20}})
+    assert out["source"] == "external_claude_session"
+    assert "check the cart badge" in out["output"]
+
+
+def test_no_external_session_means_the_normal_agent_path(cfg, fake_claude, monkeypatch):
+    monkeypatch.setattr(agent, "foreign_claude_in", lambda p: None)
+    a = agent.Agent(cfg)
+    a.execute({"action": "agent.send", "workspace_id": "gaika-basket",
+               "params": {"text": "hi"}})
+    out = a.execute({"action": "agent.read", "workspace_id": "gaika-basket",
+                     "params": {"lines": 10}})
+    assert out["source"] == "owner_os_agent"
+    assert "hi" in out["output"]

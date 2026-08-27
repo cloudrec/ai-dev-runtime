@@ -228,6 +228,150 @@ def find_claude(cfg: Config) -> str:
     return found
 
 
+def claude_home() -> str:
+    return os.getenv("CLAUDE_CONFIG_DIR") or os.path.join(os.path.expanduser("~"), ".claude")
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (text or "").lower())
+
+
+def external_session_file(workspace_path: str) -> Optional[str]:
+    """The transcript Claude Code itself keeps for this folder, if one exists.
+
+    Claude stores each project's sessions as JSONL under
+    `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. The encoding has changed
+    between versions, so rather than reproducing it this matches on a normalized
+    slug of the path - stable across a Windows path, its encoded form,
+    and a slash-separated one.
+
+    This is how Owner OS can SEE a Claude the owner started himself: the bridge
+    cannot type into another process's console on Windows, but the conversation is
+    on disk, so `read`/`status` can report it truthfully instead of pretending the
+    workspace is idle.
+    """
+    root = os.path.join(claude_home(), "projects")
+    if not os.path.isdir(root):
+        return None
+    want = _slug(os.path.abspath(workspace_path))
+    best, best_mtime = None, -1.0
+    try:
+        for entry in os.listdir(root):
+            d = os.path.join(root, entry)
+            if not os.path.isdir(d):
+                continue
+            if _slug(entry) != want:
+                continue
+            for name in os.listdir(d):
+                if not name.endswith(".jsonl"):
+                    continue
+                f = os.path.join(d, name)
+                try:
+                    m = os.path.getmtime(f)
+                except OSError:
+                    continue
+                if m > best_mtime:
+                    best, best_mtime = f, m
+    except OSError:
+        return None
+    return best
+
+
+def read_external_session(workspace_path: str, lines: int = DEFAULT_LINES) -> dict:
+    """Tail of the owner's own visible Claude session for this folder."""
+    path = external_session_file(workspace_path)
+    if not path:
+        return {"external_session": False}
+    out, session_id = [], os.path.splitext(os.path.basename(path))[0]
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.readlines()[-max(1, min(int(lines), MAX_LINES)) * 2:]
+    except OSError as e:
+        return {"external_session": True, "session_id": session_id,
+                "error": f"cannot read session transcript: {e}"}
+    for line in raw:
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        role = (rec.get("type") or rec.get("role") or "")
+        msg = rec.get("message") or {}
+        content = msg.get("content") if isinstance(msg, dict) else None
+        text = ""
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = " ".join(c.get("text", "") for c in content
+                            if isinstance(c, dict) and c.get("type") == "text")
+        if text.strip():
+            out.append(f"[{role}] {text.strip()}")
+    return {"external_session": True, "session_id": session_id,
+            "transcript_path": path,
+            "output": "\n".join(out[-max(1, min(int(lines), MAX_LINES)):])}
+
+
+def foreign_claude_in(path: str) -> Optional[int]:
+    """PID of a Claude process running in `path` that this agent did not start.
+
+    Duplicate agents are the failure mode the server-side fabric is built to avoid,
+    and the same rule has to hold here: if the owner has Claude open in the workspace
+    himself, the bridge must not quietly start a second conversation beside it.
+
+    Best-effort by design - an unreadable process table returns None (no false
+    refusals), and the check never raises.
+    """
+    target = os.path.normcase(os.path.abspath(path))
+    try:
+        if os.name == "nt":
+            # One fixed argv, no remote input interpolated into it.
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name='node.exe' or "
+                 "Name='claude.exe'\" | ForEach-Object { \"$($_.ProcessId)`t"
+                 "$($_.CommandLine)\" }"],
+                capture_output=True, text=True, timeout=20, shell=False)
+            for line in (out.stdout or "").splitlines():
+                pid, _, cmdline = line.partition("\t")
+                if "claude" not in (cmdline or "").lower():
+                    continue
+                try:
+                    pid_i = int(pid.strip())
+                except ValueError:
+                    continue
+                cwd = _proc_cwd_windows(pid_i)
+                if cwd and os.path.normcase(cwd) == target:
+                    return pid_i
+            return None
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    cmd = f.read().decode("utf-8", "replace")
+                if "claude" not in cmd:
+                    continue
+                if os.path.normcase(os.readlink(f"/proc/{entry}/cwd")) == target:
+                    return int(entry)
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001 - detection must never break a send
+        return None
+    return None
+
+
+def _proc_cwd_windows(pid: int) -> str:
+    """Working directory of a Windows process, best effort."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"(Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue).Path"],
+            capture_output=True, text=True, timeout=15, shell=False)
+        exe = (out.stdout or "").strip()
+        return os.path.dirname(exe) if exe else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 class WorkspaceRunner:
     """One enrolled folder's Claude session: its transcript, its session id and
     at most one running Claude process. Serialized by a lock, so two commands
@@ -284,6 +428,20 @@ class WorkspaceRunner:
 
     # -- verbs ---------------------------------------------------------------
     def status(self) -> dict:
+        # A Claude the OWNER started is reported, not hidden: "idle" would be a lie
+        # while a visible session is working in this very folder.
+        foreign = foreign_claude_in(self.path)
+        ext = read_external_session(self.path, lines=1) if foreign else {}
+        if foreign:
+            return {"workspace_id": self.workspace_id, "path": self.path,
+                    "state": "external_session", "running": True, "pid": foreign,
+                    "session_id": ext.get("session_id", ""),
+                    "owned_by": "owner (started outside Owner OS)",
+                    "controllable": False,
+                    "note": "read-only: Owner OS can read this session but will not "
+                            "start a second Claude in the same workspace",
+                    "last_activity": self.last_activity, "last_error": self.last_error[:300],
+                    "transcript_bytes": len(self.buffer)}
         return {"workspace_id": self.workspace_id, "path": self.path,
                 "state": "working" if self.running else
                          ("error" if self.last_error else "idle"),
@@ -295,7 +453,15 @@ class WorkspaceRunner:
                 "transcript_bytes": len(self.buffer)}
 
     def read(self, lines: int = DEFAULT_LINES) -> dict:
-        return {**self.status(), "lines": lines, "output": self.tail(lines)}
+        st = self.status()
+        if st.get("state") == "external_session":
+            # Read the owner's visible conversation from Claude's own transcript.
+            ext = read_external_session(self.path, lines=lines)
+            return {**st, "lines": lines, "output": ext.get("output", ""),
+                    "source": "external_claude_session",
+                    "transcript_path": ext.get("transcript_path", "")}
+        return {**st, "lines": lines, "output": self.tail(lines),
+                "source": "owner_os_agent"}
 
     def send(self, text: str, *, resume: bool = True) -> dict:
         """One Claude turn, headless. `resume=False` starts a new session; the
@@ -311,6 +477,16 @@ class WorkspaceRunner:
         try:
             if self.running:
                 raise AgentError("workspace busy: a Claude turn is already running")
+            foreign = foreign_claude_in(self.path)
+            if foreign:
+                # The owner started Claude in this folder by hand. Spawning a second
+                # one would give this workspace two agents with two different
+                # conversations - the duplicate-agent failure the whole fabric exists
+                # to prevent. Refuse with a reason instead.
+                raise AgentError(
+                    f"a Claude process started outside Owner OS is already running in "
+                    f"this workspace (pid {foreign}); refusing to start a second one. "
+                    f"Close it, or use it interactively and let the bridge stay idle.")
             argv = [self.claude_cmd, "-p", "--output-format", "json"]
             sid = self.session_id
             if resume and sid:
@@ -544,6 +720,43 @@ def cmd_rotate(args) -> int:
     return 0
 
 
+def cmd_watch(args) -> int:
+    """Follow one workspace's transcript live, in a visible window.
+
+    This is the answer to "I want to SEE what Claude is doing" that does not create a
+    second agent. The bridge runs Claude headlessly and records every prompt and reply
+    to the workspace transcript; this tails that file the way `tail -f` would, so the
+    owner watches the real conversation as it happens while exactly one Claude process
+    (the bridge's) ever runs in the folder.
+    """
+    cfg = Config(args.config or default_config_path())
+    entry = cfg.workspace(args.id)
+    if not entry:
+        raise AgentError(f"workspace {args.id!r} is not enrolled on this device")
+    state_dir = os.path.join(os.path.dirname(cfg.path), "state")
+    path = os.path.join(state_dir, f"{args.id}.log")
+    print(f"watching {args.id} -> {entry.get('path')}")
+    print(f"transcript: {path}")
+    print("(Ctrl+C to stop watching; this does not stop the agent)\n")
+    pos = 0
+    if os.path.exists(path) and not args.all:
+        pos = max(0, os.path.getsize(path) - 4096)   # start from the recent tail
+    try:
+        while True:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    f.seek(pos)
+                    chunk = f.read()
+                    pos = f.tell()
+                if chunk:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print("\nstopped watching")
+        return 0
+
+
 def cmd_run(args) -> int:
     cfg = Config(args.config or default_config_path())
     Agent(cfg).run(once=args.once)
@@ -579,6 +792,11 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="connect and serve commands (outbound only)")
     run.add_argument("--once", action="store_true", help="one poll cycle, then exit")
     run.set_defaults(func=cmd_run)
+
+    w = sub.add_parser("watch", help="follow a workspace's live transcript in this window")
+    w.add_argument("--id", required=True)
+    w.add_argument("--all", action="store_true", help="from the beginning, not the tail")
+    w.set_defaults(func=cmd_watch)
     return p
 
 
