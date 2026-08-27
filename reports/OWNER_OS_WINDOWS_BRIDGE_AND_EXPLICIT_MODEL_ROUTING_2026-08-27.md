@@ -328,3 +328,87 @@ the PC.
 
 The device will then appear in `GET /api/v1/windows/devices` and as
 `win:win-<id>:gaika-basket-extension` in `GET /api/v1/fabric/agents`.
+
+---
+
+# Stuchalka (wake) repair + GAIKA reconciliation — 2026-08-27 evening
+
+## Wake: three root causes, fixed and live
+
+All three were separate reasons a project agent could not ring its own ChatGPT
+chat, forcing the owner to relay by hand.
+
+1. **Session-vs-project key mismatch.** `agent_watcher` labels a transition with
+   the tmux SESSION (`payorch-live-buttons`, `chemmy-fast`), while `wake_route`
+   is keyed by the PROJECT (`payment-orchestrator`, `mess`). The keys never
+   matched, so every project wake fell through to the owner-os control chat.
+   The mapping already existed in the control plane's own `agent.project_id`.
+   `wake_routes.resolve()` now consults it — a lookup, not a guess: an ambiguous
+   session refuses, a missing registry degrades to previous behaviour.
+
+2. **Dead marks were permanent.** A dead route is never selected for delivery
+   and only a delivery clears the mark, so one transient
+   `composer_did_not_clear_after_send` pair silenced `gaika-video` for twelve
+   days. `wake_bridge` already exempted owner-os from this self-locking gate;
+   project routes were left inside it. Marks now expire after
+   `WAKE_DEAD_ROUTE_RETRY_SECS` (1h) and earn one retry per window.
+
+3. **Cooldowns were global.** Both floors queried the most recent wake for ANY
+   project, so the busiest chat silenced every other one — owner-os traffic alone
+   accounts for most of 17,289 `cooldown_active` skips in fourteen days. Both are
+   now matched on the decision's resolved route; `wake_audit.route_key` was added
+   (additive) to make that possible, with legacy NULL rows counted as owner-os so
+   that chat keeps exactly its current protection.
+
+**Live evidence, production service:** four chats each cleared their own floor
+seconds apart (owner-os / payment-orchestrator / mess / treasure) where a global
+floor would have passed only the first; `payorch-*`, `chemmy-fast`,
+`treasure-*`, `jobhunter-media-audit` now resolve to their own conversations;
+`gaika-video` recovered from its dead mark. End-to-end: event 9864 decided at
+17:46:34 with `route_key` persisted, delivered 17:47:00
+(`submitted_and_user_turn_appeared`). Commits `076e096`, `e525c4a`; 271 wake
+tests pass; no route was rebound (`wake_route_audit` today = 0).
+
+## Notification tiers are RED — one owner gate
+
+Event 9800 (`notification_dead_letter`) and 9864 (`notifications_red`) share one
+cause. The bot token is VALID (`@ezzetasecurity_bot`), but `getChat` with the
+configured `TELEGRAM_CHAT_ID` returns `400 Bad Request: chat not found`, so
+every Telegram notification dead-letters after 5 attempts — 30 in 48 hours,
+100%. The other two tiers are red by configuration, not by fault:
+`same_chat_wake` has no inbound trigger and `scheduled_chatgpt` is disabled.
+
+This is separate from the ChatGPT wake path, which is healthy and delivering.
+
+**Owner action:** send `/start` to `@ezzetasecurity_bot` from the account that
+should receive alerts; the correct chat id can then be read from `getUpdates`
+and set in `configs/.env`. Not done here — credentials are an owner gate.
+
+## GAIKA reconciliation — no unique Windows work
+
+The owner's archive (`gaika-basket-extension.zip`, sha256 `c349f2a8…`) was
+extracted read-only to `/tmp`; neither copy was modified.
+
+It carries no `.git`. Hashing its 31 files against every commit in the server
+history matches **`45082dd` "chore: baseline import of GAIKA extension v0.4.3"**
+exactly — 31/31 byte-identical, 0 files differing from that baseline. The Windows
+copy is a strict ANCESTOR of `/opt/gaika-extension` `main` (`f3c405b`), not a
+divergence.
+
+| Group | Count |
+| --- | --- |
+| identical to server HEAD | 18 |
+| changed (server advanced, Windows did not) | 12 |
+| server-only additions since the fork | 35 |
+| Windows-only | 1 — `content/store-adapter.js` |
+
+The single Windows-only file is a server-side RENAME, verified in git
+(`R071 content/store-adapter.js -> content/gaika-core.js`), and the Windows copy
+of it is byte-identical to the pre-rename version. **Nothing to merge, nothing
+to salvage.**
+
+Recommended (all owner-gated, none performed): tag `45082dd` as the Windows
+snapshot; give `/opt/gaika-extension` a backup remote — 33 commits currently
+exist in one place with no remote, and `cloudrec/gaika` is a DIFFERENT project
+(docs/investor material), so it is the wrong destination; move the ZIP out of
+the working tree before it lands in a milestone archive.
