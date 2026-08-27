@@ -377,3 +377,33 @@ def test_a_cooldown_on_another_chat_does_not_excuse_a_stuck_wake(conn):
     h = wake_bridge.pipeline_health(conn=conn, now=NOW)
     assert h["status"] == "stuck"
     assert any(r.startswith("pending_wake_stuck:mess") for r in h["reasons"])
+
+
+def test_a_stuck_chat_is_not_hidden_behind_a_waiting_one(conn):
+    """Per route here too: judging only the single oldest pending wake would let
+    a genuinely stuck chat hide behind another that is correctly waiting out its
+    floor - the same cross-chat blindness as the original defects."""
+    # mess: floor cleared long ago, wake far past the threshold -> stuck
+    _pending_wake(conn, event_id=1, route="mess", actionable=0,
+                  ts=NOW - wake_bridge.STUCK_PENDING_SECS - 300)
+    _claim(conn, ts=NOW - wake_bridge.COOLDOWN_SECS - 60, actionable=0, route="mess")
+    # owner-os: just sent to, so legitimately waiting, and OLDER
+    _pending_wake(conn, event_id=2, route="owner-os", actionable=0,
+                  ts=NOW - wake_bridge.STUCK_PENDING_SECS - 600)
+    _claim(conn, ts=NOW - 30, actionable=0, route="owner-os")
+    h = wake_bridge.pipeline_health(conn=conn, now=NOW)
+    assert h["status"] == "stuck"
+    assert "mess" in h["stuck_routes"]
+    assert "owner-os" in h["waiting_routes"]
+
+
+def test_a_dead_companion_is_caught_while_the_work_is_still_fresh(conn):
+    """Silence is about whether there is claimable work, not about how long a
+    wake has waited - otherwise a crashed deliverer stays invisible for the
+    whole stuck threshold."""
+    _pending_wake(conn, event_id=1, route="mess", actionable=0, ts=NOW - 20)
+    _claim(conn, ts=NOW - wake_bridge.COMPANION_SILENT_SECS - 60,
+           actionable=0, route="treasure")       # last attempt, unrelated chat
+    h = wake_bridge.pipeline_health(conn=conn, now=NOW)
+    assert h["status"] == "stuck"
+    assert any(r.startswith("companion_silent") for r in h["reasons"])

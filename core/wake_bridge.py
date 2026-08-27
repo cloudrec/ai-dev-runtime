@@ -515,30 +515,54 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
         # that "stuck" would be an alarm that cries wolf, which is how a detector
         # trains people to ignore it. Only a wake whose floor has ALREADY cleared
         # and which still has not gone out is genuinely not moving.
-        cooldown_remaining = 0
-        if pending:
-            oldest_actionable = bool(pending[0][3])
-            floor = ACTIONABLE_COOLDOWN_SECS if oldest_actionable else COOLDOWN_SECS
-            last_allowed = conn.execute(
+        def _cooldown_left(route: str, actionable: bool) -> int:
+            floor = ACTIONABLE_COOLDOWN_SECS if actionable else COOLDOWN_SECS
+            r = conn.execute(
                 f"SELECT ts FROM wake_send WHERE allowed=1 AND {_ROUTE_MATCH} "
-                + ("AND COALESCE(actionable,0)=1 " if oldest_actionable else "")
-                + "ORDER BY id DESC LIMIT 1", _route_params(oldest_route)).fetchone()
-            if last_allowed:
-                elapsed = now - float(last_allowed[0] or 0)
-                if elapsed < floor:
-                    cooldown_remaining = int(floor - elapsed)
+                + ("AND COALESCE(actionable,0)=1 " if actionable else "")
+                + "ORDER BY id DESC LIMIT 1", _route_params(route)).fetchone()
+            if not r:
+                return 0
+            elapsed = now - float(r[0] or 0)
+            return int(floor - elapsed) if elapsed < floor else 0
+
+        # PER ROUTE, like every other floor in this module. Judging only the
+        # single oldest pending wake would let a genuinely stuck wake on one chat
+        # hide behind a legitimately-waiting wake on another - the same
+        # cross-chat blindness that caused the original defects.
+        oldest_per_route: dict = {}
+        for eid, rk, ts, act in pending:
+            key = rk or wake_routes.FALLBACK_ROUTE
+            if key not in oldest_per_route or float(ts) < oldest_per_route[key][1]:
+                oldest_per_route[key] = (eid, float(ts), bool(act))
+        stuck_routes, waiting_routes, claimable_routes = [], [], []
+        for key, (eid, ts, act) in oldest_per_route.items():
+            age = int(now - ts)
+            left = _cooldown_left(key, act)
+            if left:
+                waiting_routes.append((key, left))
+                continue
+            # Claimable NOW: its floor has cleared, whatever its age. This is the
+            # set that says whether the deliverer has anything to do, which is a
+            # different question from whether a wake has waited too long.
+            claimable_routes.append(key)
+            if age > STUCK_PENDING_SECS:
+                stuck_routes.append((key, age))
+        cooldown_remaining = max((l for _k, l in waiting_routes), default=0)
 
         reasons = []
         if kill:
             reasons.append("kill_switch_engaged")
         if not enabled:
             reasons.append("bridge_disabled")
-        if pending and oldest_age > STUCK_PENDING_SECS and not cooldown_remaining:
-            reasons.append(f"pending_wake_stuck:{oldest_route}:{oldest_age}s")
-        if (pending and not cooldown_remaining and claim_age is not None
+        for key, age in sorted(stuck_routes, key=lambda x: -x[1]):
+            reasons.append(f"pending_wake_stuck:{key}:{age}s")
+        # A dead deliverer must be caught while the work is FRESH; tying this to
+        # the stuck age would hide a crashed companion for the whole threshold.
+        if (claimable_routes and claim_age is not None
                 and claim_age > COMPANION_SILENT_SECS):
             reasons.append(f"companion_silent:{claim_age}s_with_{len(pending)}_pending")
-        if pending and claim_age is None:
+        if claimable_routes and claim_age is None:
             reasons.append("companion_never_claimed")
         if consecutive_failures >= CONSECUTIVE_FAILURE_LIMIT:
             reasons.append(f"consecutive_delivery_failures:{consecutive_failures}")
@@ -554,13 +578,16 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
                                                   "consecutive_delivery_failures",
                                                   "worker_running_stale_code"))
                                     for r in reasons) else "disabled"
-        if cooldown_remaining and status == "ok":
+        if waiting_routes and status == "ok":
             # Reported, not alarmed: the owner can see WHY nothing is moving.
-            reasons.append(f"waiting_on_cooldown:{oldest_route}:{cooldown_remaining}s")
+            for key, left in sorted(waiting_routes, key=lambda x: -x[1]):
+                reasons.append(f"waiting_on_cooldown:{key}:{left}s")
             status = "waiting"
         return {"status": status, "reasons": reasons,
                 "worker_skew": skew,
                 "cooldown_remaining_secs": cooldown_remaining,
+                "stuck_routes": dict(stuck_routes),
+                "waiting_routes": dict(waiting_routes),
                 "pending_count": len(pending),
                 "pending_oldest_age_secs": oldest_age,
                 "pending_oldest_route": oldest_route,
