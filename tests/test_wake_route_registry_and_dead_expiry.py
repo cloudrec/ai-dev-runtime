@@ -367,3 +367,51 @@ def test_a_claim_without_a_route_counts_as_owner_os(bridge):
     blocked = wake_bridge.claim_send("legacy", event_id=10, conn=bridge, now=now + 5,
                                      route_key="owner-os")
     assert blocked["allowed"] is False
+
+
+# ── 6. decision and delivery must ask the SAME routing question ────────────
+# Event 9868 was decided for the gaika-drop chat and delivered to owner-os. Both
+# stages re-resolve the route (deliberately - a rebind between decision and
+# submission must take effect), but they resolved with DIFFERENT inputs:
+# should_wake passed project AND agent ref, pending_wake passed only the
+# project. The event's project ('gaika-extension') matched no route and no
+# session; only its agent ref ('gaika-ext-audit:0.0') reached the registry. So
+# the decision found the project chat and the delivery did not.
+
+def test_an_event_routed_only_by_its_agent_ref_survives_to_delivery(bridge, monkeypatch):
+    _agent_row(bridge, "gaika-ext-audit", "payment-orchestrator",
+               target="gaika-ext-audit:0.0")
+    now = 1_800_000_000.0
+    d = wake_bridge.should_wake(event_id=9868, severity="critical",
+                                event_type="agent_waiting_input",
+                                project_id="gaika-extension",
+                                agent_id="gaika-ext-audit:0.0",
+                                owner_action_required=True, conn=bridge, now=now)
+    assert d["route_key"] == "payment-orchestrator", "decision must use the agent ref"
+    wake_bridge.record(d, event_id=9868, severity="critical",
+                       event_type="agent_waiting_input", project_id="gaika-extension",
+                       agent_id="gaika-ext-audit:0.0", conn=bridge, now=now)
+
+    p = wake_bridge.pending_wake(conn=bridge, now=now + 1)
+    assert p["pending"] is True
+    assert p["route_key"] == "payment-orchestrator", (
+        "delivery re-resolved with a narrower question and lost the route")
+    assert p["conversation"] == CHAT_B
+
+
+def test_delivery_still_re_resolves_so_a_rebind_takes_effect(bridge):
+    """Fresh resolution is the point; it just has to ask the same question."""
+    _agent_row(bridge, "sess-x", "payment-orchestrator", target="sess-x:0.0")
+    now = 1_800_000_000.0
+    d = wake_bridge.should_wake(event_id=9701, severity="critical",
+                                event_type="agent_waiting_input", project_id="sess-x",
+                                agent_id="sess-x:0.0", owner_action_required=True,
+                                conn=bridge, now=now)
+    wake_bridge.record(d, event_id=9701, severity="critical",
+                       event_type="agent_waiting_input", project_id="sess-x",
+                       agent_id="sess-x:0.0", conn=bridge, now=now)
+    # Owner rebinds that project's chat AFTER the decision.
+    wake_routes.bind_route("payment-orchestrator", CHAT_A, by="owner",
+                           note="rotated", conn=bridge)
+    p = wake_bridge.pending_wake(conn=bridge, now=now + 1)
+    assert p["conversation"] == CHAT_A, "a rebind between decision and submission must win"

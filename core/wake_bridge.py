@@ -1070,7 +1070,14 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
                     "coalesced": coalesced["superseded_event_ids"]}
         # FAIL CLOSED per event: an event whose route cannot be resolved offers nothing,
         # rather than borrowing whichever chat another event would have used.
-        target = wake_routes.resolve(project_id=r[2], conn=conn)
+        # Re-resolved with the SAME inputs the decision used - project AND agent
+        # ref. Passing only the project was a wrong-chat bug: event 9868 matched
+        # the agent registry through its agent ref at decision time (gaika-drop)
+        # and missed it here, so a wake decided for the project chat was
+        # delivered to the owner-os control chat. Fresh resolution is still the
+        # point (a rebind between decision and submission must take effect); it
+        # just has to be the same QUESTION, not a narrower one.
+        target = wake_routes.resolve(project_id=r[2], agent_id=r[4], conn=conn)
         if not target.get("bound"):
             return {"pending": False, "reason": target.get("reason", "no_route_bound"),
                     "event_id": int(r[0]), "route_key": target.get("route_key")}
@@ -1112,13 +1119,13 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
         conn.execute(_SUBMIT_SCHEMA)
         rows = conn.execute(
             "SELECT a.id, a.event_id, COALESCE(a.project_id,''), "
-            "COALESCE(a.route_key,'') FROM wake_audit a "
+            "COALESCE(a.route_key,''), COALESCE(a.agent_id,'') FROM wake_audit a "
             "WHERE a.decision='wake' "
             "AND a.acknowledged=0 AND a.superseded_by IS NULL AND COALESCE(a.actionable,0)=0 "
             "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
             "ORDER BY a.id ASC").fetchall()
         groups: dict = {}
-        for aid, eid, project, stored_route in rows:
+        for aid, eid, project, stored_route, agent_ref in rows:
             # Group by the RESOLVED route, not the raw project key. Two sessions of
             # one project (payorch-live-buttons, payorch-monitor-clean) resolve to a
             # single chat, so grouping on the raw key would leave them unfolded and
@@ -1130,7 +1137,8 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
             key = (stored_route or "").strip()
             if not key:
                 try:
-                    key = wake_routes.resolve(project_id=project, conn=conn).get(
+                    key = wake_routes.resolve(project_id=project, agent_id=agent_ref,
+                                              conn=conn).get(
                         "route_key") or wake_routes.route_key_for_event(project)
                 except Exception:  # noqa: BLE001 - grouping must never break the drain
                     key = wake_routes.route_key_for_event(project)
