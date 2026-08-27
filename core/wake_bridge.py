@@ -588,11 +588,23 @@ def register_worker(worker: str, conn=None, now: Optional[float] = None) -> dict
     conn, own = _c(conn)
     try:
         conn.execute(_WORKER_SCHEMA)
-        row = conn.execute("SELECT started_ts FROM wake_worker WHERE worker=?",
+        row = conn.execute("SELECT started_ts, pid FROM wake_worker WHERE worker=?",
                            (worker,)).fetchone()
-        if row:
+        pid = os.getpid()
+        if row and int(row[1] or 0) == pid:
+            # Same process: a heartbeat. It must NOT move started_ts, or a busy
+            # stale worker would keep clearing its own alarm.
             conn.execute("UPDATE wake_worker SET last_seen_ts=?, last_seen_at=? "
                          "WHERE worker=?", (now, now_iso(), worker))
+        elif row:
+            # A DIFFERENT pid is a genuine restart, which is exactly how stale
+            # code gets fixed - so the clock restarts here. Without this the skew
+            # alarm could never clear, and an alarm that cannot clear is worse
+            # than no alarm: it trains everyone to ignore it.
+            conn.execute("UPDATE wake_worker SET pid=?, started_ts=?, started_at=?, "
+                         "last_seen_ts=?, last_seen_at=? WHERE worker=?",
+                         (pid, now, now_iso(), now, now_iso(), worker))
+            row = None
         else:
             conn.execute("INSERT INTO wake_worker (worker,pid,started_ts,started_at,"
                          "last_seen_ts,last_seen_at) VALUES (?,?,?,?,?,?)",

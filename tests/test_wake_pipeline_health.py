@@ -279,12 +279,27 @@ def test_skew_makes_the_pipeline_report_stuck(conn, monkeypatch):
     assert any(r.startswith("worker_running_stale_code:wake_companion") for r in h["reasons"])
 
 
-def test_re_registering_keeps_the_original_start_time(conn, monkeypatch):
-    """A heartbeat must not paper over the fact that the process is old."""
+def test_a_heartbeat_from_the_same_process_keeps_the_original_start_time(conn, monkeypatch):
+    """A busy stale worker must not be able to clear its own alarm."""
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 5)
     monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 60)
     assert len(wake_bridge.worker_skew(conn=conn, now=NOW)) == 1
+
+
+def test_a_restart_under_a_new_pid_clears_the_alarm(conn, monkeypatch):
+    """Restarting is exactly how stale code gets fixed, so the clock restarts.
+    An alarm that cannot clear is worse than none - it trains people to ignore
+    it. Observed live: the companion was restarted and the skew alarm stayed on
+    because the heartbeat path preserved the old start time."""
+    monkeypatch.setattr(wake_bridge.os, "getpid", lambda: 1111)
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 600)
+    assert len(wake_bridge.worker_skew(conn=conn, now=NOW)) == 1     # stale
+
+    monkeypatch.setattr(wake_bridge.os, "getpid", lambda: 2222)      # restarted
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 10)
+    assert wake_bridge.worker_skew(conn=conn, now=NOW) == []         # cleared
 
 
 def test_no_registered_worker_reports_no_skew(conn):
