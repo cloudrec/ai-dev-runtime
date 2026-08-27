@@ -984,6 +984,12 @@ async def run_loop() -> None:
         log.info("continuation watchdog disabled")
         return
     log.info(f"continuation watchdog started (interval {INTERVAL}s)")
+    # Coverage is logged on CHANGE. A watchdog that is enabled but whose
+    # managed-auto sessions are not running checks nothing and looks healthy,
+    # while every live agent needs a human to nudge it — the owner's actual
+    # complaint. Saying it once, in the log already being read, beats hoping
+    # someone calls the health endpoint.
+    previous_coverage = None
     while True:
         try:
             res = await asyncio.to_thread(run_once)
@@ -992,4 +998,20 @@ async def run_loop() -> None:
                 log.info(f"continuation watchdog: {[a.get('action') for a in acts]}")
         except Exception as e:  # noqa: BLE001
             log.warning(f"continuation watchdog tick error: {e}")
+        try:
+            def _live():
+                from core import agent_control
+                return {a.get("target") for a in agent_control.agent_list().get("agents", [])
+                        if a.get("is_agent") and a.get("target")}
+            h = await asyncio.to_thread(lambda: health(live_sessions=_live))
+            coverage = h.get("coverage")
+            if coverage != previous_coverage:
+                if h.get("status") == "warning":
+                    log.warning(f"continuation watchdog coverage {coverage}: "
+                                f"{h.get('warning')}")
+                else:
+                    log.info(f"continuation watchdog coverage {coverage}")
+                previous_coverage = coverage
+        except Exception as e:  # noqa: BLE001 — reporting must never kill the loop
+            log.warning(f"continuation watchdog coverage check error: {e}")
         await asyncio.sleep(INTERVAL)
