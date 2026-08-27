@@ -379,3 +379,48 @@ def test_installer_still_refuses_plain_http_generally():
             / "clients" / "windows" / "install.ps1").read_text(encoding="utf-8")
     assert "Refusing to install against a non-HTTPS, non-Tailscale server" in text
     assert "$Server -notmatch '^https://'" in text
+
+
+# ── install.ps1 must parse on Windows PowerShell 5.1 ────────────────────────
+# The owner's PC failed with "unexpected token '}'" (115, 157) and "string
+# missing terminator" on a file that was valid UTF-8. Cause: PowerShell 5.1
+# reads a BOM-less script as ANSI, and byte 0x94 — present in BOTH the em dash
+# (E2 80 94) and the box-drawing rule (E2 94 80) used for section headers —
+# decodes to U+201D, which PowerShell honours as a string delimiter. A comment
+# separator was enough to break the script.
+
+import ps_lint  # noqa: E402  (tests/ is on sys.path under pytest)
+
+
+def _installer_path():
+    import pathlib
+    return (pathlib.Path(__file__).resolve().parent.parent
+            / "clients" / "windows" / "install.ps1")
+
+
+def test_installer_parses_clean():
+    assert ps_lint.check(str(_installer_path())) == []
+
+
+def test_installer_is_pure_ascii_with_a_bom():
+    raw = _installer_path().read_bytes()
+    assert raw[:3] == b"\xef\xbb\xbf", "missing UTF-8 BOM"
+    assert all(b < 128 for b in raw[3:]), "non-ASCII byte would be mis-decoded as ANSI"
+
+
+@pytest.mark.parametrize("encoding", ["cp1251", "cp1252", "cp850"])
+def test_installer_still_parses_when_read_as_ansi(encoding):
+    """The real test: the PC does not decode this file as UTF-8. It must parse
+    correctly even when read through a single-byte codepage."""
+    body = _installer_path().read_bytes()[3:]
+    assert ps_lint.scan(body.decode(encoding, "replace")) == []
+
+
+def test_the_linter_would_have_caught_the_original_defect():
+    """A checker that cannot fail is worthless — pin that it rejects the exact
+    construct that broke, rather than trusting it because it currently passes."""
+    broken = 'Write-Host "through start/stop — there is no remote shell."\n'
+    assert ps_lint.scan(broken.encode("utf-8").decode("cp1251", "replace"))
+    assert ps_lint.scan('$a = "unterminated\n')
+    assert ps_lint.scan('if ($x) { echo 1 }}\n')
+    assert ps_lint.scan('Write-Host "ok"\n') == []
