@@ -242,3 +242,67 @@ def test_the_route_key_is_persisted_on_every_decision(bridge):
     _wake(bridge, event_id=9401, project="payorch-live-buttons", now=now)
     row = bridge.execute("SELECT route_key FROM wake_audit WHERE event_id=9401").fetchone()
     assert row[0] == "payment-orchestrator"
+
+
+# ── 4. coalescing folds per CHAT, not per raw project key ──────────────────
+# Two sessions of one project resolve to one conversation. Grouping the generic
+# backlog by the raw project key left them unfolded, so that chat received the
+# same "go read Owner OS" instruction twice, drained one per cooldown window -
+# the backlog this function exists to collapse.
+
+def _generic_wake(conn, *, event_id, project, now):
+    d = wake_bridge.should_wake(event_id=event_id, severity="critical",
+                                event_type="runtime_job_state", project_id=project,
+                                owner_action_required=True, conn=conn, now=now)
+    wake_bridge.record(d, event_id=event_id, severity="critical",
+                       event_type="runtime_job_state", project_id=project,
+                       conn=conn, now=now)
+    return d
+
+
+def test_two_sessions_of_one_project_fold_into_one_doorbell(bridge):
+    _agent_row(bridge, "payorch-monitor-clean", "payment-orchestrator",
+               target="payorch-monitor-clean:0.0")
+    now = 1_800_000_000.0
+    wake_bridge._conn(bridge)
+    # Two generic wakes, different sessions, SAME project chat.
+    for i, sess in enumerate(("payorch-live-buttons", "payorch-monitor-clean")):
+        bridge.execute(
+            "INSERT INTO wake_audit (ts,at,event_id,decision,reason,actionable,"
+            "project_id,route_key,acknowledged) VALUES (?,?,?,'wake','t',0,?,?,0)",
+            (now + i, "2026-08-27T18:00:00+00:00", 7100 + i, sess,
+             "payment-orchestrator"))
+    bridge.commit()
+    out = wake_bridge.coalesce_generic_backlog(conn=bridge, now=now + 10)
+    assert len(out["superseded_event_ids"]) == 1, out
+    assert 7100 in out["superseded_event_ids"]      # older folded into newer
+
+
+def test_different_chats_are_never_folded_into_each_other(bridge):
+    now = 1_800_000_000.0
+    wake_bridge._conn(bridge)
+    for i, route in enumerate(("payment-orchestrator", "owner-os")):
+        bridge.execute(
+            "INSERT INTO wake_audit (ts,at,event_id,decision,reason,actionable,"
+            "project_id,route_key,acknowledged) VALUES (?,?,?,'wake','t',0,?,?,0)",
+            (now + i, "2026-08-27T18:00:00+00:00", 7200 + i, f"p{i}", route))
+    bridge.commit()
+    out = wake_bridge.coalesce_generic_backlog(conn=bridge, now=now + 10)
+    assert out["superseded_event_ids"] == [], "a chat's only doorbell was dropped"
+
+
+def test_rows_without_a_stored_route_are_resolved_fresh(bridge):
+    """Pre-migration rows carry no route_key; they must still group by the chat
+    they would actually reach, not by their raw project string."""
+    _agent_row(bridge, "payorch-monitor-clean", "payment-orchestrator",
+               target="payorch-monitor-clean:0.0")
+    now = 1_800_000_000.0
+    wake_bridge._conn(bridge)
+    for i, sess in enumerate(("payorch-live-buttons", "payorch-monitor-clean")):
+        bridge.execute(
+            "INSERT INTO wake_audit (ts,at,event_id,decision,reason,actionable,"
+            "project_id,route_key,acknowledged) VALUES (?,?,?,'wake','t',0,?,NULL,0)",
+            (now + i, "2026-08-27T18:00:00+00:00", 7300 + i, sess))
+    bridge.commit()
+    out = wake_bridge.coalesce_generic_backlog(conn=bridge, now=now + 10)
+    assert len(out["superseded_event_ids"]) == 1, out

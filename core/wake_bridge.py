@@ -892,14 +892,30 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
     try:
         conn.execute(_SUBMIT_SCHEMA)
         rows = conn.execute(
-            "SELECT a.id, a.event_id, COALESCE(a.project_id,'') FROM wake_audit a "
+            "SELECT a.id, a.event_id, COALESCE(a.project_id,''), "
+            "COALESCE(a.route_key,'') FROM wake_audit a "
             "WHERE a.decision='wake' "
             "AND a.acknowledged=0 AND a.superseded_by IS NULL AND COALESCE(a.actionable,0)=0 "
             "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
             "ORDER BY a.id ASC").fetchall()
         groups: dict = {}
-        for aid, eid, project in rows:
-            groups.setdefault(wake_routes.route_key_for_event(project), []).append((aid, eid))
+        for aid, eid, project, stored_route in rows:
+            # Group by the RESOLVED route, not the raw project key. Two sessions of
+            # one project (payorch-live-buttons, payorch-monitor-clean) resolve to a
+            # single chat, so grouping on the raw key would leave them unfolded and
+            # deliver the same "go read Owner OS" instruction to that chat twice,
+            # drained one per cooldown window - the exact backlog this function
+            # exists to collapse. The stored route_key is preferred (it is what the
+            # decision actually used); older rows predate the column and are
+            # resolved fresh.
+            key = (stored_route or "").strip()
+            if not key:
+                try:
+                    key = wake_routes.resolve(project_id=project, conn=conn).get(
+                        "route_key") or wake_routes.route_key_for_event(project)
+                except Exception:  # noqa: BLE001 - grouping must never break the drain
+                    key = wake_routes.route_key_for_event(project)
+            groups.setdefault(key, []).append((aid, eid))
         superseded, kept = [], []
         reason = "coalesced_into_newest_generic_wake"
         for key, members in groups.items():
