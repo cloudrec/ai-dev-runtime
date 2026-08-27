@@ -1006,6 +1006,28 @@ async def analyzer_combine(req: AnalyzerCombine, _: bool = Depends(_auth)):
                                           max_size=req.max_size)}
 
 
+# ── Project supervisor (continuous development between checkpoints) ─────────
+@router.get("/projects/supervisor/status")
+async def project_supervisor_status(_: bool = Depends(_auth)):
+    """Per-project autopilot state and the recent verified-block evidence.
+    Read-only; reports only projects explicitly enabled."""
+    from core import project_supervisor
+    return project_supervisor.status()
+
+
+@router.get("/projects/supervisor/plan")
+async def project_supervisor_plan(repo: str, _: bool = Depends(_auth)):
+    """The roadmap AS PARSED from the project's own files, with the next
+    unattended-safe block or the reason there is none. Read-only, and the
+    honest answer to "why is nothing happening"."""
+    from core import project_supervisor
+    pp = _validate_project_path(repo)
+    plan = project_supervisor.parse_plan(pp)
+    return {"plan": {k: v for k, v in plan.items() if k != "blocks"},
+            "blocks": plan.get("blocks", [])[:60],
+            "next": project_supervisor.next_block(plan)}
+
+
 # ── Windows Agent Bridge (task 220) ─────────────────────────────────────────
 # Two audiences, two auth schemes, on purpose:
 #

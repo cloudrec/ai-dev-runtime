@@ -189,6 +189,23 @@ async def _start_commander_autopilot():
 
 
 @app.on_event("startup")
+async def _start_project_supervisor():
+    # Server-resident project supervisor: validates an agent's handoff against
+    # git, picks the next ALREADY-RECORDED roadmap block, and re-prompts the same
+    # agent — so ordinary block-to-block continuation does not wait on a ChatGPT
+    # wake, which cannot be invoked event-driven from here anyway. Wake stays the
+    # checkpoint channel (gate / failure / milestone).
+    # DORMANT unless PROJECT_SUPERVISOR_PROJECTS names a project.
+    import asyncio
+    try:
+        from core.project_supervisor import run_loop as _ps_loop
+        asyncio.create_task(_ps_loop(
+            log=lambda level, msg: getattr(logger, level, logger.info)(msg)))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"project supervisor not started: {e}")
+
+
+@app.on_event("startup")
 async def _start_context_budget():
     # Context budget / checkpoint / rotation: tracks conversation size + phase for every
     # registered critical agent (read-only, durable), writes an ATOMIC verified checkpoint
