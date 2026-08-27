@@ -1331,6 +1331,67 @@ def _pane_is_live_agent(target: str) -> dict:
     return pane
 
 
+# Claude Code QUEUES input that arrives mid-turn: the text is accepted, the pane
+# shows "Press up to edit queued messages", and nothing executes until the current
+# turn ends. tmux's Enter still returns 0, so a delivery path that proves itself by
+# that exit code reports submitted=true for a message the agent has not read. That is
+# how an agent stands still while every delivery looks successful — the owner's
+# report, and the same class of defect the continuation watchdog was built for on a
+# different path.
+_QUEUED_HINT_RE = re.compile(r"press\s+up\s+to\s+edit\s+queued\s+message|queued\s+message",
+                             re.IGNORECASE)
+
+
+def looks_queued(pane_text: str) -> bool:
+    """Did the pane just tell us the message is sitting in a queue?"""
+    return bool(_QUEUED_HINT_RE.search(pane_text or ""))
+
+
+# Claude Code's own "I am mid-turn" indicator: a spinner glyph, a gerund, an
+# ellipsis and an elapsed timer ("· Concocting… (2m 28s)"), usually with an
+# interrupt hint. classify_state() does not recognise this - it reported `idle`
+# for a pane actively running a test suite - so a send gated only on that
+# classification would still stack a message onto a working agent.
+# How much of the tail counts as "now". Claude's status line sits directly above
+# the composer, so a handful of lines is enough and keeps stale spinners out.
+_WORKING_WINDOW_LINES = 8
+_CLAUDE_WORKING_RE = re.compile(
+    r"(^|\n)\s*[·✢✳✻✽*✶✻]\s+\w+[…\.]{1,3}\s*\(\d+[hms]|esc\s+to\s+interrupt",
+    re.IGNORECASE)
+
+
+def claude_is_working(pane_tail: str) -> bool:
+    """Is Claude mid-turn RIGHT NOW, judged from the live status region only?
+
+    Scoped to the LAST FEW LINES because the same spinner text scrolls harmlessly
+    through history, and live_status_region() does not trim it - a match up there
+    would refuse every send to that agent forever. Proven by a test that puts a
+    finished spinner above forty lines of output.
+    """
+    tail = "\n".join((pane_tail or "").splitlines()[-_WORKING_WINDOW_LINES:])
+    return bool(_CLAUDE_WORKING_RE.search(tail))
+
+
+def _busy_for_send(target: str) -> str:
+    """Is this pane mid-turn, so a message would queue instead of executing?
+
+    Returns the blocking state, or "" when the agent can take a prompt now. An
+    unreadable pane returns "" deliberately: refusing on unknown would make the
+    control plane unusable exactly when it is needed, and the post-send queue
+    check below still catches the case honestly.
+    """
+    try:
+        tail = _pane_tail(target, lines=12)
+    except Exception:  # noqa: BLE001
+        return ""
+    if looks_queued(tail):
+        return "queued_messages_pending"
+    if claude_is_working(tail):
+        return "working"
+    state = classify_state(True, True, tail)
+    return state if state in ("working", "shell_running") else ""
+
+
 def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str],
              actor: Optional[str] = None, source: Optional[str] = None) -> dict:
     """Deliver multiline text to a pane through a tmux buffer.
@@ -1373,12 +1434,21 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
     time.sleep(0.4)
     rc_after, after, _ = _tmux(["capture-pane", "-p", "-t", resolved, "-S", "-5"])
     pane_changed = (rc_before == 0 and rc_after == 0 and before != after)
+    # A wider capture than the diff window: the queue hint renders below the input
+    # line and would fall outside the 5 lines used to prove the pane changed.
+    _rc_q, wide, _ = _tmux(["capture-pane", "-p", "-t", resolved, "-S", "-30"])
+    queued = looks_queued(wide)
     result = {
         "target": resolved,
         "action": action,
         "idempotency_key": key,
-        "delivered": rc_enter == 0,
-        "submitted": rc_enter == 0,
+        # Enter returning 0 means the keystroke reached tmux, NOT that Claude read
+        # the message. If the pane says the message is queued, it is queued.
+        "delivered": rc_enter == 0 and not queued,
+        "submitted": rc_enter == 0 and not queued,
+        "queued": queued,
+        "queued_reason": ("message accepted into Claude's queue behind the active "
+                          "turn; it will not execute until that turn ends") if queued else "",
         "duplicate": False,
         "bytes": len(text.encode("utf-8")),
         "pane_changed": pane_changed,
@@ -1395,13 +1465,37 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
 
 
 def agent_send(target: str, text: str, idempotency_key: Optional[str] = None,
-               actor: Optional[str] = None, source: Optional[str] = None) -> dict:
+               actor: Optional[str] = None, source: Optional[str] = None,
+               allow_queue: bool = False) -> dict:
     """Send a message to an existing agent. Never creates one.
+
+    REFUSES while the agent is mid-turn, because Claude Code does not reject a
+    message sent then - it QUEUES it. The reviewer's next task would sit behind
+    the active turn showing "Press up to edit queued messages", tmux's Enter
+    would still return 0, and the delivery would be reported as submitted while
+    the agent stood still. Sending again then stacks a second queued message, so
+    the failure compounds: the owner sees an idle-looking agent and a queue of
+    instructions nobody read.
+
+    A waiting agent therefore receives exactly ONE executable prompt. The caller
+    is told to retry rather than being given a false success; `allow_queue=True`
+    is the deliberate escape hatch for a caller that really does want to stack a
+    message behind the current turn.
 
     `actor`/`source` are recorded for attribution only (who asked, from where)."""
     validate_target(target)
-    return _deliver(target, text, "agent_send", idempotency_key,
-                    actor=actor, source=source)
+    if not allow_queue:
+        busy = _busy_for_send(target)
+        if busy:
+            audit("agent_send", target, idempotency_key, delivered=False,
+                  refused=busy, actor=actor, source=source)
+            return {"target": target, "action": "agent_send", "delivered": False,
+                    "submitted": False, "queued": False, "refused": busy,
+                    "reason": f"agent is {busy}; a message sent now would be queued "
+                              f"behind the active turn instead of executed — retry "
+                              f"when it is idle or waiting"}
+    return _deliver(text=text, target=target, action="agent_send",
+                    idempotency_key=idempotency_key, actor=actor, source=source)
 
 
 def agent_answer(target: str, text: str, idempotency_key: Optional[str] = None,
