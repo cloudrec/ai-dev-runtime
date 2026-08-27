@@ -241,6 +241,17 @@ def _bottom_region(tail: str, lines: int = 10) -> str:
     return " ".join(_meaningful_lines(tail)[-lines:])
 
 
+def _bottom_lines_text(tail: str, lines: int = 10) -> str:
+    """The same region with LINE BREAKS KEPT.
+
+    `_bottom_region` joins with spaces, which is right for digests and phrase
+    matching but destroys line anchors. The shell's own OOM report is the bare
+    word `Killed` alone on a line, and that is only distinguishable from prose by
+    it being the whole line — space-joining it into its neighbours made a real
+    kill undetectable. Crash matching therefore reads this view."""
+    return "\n".join(_meaningful_lines(tail)[-lines:])
+
+
 def digest_of(text: str) -> str:
     """Identity of the bottom region: lowercased, whitespace collapsed, digits stripped
     so a ticking counter or spinner frame does not mint a new fingerprint every poll."""
@@ -287,7 +298,7 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
     region = _bottom_region(tail)
     if st in _ACTIVE_STATES:
         return {"cls": "working", "reason": f"inventory_state_{st}"}
-    if _CRASH_RE.search(region):
+    if _CRASH_RE.search(_bottom_lines_text(tail)):
         return {"cls": "crashed", "reason": "crash_text"}
     if _WORKING_RE.search(_WS.sub(" ", tail[-400:] if tail else "")):
         # The live interrupt affordance sits in the chrome we strip; check it raw.

@@ -105,3 +105,28 @@ def test_a_dead_process_is_still_crashed_regardless_of_text():
     out = aw.classify(alive=False, is_agent=True, state="", tail="all fine here")
     assert out["cls"] == "crashed"
     assert out["reason"] == "process_gone"
+
+
+# ── the tightening must not weaken a REAL kill ─────────────────────────────
+# Caught in review of this very patch: `^\s*killed\s*$` anchors on lines, but the
+# region classification reads was space-joined, so the shell's own OOM report —
+# the bare word `Killed` alone on a line — stopped being detected. The old broad
+# `killed\b` did catch it. Crash matching now reads a line-preserving view.
+
+def test_a_bare_killed_line_is_still_a_crash_through_classify():
+    out = aw.classify(alive=True, is_agent=True, state="idle",
+                      tail="running the build\nKilled\n")
+    assert out["cls"] == "crashed"
+    assert out["reason"] == "crash_text"
+
+
+def test_killed_inside_a_sentence_is_still_not_a_crash_through_classify():
+    out = aw.classify(alive=True, is_agent=True, state="idle",
+                      tail="the previous task was killed by the user earlier\n")
+    assert out["cls"] != "crashed"
+
+
+def test_the_digest_view_still_joins_on_spaces():
+    """Digests stay space-joined; only crash matching needs the line breaks."""
+    assert aw._bottom_region("a\nb") == "a b"
+    assert aw._bottom_lines_text("a\nb") == "a\nb"
