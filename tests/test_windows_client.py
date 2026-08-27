@@ -424,3 +424,52 @@ def test_the_linter_would_have_caught_the_original_defect():
     assert ps_lint.scan('$a = "unterminated\n')
     assert ps_lint.scan('if ($x) { echo 1 }}\n')
     assert ps_lint.scan('Write-Host "ok"\n') == []
+
+
+# ── ACL hardening must be localization-independent ─────────────────────────
+# On the owner's PC icacls failed with "No mapping between account names and
+# security IDs was done": the script named SYSTEM and Administrators in
+# ENGLISH, and those groups carry localized names on a localized Windows. The
+# failure came AFTER /inheritance:r was processed, so the directory holding the
+# device secret could be left with inheritance stripped and no grants applied —
+# a security defect, not a cosmetic warning.
+
+def _installer_text():
+    return _installer_path().read_text(encoding="utf-8-sig")
+
+
+def test_acl_grants_are_addressed_by_well_known_sid():
+    text = _installer_text()
+    icacls = [ln for ln in text.splitlines() if "icacls" in ln and "/grant" in ln]
+    assert icacls, "no icacls grant line found"
+    line = icacls[0]
+    assert "*S-1-5-18:" in line, "Local System must be granted by SID"
+    assert "*S-1-5-32-544:" in line, "Administrators must be granted by SID"
+    # The English names must not be used as identities anywhere in the grant.
+    assert '"SYSTEM:' not in line and '"Administrators:' not in line
+
+
+def test_the_current_user_is_taken_from_the_token_not_composed_from_env():
+    """USERDOMAIN\\USERNAME breaks for Microsoft accounts and AzureAD logins as
+    well as for localized systems; the token's SID never does."""
+    text = _installer_text()
+    assert "WindowsIdentity]::GetCurrent()).User.Value" in text
+    assert '$env:USERDOMAIN\\$env:USERNAME' not in text
+
+
+def test_a_failed_acl_hardening_aborts_instead_of_storing_the_secret():
+    text = _installer_text()
+    idx = text.index("icacls $InstallDir /inheritance:r")
+    after = text[idx:idx + 1600]
+    assert "$LASTEXITCODE -ne 0" in after, "icacls exit code must be checked"
+    assert "refusing to continue" in after.lower()
+    # The check has to come BEFORE enrollment writes the secret.
+    assert text.index("refusing to continue") < text.index("Enrolling this device")
+
+
+def test_no_english_account_names_survive_anywhere_in_the_acl_step():
+    text = _installer_text()
+    idx = text.index("Restricting permissions")
+    block = text[idx:idx + 1200]
+    for name in ('"Administrators:', '"SYSTEM:', '"Users:', '"Everyone:'):
+        assert name not in block, f"localized-name identity {name} still present"

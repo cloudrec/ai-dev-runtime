@@ -27,7 +27,8 @@
       2. copies owner_os_agent.py to %ProgramData%\OwnerOS;
       3. exchanges the one-time code for a per-device identity + secret, stored
          in %ProgramData%\OwnerOS\agent.json and locked down with icacls to
-         SYSTEM, Administrators and the owner's own account;
+         SYSTEM, Administrators and the owner's own account, addressed by SID so
+         it works on a localized Windows;
       4. enrolls the workspace folder(s) you named - nothing outside them is
          ever reachable;
       5. registers a Scheduled Task that runs the agent at logon and restarts
@@ -143,9 +144,32 @@ $configPath = Join-Path $InstallDir "agent.json"
 # the scheduled-task principal below) and has to read this file. That is not a
 # weakening: the same account already holds the Claude Code credentials this
 # agent would use, so a reader of agent.json gains no privilege it did not have.
+# Identities are named by SID, never by name. "SYSTEM" and "Administrators" are
+# ENGLISH names: on a localized Windows they are "SISTEMA"/"Administradores",
+# on Russian "SISTEMA"/"Administratory", and icacls then fails with "No mapping
+# between account names and security IDs was done" - which is what happened on
+# the owner's PC. Worse, that failure came AFTER /inheritance:r had already been
+# processed, so the directory could be left with inheritance removed and none of
+# the intended grants applied. Well-known SIDs are identical on every Windows in
+# every language:
+#     S-1-5-18     Local System
+#     S-1-5-32-544 the local Administrators group
+# and the current user's SID is read from the token rather than composed from
+# DOMAIN\USERNAME, which also breaks for Microsoft accounts and AzureAD logins.
 Write-Step "Restricting permissions on $InstallDir"
-$me = "$env:USERDOMAIN\$env:USERNAME"
-& icacls $InstallDir /inheritance:r /grant:r "SYSTEM:(OI)(CI)F" "Administrators:(OI)(CI)F" "${me}:(OI)(CI)M" | Out-Null
+$meSid = ([System.Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+& icacls $InstallDir /inheritance:r /grant:r "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-544:(OI)(CI)F" "*${meSid}:(OI)(CI)M" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    # Never silent: this directory is about to hold the device secret. If it
+    # could not be locked down, say so loudly rather than enrolling into a
+    # directory whose permissions are unknown.
+    throw "Failed to restrict permissions on $InstallDir (icacls exit $LASTEXITCODE). The device secret would be stored with unknown ACLs - refusing to continue."
+}
+$acl = (& icacls $InstallDir) -join " "
+if ($acl -notmatch 'S-1-5-18|SYSTEM') {
+    throw "Permission hardening did not take effect on $InstallDir - refusing to continue."
+}
+Write-Host "    permissions restricted (SYSTEM, Administrators, and this account only)"
 
 # -- 3. enroll the device ----------------------------------------------------
 $alreadyEnrolled = $false
@@ -197,7 +221,10 @@ if ($NoAutostart) {
     # Runs as the logged-in owner, NOT as SYSTEM: Claude Code must see the same
     # user profile, PATH and credentials the owner uses interactively, and a
     # remote-control agent should hold the fewest privileges that still work.
-    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -RunLevel Limited
+    # Same rule as the ACL step: identify the account by SID. DOMAIN\USERNAME
+    # does not resolve for Microsoft accounts or AzureAD logins, and the group
+    # names are localized; the token's own SID always resolves.
+    $principal = New-ScheduledTaskPrincipal -UserId $meSid -RunLevel Limited
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `
         -DontStopIfGoingOnBatteries -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
         -ExecutionTimeLimit ([TimeSpan]::Zero)
