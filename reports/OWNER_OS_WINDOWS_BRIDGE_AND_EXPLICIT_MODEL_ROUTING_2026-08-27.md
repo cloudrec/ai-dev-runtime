@@ -412,3 +412,74 @@ snapshot; give `/opt/gaika-extension` a backup remote — 33 commits currently
 exist in one place with no remote, and `cloudrec/gaika` is a DIFFERENT project
 (docs/investor material), so it is the wrong destination; move the ZIP out of
 the working tree before it lands in a milestone archive.
+
+---
+
+# Wake reliability hardening — unattended operation (2026-08-27, late)
+
+Goal: stop the owner having to notice silence and ping agents by hand. Five
+routing/delivery defects were fixed earlier; this pass is about the system
+NOTICING its own failures.
+
+## Two more defects, both found on live traffic
+
+**#4 coalescer grouped by raw project key.** After routing learned session ->
+project, two sessions of one project resolved to one chat but were not folded,
+so that chat received the same generic instruction twice, drained one per
+cooldown window. Now groups by the RESOLVED route; cross-chat folding remains
+forbidden. `16104fc`
+
+**#5 the send choke point was still global.** `claim_send` measured its cooldown
+across all routes, re-imposing at the delivery layer exactly the cross-chat
+suppression removed from decisions — event 9870 sat 867s behind an owner-os send
+that was never going to its chat. Both floors are now per route; the claim stays
+global and every attempt is still recorded, so the out-of-band duplicate the
+gate exists to catch is caught as before. `77cc0c9`
+
+**Operational discovery:** the wake companion is a SEPARATE service. Restarting
+`ai-runtime.service` alone left the deliverer on pre-fix code — it logged
+`delivered wake for event 9880 [route owner-os]` for an event decided as
+`gaika-drop`. Both services must be restarted together.
+
+## Observability added
+
+| Surface | Answers |
+| --- | --- |
+| `wake_bridge.pipeline_health()` (in `health()`, so `/control-plane/wake/health`) | what is pending and for how long PER ROUTE; is the companion even attempting claims; consecutive delivery failures |
+| `pipeline_watch_loop` (daemon, log-only) | announces the transition into/out of a stuck pipeline in the service log, one line per outage |
+| `worker_skew` / `register_worker` | a deliverer running code older than the modules on disk — the exact split that sent a gaika-drop wake to owner-os |
+| continuation watchdog `coverage` + `covering_nothing` | whether the watchdog protects any agent that actually EXISTS, logged on change |
+
+All of it is read-only and emits no events: the wake path feeding itself is a
+failure this system has already had, so a detector that can trigger what it
+watches would be worse than none.
+
+## Live evidence
+
+* Deliveries alternating between chats on real events: `18:14:37 gaika-drop`,
+  `18:20:49 gaika-drop`, `18:25:31 owner-os`, `18:30:13 owner-os` — all
+  `submitted_and_user_turn_appeared`.
+* `pipeline_health` live: `status ok`, `worker_skew []`, companion claiming
+  within seconds, queue draining.
+* Stalled agents with no wake raised: **NONE** (12 live agents audited).
+* Route coverage: 5 of 12 live agents reach their own project chat
+  (chemmy-fast->mess, gaika-ext-audit->gaika-drop,
+  jobhunter-video-sonnet->jobhunter-ai, payorch-monitor-clean->payment-orchestrator,
+  treasure-video-sonnet->treasure). The other 7 fall back to the control chat,
+  correctly labelled `unmapped_route`.
+
+Tests: 23 pipeline-health, 37 watchdog, plus the wake suites — 264 passing.
+Commits `16104fc`, `77cc0c9`, `6b1a022`, `bafd0fc`, `98875e1`, `5bff12a`.
+
+## What is now an owner decision, with the exact knob
+
+1. **No live agent can be auto-continued.** `coverage 0/12`: the continuation
+   watchdog is enabled and its managed-auto sessions (`arbitrage2-opus`,
+   `cp-canary`, `job`, `seo-audit`) are not running, so every idle agent needs a
+   human nudge. Widening it means authorising auto-typing into those panes —
+   policy, not code. Knob: `config/agent_orchestrator.yaml`, `sessions.<name>.mode:
+   auto` (or `CONTINUATION_WATCHDOG_SESSIONS`). Not touched here.
+2. **7 live agents have no project chat.** blagopay-ru-site-final3,
+   capacity-blockchain, diamond-auction, gaika-presentation, gaika-server,
+   justice-revive-sonnet, owner-os-opus-windows. Binding a route needs the owner
+   to say WHICH conversation belongs to each project.
