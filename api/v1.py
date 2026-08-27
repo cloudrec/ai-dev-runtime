@@ -1,8 +1,10 @@
 """PHASE 13 — stable versioned Runtime API (/api/v1). Owner OS connects here."""
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
+import json
 import os
 import re
 import time
@@ -119,6 +121,10 @@ def _view(job: dict) -> dict:
         "requires_approval": job.get("approval_required"), "dangerous": job.get("dangerous"),
         "logs": job.get("logs") or [], "error": job.get("error"),
         "created_at": job.get("created_at"), "finished_at": job.get("finished_at"),
+        # task 220: what tier was asked for. The tier actually DISPATCHED is in
+        # the model_selection artifact, because an explicit ask that fails the
+        # escalation gate is honestly reported as sonnet, not as what was wanted.
+        "requested_model": job.get("requested_model"),
     }
 
 
@@ -144,6 +150,12 @@ class JobCreate(BaseModel):
     auto_commit: bool = True
     auto_push: bool = False
     approval_required: Optional[bool] = None
+    # task 220 — explicit model selection for THIS job, plus the justification
+    # the model router's hard gate needs before it will actually dispatch on an
+    # expensive tier. Both are durable columns on the jobs table; neither is a
+    # bypass of the risk floor or of the escalation gate.
+    requested_model: Optional[str] = None
+    escalation_reason: Optional[dict] = None
 
 
 @router.post("/jobs")
@@ -155,6 +167,11 @@ async def create_job(req: JobCreate, _: bool = Depends(_auth)):
     if autonomy not in job_executor.AUTONOMY_ORDER:
         raise HTTPException(status_code=422, detail=f"autonomy must be one of {job_executor.AUTONOMY_ORDER}")
     dangerous = bool(_DANGEROUS_RE.search(f"{goal} {instructions}"))
+    if req.requested_model is not None:
+        from core import model_router as _mr
+        if req.requested_model not in _mr.RANK:
+            raise HTTPException(status_code=422,
+                                detail=f"requested_model must be one of {tuple(_mr.RANK)}")
     # approval required unless execute_full+ and not dangerous
     auto_ok = job_executor._idx(autonomy) >= job_executor._idx("execute_full") and not dangerous
     approval_required = req.approval_required if req.approval_required is not None else (not auto_ok)
@@ -163,6 +180,7 @@ async def create_job(req: JobCreate, _: bool = Depends(_auth)):
         autonomy_level=autonomy, allowed_paths=req.allowed_paths, forbidden_paths=req.forbidden_paths,
         base_branch=req.base_branch, auto_commit=req.auto_commit, auto_push=req.auto_push,
         approval_required=approval_required, dangerous=int(dangerous),
+        requested_model=req.requested_model, escalation_reason=req.escalation_reason,
         status="waiting_approval" if approval_required else "queued",
     )
     job_store.append_log(job["id"], "info", f"created (autonomy={autonomy}, approval_required={approval_required}, dangerous={dangerous})")
@@ -215,6 +233,35 @@ async def artifacts(job_id: str, _: bool = Depends(_auth)):
     return {"id": job_id, "plan": j.get("plan"), "changed_files": j.get("changed_files"),
             "tests": j.get("tests"), "git_info": j.get("git_info"), "logs": j.get("logs"),
             "report_path": f"/opt/seo/reports/runtime/{job_id}.md"}
+
+
+# ── PHASE 45: provider smoke test ────────────────────────────────────────────
+# The runtime half of a contract that had only ever existed on the caller's
+# side: /opt/seo/backend/services/runtime_client.py:provider_smoke() POSTs
+# `{RUNTIME_URL}/smoke` to gate every retry dispatch, and its own comment cites
+# "ai-dev-runtime's POST /api/v1/smoke" — a route that was never implemented
+# here. Every retry therefore failed the gate with HTTP 404 Not Found and no
+# replacement coding job was ever dispatched (owner_task #220 / runtime job
+# #81; the same 404 is recorded against job #72 in
+# reports/OWNER_OS_WAKE_CONTINUATION_HANDOFF_2026-08-13.md).
+#
+# Read-only by construction: core.ai_planner.smoke() makes exactly one
+# non-agentic provider call with no project_path, no tools, no file or DB
+# writes, one hard-capped timeout and no internal retry.
+class SmokeReq(BaseModel):
+    model: Optional[str] = None
+    timeout_seconds: Optional[float] = None
+
+
+@router.post("/smoke")
+async def provider_smoke(req: Optional[SmokeReq] = None, _: bool = Depends(_auth)):
+    """{ok, provider, model, latency_seconds, tokens{input_tokens,output_tokens},
+    cost_usd, error} — the exact shape runtime_client.provider_smoke() reads.
+    A provider failure is a 200 with ok=false, not an HTTP error: the caller
+    gates on the body, and a transport-level failure must stay distinguishable
+    from "the provider answered and said no"."""
+    req = req or SmokeReq()
+    return ai_planner.smoke(model=req.model, timeout_seconds=req.timeout_seconds)
 
 
 # ── PHASE 17: deterministic delivery (merge → test → push), no AI ────────────
@@ -651,8 +698,13 @@ class FabricSend(BaseModel):
 
 
 class FabricStart(BaseModel):
-    project_dir: str
+    # A Windows workspace is addressed by ref (win:<device>:<workspace>) rather
+    # than by path — its real path never crosses the wire — so project_dir is
+    # optional when `ref` is given.
+    project_dir: str = ""
     conversation_id: Optional[str] = None
+    ref: str = ""
+    text: str = ""
 
 
 class FabricStop(BaseModel):
@@ -673,6 +725,18 @@ class FabricTransition(BaseModel):
     evidence: Optional[dict] = None
 
 
+async def _fabric_call_async(ref: str, fn, *args, **kw):
+    """Windows refs block waiting on a remote device; tmux/runtime refs do not.
+
+    A blocking wait on the event loop would starve the device's own long-poll,
+    so a `win:` ref is offloaded to a worker thread. Every other ref keeps the
+    exact inline path it had before the Windows bridge existed — the tmux
+    behaviour is deliberately untouched."""
+    if (ref or "").startswith("win:"):
+        return await asyncio.to_thread(_fabric_call, fn, *args, **kw)
+    return _fabric_call(fn, *args, **kw)
+
+
 def _fabric_call(fn, *args, **kw):
     from core.agent_fabric import FabricError
     from core.task_contract import ContractError
@@ -691,32 +755,40 @@ async def fabric_agents(include_terminal: bool = False, _: bool = Depends(_auth)
 @router.get("/fabric/agents/{ref:path}/status")
 async def fabric_status(ref: str, _: bool = Depends(_auth)):
     from core import agent_fabric
-    return _fabric_call(agent_fabric.status, ref)
+    return await _fabric_call_async(ref, agent_fabric.status, ref)
 
 
 @router.post("/fabric/agents/{ref:path}/send")
 async def fabric_send(ref: str, req: FabricSend, _: bool = Depends(_auth)):
     from core import agent_fabric
-    return _fabric_call(agent_fabric.send, ref, req.text,
-                        idempotency_key=req.idempotency_key)
+    return await _fabric_call_async(ref, agent_fabric.send, ref, req.text,
+                                    idempotency_key=req.idempotency_key)
 
 
 @router.post("/fabric/agents/{ref:path}/stop")
 async def fabric_stop(ref: str, req: FabricStop, _: bool = Depends(_auth)):
     from core import agent_fabric
-    return _fabric_call(agent_fabric.stop, ref, confirm=req.confirm,
-                        idempotency_key=req.idempotency_key)
+    return await _fabric_call_async(ref, agent_fabric.stop, ref, confirm=req.confirm,
+                                    idempotency_key=req.idempotency_key)
 
 
 @router.get("/fabric/agents/{ref:path}/result")
 async def fabric_result(ref: str, _: bool = Depends(_auth)):
     from core import agent_fabric
-    return _fabric_call(agent_fabric.result, ref)
+    return await _fabric_call_async(ref, agent_fabric.result, ref)
 
 
 @router.post("/fabric/start-or-resume")
 async def fabric_start(req: FabricStart, _: bool = Depends(_auth)):
     from core import agent_fabric
+    if req.ref:
+        # Windows refs skip _validate_project_path deliberately: RUNTIME_ALLOWED_ROOTS
+        # describes THIS server's filesystem and has nothing to say about a path
+        # on the owner's PC. The device's own enrollment file is that gate.
+        return await _fabric_call_async(req.ref, agent_fabric.start_or_resume_ref,
+                                        req.ref, text=req.text)
+    if not req.project_dir:
+        raise HTTPException(status_code=422, detail="project_dir or ref is required")
     pp = _validate_project_path(req.project_dir)
     return _fabric_call(agent_fabric.start_or_resume, pp,
                         conversation_id=req.conversation_id)
@@ -922,6 +994,203 @@ async def analyzer_combine(req: AnalyzerCombine, _: bool = Depends(_auth)):
                                           max_size=req.max_size)}
 
 
+# ── Windows Agent Bridge (task 220) ─────────────────────────────────────────
+# Two audiences, two auth schemes, on purpose:
+#
+#   * DEVICE routes (/windows/enroll|poll|result|rotate) are called by the
+#     owner's Windows machine. They do NOT use RUNTIME_TOKEN: a laptop is a
+#     weaker place to keep a secret than this server, so it gets its own
+#     per-device, rotatable, revocable identity and signs each request over
+#     (device, timestamp, nonce, path, body-hash) — see core.windows_bridge.
+#   * OWNER routes (everything else below) are ordinary Owner OS calls behind
+#     the existing bearer/HMAC `_auth`.
+#
+# The device never listens on a port: it long-polls /windows/poll and posts
+# results back, so the Windows machine opens every connection outbound.
+from core import windows_bridge  # noqa: E402
+
+
+def _win_call(fn, *args, **kwargs):
+    try:
+        return fn(*args, **kwargs)
+    except windows_bridge.AuthError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+    except windows_bridge.WindowsBridgeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+async def _win_device(request: Request) -> tuple[dict, dict]:
+    """Authenticate a device request and return (device_row, parsed_body).
+
+    The body is read RAW and hashed before it is parsed, because the signature
+    covers the exact bytes on the wire — re-serializing a parsed body would
+    verify a document the client never sent."""
+    raw = await request.body()
+    device_id = request.headers.get("x-oos-device") or ""
+    device = _win_call(windows_bridge.verify_request,
+                       device_id,
+                       request.headers.get("x-oos-timestamp"),
+                       request.headers.get("x-oos-nonce") or "",
+                       request.url.path,
+                       raw,
+                       request.headers.get("x-oos-signature") or "")
+    try:
+        body = json.loads(raw or b"{}")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="body must be JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="body must be a JSON object")
+    return device, body
+
+
+class WinEnrollReq(BaseModel):
+    code: str
+    device_name: str = ""
+    os_version: str = ""
+    agent_version: str = ""
+
+
+@router.post("/windows/enroll")
+async def windows_enroll(req: WinEnrollReq, request: Request):
+    """Exchange a single-use enrollment code for a device identity + secret.
+    Deliberately unauthenticated by RUNTIME_TOKEN: the whole point is that the
+    Windows machine never holds the server's own token. The code is the
+    credential, it is single-use, it expires, and it is stored only as a hash."""
+    client = getattr(request.client, "host", "") or ""
+    return _win_call(windows_bridge.enroll, req.code, device_name=req.device_name,
+                     os_version=req.os_version, agent_version=req.agent_version,
+                     enrolled_from=client)
+
+
+@router.post("/windows/poll")
+async def windows_poll(request: Request):
+    """Long-poll: heartbeat + workspace inventory in, leased commands out.
+
+    Returning an empty list after `wait` seconds is a normal, healthy answer —
+    the device reconnects immediately, which is also how the server learns it
+    is still alive."""
+    import asyncio
+
+    device, body = await _win_device(request)
+    device_id = device["device_id"]
+    windows_bridge.touch_device(device_id,
+                               agent_version=str(body.get("agent_version") or "")[:40],
+                               os_version=str(body.get("os_version") or "")[:120])
+    if "workspaces" in body:
+        _win_call(windows_bridge.report_workspaces, device_id, body.get("workspaces"))
+    try:
+        wait = float(body.get("wait") or 0)
+    except (TypeError, ValueError):
+        wait = 0.0
+    wait = max(0.0, min(wait, windows_bridge.MAX_POLL_WAIT_SECS))
+    deadline = time.monotonic() + wait
+    while True:
+        commands = _win_call(windows_bridge.lease, device_id)
+        if commands or time.monotonic() >= deadline:
+            return {"commands": commands, "server_time": time.time(),
+                    "poll_after_secs": 1 if commands else 0}
+        await asyncio.sleep(0.5)
+
+
+@router.post("/windows/result")
+async def windows_result(request: Request):
+    device, body = await _win_device(request)
+    return _win_call(windows_bridge.complete, device["device_id"],
+                     str(body.get("command_id") or ""), ok=bool(body.get("ok")),
+                     result=body.get("result"), error=str(body.get("error") or ""))
+
+
+@router.post("/windows/rotate")
+async def windows_rotate(request: Request):
+    """Device-initiated secret rotation over an already-authenticated request."""
+    device, _body = await _win_device(request)
+    return _win_call(windows_bridge.rotate_secret, device["device_id"])
+
+
+class WinEnrollCodeReq(BaseModel):
+    label: str = ""
+    ttl_secs: int = windows_bridge.ENROLL_CODE_TTL_SECS
+
+
+@router.post("/windows/enroll-code")
+async def windows_enroll_code(req: WinEnrollCodeReq, _: bool = Depends(_auth)):
+    """Owner-only: mint the one-time code that is typed on the Windows machine.
+    The plaintext is returned exactly once and never stored."""
+    return _win_call(windows_bridge.create_enrollment_code, req.label, req.ttl_secs)
+
+
+@router.get("/windows/devices")
+async def windows_devices(_: bool = Depends(_auth)):
+    return windows_bridge.list_devices()
+
+
+@router.post("/windows/devices/{device_id}/revoke")
+async def windows_revoke(device_id: str, reason: str = "", _: bool = Depends(_auth)):
+    return _win_call(windows_bridge.revoke_device, device_id, reason=reason)
+
+
+@router.get("/windows/workspaces")
+async def windows_workspaces(device_id: str = "", _: bool = Depends(_auth)):
+    return windows_bridge.list_workspaces(device_id)
+
+
+class WinWorkspaceToggle(BaseModel):
+    device_id: str
+    workspace_id: str
+    enabled: bool
+
+
+@router.post("/windows/workspaces/enabled")
+async def windows_workspace_enabled(req: WinWorkspaceToggle, _: bool = Depends(_auth)):
+    """The server-side off switch. Enrollment happens on the Windows machine;
+    this can only withdraw reachability, never grant it."""
+    return _win_call(windows_bridge.set_workspace_enabled, req.device_id,
+                     req.workspace_id, req.enabled)
+
+
+class WinCommandReq(BaseModel):
+    device_id: str
+    action: str
+    workspace_id: str = ""
+    params: Optional[dict] = None
+    command_id: str = ""
+    wait_secs: float = 30.0
+
+
+@router.post("/windows/command")
+async def windows_command(req: WinCommandReq, request: Request,
+                          x_runtime_actor: Optional[str] = Header(None),
+                          _: bool = Depends(_auth)):
+    """Enqueue one allowlisted command and (by default) wait for its result.
+    A timeout is reported as timed_out=true with the command still queued —
+    never as a failure the device did not report."""
+    actor, _source = caller_identity(request, x_runtime_actor)
+    # to_thread, NOT inline: dispatch() waits for the device by polling the
+    # queue, and doing that on the event loop would freeze the very
+    # /windows/poll request the device is holding open — the command would then
+    # ALWAYS time out, because the only process that could answer it is blocked
+    # behind this handler. Caught by tools/windows_bridge_sim.py step 6.
+    return await asyncio.to_thread(
+        _win_call, windows_bridge.dispatch, req.device_id, req.action,
+        workspace_id=req.workspace_id, params=req.params,
+        command_id=req.command_id, created_by=actor or "owner",
+        wait_secs=max(0.0, min(float(req.wait_secs or 0), 120.0)))
+
+
+@router.get("/windows/command/{command_id}")
+async def windows_command_get(command_id: str, _: bool = Depends(_auth)):
+    cmd = windows_bridge.get_command(command_id)
+    if not cmd:
+        raise HTTPException(status_code=404, detail="not found")
+    return cmd
+
+
+@router.get("/windows/policy")
+async def windows_policy(_: bool = Depends(_auth)):
+    """The entire remote surface, in one auditable dump."""
+    return windows_bridge.policy()
+
+
 # ── Model Router (task 209) ──────────────────────────────────────────────────
 # Standing cost-aware routing policy: decides and records, never dispatches.
 # The adapter renders effectiveness and forwards outcomes only.
@@ -942,6 +1211,7 @@ class RouterRoute(BaseModel):
     task_ref: str = ""
     strict: bool = False
     escalation_reason: Optional[dict] = None
+    explicit_model: Optional[str] = None
 
 
 class RouterOutcome(BaseModel):
@@ -960,7 +1230,8 @@ async def router_route(req: RouterRoute, _: bool = Depends(_auth)):
     return _router_call(model_router.route, req.task_class, risk=req.risk,
                         prior_attempts=req.prior_attempts, context_pack=req.context_pack,
                         task_ref=req.task_ref, strict=req.strict,
-                        escalation_reason=req.escalation_reason)
+                        escalation_reason=req.escalation_reason,
+                        explicit_model=req.explicit_model)
 
 
 @router.post("/router/outcome")

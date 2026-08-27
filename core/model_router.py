@@ -126,6 +126,11 @@ _ESCALATION_COLUMNS = (
     ("escalation_evidence", "TEXT"),
     ("escalation_expected_benefit", "TEXT"),
     ("escalation_valid", "INTEGER DEFAULT 0"),
+    # task 220 explicit-selection audit: what the caller ASKED for, and whether
+    # the policy granted it. Distinct from `requested_model`, which is the tier
+    # the policy itself computed before the hard gate ran.
+    ("explicit_model", "TEXT"),
+    ("explicit_granted", "INTEGER"),
 )
 
 
@@ -166,12 +171,27 @@ def _validate_prior_attempts(prior_attempts) -> list:
 
 def route(task_class: str, *, risk: str = "normal", prior_attempts=None,
           context_pack: str = "", task_ref: str = "", strict: bool = False,
-          escalation_reason: Optional[dict] = None, conn=None) -> dict:
+          escalation_reason: Optional[dict] = None,
+          explicit_model: Optional[str] = None, conn=None) -> dict:
     """Decide a model for a unit of work and RECORD the decision durably.
 
     Order: base class -> risk floor -> escalation ladder -> de-escalation
-    for clear_finding_implementation -> HARD escalation gate (task 213) ->
-    context-pack economics -> record.
+    for clear_finding_implementation -> EXPLICIT model request -> HARD
+    escalation gate (task 213) -> context-pack economics -> record.
+
+    `explicit_model` (task 220) is the caller naming a tier outright —
+    "run this one on opus" — instead of hoping the task_class partition
+    lands there. It is an INPUT to the policy, never a bypass of it:
+
+      * asking for a HIGHER tier raises the decision to it, and then still
+        has to clear the task-213 hard gate below (category + evidence +
+        expected_benefit + context_pack), so an unjustified "give me opus"
+        de-escalates to sonnet with the refusal recorded;
+      * asking for a LOWER tier is honoured only when nothing safety-
+        relevant put the decision where it is — a money/security/high risk
+        floor or a prior-attempt escalation both refuse the downgrade,
+        because cost is not a reason to re-run failed work on the tier that
+        already failed it.
 
     `escalation_reason`, if the policy above lands on opus/fable, must be a
     dict with a category from ESCALATION_CATEGORIES[model], non-empty
@@ -182,6 +202,9 @@ def route(task_class: str, *, risk: str = "normal", prior_attempts=None,
     """
     if risk not in _RISK_VALUES:
         raise RouterError(f"unknown risk {risk!r}; valid: {_RISK_VALUES}")
+    if explicit_model is not None and explicit_model not in RANK:
+        raise RouterError(f"unknown explicit_model {explicit_model!r}; "
+                          f"valid: {tuple(RANK)}")
     attempts = _validate_prior_attempts(prior_attempts)
 
     # 1. base model from the partition (fail-toward-cheap by default)
@@ -224,7 +247,33 @@ def route(task_class: str, *, risk: str = "normal", prior_attempts=None,
             model = SONNET
             reason += "; fable findings implement at sonnet unless high-risk"
 
-    # 5. HARD escalation gate (task 213) — requested_model is the tier every
+    # 5. EXPLICIT model request (task 220) — the caller naming a tier instead
+    # of relying on the partition to land there. Upward requests are granted
+    # here and then still have to clear the hard gate in step 6; downward
+    # requests are refused whenever something safety-relevant (risk floor or
+    # a prior-attempt escalation) is what put the decision where it is.
+    explicit_granted = None
+    if explicit_model is not None and explicit_model != model:
+        if RANK[explicit_model] > RANK[model]:
+            model = explicit_model
+            explicit_granted = True
+            reason += f"; explicit_model_request:{explicit_model}"
+        else:
+            policy_floor = (risk in _RISK_FLOOR_VALUES) or ("_insufficient" in reason) \
+                or ("escalate_to_fable" in reason)
+            if policy_floor:
+                explicit_granted = False
+                reason += (f"; explicit downgrade to {explicit_model} REFUSED "
+                           f"(policy floor holds {model})")
+            else:
+                model = explicit_model
+                explicit_granted = True
+                reason += f"; explicit_model_request:{explicit_model} (downgrade)"
+    elif explicit_model is not None:
+        explicit_granted = True
+        reason += f"; explicit_model_request:{explicit_model} (already routed there)"
+
+    # 6. HARD escalation gate (task 213) — decided_model is the tier every
     # step above computed; requires_context_pack below stays keyed to IT (not
     # the possibly-gated final `model`) so a denied escalation still surfaces
     # "this class of work wants a context pack" rather than hiding it.
@@ -236,7 +285,7 @@ def route(task_class: str, *, risk: str = "normal", prior_attempts=None,
         reason += (f"; escalation_reason invalid ({escalation_problem}) -> "
                    f"hard gate de-escalates to sonnet (requested {requested_model})")
 
-    # 6. context-pack economics — advisory only, never blocks by itself (the
+    # 7. context-pack economics — advisory only, never blocks by itself (the
     # hard gate above already blocked on it when escalation was requested)
     requires_context_pack = requested_model in (OPUS, FABLE)
     context_pack_missing = requires_context_pack and not (context_pack or "").strip()
@@ -250,13 +299,15 @@ def route(task_class: str, *, risk: str = "normal", prior_attempts=None,
             "INSERT INTO router_decision (task_ref,task_class,risk,model,model_id,"
             "reason,context_pack,requires_context_pack,at,ts,requested_model,"
             "escalation_category,escalation_evidence,escalation_expected_benefit,"
-            "escalation_valid) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "escalation_valid,explicit_model,explicit_granted) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (task_ref, task_class, risk, model, MODEL_IDS[model], reason,
              context_pack or "", int(requires_context_pack), now_iso(), now_ts(),
              requested_model, ereason.get("category") or "",
              (ereason.get("evidence") or "")[:500],
              (ereason.get("expected_benefit") or "")[:500],
-             int(escalation_valid)))
+             int(escalation_valid), explicit_model or "",
+             None if explicit_granted is None else int(explicit_granted)))
         conn.commit()
         return {
             "decision_id": cur.lastrowid,
@@ -266,6 +317,8 @@ def route(task_class: str, *, risk: str = "normal", prior_attempts=None,
             "requires_context_pack": requires_context_pack,
             "context_pack_missing": context_pack_missing,
             "requested_model": requested_model,
+            "explicit_model": explicit_model,
+            "explicit_granted": explicit_granted,
             "escalation_valid": escalation_valid,
         }
     finally:

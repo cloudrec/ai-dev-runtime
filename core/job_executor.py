@@ -136,7 +136,13 @@ def _route_model(job: dict, kind: str | None, *, extra_attempts=(), stage: str =
     core.model_router) — ordinary/automated dispatch never sets it, so
     routine/load/perf/docs/repo-inspection/concrete-fix jobs always land on
     sonnet even if their task_class or risk floor would otherwise reach for
-    a pricier model."""
+    a pricier model.
+
+    `job["requested_model"]` (task 220) is the owner/caller naming a tier for
+    THIS job. Both fields are columns on the jobs table, so they survive the
+    round-trip through the store: before task 220 they were in-memory only,
+    which is why an explicitly-requested opus job still dispatched on sonnet
+    once the executor re-read the job (owner_task #220 / runtime job #81)."""
     if not _router_enabled():
         return (None, None, None)
     job_id = job.get("id")
@@ -149,7 +155,8 @@ def _route_model(job: dict, kind: str | None, *, extra_attempts=(), stage: str =
             task_class, risk=risk, prior_attempts=attempts,
             context_pack=f"planner-prompt:{stage} (goal+instructions+file-listing<=80 lines)",
             task_ref=f"runtimejob:{job_id}:{stage}",
-            escalation_reason=escalation_reason if isinstance(escalation_reason, dict) else None)
+            escalation_reason=escalation_reason if isinstance(escalation_reason, dict) else None,
+            explicit_model=(job.get("requested_model") or None))
         cur = job_store.get_job(job_id) or job
         job_store.update_job(job_id, artifacts=(cur.get("artifacts") or []) + [{
             "model_selection": {
@@ -157,6 +164,8 @@ def _route_model(job: dict, kind: str | None, *, extra_attempts=(), stage: str =
                 "model": decision["model"], "model_id": decision["model_id"],
                 "reason": decision["reason"], "task_class": task_class, "risk": risk,
                 "requested_model": decision.get("requested_model"),
+                "explicit_model": decision.get("explicit_model"),
+                "explicit_granted": decision.get("explicit_granted"),
                 "escalation_valid": decision.get("escalation_valid"),
             },
         }])

@@ -1,0 +1,179 @@
+# Owner OS — Windows bridge + explicit model routing (task 220 / runtime job #81)
+
+Date: 2026-08-27 · Session: manual Opus 5 · Branch: `ai-runtime/220-windows-bridge`
+(cut from `ai-runtime/182-retry-fix-wake-continuation-star` @ `daeda13`)
+
+Three things were delivered: the explicit model-routing defect that killed jobs
+#219/#81 is fixed at its actual cause, the missing runtime endpoint behind the
+retry path's HTTP 404 is implemented, and the Windows Owner OS bridge is built
+end to end with a working local simulation.
+
+---
+
+## 1. Explicit model routing — the real defect
+
+**Symptom.** "Dispatch this on Opus" never worked; the dispatcher always chose
+Sonnet (task #219 cancelled for it, #220/#81 tried and failed to fix it).
+
+**Cause — two separate gaps, both real:**
+
+1. `core/model_router.py:route()` had **no input for a requested model at all**.
+   Its only inputs were `task_class`, `risk` and `prior_attempts`, so a caller
+   who wanted Opus could only hope the static partition landed there. There was
+   nothing to fix in the caller — the capability did not exist.
+2. `core/job_executor.py:_route_model()` reads `job["escalation_reason"]`, which
+   is the ONLY way past the task-213 hard gate — but `escalation_reason` **was
+   never a column on the `jobs` table**. `create_job()` dropped it, so every job
+   re-read from the store arrived without it and was de-escalated to Sonnet.
+   The existing test passed because it set the field on an in-memory dict and
+   never round-tripped it through the store.
+
+**Fix.**
+
+* `route(..., explicit_model=...)` — an explicit tier request that is an INPUT
+  to the policy, never a bypass of it:
+  * asking **up** raises the decision, then still has to clear the task-213 hard
+    gate (category + evidence + expected_benefit + context_pack). An unjustified
+    "give me opus" de-escalates to sonnet with the refusal recorded.
+  * asking **down** is refused whenever a money/security/high risk floor or a
+    prior-attempt escalation is what put the decision where it is.
+  * `explicit_model` / `explicit_granted` are recorded on `router_decision`.
+* `jobs.requested_model` and `jobs.escalation_reason` are now durable columns
+  (additive `ALTER TABLE`, forward-only, matching the existing migration idiom).
+* `POST /api/v1/jobs` accepts `requested_model` + `escalation_reason`;
+  `POST /api/v1/router/route` accepts `explicit_model`; the job view returns
+  `requested_model`.
+
+The safety properties of task 213 are unchanged: automated dispatch still never
+sets an escalation reason, so routine work still lands on Sonnet.
+
+## 2. The retry path's HTTP 404 — root cause and fix
+
+`/opt/seo/backend/services/runtime_client.py:141` gates every runtime retry on
+`POST {RUNTIME_URL}/smoke`, and its own comment cites *"ai-dev-runtime's POST
+/api/v1/smoke (core/ai_planner.smoke)"* — **but that route was never implemented
+here.** `core/ai_planner.smoke()` (PHASE 45) existed; nothing exposed it. Every
+retry therefore failed its gate with 404 and dispatched no replacement job
+(job #81 now, job #72 in `reports/OWNER_OS_WAKE_CONTINUATION_HANDOFF_2026-08-13.md`).
+
+Implemented `POST /api/v1/smoke` in `api/v1.py`: auth-gated, read-only by
+construction (no `project_path`, no tools, one hard-capped non-agentic call, no
+internal retry), returning the exact contract the caller reads. A provider
+failure is a 200 with `ok=false`, never an HTTP error — the gate reads the body,
+and a 500 would be indistinguishable from the 404 it replaces.
+
+**No provider config was touched.** The seo-side caller was inspected read-only.
+
+## 3. Windows Owner OS bridge
+
+Full design and setup: `docs/OWNER_OS_WINDOWS_BRIDGE.md`.
+
+* **Outbound only.** The PC long-polls Owner OS over HTTPS. No listening socket,
+  no port forward, no firewall rule on Windows.
+* **Per-device identity.** Single-use, expiring, hash-stored enrollment code →
+  device id + 256-bit secret. Every later request is HMAC-SHA256 over
+  `oos-win-v1 | device | ts | nonce | path | sha256(body)`. Rotatable, revocable.
+* **Replay-proof.** ±300 s window *and* a burned per-device nonce; binding path
+  and body hash means a captured signature cannot be re-pointed.
+* **No remote shell.** Six allowlisted actions, closed parameter vocabulary,
+  unknown params refused rather than ignored.
+* **No paths on the wire.** Commands name a workspace id; the device resolves it
+  against its own local enrollment file. The server cannot express a path.
+* **No command injection.** Claude runs as an argv list with the prompt on
+  stdin — `claude` on Windows is a `.cmd` whose arguments cmd.exe re-parses.
+* **Explicit enrollment.** A folder is reachable only after `add-workspace` is
+  run ON the PC. The server can disable a workspace, never add one.
+* **Idempotent + bounded + redacted.** UUID command ids, 16 KB prompts, 256 KB
+  results, 15-minute TTL, `agent_control.redact()` applied inside the structure.
+* **Fabric integration.** `win:<device>:<workspace>` joins `tmux:` and
+  `runtime:` in `GET /fabric/agents`, with `platform` explicit on every entry
+  (`linux` | `windows`). tmux behaviour is unchanged.
+
+### A concurrency defect the simulation caught
+
+The owner-side wait originally ran its blocking poll loop **inside the async
+endpoint**, which starved the event loop serving the device's own long-poll:
+the only party that could answer the command was blocked behind the handler, so
+every command timed out. `/windows/command` and the fabric's `win:` verbs now
+run their wait via `asyncio.to_thread`; tmux/runtime refs keep their exact inline
+path. Pinned by `test_owner_command_does_not_block_the_event_loop`.
+
+## 4. Files
+
+**New**
+
+| Path | Role |
+| --- | --- |
+| `core/windows_bridge.py` | server half: enrollment, device auth, allowlist, queue, inventory |
+| `clients/windows/owner_os_agent.py` | device half: stdlib-only agent, workspace resolution, Claude session runner |
+| `clients/windows/install.ps1` | one-command bootstrap (PS 5.1 compatible): prereqs, enroll, workspace, ACLs, scheduled task |
+| `tools/windows_bridge_sim.py` | narrated end-to-end simulation on 127.0.0.1 |
+| `docs/OWNER_OS_WINDOWS_BRIDGE.md` | architecture, security table, setup, endpoints, rollback |
+| `tests/test_windows_bridge.py` | 47 server tests |
+| `tests/test_windows_client.py` | 38 device tests |
+| `tests/test_windows_fabric.py` | 20 fabric tests |
+| `tests/test_windows_e2e.py` | 3 (deadlock regression + full simulation) |
+| `tests/test_explicit_model_routing.py` | 26 (explicit routing, durability, the 404) |
+
+**Modified**
+
+| Path | Change |
+| --- | --- |
+| `core/model_router.py` | `explicit_model` input + audit columns |
+| `core/job_store.py` | `requested_model` / `escalation_reason` columns + migration |
+| `core/job_executor.py` | passes the persisted explicit selection into the router |
+| `core/agent_fabric.py` | `win:` ref kind, windows inventory, explicit `platform` |
+| `api/v1.py` | `POST /smoke`, 12 `/windows/*` routes, explicit-model fields, event-loop offload |
+
+## 5. Tests
+
+* Focused: **134 passed** (`test_windows_bridge`, `test_windows_client`,
+  `test_windows_fabric`, `test_windows_e2e`, `test_explicit_model_routing`).
+* Broad relevant: **425 passed** (`agent_fabric`, `model_router`,
+  `runtime_model_routing`, `model_routing`, `job_executor`, `phase13`,
+  `agent_control`, `control_plane`, `api_wake_routes`, `owner_os_policy`,
+  `owner_os_adversarial`, `agent_supervisor`, `agent_orchestrator`,
+  `direct_pane_control`, `direct_agent_lifecycle`, `job_kinds`, `job_workspace`,
+  `runtime_bridge`).
+* Full suite run in halves (a single run exceeds the 600 s cap — the same limit
+  that failed job #81, not a defect in this work).
+* `venv/bin/python tools/windows_bridge_sim.py` → SIMULATION PASSED (10 steps).
+
+## 6. Activation (server) — nothing here is live yet
+
+No service was restarted and no config was changed. To activate:
+
+1. Merge/deploy this branch to `/root/ai-dev-runtime`.
+2. `systemctl restart ai-runtime.service` — this is the ONLY step. The `win_*`
+   tables and the two `jobs` columns are created on first touch by the existing
+   additive-migration paths.
+3. Verify: `curl -H "Authorization: Bearer $RUNTIME_TOKEN" .../api/v1/windows/policy`
+   and `.../api/v1/smoke` (the latter also closes the retry-path 404).
+
+**Rollback:** revert the branch and restart; or leave the code in place and
+never enroll a device — every `/windows/*` route is inert without one. The new
+columns and tables are additive and harmless if unused.
+
+## 7. Owner gates (what is left)
+
+1. **Deploy + restart `ai-runtime.service`** — deliberately not done here.
+2. **Run the Windows command** on the PC (needs a code minted at that moment;
+   codes expire in 15 minutes):
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File install.ps1 `
+     -Server https://<owner-os> -Code OOS-XXXXX-XXXXX-XXXXX `
+     -WorkspacePath "C:\Users\0962871647\Desktop\GAIKA_Basket_Chrome_Extension_MVP_v0.1.0\gaika-basket-extension"
+   ```
+
+   Prereqs if missing: `winget install -e --id Python.Python.3.12` and
+   `npm install -g @anthropic-ai/claude-code`.
+3. **HTTPS reachability** — the PC must be able to reach Owner OS on a TLS
+   endpoint. The installer refuses a non-HTTPS server without `-Force`.
+
+## 8. Known blockers, unchanged
+
+* **Runtime retry remains unproven end to end.** The 404 cause is fixed in this
+  branch, but the fix is not deployed, so the retry path stays unavailable until
+  gate 1 above. Do not re-trigger a runtime retry before then.
+* The full pytest run still exceeds 600 s in one pass; run it in halves.
