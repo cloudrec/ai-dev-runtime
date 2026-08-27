@@ -46,6 +46,26 @@ ACTIONABLE_COOLDOWN_SECS = int(os.getenv("WAKE_BRIDGE_ACTIONABLE_COOLDOWN_SECS",
 # actionable claim each time, and the younger actionable behind it (4313) never got a
 # single attempt. Backoff breaks the hot loop AND the head-of-line blockade at once.
 RETRY_BACKOFF_SECS = int(os.getenv("WAKE_BRIDGE_RETRY_BACKOFF_SECS", "300"))
+# A transient composer-lookup failure is not the 4214 shape. Event 10063
+# (2026-08-27): the composer read 0 matches at 22:20:30 and 1 match at 22:26:03 — the
+# page was mid-render, not wedged or dead — yet the standard 300s bench held a LIVE
+# `agent_waiting_input` wake back for over five minutes because every failure reason
+# shared one floor. This fast lane applies ONLY to that one reason class; every other
+# failure (a wedged renderer, a dead chat, a refused send) keeps the original floor.
+TRANSIENT_RETRY_BACKOFF_SECS = int(os.getenv("WAKE_BRIDGE_TRANSIENT_RETRY_BACKOFF_SECS", "30"))
+# After this many CONSECUTIVE transient failures for the SAME event, the fast lane
+# stands down and the event falls back to the standard floor above — a composer still
+# ambiguous after ~3 minutes of fast retries is no longer "still loading", and a stuck
+# page must never turn the fast lane into a CDP hot-loop. `expire_stale`'s
+# MAX_WAKE_AGE_SECS ceiling below remains the final, unconditional stop either way.
+TRANSIENT_RETRY_MAX_ATTEMPTS = int(os.getenv("WAKE_BRIDGE_TRANSIENT_RETRY_MAX_ATTEMPTS", "6"))
+# Matched by prefix: cdp_composer.py appends the observed composer count
+# (`composer_ambiguous_or_absent:0`, `:2`, …), never the bare string.
+TRANSIENT_FAILURE_PREFIXES = ("composer_ambiguous_or_absent",)
+# How many oldest-eligible candidates `pending_wake` will walk past a benched head of
+# line before giving up for this tick. Bounded so a large backlog of benched events
+# can never turn selection into an unbounded per-tick scan.
+_CANDIDATE_SCAN_LIMIT = 200
 # A decided-but-undelivered wake older than this is stale: "this agent is waiting NOW"
 # stops being true after hours of silence, and "read Owner OS" stops being useful once
 # the backlog it points at is ancient history. The 2026-08-15 incident this guards:
@@ -480,24 +500,29 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
         conn.execute(_DELIVERY_SCHEMA)
         conn.execute(_SEND_SCHEMA)
         _migrate_send(conn)
-        # The SAME eligibility the selector uses, including the backoff that
-        # benches an event after a failed delivery. Counting a benched event as
-        # pending would let health call the pipeline stuck while the selector is
-        # correctly waiting out that event's retry window - an alarm describing a
-        # queue nobody is actually trying to drain.
-        pending = conn.execute(
+        # The SAME per-event eligibility `pending_wake` uses, including the backoff
+        # that benches an event after a failed delivery (a short fast lane for a
+        # transient composer-lookup failure, the original floor for everything else).
+        # Counting a benched event as pending would let health call the pipeline
+        # stuck while the selector is correctly waiting out that event's retry
+        # window - an alarm describing a queue nobody is actually trying to drain.
+        all_undelivered = conn.execute(
             "SELECT event_id, COALESCE(route_key,''), ts, COALESCE(actionable,0) "
             "FROM wake_audit "
             "WHERE decision='wake' AND acknowledged=0 AND superseded_by IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=wake_audit.event_id) "
-            "AND NOT EXISTS (SELECT 1 FROM wake_delivery d WHERE d.event_id=wake_audit.event_id "
-            "                AND d.delivered=0 AND d.ts > ?) "
-            "ORDER BY id ASC", (now - RETRY_BACKOFF_SECS,)).fetchall()
-        benched = conn.execute(
-            "SELECT COUNT(*) FROM wake_audit WHERE decision='wake' AND acknowledged=0 "
-            "AND superseded_by IS NULL AND EXISTS (SELECT 1 FROM wake_delivery d "
-            "  WHERE d.event_id=wake_audit.event_id AND d.delivered=0 AND d.ts > ?)",
-            (now - RETRY_BACKOFF_SECS,)).fetchone()[0]
+            "ORDER BY id ASC").fetchall()
+        pending, benched = [], 0
+        for row in all_undelivered:
+            eid = int(row[0])
+            last = conn.execute(
+                "SELECT ts, delivered FROM wake_delivery WHERE event_id=? "
+                "ORDER BY id DESC LIMIT 1", (eid,)).fetchone()
+            if last and not last[1] and \
+                    now < float(last[0]) + _event_retry_backoff_secs(conn, eid):
+                benched += 1
+                continue
+            pending.append(row)
         oldest_age = int(now - float(pending[0][2])) if pending else 0
         oldest_route = (pending[0][1] or wake_routes.FALLBACK_ROUTE) if pending else None
 
@@ -1087,6 +1112,39 @@ def expire_stale(conn=None, now: Optional[float] = None) -> list:
             conn.close()
 
 
+def _is_transient_failure(reason: str) -> bool:
+    r = reason or ""
+    return any(r.startswith(p) for p in TRANSIENT_FAILURE_PREFIXES)
+
+
+def _consecutive_transient_failures(conn, event_id: int) -> int:
+    """How many of the most recent, UNBROKEN delivery attempts for this event were the
+    transient composer-lookup failure. A success or a DIFFERENT failure reason ends the
+    streak immediately — the fast lane is only for repeats of this one transient shape,
+    never a general "this event has failed before" counter."""
+    rows = conn.execute(
+        "SELECT delivered, reason FROM wake_delivery WHERE event_id=? "
+        "ORDER BY id DESC LIMIT ?",
+        (int(event_id), TRANSIENT_RETRY_MAX_ATTEMPTS + 1)).fetchall()
+    streak = 0
+    for delivered, reason in rows:
+        if delivered or not _is_transient_failure(reason):
+            break
+        streak += 1
+    return streak
+
+
+def _event_retry_backoff_secs(conn, event_id: int) -> int:
+    """The bench window THIS event's most recent failure earns. A transient
+    composer-lookup failure gets the short, bounded fast lane; a non-transient failure,
+    or a transient one repeated past the attempt cap, keeps the original floor that
+    event 4214 exists to enforce — the fast lane never becomes an unbounded hot-loop."""
+    streak = _consecutive_transient_failures(conn, event_id)
+    if 0 < streak <= TRANSIENT_RETRY_MAX_ATTEMPTS:
+        return TRANSIENT_RETRY_BACKOFF_SECS
+    return RETRY_BACKOFF_SECS
+
+
 def pending_wake(conn=None, now: Optional[float] = None) -> dict:
     """The oldest decided-but-unacknowledged wake, with the target resolved for ITS route.
 
@@ -1129,22 +1187,47 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         # Actionable first, then oldest — the only ordering change. Within a class the old
         # oldest-first behaviour is untouched, so nothing is starved, it is merely outranked.
         conn.execute(_DELIVERY_SCHEMA)
-        r = conn.execute("SELECT a.event_id, COALESCE(a.actionable,0), "
-                         "COALESCE(a.project_id,''), COALESCE(a.event_type,''), "
-                         "COALESCE(a.agent_id,'') FROM wake_audit a "
-                         "WHERE a.decision='wake' AND a.acknowledged=0 "
-                         "AND a.superseded_by IS NULL AND NOT EXISTS "
-                         "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
-                         # a fresh delivery failure benches the event for the backoff
-                         # window, so the next-in-line is tried instead of starving
-                         "AND NOT EXISTS (SELECT 1 FROM wake_delivery d "
-                         "  WHERE d.event_id=a.event_id AND d.delivered=0 AND d.ts > ?) "
-                         "ORDER BY COALESCE(a.actionable,0) DESC, a.id ASC LIMIT 1",
-                         ((now if now is not None else now_ts()) - RETRY_BACKOFF_SECS,)
-                         ).fetchone()
+        now_ = now if now is not None else now_ts()
+        # Every eligible candidate, un-benched — the per-event backoff below (transient
+        # composer failures get a short fast lane, everything else keeps the original
+        # floor) cannot be expressed as one fixed cutoff, so it is applied in Python over
+        # a bounded scan instead of as a single static SQL predicate.
+        candidates = conn.execute(
+            "SELECT a.event_id, COALESCE(a.actionable,0), "
+            "COALESCE(a.project_id,''), COALESCE(a.event_type,''), "
+            "COALESCE(a.agent_id,'') FROM wake_audit a "
+            "WHERE a.decision='wake' AND a.acknowledged=0 "
+            "AND a.superseded_by IS NULL AND NOT EXISTS "
+            "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
+            "ORDER BY COALESCE(a.actionable,0) DESC, a.id ASC "
+            "LIMIT ?", (_CANDIDATE_SCAN_LIMIT,)).fetchall()
+        r = None
+        benched = None  # (event_id, retry_at, attempt, transient) for the head of line
+        for cand in candidates:
+            eid = int(cand[0])
+            last = conn.execute(
+                "SELECT ts, delivered FROM wake_delivery WHERE event_id=? "
+                "ORDER BY id DESC LIMIT 1", (eid,)).fetchone()
+            if last and not last[1]:
+                streak = _consecutive_transient_failures(conn, eid)
+                fast_lane = 0 < streak <= TRANSIENT_RETRY_MAX_ATTEMPTS
+                backoff = TRANSIENT_RETRY_BACKOFF_SECS if fast_lane else RETRY_BACKOFF_SECS
+                retry_at = float(last[0]) + backoff
+                if now_ < retry_at:
+                    if benched is None:
+                        benched = (eid, retry_at, streak, fast_lane)
+                    continue
+            r = cand
+            break
         if not r:
-            return {"pending": False, "reason": "nothing_to_wake_for",
-                    "coalesced": coalesced["superseded_event_ids"]}
+            result = {"pending": False, "reason": "nothing_to_wake_for",
+                      "coalesced": coalesced["superseded_event_ids"]}
+            if benched is not None:
+                eid, retry_at, attempt, transient = benched
+                result.update({"reason": "retry_backoff_pending", "event_id": eid,
+                               "attempt": attempt, "transient_retry": transient,
+                               "next_retry_in_secs": max(0, int(retry_at - now_))})
+            return result
         # FAIL CLOSED per event: an event whose route cannot be resolved offers nothing,
         # rather than borrowing whichever chat another event would have used.
         # Re-resolved with the SAME inputs the decision used - project AND agent

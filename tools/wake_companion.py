@@ -81,6 +81,11 @@ def tick(wb) -> dict:
     """
     p = wb.pending_wake()
     if not p.get("pending"):
+        if p.get("reason") == "retry_backoff_pending":
+            lane = "transient composer" if p.get("transient_retry") else "standard"
+            print(f"event {p.get('event_id')} benched ({lane} backoff, "
+                  f"attempt {p.get('attempt')}, next retry in "
+                  f"{p.get('next_retry_in_secs')}s)", flush=True)
         return {"acted": False, "reason": p.get("reason", "nothing_pending")}
     # The conversation used is the one the bridge resolved THIS tick from the rotatable
     # pointer. It is never cached across ticks, so a rebind takes effect on the next poll.
