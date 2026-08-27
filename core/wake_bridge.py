@@ -269,6 +269,11 @@ _AUDIT_COLUMNS = (
     # Routing: the event's project, kept so the target can be re-resolved FRESH at
     # delivery time. Rows from before the column exist as NULL and route to owner-os.
     ("project_id", "TEXT"),
+    # The RESOLVED route this decision belongs to. Cooldowns are per chat, and a
+    # cooldown cannot be scoped to something the row does not remember. Rows from
+    # before this column are NULL and are counted as owner-os traffic, which is
+    # what they overwhelmingly were.
+    ("route_key", "TEXT"),
     # task 211: the agent ref, persisted alongside project_id for the same reason —
     # the wake TEXT is composed fresh at delivery time and needs it there.
     ("agent_id", "TEXT"),
@@ -306,6 +311,22 @@ def _enabled() -> tuple:
     enabled = os.getenv("WAKE_BRIDGE_ENABLED", "0") not in ("0", "", "false", "no")
     kill = os.getenv("WAKE_BRIDGE_KILL_SWITCH", "0") not in ("0", "", "false", "no")
     return enabled, kill
+
+
+# A cooldown protects ONE chat from being spammed. Applying it across chats meant
+# the busiest route silenced every other one: owner-os traffic alone produced most
+# of the 17k `cooldown_active` skips, and a MESS or payments agent waiting on the
+# owner simply never rang while that ran. The floor is therefore matched per route.
+#
+# NULL route_key rows predate the column and are counted as owner-os, which is what
+# they were - so owner-os keeps exactly the protection it has today, and a project
+# route is no longer held down by traffic that was never going to its chat.
+_ROUTE_MATCH = ("(COALESCE(NULLIF(route_key,''), ?) = ?)")
+
+
+def _route_params(route_key: str) -> tuple:
+    key = (route_key or wake_routes.FALLBACK_ROUTE).strip() or wake_routes.FALLBACK_ROUTE
+    return (wake_routes.FALLBACK_ROUTE, key)
 
 
 def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
@@ -348,7 +369,8 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
             # Its own floor still applies, so distinct actionable events cannot burst.
             last_a = conn.execute(
                 "SELECT ts FROM wake_audit WHERE decision='wake' AND actionable=1 "
-                "ORDER BY id DESC LIMIT 1").fetchone()
+                f"AND {_ROUTE_MATCH} ORDER BY id DESC LIMIT 1",
+                _route_params(target["route_key"])).fetchone()
             if last_a and (now - float(last_a[0] or 0)) < ACTIONABLE_COOLDOWN_SECS:
                 wait = int(ACTIONABLE_COOLDOWN_SECS - (now - float(last_a[0])))
                 return {"wake": False, "reason": "actionable_cooldown_active",
@@ -361,8 +383,8 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
                     "route_key": target["route_key"],
                     "route_reason": target["route_reason"]}
         last = conn.execute(
-            "SELECT ts FROM wake_audit WHERE decision='wake' ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+            f"SELECT ts FROM wake_audit WHERE decision='wake' AND {_ROUTE_MATCH} "
+            "ORDER BY id DESC LIMIT 1", _route_params(target["route_key"])).fetchone()
         if last and (now - float(last[0] or 0)) < COOLDOWN_SECS:
             wait = int(COOLDOWN_SECS - (now - float(last[0])))
             return {"wake": False, "reason": "cooldown_active", "wait_secs": wait,
@@ -396,11 +418,13 @@ def record(decision: dict, *, event_id: int, severity: str = "", event_type: str
     try:
         cur = conn.execute(
             "INSERT INTO wake_audit (ts,at,event_id,correlation_id,severity,decision,reason,"
-            "event_type,actionable,project_id,agent_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "event_type,actionable,project_id,agent_id,route_key) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, now_iso(), int(event_id), correlation_id, severity,
              "wake" if decision.get("wake") else "skip", str(decision.get("reason"))[:160],
              (event_type or "").strip(), 1 if actionable else 0,
-             (project_id or "").strip(), (agent_id or "").strip()[:200]))
+             (project_id or "").strip(), (agent_id or "").strip()[:200],
+             (decision.get("route_key") or "").strip()))
         conn.commit()
         return int(cur.lastrowid)
     finally:

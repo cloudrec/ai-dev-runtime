@@ -161,3 +161,84 @@ def test_the_owner_os_fallback_is_still_exempt_from_dead_gating(conn):
     assert out["bound"] is True
     assert out["conversation"] == CHAT_A
     assert "despite_dead_mark" in out["route_reason"]
+
+
+# ── 3. cooldowns are per chat, not global ──────────────────────────────────
+# A cooldown exists so one chat is not spammed. It was evaluated across ALL
+# routes, so the busiest chat silenced every other one: owner-os traffic alone
+# accounted for most of 17k `cooldown_active` skips, and a MESS or payments
+# agent waiting on the owner simply never rang while that ran.
+
+import os  # noqa: E402
+
+from core import wake_bridge  # noqa: E402
+
+
+@pytest.fixture()
+def bridge(conn, monkeypatch):
+    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "1")
+    monkeypatch.setenv("WAKE_BRIDGE_KILL_SWITCH", "0")
+    _agent_row(conn, "payorch-live-buttons", "payment-orchestrator")
+    return conn
+
+
+def _wake(conn, *, event_id, project, now, severity="critical",
+          event_type="agent_waiting_input"):
+    d = wake_bridge.should_wake(event_id=event_id, severity=severity,
+                                event_type=event_type, project_id=project,
+                                owner_action_required=True, conn=conn, now=now)
+    wake_bridge.record(d, event_id=event_id, severity=severity, event_type=event_type,
+                       project_id=project, conn=conn, now=now)
+    return d
+
+
+def test_one_chats_cooldown_no_longer_silences_another(bridge):
+    now = 1_800_000_000.0
+    first = _wake(bridge, event_id=9001, project="owner-os", now=now)
+    assert first["wake"] is True
+
+    # Immediately after, a DIFFERENT project's chat must still be reachable.
+    second = _wake(bridge, event_id=9002, project="payorch-live-buttons", now=now + 5)
+    assert second["wake"] is True, second["reason"]
+    assert second["route_key"] == "payment-orchestrator"
+
+
+def test_the_same_chat_is_still_protected_from_a_burst(bridge):
+    now = 1_800_000_000.0
+    assert _wake(bridge, event_id=9101, project="payorch-live-buttons", now=now)["wake"]
+    second = _wake(bridge, event_id=9102, project="payorch-live-buttons", now=now + 5)
+    assert second["wake"] is False
+    assert "cooldown" in second["reason"]
+
+
+def test_the_floor_still_clears_for_that_chat_after_its_window(bridge):
+    now = 1_800_000_000.0
+    _wake(bridge, event_id=9201, project="payorch-live-buttons", now=now)
+    later = _wake(bridge, event_id=9202, project="payorch-live-buttons",
+                  now=now + wake_bridge.ACTIONABLE_COOLDOWN_SECS
+                  + wake_bridge.COOLDOWN_SECS + 1)
+    assert later["wake"] is True
+
+
+def test_legacy_rows_without_a_route_key_count_as_owner_os(bridge):
+    """Pre-migration audit rows are NULL. They were owner-os traffic, so they must
+    keep holding the owner-os floor down rather than being ignored entirely."""
+    now = 1_800_000_000.0
+    wake_bridge._conn(bridge)          # ensure the audit schema exists
+    bridge.execute("INSERT INTO wake_audit (ts,at,event_id,decision,reason,actionable,"
+                   "project_id,route_key) VALUES (?,?,?,'wake','legacy',1,'',NULL)",
+                   (now, "2026-08-27T00:00:00+00:00", 8999))
+    bridge.commit()
+    blocked = _wake(bridge, event_id=9301, project="owner-os", now=now + 5)
+    assert blocked["wake"] is False
+    assert "cooldown" in blocked["reason"]
+    # ...while a project chat is unaffected by that legacy owner-os row.
+    assert _wake(bridge, event_id=9302, project="payorch-live-buttons",
+                 now=now + 6)["wake"] is True
+
+
+def test_the_route_key_is_persisted_on_every_decision(bridge):
+    now = 1_800_000_000.0
+    _wake(bridge, event_id=9401, project="payorch-live-buttons", now=now)
+    row = bridge.execute("SELECT route_key FROM wake_audit WHERE event_id=9401").fetchone()
+    assert row[0] == "payment-orchestrator"
