@@ -169,3 +169,81 @@ def test_pipeline_health_writes_nothing(conn):
 def test_health_embeds_the_pipeline_verdict(conn):
     h = wake_bridge.health(conn=conn, now=NOW)
     assert "pipeline" in h and h["pipeline"]["status"] in ("ok", "stuck", "disabled")
+
+
+# ── the watcher that says it out loud ──────────────────────────────────────
+# An endpoint nobody polls is not detection. The loop logs on TRANSITION so a
+# stuck pipeline appears in the service log the owner already reads, while a long
+# outage stays one line rather than a stream.
+
+def _run_loop_once(monkeypatch, statuses):
+    """Drive pipeline_watch_loop deterministically over a sequence of verdicts."""
+    import asyncio
+    from core import wake_bridge as wb
+
+    seen, calls = [], {"n": 0}
+
+    def fake_health(*_a, **_k):
+        i = min(calls["n"], len(statuses) - 1)
+        calls["n"] += 1
+        st = statuses[i]
+        return {"status": st, "reasons": [f"r_{st}"], "pending_count": 1,
+                "pending_oldest_age_secs": 700, "pending_oldest_route": "mess",
+                "last_claim_attempt_age_secs": 5}
+
+    async def fake_sleep(_s):
+        if calls["n"] >= len(statuses):
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(wb, "pipeline_health", fake_health)
+    try:
+        asyncio.run(wb.pipeline_watch_loop(log=lambda lvl, m: seen.append((lvl, m)),
+                                           sleep=fake_sleep))
+    except asyncio.CancelledError:
+        pass
+    return seen
+
+
+def test_it_logs_when_the_pipeline_becomes_stuck(monkeypatch):
+    seen = _run_loop_once(monkeypatch, ["stuck"])
+    assert seen and seen[0][0] == "warning"
+    assert "wake pipeline stuck" in seen[0][1]
+    assert "route=mess" in seen[0][1]
+
+
+def test_a_healthy_pipeline_logs_nothing(monkeypatch):
+    assert _run_loop_once(monkeypatch, ["ok", "ok", "ok"]) == []
+
+
+def test_a_sustained_outage_is_one_line_not_a_stream(monkeypatch):
+    seen = _run_loop_once(monkeypatch, ["stuck", "stuck", "stuck", "stuck"])
+    assert len(seen) == 1
+
+
+def test_recovery_is_announced(monkeypatch):
+    seen = _run_loop_once(monkeypatch, ["stuck", "stuck", "ok"])
+    assert [lvl for lvl, _ in seen] == ["warning", "info"]
+    assert "recovered" in seen[1][1]
+
+
+def test_a_failing_health_call_never_kills_the_loop(monkeypatch):
+    import asyncio
+    from core import wake_bridge as wb
+    seen, calls = [], {"n": 0}
+
+    def boom(*_a, **_k):
+        calls["n"] += 1
+        raise RuntimeError("db locked")
+
+    async def fake_sleep(_s):
+        if calls["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(wb, "pipeline_health", boom)
+    try:
+        asyncio.run(wb.pipeline_watch_loop(log=lambda lvl, m: seen.append((lvl, m)),
+                                           sleep=fake_sleep))
+    except asyncio.CancelledError:
+        pass
+    assert calls["n"] >= 2                      # kept going after the exception
+    assert all("watch error" in m for _l, m in seen)

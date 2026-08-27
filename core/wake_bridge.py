@@ -544,6 +544,45 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
             conn.close()
 
 
+PIPELINE_WATCH_INTERVAL_SECS = int(os.getenv("WAKE_PIPELINE_WATCH_SECS", "120"))
+
+
+async def pipeline_watch_loop(log=None, sleep=None) -> None:
+    """Say out loud when the pipeline stops moving.
+
+    An endpoint nobody polls is not detection. This logs a transition into and
+    out of a stuck state, so a wake that is decided and never delivered - or a
+    companion process that has died - shows up in the service log the owner
+    already reads, instead of being noticed as silence hours later.
+
+    Log-only ON PURPOSE: it emits no event and actuates nothing, because the wake
+    path feeding itself is a failure this system has already had. It also logs
+    only on CHANGE, so a long outage is one line, not a stream.
+    """
+    import asyncio
+    log = log or (lambda level, msg: None)
+    sleep = sleep or asyncio.sleep
+    previous = "ok"
+    while True:
+        try:
+            h = pipeline_health()
+            status = h.get("status", "ok")
+            if status != previous:
+                if status == "ok":
+                    log("info", "wake pipeline recovered — deliveries moving again")
+                else:
+                    log("warning",
+                        f"wake pipeline {status}: {'; '.join(h.get('reasons') or [])} "
+                        f"(pending={h.get('pending_count')}, "
+                        f"oldest={h.get('pending_oldest_age_secs')}s "
+                        f"route={h.get('pending_oldest_route')}, "
+                        f"last_claim={h.get('last_claim_attempt_age_secs')}s ago)")
+                previous = status
+        except Exception as e:  # noqa: BLE001 — a watcher must never kill the daemon
+            log("warning", f"wake pipeline watch error: {type(e).__name__}: {e}")
+        await sleep(PIPELINE_WATCH_INTERVAL_SECS)
+
+
 def health(conn=None, now: Optional[float] = None) -> dict:
     """Freshness the owner can check: is it on, when did it last wake, was that acknowledged?"""
     now = now if now is not None else now_ts()

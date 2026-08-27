@@ -158,6 +158,22 @@ async def _start_continuation_watchdog():
 
 
 @app.on_event("startup")
+async def _start_wake_pipeline_watch():
+    # Says out loud when the wake pipeline stops moving: a wake decided and never
+    # delivered, or a companion process that died (its claim silence is the only
+    # signal - the last successful delivery keeps looking recent). Log-only by
+    # design: it emits no event and actuates nothing, because the wake path
+    # feeding itself is a failure this system has already had.
+    import asyncio
+    try:
+        from core.wake_bridge import pipeline_watch_loop
+        asyncio.create_task(pipeline_watch_loop(
+            log=lambda level, msg: getattr(logger, level, logger.info)(msg)))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"wake pipeline watch not started: {e}")
+
+
+@app.on_event("startup")
 async def _start_commander_autopilot():
     # Commander autopilot: per-minute evaluation of critical projects (state + unfinished
     # tasks + background subagents + last proven progress) and auto-delivery of the exact
