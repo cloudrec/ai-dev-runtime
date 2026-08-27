@@ -177,3 +177,70 @@ columns and tables are additive and harmless if unused.
   branch, but the fix is not deployed, so the retry path stays unavailable until
   gate 1 above. Do not re-trigger a runtime retry before then.
 * The full pytest run still exceeds 600 s in one pass; run it in halves.
+
+---
+
+# Deployment record — 2026-08-27 18:02 UTC
+
+Deployed and verified live on the Owner OS server. Owner-authorized; no
+destructive step was taken.
+
+**Deployed:** `ai-runtime/220-windows-bridge` @ `33cd3f2`, local == remote.
+`ai-runtime.service` runs `WorkingDirectory=/root/ai-dev-runtime` directly, so
+the checkout IS the deploy and the restart is what activates it. `git diff HEAD`
+over `api/ core/ clients/ tools/ tests/ docs/` was empty — the running tree is
+byte-identical to the tested commit. 29 unrelated dirty/untracked `reports/*`
+files were left untouched.
+
+**Rollback point:** `backups/predeploy_win_bridge_20260827T160240Z/` — copies of
+`runtime_jobs.db`, `control_plane.db`, `agent_control.db` plus `ROLLBACK.md`.
+Code rollback alone is sufficient (`git checkout
+ai-runtime/182-retry-fix-wake-continuation-star && systemctl restart
+ai-runtime.service`); the schema changes are additive and the previous code
+ignores them.
+
+**Restart:** zero in-flight jobs beforehand. PID 1586787 → 4042415, `NRestarts=0`,
+clean shutdown/startup, all six workers back (supervisor, orchestrator, control
+plane, continuation watchdog, commander autopilot, context budget). Zero
+errors/tracebacks in the log since restart.
+
+**Post-restart checks**
+
+| Check | Before | After |
+| --- | --- | --- |
+| `GET /api/v1/health` | ok | ok, `provider_available: true`, 100 jobs |
+| `POST /api/v1/smoke` unauthenticated | **404** | 401 (route exists, auth-gated) |
+| `POST /api/v1/smoke` authenticated | — | **`ok: true`**, claude-cli, 5.53 s |
+| `GET /api/v1/windows/policy` | **404** | 401 unauth / full surface with auth |
+| `GET /api/v1/windows/devices` | — | `{"devices": []}` |
+| `GET /api/v1/fabric/agents` | — | 23 agents (11 tmux + 12 runtime), **no errors** |
+| explicit opus, no justification | — | de-escalates to **sonnet**, gate `false` |
+| explicit opus, justified | — | reaches **claude-opus-5**, gate `true` |
+| `jobs.requested_model` / `escalation_reason` | absent | present, 100 rows untouched |
+| `win_*` tables | absent | all five created |
+
+**The retry-path 404 is closed.** The exact call that failed every Runtime retry
+now returns `ok: true` against the real provider.
+
+## Remaining owner gate — network ingress (blocks the Windows step)
+
+`ai-runtime.service` listens on **172.17.0.1:8199 only** (docker bridge, plain
+HTTP). nginx serves :80/:443 on this host but **nothing proxies to 8199**, and no
+`server_name` maps to the runtime API. The Windows PC therefore cannot reach
+Owner OS at all yet, and the agent refuses a non-HTTPS server by design.
+
+Publishing a control-plane API to the public internet is an outward-facing
+security decision and a config change, so it was NOT made here. The owner must
+choose one:
+
+1. **Public HTTPS reverse proxy** — an nginx `server_name` (e.g.
+   `owneros.<domain>`) with a certificate, `proxy_pass http://172.17.0.1:8199;`,
+   ideally restricted to `/api/v1/windows/` and `/api/v1/health`. Widest
+   exposure; only the device-authenticated routes need to be public.
+2. **Tailscale / WireGuard** — the PC joins a private network and reaches the
+   API on its tailnet address. No public exposure at all; recommended.
+3. **Cloudflare Tunnel** — no inbound firewall change on this host.
+
+Enrollment cannot be completed until one of those exists. Everything on the
+server side is otherwise ready and idle: no device is enrolled, and every
+`/windows/*` route is inert without one.
