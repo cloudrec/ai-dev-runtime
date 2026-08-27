@@ -41,17 +41,17 @@ def conn(tmp_path, monkeypatch):
 NOW = 1_800_000_000.0
 
 
-def _pending_wake(conn, *, event_id, route, ts):
+def _pending_wake(conn, *, event_id, route, ts, actionable=1):
     conn.execute("INSERT INTO wake_audit (ts,at,event_id,decision,reason,actionable,"
-                 "project_id,route_key,acknowledged) VALUES (?,?,?,'wake','t',1,?,?,0)",
-                 (ts, "2026-08-27T18:00:00+00:00", event_id, route, route))
+                 "project_id,route_key,acknowledged) VALUES (?,?,?,'wake','t',?,?,?,0)",
+                 (ts, "2026-08-27T18:00:00+00:00", event_id, actionable, route, route))
     conn.commit()
 
 
-def _claim(conn, *, ts, allowed=1):
+def _claim(conn, *, ts, allowed=1, actionable=1, route="owner-os"):
     conn.execute("INSERT INTO wake_send (ts,at,source,event_id,allowed,reason,actionable,"
-                 "route_key) VALUES (?,?,'companion',1,?,'t',1,'owner-os')",
-                 (ts, "2026-08-27T18:00:00+00:00", allowed))
+                 "route_key) VALUES (?,?,'companion',1,?,'t',?,?)",
+                 (ts, "2026-08-27T18:00:00+00:00", allowed, actionable, route))
     conn.commit()
 
 
@@ -304,3 +304,76 @@ def test_a_restart_under_a_new_pid_clears_the_alarm(conn, monkeypatch):
 
 def test_no_registered_worker_reports_no_skew(conn):
     assert wake_bridge.worker_skew(conn=conn, now=NOW) == []
+
+
+# ── a cooldown is not a stall ──────────────────────────────────────────────
+# Observed live: event 9832 waited out the owner-os 900s floor, counting down
+# correctly (475s -> 360s), and would have crossed the 600s "stuck" threshold
+# while the system was behaving exactly as designed. An alarm that fires on
+# correct behaviour is how a detector teaches people to ignore it.
+
+def test_a_wake_waiting_out_its_own_cooldown_is_not_called_stuck(conn):
+    """Modelled on live event 9832: a GENERIC wake on owner-os, past the stuck
+    threshold, still inside the 900s generic floor."""
+    _pending_wake(conn, event_id=1, route="owner-os", actionable=0,
+                  ts=NOW - wake_bridge.STUCK_PENDING_SECS - 120)
+    _claim(conn, ts=NOW - 60, actionable=0)      # a send to that chat 60s ago
+    h = wake_bridge.pipeline_health(conn=conn, now=NOW)
+    assert h["status"] == "waiting"
+    assert h["cooldown_remaining_secs"] > 0
+    assert not any(r.startswith("pending_wake_stuck") for r in h["reasons"])
+    assert any(r.startswith("waiting_on_cooldown:owner-os") for r in h["reasons"])
+
+
+def test_once_the_floor_clears_a_wake_that_still_has_not_gone_out_is_stuck(conn):
+    _pending_wake(conn, event_id=1, route="owner-os",
+                  ts=NOW - wake_bridge.STUCK_PENDING_SECS - 120)
+    _claim(conn, ts=NOW - wake_bridge.ACTIONABLE_COOLDOWN_SECS
+           - wake_bridge.COOLDOWN_SECS - 10)     # floor long expired
+    h = wake_bridge.pipeline_health(conn=conn, now=NOW)
+    assert h["status"] == "stuck"
+    assert any(r.startswith("pending_wake_stuck:owner-os") for r in h["reasons"])
+
+
+def test_companion_silence_is_not_alarmed_while_a_cooldown_holds(conn):
+    """Nothing to claim yet means nothing to complain about."""
+    _pending_wake(conn, event_id=1, route="owner-os", ts=NOW - 60)
+    _claim(conn, ts=NOW - 30)
+    h = wake_bridge.pipeline_health(conn=conn, now=NOW)
+    assert not any(r.startswith("companion_silent") for r in h["reasons"])
+
+
+def test_the_generic_and_actionable_floors_are_not_interchangeable(conn):
+    """A claim 90s old clears the 60s actionable floor but not the 900s generic
+    one; reading the wrong floor would mislabel a correctly-waiting wake."""
+    _pending_wake(conn, event_id=1, route="owner-os", actionable=0,
+                  ts=NOW - wake_bridge.STUCK_PENDING_SECS - 120)
+    _claim(conn, ts=NOW - 90, actionable=0)
+    assert wake_bridge.pipeline_health(conn=conn, now=NOW)["status"] == "waiting"
+
+
+def test_an_actionable_wake_is_measured_against_the_actionable_floor(conn):
+    """The two classes have different floors; using the generic one would either
+    over- or under-report a blocked actionable wake."""
+    conn.execute("INSERT INTO wake_audit (ts,at,event_id,decision,reason,actionable,"
+                 "project_id,route_key,acknowledged) VALUES (?,?,?,'wake','t',1,?,?,0)",
+                 (NOW - wake_bridge.STUCK_PENDING_SECS - 60,
+                  "2026-08-27T18:00:00+00:00", 7, "mess", "mess"))
+    conn.execute("INSERT INTO wake_send (ts,at,source,event_id,allowed,reason,actionable,"
+                 "route_key) VALUES (?,?,'companion',7,1,'t',1,'mess')",
+                 (NOW - 5, "2026-08-27T18:00:00+00:00"))
+    conn.commit()
+    h = wake_bridge.pipeline_health(conn=conn, now=NOW)
+    assert h["status"] == "waiting"
+    assert h["cooldown_remaining_secs"] > 0
+
+
+def test_a_cooldown_on_another_chat_does_not_excuse_a_stuck_wake(conn):
+    """Per-chat throughout: a send to owner-os must not make a stalled mess wake
+    look like it is merely waiting."""
+    _pending_wake(conn, event_id=1, route="mess",
+                  ts=NOW - wake_bridge.STUCK_PENDING_SECS - 120)
+    _claim(conn, ts=NOW - 30)                    # that claim was for owner-os
+    h = wake_bridge.pipeline_health(conn=conn, now=NOW)
+    assert h["status"] == "stuck"
+    assert any(r.startswith("pending_wake_stuck:mess") for r in h["reasons"])

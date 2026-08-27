@@ -481,7 +481,8 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
         conn.execute(_SEND_SCHEMA)
         _migrate_send(conn)
         pending = conn.execute(
-            "SELECT event_id, COALESCE(route_key,''), ts FROM wake_audit "
+            "SELECT event_id, COALESCE(route_key,''), ts, COALESCE(actionable,0) "
+            "FROM wake_audit "
             "WHERE decision='wake' AND acknowledged=0 AND superseded_by IS NULL "
             "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=wake_audit.event_id) "
             "ORDER BY id ASC").fetchall()
@@ -504,19 +505,38 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
         # Per-route backlog: a single blocked chat must be nameable, not averaged
         # away behind a healthy total.
         by_route: dict = {}
-        for _eid, rk, ts in pending:
+        for _eid, rk, ts, _act in pending:
             key = rk or wake_routes.FALLBACK_ROUTE
             age = int(now - float(ts))
             by_route[key] = max(by_route.get(key, 0), age)
+
+        # A wake waiting out its OWN chat's cooldown is not stuck - it is the
+        # cooldown doing its job, and it will fire when the floor clears. Calling
+        # that "stuck" would be an alarm that cries wolf, which is how a detector
+        # trains people to ignore it. Only a wake whose floor has ALREADY cleared
+        # and which still has not gone out is genuinely not moving.
+        cooldown_remaining = 0
+        if pending:
+            oldest_actionable = bool(pending[0][3])
+            floor = ACTIONABLE_COOLDOWN_SECS if oldest_actionable else COOLDOWN_SECS
+            last_allowed = conn.execute(
+                f"SELECT ts FROM wake_send WHERE allowed=1 AND {_ROUTE_MATCH} "
+                + ("AND COALESCE(actionable,0)=1 " if oldest_actionable else "")
+                + "ORDER BY id DESC LIMIT 1", _route_params(oldest_route)).fetchone()
+            if last_allowed:
+                elapsed = now - float(last_allowed[0] or 0)
+                if elapsed < floor:
+                    cooldown_remaining = int(floor - elapsed)
 
         reasons = []
         if kill:
             reasons.append("kill_switch_engaged")
         if not enabled:
             reasons.append("bridge_disabled")
-        if pending and oldest_age > STUCK_PENDING_SECS:
+        if pending and oldest_age > STUCK_PENDING_SECS and not cooldown_remaining:
             reasons.append(f"pending_wake_stuck:{oldest_route}:{oldest_age}s")
-        if pending and claim_age is not None and claim_age > COMPANION_SILENT_SECS:
+        if (pending and not cooldown_remaining and claim_age is not None
+                and claim_age > COMPANION_SILENT_SECS):
             reasons.append(f"companion_silent:{claim_age}s_with_{len(pending)}_pending")
         if pending and claim_age is None:
             reasons.append("companion_never_claimed")
@@ -534,8 +554,13 @@ def pipeline_health(conn=None, now: Optional[float] = None) -> dict:
                                                   "consecutive_delivery_failures",
                                                   "worker_running_stale_code"))
                                     for r in reasons) else "disabled"
+        if cooldown_remaining and status == "ok":
+            # Reported, not alarmed: the owner can see WHY nothing is moving.
+            reasons.append(f"waiting_on_cooldown:{oldest_route}:{cooldown_remaining}s")
+            status = "waiting"
         return {"status": status, "reasons": reasons,
                 "worker_skew": skew,
+                "cooldown_remaining_secs": cooldown_remaining,
                 "pending_count": len(pending),
                 "pending_oldest_age_secs": oldest_age,
                 "pending_oldest_route": oldest_route,
