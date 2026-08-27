@@ -167,12 +167,22 @@ def test_malformed_credentials_are_refused_before_any_lookup(device):
 
 def test_the_remote_surface_has_no_shell_verb():
     """The property that matters most: there is no way to ask a Windows device
-    to run a command of the caller's choosing."""
-    assert set(wb.ACTIONS) == {"workspace.list", "agent.status", "agent.read",
+    to run a command of the caller's choosing.
+
+    The set is pinned deliberately. Adding a verb has to be a decision someone
+    makes here, in a test, not a side effect of editing a dict — which is why
+    `workspace.inspect` (read-only git/tree facts, fixed argv on the device)
+    appears in this list rather than slipping in unnoticed."""
+    assert set(wb.ACTIONS) == {"workspace.list", "workspace.inspect",
+                               "agent.status", "agent.read",
                                "agent.start", "agent.send", "agent.stop"}
     joined = " ".join(wb.ACTIONS).lower()
-    for forbidden in ("exec", "shell", "run", "cmd", "powershell", "script", "eval"):
+    for forbidden in ("exec", "shell", "cmd", "powershell", "script", "eval"):
         assert forbidden not in joined
+    # No action takes a parameter that could carry a command or a path.
+    for params in wb.ACTIONS.values():
+        assert not ({"cmd", "command", "args", "argv", "shell", "path", "cwd"}
+                    & set(params))
 
 
 def test_an_unknown_action_is_refused(device):
@@ -375,3 +385,34 @@ def test_policy_dump_describes_the_whole_surface():
     assert p["paths_on_the_wire"] is False
     assert set(p["actions"]) == set(wb.ACTIONS)
     assert p["ref_format"] == "win:<device_id>:<workspace_id>"
+
+
+# ── workspace.inspect: read-only, still not a shell ────────────────────────
+
+def test_inspect_is_allowlisted_and_addresses_one_workspace(device):
+    cmd = wb.enqueue(device["device_id"], "workspace.inspect",
+                     workspace_id="gaika-basket", params={"max_files": 50})
+    assert cmd["status"] == "pending"
+    assert cmd["params"]["max_files"] == 50
+
+
+def test_inspect_max_files_is_clamped(device):
+    cmd = wb.enqueue(device["device_id"], "workspace.inspect",
+                     workspace_id="gaika-basket", params={"max_files": 10 ** 7})
+    assert cmd["params"]["max_files"] == 2000
+
+
+def test_inspect_takes_no_command_or_path_parameter(device):
+    """The reconciliation needs facts from the Windows repo, and the way NOT to
+    get them is a parameter that reaches a command line."""
+    assert set(wb.ACTIONS["workspace.inspect"]) == {"max_files"}
+    for bad in ({"cmd": "git log"}, {"args": ["-C", "/etc"]}, {"path": "C:\\Windows"}):
+        with pytest.raises(wb.WindowsBridgeError, match="not accepted"):
+            wb.enqueue(device["device_id"], "workspace.inspect",
+                       workspace_id="gaika-basket", params=bad)
+
+
+def test_inspect_still_requires_an_enrolled_workspace(device):
+    with pytest.raises(wb.WindowsBridgeError, match="not enrolled"):
+        wb.enqueue(device["device_id"], "workspace.inspect",
+                   workspace_id="some-other-repo")

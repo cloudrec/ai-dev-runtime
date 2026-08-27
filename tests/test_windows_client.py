@@ -591,3 +591,44 @@ def test_no_external_session_means_the_normal_agent_path(cfg, fake_claude, monke
                      "params": {"lines": 10}})
     assert out["source"] == "owner_os_agent"
     assert "hi" in out["output"]
+
+
+# ── workspace.inspect on the device ────────────────────────────────────────
+
+def test_inspect_reports_git_identity_and_content(cfg, workspace):
+    import subprocess as sp
+    sp.run(["git", "init", "-q"], cwd=str(workspace), check=True)
+    sp.run(["git", "config", "user.email", "t@example.com"], cwd=str(workspace), check=True)
+    sp.run(["git", "config", "user.name", "t"], cwd=str(workspace), check=True)
+    sp.run(["git", "add", "-A"], cwd=str(workspace), check=True)
+    sp.run(["git", "commit", "-qm", "seed"], cwd=str(workspace), check=True)
+    (workspace / "dirty.txt").write_text("uncommitted")
+
+    out = agent.Agent(cfg).execute({"action": "workspace.inspect",
+                                    "workspace_id": "gaika-basket",
+                                    "params": {"max_files": 100}})
+    assert out["is_git_repo"] is True
+    assert out["head"] and len(out["head"]) == 40
+    assert out["commit_count"] == "1"
+    assert out["dirty_count"] == 1
+    assert "manifest.json" in out["files"]
+    assert len(out["files"]["manifest.json"]) == 16      # short sha256
+
+
+def test_inspect_works_on_a_folder_with_no_git_history(cfg, workspace):
+    out = agent.Agent(cfg).execute({"action": "workspace.inspect",
+                                    "workspace_id": "gaika-basket", "params": {}})
+    assert out["exists"] is True
+    assert out["is_git_repo"] is False
+    assert out["file_count"] >= 1
+
+
+def test_inspect_honours_the_file_cap(cfg, workspace):
+    for i in range(30):
+        (workspace / f"f{i}.txt").write_text(str(i))
+    out = agent.Agent(cfg).execute({"action": "workspace.inspect",
+                                    "workspace_id": "gaika-basket",
+                                    "params": {"max_files": 5}})
+    assert len(out["files"]) == 5
+    assert out["files_skipped"] >= 25
+    assert out["file_count"] == len(out["files"]) + out["files_skipped"]

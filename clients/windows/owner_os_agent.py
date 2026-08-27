@@ -550,6 +550,75 @@ class WorkspaceRunner:
 
 # ── the agent loop ──────────────────────────────────────────────────────────
 
+def _git(workspace: str, args: list, timeout: int = 45) -> str:
+    """One git invocation, fixed argv, no shell. Returns "" on any failure."""
+    try:
+        out = subprocess.run(["git", "-C", workspace] + args, capture_output=True,
+                             text=True, timeout=timeout, shell=False,
+                             encoding="utf-8", errors="replace")
+        return (out.stdout or "").strip() if out.returncode == 0 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def inspect_workspace(path: str, max_files: int = 500) -> dict:
+    """Read-only facts about an enrolled workspace: git identity and content.
+
+    Everything here is observation - git plumbing with fixed arguments plus file
+    hashing. Nothing is written, no branch is checked out, and no argument comes
+    from the request, so this cannot become a remote shell by parameter.
+    """
+    info: dict = {"path": path, "exists": os.path.isdir(path)}
+    if not info["exists"]:
+        return info
+    root = _git(path, ["rev-parse", "--show-toplevel"])
+    info["git_root"] = root
+    info["is_git_repo"] = bool(root)
+    if root:
+        info["branch"] = _git(path, ["rev-parse", "--abbrev-ref", "HEAD"])
+        info["head"] = _git(path, ["rev-parse", "HEAD"])
+        info["head_date"] = _git(path, ["log", "-1", "--format=%cI"])
+        info["head_subject"] = _git(path, ["log", "-1", "--format=%s"])[:200]
+        info["commit_count"] = _git(path, ["rev-list", "--count", "HEAD"])
+        info["remotes"] = _git(path, ["remote", "-v"]).splitlines()[:6]
+        info["branches"] = _git(path, ["branch", "-a", "--format=%(refname:short)"]
+                                ).splitlines()[:20]
+        status = _git(path, ["status", "--porcelain"]).splitlines()
+        info["dirty_count"] = len(status)
+        info["dirty"] = status[:60]
+        info["recent_commits"] = _git(
+            path, ["log", "--format=%h %cI %s", "-12"]).splitlines()
+    # Content inventory - the part that survives a missing/absent git history.
+    files, skipped = {}, 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        dirnames[:] = [d for d in dirnames
+                       if d not in (".git", "node_modules", "__pycache__", ".venv")]
+        for name in sorted(filenames):
+            full = os.path.join(dirpath, name)
+            rel = os.path.relpath(full, path).replace(os.sep, "/")
+            if len(files) >= max_files:
+                skipped += 1
+                continue
+            try:
+                with open(full, "rb") as f:
+                    files[rel] = hashlib.sha256(f.read()).hexdigest()[:16]
+            except OSError:
+                files[rel] = "unreadable"
+    info["file_count"] = len(files) + skipped
+    info["files_skipped"] = skipped
+    info["files"] = files
+    manifest = os.path.join(path, "manifest.json")
+    if os.path.exists(manifest):
+        try:
+            with open(manifest, "r", encoding="utf-8", errors="replace") as f:
+                data = json.load(f)
+            info["manifest"] = {k: data.get(k) for k in ("name", "version",
+                                                         "manifest_version")}
+        except Exception:  # noqa: BLE001
+            info["manifest"] = {"error": "unparseable"}
+    return info
+
+
 class Agent:
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -607,6 +676,9 @@ class Agent:
         if action == "workspace.list":
             return {"workspaces": self.workspace_report()}
         runner = self.runner(workspace_id)
+        if action == "workspace.inspect":
+            return inspect_workspace(runner.path,
+                                     max_files=int(params.get("max_files") or 500))
         if action == "agent.status":
             return runner.status()
         if action == "agent.read":

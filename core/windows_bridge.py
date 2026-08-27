@@ -97,6 +97,14 @@ ACTIONS: dict[str, tuple[str, ...]] = {
     "agent.start": ("text", "idempotency_key"),
     "agent.send": ("text", "idempotency_key"),
     "agent.stop": ("confirm",),
+    # Read-only repository/tree inspection of ONE enrolled workspace. Added for
+    # the GAIKA reconciliation: comparing two copies of a repo needs facts from
+    # the Windows side (branch, HEAD, remotes, dirty files, content hashes), and
+    # the alternative - asking a Claude on that machine to run commands - is both
+    # slower and exactly the arbitrary execution this surface refuses. The device
+    # runs a FIXED set of git argv lists and hashes files; nothing in `params`
+    # reaches a command line.
+    "workspace.inspect": ("max_files",),
 }
 # Actions that address the device rather than one workspace.
 _DEVICE_ACTIONS = ("workspace.list",)
@@ -573,6 +581,12 @@ def validate_params(action: str, params: Any) -> dict:
         if "\x00" in text:
             raise WindowsBridgeError("text may not contain NUL")
         out["text"] = text
+    if "max_files" in allowed:
+        try:
+            mx = int(params.get("max_files") or 500)
+        except (TypeError, ValueError):
+            raise WindowsBridgeError("max_files must be an integer")
+        out["max_files"] = max(1, min(mx, 2000))
     if "lines" in allowed:
         try:
             lines = int(params.get("lines") or DEFAULT_LINES)
