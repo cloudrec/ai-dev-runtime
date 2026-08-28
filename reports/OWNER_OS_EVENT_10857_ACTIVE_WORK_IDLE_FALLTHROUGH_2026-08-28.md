@@ -97,3 +97,53 @@ full argv inspection) to resolve without risking false "shell_running" positives
 on the ordinary idle-shell-prompt case, which is far more common than either
 incident shape. Flagged for a future, separately-scoped, separately-tested fix
 if this pattern recurs.
+
+### Follow-up (later same day): deterministic reproduction, no fix implemented
+
+Reproduced both ambiguities directly — a throwaway tmux session
+(`_repro_scratch`), created and killed by this investigation, never touched any
+live/owner agent:
+
+```
+$ tmux new-session -d -s _repro_scratch
+$ tmux send-keys -t _repro_scratch "for i in 1 2; do node -e 'setTimeout(()=>{},3000)'; done" Enter
+# pane_current_command sampled every 0.5s:
+bash
+bash
+bash
+node
+node
+node
+```
+
+**Finding 1 (loop-startup race) — real, but SHORT, not a sustained
+misclassification.** `bash` is reported only for the ~1-1.5s the shell takes to
+parse the loop and exec the first child; once `node` is actually running,
+`pane_current_command` correctly reports `node`, not `bash`. This narrows the
+original hypothesis: a `for`/`while` loop does not read as idle-safe for its
+whole duration, only for a brief startup window per iteration boundary.
+
+**Finding 2 (`"node"` name ambiguity) — confirmed structural, not transient.**
+For as long as the loop's `node` subprocess actually runs, `pane_current_command`
+reports exactly `node` — genuinely indistinguishable, by name alone, from
+whatever value Claude Code's own runtime would report if it also manifests as
+`node` on some install (the reason `"node"` was added to `_IDLE_FG_COMMANDS` in
+the first place, per its own comment). On *this* host, `find_claude_in_pane`
+already independently proves whether a Claude process is actually running in
+the pane (that's the whole `is_agent`/`claude` gate `agent_list()` uses upstream
+of `_pane_shell_running`), and this host's own `claude` CLI was observed
+reporting its foreground command as literally `claude`, never `node` — so
+`"node"` may be dead weight on this specific install. But that is one host, one
+observation, and removing `"node"` from `_IDLE_FG_COMMANDS` blind, without a
+counter-repro of the install shape the entry was originally added to defend
+against, risks reintroducing exactly the bug it was added to prevent.
+
+**No fix implemented.** Per the explicit "do not guess a fix without a live
+deterministic repro" instruction: finding 1 does not warrant a change (the race
+is real but too short-lived to be the incident's likely cause on its own, and
+narrowing `_IDLE_FG_COMMANDS` for it would reduce the false-idle window by
+~1s at the cost of new false-positive risk everywhere a shell briefly parses a
+command). Finding 2 has a real repro for the *ambiguity* but not for the
+*original bug `"node"` defends against* — without that second repro, a change
+here is not safely verifiable and was not made. Both remain documented,
+open, and gated on a future incident or deliberate cross-install verification.
