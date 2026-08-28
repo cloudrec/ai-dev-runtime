@@ -146,6 +146,21 @@ def _resolution_reason(conn, *, event_id: int, target: str) -> Optional[str]:
             "SELECT cls FROM agent_watch_state WHERE target=?", (target,)).fetchone()
         if row and row[0] == "working":
             return "pane_alive_and_working"
+        # task 221 (events 10268/10284, mess/chemmy-fast): an agent that finished its
+        # authorized scope and is explicitly at rest (agent_watch's "completed" class —
+        # `stated_finish_at_rest`) is not stuck; it is DONE. Without this, a wake
+        # delivered right before the agent finished kept re-firing
+        # wake_loop_no_progress/wake_loop_stalled for a state that never changes again,
+        # because `_progress_since` correctly sees no further activity from a parked
+        # agent. Deliberately NOT extended to "idle" (`no_signal` — no positive
+        # completion evidence, genuinely ambiguous) or "crashed" (a real failure): both
+        # must keep waking exactly as before. `owner_prompt`/`blocker` are untouched,
+        # so a real waiting-owner state still wakes. A later state change moves `cls`
+        # away from "completed", so this check stops applying on its own — no separate
+        # reset logic is needed, and a NEW event for the same target starts its own
+        # fresh watch regardless.
+        if row and row[0] == "completed":
+            return "agent_parked_completed"
     except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
         pass
     return None

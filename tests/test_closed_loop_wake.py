@@ -681,3 +681,96 @@ def test_deregister_resolved_is_directly_callable_for_one_time_cleanup(conn):
     assert [d["event_id"] for d in out] == [305]
     row = conn.execute("SELECT resolved FROM wake_loop_watch WHERE event_id=305").fetchone()
     assert row == (1,)
+
+
+# ── task 221 (events 10268/10284, mess/chemmy-fast): parked wake-loop false
+# positives — an agent that finished its authorized scope and is explicitly at
+# rest must not keep getting no-progress/stalled wakes for that same unchanged
+# state, while every other state keeps its existing wake behavior exactly. ──
+
+def _set_cls(conn, target, cls):
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_watch_state (target TEXT PRIMARY KEY, "
+        "cls TEXT, digest TEXT, at TEXT, ts REAL, notified_cls TEXT, "
+        "notified_digest TEXT, notified_at TEXT, notified_ts REAL, "
+        "emissions INTEGER DEFAULT 0)")
+    conn.execute("INSERT OR REPLACE INTO agent_watch_state (target, cls) VALUES (?, ?)",
+                (target, cls))
+    conn.commit()
+
+
+def test_explicit_parked_idle_suppresses_repeated_loop_wake(conn):
+    """cls == 'completed' (agent_watch's stated_finish_at_rest) is DONE, not stuck —
+    no wake_loop_no_progress, no wake_loop_stalled, ever, for this unchanged state."""
+    _set_cls(conn, "chemmy-fast:0.0", "completed")
+    emit = _Emit()
+    clw.register_delivery(event_id=310, target="chemmy-fast:0.0", project_id="mess",
+                          event_type="agent_waiting_input", conn=conn, now=NOW)
+    r1 = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r1["rewoken"] and not r1["escalated"]
+    assert r1["deregistered"][0]["reason"] == "agent_parked_completed"
+    r2 = clw.slo_scan(conn=conn, now=NOW + 3 * clw.WAKE_LOOP_SLO_SECS, emit_fn=emit)
+    assert not r2["rewoken"] and not r2["escalated"] and not r2["deregistered"]
+    assert emit.calls == [], "a parked/completed agent must never be woken for this"
+
+
+def test_waiting_owner_still_wakes_despite_the_parked_suppression(conn):
+    """cls == 'owner_prompt' is the opposite of parked — a real waiting-owner state
+    must still re-wake and escalate exactly as before."""
+    _set_cls(conn, "mess:0.0", "owner_prompt")
+    emit = _Emit()
+    clw.register_delivery(event_id=311, target="mess:0.0", project_id="mess",
+                          conn=conn, now=NOW)
+    r1 = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert [e["event_id"] for e in r1["rewoken"]] == [311]
+    assert emit.calls[-1]["type"] == "wake_loop_no_progress"
+    r2 = clw.slo_scan(conn=conn, now=NOW + 2 * clw.WAKE_LOOP_SLO_SECS + 60, emit_fn=emit)
+    assert [e["event_id"] for e in r2["escalated"]] == [311]
+    assert emit.calls[-1]["type"] == "wake_loop_stalled"
+
+
+def test_stale_non_parked_state_still_wakes(conn):
+    """cls == 'idle' (no_signal — no positive completion evidence) is genuinely
+    ambiguous, not an explicit park; it must keep the pre-existing stuck-and-stale
+    wake behavior, not be silently swallowed."""
+    _set_cls(conn, "gaika-server:0.0", "idle")
+    emit = _Emit()
+    clw.register_delivery(event_id=312, target="gaika-server:0.0", project_id="gaika-extension",
+                          conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert [e["event_id"] for e in r["rewoken"]] == [312]
+    assert emit.calls[-1]["type"] == "wake_loop_no_progress"
+
+
+def test_a_new_event_after_parking_still_gets_its_own_wake(conn):
+    """A NEW owner-facing event for the same target, after it was parked, must wake
+    normally — the suppression only ever silences the OLD, unchanged watch, never a
+    fresh one for a state the agent has since moved into."""
+    _set_cls(conn, "chemmy-fast:0.0", "completed")
+    emit = _Emit()
+    clw.register_delivery(event_id=313, target="chemmy-fast:0.0", project_id="mess",
+                          event_type="agent_waiting_input", conn=conn, now=NOW)
+    r1 = clw.slo_scan(conn=conn, now=NOW + 10, emit_fn=emit)
+    assert r1["deregistered"][0]["event_id"] == 313, "the stale parked watch resolves"
+
+    # the agent is handed NEW work and stops being parked
+    _set_cls(conn, "chemmy-fast:0.0", "owner_prompt")
+    clw.register_delivery(event_id=314, target="chemmy-fast:0.0", project_id="mess",
+                          conn=conn, now=NOW + 20)
+    r2 = clw.slo_scan(conn=conn, now=NOW + 20 + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert [e["event_id"] for e in r2["rewoken"]] == [314]
+
+
+def test_state_change_away_from_parked_resets_suppression(conn):
+    """Resolution is checked fresh on every scan against the CURRENT cls, not
+    snapshotted at registration time: an agent parked at delivery time but handed
+    new work (owner_prompt) before the SLO window elapses must wake normally — the
+    parked state does not stick to a watch once the agent has moved on."""
+    _set_cls(conn, "mess:0.0", "completed")
+    emit = _Emit()
+    clw.register_delivery(event_id=315, target="mess:0.0", project_id="mess",
+                          conn=conn, now=NOW)
+    _set_cls(conn, "mess:0.0", "owner_prompt")
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert [e["event_id"] for e in r["rewoken"]] == [315]
+    assert emit.calls[-1]["type"] == "wake_loop_no_progress"
