@@ -147,3 +147,38 @@ command). Finding 2 has a real repro for the *ambiguity* but not for the
 *original bug `"node"` defends against* — without that second repro, a change
 here is not safely verifiable and was not made. Both remain documented,
 open, and gated on a future incident or deliberate cross-install verification.
+
+### Follow-up 2: read-only cross-check of `"node"`'s original justification
+
+Inspected (read-only, no execution) how `claude` actually resolves on this host:
+`/usr/local/bin/claude` → symlink → `/root/.local/share/claude/versions/2.1.251`,
+a native ELF binary — a self-updating standalone distribution, not an
+npm-shebang wrapper. Every installed version on this host
+(`/root/.local/share/claude/versions/`: 2.1.241 through 2.1.251, six in total)
+is the same standalone-binary shape. Cross-checked three other live,
+non-gaika-server agents' foreground command (`tmux display-message -p
+"#{pane_current_command}"`, read-only): `payorch-monitor-clean:0.0` → `claude`,
+`jobhunter-video-sonnet:0.0` → `claude`; consistent with gaika-server's own
+earlier read (also `claude`). Every sample on this host, across every installed
+version, reports `claude`, never `node`.
+
+**This narrows but does not close the question.** On this host's current
+distribution method, Claude Code's own process will never trigger the `"node"`
+ambiguity — but this repo's own Windows-bridge work
+(`docs/OWNER_OS_WINDOWS_BRIDGE.md`, `clients/windows/install.ps1`) installs
+Claude Code via `npm install -g @anthropic-ai/claude-code`, which on a typical
+npm global install creates a `#!/usr/bin/env node` shebang shim — a shape that
+plausibly *would* exec-replace into a process reporting `node`. That path is a
+different host, different OS, and (crucially) not even reachable through this
+function at all: Windows agents are actuated via `core/windows_bridge.py`'s
+long-poll protocol, never through `core/agent_control.py`'s tmux-based
+`_pane_shell_running`. Whether any *Linux* npm-global install of Claude Code
+(as opposed to the standalone-binary self-updater used here) would hit this
+ambiguity remains unverified — no such install exists on this host to check,
+and setting one up is out of scope for a read-only investigation.
+
+**Still no fix implemented.** Strong, multi-sample evidence that `"node"` is
+inert on this specific host's install method is not the same as a bounded,
+safe change to a shared codebase file that may run under a different install
+shape elsewhere. Removing it is not clearly bounded without that missing data
+point. Left exactly as documented in Follow-up 1 — open, not fixed.
