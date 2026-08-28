@@ -1095,7 +1095,8 @@ def live_status_region(tail: str) -> str:
 
 
 def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str | None = None,
-                   *, pending_input: str = "", shell_running: bool = False) -> str:
+                   *, pending_input: str = "", shell_running: bool = False,
+                   recently_active: bool = False) -> str:
     """Observable state of an agent pane.
 
     `working` requires concrete active-execution evidence — a live spinner timer,
@@ -1105,7 +1106,21 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
     means a command was typed/pasted but NOT submitted → `waiting_input`, so such
     an agent is never lost as plain idle. `prev_tail` is accepted for signature
     compatibility but does not influence `working`. New signals default off so the
-    behaviour is unchanged for callers that do not pass them."""
+    behaviour is unchanged for callers that do not pass them.
+
+    `recently_active` (event 10857, gaika-server 2026-08-28): independent proof —
+    this project's Claude transcript file was written to within the last few
+    seconds — that the agent is genuinely still working, regardless of whether the
+    pane's CURRENT spinner text happens to match any known active-run pattern.
+    `_STATE_ACTIVE_RUN_RE` cannot enumerate every whimsical-gerund rendering
+    Claude Code ever ships ("Wibbling… (thinking)" fixed one shape at event
+    10801's `\\(thinking\\)`; "Razzle-dazzling…" — no parenthesis, no duration, no
+    "thinking" at all — proved the next one always exists). Checked AFTER a real
+    permission dialog (`waiting_owner` is a genuine, structural, higher-priority
+    signal a live transcript write does not override) but BEFORE every other
+    at-rest reading — a composer/pending-input guess, a stale external-block
+    phrase from scrollback, or the default `idle` fallthrough must never win over
+    proof this fresh."""
     if not alive:
         return "dead"
     if not is_agent:
@@ -1130,6 +1145,10 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
     #    being auto-answered.
     if _STATE_WAIT_OWNER_RE.search(tail) or dialog_signature(tail):
         return "waiting_owner"
+    # 2b) proof-of-activity independent of pane text — see the docstring. Outranks
+    #     every remaining at-rest reading below, including pending_input.
+    if recently_active:
+        return "working"
     # 3) a typed/pasted but unsubmitted command → waiting_input (owner must submit).
     #    Recovers idle agents with a staged command that were previously lost.
     if pending_input and pending_input.strip():
@@ -1234,19 +1253,21 @@ def agent_list() -> dict:
         tail = _pane_tail(pane["target"]) if (is_agent and pane["alive"]) else ""
         # Extra signals only for an at-rest agent (skip when already active/working)
         # so an active agent costs no extra tmux capture.
-        shell_running, pending = False, ""
+        shell_running, pending, recently_active = False, "", False
         if is_agent and pane["alive"] and not _STATE_ACTIVE_RUN_RE.search(
                 live_status_region(tail[-1500:])):
             shell_running = _pane_shell_running(pane)
             cwd = (claude or {}).get("cwd", "")
-            # Independent-of-pane-text backstop (event 10801): a transcript actively
-            # being written to is real work in progress no matter what the tail-text
-            # spinner regex did or didn't catch. Never let a pending-input guess
-            # override proof this fresh.
-            if not shell_running and not conversation_recently_active(cwd):
-                pending = _pane_pending_input(pane["target"], cwd=cwd)
-        state = classify_state(pane["alive"], is_agent, tail,
-                               pending_input=pending, shell_running=shell_running)
+            # Independent-of-pane-text backstop (events 10801/10857): a transcript
+            # actively being written to is real work in progress no matter what the
+            # tail-text spinner regex did or didn't catch. Never let a pending-input
+            # guess, or the plain `idle` fallthrough, override proof this fresh.
+            if not shell_running:
+                recently_active = conversation_recently_active(cwd)
+                if not recently_active:
+                    pending = _pane_pending_input(pane["target"], cwd=cwd)
+        state = classify_state(pane["alive"], is_agent, tail, pending_input=pending,
+                               shell_running=shell_running, recently_active=recently_active)
         # OWNER TRUTH (payment): an externally_blocked caused by a recoverable key/credential/
         # user selection issue is INTERNAL recovery, not an owner gate — downgrade the REPORTED
         # state so the seo-backend agent_notifier (which reads this over HTTP) does not
@@ -1305,14 +1326,16 @@ def agent_status(target: str) -> dict:
     evidence = conversation_evidence(agent_cwd)
     rc, out, _ = _tmux(["capture-pane", "-p", "-t", agent["target"], "-S", "-40"])
     recent = redact(out) if rc == 0 else ""
-    shell_running, pending = False, ""
+    shell_running, pending, recently_active = False, "", False
     if agent["alive"] and agent["is_agent"] and not _STATE_ACTIVE_RUN_RE.search(
             live_status_region(recent[-1500:])):
         shell_running = _pane_shell_running(agent)
-        if not shell_running and not conversation_recently_active(agent_cwd):
-            pending = _pane_pending_input(agent["target"], cwd=agent_cwd)
-    state = classify_state(agent["alive"], agent["is_agent"], recent,
-                           pending_input=pending, shell_running=shell_running)
+        if not shell_running:
+            recently_active = conversation_recently_active(agent_cwd)
+            if not recently_active:
+                pending = _pane_pending_input(agent["target"], cwd=agent_cwd)
+    state = classify_state(agent["alive"], agent["is_agent"], recent, pending_input=pending,
+                           shell_running=shell_running, recently_active=recently_active)
     audit("agent_status", agent["target"], found=True, alive=agent["alive"], is_agent=agent["is_agent"])
     return {
         "target": agent["target"],

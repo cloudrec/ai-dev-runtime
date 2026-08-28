@@ -641,6 +641,53 @@ def test_recent_transcript_activity_overrides_a_pending_input_guess(monkeypatch)
     inv = ac.agent_list()
     st = [x for x in inv["agents"] if x["target"] == "gaika-server:0.0"][0]["state"]
     assert st != "waiting_input"
+    assert st == "working"
+
+
+# ── event 10857 (gaika-server, 2026-08-28): recently_active must win over the
+# plain `idle` fallthrough too, not only over a pending-input guess. Live
+# evidence: agent_status reported idle/pending=null while the pane showed an
+# active foreground stability command AND live "Razzle-dazzling…" thinking — a
+# bare gerund spinner with no duration/"(thinking)" suffix at all, so no
+# _STATE_ACTIVE_RUN_RE pattern could ever have caught it; only independent proof
+# of recent transcript activity closes this class of gap in general. ──────────
+
+def test_recently_active_wins_over_idle_fallthrough():
+    """No active-run match, no pending input, no dialog, no external-block text
+    — classify_state must still say working when recently_active is proven,
+    never fall through to idle."""
+    tail = "  ✽ Razzle-dazzling…\n  ✔ Update installed · Re…\n───\n❯ \n───\n  ⏵⏵ auto mode on"
+    assert ac.classify_state(True, True, tail, recently_active=True) == "working"
+    # sanity: without the signal, the exact same tail still falls through to idle
+    assert ac.classify_state(True, True, tail, recently_active=False) == "idle"
+
+
+def test_recently_active_does_not_override_a_real_permission_dialog():
+    """A genuine, structural dialog signal stays higher-priority than a fresh
+    transcript write — recently_active must never mask an actual owner-facing
+    prompt."""
+    tail = "Do you want to proceed?\n❯ 1. Yes\n  2. No"
+    assert ac.classify_state(True, True, tail, recently_active=True) == "waiting_owner"
+
+
+def test_gaika_server_agent_list_reports_working_not_idle_for_bare_gerund_spinner(monkeypatch):
+    """The exact event 10857 shape end-to-end: no digit/duration/thinking marker
+    in the spinner at all, empty composer, but a fresh transcript write —
+    agent_list() must classify working, not idle."""
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, "PANE", ""))
+    monkeypatch.setattr(ac, "parse_panes", lambda out: [
+        {"target": "gaika-server:0.0", "session": "gaika-server", "alive": True,
+         "pid": 1, "command": "claude", "cwd": "/opt/gaika-extension"}])
+    monkeypatch.setattr(ac, "find_claude_in_pane",
+                        lambda pid: {"pid": pid, "cwd": "/opt/gaika-extension"})
+    monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k:
+                        "  ✽ Razzle-dazzling…\n  ✔ Update installed · Re…\n───\n❯ \n───\n  ⏵⏵ auto mode on")
+    monkeypatch.setattr(ac, "_pane_shell_running", lambda pane: False)
+    monkeypatch.setattr(ac, "conversation_recently_active", lambda cwd: True)
+    monkeypatch.setattr(ac, "audit", lambda *a, **k: None)
+    inv = ac.agent_list()
+    st = [x for x in inv["agents"] if x["target"] == "gaika-server:0.0"][0]["state"]
+    assert st == "working"
 
 
 def test_detect_exec_mode():
