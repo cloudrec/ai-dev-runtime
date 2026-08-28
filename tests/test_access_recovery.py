@@ -153,7 +153,7 @@ def test_agent_list_applies_reported_state_downgrade(monkeypatch):
     monkeypatch.setattr(agc, "find_claude_in_pane", lambda pid: {"pid": pid, "cwd": "/opt/payment-orchestrator"})
     monkeypatch.setattr(agc, "_pane_tail", lambda *a, **k: "ssh root@ru-prod: credentials required (publickey)")
     monkeypatch.setattr(agc, "_pane_shell_running", lambda pane: False)
-    monkeypatch.setattr(agc, "_pane_pending_input", lambda t: "")
+    monkeypatch.setattr(agc, "_pane_pending_input", lambda *a, **k: "")
     monkeypatch.setattr(agc, "classify_state", lambda *a, **k: "externally_blocked")
     monkeypatch.setattr(agc, "audit", lambda *a, **k: None)
     inv = agc.agent_list()

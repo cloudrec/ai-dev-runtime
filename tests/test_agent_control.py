@@ -539,6 +539,58 @@ def test_pending_input_text_detects_queued_instruction():
     assert ac.pending_input_text("x:0.0", tail="Do you want to proceed?\n❯ 1. Yes\n  2. No") == ""
 
 
+# ── _pane_pending_input dim recall-ghost fix (gaika-server 2026-08-28) ────────
+# waiting_transitions/classify_state kept reading Claude Code's own dim recall-
+# ghost redraw of its last completed turn — varying text each tick ("check
+# status", "check status tomorrow", "next safe roadmap item…") — as a genuine
+# staged command, so an intentionally idle/parked agent (pending=null in every
+# other consumer) kept getting fresh false `waiting_input`/actionable wakes.
+
+def _dim_pane(content: str) -> str:
+    return f"──────\n❯ \x1b[2m{content}\x1b[0m\n──────\n  ⏵⏵ auto mode on"
+
+
+def test_dim_recall_ghost_matching_last_submitted_is_not_pending(monkeypatch):
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, _dim_pane("check status"), ""))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "check status")
+    assert ac._pane_pending_input("gaika-server:0.0", cwd="/opt/gaika-server") == ""
+
+
+def test_dim_text_not_matching_last_submitted_is_still_real_pending(monkeypatch):
+    # dim rendering alone never decides ghost-vs-staged (mess-qa-automation 2026-08-05):
+    # a dim line that does NOT match what was actually last submitted is real input.
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, _dim_pane("continue with slice 2"), ""))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "an unrelated earlier command")
+    assert ac._pane_pending_input("mess-qa-automation:0.0", cwd="/opt/mess") == "continue with slice 2"
+
+
+def test_no_cwd_keeps_old_behaviour_unchanged(monkeypatch):
+    # callers that cannot supply a cwd (e.g. context_budget's /clear-safety check) must see
+    # EXACTLY the pre-fix behaviour: a dim ghost still reads as non-empty pending text.
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, _dim_pane("check status"), ""))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "check status")
+    out = ac._pane_pending_input("gaika-server:0.0")
+    assert out and out.strip()             # still truthy — no behaviour change without cwd
+
+
+def test_plain_non_dim_pending_text_unaffected_by_cwd(monkeypatch):
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (
+        0, "──────\n❯ deploy the fix to staging\n──────\n  ⏵⏵ auto mode on", ""))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "deploy the fix to staging")
+    assert ac._pane_pending_input("x:0.0", cwd="/opt/x") == "deploy the fix to staging"
+
+
+def test_end_to_end_ghost_no_longer_classifies_as_waiting_input(monkeypatch):
+    """The exact gaika-server shape: an at-rest pane whose only 'signal' is the dim
+    recall-ghost redraw must classify idle, not waiting_input — so
+    waiting_transitions never sees an edge into waiting and never re-wakes."""
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, _dim_pane("check status tomorrow"), ""))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "check status tomorrow")
+    pending = ac._pane_pending_input("gaika-server:0.0", cwd="/opt/gaika-server")
+    idle_tail = "✻ Sautéed for 24s · done 3:43 PM\n  ⏵⏵ auto mode on"
+    assert ac.classify_state(True, True, idle_tail, pending_input=pending) == "idle"
+
+
 def test_detect_exec_mode():
     assert ac.detect_exec_mode("⏵⏵ auto mode on (shift+tab to cycle) · ← 3 agents") == "auto"
     assert ac.detect_exec_mode("⏵⏵ accept edits on (shift+tab to cycle)") == "accept_edits"

@@ -1146,17 +1146,39 @@ def _pane_shell_running(pane: dict) -> bool:
     return bool(cmd) and cmd not in _IDLE_FG_COMMANDS
 
 
-def _pane_pending_input(target: str) -> str:
+def _pane_pending_input(target: str, cwd: str = "") -> str:
     """Real, non-empty text typed/pasted at the `❯` prompt but NOT submitted.
-    Returns '' for an empty prompt or a dim RECALL GHOST (SGR 2), so a ghost is
-    never mistaken for a staged command."""
+
+    The docstring has always promised '' for a dim RECALL GHOST (SGR 2), but the
+    code never actually delivered that: `prompt_text_from_styled` tags dim text
+    with `DIM_PREFIX` and returns it VERBATIM, and every caller's truthiness
+    check (`if pending_input and pending_input.strip()`) treats a
+    `DIM_PREFIX`-tagged string as non-empty regardless. gaika-server 2026-08-28:
+    Claude Code's own dim recall-ghost redraw of its last completed turn (varying
+    text each tick — "check status", "check status tomorrow", "next safe roadmap
+    item…") kept reading as a genuine staged command, so `classify_state` never
+    left `waiting_input` and `waiting_transitions` re-emitted a fresh actionable
+    wake on every tick the redrawn text happened to change — a real gate never
+    existed (`pending=null` in every other consumer, e.g. stall_doctor via
+    `pending_input_text`, which already does the check below).
+
+    With a `cwd`, a dim line is resolved exactly like `pending_input_text` does:
+    the recall ghost of what was ACTUALLY last submitted (`_is_recall_ghost`)
+    reads as '' (not pending); anything dim that does not match reads as real,
+    unchanged. Without a `cwd` (a caller that cannot supply one) the behaviour
+    is UNCHANGED from before this fix — dim or not, non-empty text is returned
+    as-is — so no existing caller's safety semantics move under it."""
     rc, out, _ = _tmux(["capture-pane", "-e", "-p", "-t", target, "-S", "-6"])
     if rc != 0:
         return ""
     prompt_lines = [ln for ln in out.splitlines() if "❯" in ln]
     if not prompt_lines:
         return ""
-    return prompt_text_from_styled(prompt_lines[-1].split("❯", 1)[1])
+    raw = prompt_text_from_styled(prompt_lines[-1].split("❯", 1)[1])
+    if cwd and raw.startswith(DIM_PREFIX):
+        dim = raw[len(DIM_PREFIX):]
+        return "" if _is_recall_ghost(dim, cwd) else dim
+    return raw
 
 
 def agent_list() -> dict:
@@ -1183,7 +1205,7 @@ def agent_list() -> dict:
                 live_status_region(tail[-1500:])):
             shell_running = _pane_shell_running(pane)
             if not shell_running:
-                pending = _pane_pending_input(pane["target"])
+                pending = _pane_pending_input(pane["target"], cwd=(claude or {}).get("cwd", ""))
         state = classify_state(pane["alive"], is_agent, tail,
                                pending_input=pending, shell_running=shell_running)
         # OWNER TRUTH (payment): an externally_blocked caused by a recoverable key/credential/
@@ -1240,7 +1262,8 @@ def agent_status(target: str) -> dict:
             f"{', '.join(m['target'] for m in matches)}")
 
     agent = matches[0]
-    evidence = conversation_evidence(agent.get("claude_cwd") or agent.get("cwd") or "")
+    agent_cwd = agent.get("claude_cwd") or agent.get("cwd") or ""
+    evidence = conversation_evidence(agent_cwd)
     rc, out, _ = _tmux(["capture-pane", "-p", "-t", agent["target"], "-S", "-40"])
     recent = redact(out) if rc == 0 else ""
     shell_running, pending = False, ""
@@ -1248,7 +1271,7 @@ def agent_status(target: str) -> dict:
             live_status_region(recent[-1500:])):
         shell_running = _pane_shell_running(agent)
         if not shell_running:
-            pending = _pane_pending_input(agent["target"])
+            pending = _pane_pending_input(agent["target"], cwd=agent_cwd)
     state = classify_state(agent["alive"], agent["is_agent"], recent,
                            pending_input=pending, shell_running=shell_running)
     audit("agent_status", agent["target"], found=True, alive=agent["alive"], is_agent=agent["is_agent"])
