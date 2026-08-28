@@ -547,6 +547,34 @@ def last_submitted_text(cwd: str) -> str:
         return ""
 
 
+# How fresh a transcript write has to be to count as "still working right now".
+# Generous: the companion polls on a ~20s cadence and a capture/tmux round-trip
+# costs real time, so this only has to beat that gap, not be split-second exact.
+RECENTLY_ACTIVE_SECS = int(os.getenv("AGENT_CONVERSATION_RECENT_SECS", "10"))
+
+
+def conversation_recently_active(cwd: str, within_secs: int = RECENTLY_ACTIVE_SECS) -> bool:
+    """Was this project's Claude transcript written to within the last
+    `within_secs`? A file Claude Code appends to continuously while it is
+    thinking/streaming — independent of what any single pane-text capture
+    happened to show at the same instant. gaika-server 2026-08-28 (event
+    10801): the pane's active-run text ("Wibbling… (thinking)") did not match
+    any known spinner pattern, so a composer/pending heuristic classified a
+    genuinely-thinking agent as waiting_input. This is the general backstop:
+    real recent activity, proven independently of pane-text regexes, must
+    always win over a pending-input guess — never the other way around."""
+    import glob
+    try:
+        proj = "/root/.claude/projects/" + cwd.replace("/", "-")
+        files = glob.glob(proj + "/*.jsonl")
+        if not files:
+            return False
+        newest_mtime = max(os.path.getmtime(f) for f in files)
+        return (time.time() - newest_mtime) < within_secs
+    except Exception:  # noqa: BLE001 — unreadable transcript must never block classification
+        return False
+
+
 def _is_recall_ghost(dim_text: str, cwd: str) -> bool:
     """Is this dim line the recall ghost of what was last submitted?
 
@@ -848,6 +876,12 @@ _STATE_ACTIVE_RUN_RE = re.compile(
     r"|\(\d+\s*m?s(\s+\d+s)?\s*·"
     r"|·\s*thinking\b"
     r"|…\s*\(\d+\s*m?s\b"
+    # gaika-server 2026-08-28 (event 10801): a whimsical-gerund spinner ("Wibbling…
+    # (thinking)") with no digit/duration in the parenthesis at all — the existing
+    # "…​ (Ns" form requires a number and missed it, so an actively-thinking turn
+    # fell through every active-run signal into idle, and pending_input then
+    # misread the composer as waiting_input while the agent was genuinely working.
+    r"|\(thinking\)"
     # Claude Code footer shows "· N shell ·" while a BACKGROUND shell command runs
     # (e.g. a live monitor launched via the Bash tool). The pane foreground stays
     # `claude`, so the pane-command heuristic misses it — this footer marker means the
@@ -1204,8 +1238,13 @@ def agent_list() -> dict:
         if is_agent and pane["alive"] and not _STATE_ACTIVE_RUN_RE.search(
                 live_status_region(tail[-1500:])):
             shell_running = _pane_shell_running(pane)
-            if not shell_running:
-                pending = _pane_pending_input(pane["target"], cwd=(claude or {}).get("cwd", ""))
+            cwd = (claude or {}).get("cwd", "")
+            # Independent-of-pane-text backstop (event 10801): a transcript actively
+            # being written to is real work in progress no matter what the tail-text
+            # spinner regex did or didn't catch. Never let a pending-input guess
+            # override proof this fresh.
+            if not shell_running and not conversation_recently_active(cwd):
+                pending = _pane_pending_input(pane["target"], cwd=cwd)
         state = classify_state(pane["alive"], is_agent, tail,
                                pending_input=pending, shell_running=shell_running)
         # OWNER TRUTH (payment): an externally_blocked caused by a recoverable key/credential/
@@ -1270,7 +1309,7 @@ def agent_status(target: str) -> dict:
     if agent["alive"] and agent["is_agent"] and not _STATE_ACTIVE_RUN_RE.search(
             live_status_region(recent[-1500:])):
         shell_running = _pane_shell_running(agent)
-        if not shell_running:
+        if not shell_running and not conversation_recently_active(agent_cwd):
             pending = _pane_pending_input(agent["target"], cwd=agent_cwd)
     state = classify_state(agent["alive"], agent["is_agent"], recent,
                            pending_input=pending, shell_running=shell_running)

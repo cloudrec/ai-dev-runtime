@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 
 import pytest
 
@@ -589,6 +590,57 @@ def test_end_to_end_ghost_no_longer_classifies_as_waiting_input(monkeypatch):
     pending = ac._pane_pending_input("gaika-server:0.0", cwd="/opt/gaika-server")
     idle_tail = "✻ Sautéed for 24s · done 3:43 PM\n  ⏵⏵ auto mode on"
     assert ac.classify_state(True, True, idle_tail, pending_input=pending) == "idle"
+
+
+# ── active work must never classify as waiting_input (gaika-server, event 10801,
+# 2026-08-28): a whimsical-gerund spinner with no digit/duration in the parens
+# ("Wibbling… (thinking)") matched no known active-run pattern, and a composer/
+# pending heuristic then misread the still-thinking agent as waiting_input. ──
+
+def test_gerund_thinking_spinner_without_a_duration_is_working():
+    tail = "  Wibbling… (thinking)\n───\n❯\n───\n  ⏵⏵ auto mode on"
+    assert ac.classify_state(True, True, tail) == "working"
+
+
+def test_conversation_recently_active_true_for_a_fresh_transcript_write(monkeypatch):
+    monkeypatch.setattr("glob.glob", lambda pattern: ["/fake/gaika-server/session.jsonl"])
+    monkeypatch.setattr("os.path.getmtime", lambda f: time.time() - 2)
+    assert ac.conversation_recently_active("/opt/gaika-extension") is True
+
+
+def test_conversation_recently_active_false_for_a_stale_transcript(monkeypatch):
+    monkeypatch.setattr("glob.glob", lambda pattern: ["/fake/gaika-server/session.jsonl"])
+    monkeypatch.setattr("os.path.getmtime", lambda f: time.time() - 120)
+    assert ac.conversation_recently_active("/opt/gaika-extension") is False
+
+
+def test_conversation_recently_active_false_with_no_transcript(monkeypatch):
+    monkeypatch.setattr("glob.glob", lambda pattern: [])
+    assert ac.conversation_recently_active("/opt/never-run-here") is False
+
+
+def test_recent_transcript_activity_overrides_a_pending_input_guess(monkeypatch):
+    """The general backstop the incident actually needs: even if the pane text
+    looks exactly like a real pending line (any composer heuristic could fire),
+    proof of very-recent transcript activity must win — agent_list() must never
+    classify this pane waiting_input while it is provably still working."""
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, "PANE", ""))
+    monkeypatch.setattr(ac, "parse_panes", lambda out: [
+        {"target": "gaika-server:0.0", "session": "gaika-server", "alive": True,
+         "pid": 1, "command": "claude", "cwd": "/opt/gaika-extension"}])
+    monkeypatch.setattr(ac, "find_claude_in_pane",
+                        lambda pid: {"pid": pid, "cwd": "/opt/gaika-extension"})
+    monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k: "  Continuing the audit.")
+    monkeypatch.setattr(ac, "_pane_shell_running", lambda pane: False)
+    monkeypatch.setattr(ac, "conversation_recently_active", lambda cwd: True)
+
+    def _fail_if_called(target, cwd=""):
+        raise AssertionError("pending-input heuristic must not run while recently active")
+    monkeypatch.setattr(ac, "_pane_pending_input", _fail_if_called)
+    monkeypatch.setattr(ac, "audit", lambda *a, **k: None)
+    inv = ac.agent_list()
+    st = [x for x in inv["agents"] if x["target"] == "gaika-server:0.0"][0]["state"]
+    assert st != "waiting_input"
 
 
 def test_detect_exec_mode():
