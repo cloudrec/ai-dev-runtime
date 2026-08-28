@@ -37,11 +37,16 @@ from core import job_executor, job_kinds, job_store, model_router  # noqa: E402
 
 
 def setup_module(_m):
-    try:
-        os.remove(os.environ["RUNTIME_DB"])
-    except (FileNotFoundError, KeyError):
-        pass
+    # conftest.py points RUNTIME_DB at ONE shared temp file for the whole pytest
+    # session. Removing it here raced other test modules' still-live background
+    # threads (job_executor's heartbeat, or an unjoined dispatch thread) writing
+    # to it mid-run -> sqlite3.OperationalError: attempt to write a readonly
+    # database in unrelated files. Clearing the ROWS instead leaves the file
+    # (and any other module's open connection) intact, while still giving this
+    # module the same "starts empty" guarantee the old os.remove() gave it.
     job_store.init_db()
+    with job_store._LOCK, job_store._conn() as c:
+        c.execute("DELETE FROM jobs")
 
 
 @pytest.fixture(autouse=True)
