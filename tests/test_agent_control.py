@@ -742,6 +742,53 @@ def test_gaika_server_agent_list_reports_working_for_parent_with_live_children(m
     assert st == "working"
 
 
+# ── event 11073 (gaika-server, 2026-08-28): a fresh false agent_waiting_input
+# AFTER the 11050 wrap-tolerance fix landed in this file — but the fix was
+# never a code defect for this exact evidence. ai-runtime.service, the process
+# that actually runs agent_orchestrator.run_loop() -> waiting_transitions ->
+# agent_waiting_input, was never restarted across three straight
+# agent_control.py fixes; it kept running pre-fix code from before this
+# session even started. Verified live: this evidence resolves to "working"
+# under the code that was already committed at the time of the wake — the gap
+# was a deploy skew (see test_wake_pipeline_health.py's per-worker skew
+# tests), not a missing pattern. This test locks in the exact evidence shape
+# so a future regression in either the regex or the deploy path is caught. ──
+
+def _event_11073_tail() -> str:
+    return ("  Ran 1 shell command\n"
+            "  ● Still waiting.\n\n"
+            "✻ Waiting for 2 background\n  agents to finish\n"
+            "  ✔ Update installed · Re…\n───\n"
+            "❯ continue waiting, check b…\n───\n"
+            "  [CAVEMAN]\n  ⏵⏵ auto mode on      · …\n\n"
+            "  ● main\n  ◯ general-purpose 3m 9s ·\n  ◯ general-purpose 3m 5s ·")
+
+
+def test_event_11073_active_test_run_with_live_child_is_working():
+    assert ac.classify_state(True, True, _event_11073_tail()) == "working"
+
+
+def test_event_11073_agent_list_end_to_end_is_working_not_pending(monkeypatch):
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, "PANE", ""))
+    monkeypatch.setattr(ac, "parse_panes", lambda out: [
+        {"target": "gaika-server:0.0", "session": "gaika-server", "alive": True,
+         "pid": 1, "command": "claude", "cwd": "/opt/gaika-extension"}])
+    monkeypatch.setattr(ac, "find_claude_in_pane",
+                        lambda pid: {"pid": pid, "cwd": "/opt/gaika-extension"})
+    monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k: _event_11073_tail())
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("pending-input/shell heuristics must not run — "
+                             "the active-run check must already resolve this")
+    monkeypatch.setattr(ac, "_pane_shell_running", _fail_if_called)
+    monkeypatch.setattr(ac, "_pane_pending_input", _fail_if_called)
+    monkeypatch.setattr(ac, "conversation_recently_active", _fail_if_called)
+    monkeypatch.setattr(ac, "audit", lambda *a, **k: None)
+    inv = ac.agent_list()
+    st = [x for x in inv["agents"] if x["target"] == "gaika-server:0.0"][0]["state"]
+    assert st == "working"
+
+
 def test_detect_exec_mode():
     assert ac.detect_exec_mode("⏵⏵ auto mode on (shift+tab to cycle) · ← 3 agents") == "auto"
     assert ac.detect_exec_mode("⏵⏵ accept edits on (shift+tab to cycle)") == "accept_edits"

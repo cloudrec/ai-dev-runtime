@@ -13,6 +13,8 @@ feeding itself is a failure this system has already had.
 """
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from core import wake_bridge
@@ -258,7 +260,7 @@ def test_a_failing_health_call_never_kills_the_loop(monkeypatch):
 
 def test_a_worker_started_before_the_current_code_is_flagged(conn, monkeypatch):
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
-    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 60)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 60)
     skew = wake_bridge.worker_skew(conn=conn, now=NOW)
     assert len(skew) == 1
     assert skew[0]["worker"] == "wake_companion"
@@ -266,14 +268,14 @@ def test_a_worker_started_before_the_current_code_is_flagged(conn, monkeypatch):
 
 
 def test_a_worker_restarted_after_the_deploy_is_clean(conn, monkeypatch):
-    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 600)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 600)
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 60)
     assert wake_bridge.worker_skew(conn=conn, now=NOW) == []
 
 
 def test_skew_makes_the_pipeline_report_stuck(conn, monkeypatch):
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
-    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 60)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 60)
     h = wake_bridge.pipeline_health(conn=conn, now=NOW)
     assert h["status"] == "stuck"
     assert any(r.startswith("worker_running_stale_code:wake_companion") for r in h["reasons"])
@@ -283,7 +285,7 @@ def test_a_heartbeat_from_the_same_process_keeps_the_original_start_time(conn, m
     """A busy stale worker must not be able to clear its own alarm."""
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 5)
-    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 60)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 60)
     assert len(wake_bridge.worker_skew(conn=conn, now=NOW)) == 1
 
 
@@ -294,7 +296,7 @@ def test_a_restart_under_a_new_pid_clears_the_alarm(conn, monkeypatch):
     because the heartbeat path preserved the old start time."""
     monkeypatch.setattr(wake_bridge.os, "getpid", lambda: 1111)
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
-    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda: NOW - 600)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 600)
     assert len(wake_bridge.worker_skew(conn=conn, now=NOW)) == 1     # stale
 
     monkeypatch.setattr(wake_bridge.os, "getpid", lambda: 2222)      # restarted
@@ -304,6 +306,36 @@ def test_a_restart_under_a_new_pid_clears_the_alarm(conn, monkeypatch):
 
 def test_no_registered_worker_reports_no_skew(conn):
     assert wake_bridge.worker_skew(conn=conn, now=NOW) == []
+
+
+# ── per-worker watched files (event 11073) ─────────────────────────────────
+# ai-runtime.service (running agent_orchestrator.run_loop, the source of
+# waiting_transitions/agent_waiting_input events) was never restarted across
+# three straight agent_control.py fixes on 2026-08-28 - only the SEPARATE
+# owner-os-wake-companion.service was, every time. worker_skew() previously
+# judged every registered worker against wake_bridge.py's own mtime, so it
+# could not have caught this: agent_orchestrator watches a different file set.
+
+def test_a_worker_is_judged_only_against_its_own_watched_files(conn, monkeypatch):
+    monkeypatch.setattr(wake_bridge, "_WORKER_WATCHED_FILES", {
+        "wake_companion": ("wake_bridge.py",),
+        "agent_orchestrator": ("agent_control.py",),
+    })
+    mtimes = {"wake_bridge.py": NOW - 600, "agent_control.py": NOW - 10}
+    monkeypatch.setattr(wake_bridge.os.path, "getmtime",
+                         lambda p: mtimes[os.path.basename(p)])
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 300)
+    wake_bridge.register_worker("agent_orchestrator", conn=conn, now=NOW - 300)
+    skew = wake_bridge.worker_skew(conn=conn, now=NOW)
+    assert [w["worker"] for w in skew] == ["agent_orchestrator"]
+
+
+def test_agent_orchestrator_watched_files_include_agent_control(monkeypatch):
+    """The exact shape of event 11073: agent_control.py changed, wake_bridge.py
+    did not. If agent_control.py ever falls out of the watched set, this
+    mechanism silently stops catching the class of bug it was built for."""
+    assert "agent_control.py" in wake_bridge._WORKER_WATCHED_FILES["agent_orchestrator"]
+    assert "agent_orchestrator.py" in wake_bridge._WORKER_WATCHED_FILES["agent_orchestrator"]
 
 
 # ── a cooldown is not a stall ──────────────────────────────────────────────

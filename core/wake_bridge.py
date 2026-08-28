@@ -660,11 +660,23 @@ CREATE TABLE IF NOT EXISTS wake_worker (
 """
 
 
-def _module_mtime() -> float:
-    """Newest mtime across the modules a deliverer actually runs."""
+# Which source files matter varies by worker - the wake companion cares about
+# its own delivery code, the agent orchestrator cares about the classifier it
+# imports (this is how event 11073 happened: agent_control.py got four fixes
+# across 2026-08-28 but ai-runtime.service, which owns the orchestrator loop,
+# was only ever restarted for the first one).
+_WORKER_WATCHED_FILES = {
+    "wake_companion": ("wake_bridge.py", "wake_routes.py"),
+    "agent_orchestrator": ("agent_control.py", "agent_orchestrator.py",
+                            os.path.join("control_plane", "waiting_transitions.py")),
+}
+
+
+def _module_mtime(worker: str = "wake_companion") -> float:
+    """Newest mtime across the modules this worker actually runs."""
     newest = 0.0
     here = os.path.dirname(os.path.abspath(__file__))
-    for rel in ("wake_bridge.py", "wake_routes.py"):
+    for rel in _WORKER_WATCHED_FILES.get(worker, _WORKER_WATCHED_FILES["wake_companion"]):
         try:
             newest = max(newest, os.path.getmtime(os.path.join(here, rel)))
         except OSError:
@@ -709,13 +721,13 @@ def register_worker(worker: str, conn=None, now: Optional[float] = None) -> dict
 def worker_skew(conn=None, now: Optional[float] = None) -> list:
     """Workers whose start predates the code they are supposed to be running."""
     now = now if now is not None else now_ts()
-    code_mtime = _module_mtime()
     conn, own = _c(conn)
     try:
         conn.execute(_WORKER_SCHEMA)
         out = []
         for worker, started, last_seen in conn.execute(
                 "SELECT worker, started_ts, last_seen_ts FROM wake_worker"):
+            code_mtime = _module_mtime(worker)
             if started and code_mtime > float(started):
                 out.append({"worker": worker,
                             "started_at_age_secs": int(now - float(started)),

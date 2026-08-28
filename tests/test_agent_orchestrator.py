@@ -344,3 +344,37 @@ def test_budget_reset_idle_marks_stalled_without_escalation(monkeypatch):
     assert rec["notification_state"] == "stalled_after_budget"
     assert "no auto re-dispatch" in (rec["blocker_text"] or "")
     assert out["escalations"] == []           # internal → surfaced, not alerted
+
+
+# ── run_loop registers itself for deploy-skew detection (event 11073) ──────
+# ai-runtime.service, which owns this loop, was never restarted across three
+# straight agent_control.py fixes on 2026-08-28 - each fix's deploy step only
+# restarted the SEPARATE owner-os-wake-companion.service. Each tick must
+# heartbeat wake_bridge's worker registry so that gap becomes self-diagnosing
+# via worker_skew() instead of silently recurring.
+class _StopLoop(Exception):
+    pass
+
+
+def test_run_loop_registers_the_orchestrator_worker_each_tick(monkeypatch):
+    import asyncio
+    from core import wake_bridge as wb
+
+    monkeypatch.setattr(orch, "ENABLED", True)
+    monkeypatch.setattr(orch, "load_config", lambda: None)
+    monkeypatch.setattr(orch, "refresh_and_resolve", lambda approve=True: {})
+    from core import direct_agent_lifecycle as _dal
+    monkeypatch.setattr(_dal, "ENABLED", False)
+
+    calls = []
+    monkeypatch.setattr(wb, "register_worker", lambda w: calls.append(w))
+
+    async def _raise_sleep(_secs):
+        raise _StopLoop
+
+    monkeypatch.setattr(asyncio, "sleep", _raise_sleep)
+
+    with pytest.raises(_StopLoop):
+        asyncio.run(orch.run_loop())
+
+    assert calls == ["agent_orchestrator"]

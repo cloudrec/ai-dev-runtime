@@ -1025,6 +1025,11 @@ async def run_loop() -> None:
     log.info(f"agent orchestrator started (interval {interval}s)")
     while True:
         try:
+            from core import wake_bridge as _wb
+            _wb.register_worker("agent_orchestrator")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"orchestrator worker registration error: {e}")
+        try:
             res = await asyncio.to_thread(refresh_and_resolve, True)
             if res.get("resolved") or res.get("escalations"):
                 log.info(f"orchestrator: resolved={len(res.get('resolved', []))} "
