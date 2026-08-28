@@ -296,6 +296,132 @@ def test_actuation_scope_env(monkeypatch, conn):
     assert any(s.get("why") == "actuation_not_allowed" for s in r["skipped"])
 
 
+# ── per-target pause: 2026-08-28 gaika-server LOST_CONTINUATION loop ─────────
+# Claude Code's own dim "suggested next input" redraw was auto-submitted as if
+# it were a real queued owner instruction, in a self-feeding loop. The pause is
+# a scoped, durable, reversible safety guard — every OTHER target's behaviour
+# must stay exactly as before.
+
+def test_pause_target_stops_actuation_for_that_target_only(conn):
+    sd.pause_target("gaika-server:0.0", "false-submit loop, 2026-08-28", conn=conn)
+    emit, dlv = Emit(), Deliver()
+    paused = _agent("gaika-server:0.0", "/opt/gaika-extension")
+    other = _agent("gaika-video:0.0", "/opt/gaika-drop")
+    tails = {"gaika-server:0.0": GAIKA_TAIL, "gaika-video:0.0": GAIKA_TAIL}
+    pend = {"gaika-server:0.0": GAIKA_PENDING, "gaika-video:0.0": GAIKA_PENDING}
+    _scan([paused, other], tails, pend, emit, dlv, conn, now=NOW)
+    r = _scan([paused, other], tails, pend, emit, dlv, conn,
+             now=NOW + sd.QUEUED_SLO_SECS + 1)
+    # the paused target got NO action of any kind
+    assert not any(a["target"] == "gaika-server:0.0" for a in r["acted"])
+    assert not any(c["target"] == "gaika-server:0.0" for c in dlv.calls)
+    assert any(s["target"] == "gaika-server:0.0" and s["why"] == "paused"
+              for s in r["skipped"])
+    # the OTHER target's normal auto-submit behaviour is completely unaffected
+    assert [a["action"] for a in r["acted"]] == ["submit_queued"]
+    assert dlv.calls[0]["target"] == "gaika-video:0.0"
+
+
+def test_paused_target_is_observed_not_silently_dropped(conn):
+    """Pausing stops ACTUATION, not visibility — the target still shows up in
+    every scan so its state is never invisible to the owner."""
+    sd.pause_target("gaika-server:0.0", "investigation", conn=conn)
+    r = _scan([_agent("gaika-server:0.0", "/opt/gaika-extension")],
+              {"gaika-server:0.0": GAIKA_TAIL}, {"gaika-server:0.0": GAIKA_PENDING},
+              Emit(), Deliver(), conn, now=NOW)
+    assert r["skipped"] == [{"target": "gaika-server:0.0", "why": "paused"}]
+
+
+def test_resume_target_restores_normal_actuation(conn):
+    sd.pause_target("gaika-server:0.0", "investigation", conn=conn)
+    emit, dlv = Emit(), Deliver()
+    ag = [_agent("gaika-server:0.0", "/opt/gaika-extension")]
+    tails = {"gaika-server:0.0": GAIKA_TAIL}
+    pend = {"gaika-server:0.0": GAIKA_PENDING}
+    _scan(ag, tails, pend, emit, dlv, conn, now=NOW)
+    r1 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
+    assert not dlv.calls and r1["skipped"][0]["why"] == "paused"
+
+    assert sd.resume_target("gaika-server:0.0", conn=conn) is True
+    # a fresh episode opens (paused ticks never started the clock) then acts after the SLO
+    _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 2)
+    r2 = _scan(ag, tails, pend, emit, dlv, conn,
+              now=NOW + sd.QUEUED_SLO_SECS + 2 + sd.QUEUED_SLO_SECS + 1)
+    assert [a["action"] for a in r2["acted"]] == ["submit_queued"]
+    assert dlv.calls[0]["target"] == "gaika-server:0.0"
+
+
+def test_resume_of_a_never_paused_target_reports_false(conn):
+    assert sd.resume_target("never-paused:0.0", conn=conn) is False
+
+
+def test_paused_targets_lists_current_pauses(conn):
+    sd.pause_target("gaika-server:0.0", "false-submit loop", by="owner", conn=conn)
+    listing = sd.paused_targets(conn=conn)
+    assert len(listing) == 1
+    assert listing[0]["target"] == "gaika-server:0.0"
+    assert listing[0]["reason"] == "false-submit loop"
+    assert listing[0]["paused_by"] == "owner"
+    sd.resume_target("gaika-server:0.0", conn=conn)
+    assert sd.paused_targets(conn=conn) == []
+
+
+# ── cross-episode submit-rate guard (the actual loop stopper) ───────────────
+# MAX_ACTIONS_PER_EPISODE never sees this shape: a fresh, DIFFERENT queued line
+# every cycle starts a brand-new episode with its own zeroed action counter, so
+# the per-episode loop guard never trips. LOST_CONTINUATION_MAX_SUBMITS_PER_
+# WINDOW counts submit_queued deliveries for the target ACROSS episodes.
+
+def _submit_episode(agents, target, text, emit, dlv, conn, t0):
+    # the digest is computed from the tail's BOTTOM CONTENT line, not the composer
+    # line — a real redraw episode differs there too (Claude answered differently
+    # each cycle in the live incident), so the fixture must vary it the same way
+    # for the digest (and therefore episode identity) to actually change.
+    tail = f"  {text}, done.\n✻ Sautéed for 24s\n───\n❯ {text}\n───\n  ⏵⏵ auto mode on\n"
+    tails = {target: tail}
+    pend = {target: text}
+    _scan(agents, tails, pend, emit, dlv, conn, now=t0)
+    return _scan(agents, tails, pend, emit, dlv, conn, now=t0 + sd.QUEUED_SLO_SECS + 1)
+
+
+def test_rate_limit_escalates_after_repeated_different_digest_submits(conn):
+    """The exact gaika-server 2026-08-28 shape: three DIFFERENT self-generated
+    suggestions submitted within ~15 minutes, none of them repeating a digest —
+    the fourth in the same rolling window must escalate, not submit."""
+    emit, dlv = Emit(), Deliver()
+    ag = [_agent("gaika-server:0.0", "/opt/gaika-extension")]
+    t = NOW
+    for text in ("check status", "check status tomorrow", "next safe roadmap item"):
+        r = _submit_episode(ag, "gaika-server:0.0", text, emit, dlv, conn, t)
+        assert [a["action"] for a in r["acted"]] == ["submit_queued"], text
+        t += sd.QUEUED_SLO_SECS + 60
+    r4 = _submit_episode(ag, "gaika-server:0.0", "ok stopping here", emit, dlv, conn, t)
+    assert [a["action"] for a in r4["acted"]] == ["escalate"]
+    assert emit.calls[-1]["type"] == "agent_waiting_input"
+    assert "lost_continuation_submit_rate_exceeded" in emit.calls[-1]["payload"]["reason"]
+    assert len([c for c in dlv.calls if c["action"] == "submit"]) == 3
+
+
+def test_rate_limit_does_not_affect_a_single_legitimate_submission(conn):
+    """One real queued instruction, one submit — the ordinary shape for every
+    OTHER project — is completely unaffected."""
+    emit, dlv = Emit(), Deliver()
+    r = _submit_episode([_agent()], "gaika-video:0.0", GAIKA_PENDING, emit, dlv, conn, NOW)
+    assert [a["action"] for a in r["acted"]] == ["submit_queued"]
+
+
+def test_decide_boundary_for_recent_lc_submits():
+    below = sd.decide(sd.LOST_CONTINUATION, pending="proceed",
+                      age_secs=sd.QUEUED_SLO_SECS + 1,
+                      recent_lc_submits=sd.LOST_CONTINUATION_MAX_SUBMITS_PER_WINDOW - 1)
+    assert below["action"] == "submit_queued"
+    at_cap = sd.decide(sd.LOST_CONTINUATION, pending="proceed",
+                       age_secs=sd.QUEUED_SLO_SECS + 1,
+                       recent_lc_submits=sd.LOST_CONTINUATION_MAX_SUBMITS_PER_WINDOW)
+    assert at_cap["action"] == "escalate"
+    assert "lost_continuation_submit_rate_exceeded" in at_cap["reason"]
+
+
 def test_progress_resets_episode_and_rearm(conn):
     emit, dlv = Emit(), Deliver()
     t = "gaika-video:0.0"

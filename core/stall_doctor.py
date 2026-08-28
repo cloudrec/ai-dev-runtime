@@ -67,6 +67,23 @@ ACTION_COOLDOWN_SECS = int(os.getenv("STALL_DOCTOR_COOLDOWN_SECS", "1800"))
 # actions retry on a short clock; the loop guard still caps total attempts.
 FAILED_RETRY_COOLDOWN_SECS = int(os.getenv("STALL_DOCTOR_FAILED_RETRY_SECS", "180"))
 MAX_ACTIONS_PER_EPISODE = int(os.getenv("STALL_DOCTOR_MAX_ACTIONS", "2"))
+# 2026-08-28 gaika-server incident: `may_submit_queued` proves the QUEUED TEXT is
+# content-safe, never that it was actually put there by the owner — there is no
+# durable record anywhere in this codebase of Owner OS itself staging text into a
+# composer (confirmed: agent_send/agent_answer always paste+Enter atomically; the
+# one staging primitive, DirectPaneController.replace_pending(submit=False), has
+# no production caller). A genuine owner-staged instruction is a rare, one-off
+# event per target; Claude Code's own dim "suggested next input" redraw is not —
+# it regenerates fresh (different) text after every turn, and MAX_ACTIONS_PER_
+# EPISODE never catches it because a new digest each cycle starts a brand-new
+# episode with its own zeroed action counter. This is the cross-episode backstop:
+# count actual submit_queued DELIVERIES for this target over a rolling window,
+# regardless of digest/episode; once the rate is implausible for a human pacing
+# real instructions, refuse and escalate instead of guessing at content.
+LOST_CONTINUATION_SUBMIT_WINDOW_SECS = int(
+    os.getenv("STALL_DOCTOR_LC_SUBMIT_WINDOW_SECS", "3600"))
+LOST_CONTINUATION_MAX_SUBMITS_PER_WINDOW = int(
+    os.getenv("STALL_DOCTOR_LC_MAX_SUBMITS", "3"))
 
 LOST_CONTINUATION = "LOST_CONTINUATION"
 CHILD_WORKFLOW_WAIT = "CHILD_WORKFLOW_WAIT"
@@ -123,6 +140,15 @@ CREATE TABLE IF NOT EXISTS stall_doctor_action (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     target TEXT, shape TEXT, action TEXT, digest TEXT,
     delivered INTEGER, detail TEXT, at TEXT, ts REAL
+);
+-- 2026-08-28 gaika-server incident: LOST_CONTINUATION auto-submitted Claude
+-- Code's own dim "suggested next input" redraw as if it were a real queued
+-- owner instruction, in a self-feeding loop (submit -> agent responds ->
+-- new suggestion redraws -> submit again). A per-target pause is a durable,
+-- reversible, SCOPED safety guard — every other target's behaviour is
+-- completely unaffected, and no restart is needed to set or clear it.
+CREATE TABLE IF NOT EXISTS stall_doctor_pause (
+    target TEXT PRIMARY KEY, reason TEXT, at TEXT, ts REAL, paused_by TEXT
 )
 """
 
@@ -199,8 +225,16 @@ def _digest(tail: str, child: Optional[dict]) -> str:
 
 def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
            actions_used: int = 0, since_last_action: float = 1e9,
-           child: Optional[dict] = None, last_action_ok: bool = True) -> dict:
-    """Pure policy. Returns {action, reason} — fully testable."""
+           child: Optional[dict] = None, last_action_ok: bool = True,
+           recent_lc_submits: int = 0) -> dict:
+    """Pure policy. Returns {action, reason} — fully testable.
+
+    `recent_lc_submits`: how many submit_queued deliveries this target has
+    already had for LOST_CONTINUATION within LOST_CONTINUATION_SUBMIT_WINDOW_SECS,
+    counted ACROSS episodes/digests (unlike `actions_used`, which is per-episode
+    and resets whenever the queued text changes). The caller computes this from
+    the durable stall_doctor_action log; it is the one loop shape MAX_ACTIONS_
+    PER_EPISODE cannot see."""
     if shape in (NONE, OWNER_WAIT):
         return {"action": "none",
                 "reason": "not_doctor_domain" if shape == OWNER_WAIT else "no_wait"}
@@ -223,6 +257,9 @@ def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
                 "reason": "action_cooldown" if last_action_ok
                 else "failed_action_cooldown"}
     if shape == LOST_CONTINUATION:
+        if recent_lc_submits >= LOST_CONTINUATION_MAX_SUBMITS_PER_WINDOW:
+            return {"action": "escalate",
+                   "reason": f"lost_continuation_submit_rate_exceeded:{recent_lc_submits}"}
         ok, why = may_submit_queued(pending)
         if ok:
             return {"action": "submit_queued", "reason": why}
@@ -241,6 +278,65 @@ def _actuation_allowed(target: str) -> bool:
     if a.lower() == "all":
         return True
     return target in {t.strip() for t in a.split(",") if t.strip()}
+
+
+# ── per-target pause: a scoped, reversible override independent of ACTUATE ───
+def pause_target(target: str, reason: str, *, by: str = "owner", conn=None,
+                 now: Optional[float] = None) -> None:
+    """Exclude exactly ONE target from every stall_doctor action — read-only
+    observation continues (the target still shows up in `skipped`), only
+    actuation stops. Durable (a DB row, not an env var), so it takes effect and
+    reverses without a service restart, and it never touches ACTUATE or any
+    other target's behaviour."""
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        conn.execute(
+            "INSERT INTO stall_doctor_pause (target,reason,at,ts,paused_by) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(target) DO UPDATE SET reason=excluded.reason, at=excluded.at, "
+            "ts=excluded.ts, paused_by=excluded.paused_by",
+            (target, reason, now_iso(), now, by))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def resume_target(target: str, conn=None) -> bool:
+    """Reverse `pause_target`. Returns whether a pause actually existed."""
+    conn, own = _conn(conn)
+    try:
+        cur = conn.execute("DELETE FROM stall_doctor_pause WHERE target=?", (target,))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        if own:
+            conn.close()
+
+
+def is_paused(target: str, conn=None) -> bool:
+    conn, own = _conn(conn)
+    try:
+        return conn.execute(
+            "SELECT 1 FROM stall_doctor_pause WHERE target=?", (target,)
+        ).fetchone() is not None
+    finally:
+        if own:
+            conn.close()
+
+
+def paused_targets(conn=None) -> list:
+    """Every currently paused target, for observability — never guessed from logs."""
+    conn, own = _conn(conn)
+    try:
+        rows = conn.execute(
+            "SELECT target, reason, at, paused_by FROM stall_doctor_pause "
+            "ORDER BY ts").fetchall()
+        return [{"target": r[0], "reason": r[1], "at": r[2], "paused_by": r[3]}
+                for r in rows]
+    finally:
+        if own:
+            conn.close()
 
 
 def _deliver(target: str, cwd: str, *, action: str, text: str) -> dict:
@@ -321,6 +417,9 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             target = a.get("target") or ""
             if not target:
                 continue
+            if is_paused(target, conn=conn):
+                skipped.append({"target": target, "why": "paused"})
+                continue
             cwd = a.get("claude_cwd") or a.get("cwd") or ""
             try:
                 tail = read_fn(target)
@@ -367,9 +466,16 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                     " last_action_ts=0, escalated=0, last_action_ok=1",
                     (target, shape, dg, now))
                 conn.commit()
+            recent_lc_submits = 0
+            if shape == LOST_CONTINUATION:
+                recent_lc_submits = conn.execute(
+                    "SELECT COUNT(*) FROM stall_doctor_action WHERE target=? "
+                    "AND action='submit_queued' AND delivered=1 AND ts > ?",
+                    (target, now - LOST_CONTINUATION_SUBMIT_WINDOW_SECS)).fetchone()[0]
             d = decide(shape, pending=pending, age_secs=now - first_ts,
                        actions_used=actions, since_last_action=now - (last_ts or 0),
-                       child=c.get("child"), last_action_ok=last_ok)
+                       child=c.get("child"), last_action_ok=last_ok,
+                       recent_lc_submits=recent_lc_submits)
             if d["action"] == "none":
                 skipped.append({"target": target, "shape": shape, "why": d["reason"]})
                 continue
