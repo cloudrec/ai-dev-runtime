@@ -890,7 +890,12 @@ _STATE_ACTIVE_RUN_RE = re.compile(
     # A RUNNING background subagent (Fable/Task tool) is real work in progress. The live
     # mess-qa-automation pane (2026-08-03) showed "✻ Waiting for 1 background agent to
     # finish" yet classified idle — and was then listed as a poke candidate mid-audit.
-    r"|waiting for \d+ background agents?\b"
+    # gaika-server 2026-08-28 (event 11050): a narrower terminal wrapped the SAME phrase
+    # as "Waiting for 2 background\n  agents to finish" — the literal single spaces below
+    # required an exact one-line render, so the wrap silently broke the match and a
+    # parent genuinely waiting on two live child forks was woken as owner-input-blocked.
+    # \s+ tolerates a wrap at any word boundary in the phrase, not just this one.
+    r"|waiting\s+for\s+\d+\s+background\s+agents?\b"
     # Context compaction is live work — poking or /clear-ing during it corrupts state.
     r"|\bcompacting\b"
     # Live minute-form spinner "(19m 23s ·" — the second-form "(8s ·" pattern above missed

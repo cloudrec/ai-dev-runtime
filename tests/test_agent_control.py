@@ -690,6 +690,58 @@ def test_gaika_server_agent_list_reports_working_not_idle_for_bare_gerund_spinne
     assert st == "working"
 
 
+# ── event 11050 (gaika-server, 2026-08-28): a parent waiting on LIVE background
+# child forks was woken as owner-input-blocked. The active-run pattern that
+# already exists for exactly this shape ("waiting for N background agents")
+# required a literal single space, but a narrower terminal wrapped the phrase
+# across two lines ("background\n  agents") — the match silently missed. ──────
+
+def _wrapped_background_agents_tail() -> str:
+    return ("  completion notifications land.\n\n"
+            "✻ Waiting for 2 background\n  agents to finish\n"
+            "  ✔ Update installed · Re…\n───\n"
+            "❯ continue waiting, check b…\n───\n"
+            "  [CAVEMAN]\n  ⏵⏵ auto mode on      · …\n\n"
+            "  ● main\n  ◯ general-purpose 1m 53s ·\n  ◯ general-purpose 1m 40s ·")
+
+
+def test_parent_waiting_on_wrapped_background_agents_text_is_working():
+    assert ac.classify_state(True, True, _wrapped_background_agents_tail()) == "working"
+
+
+def test_parent_waiting_on_single_line_background_agent_text_is_still_working():
+    """Unchanged behaviour for the original, non-wrapped shape (mess-qa-automation,
+    2026-08-03) that the pattern already covered before this fix."""
+    tail = "✻ Waiting for 1 background agent to finish\n\n❯ \n"
+    assert ac.classify_state(True, True, tail) == "working"
+
+
+def test_gaika_server_agent_list_reports_working_for_parent_with_live_children(monkeypatch):
+    """The exact event 11050 shape end-to-end: composer holds a plausible-looking
+    'continue waiting…' line, which — without the fix — would have been read as
+    real pending input once the active-run check missed the wrapped phrase.
+    agent_list() must classify working, never waiting_input, while live child
+    forks are running."""
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, "PANE", ""))
+    monkeypatch.setattr(ac, "parse_panes", lambda out: [
+        {"target": "gaika-server:0.0", "session": "gaika-server", "alive": True,
+         "pid": 1, "command": "claude", "cwd": "/opt/gaika-extension"}])
+    monkeypatch.setattr(ac, "find_claude_in_pane",
+                        lambda pid: {"pid": pid, "cwd": "/opt/gaika-extension"})
+    monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k: _wrapped_background_agents_tail())
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("pending-input/shell heuristics must not run — "
+                             "the active-run check must already resolve this")
+    monkeypatch.setattr(ac, "_pane_shell_running", _fail_if_called)
+    monkeypatch.setattr(ac, "_pane_pending_input", _fail_if_called)
+    monkeypatch.setattr(ac, "conversation_recently_active", _fail_if_called)
+    monkeypatch.setattr(ac, "audit", lambda *a, **k: None)
+    inv = ac.agent_list()
+    st = [x for x in inv["agents"] if x["target"] == "gaika-server:0.0"][0]["state"]
+    assert st == "working"
+
+
 def test_detect_exec_mode():
     assert ac.detect_exec_mode("⏵⏵ auto mode on (shift+tab to cycle) · ← 3 agents") == "auto"
     assert ac.detect_exec_mode("⏵⏵ accept edits on (shift+tab to cycle)") == "accept_edits"
