@@ -7,6 +7,8 @@ import stat
 import subprocess
 import tempfile
 
+import pytest
+
 os.environ.setdefault("RUNTIME_DB", os.path.join(tempfile.gettempdir(), "rt_test_jobs.db"))
 
 from core import ai_planner, job_executor, job_store  # noqa: E402
@@ -128,3 +130,42 @@ sys.stdout.write(json.dumps(envelope))
     assert "a.txt" in committed and "b.txt" in committed
     from core import git_write
     assert not any(p.endswith("a.txt") or p.endswith("b.txt") for p in git_write.dirty_files(str(repo)))
+
+
+# ── test-step timeout must reap the whole process group ──────────────────────
+# subprocess.run(timeout=) kills only the direct child, so a `pytest` killed at
+# RUNTIME_TEST_TIMEOUT left everything its tests had spawned running on the
+# server. Real exposure: 7 recorded jobs (tasks 162/182/193/220/221) hit that cap
+# on the full suite, and this repo's own suite spawns long-lived CLI stubs.
+
+def test_timed_out_step_reaps_its_grandchildren(tmp_path, monkeypatch):
+    import signal as _signal
+    import subprocess as _sp
+    import time as _time
+
+    marker = tmp_path / "gc.pid"
+    script = tmp_path / "spawn.py"
+    script.write_text(
+        "import subprocess, sys, time\n"
+        f"p = subprocess.Popen(['sleep', '90'])\n"
+        f"open({str(marker)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(90)\n")
+
+    monkeypatch.setattr(job_executor, "_TEST_TIMEOUT", 3)
+    with pytest.raises(_sp.TimeoutExpired):
+        job_executor._run_step(str(tmp_path), f"python3 {script}")
+
+    gc_pid = int(marker.read_text())
+    # give the group kill a moment to land
+    for _ in range(20):
+        try:
+            os.kill(gc_pid, 0)
+        except (ProcessLookupError, OSError):
+            break
+        _time.sleep(0.25)
+    else:
+        try:
+            os.killpg(gc_pid, _signal.SIGKILL)   # don't leak from the test itself
+        except Exception:
+            pass
+        pytest.fail(f"grandchild {gc_pid} survived the step timeout — process group not reaped")
