@@ -209,3 +209,53 @@ zero errors, 10/10 flat soak samples 16:37-16:42Z). **Salvage has not yet fired 
 production** — zero runtime jobs since the 16:26Z restart, and job traffic runs
 1-4/day. The `fallback_plan_only` count is unchanged at 9 through absence of
 traffic, not through disproof. A read-only watcher is armed on the 180s signature.
+
+---
+
+# Observability gap CLOSED in code — staged, not deployed (2026-08-29)
+
+The gap recorded above ("the salvage branch emits no log line and no artifact")
+is fixed on branch `feat/salvage-observability`, cut from the deployed `5618ce3`.
+**Not pushed, merged, deployed or restarted.**
+
+## What changed
+
+* `core/ai_planner.plan()` — the salvage branch now marks its result:
+  `salvaged_after_timeout=True`, plus `planner_tokens` / `planner_cost_usd` /
+  `planner_duration_ms` carried from the envelope the provider had already
+  written before it was killed. Mirrors how `build_fallback_plan` marks its own
+  output.
+* `core/job_executor` — on a marked plan, logs
+  `"planner exceeded its deadline but had already delivered a complete plan —
+  SALVAGED, no fallback used"` and appends a
+  `planner_salvaged_after_timeout` artifact with that accounting. Mirrors the
+  `fallback_planning` artifact the failure path already recorded.
+
+Nothing else moves: no change to when salvage happens, to the fallback path, to
+the timeout, or to any status/outcome value. This is purely making an existing
+behaviour visible.
+
+## Verification
+
+* `tests/test_planner_fallback.py` 22 -> **26 passed**. New tests pin: the marker
+  and its accounting; that an ordinary fast plan is NOT marked; that the executor
+  emits both the log line and the artifact and does not report a fallback; and
+  that a genuine fallback records NO salvage artifact.
+* Regression gate: **131 passed** (`planner_fallback`, `phase13`,
+  `fallback_truthfulness`, `job_executor`, `job_kinds`, `job_workspace`,
+  `explicit_model_routing`).
+* Mutation: dropping the marker fails both the planner test and the executor
+  test. Production file restored clean.
+
+## Effect on the 180s heuristic
+
+Once this is deployed, the inference method documented above (heartbeat >= the
+full timeout, no `planner failed` log, real plan) becomes unnecessary — salvage
+answers for itself in the logs and artifacts. Until then the heuristic remains
+the only available signal, and the read-only watcher still uses it.
+
+## Gate
+
+Landing this needs merge + push + `systemctl restart ai-runtime.service`. Not
+authorized; not done. It is independent of `fix/test-step-process-group` and of
+the withdrawn cap raise.

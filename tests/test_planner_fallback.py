@@ -501,3 +501,73 @@ def test_existing_dirty_workspace_preserved(tmp_path, monkeypatch):
     assert final["status"] == "fallback_plan_only", final.get("error")
     assert stray.exists()
     assert stray.read_text() == "operator work in progress\n"
+
+
+# ── salvage must be OBSERVABLE, not merely correct ───────────────────────────
+# A salvaged plan used to be indistinguishable in the job record from an
+# ordinary slow plan: no log line, no artifact, no marker. "Did salvage ever
+# fire in production?" could only be inferred from heartbeat timing. These pin
+# the marker, the log line and the artifact.
+
+def test_salvaged_plan_is_marked_and_carries_accounting(tmp_path, monkeypatch):
+    plan_json = json.dumps({
+        "summary": "provider plan", "risk_level": "low",
+        "files": [{"path": "a.py", "operation": "create", "content": "x = 1\n"}],
+        "test_commands": [], "expected_result": "ok"})
+    cli, _ = _lingering_cli(tmp_path, plan_json)
+    _reload(monkeypatch, cli, timeout=3)
+    plan = ai_planner.plan("g", "i", str(tmp_path), [])
+    assert plan["salvaged_after_timeout"] is True
+    # accounting the provider reported before it was killed survives onto the plan
+    assert plan["planner_cost_usd"] == 0.5
+    assert plan["planner_tokens"] == {"input_tokens": 11, "output_tokens": 22}
+
+
+def test_a_normal_plan_is_not_marked_as_salvaged(tmp_path, monkeypatch):
+    plan_json = json.dumps({
+        "summary": "fast plan", "risk_level": "low",
+        "files": [{"path": "a.py", "operation": "create", "content": "x = 1\n"}],
+        "test_commands": [], "expected_result": "ok"})
+    cli, _ = _counting_cli(tmp_path, (
+        "import json, sys\n"
+        f"result = {plan_json!r}\n"
+        "sys.stdout.write(json.dumps({'type':'result','is_error':False,'result':result}))\n"))
+    _reload(monkeypatch, cli, timeout=10)
+    plan = ai_planner.plan("g", "i", str(tmp_path), [])
+    assert plan.get("salvaged_after_timeout") is not True
+
+
+def test_executor_logs_and_records_an_artifact_when_a_plan_is_salvaged(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    plan_json = json.dumps({
+        "summary": "real plan from provider", "risk_level": "low",
+        "files": [{"path": "NOTES.md", "operation": "create", "content": "real\n"}],
+        "test_commands": [], "expected_result": "ok"})
+    cli, _ = _lingering_cli(tmp_path, plan_json)
+    _reload(monkeypatch, cli, timeout=3)
+    job = job_store.create_job(project_path=str(repo), goal="g", instructions="i",
+                               task_id=862, autonomy_level="execute_safe",
+                               auto_commit=True, auto_push=False)
+    job_executor.execute(job["id"])
+    final = job_store.get_job(job["id"])
+    arts = [a for a in (final["artifacts"] or []) if a.get("planner_salvaged_after_timeout")]
+    assert arts, "no salvage artifact recorded — salvage is invisible again"
+    assert arts[0]["cost_usd"] == 0.5
+    msgs = " ".join(l.get("msg", "") for l in (final["logs"] or []))
+    assert "SALVAGED" in msgs
+    # and it is emphatically NOT a fallback
+    assert not any(a.get("fallback_planning") for a in (final["artifacts"] or []))
+    assert final["status"] != "fallback_plan_only"
+
+
+def test_a_fallback_job_records_no_salvage_artifact(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    cli, _ = _counting_cli(tmp_path, "import time\ntime.sleep(30)\n")   # nothing delivered
+    _reload(monkeypatch, cli, timeout=2)
+    job = job_store.create_job(project_path=str(repo), goal="g", instructions="i",
+                               task_id=863, autonomy_level="execute_safe",
+                               auto_commit=True, auto_push=False)
+    job_executor.execute(job["id"])
+    final = job_store.get_job(job["id"])
+    assert final["status"] == "fallback_plan_only"
+    assert not any(a.get("planner_salvaged_after_timeout") for a in (final["artifacts"] or []))
