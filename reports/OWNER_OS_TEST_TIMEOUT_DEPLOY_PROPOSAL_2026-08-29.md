@@ -93,6 +93,47 @@ Restart interrupts 6 workers; there are currently **0 in-flight jobs**.
    it harmless when it still fires. Neither substitutes for the other, and
    shipping them separately costs two restarts of a live control loop.
 
+## CORRECTION 2 — 1200s is NOT a safe cap (measured 2026-08-29, post-draft)
+
+The full suite was finally run on this branch. Result: **2550 passed in 1170.99s
+(19m30s)** — 29 seconds under the 1200s I recommended.
+
+Three measurements of the same suite this session:
+
+| Run | Tests | Duration |
+| --- | --- | --- |
+| integration branch | 2549 | 742s |
+| integration branch | 2549 | 832s |
+| `fix/test-step-process-group` | 2550 | **1171s** |
+
+The suite is not ~850s; it is **742-1171s depending on machine load** (the slow run
+competed with the live service and other agents). Duration varies by 58% for
+essentially the same test count, so a cap must be sized against the worst
+observed case under load, not the median.
+
+**1200s gives 2.5% headroom over the worst run and would re-time-out almost
+immediately.** The earlier "1200s restores headroom" claim was based on the two
+fast runs only and is withdrawn.
+
+Revised options, in order of preference:
+
+1. **Fix the cause, not the symptom — scope the derived test command.**
+   `ai_planner.default_test_commands()` returns the whole suite for every job
+   however small the change. A job touching one module does not need 2550 tests.
+   This is the only option that does not degrade as the suite grows. It changes
+   what "validated" means per job, so it is an owner policy decision.
+2. **If a cap raise is still wanted, 1200 is too low.** `2400` gives ~105%
+   headroom over the worst observed run. Note this doubles how long a genuinely
+   hung step occupies a worker before being killed — and, per CORRECTION 1, it
+   applies to `core/deliver.py`'s live merge-gate too.
+3. Do nothing to the cap and land `ce135ad` alone. Timeouts keep happening at the
+   current rate, but they stop leaking processes. This is the smallest, safest
+   step and it strictly improves on today.
+
+**Recommendation changed to (3) now, (1) next**, rather than the original batched
+cap raise. `ce135ad` is independently correct and load-insensitive; the cap number
+is not something this evidence can pin down confidently.
+
 ## CORRECTION — the cap change has a second consumer (found 2026-08-29, post-draft)
 
 The section above describes the cap as "one line, one value". The *edit* is, but
