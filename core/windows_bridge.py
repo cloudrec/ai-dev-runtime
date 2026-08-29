@@ -739,6 +739,23 @@ def complete(device_id: str, command_id: str, *, ok: bool, result: Any = None,
             raise AuthError("command belongs to a different device")
         if row["status"] in ("done", "failed"):
             return _public_command(row)      # idempotent re-post
+        if row["status"] == "expired":
+            # The owner has ALREADY been told this command was refused, and may
+            # have re-issued it on that basis. Letting a late device flip
+            # expired -> done would retroactively turn a refusal into a success
+            # and hide a double execution — precisely the "half-applied action"
+            # this module's contract disclaims. `expire_stale` retires `leased`
+            # commands too, so this is reachable whenever a device takes work and
+            # then goes dark mid-execution.
+            #
+            # The late result is not stored (that would overwrite the refusal the
+            # owner saw) but it is NOT silent either: it is audited, because a
+            # device reporting work against an expired command means that work
+            # probably ran.
+            _audit("windows_late_result_after_expiry", device_id,
+                   command_id=command_id, action=row.get("action"),
+                   reported_ok=bool(ok))
+            return _public_command(row)
         conn.execute(
             "UPDATE win_command SET status=?, ok=?, result=?, error=?, completed_at=? "
             "WHERE command_id=?",

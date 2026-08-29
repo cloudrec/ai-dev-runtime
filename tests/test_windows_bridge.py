@@ -471,3 +471,48 @@ def test_a_finished_command_is_never_rewritten_by_a_read(device):
     _backdate(cmd["command_id"])                       # old, but already terminal
     got = wb.get_command(cmd["command_id"])
     assert got["status"] == "done"
+
+
+# ── a late result must not resurrect an expired command ──────────────────────
+# complete() treated only ("done","failed") as terminal, so `expired` was
+# writable. expire_stale retires `leased` commands too, so a device that took
+# work and then went dark mid-execution could come back and flip
+# expired -> done. The owner has already been told the command was refused and
+# may have re-issued it on that basis, so that silently converts a refusal into
+# a success and hides a double execution — the "half-applied action" this
+# module's contract disclaims.
+
+def test_a_late_result_cannot_overwrite_an_expired_command(device):
+    cmd = wb.enqueue(device["device_id"], "agent.start", workspace_id="gaika-basket",
+                     params={"text": "do the thing"})
+    wb.lease(device["device_id"])                       # taken, then the device dies
+    wb.expire_stale(now=wb.now_ts() + wb.COMMAND_TTL_SECS + 1)
+    assert wb.get_command(cmd["command_id"])["status"] == "expired"
+
+    out = wb.complete(device["device_id"], cmd["command_id"], ok=True,
+                      result={"started": True})
+    assert out["status"] == "expired", "a late result resurrected an expired command"
+    final = wb.get_command(cmd["command_id"])
+    assert final["status"] == "expired"
+    assert final["ok"] in (None, 0)
+    # the refusal the owner was shown is still intact
+    assert "did not collect" in (final["error"] or "")
+
+
+def test_a_late_failure_also_cannot_overwrite_an_expired_command(device):
+    cmd = wb.enqueue(device["device_id"], "agent.status", workspace_id="gaika-basket")
+    wb.lease(device["device_id"])
+    wb.expire_stale(now=wb.now_ts() + wb.COMMAND_TTL_SECS + 1)
+    out = wb.complete(device["device_id"], cmd["command_id"], ok=False, error="boom")
+    assert out["status"] == "expired"
+    assert "boom" not in (wb.get_command(cmd["command_id"])["error"] or "")
+
+
+def test_a_normal_result_still_completes(device):
+    """Guard: the expiry rule must not block the ordinary path."""
+    cmd = wb.enqueue(device["device_id"], "agent.status", workspace_id="gaika-basket")
+    wb.lease(device["device_id"])
+    out = wb.complete(device["device_id"], cmd["command_id"], ok=True,
+                      result={"state": "idle"})
+    assert out["status"] == "done"
+    assert wb.get_command(cmd["command_id"])["status"] == "done"
