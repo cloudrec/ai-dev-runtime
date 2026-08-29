@@ -739,6 +739,23 @@ def complete(device_id: str, command_id: str, *, ok: bool, result: Any = None,
             raise AuthError("command belongs to a different device")
         if row["status"] in ("done", "failed"):
             return _public_command(row)      # idempotent re-post
+        if row["status"] == "expired":
+            # The owner has ALREADY been told this command was refused, and may
+            # have re-issued it on that basis. Letting a late device flip
+            # expired -> done would retroactively turn a refusal into a success
+            # and hide a double execution — precisely the "half-applied action"
+            # this module's contract disclaims. `expire_stale` retires `leased`
+            # commands too, so this is reachable whenever a device takes work and
+            # then goes dark mid-execution.
+            #
+            # The late result is not stored (that would overwrite the refusal the
+            # owner saw) but it is NOT silent either: it is audited, because a
+            # device reporting work against an expired command means that work
+            # probably ran.
+            _audit("windows_late_result_after_expiry", device_id,
+                   command_id=command_id, action=row.get("action"),
+                   reported_ok=bool(ok))
+            return _public_command(row)
         conn.execute(
             "UPDATE win_command SET status=?, ok=?, result=?, error=?, completed_at=? "
             "WHERE command_id=?",
@@ -757,10 +774,32 @@ def complete(device_id: str, command_id: str, *, ok: bool, result: Any = None,
 
 
 def get_command(command_id: str, conn=None) -> Optional[dict]:
+    """Read one command, expiring it in place if its TTL has passed.
+
+    `expire_stale()` only ever ran inside `lease()`, i.e. only when the device
+    polled. A device that never comes back therefore left its commands `pending`
+    forever: `wait_for_result` could never observe `expired` and always exited
+    via `timed_out`, and the status endpoint reported `pending` indefinitely.
+    That contradicts this module's stated contract — "if the laptop is asleep the
+    command simply expires ... never a hang" — precisely in the case the contract
+    is about.
+
+    Only the row being read is touched, and only when it is genuinely stale, so
+    the common read takes no write lock."""
     conn, own = _conn(conn)
     try:
         row = _row(conn.execute("SELECT * FROM win_command WHERE command_id=?",
                                 (command_id,)))
+        if (row and row["status"] in ("pending", "leased")
+                and float(row["created_ts"] or 0) < now_ts() - COMMAND_TTL_SECS):
+            conn.execute(
+                "UPDATE win_command SET status='expired', "
+                "error='device did not collect the command in time', completed_at=? "
+                "WHERE command_id=? AND status IN ('pending','leased')",
+                (now_iso(), command_id))
+            conn.commit()
+            row = _row(conn.execute("SELECT * FROM win_command WHERE command_id=?",
+                                    (command_id,)))
     finally:
         if own:
             conn.close()
