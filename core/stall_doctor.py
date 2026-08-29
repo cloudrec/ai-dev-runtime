@@ -139,7 +139,7 @@ CREATE TABLE IF NOT EXISTS stall_doctor_state (
 CREATE TABLE IF NOT EXISTS stall_doctor_action (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     target TEXT, shape TEXT, action TEXT, digest TEXT,
-    delivered INTEGER, detail TEXT, at TEXT, ts REAL
+    delivered INTEGER, detail TEXT, at TEXT, ts REAL, pending_text TEXT
 );
 -- 2026-08-28 gaika-server incident: LOST_CONTINUATION auto-submitted Claude
 -- Code's own dim "suggested next input" redraw as if it were a real queued
@@ -163,6 +163,10 @@ def _conn(conn=None):
                      "last_action_ok INTEGER DEFAULT 1")
     except Exception:  # noqa: BLE001
         pass
+    try:  # pre-column deployments carry the old shape
+        conn.execute("ALTER TABLE stall_doctor_action ADD COLUMN pending_text TEXT")
+    except Exception:  # noqa: BLE001
+        pass
     return conn, own
 
 
@@ -181,6 +185,28 @@ def may_submit_queued(text: str) -> tuple[bool, str]:
     if _FORBIDDEN_RE.search(t) or _EXTRA_FORBIDDEN_RE.search(t):
         return False, "forbidden_token"
     return True, "queued_line_provenance_safe"
+
+
+def _recent_repeat_submission(target: str, pending: str, *, window_secs: float,
+                              conn, now: float) -> bool:
+    """Has this EXACT queued text already been submit_queued'd for this target
+    recently? A standing-loop nudge redraws the same line after it was already
+    submitted once (submit -> agent responds -> the same nudge text reappears
+    queued -> submit again). Content alone (`may_submit_queued`) cannot tell
+    that apart from a genuinely fresh instruction that happens to be benign —
+    only "have we already acted on this precise string" can. `digest` is NOT
+    reused for this check: it is derived from the surrounding pane region, not
+    the queued text itself, and two submissions of the identical text produced
+    different digests live (events 11100/11253, gaika-server incident 2026-08-
+    29) because the footer/timestamp around the composer had moved."""
+    t = (pending or "").strip()
+    if not t:
+        return False
+    row = conn.execute(
+        "SELECT 1 FROM stall_doctor_action WHERE target=? AND action='submit_queued' "
+        "AND delivered=1 AND pending_text=? AND ts > ? LIMIT 1",
+        (target, t, now - window_secs)).fetchone()
+    return row is not None
 
 
 def classify_wait(tail: str, *, state: str = "", pending: str = "") -> dict:
@@ -226,7 +252,7 @@ def _digest(tail: str, child: Optional[dict]) -> str:
 def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
            actions_used: int = 0, since_last_action: float = 1e9,
            child: Optional[dict] = None, last_action_ok: bool = True,
-           recent_lc_submits: int = 0) -> dict:
+           recent_lc_submits: int = 0, pending_repeat: bool = False) -> dict:
     """Pure policy. Returns {action, reason} — fully testable.
 
     `recent_lc_submits`: how many submit_queued deliveries this target has
@@ -234,7 +260,16 @@ def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
     counted ACROSS episodes/digests (unlike `actions_used`, which is per-episode
     and resets whenever the queued text changes). The caller computes this from
     the durable stall_doctor_action log; it is the one loop shape MAX_ACTIONS_
-    PER_EPISODE cannot see."""
+    PER_EPISODE cannot see.
+
+    `pending_repeat`: this EXACT queued text was already submit_queued'd for this
+    target before (events 11100/11253, owner-os-opus-windows, 2026-08-29 — a
+    standing-loop nudge redrew the identical line after it had already been
+    submitted once, and content-only provenance (`may_submit_queued`) has no way
+    to tell a genuinely fresh instruction from the same string reappearing).
+    Checked BEFORE `may_submit_queued` because "already acted on this precise
+    string" is a stronger, narrower signal than any content denylist — a
+    different, genuinely new instruction is completely unaffected."""
     if shape in (NONE, OWNER_WAIT):
         return {"action": "none",
                 "reason": "not_doctor_domain" if shape == OWNER_WAIT else "no_wait"}
@@ -260,6 +295,8 @@ def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
         if recent_lc_submits >= LOST_CONTINUATION_MAX_SUBMITS_PER_WINDOW:
             return {"action": "escalate",
                    "reason": f"lost_continuation_submit_rate_exceeded:{recent_lc_submits}"}
+        if pending_repeat:
+            return {"action": "none", "reason": "queued_line_repeat_of_prior_submission"}
         ok, why = may_submit_queued(pending)
         if ok:
             return {"action": "submit_queued", "reason": why}
@@ -467,15 +504,19 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                     (target, shape, dg, now))
                 conn.commit()
             recent_lc_submits = 0
+            pending_repeat = False
             if shape == LOST_CONTINUATION:
                 recent_lc_submits = conn.execute(
                     "SELECT COUNT(*) FROM stall_doctor_action WHERE target=? "
                     "AND action='submit_queued' AND delivered=1 AND ts > ?",
                     (target, now - LOST_CONTINUATION_SUBMIT_WINDOW_SECS)).fetchone()[0]
+                pending_repeat = _recent_repeat_submission(
+                    target, pending, window_secs=LOST_CONTINUATION_SUBMIT_WINDOW_SECS,
+                    conn=conn, now=now)
             d = decide(shape, pending=pending, age_secs=now - first_ts,
                        actions_used=actions, since_last_action=now - (last_ts or 0),
                        child=c.get("child"), last_action_ok=last_ok,
-                       recent_lc_submits=recent_lc_submits)
+                       recent_lc_submits=recent_lc_submits, pending_repeat=pending_repeat)
             if d["action"] == "none":
                 skipped.append({"target": target, "shape": shape, "why": d["reason"]})
                 continue
@@ -521,7 +562,8 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 "UPDATE stall_doctor_state SET actions=actions+1, last_action_ts=?,"
                 " last_action_ok=? WHERE target=?", (now, int(ok), target))
             self_log(conn, target, shape, d["action"], dg, ok,
-                     f"{d['reason']}; verify={res.get('reason') or ok}", now)
+                     f"{d['reason']}; verify={res.get('reason') or ok}", now,
+                     pending_text=pending if d["action"] == "submit_queued" else "")
             emit_fn(
                 "stall_doctor", "stall_doctor_action", project_id=project,
                 agent_id=target, severity="info", owner_action_required=False,
@@ -577,12 +619,13 @@ def _retire_stale_escalation(conn, target: str, now: float, *, why: str) -> list
     return retired
 
 
-def self_log(conn, target, shape, action, digest, delivered, detail, now) -> None:
+def self_log(conn, target, shape, action, digest, delivered, detail, now,
+             pending_text: str = "") -> None:
     conn.execute(
         "INSERT INTO stall_doctor_action (target, shape, action, digest, delivered,"
-        " detail, at, ts) VALUES (?,?,?,?,?,?,?,?)",
+        " detail, at, ts, pending_text) VALUES (?,?,?,?,?,?,?,?,?)",
         (target, shape, action, digest, int(bool(delivered)), (detail or "")[:300],
-         now_iso(), now))
+         now_iso(), now, (pending_text or "").strip() or None))
 
 
 def _project_of(agent: dict, conn) -> str:

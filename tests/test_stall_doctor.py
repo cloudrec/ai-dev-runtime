@@ -598,3 +598,116 @@ def test_prune_skipped_when_live_agent_list_is_empty(conn):
     assert r["pruned"] == []
     assert conn.execute("SELECT 1 FROM stall_doctor_state WHERE target=?",
                         (t,)).fetchone()
+
+
+# ── standing-loop repeat-submission guard (events 11100/11253, 2026-08-29) ──
+# owner-os-opus-windows:0.0: the exact string "Check for the next Owner OS wake
+# event" was submit_queued'd once, then reappeared queued and got submitted
+# AGAIN as if it were a fresh instruction — a self-feeding loop, not a new
+# owner directive. The two episodes had DIFFERENT digests (the footer/status
+# line around the composer had moved), so nothing episode- or digest-keyed
+# could catch it; only the exact submitted TEXT repeating is the signal.
+
+REPEAT_TEXT = "Check for the next Owner OS wake event"
+
+
+def _tail_for(text, footer):
+    # digest is derived from the CONTENT line (footer), independent of the
+    # composer/pending text — mirrors the live incident where two submissions
+    # of the identical queued line produced different digests.
+    return f"  {footer}\n✻ Sautéed for 1m 5s\n───\n❯ {text}\n───\n  ⏵⏵ auto mode on\n"
+
+
+def test_a_repeated_queued_text_is_not_resubmitted(conn):
+    emit, dlv = Emit(), Deliver()
+    t = "owner-os-opus-windows:0.0"
+    ag = [_agent(t, "/root/ai-dev-runtime")]
+
+    tails = {t: _tail_for(REPEAT_TEXT, "first episode footer, done.")}
+    pend = {t: REPEAT_TEXT}
+    _scan(ag, tails, pend, emit, dlv, conn, now=NOW)
+    r1 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
+    assert [a["action"] for a in r1["acted"]] == ["submit_queued"]
+
+    # a DIFFERENT footer (→ different digest) but the SAME queued text, well
+    # after the action cooldown — the exact live shape.
+    t2 = NOW + sd.QUEUED_SLO_SECS + 1 + sd.ACTION_COOLDOWN_SECS + 1
+    tails2 = {t: _tail_for(REPEAT_TEXT, "second episode footer, done.")}
+    _scan(ag, tails2, pend, emit, dlv, conn, now=t2)
+    r2 = _scan(ag, tails2, pend, emit, dlv, conn, now=t2 + sd.QUEUED_SLO_SECS + 1)
+
+    assert r2["acted"] == []
+    assert r2["skipped"][0]["why"] == "queued_line_repeat_of_prior_submission"
+    assert len([c for c in dlv.calls if c["action"] == "submit"]) == 1, (
+        "the repeated line must not be pressed a second time")
+
+
+def test_a_genuinely_different_instruction_still_submits_after_a_blocked_repeat(conn):
+    """The guard is text-exact, not a blanket freeze on the target: a real new
+    instruction arriving afterward must still go through."""
+    emit, dlv = Emit(), Deliver()
+    t = "owner-os-opus-windows:0.0"
+    ag = [_agent(t, "/root/ai-dev-runtime")]
+    pend = {t: REPEAT_TEXT}
+    tails = {t: _tail_for(REPEAT_TEXT, "first episode footer, done.")}
+    _scan(ag, tails, pend, emit, dlv, conn, now=NOW)
+    _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
+
+    t2 = NOW + sd.QUEUED_SLO_SECS + 1 + sd.ACTION_COOLDOWN_SECS + 1
+    new_text = "Investigate event 11300 and report the exact blocker"
+    pend2 = {t: new_text}
+    tails2 = {t: _tail_for(new_text, "genuinely new turn, done.")}
+    _scan(ag, tails2, pend2, emit, dlv, conn, now=t2)
+    r = _scan(ag, tails2, pend2, emit, dlv, conn, now=t2 + sd.QUEUED_SLO_SECS + 1)
+
+    assert [a["action"] for a in r["acted"]] == ["submit_queued"]
+    assert dlv.calls[-1]["text"] == new_text
+
+
+def test_recent_repeat_submission_helper_matches_exact_text_only(conn):
+    sd._conn(conn)  # ensure schema — this test writes directly, bypassing scan()
+    now = NOW
+    sd.self_log(conn, "t:0.0", sd.LOST_CONTINUATION, "submit_queued", "dgA", True,
+                "queued_line_provenance_safe; verify=True", now, pending_text=REPEAT_TEXT)
+    conn.commit()
+    assert sd._recent_repeat_submission(
+        "t:0.0", REPEAT_TEXT, window_secs=3600, conn=conn, now=now + 60) is True
+    assert sd._recent_repeat_submission(
+        "t:0.0", "a different line entirely", window_secs=3600, conn=conn,
+        now=now + 60) is False
+    # a different target with the same text is unaffected — scoped, not global
+    assert sd._recent_repeat_submission(
+        "other-target:0.0", REPEAT_TEXT, window_secs=3600, conn=conn,
+        now=now + 60) is False
+    # outside the window, the same text is treated as fresh again
+    assert sd._recent_repeat_submission(
+        "t:0.0", REPEAT_TEXT, window_secs=3600, conn=conn, now=now + 3601) is False
+
+
+def test_decide_repeat_blocks_submission_but_a_fresh_instruction_is_unaffected():
+    blocked = sd.decide(sd.LOST_CONTINUATION, pending=REPEAT_TEXT,
+                        age_secs=sd.QUEUED_SLO_SECS + 1, pending_repeat=True)
+    assert blocked == {"action": "none",
+                       "reason": "queued_line_repeat_of_prior_submission"}
+    fresh = sd.decide(sd.LOST_CONTINUATION, pending="a brand new instruction",
+                      age_secs=sd.QUEUED_SLO_SECS + 1, pending_repeat=False)
+    assert fresh["action"] == "submit_queued"
+
+
+def test_a_failed_submission_is_not_treated_as_already_submitted(conn):
+    """`delivered=0` must not poison the repeat-check — a submit that FAILED
+    to land is not "already acted on", and must be retried, not silently
+    skipped forever."""
+    emit, dlv = Emit(), Deliver(ok=False)
+    t = "owner-os-opus-windows:0.0"
+    ag = [_agent(t, "/root/ai-dev-runtime")]
+    tails = {t: _tail_for(REPEAT_TEXT, "first episode footer, done.")}
+    pend = {t: REPEAT_TEXT}
+    _scan(ag, tails, pend, emit, dlv, conn, now=NOW)
+    r1 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
+    assert [a["action"] for a in r1["acted"]] == ["submit_queued"]
+    assert r1["acted"][0]["delivered"] is False
+
+    assert sd._recent_repeat_submission(
+        t, REPEAT_TEXT, window_secs=3600, conn=conn,
+        now=NOW + sd.QUEUED_SLO_SECS + 2) is False
