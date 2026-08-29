@@ -796,7 +796,19 @@ def health(conn=None, now: Optional[float] = None) -> dict:
                          "ORDER BY id DESC LIMIT 1").fetchone()
         failed = conn.execute(
             "SELECT COUNT(*) FROM wake_delivery WHERE delivered=0").fetchone()[0]
+        # Wakes whose phrase was latched (composer observed cleared) but whose
+        # delivery was never confirmed, then aged out. Invisible everywhere else by
+        # design — `expire_stale` excludes them, `should_wake` refuses them as
+        # already-woken — so health is the only place the unresolved outcome shows.
+        conn.execute(_ABANDON_SCHEMA)
+        abandoned_total = conn.execute("SELECT COUNT(*) FROM wake_abandoned").fetchone()[0]
+        ab = conn.execute("SELECT at,event_id,last_delivery_reason FROM wake_abandoned "
+                          "ORDER BY ts DESC LIMIT 1").fetchone()
         return {"enabled": enabled, "kill_switch": kill,
+                "abandoned_total": int(abandoned_total),
+                "last_abandoned_at": (ab[0] if ab else None),
+                "last_abandoned_event_id": (int(ab[1]) if ab else None),
+                "last_abandoned_reason": (ab[2] if ab else None),
                 "last_delivery_at": (d[0] if d else None),
                 "last_delivery_ok": (bool(d[1]) if d else None),
                 "last_delivery_reason": (d[2] if d else None),
@@ -1070,12 +1082,18 @@ def record_abandoned_wakes(conn=None, now: Optional[float] = None) -> list:
     and is NOT changed here.
 
     The gap it left is that such an event simply stopped: never retried, never
-    superseded, never expired, and absent from `wake_expire_audit`. Nothing
-    anywhere recorded that an `owner_action_required` alert might never have been
-    seen. Observed 2026-08-29/30: events 12531, 11659, 11233 (`agent_waiting_input`,
-    high, oar=1) and 12370 (`notifications_red`, critical) each had exactly one
-    delivery attempt, failed with `cdp_error:WebSocketTimeoutException`, and went
-    silent for 12-24h.
+    superseded, never expired, and absent from `wake_expire_audit`.
+
+    What these events are, precisely: `cdp_composer` latches `wake_submitted` ONLY
+    after it observes the composer cleared — "the page took the phrase". So a
+    latched event's phrase almost certainly DID reach the chat; what was never
+    confirmed is that the assistant then started. That is a weaker failure than a
+    lost alert, and the record says so rather than overstating it.
+
+    Observed 2026-08-29/30: events 12531, 11659, 11233 (`agent_waiting_input`,
+    high, oar=1) and 12370 (`notifications_red`, critical) each latched, then hit
+    `cdp_error:WebSocketTimeoutException` during post-send verification, and went
+    silent for 12-24h with nothing recording the unresolved outcome.
 
     This turns that silent drop into a visible one. It records; it never re-offers,
     so the no-duplicate invariant holds by construction.

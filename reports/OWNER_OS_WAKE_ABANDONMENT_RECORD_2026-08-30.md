@@ -18,8 +18,7 @@ re-offered, and `should_wake` independently refuses it with
 `already_woke_for_this_event`. **Neither rule is changed here.**
 
 But such an event then had no terminal record anywhere: never retried, never
-superseded, never expired, absent from `wake_expire_audit`. Nothing recorded that
-an `owner_action_required` alert might never have been seen.
+superseded, never expired, absent from `wake_expire_audit`. Nothing recorded the unresolved outcome.
 
 Measured on the live db, read-only:
 
@@ -100,3 +99,75 @@ sweep would almost never have run. Fixed, and pinned by
 Never deployed. Additive: one new table, two new functions, two call sites in
 `expire_stale`. No existing query, schema column, config, credential or protocol
 changed. Restore `core/wake_bridge.py`.
+
+
+---
+
+# Correction and WebSocket root cause (same day, after further read-only work)
+
+## Correction to this report's framing
+
+Above I wrote that these events mean "an `owner_action_required` alert might never
+have been seen". **That overstates it.** `cdp_composer` latches `wake_submitted`
+only at an explicit boundary:
+
+```python
+# THE LATCH BOUNDARY. A cleared composer means the page took the
+# phrase — from here on it may be in the chat, so this event must
+# never be submitted again, whatever verification says below.
+_latch_submitted(source, event_id)
+```
+
+The latch fires **only after the composer is observed cleared**. So a latched
+event's phrase almost certainly DID reach the owner's chat. What was never
+confirmed is that the **assistant started** on it. That is a materially weaker
+failure than a lost alert, and the code and health text now say so.
+
+The record is still worth having — an unresolved wake should not vanish — but it
+should be read as "phrase landed, assistant-start unconfirmed", not "the owner was
+never told".
+
+## WebSocket timeout root cause — no fix needed, and option B is unnecessary
+
+37 `cdp_error:WebSocketTimeoutException` in 3 days, all routes, 1-5/hour, isolated
+(one attempt per event). **Not** the wedged-renderer shape: that was the 4214
+incident (113 consecutive against one hung page), and it is already guarded by
+`page_responsive()` + `recover_wedged_tab()` which run BEFORE the attempt.
+
+Given the latch boundary, these timeouts occur during **post-send verification** —
+the loop waiting for the composer to clear and the assistant to start, against a
+15s session timeout. They are transient/environmental, not a wedged page.
+
+**This retires option B** from the earlier decision. B was "retry when the failure
+provably preceded submission" — but the latch boundary already performs exactly
+that discrimination: a pre-send failure never latches, so it stays retryable and
+IS retried. Only post-latch failures are suppressed, and suppressing those is
+correct, because the phrase is probably already in the chat. There is nothing for
+B to add.
+
+**No production, config or credential change is proposed for the WebSocket issue.**
+It is a transient network/page condition whose casualties are now visible.
+
+## A grep error worth recording
+
+While tracing this I claimed `mark_submitted` had "no production caller". Wrong:
+`tools/cdp_composer.py:323` calls it in both the pre- and post-deploy trees. The
+grep that produced that claim filtered out `worktrees/` while running from inside
+a worktree, excluding the very file being searched.
+
+## Separate live-vs-git finding: the companion runs pre-deploy code
+
+`owner-os-wake-companion.service` started **2026-08-29 20:46:51 CEST**. The deploy
+commit `2e4c137` is 23:37 and the `ai-runtime.service` restart was 23:40 — only
+`ai-runtime.service` was restarted, so the companion still runs the code it loaded
+at 20:46 (`5618ce3`).
+
+**Impact of that gap: none from this deploy.** `2e4c137` changed `ai_planner`,
+`job_executor`, `deliver` and `windows_bridge`; the companion uses `wake_bridge`
+and `cdp_composer`, neither of which that deploy touched. So the stale process is
+running identical code for its own purposes.
+
+It matters for the FUTURE, though: any wake-bridge change — including the
+abandonment record here, and `fix/wake-nonactionable-starvation` — will not take
+effect in the companion until that service is restarted too. Restarting it is an
+owner gate, not taken.

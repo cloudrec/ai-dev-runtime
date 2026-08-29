@@ -496,3 +496,45 @@ def test_expire_stale_runs_the_sweep_even_when_nothing_is_expirable():
     expired = wb.expire_stale(now=t + wb.MAX_WAKE_AGE_SECS + 1)
     assert expired == [], expired          # nothing matches expire_stale's own query
     assert [a["event_id"] for a in wb.abandoned_wakes()] == [5]
+
+
+# ── the abandonment log must be visible in health ───────────────────────────
+# An abandoned wake is invisible everywhere else BY DESIGN: expire_stale excludes
+# it and should_wake refuses it as already-woken. Health is therefore the only
+# place the owner can learn that an alert may never have been seen. A log nothing
+# surfaces is not observability.
+
+def test_health_reports_zero_abandoned_before_any():
+    h = wb.health(now=1000.0)
+    assert h["abandoned_total"] == 0
+    assert h["last_abandoned_at"] is None
+    assert h["last_abandoned_event_id"] is None
+
+
+def test_health_surfaces_an_abandoned_wake():
+    t = 1000.0
+    _submitted_but_failed(31, at=t)
+    wb.record_abandoned_wakes(now=t + wb.MAX_WAKE_AGE_SECS + 1)
+    h = wb.health(now=t + wb.MAX_WAKE_AGE_SECS + 2)
+    assert h["abandoned_total"] == 1
+    assert h["last_abandoned_event_id"] == 31
+    assert h["last_abandoned_reason"].startswith("cdp_error:")
+    assert h["last_abandoned_at"]
+
+
+def test_health_counts_every_abandoned_wake():
+    # spaced past COOLDOWN_SECS: a second wake inside the window is refused, so
+    # bunching them would silently test one event, not three.
+    t = 2000.0
+    last = t
+    for i, eid in enumerate((41, 42, 43)):
+        last = t + i * (wb.COOLDOWN_SECS + 1)
+        _submitted_but_failed(eid, at=last)
+    wb.record_abandoned_wakes(now=last + wb.MAX_WAKE_AGE_SECS + 1)
+    assert wb.health(now=last + wb.MAX_WAKE_AGE_SECS + 2)["abandoned_total"] == 3
+
+
+def test_health_still_works_when_the_table_has_never_been_written():
+    """The schema is created on read; health must not raise on a fresh db."""
+    h = wb.health(now=500.0)
+    assert "abandoned_total" in h and h["abandoned_total"] == 0
