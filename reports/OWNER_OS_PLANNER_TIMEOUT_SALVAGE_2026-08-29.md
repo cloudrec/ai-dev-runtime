@@ -134,9 +134,25 @@ two in isolation, where they fail identically. Neither is caused by this change:
 - `tests/test_delivery_attribution.py::test_agent_send_threads_attribution_to_the_record`
   — unrelated (agent_send attribution record).
 - `tests/test_phase13.py::test_planner_hanging_parent_with_no_children_still_times_out`
-  — `assert elapsed < 10` fails at `13.98`. **Same harness, adjacent defect**:
-  `_invoke_cli` enforces the deadline on the wait loop, then unconditionally does
-  `t_out.join(timeout=5)` + `t_err.join(timeout=5)`. When the killed child leaves
-  the pipe open, those joins add up to 10s *after* the deadline, so the planner's
-  effective wall time is `timeout + 10s`, not `timeout`. Left untouched here to
-  keep this fix minimal; tracked as the next item.
+  — `assert elapsed < 10` fails at `13.98`. Measured, not assumed: `_invoke_cli`
+  returns in **2.04s**, correctly bounded by its 2s deadline. The kill path and
+  the drain joins are not implicated. The extra ~12s is spent *before* the
+  subprocess ever starts, in `plan()`'s prompt file listing — `os.walk` over the
+  test's `project_path`, which is `/tmp`. On this host `/tmp` holds 2927
+  top-level entries, and a single `scandir` of it costs 5-8s.
+
+  The real finding is that **`plan()` has no overall deadline**:
+  `RUNTIME_PLAN_TIMEOUT` bounds only the planner subprocess, so the prompt-
+  building walk that precedes it is unbounded. A project path on a slow or very
+  large filesystem delays a job before the timeout clock even starts.
+
+  Deliberately NOT fixed here. Two candidate fixes were tried and rejected on
+  measurement: pruning excluded directories in place (`dirs[:] = ...`, so a large
+  `.git`/`node_modules` is not descended into) and a ceiling on directories
+  visited. Neither helps this case — the walk visits only **25** directories and
+  the cost is enumerating one huge directory, which no dir-count cap avoids. On a
+  real repo path the existing walk already costs 0.054s, so the pruning change
+  was a micro-optimization, not a defect fix, and was reverted rather than
+  committed as unrequested scope. A correct fix needs a wall-clock budget on the
+  listing step; that is a real change to `plan()`'s contract and wants its own
+  task. This failure is host-dependent and does not gate the job-86 fix.
