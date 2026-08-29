@@ -17,6 +17,7 @@ No network / no real provider — a fake `claude` CLI stub is injected via
 RUNTIME_CLAUDE_BIN, exactly like the existing phase-13/job-executor tests.
 """
 import importlib
+import json
 import os
 import stat
 import subprocess
@@ -196,6 +197,92 @@ def test_valid_json_uses_normal_plan_no_fallback(tmp_path, monkeypatch):
     assert final["plan"].get("fallback") is not True
     assert not any(a.get("fallback_planning") for a in (final["artifacts"] or []))
     assert int(open(counter).read()) == 1
+
+
+# ── Regression (job 86 / task_id=86): a plan DELIVERED before the process
+# deadline must not be thrown away just because the CLI lingered afterwards.
+# The old harness checked `timed_out` before it ever looked at stdout, so a
+# complete, valid plan was discarded and the job was downgraded to a
+# `fallback_plan_only` NON-implementation. ───────────────────────────────
+
+def _lingering_cli(tmp_path, plan_json, linger=30):
+    """Fake CLI that writes a COMPLETE result envelope, flushes, then hangs past
+    the deadline so the process group is killed with the plan already on stdout."""
+    return _counting_cli(tmp_path, (
+        "import json, sys, time\n"
+        f"result = {plan_json!r}\n"
+        "sys.stdout.write(json.dumps({'type':'result','subtype':'success','is_error':False,"
+        "'result':result,'usage':{'input_tokens':11,'output_tokens':22},"
+        "'total_cost_usd':0.5,'duration_ms':1234}))\n"
+        "sys.stdout.flush()\n"
+        f"time.sleep({linger})\n"
+    ))
+
+
+def test_plan_delivered_before_timeout_is_salvaged_not_discarded(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    plan_json = json.dumps({
+        "summary": "real plan from provider", "risk_level": "low",
+        "files": [{"path": "NOTES.md", "operation": "create", "content": "real planner output\n"}],
+        "test_commands": [], "expected_result": "ok"})
+    cli, counter = _lingering_cli(tmp_path, plan_json)
+    _reload(monkeypatch, cli, timeout=3)
+    job = job_store.create_job(project_path=str(repo),
+                               goal="Global Claude Context Lifecycle Manager",
+                               instructions="save handoff, rotate context, restore project state",
+                               task_id=86, autonomy_level="execute_safe",
+                               auto_commit=True, auto_push=False)
+    job_executor.execute(job["id"])
+    final = job_store.get_job(job["id"])
+    # The provider's real plan is used — NOT the deterministic fallback.
+    assert final["plan"]["summary"] == "real plan from provider"
+    assert final["plan"].get("fallback") is not True
+    assert final["status"] != "fallback_plan_only", final.get("error")
+    assert not any(a.get("fallback_planning") for a in (final["artifacts"] or []))
+    # the provider's own file op reached the coding stage, not a fallback doc
+    assert [f["path"] for f in final["changed_files"]] == ["NOTES.md"]
+    # still exactly one planner call — salvage is not a retry
+    assert int(open(counter).read()) == 1
+
+
+def test_timeout_with_no_usable_output_still_falls_back(tmp_path, monkeypatch):
+    """Salvage must not swallow a real timeout: partial/garbage bytes on stdout
+    are still a planner failure, still marked `timed_out`."""
+    repo = _repo(tmp_path)
+    cli, _ = _counting_cli(tmp_path, (
+        "import sys, time\n"
+        "sys.stdout.write('{\"type\":\"result\",\"result\":\"{par')\n"  # truncated mid-plan
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n"))
+    _reload(monkeypatch, cli, timeout=3)
+    job = job_store.create_job(project_path=str(repo), goal="g", instructions="i",
+                               task_id=861, autonomy_level="execute_safe",
+                               auto_commit=True, auto_push=False)
+    job_executor.execute(job["id"])
+    final = job_store.get_job(job["id"])
+    assert final["status"] == "fallback_plan_only", final.get("error")
+    assert final["plan"]["fallback"] is True
+    assert final["plan"]["fallback_timed_out"] is True
+
+
+def test_timeout_error_preserves_accounting_when_envelope_was_delivered(tmp_path, monkeypatch):
+    """A timeout that cannot be salvaged still carries the provider's
+    token/cost/timing, instead of reporting the spend as unknown."""
+    repo = _repo(tmp_path)
+    # valid envelope, but `result` is prose — parses, never validates as a plan
+    cli, _ = _counting_cli(tmp_path, (
+        "import json, sys, time\n"
+        "sys.stdout.write(json.dumps({'type':'result','is_error':False,"
+        "'result':'I need more information before planning.',"
+        "'usage':{'input_tokens':11,'output_tokens':22},'total_cost_usd':0.5}))\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n"))
+    _reload(monkeypatch, cli, timeout=3)
+    with pytest.raises(ai_planner.PlannerError) as ei:
+        ai_planner.plan("g", "i", str(repo), [])
+    assert ei.value.timed_out is True
+    assert ei.value.cost_usd == 0.5
+    assert ei.value.tokens == {"input_tokens": 11, "output_tokens": 22}
 
 
 # ── E2E: timeout -> fallback, reaches coding stage, exactly one planner call ──

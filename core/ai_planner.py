@@ -398,27 +398,44 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
 
     stdout, stderr, timed_out, returncode = _invoke_cli(cmd, prompt, effective_timeout, heartbeat_cb)
 
-    if timed_out:
-        raise PlannerError("planner timed out", timed_out=True)
-
     try:
         envelope = json.loads(stdout) if stdout.strip() else None
     except json.JSONDecodeError:
         envelope = None
     acct = _accounting(envelope)
 
+    from core import job_kinds
+    allow_empty = kind is not None and not job_kinds.requires_code_changes(kind)
+    plan_text = envelope["result"] if envelope is not None and "result" in envelope else stdout
+
+    if timed_out:
+        # The deadline is on the *process*, not on the work. The CLI can emit a
+        # complete plan and only then linger past the deadline (slow teardown, a
+        # detached grandchild still holding the pipe) until the group is killed.
+        # Discarding a plan the provider already delivered turns a satisfiable
+        # job into a `fallback_plan_only` NON-implementation — that is what job
+        # 86 (task_id=86) lost. So salvage a delivered plan that parses AND
+        # validates; a timeout with nothing usable is still a planner failure.
+        # The returncode check below is deliberately skipped here: a killed
+        # process group always reports failure, which says nothing about whether
+        # the bytes it already wrote are a good plan.
+        if stdout.strip() and not (envelope is not None and envelope.get("is_error")):
+            try:
+                return _validate(_extract_json(plan_text), allowed_paths,
+                                 allow_empty_files=allow_empty)
+            except PlannerError:
+                pass  # nothing usable was delivered — fall through to the timeout
+        raise PlannerError("planner timed out", timed_out=True, **acct)
+
     if returncode != 0 or (envelope is not None and envelope.get("is_error")):
         raise PlannerError(_classify_failure(stdout, stderr, envelope), **acct)
     if not stdout.strip():
         raise PlannerError("planner produced empty output", **acct)
 
-    plan_text = envelope["result"] if envelope is not None and "result" in envelope else stdout
     raw = _sanitize_raw(plan_text)
     try:
         plan_obj = _extract_json(plan_text)
-        from core import job_kinds
-        return _validate(plan_obj, allowed_paths,
-                         allow_empty_files=kind is not None and not job_kinds.requires_code_changes(kind))
+        return _validate(plan_obj, allowed_paths, allow_empty_files=allow_empty)
     except PlannerError as e:
         # Re-raise with the sanitized raw response + accounting attached so the
         # caller can record diagnostics and fall back deterministically.
