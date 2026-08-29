@@ -52,3 +52,42 @@ The combined suite took 1117s — again above the 600s cap the runtime enforces 
 job validation. Consistent with the 742/832/1171/1117s spread already recorded:
 the suite's duration is load-dependent and routinely exceeds the cap. That is the
 condition `fix/test-step-process-group` exists to make harmless.
+
+---
+
+# Re-probe with the fourth code branch (2026-08-29, later)
+
+`fix/windows-late-result-after-expiry` (`8e50ae1`) was added after the first
+probe. It is cut from `fix/windows-command-expiry-on-read` (`62df2dc`), so
+landing it lands that one too — four code branches, not five.
+
+Re-probed the same way: throwaway **detached** worktree at `5618ce3`, merge all,
+no branch ref moved.
+
+| Branch | Head | Merge |
+| --- | --- | --- |
+| `fix/test-step-process-group` | `d7749a9` | OK |
+| `feat/salvage-observability` | `80d66d5` | OK |
+| `fix/windows-late-result-after-expiry` (carries `62df2dc`) | `8e50ae1` | OK |
+| `docs/staged-integration-probe` | `f655df3` | OK |
+
+* No conflicts.
+* Combined `core/` delta vs `5618ce3`: `ai_planner.py` +16, `deliver.py` +48/-4,
+  `job_executor.py` +61/-3, `windows_bridge.py` +39.
+* **Full suite: 2565 passed, 0 failed** (1622s) — 2562 from the first probe plus
+  the 3 late-result tests.
+
+## Git hygiene
+
+Every staged branch verified `pushed=0` — none is contained in any remote ref.
+Nothing has leaked to `origin`. The deployed line is still `5618ce3`, local ==
+remote.
+
+## Timing, again
+
+1622s this run. Five measurements of essentially the same suite now:
+**742 / 832 / 1117 / 1171 / 1622s**. The spread is load, not test count. This
+reinforces that the withdrawn `RUNTIME_TEST_TIMEOUT` 600->1200 raise was the
+wrong number — 1622s would have blown a 1200s cap too. Any cap chosen from these
+numbers is guesswork; scoping `ai_planner.default_test_commands()` remains the
+only fix that does not degrade, and it is an owner policy decision.
