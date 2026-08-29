@@ -93,6 +93,46 @@ Restart interrupts 6 workers; there are currently **0 in-flight jobs**.
    it harmless when it still fires. Neither substitutes for the other, and
    shipping them separately costs two restarts of a live control loop.
 
+## CORRECTION — the cap change has a second consumer (found 2026-08-29, post-draft)
+
+The section above describes the cap as "one line, one value". The *edit* is, but
+the **blast radius is two subsystems, not one**. `RUNTIME_TEST_TIMEOUT` is read by
+two independent modules:
+
+| Module | Line | Code default | Purpose |
+| --- | --- | --- | --- |
+| `core/job_executor.py` | 29 | `300` | runtime-job validation (fixed by `ce135ad`) |
+| `core/deliver.py` | 16 | **`180`** | PHASE 17 merge -> test -> push gate |
+
+`core/deliver.py` is **live**, not dead code: `api/v1.py:277` exposes
+`POST /api/v1/deliver`, which calls `deliver_mod.deliver(...)`.
+
+Three consequences the owner should weigh before authorizing:
+
+1. **Raising the cap to 1200 silently also raises the delivery gate's timeout.**
+   That is probably desirable — but it is a second behaviour change, not a
+   side-effect-free config tweak, and it was not stated in the original proposal.
+2. **`deliver._run_tests` has the SAME process-group leak** that `ce135ad` fixes.
+   `ce135ad` touches only `job_executor`, so after that deploy the leak still
+   exists on the delivery path. Its default test command is `python3 -m pytest -q`
+   — the full suite — so it is exposed to exactly the same timeout.
+3. **The two modules disagree on the code default** (300 vs 180) for the same
+   env var. Only matters when the env is unset, but it means "the default cap"
+   is ambiguous depending on which subsystem you mean.
+
+Additionally `deliver._run_tests` splits its command with `cmd.split()` rather
+than `shlex.split()`, so a quoted argument would tokenize differently than the
+same command run through `job_executor`. Cosmetic today (the default command has
+no quoting), noted so it is not rediscovered as a bug later.
+
+**Not fixed here.** Extending `ce135ad` to `core/deliver.py` would enlarge the
+pending deploy, so it is recorded rather than taken. If the batched deploy is
+authorized, the honest options are (a) land `ce135ad` as-is and accept that the
+delivery path keeps the leak, or (b) authorize a follow-up commit that applies
+the same kill-group fix to `deliver._run_tests` so both consumers of the raised
+cap are safe. (b) is recommended — a raised cap means a timing-out delivery now
+leaks processes for twice as long.
+
 ## Unaffected
 
 Telegram `notifications_red` / dead-letter stays credential-gated and untouched.
