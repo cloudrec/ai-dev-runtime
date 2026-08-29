@@ -1052,6 +1052,103 @@ def _invalid_event_ids(conn, event_ids: list) -> set:
         return set()
 
 
+_ABANDON_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wake_abandoned (
+    event_id INTEGER PRIMARY KEY,
+    ts REAL, at TEXT, reason TEXT, last_delivery_reason TEXT, age_secs REAL
+)
+"""
+
+
+def record_abandoned_wakes(conn=None, now: Optional[float] = None) -> list:
+    """Record wakes that were SUBMITTED but never proven delivered, and are now too
+    old to ever resolve.
+
+    `expire_stale` deliberately excludes these — its query carries
+    `AND NOT EXISTS (SELECT 1 FROM wake_submitted ...)` — because a phrase that may
+    already sit in the owner's chat must never be re-offered. That rule is correct
+    and is NOT changed here.
+
+    The gap it left is that such an event simply stopped: never retried, never
+    superseded, never expired, and absent from `wake_expire_audit`. Nothing
+    anywhere recorded that an `owner_action_required` alert might never have been
+    seen. Observed 2026-08-29/30: events 12531, 11659, 11233 (`agent_waiting_input`,
+    high, oar=1) and 12370 (`notifications_red`, critical) each had exactly one
+    delivery attempt, failed with `cdp_error:WebSocketTimeoutException`, and went
+    silent for 12-24h.
+
+    This turns that silent drop into a visible one. It records; it never re-offers,
+    so the no-duplicate invariant holds by construction.
+
+    Deliberately does NOT emit a control-plane event: an abandonment event would
+    itself become a wake candidate, which could fail delivery and be abandoned in
+    turn. A durable audit row is the record; a feedback loop is not.
+    """
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        conn.execute(_SCHEMA)
+        _migrate(conn)
+        conn.execute(_SUBMIT_SCHEMA)
+        conn.execute(_DELIVERY_SCHEMA)
+        conn.execute(_ABANDON_SCHEMA)
+        rows = conn.execute(
+            "SELECT a.event_id, a.ts, e.ts_epoch FROM wake_audit a "
+            "LEFT JOIN event e ON e.id = a.event_id "
+            "WHERE a.decision='wake' AND a.acknowledged=0 "
+            "AND a.superseded_by IS NULL "
+            "AND EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
+            "AND NOT EXISTS (SELECT 1 FROM wake_delivery d "
+            "                WHERE d.event_id=a.event_id AND d.delivered=1) "
+            "AND NOT EXISTS (SELECT 1 FROM wake_abandoned b WHERE b.event_id=a.event_id)"
+        ).fetchall()
+        out = []
+        for event_id, decision_ts, event_ts_epoch in rows:
+            decision_age = now - float(decision_ts or 0)
+            event_age = (now - float(event_ts_epoch)) if event_ts_epoch is not None else None
+            age = event_age if event_age is not None else decision_age
+            if age <= MAX_WAKE_AGE_SECS:
+                continue          # still inside its window; may yet be proven
+            last = conn.execute(
+                "SELECT reason FROM wake_delivery WHERE event_id=? ORDER BY id DESC LIMIT 1",
+                (int(event_id),)).fetchone()
+            conn.execute(
+                "INSERT OR IGNORE INTO wake_abandoned "
+                "(event_id,ts,at,reason,last_delivery_reason,age_secs) VALUES (?,?,?,?,?,?)",
+                (int(event_id), now, now_iso(), "submitted_delivery_unproven",
+                 (last[0] if last else "") or "", age))
+            # Same retirement mechanism expire_stale uses: the doorbell stops, the
+            # event stays fully readable in the durable CTO inbox. It was already
+            # unreachable via should_wake's already_woke_for_this_event rule; this
+            # only makes the terminal state explicit instead of implicit.
+            conn.execute("UPDATE wake_audit SET acknowledged=1, acknowledged_at=? "
+                         "WHERE event_id=? AND decision='wake'", (now_iso(), int(event_id)))
+            out.append({"event_id": int(event_id),
+                        "reason": "submitted_delivery_unproven",
+                        "last_delivery_reason": (last[0] if last else "") or "",
+                        "age_secs": int(age)})
+        if out:
+            conn.commit()
+        return out
+    finally:
+        if own:
+            conn.close()
+
+
+def abandoned_wakes(conn=None, limit: int = 50) -> list:
+    """The abandonment log, newest first — for health surfaces and the owner."""
+    conn, own = _c(conn)
+    try:
+        conn.execute(_ABANDON_SCHEMA)
+        return [dict(zip(("event_id", "at", "reason", "last_delivery_reason", "age_secs"), r))
+                for r in conn.execute(
+                    "SELECT event_id,at,reason,last_delivery_reason,age_secs "
+                    "FROM wake_abandoned ORDER BY ts DESC LIMIT ?", (int(limit),))]
+    finally:
+        if own:
+            conn.close()
+
+
 def expire_stale(conn=None, now: Optional[float] = None) -> list:
     """Retire (acknowledge) every decided-but-undelivered wake that is either past
     `MAX_WAKE_AGE_SECS` or has since been marked invalid by agent_watch/stall_doctor's
@@ -1087,6 +1184,10 @@ def expire_stale(conn=None, now: Optional[float] = None) -> list:
             "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id)"
         ).fetchall()
         if not rows:
+            # The abandonment sweep must still run: its set is the one this query
+            # EXCLUDES, so "nothing to expire" says nothing about it. Returning
+            # early here skipped it in the normal case.
+            record_abandoned_wakes(conn=conn, now=now)
             return []
         event_ids = [int(r[0]) for r in rows]
         invalid_ids = _invalid_event_ids(conn, event_ids)
@@ -1118,6 +1219,9 @@ def expire_stale(conn=None, now: Optional[float] = None) -> list:
                             "age_secs": int(age_for_audit)})
         if expired:
             conn.commit()
+        # Sibling sweep for the set this function deliberately excludes: submitted
+        # but never proven delivered. Same tick, so no new scheduler is needed.
+        record_abandoned_wakes(conn=conn, now=now)
         return expired
     finally:
         if own:

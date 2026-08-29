@@ -426,3 +426,73 @@ def test_a_disabled_bridge_blocks_the_claim(monkeypatch):
     monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "0")
     r = wb.claim_send("companion", event_id=1)
     assert r["allowed"] is False and r["reason"] == "bridge_disabled"
+
+
+# ── a submitted-but-unproven wake must leave a record ────────────────────────
+# expire_stale deliberately excludes events that were SUBMITTED
+# (AND NOT EXISTS (SELECT 1 FROM wake_submitted ...)), because a phrase that may
+# already sit in the owner's chat must never be re-offered. Correct — but it left
+# such an event with no terminal record anywhere: never retried, never superseded,
+# never expired, absent from wake_expire_audit.
+#
+# Observed 2026-08-29/30: events 12531, 11659, 11233 (agent_waiting_input, high,
+# owner_action_required=1) and 12370 (notifications_red, critical) each had one
+# delivery attempt, failed cdp_error:WebSocketTimeoutException, and went silent
+# for 12-24h with nothing recording that the owner may never have been told.
+
+def _submitted_but_failed(event_id, *, at, fail="cdp_error:WebSocketTimeoutException"):
+    """A wake that was decided, submitted, and whose only delivery failed."""
+    _wake(event_id, now=at)
+    wb.mark_submitted(event_id, source="companion", now=at)
+    wb.record_delivery("companion", event_id=event_id, delivered=False, reason=fail, now=at)
+
+
+def test_a_submitted_unproven_wake_is_recorded_as_abandoned():
+    t = 1000.0
+    _submitted_but_failed(1, at=t)
+    out = wb.record_abandoned_wakes(now=t + wb.MAX_WAKE_AGE_SECS + 1)
+    assert [o["event_id"] for o in out] == [1], out
+    assert out[0]["reason"] == "submitted_delivery_unproven"
+    assert out[0]["last_delivery_reason"].startswith("cdp_error:")
+    assert [a["event_id"] for a in wb.abandoned_wakes()] == [1]
+
+
+def test_it_is_not_recorded_while_still_inside_its_window():
+    t = 2000.0
+    _submitted_but_failed(2, at=t)
+    assert wb.record_abandoned_wakes(now=t + 60) == []
+    assert wb.abandoned_wakes() == []
+
+
+def test_a_proven_delivery_is_never_abandoned():
+    t = 3000.0
+    _wake(3, now=t)
+    wb.mark_submitted(3, source="companion", now=t)
+    wb.record_delivery("companion", event_id=3, delivered=True,
+                       reason="submitted_and_assistant_started_generating", now=t)
+    assert wb.record_abandoned_wakes(now=t + wb.MAX_WAKE_AGE_SECS + 1) == []
+
+
+def test_recording_is_idempotent_and_never_re_offers_the_event():
+    """The no-duplicate invariant: recording must not make the event selectable."""
+    t = 4000.0
+    _submitted_but_failed(4, at=t)
+    later = t + wb.MAX_WAKE_AGE_SECS + 1
+    first = wb.record_abandoned_wakes(now=later)
+    second = wb.record_abandoned_wakes(now=later + 10)
+    assert len(first) == 1 and second == [], "abandonment recorded twice"
+    assert len(wb.abandoned_wakes()) == 1
+    # still refused by the dedupe rule — never re-offered
+    d = wb.should_wake(event_id=4, severity="critical", now=later + 20)
+    assert d["wake"] is False
+    assert d["reason"] == "already_woke_for_this_event"
+
+
+def test_expire_stale_runs_the_sweep_even_when_nothing_is_expirable():
+    """expire_stale returns early when its own query is empty; the abandonment set
+    is precisely what that query excludes, so the sweep must still run."""
+    t = 5000.0
+    _submitted_but_failed(5, at=t)
+    expired = wb.expire_stale(now=t + wb.MAX_WAKE_AGE_SECS + 1)
+    assert expired == [], expired          # nothing matches expire_stale's own query
+    assert [a["event_id"] for a in wb.abandoned_wakes()] == [5]
