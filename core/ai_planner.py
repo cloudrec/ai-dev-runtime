@@ -421,10 +421,22 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
         # the bytes it already wrote are a good plan.
         if stdout.strip() and not (envelope is not None and envelope.get("is_error")):
             try:
-                return _validate(_extract_json(plan_text), allowed_paths,
-                                 allow_empty_files=allow_empty)
+                salvaged = _validate(_extract_json(plan_text), allowed_paths,
+                                     allow_empty_files=allow_empty)
             except PlannerError:
                 pass  # nothing usable was delivered — fall through to the timeout
+            else:
+                # Mark it. Without this the salvage is INVISIBLE: a salvaged plan
+                # was indistinguishable in the job record from an ordinary slow
+                # plan, so "did salvage ever fire?" could only be inferred from
+                # heartbeat timing. Mirrors how build_fallback_plan marks its own
+                # output, and carries the accounting the provider had already
+                # reported before it was killed.
+                salvaged["salvaged_after_timeout"] = True
+                salvaged["planner_tokens"] = acct["tokens"]
+                salvaged["planner_cost_usd"] = acct["cost_usd"]
+                salvaged["planner_duration_ms"] = acct["duration_ms"]
+                return salvaged
         raise PlannerError("planner timed out", timed_out=True, **acct)
 
     if returncode != 0 or (envelope is not None and envelope.get("is_error")):

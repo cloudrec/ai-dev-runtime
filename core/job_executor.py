@@ -534,6 +534,22 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     job_store.update_job(job_id, plan=plan, risk_level=plan.get("risk_level", job["risk_level"]))
     if fallback_used:
         job_store.append_log(job_id, "info", f"FALLBACK PLAN in use ({len(plan['files'])} safe file op)")
+    if plan.get("salvaged_after_timeout"):
+        # The provider blew its deadline but had ALREADY written a complete,
+        # valid plan, so the plan was used instead of being discarded into a
+        # fallback. Recorded explicitly: without it this is indistinguishable
+        # from an ordinary slow plan, and the only way to answer "did salvage
+        # fire?" was inferring it from heartbeat timing.
+        job_store.append_log(job_id, "warn",
+                             "planner exceeded its deadline but had already delivered a "
+                             "complete plan — SALVAGED, no fallback used")
+        _cur = job_store.get_job(job_id) or job
+        job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
+            "planner_salvaged_after_timeout": True,
+            "tokens": plan.get("planner_tokens"),
+            "cost_usd": plan.get("planner_cost_usd"),
+            "duration_ms": plan.get("planner_duration_ms"),
+        }])
     job_store.append_log(job_id, "info", f"plan: {plan.get('summary','')[:120]} ({len(plan['files'])} file ops)")
 
     # observe/suggest -> plan only, stop here. A plan is not an implementation,
