@@ -426,3 +426,50 @@ def test_a_disabled_bridge_blocks_the_claim(monkeypatch):
     monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "0")
     r = wb.claim_send("companion", event_id=1)
     assert r["allowed"] is False and r["reason"] == "bridge_disabled"
+
+
+# ── cooldown lookbacks must not degrade as the audit tables grow ─────────────
+# Both lookbacks are `WHERE allowed=1 AND actionable=? AND <route> ORDER BY id
+# DESC LIMIT 1`. Unindexed they SCAN — cheap while a recent row matches and the
+# scan stops early, but a route with no prior send of that class walks the whole
+# table. Measured on the live db 2026-08-30 (wake_audit 104k rows): 0.021ms with
+# a recent match, 23ms with none. Both tables are append-only.
+
+def _indexes(table):
+    import os, sqlite3
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    try:
+        return {r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name=?", (table,))}
+    finally:
+        c.close()
+
+
+def test_the_cooldown_lookback_tables_are_indexed():
+    # the two tables are created by different paths: claim_send runs the send
+    # migration, record() runs the audit one.
+    wb.claim_send("companion", event_id=1, actionable=False, now=1000.0)
+    _wake(1)                       # module helper: should_wake + record
+    assert "ix_wake_send_lookback" in _indexes("wake_send")
+    assert "ix_wake_audit_lookback" in _indexes("wake_audit")
+
+
+def test_the_worst_case_lookback_uses_the_index_not_a_scan():
+    """The no-match case is the one that walked the whole table."""
+    import os, sqlite3
+    wb.claim_send("companion", event_id=1, actionable=True, now=1000.0)
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    try:
+        plan = " ".join(str(r[-1]) for r in c.execute(
+            "EXPLAIN QUERY PLAN SELECT ts FROM wake_send WHERE allowed=1 AND "
+            "COALESCE(actionable,0)=1 AND route_key='never-used' ORDER BY id DESC LIMIT 1"))
+    finally:
+        c.close()
+    assert "ix_wake_send_lookback" in plan, plan
+
+
+def test_creating_the_index_is_idempotent():
+    """It runs on every connection; a second call must not raise."""
+    wb.claim_send("companion", event_id=1, actionable=False, now=1000.0)
+    wb.claim_send("companion", event_id=2, actionable=False, now=1000.0 + wb.COOLDOWN_SECS + 1)
+    assert "ix_wake_send_lookback" in _indexes("wake_send")
