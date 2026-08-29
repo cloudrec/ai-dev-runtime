@@ -9,6 +9,7 @@ import hashlib
 import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
 
@@ -210,13 +211,51 @@ def _hash(path: str) -> str:
         return "absent"
 
 
+def _kill_step_group(proc: subprocess.Popen) -> None:
+    """Reap the step's whole process group. `proc` was started with
+    start_new_session=True, so it is the group leader and pgid == proc.pid by
+    construction — never look it up via os.getpgid(), which raises once proc has
+    been reaped and would silently skip cleanup. Same discipline as
+    ai_planner._kill_process_group."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def _run_step(project_path: str, step: str) -> tuple[bool, str]:
     parts = shlex.split(step)
     if not parts:
         return True, ""
-    p = subprocess.run(parts, cwd=project_path, capture_output=True, text=True,
-                       timeout=_TEST_TIMEOUT, shell=False)
-    return p.returncode == 0, (p.stdout + p.stderr)
+    # start_new_session makes the step its own process-group leader so a timeout
+    # can reap everything it spawned. subprocess.run(timeout=) kills ONLY the
+    # direct child: a `pytest` killed at RUNTIME_TEST_TIMEOUT left every process
+    # its tests had spawned running on the server indefinitely. That is not
+    # hypothetical here — this repo's own suite spawns long-lived CLI stubs, and
+    # 7 recorded jobs (tasks 162/182/193/220/221) hit that cap on the full suite.
+    proc = subprocess.Popen(parts, cwd=project_path, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, shell=False,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=_TEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _kill_step_group(proc)
+        # Drain whatever the step wrote before it died, then re-raise unchanged:
+        # _run_tests records str(e), and the existing
+        # "Command '[...]' timed out after N seconds" text is what operators and
+        # the stored `tests` blobs already carry.
+        try:
+            proc.communicate(timeout=10)
+        except Exception:  # noqa: BLE001 — draining must never mask the timeout
+            pass
+        raise
+    return proc.returncode == 0, (out + err)
 
 
 def _run_tests(project_path: str, commands: list[str]) -> dict:
