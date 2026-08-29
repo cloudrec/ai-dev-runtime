@@ -100,3 +100,55 @@ that alarm can actually reach the owner through the wake path.
 
 Never deployed. One clause in `core/wake_bridge.py`; no schema, config, credential
 or protocol change. Restore the file.
+
+---
+
+## Quantified impact (measured 2026-08-30, read-only)
+
+`wake_expire_audit` records events retired without ever being delivered. **87
+events expired; 75 of them were `critical` or `owner_action_required=1`**, each
+aging out at ~10,800s (the 3h max wake age).
+
+By type:
+
+| Type | Count | Actionable? |
+| --- | --- | --- |
+| `notification_dead_letter` | 53 | no |
+| `agent_waiting_input` | 11 | **yes** |
+| `task_completed` | 7 | no |
+| `agent_process_failed` | 5 | no |
+| `agent_dead` | 4 | no |
+| `agent_prompt_needs_response` | 4 | no |
+
+The ~70 **non-actionable** expiries are the starvation defect's body count: they
+could never claim a send slot while actionable traffic flowed, so they sat pending
+until they aged out. 53 of them were the `notification_dead_letter` alarm — the
+owner was never told, 53 times, that a notification channel was failing.
+
+## The 11 actionable expiries are a DIFFERENT, already-fixed bug
+
+Starvation does not explain those: `agent_waiting_input` is actionable. Checked
+rather than assumed — they were claimed **366 times** and every attempt failed
+with `composer_did_not_clear_after_send`. They never lost a claim; they lost the
+delivery.
+
+That failure was a mid-August spike, and it is largely gone:
+
+```
+2026-08-16  511      2026-08-24    3
+2026-08-17  490      2026-08-25    1
+2026-08-20  273      2026-08-28    1
+2026-08-21  106      2026-08-29   18
+```
+
+Last three days: **744 delivered, 68 failed (91.6% success)**. Residual, not
+systemic — prior composer/verifier work already addressed it. **No fix is proposed
+here**, and the 11 expiries are historical collateral, not evidence of a live
+defect.
+
+## What this changes about the gate
+
+It does not change the decision, but it sizes it. Deploying this fix means the
+class of alert that silently expired ~70 times starts reaching the owner at up to
+one per 900s per route. The safest default remains **not deploying blind**: the
+volume increase is real, and the owner should choose it deliberately.
