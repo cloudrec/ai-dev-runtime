@@ -63,3 +63,49 @@ Exactly one production file changed across the whole integration:
 - Rollback: `git worktree remove .claude/worktrees/integration --force` and
   `git branch -D integration/owner-os-2026-08-29`. The three source branches are
   independent and survive that.
+
+---
+
+# Deployment record — 2026-08-29 16:26 UTC
+
+Owner-authorized. Merged, pushed, restarted, verified. No destructive step taken.
+
+**Merge:** `integration/owner-os-2026-08-29` @ `21ba90f` → `ai-runtime/220-windows-bridge`,
+`--no-ff`, no conflicts. Merge commit **`8dcaeea9acd191860aa64a3c0fd6e53743d7cbe6`**.
+8 files, +560/−19. `ai-runtime.service` has `WorkingDirectory=/root/ai-dev-runtime`,
+so the checkout IS the deploy; `git diff 21ba90f` over `core/ api/ cli/ clients/
+tests/` was empty — the running tree is byte-identical to the tested commit.
+The 29 unrelated dirty/untracked `reports/*` files were left untouched.
+
+**Remote:** pushed `9dfaa3c..8dcaeea`; local == `origin/ai-runtime/220-windows-bridge`.
+
+**Rollback point:** tag `rollback/pre-planner-salvage-20260829T162442Z` → `b30ebf8`,
+plus `backups/predeploy_planner_salvage_20260829T162442Z/` (four db copies +
+`ROLLBACK.md`). Only production change is `core/ai_planner.py` (+24/−7); no schema
+change, so code rollback alone suffices. The preferred rollback restores that one
+file rather than `reset --hard`, which would discard the unrelated dirty reports.
+
+**Restart:** zero in-flight jobs beforehand. PID 2944952 → 2872356, `Result=success`,
+`NRestarts=0`, `active (running)`. Zero errors/tracebacks in the log since restart.
+
+**Post-restart verification**
+
+| Check | Result |
+| --- | --- |
+| `GET /api/v1/health` | ok, `provider_available: true`, 105 jobs |
+| `POST /api/v1/smoke` unauth | 401 (route live, auth-gated) |
+| `GET /windows/policy` unauth / auth | 401 / all 7 actions, `device_actions: [workspace.list]` |
+| `GET /windows/devices` | `win-92840f98d82ad3fe` (DESKTOP-HI6L6AD), active, agent 0.1.0, offline since 08-27 — PC not running, expected |
+| `GET /fabric/agents` | 27 agents, platforms `linux`+`windows`, `errors: []` |
+| planner/fallback behavior on deployed tree | 73 passed (`planner_fallback`, `fallback_truthfulness`, `job_kinds`) |
+| live db mutation guard | `jobs` 105 before and after the test run — no debris |
+| existing outcomes intact | 9 `fallback_plan_only` status rows + 6 completed-with-outcome, unchanged |
+
+**Behaviour change now live.** A planner that delivers a complete, valid plan and
+then lingers past the deadline is salvaged instead of discarded, so such jobs end
+as real implementations rather than `fallback_plan_only`. Expect the
+`fallback_plan_only` rate to fall; alerting keyed to it will shift. A timeout with
+nothing usable still falls back exactly as before.
+
+**Not touched:** the credential-gated Telegram dead-letter loop, and all unrelated
+work.
