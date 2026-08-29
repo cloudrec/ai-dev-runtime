@@ -757,10 +757,32 @@ def complete(device_id: str, command_id: str, *, ok: bool, result: Any = None,
 
 
 def get_command(command_id: str, conn=None) -> Optional[dict]:
+    """Read one command, expiring it in place if its TTL has passed.
+
+    `expire_stale()` only ever ran inside `lease()`, i.e. only when the device
+    polled. A device that never comes back therefore left its commands `pending`
+    forever: `wait_for_result` could never observe `expired` and always exited
+    via `timed_out`, and the status endpoint reported `pending` indefinitely.
+    That contradicts this module's stated contract — "if the laptop is asleep the
+    command simply expires ... never a hang" — precisely in the case the contract
+    is about.
+
+    Only the row being read is touched, and only when it is genuinely stale, so
+    the common read takes no write lock."""
     conn, own = _conn(conn)
     try:
         row = _row(conn.execute("SELECT * FROM win_command WHERE command_id=?",
                                 (command_id,)))
+        if (row and row["status"] in ("pending", "leased")
+                and float(row["created_ts"] or 0) < now_ts() - COMMAND_TTL_SECS):
+            conn.execute(
+                "UPDATE win_command SET status='expired', "
+                "error='device did not collect the command in time', completed_at=? "
+                "WHERE command_id=? AND status IN ('pending','leased')",
+                (now_iso(), command_id))
+            conn.commit()
+            row = _row(conn.execute("SELECT * FROM win_command WHERE command_id=?",
+                                    (command_id,)))
     finally:
         if own:
             conn.close()

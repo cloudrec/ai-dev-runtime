@@ -416,3 +416,58 @@ def test_inspect_still_requires_an_enrolled_workspace(device):
     with pytest.raises(wb.WindowsBridgeError, match="not enrolled"):
         wb.enqueue(device["device_id"], "workspace.inspect",
                    workspace_id="some-other-repo")
+
+
+# ── a command for a device that never polls must still expire ────────────────
+# expire_stale() ran ONLY inside lease(), i.e. only when the device polled. The
+# existing test above proves expiry works when expire_stale is called by hand —
+# nothing in production called it for a device that never comes back, so such a
+# command hung as `pending` forever: wait_for_result could never observe
+# `expired` and always exited via timed_out, and the status read stayed
+# `pending` indefinitely. That contradicts this module's contract ("if the
+# laptop is asleep the command simply expires ... never a hang") in exactly the
+# case the contract is about. Live shape: the enrolled device
+# win-92840f98d82ad3fe has been offline since 2026-08-27.
+
+def _backdate(command_id):
+    """Age a command past COMMAND_TTL_SECS without touching its status."""
+    c, own = wb._conn(None)
+    try:
+        c.execute("UPDATE win_command SET created_ts=? WHERE command_id=?",
+                  (wb.now_ts() - wb.COMMAND_TTL_SECS - 1, command_id))
+        c.commit()
+    finally:
+        if own:
+            c.close()
+
+
+def test_get_command_expires_what_the_device_never_collected(device):
+    cmd = wb.enqueue(device["device_id"], "agent.status", workspace_id="gaika-basket")
+    assert wb.get_command(cmd["command_id"])["status"] == "pending"
+    _backdate(cmd["command_id"])                       # device never polls again
+    got = wb.get_command(cmd["command_id"])
+    assert got["status"] == "expired", "a never-collected command hung as pending"
+    assert "did not collect" in (got["error"] or "")
+
+
+def test_wait_for_result_reports_expired_rather_than_a_bare_timeout(device):
+    cmd = wb.enqueue(device["device_id"], "agent.status", workspace_id="gaika-basket")
+    _backdate(cmd["command_id"])
+    res = wb.wait_for_result(cmd["command_id"], timeout_secs=2, poll_secs=0.05)
+    assert res["status"] == "expired"
+    assert res["timed_out"] is False
+
+
+def test_a_fresh_command_is_not_expired_by_being_read(device):
+    cmd = wb.enqueue(device["device_id"], "agent.status", workspace_id="gaika-basket")
+    for _ in range(3):
+        assert wb.get_command(cmd["command_id"])["status"] == "pending"
+
+
+def test_a_finished_command_is_never_rewritten_by_a_read(device):
+    cmd = wb.enqueue(device["device_id"], "agent.status", workspace_id="gaika-basket")
+    wb.lease(device["device_id"])
+    wb.complete(device["device_id"], cmd["command_id"], ok=True, result={"state": "idle"})
+    _backdate(cmd["command_id"])                       # old, but already terminal
+    got = wb.get_command(cmd["command_id"])
+    assert got["status"] == "done"
