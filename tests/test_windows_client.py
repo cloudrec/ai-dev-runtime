@@ -17,6 +17,7 @@ The properties under test:
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -646,3 +647,33 @@ def _agent_source():
     import pathlib
     return (pathlib.Path(__file__).resolve().parent.parent / "clients" / "windows"
             / "owner_os_agent.py").read_text(encoding="utf-8")
+
+
+# ── server/device action-contract drift ──────────────────────────────────────
+# Live gap this pins (device win-92840f98d82ad3fe, 2026-08-27 17:14-17:17):
+# three `workspace.inspect` commands were accepted and queued by the server and
+# then failed ON THE DEVICE with "unsupported action 'workspace.inspect'" — the
+# PC was running a client built before that action existed. The server allowlist
+# and the device dispatch are two halves of one wire contract with nothing
+# holding them together, so drift was only observable as a failed command after
+# a full round trip. These assert the halves agree in-tree.
+
+def _client_dispatch_actions():
+    """Action names the device's execute() dispatch actually branches on."""
+    src = io.open(agent.__file__, encoding="utf-8").read()
+    body = src.split("def execute", 1)[1].split("\n    def ", 1)[0]
+    return set(re.findall(r'action == "([a-z_.]+)"', body))
+
+
+def test_every_server_action_has_a_device_handler():
+    missing = set(wb.ACTIONS) - _client_dispatch_actions()
+    assert not missing, (
+        f"server queues {sorted(missing)} but the device cannot execute them; "
+        "adding to windows_bridge.ACTIONS requires a handler in owner_os_agent.execute()")
+
+
+def test_the_device_handles_no_action_the_server_cannot_queue():
+    extra = _client_dispatch_actions() - set(wb.ACTIONS)
+    assert not extra, (
+        f"device handles {sorted(extra)} that the server has no allowlist entry for; "
+        "such a handler is unreachable and the contract is ambiguous")
