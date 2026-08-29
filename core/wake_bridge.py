@@ -1422,7 +1422,19 @@ def claim_send(source: str, event_id: Optional[int] = None, conn=None,
             else:
                 res = (True, "claimed_actionable")
         else:
-            r = conn.execute(f"SELECT ts FROM wake_send WHERE allowed=1 AND {_ROUTE_MATCH} "
+            # Look back at NON-actionable sends only, mirroring the actionable
+            # branch above. This was unscoped, so every actionable claim reset the
+            # 900s window for non-actionable events. With actionable wakes arriving
+            # every ~60-90s and COOLDOWN_SECS=900, a non-actionable event could
+            # never be claimed at all — not delayed, starved.
+            #
+            # Observed live 2026-08-29/30: event 13383 (notifications_red,
+            # severity=critical, owner_action_required=1) went undelivered for ~4h
+            # across 115 attempts. Its countdown decayed 865->822->784->752->713->679
+            # and jumped straight back to 862 the moment an unrelated actionable
+            # wake was claimed.
+            r = conn.execute(f"SELECT ts FROM wake_send WHERE allowed=1 AND "
+                             f"COALESCE(actionable,0)=0 AND {_ROUTE_MATCH} "
                              "ORDER BY id DESC LIMIT 1",
                              _route_params(route_key)).fetchone()
             if r and (now - float(r[0] or 0)) < COOLDOWN_SECS:

@@ -426,3 +426,53 @@ def test_a_disabled_bridge_blocks_the_claim(monkeypatch):
     monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "0")
     r = wb.claim_send("companion", event_id=1)
     assert r["allowed"] is False and r["reason"] == "bridge_disabled"
+
+
+# ── a stream of actionable wakes must not starve a non-actionable one ────────
+# The non-actionable branch of claim_send looked back at ALL allowed sends, while
+# the actionable branch scoped its lookback to actionable ones. So every
+# actionable claim reset the 900s non-actionable window. With actionable wakes
+# arriving every ~60-90s, a non-actionable event was not delayed — it could never
+# be claimed at all.
+#
+# Observed live 2026-08-29/30: event 13383 (notifications_red, severity=critical,
+# owner_action_required=1) went undelivered ~4h across 115 attempts, its countdown
+# decaying 865->822->784->752->713->679 and snapping back to 862 the instant an
+# unrelated actionable wake was claimed.
+
+def test_actionable_traffic_does_not_reset_the_non_actionable_cooldown():
+    t = 1000.0
+    first = wb.claim_send("companion", event_id=1, actionable=False, now=t)
+    assert first["allowed"] is True
+
+    # a steady stream of actionable wakes, well inside the 900s window
+    for i in range(10):
+        got = wb.claim_send("companion", event_id=100 + i, actionable=True,
+                            now=t + 60 * (i + 1))
+        assert got["allowed"] is True, got
+
+    # the non-actionable lane must still open on its own schedule
+    later = wb.claim_send("companion", event_id=2, actionable=False,
+                          now=t + wb.COOLDOWN_SECS + 1)
+    assert later["allowed"] is True, (
+        f"non-actionable event starved by actionable traffic: {later}")
+
+
+def test_the_non_actionable_cooldown_still_applies_to_its_own_lane():
+    """The fix must not remove the rate limit, only stop the wrong lane resetting it."""
+    t = 2000.0
+    assert wb.claim_send("companion", event_id=1, actionable=False, now=t)["allowed"] is True
+    blocked = wb.claim_send("companion", event_id=2, actionable=False, now=t + 60)
+    assert blocked["allowed"] is False
+    assert blocked["reason"].startswith("global_cooldown_active")
+
+
+def test_the_actionable_lane_is_unchanged():
+    t = 3000.0
+    assert wb.claim_send("c", event_id=1, actionable=True, now=t)["allowed"] is True
+    soon = wb.claim_send("c", event_id=2, actionable=True, now=t + 5)
+    assert soon["allowed"] is False
+    assert soon["reason"].startswith("actionable_cooldown_active")
+    ok = wb.claim_send("c", event_id=3, actionable=True,
+                       now=t + wb.ACTIONABLE_COOLDOWN_SECS + 1)
+    assert ok["allowed"] is True
