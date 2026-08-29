@@ -189,6 +189,30 @@ Before any mutating action there must exist an adequate, **verifiable** path bac
 - **R12.2** — `PROJECT_STATE` and ledgers record facts, never intentions.
 - **R12.3** — the tree ends clean, or the uncommitted files are listed with the reason.
 
+## 13. Work cadence and autonomy — `R13`
+
+*(Owner rule, 2026-08-29. Policy-only — a cadence preference, not a machine gate.)*
+
+- **R13.1** — approved project work is not orchestrated as 2–5 minute microtasks that
+  repeatedly stop for another owner ping. Prefer large, outcome-oriented end-to-end blocks.
+- **R13.2** — inside an authorized block the agent loops autonomously: inspect →
+  reproduce/verify → implement → focused tests → full relevant regression → logical commit
+  → update handoff/roadmap truth → immediately take the next substantive safe/reversible
+  item.
+- **R13.3** — a small fix is a checkpoint, not a stopping condition. Continue through
+  multiple related fixes/commits within the same authorized block.
+- **R13.4** — stop and ask the owner only for a genuine external, irreversible,
+  credential/access, business-policy, safety/control-plane, or materially ambiguous
+  decision that cannot be resolved with a neutral, reversible default/interface/fixture.
+  This is the same bar as **R11.1/R11.2**, applied to cadence rather than content.
+- **R13.5** — a local blocker on one path is not a global stop: continue independent safe
+  work elsewhere in scope.
+- **R13.6** — microsteps are fine internally for correctness and testing, but are not
+  exposed as separate owner-gated work chunks.
+- **R13.7** — do not create polling/heartbeat loops merely to keep work alive.
+- **R13.8** — every rule elsewhere in this document (R1–R10, especially scope in `R2` and
+  fail-closed in `R8`) overrides this section. Cadence never widens what is safe.
+
 ---
 
 ## Emergency override
