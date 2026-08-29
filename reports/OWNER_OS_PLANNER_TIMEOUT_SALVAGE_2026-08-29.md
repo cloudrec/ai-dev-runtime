@@ -156,3 +156,56 @@ two in isolation, where they fail identically. Neither is caused by this change:
   committed as unrequested scope. A correct fix needs a wall-clock budget on the
   listing step; that is a real change to `plan()`'s contract and wants its own
   task. This failure is host-dependent and does not gate the job-86 fix.
+
+---
+
+## Observability gap in this fix (recorded 2026-08-29, NOT yet fixed)
+
+**The salvage branch emits no log line and no artifact.** When `plan()` recovers a
+plan the provider delivered before the deadline, the job record is
+indistinguishable from an ordinary slow-but-successful plan: same status, a real
+non-fallback plan, no marker. The failure path is well instrumented — the fallback
+branch logs `planner failed (...) — building deterministic fallback plan` and
+appends a `fallback_planning` artifact — but the success-after-timeout path is
+silent.
+
+Consequence: *"did salvage ever fire in production?"* cannot be answered from the
+job records directly. It can only be inferred.
+
+### Inference method used meanwhile (read-only)
+
+Signature: **max planner heartbeat >= the full `RUNTIME_PLAN_TIMEOUT` (180s)**, no
+`planner failed` log, and a real plan with `fallback != True`. Salvage can only
+occur at or past the deadline; a plan that returns before it is a normal success.
+
+Calibrated against all 105 historical jobs in `runtime_jobs.db`:
+
+| threshold | historical matches |
+| --- | --- |
+| >= 100s | 8 — all false positives (pre-fix, salvage was impossible) |
+| >= 180s | **0** |
+
+The highest heartbeat ever recorded on a successful pre-deadline plan in this db
+is **160s**, so 180s separates cleanly and a hit will be real. Jobs 88, 94, 108,
+113, 118 are the slow-but-successful cases that a 100s threshold wrongly caught.
+
+Job 86 itself classifies as `normal`, not salvage — correct: under the old code it
+hard-failed with an empty plan. It is the case the fix addresses, not an instance
+of the fix working.
+
+### The rigorous fix (deliberately not done here)
+
+One log line plus an artifact on the salvage branch — mirroring what the fallback
+branch already records — would make this directly observable instead of inferred.
+That is a change to `core/ai_planner.py`, so it needs another merge, deploy and
+`systemctl restart ai-runtime.service`: an owner gate. Recorded here rather than
+taken. Until then, treat any salvage claim as inference from heartbeat timing, not
+as direct evidence.
+
+### Live status at time of writing
+
+Deployed and healthy (`8dcaeea` / `c4bb6ad`, service PID 2872356, `NRestarts=0`,
+zero errors, 10/10 flat soak samples 16:37-16:42Z). **Salvage has not yet fired in
+production** — zero runtime jobs since the 16:26Z restart, and job traffic runs
+1-4/day. The `fallback_plan_only` count is unchanged at 9 through absence of
+traffic, not through disproof. A read-only watcher is armed on the 180s signature.
