@@ -16,6 +16,7 @@ or store it must never break a delivery.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import sqlite3
 import time
@@ -217,13 +218,38 @@ def test_attribution_is_pruned_on_the_same_retention_as_deliveries(tmp_path, mon
 
 def test_agent_send_threads_attribution_to_the_record(monkeypatch):
     captured = {}
+    real_deliver = ac._deliver           # keep the real signature to bind against
     monkeypatch.setattr(ac, "validate_target", lambda t: None)
     monkeypatch.setattr(ac, "_deliver",
                         lambda *a, **k: captured.update(args=a, kw=k) or {"ok": True})
+
+    def _delivered():
+        """Resolve the recorded call to _deliver by PARAMETER NAME.
+
+        This used to assert `captured["kw"] == {...}` — an exact match on the
+        keyword dict, which silently pinned HOW the caller passes its arguments
+        rather than WHAT it threads through. Commit 2356691 (`a queued message is
+        not a delivered one`) switched agent_send to an all-keyword call while
+        still passing actor/source correctly, and the test failed on the call
+        style alone. Binding to the signature checks the contract the test is
+        named for, and works for positional and keyword callers alike.
+        """
+        bound = inspect.signature(real_deliver).bind(*captured["args"], **captured["kw"])
+        bound.apply_defaults()
+        return bound.arguments
+
     ac.agent_send("proj:0.0", "hello", "key-1", actor="api:hmac/x", source="1.2.3.4:5")
-    assert captured["kw"] == {"actor": "api:hmac/x", "source": "1.2.3.4:5"}
+    sent = _delivered()
+    assert (sent["actor"], sent["source"]) == ("api:hmac/x", "1.2.3.4:5")
+    # the payload itself must still arrive intact alongside the attribution
+    assert (sent["target"], sent["text"], sent["action"], sent["idempotency_key"]) == \
+           ("proj:0.0", "hello", "agent_send", "key-1")
+
     ac.agent_answer("proj:0.0", "yes", "key-2", actor="api:bearer", source="1.2.3.4:6")
-    assert captured["kw"] == {"actor": "api:bearer", "source": "1.2.3.4:6"}
+    answered = _delivered()
+    assert (answered["actor"], answered["source"]) == ("api:bearer", "1.2.3.4:6")
+    assert (answered["target"], answered["text"], answered["action"],
+            answered["idempotency_key"]) == ("proj:0.0", "yes", "agent_answer", "key-2")
 
 
 # ═════════════ 3. the API computes the identity ═════════════════════════════
