@@ -2242,3 +2242,121 @@ resolves to the new conversation. It is queued behind the non-actionable lane's
 
 The separate production-publish gate was not touched, and this rebind is not
 treated as approval for it.
+
+---
+
+# Part 10 — two real production misses: stop latency, and a masked foreground
+
+## 1. Lifecycle stops were stuck in the generic lane (`901e86f`)
+
+Event **15448** (`work_stopped_incomplete`, `mess-opus:0.0`) was detected
+immediately and correctly by the Part 8 quiescence rule — and then faced up to
+`COOLDOWN_SECS` (900 s) before its project chat could be woken, because
+lifecycle terminals were classed as generic history. A managed agent that has
+stopped is a project standing still. Detection was never the problem; the lane
+was.
+
+`work_stopped_incomplete`, `task_completed`, `agent_process_failed` and
+`agent_dead` now take the same bounded fast floor as the waiting transitions.
+
+**Why one shared lane rather than a third.** A third lane needs its own lookback
+scope in BOTH the decision gate and the send gate, and mis-scoping exactly that
+is what starved the non-actionable lane twice already (`claim_send`, then
+`should_wake` — Parts 1 and 2). Reusing an already-correct floor is the safer
+shape. The cost is stated in the code rather than hidden: a `waiting_input` event
+can now queue behind a lifecycle event on one route for at most
+`ACTIONABLE_COOLDOWN_SECS`, against the 900 s a lifecycle stop used to wait.
+
+**Deliberately narrow.** `notification_dead_letter`, `notifications_red` and
+`notification_channel_down` stay generic — channel-health chatter arrives
+constantly and making it fast would be noise, not latency. Dedupe, coalescing,
+exactly-once and stale/superseded suppression are untouched; per-event dedupe is
+still checked before any lane logic, and the fast lane keeps its own floor so two
+distinct stops on one route cannot burst.
+
+| Type | Fast lane | Audit reason |
+| --- | --- | --- |
+| `agent_waiting_input`, `owner_decision_required`, `agent_crash_loop`, `wake_loop_*` | yes (unchanged) | `actionable_waiting_transition` |
+| `work_stopped_incomplete`, `task_completed`, `agent_process_failed`, `agent_dead` | **yes (new)** | `lifecycle_terminal_transition` |
+| `notification_dead_letter`, `notifications_red`, `notification_channel_down` | **no** | generic |
+
+**15448 itself keeps the old lane, by design.** Its `wake` decision row was
+written with `actionable=0` three minutes before the fix, and decision rows are
+immutable audit records — rewriting one to accelerate it would be exactly the
+hand-editing this work refuses. The fix applies to lifecycle events decided from
+now on.
+
+## 2. A background shell masked a finished foreground turn (`901e86f`)
+
+`capacity-blockchain:0.0` finished its stage, printed "Stopped here as
+instructed", and sat at an empty `❯` prompt. `agent_status` still reported
+`working`. Traced to the exact matcher:
+
+```
+pane_current_command = claude          -> _pane_shell_running() == False
+live_status_region   = "✻ Brewed for 39s · done 6:59 PM · 1 shell still running
+                        … ❯   … ⏵⏵ auto mode on · 1 shell · ← 3 agents"
+_STATE_ACTIVE_RUN_RE match -> '· 1 shell'
+```
+
+So the mask was **not** the shell flag. Claude Code's `· N shell` footer marker —
+which persists in the chrome after a turn ends — lived in `_STATE_ACTIVE_RUN_RE`
+and was indistinguishable from a live turn. The background `pytest` the agent had
+launched kept it alive, pinning the pane at `working` and blinding every
+downstream consumer, the quiescence rule included.
+
+The marker now proves only that work is ATTACHED to the pane, not that the
+foreground is live. `classify_state` checks a foreground-only twin first, then
+falls back to the shared predicate **unless** the turn carries its own
+`· done H:MM` completion stamp.
+
+* **Fail-safe by construction:** with no stamp we cannot prove the turn ended, so
+  the previous behaviour stands and a genuine long-running shell is never
+  demoted.
+* **No blast radius:** `_STATE_ACTIVE_RUN_RE` is imported by `context_budget`,
+  `commander_autopilot`, the continuation watchdog and the state estimator, which
+  each want the broader "something is running here" meaning. It is **unchanged**;
+  the refinement belongs to `classify_state` alone. The twin is BUILT from the
+  shared pattern, so a marker added there is added to both and they cannot drift.
+* **The stamp is strict on purpose:** agents say "done" in prose constantly
+  ("done with step 3, continuing"), and matching that would demote live agents
+  fleet-wide.
+
+**Live effect, immediately after deploy:** `capacity-blockchain:0.0` moved from
+`working` to **`idle`** in production. Nothing was killed, no shell was touched,
+and no work was sent to that agent — the change is purely in how its pane is
+read.
+
+## Verification
+
+Nine mutations, each killed by its own isolating test:
+
+```
+lifecycle not in the fast lane          -> lifecycle_terminals / stale_generic_backlog  FAILED
+notification noise made fast            -> notification_noise_is_NOT_made_fast          FAILED
+fast lane loses its own floor           -> the_fast_lane_still_has_its_own_bounded_floor FAILED
+fast lane bypasses per-event dedupe     -> exactly_once_still_wins_over_the_fast_lane   FAILED
+lifecycle audited as waiting transition -> lifecycle_is_audited_under_its_own_reason    FAILED
+shell marker back in the foreground path-> a_finished_turn_is_not_working…              FAILED
+demote on shell marker regardless       -> a_genuine_long_running_shell_is_not_demoted  FAILED
+strip marker from the SHARED predicate  -> shared_active_predicate_is_unchanged         FAILED
+bare "done" as the completion stamp     -> the_word_done_in_prose_is_not_a_stamp        FAILED
+```
+
+Three of those initially survived and the fixtures were rewritten until each
+mutation had a test that distinguishes it. Two DB-backed fixtures were also found
+passing **vacuously** — with no route bound in the temp database the target
+resolved to the fallback, so the route-scoped floor never matched the row the
+test had inserted. Both now bind the route first. That is the third time this
+session the same class of vacuous fixture appeared; it is recorded each time
+rather than quietly fixed.
+
+Gate: **795 passed**, 0 failed.
+
+## Deploy record
+
+* Backup: `backups/predeploy_lane_fg_20260830T170749Z/` — three databases,
+  `configs/.env`, both systemd units.
+* Rollback tag: `rollback/pre-lane-fg-20260830T170749Z` → `b9a7fd2`.
+* Both importing workers restarted together: `Result=success`, `NRestarts=0`,
+  `worker_skew()` empty.
