@@ -1173,6 +1173,27 @@ behind the backlog the 3.5-hour composer blackout created. Its delivery is a
 matter of queue position, and the class it belongs to is proven four times over
 above.
 
+### The same run's B-class event
+
+The canary also produced **15237** `work_stopped_incomplete` (severity high,
+`owner_action_required=1`) at 14:21:11Z from the real `work_evidence.scan()`.
+Its decision is `skip` / `cooldown_active`, non-actionable, coalesced under audit
+**111202** — refused for timing and folded into a surviving wake, never silently
+dropped. That is the designed non-actionable lane behaviour documented in Parts
+2–5, observed working unchanged after this session's deploys.
+
+## Recurrence — the source is fixed by the guard, not by the script
+
+`/root/cleanup_disk_pass2.sh` is an ad-hoc script outside this repository and it
+has already run; it was **not modified by this session**. If it or anything like
+it deletes the socket again, the guard now repairs it within one companion tick
+(≈20 s) instead of 100 minutes, and emits a durable event either way. The
+cheaper belt-and-braces fix — adding `/tmp/tmux-*` to that script's exclusion
+list beside `/tmp/claude-0` — is recommended but is an owner's change to an
+owner's file, and the general lesson generalises past that one script: **any
+mtime-based `/tmp` reaper will eventually delete a long-lived unix socket**,
+because a socket's mtime never moves after `bind()`.
+
 ## Deploy record
 
 * Backup: `backups/predeploy_tmux_control_guard_20260830T135923Z/` —
