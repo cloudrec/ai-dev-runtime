@@ -634,6 +634,15 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
              event_id: Optional[int] = None) -> dict:
     """The submission itself, once the slot is claimed. Split out so that every exit path
     below is recorded by exactly one caller instead of each remembering to do it."""
+    # FAIL FAST on a starving browser, before any session is opened. Under the 2026-08-30
+    # host exhaustion the renderer probe passed and the CDP session then hung, so each
+    # attempt burned tens of seconds of a machine that was already thrashing and recorded
+    # `cdp_error:WebSocketTimeoutException` — true, but it blames the socket for a
+    # shortage of memory. Checking first costs one cheap browser-level call and makes the
+    # attempt honest. Fail-open: only a browser that is measurably degraded is refused.
+    _bd = browser_degraded()
+    if _bd.get("degraded"):
+        return {"ok": False, "reason": f"browser_degraded:{_bd.get('reason')}"}
     target = find_target(conversation_url)
     if not target:
         # The page may simply be on another ChatGPT URL (a restart lands on the root). Take

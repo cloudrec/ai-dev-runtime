@@ -91,6 +91,12 @@ def _no_waiting(monkeypatch):
 def wired(monkeypatch):
     def _mk(counts=None, bools=None, turns=None, ids=None):
         s = _S(counts, bools, turns, ids)
+        # Structural stub, like page_responsive: `_attempt` now asks the BROWSER whether it
+        # is degraded before opening a session, and without this every test using this
+        # fixture would make a real HTTP call to the live CDP port — which on a loaded host
+        # takes seconds each and hung the suite when it was first added.
+        monkeypatch.setattr(cdp, "browser_degraded",
+                            lambda *a, **k: {"degraded": False, "reason": "ok", "pages": 3})
         monkeypatch.setattr(cdp, "page_responsive", lambda t, timeout=8.0: True)
         monkeypatch.setattr(cdp, "find_target",
                             lambda url: {"webSocketDebuggerUrl": "ws://x"})
@@ -293,7 +299,14 @@ def test_a_composer_that_never_clears_is_still_the_earlier_failure(wired):
     assert r["ok"] is False and r["reason"] == "composer_did_not_clear_after_send"
 
 
+def _no_browser_degradation(monkeypatch):
+    """The browser-health probe is infrastructure, not the subject of these tests."""
+    monkeypatch.setattr(cdp, "browser_degraded",
+                        lambda *a, **k: {"degraded": False, "reason": "ok", "pages": 3})
+
+
 def test_it_refuses_when_no_chatgpt_page_exists(monkeypatch):
+    _no_browser_degradation(monkeypatch)
     monkeypatch.setattr(cdp, "find_target", lambda url: None)
     monkeypatch.setattr(cdp, "find_chatgpt_page", lambda: None)
     r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
@@ -303,6 +316,7 @@ def test_it_refuses_when_no_chatgpt_page_exists(monkeypatch):
 def test_it_navigates_to_the_bound_conversation_when_the_tab_is_elsewhere(monkeypatch):
     """A restart lands the tab on the root. Navigating to the BOUND url is what guarantees
     the phrase cannot land in some other chat."""
+    _no_browser_degradation(monkeypatch)
     seen = {}
     calls = {"n": 0}
 
@@ -759,3 +773,28 @@ def test_a_healthy_browser_still_gets_its_replacement_tab(monkeypatch):
     monkeypatch.setattr(cc.time, "sleep", lambda s: None)
     assert cc.recover_wedged_tab({"id": "old"}, "https://chatgpt.com/c/a") is not None
     assert any("/json/new" in p for p in opened)
+
+
+def test_a_starving_browser_is_refused_before_any_session_is_opened(monkeypatch):
+    """Under the live exhaustion the renderer probe passed and the CDP session then hung,
+    so every attempt burned tens of seconds of a thrashing machine and recorded
+    `cdp_error:WebSocketTimeoutException` — true, but blaming the socket for a shortage
+    of memory. One cheap browser-level check first makes it honest and cheap."""
+    from tools import cdp_composer as cc
+    touched = []
+    monkeypatch.setattr(cc, "browser_degraded",
+                        lambda *a, **k: {"degraded": True, "reason": "too_many_pages:41"})
+    monkeypatch.setattr(cc, "find_target", lambda u: touched.append("find") or None)
+    monkeypatch.setattr(cc, "_Session", lambda ws: touched.append("session"))
+    r = cc._attempt("https://chatgpt.com/c/a", "PHRASE")
+    assert r["reason"] == "browser_degraded:too_many_pages:41"
+    assert touched == [], "no target lookup and no session on a starving browser"
+
+
+def test_a_healthy_browser_still_reaches_the_composer(wired, monkeypatch):
+    """Fail-OPEN: the ordinary path must be untouched when the browser is fine."""
+    from tools import cdp_composer as cc
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is True and s.inserted == ["PHRASE"]
