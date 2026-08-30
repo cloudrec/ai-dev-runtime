@@ -1843,3 +1843,102 @@ on the reporting side — an agent should not render outstanding owner gates as 
 numbered list in its pane. Dedupe bounds the cost to one wake per distinct
 wording (Part 6 refinement), and no gate is ever crossed by it. `core/agent_watch.py`
 and `core/stall_doctor.py` are byte-identical to `HEAD`; nothing was left applied.
+
+## Closeout canary, and an honestly-reported detector limit
+
+A fresh disposable canary was run through the production actuation path
+(`agent_control.agent_send`, key `p0-canary-closeout-20260830-1800`,
+`delivered=true submitted=true queued=false duplicate=false`), confined to
+`/root/cp-canary-v2`. The canary did the work and stopped:
+
+```
+/root/cp-canary-v2/reports/CANARY_TMUX_GUARD_20260830.md
+  2026-08-30T16:02:10Z: wake/control-plane closeout check recorded. File write inside
+  /root/cp-canary-v2 only; no network, no git, no external effect… stopping here to ask.
+```
+
+It emitted **15392** `work_report_published` — and then **no wake event at all**.
+Diagnosed rather than assumed, against the live pane:
+
+```
+inventory state: idle   pending: None
+_OWNER_PROMPT_RE False | _MENU_RE False | _BLOCKER_RE False
+_FINISH_RE(final) False | _CONTINUATION_RE False
+classify -> {'cls': 'working', 'reason': 'no_positive_finish_evidence'}
+```
+
+Its closing words — "Not proceeding past this question." — match none of the four
+detectors, so the pane holds as `working` and nothing is emitted. The SAME canary
+produced `working->waiting_input` transitions twice earlier today (15228, 15230),
+so this is phrasing-dependent detector coverage, not a regression: completion is
+deliberately never inferred from quietness, and the cost of that conservatism is
+that a stop worded outside the recognised vocabulary is silent.
+
+**This was NOT "fixed".** Loosening `_FINISH_RE`/`_BLOCKER_RE`/`_OWNER_PROMPT_RE`
+to catch it would manufacture false completion and prompt wakes across every
+managed agent — the opposite failure, and far worse. It is pre-existing, unrelated
+to the tmux incident, and recorded here as a known limit rather than quietly
+widened.
+
+**Item (4) is nevertheless satisfied by this session's own evidence**, from the
+earlier run in Part 6: 15228 → 15230 → claim 14:39:20Z → delivery 14:39:49Z
+(`submitted_and_assistant_started_generating`, `wake_submitted`=1, acknowledged)
+→ ChatGPT continuation `cp-canary-event-15230-continue-safe-20260830-1643` at
+14:43:47Z, `actor=api:bearer`, **238 s**, key carrying the wake's event id,
+`duplicate=0`, `agent_created=0`, exactly one `cp-canary` pane.
+
+## Full reverification (item 5) — live, post-deploy
+
+| Check | Result |
+| --- | --- |
+| `agent_waiting_input` / `work_stopped_incomplete` / `task_completed` / `agent_process_failed` / `agent_dead` | all `WAKE_EVENT_TYPES=True`, none routine |
+| New control-plane types | `unreachable` + `split` wake-capable; `recovered` routine |
+| Dedupe (global) | **0** events ever delivered twice |
+| Exactly-once | **0** duplicate `wake_submitted` rows |
+| Bounded retry | live pairs 15363, 15364, 15368, 15380 (refuse → claim) |
+| Stale/superseded suppression | **0** fresh wake decisions on events already past `MAX_WAKE_AGE_SECS` (10800); **0** superseded rows whose event was already too old at decision time — defect-4 class clean |
+| Dedupe of repeat wakes | 24 × `skip/already_woke_for_this_event` on the 15380 chain |
+| Canonical rebind registry | 10 routes (5 owner, 4 auto-discovery, 1 deploy-bound), fallback `owner-os` — nothing rebound or hand-edited |
+| Socket-loss self-heal | `tmux_control_audit`: `repaired / socket_rebound_by_sigusr1` ×1 (the live proof), `repair_refused / already_reachable` ×1; **0** `agent_control_plane_*` events ever — the live plane has never gone unhealthy since deploy |
+| Composer-dialog recovery | `composer_focus_trapped_by_dialog` last seen 14:10:00Z, **0** since the fix |
+| Pipeline | `status: ok` |
+| `worker_skew()` | `[]` |
+| Services | both `active`, `Result=success`, `NRestarts=0`, one process each |
+| tmux | server pid **302442** (original, 2026-08-12), 1 listener, no split, 10 sessions |
+| Inventory | 10 agents, `duplicates: []`, `control_unreachable: false` |
+| Unrelated WIP | 29 files byte-identical to session start |
+
+Residual delivery noise, both pre-existing and retry-absorbed, neither introduced
+by this work: `cdp_error:WebSocketTimeoutException` and
+`composer_did_not_clear_after_send` (1,463 occurrences historically, 273 on
+2026-08-20 alone). Events 14927 and 15380 hit the latter and remain correctly in
+flight — their coalescing chain converges on audit **111536**, which holds a live
+`wake` decision; neither is in `wake_abandoned`.
+
+## Final technical verdict
+
+**The wake/tmux control-plane work is technically GREEN.** Six real defects were
+found live, fixed, tested, mutation-verified and deployed backup-first across this
+session's two parts: the two starvation gates, the unbounded coalescing scan and
+its missing index, the doomed survivor, the wake-demotion, the three control-plane
+fail-open paths, and the composer focus trap. Every acceptance leg — decision,
+claim, correct route, exactly-once delivery, assistant started, ChatGPT re-reading
+live Owner OS, same-agent continuation with no duplicate — is proven on real
+production evidence, and the socket-loss self-heal is proven end to end on real
+tmux with the session list byte-identical across the repair.
+
+**Concrete gates that remain, none of them technical:**
+
+1. **Owner-gated jobs** — `cd01ad71`, `8ee3aa76`, `a6f4c391`, `35337a2c`
+   (obsolete tmux repairs) and `5e1bcdc8` (unstarted XMRig triage) are all still
+   `waiting_approval`. Approval is gated through `config/approved_gates.yaml`.
+2. **External ops** — the one-line `/tmp/tmux-*` exclusion in
+   `/root/cleanup_disk_pass2.sh`, deliberately not applied here. The guard already
+   bounds a recurrence to one companion tick.
+3. **Known, not-safely-fixable** — the derived `agent_prompt_needs_response`
+   classification of report prose, and the phrasing-dependent silent stop above.
+   Both documented with evidence; both would require loosening or tightening
+   detectors in ways that trade one failure mode for a worse one.
+
+Not marking acceptance GREEN as a formal claim — that determination belongs to
+whoever has authority to accept it, on the evidence above.

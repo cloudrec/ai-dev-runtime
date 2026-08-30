@@ -117,16 +117,46 @@ composer present : 1     user turns : 0     no login form : True     readyState 
 Companion restarted once, alone: PID **440153**, `active (running)`, started
 **2026-08-11 05:54:36 CEST**, on the fixed code.
 
-## 6. Live end-to-end test
+## 6. Live end-to-end test — PASSED 2026-08-11T04:07Z
 
 Event **3706** — a real pending wake, unacknowledged since 2026-08-11T02:50:53Z — was left to
 deliver through the **normal choke point**, including the full 900 s global claim cooldown that
 was still running at restart. No cooldown was bypassed and no synthetic event was injected into
 the production stream.
 
-Expected and asserted: exactly one submission, a `wake_submitted` row for 3706, and
-`pending_wake()` returning `nothing_to_wake_for` afterwards — no second copy regardless of how
-the verification lands.
+```
+wake_submitted   3706  latched  2026-08-11T04:07:39.537294Z  source=companion
+wake_delivery    3706           2026-08-11T04:07:51.651371Z  delivered=0
+                                reason=user_turn_not_observed_after_send
+attempts for 3706 after the latch : 0
+pending_wake() now                : 3707   (queue advanced)
+```
+
+**The contrast is the proof.** Before the fix, event 3706 was attempted **four times** at
+fifteen-minute intervals — 03:22, 03:37, 03:52, 04:07 — each attempt a fresh copy of the phrase
+into the chat and each burning the 900 s claim. The 04:07 attempt is the first under the fix:
+it latched *before* firing, the verification false-negatived exactly as before, and the
+companion **stopped**. There was no fifth attempt, and the queue moved on to 3707.
+
+One submission, one latch, zero resend on ambiguous verification — with the evidence still
+recording `delivered=0` and its real reason rather than hiding it.
+
+The bound page independently corroborates the diagnosis: it held **0** user turns immediately
+after navigation and shows turns afterwards, while the 04:07:51 verification still reported
+`user_turn_not_observed_after_send`. That is the ten-second window expiring on a page that had
+in fact accepted the message — the precise false-negative mechanism named in §1. It is now
+harmless: it costs one unproven delivery record, never a duplicate in the owner's chat.
+
+**Honest limit:** the turn count cannot be attributed solely to the wake phrase. The owner is
+also writing in that conversation, and this bridge is designed never to read message content —
+only to count nodes. What is proven here is the resend behaviour.
+
+## 6a. The new control chat is active
+
+`https://chatgpt.com/c/6a7a9736-2f18-83eb-bca5-cc55db60fa7a` — *Оплата и отказоустойчивость* —
+is bound, loaded in the existing authenticated profile, and carrying live turns. Wake traffic
+now lands in the conversation the owner is actually reading. Event 3707 is queued and will
+deliver on the next claim; normal operation has resumed.
 
 ## 7. Rollback
 
@@ -145,9 +175,23 @@ wake_bridge.bind_chat('<previous url>', by='owner')
 
 ## 8. Still open
 
-- The wake code remains **uncommitted** in the working tree. It is now correct and tested, but
-  committing it is an owner decision, and the accidental-live-patch failure above is the exact
-  argument for not leaving unreviewed changes on disk next to a service that restarts.
+- **The verification window is still too short.** Healthy deliveries keep being *recorded* as
+  unproven even though they arrive, which makes `deliveries_failed_total` misleading as a
+  health metric. It no longer causes duplicates, so this is a reporting defect, not a delivery
+  one. Widening the poll window is a small follow-up and was deliberately **not** done here —
+  it is beyond what was authorized, and the last time unreviewed wake code sat on disk it
+  reached production through a restart.
 - The ~60 duplicate phrases already delivered to the previous chat cannot be recalled.
 - Whether any of the 58 failed verifications was a *genuine* non-delivery cannot be settled
   without reading conversation content, which this bridge is designed never to do.
+
+## 9. Committed
+
+`df24ecfae8f2c04e0bdb4e98668d65fbddd3d431` — *fix(wake): a fired phrase is never sent twice,
+however the check lands* — carrying `core/wake_bridge.py`, `tools/cdp_composer.py`,
+`tools/wake_companion.py`, `core/control_plane/cto.py`, the two test files and this report.
+Nothing pushed. Targeted suite green at **78 passed, exit 0** immediately before the commit.
+
+Unrelated working-tree entries were deliberately excluded: `reports/phase3_postfix_soak.jsonl`
+(pre-existing) and `reports/OWNER_OS_WAKE_REBIND_STATUS_2026-08-08.md` (the earlier
+paused-patch status report).
