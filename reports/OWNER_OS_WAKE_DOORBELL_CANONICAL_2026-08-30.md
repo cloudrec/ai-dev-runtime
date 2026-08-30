@@ -2807,3 +2807,75 @@ fixture now stubs `browser_degraded` structurally, exactly as it already stubs
 infrastructure probe from a scripted queue or the live system**; each instance is
 recorded rather than quietly patched, because the pattern keeps producing either
 false greens or, here, a hang.
+
+## Technical closeout
+
+**Final gate: 762 passed, 0 failed** across every suite this session touched.
+
+### The lifecycle fast lane, delivering real traffic
+
+Three lifecycle terminals delivered in four and a half minutes, all on real
+production agents, all `submitted_and_assistant_started_generating`:
+
+```
+18:22:34  15393  agent_dead             arbitrage2-audit:0.0
+18:24:38  15402  agent_process_failed   arbitrage2-fable-audit:0.0
+18:26:59  15433  agent_process_failed   arbitrage2-fable-audit:0.0
+```
+
+Against **one per 900 s per route** before the fix. Event 15393 carries the
+before/after on a single event — `actionable=0` in audit 111562, `actionable=1`
+in 112065 — with exactly one `wake_submitted` despite two allowed claims, and
+`acknowledged=1`.
+
+### The two delivery guards, discriminating correctly in production
+
+```
+15416  assistant_generating_wedged     -> recovered, retried
+15431  assistant_still_generating      -> NOT recovered, left alone, retried later
+15433  submitted_and_assistant_started -> delivered
+```
+
+A wedged conversation and a genuinely busy one now produce different verdicts and
+different actions, which is the entire point. Tab count held at 5 across the
+window (cap 12), chrome at 23 processes — bounded, no accumulation.
+
+Event 15401's own history is the session's diagnosis improving in one column:
+`assistant_still_generating` → `renderer_unresponsive` →
+`cdp_error:WebSocketTimeoutException` → `assistant_generating_wedged`.
+
+### Verdict by leg
+
+| Leg | Verdict |
+| --- | --- |
+| Structural stop detection (ACAP: a background shell masking a finished turn) | **PROVEN** — 15458, 15460, 15473 |
+| Lifecycle fast-lane decision | **PROVEN** — `actionable=1`, with a same-event before/after |
+| Bounded claim + retry | **PROVEN** — claim, `actionable_cooldown_active:50s` refusal, claim again |
+| Delivery → assistant started → exactly-once → ack | **PROVEN ×3** on real lifecycle terminals |
+| Back-pressure: no typed draft, no latch | **PROVEN** |
+| Wedged-conversation detection + one bounded recovery | **PROVEN live** |
+| Degraded-browser guard (no replacement tabs) | **PROVEN live**, tab growth stopped |
+| Red-gate deploys | **CLOSED** — every deploy since has gone through `guarded_deploy.sh` |
+| ACAP's own three stops | fast-lane wakes, coalesced into surviving wakes on the route per the documented design |
+
+### State at closeout
+
+```
+pipeline        draining a backlog from the ~70-minute outage (gaika-extension, email, mess)
+worker_skew     []
+tmux_control    ok, 1 listener, no split
+dedupe          0 events ever delivered twice
+browser         degraded: false, 5 pages, 49 ms
+unrelated WIP   29/29 byte-identical
+```
+
+Nine defects were found and fixed against real production panes today, each
+backup-first, each mutation-verified, none weakening a cooldown, dedupe,
+exactly-once or suppression rule, and no synthetic product event ever substituted
+for a real one. Four fixture traps and three of my own measurement errors are
+recorded alongside them rather than quietly corrected.
+
+**Not marking acceptance GREEN as a formal claim** — that determination belongs to
+whoever has authority to accept it, on the evidence above. The technical legs are
+proven; the remaining items are the host memory gate and the owner-gated jobs,
+both unchanged and both recorded.
