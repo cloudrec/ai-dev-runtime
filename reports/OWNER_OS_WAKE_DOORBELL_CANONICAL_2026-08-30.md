@@ -2395,3 +2395,63 @@ One measurement error of this session's own is recorded rather than hidden: the
 first ACAP watcher took its baseline as `MAX(event.id)` at arm time, which was
 15458 itself — the very event it was waiting for — so it reported `stops=0` while
 the event already existed. The watcher was wrong, not the system.
+
+## The real current blocker, found while proving the fast lane: back-pressure
+
+Claims after the fast-lane deploy were fast and correct, yet no lifecycle event
+was delivered. Six consecutive attempts read
+`composer_did_not_clear_after_send`. The live page said why:
+
+```
+stop-generating button present : True
+send button count (SEND_SEL)   : 0
+composer                       : empty, no dialog, no focus trap
+```
+
+While a turn is generating ChatGPT REPLACES the send control with a stop control.
+The composer still accepts text, so the phrase was typed, the Enter fallback was
+ignored, and the verdict described a refused send when **no send was ever
+possible**. The reason string sent this session hunting a broken composer before
+the page was inspected.
+
+Fixed in `61e0a28`: the probe now runs BEFORE anything is typed and returns
+`assistant_still_generating`. Nothing is latched and nothing is typed, so the
+event stays pending and the ordinary backoff brings it around once the assistant
+is free — back-pressure delays a delivery, it never consumes one. **Fail-open by
+construction:** only an explicit `True` short-circuits; a page that cannot answer
+the probe runs the previous path unchanged, because treating unknown as
+"generating" would stall delivery on any page whose stop control this selector
+cannot see.
+
+Live within one minute of deploy — the log now names the real condition:
+
+```
+17:22:12  event 15397  assistant_still_generating
+17:23:22  event 15424  assistant_still_generating
+```
+
+**This is an external constraint, not a pipeline defect.** The owner-os chat's
+assistant has been generating continuously; wakes cannot be delivered into a chat
+that is mid-answer. Detection, decision and claim are all fast now; the remaining
+latency is the assistant's own response time.
+
+## Two corrections to this session's own claims
+
+1. **"ACAP emits exactly one stop" — imprecise.** It emitted **two**:
+   15458 (digest `e4c5fb8f8a05baf1`, 17:07:56Z) and 15460 (digest
+   `a4e48650bd8c81a4`, 17:18:04Z). They are not duplicates — the background
+   `pytest` exited between them, the pane text materially changed, and the pane
+   settled again. Dedupe is per PANE STATE, not one event forever. The accurate
+   statement is: one stop per distinct settled state, re-armed only by a real
+   change.
+
+2. **A commit was deployed on a red gate.** The gate, backup, commit and service
+   restart were chained in a single command, so 8 failures in
+   `test_wake_delivery_verification.py` did not stop the deploy. The deployed
+   CODE was unaffected — those failures were fixture sequencing, not behaviour:
+   that suite's fake pops scripted booleans in order and the new probe consumed
+   the first entry, shifting every expectation, exactly as had already happened
+   in the composer suite. Both fakes now answer the probe structurally, like
+   `readyState`, and the suites are green (184 passed). Deploying on a red gate
+   was still wrong, and the chaining that allowed it is the actual process defect
+   — recorded rather than quietly corrected.
