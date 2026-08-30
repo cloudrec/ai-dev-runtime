@@ -3730,3 +3730,27 @@ line anchors, declared status, native lifecycle state.
 Companion restarted cleanly, 9 sessions unchanged, no duplicates, 29 unrelated WIP files
 untouched. No owner gate crossed: `approved_gates.yaml`, Telegram credentials, ACAP C1/C2,
 XMRig, `/etc/systemd/system` and the HIGH_RISK jobs were all left alone.
+
+---
+
+# Part 20 — WIP preservation breached and restored (my error, twice)
+
+The standing requirement is that the owner's unrelated WIP report files stay untouched.
+`8fdbd83` (03:57) swept them into version control; `68f7e9f` (03:58) caught and reverted
+that. **The same mistake recurred at `faf4e83` (18:06, Part 7)** — a directory-wide
+`git add reports/` picked up 32 unrelated files — and went unnoticed until a WIP count of
+0 during Part 19's verification exposed it.
+
+Restored in `d1f0507`: `git rm --cached` only, so nothing on disk was touched. 32 files
+untracked again, all verified byte-identical to their pre-existing snapshot both before
+and after the restore. Nothing was ever pushed.
+
+**Content was never altered.** Every one of the 32 is blob-identical to its `8fdbd83`
+snapshot, and the working tree matched HEAD throughout. An earlier pass of this check
+reported "content changed" for 28 of them; that was wrong — `git rev-parse` echoes an
+unresolvable argument to stdout, so the untrack commit (where the file legitimately does
+not exist) was being counted as a second, different blob. The figure is withdrawn.
+
+Durable fix: stage report changes by explicit path, never by directory. The recurrence
+happened precisely because `68f7e9f` restored the state without removing the habit that
+caused it.
