@@ -144,10 +144,84 @@ def list_external_waits(conn=None, now: Optional[float] = None) -> list:
 
 def _conn(conn=None):
     conn, own = _c(conn)
-    for stmt in (_SCHEMA + _WAIT_SCHEMA).strip().split(";"):
+    for stmt in (_SCHEMA + _WAIT_SCHEMA + _REG_SCHEMA).strip().split(";"):
         if stmt.strip():
             conn.execute(stmt)
     return conn, own
+
+
+# PROJECTS THAT NEVER AUTO-REGISTER. Auto-registration exists so a new agent is supervised
+# without a manual edit; this list exists so that convenience can never reach a project
+# whose gates are expensive to get wrong. A denylist beats discovery, always — an agent is
+# excluded because of what its project DOES, not because nobody got round to listing it.
+AUTO_REGISTER_DENY_PROJECTS = {
+    p.strip() for p in os.getenv(
+        "NATIVE_SUPERVISOR_DENY_PROJECTS",
+        # ACAP C1/C2 · Auction value-bearing gates · payment · outbound mail · miner
+        # triage · and ai-dev-runtime, because the supervisor must never drive its own
+        # session: it would answer its own turn boundaries and loop on itself.
+        "capacity,auction,payment-orchestrator,payorch,email,xmrig,"
+        "ai-dev-runtime").split(",") if p.strip()
+}
+AUTO_REGISTER = os.getenv("NATIVE_SUPERVISOR_AUTO_REGISTER", "1") not in ("0", "false", "no")
+
+_REG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS native_supervised_target (
+    target TEXT PRIMARY KEY, project TEXT, cwd TEXT, since TEXT, since_ts REAL,
+    by TEXT, reason TEXT);
+"""
+
+
+def _project_of(agent: dict) -> str:
+    cwd = (agent.get("claude_cwd") or agent.get("cwd") or "").rstrip("/")
+    return cwd.rsplit("/", 1)[-1] if cwd else ""
+
+
+def auto_register(agents: list, *, conn=None, now: Optional[float] = None,
+                  by: str = "auto-discovery") -> dict:
+    """Register newly-seen managed agents for supervision, minus the deny-listed projects.
+
+    Requirement 8 was "this must never become per-agent manual setup". The honest way to
+    satisfy that without also handing the supervisor every future agent on the box is to
+    make registration automatic but SUBTRACTIVE: everything is registered except projects
+    whose gates are expensive, and every registration is durable and attributed so it can
+    be read back and revoked.
+    """
+    now = now if now is not None else time.time()
+    conn, own = _conn(conn)
+    try:
+        if not AUTO_REGISTER:
+            return {"registered": [], "skipped": [{"why": "auto_register_disabled"}]}
+        known = {r[0] for r in conn.execute("SELECT target FROM native_supervised_target")}
+        registered, skipped = [], []
+        for a in agents or []:
+            t = a.get("target") or ""
+            if not t or not a.get("is_agent") or not a.get("alive") or t in known:
+                continue
+            proj = _project_of(a)
+            if proj in AUTO_REGISTER_DENY_PROJECTS:
+                skipped.append({"target": t, "project": proj, "why": "deny_listed_project"})
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO native_supervised_target "
+                "(target,project,cwd,since,since_ts,by,reason) VALUES (?,?,?,?,?,?,?)",
+                (t, proj, a.get("claude_cwd") or a.get("cwd") or "", now_iso(), now, by,
+                 "auto-registered on discovery"))
+            registered.append({"target": t, "project": proj})
+        conn.commit()
+        return {"registered": registered, "skipped": skipped}
+    finally:
+        if own:
+            conn.close()
+
+
+def registered_targets(conn=None) -> set:
+    conn, own = _conn(conn)
+    try:
+        return {r[0] for r in conn.execute("SELECT target FROM native_supervised_target")}
+    finally:
+        if own:
+            conn.close()
 
 
 def allowed_targets() -> set:
@@ -155,9 +229,18 @@ def allowed_targets() -> set:
     return {"*"} if raw == "*" else {t.strip() for t in raw.split(",") if t.strip()}
 
 
-def is_supervised(target: str) -> bool:
+def is_supervised(target: str, *, conn=None) -> bool:
+    """Supervised if explicitly allow-listed OR auto-registered. Either way it is a
+    positive record — nothing is supervised merely by existing."""
+    if not target:
+        return False
     a = allowed_targets()
-    return bool(target) and ("*" in a or target in a)
+    if "*" in a or target in a:
+        return True
+    try:
+        return target in registered_targets(conn=conn)
+    except Exception:  # noqa: BLE001 — unknown is never "supervised"
+        return False
 
 
 def resolve_target(cwd: str, agents: list) -> Optional[str]:
@@ -192,6 +275,48 @@ def decide(event_type: str, payload: dict) -> dict:
         # We are inside a stop hook's own continuation; re-entering would loop.
         return {"action": "skip", "reason": "stop_hook_active"}
     return {"action": "continue", "reason": "turn_ended_nothing_armed"}
+
+
+# /goal — a verified-completion loop, so a substantial task keeps going turn to turn
+# without a ping. Composing one is safe; AUTO-SUBMITTING one is not the same thing, and the
+# difference is deliberate.
+#
+# `is_safe_continuation` is an ALLOWLIST of recognised benign meta-steps, and a `/goal`
+# line is not one: it changes how the agent behaves for many turns, which is exactly the
+# class of instruction that allowlist exists to keep out of an automated path. So this
+# composes the text and refuses to submit it unless GOAL_AUTOSUBMIT is explicitly turned
+# on — and even then only for a caller that supplies its own verifiable condition.
+#
+# Left OFF by default on purpose: widening the classifier is a safety decision, not an
+# implementation detail, and nothing here does it silently.
+GOAL_AUTOSUBMIT = os.getenv("NATIVE_SUPERVISOR_GOAL_AUTOSUBMIT", "0") not in ("0", "false", "no")
+_GOAL_MAX_LEN = 300
+
+
+def compose_goal_step(objective: str, completion_condition: str) -> Optional[str]:
+    """A `/goal` line with a VERIFIABLE stopping condition, or None if it cannot be made.
+
+    Refuses an empty objective, an empty condition, or anything over the length cap. A
+    goal without a checkable end is how an agent loops forever, so the condition is not
+    optional — a caller that has not decided what "done" means has not got a goal.
+    """
+    o = " ".join((objective or "").split())
+    c = " ".join((completion_condition or "").split())
+    if not o or not c:
+        return None
+    line = f"/goal {o} — done when: {c}"
+    return line if len(line) <= _GOAL_MAX_LEN else None
+
+
+def may_autosubmit_goal(text: str, safe_fn: Callable) -> dict:
+    """May this /goal line be submitted automatically? Two independent gates."""
+    if not text or not text.startswith("/goal "):
+        return {"ok": False, "reason": "not_a_goal_line"}
+    if not GOAL_AUTOSUBMIT:
+        return {"ok": False, "reason": "goal_autosubmit_disabled"}
+    if not safe_fn(text):
+        return {"ok": False, "reason": "failed_safety_classifier"}
+    return {"ok": True, "reason": "allowed"}
 
 
 def _recent_for_target(conn, target: str, now: float) -> tuple:
@@ -239,6 +364,12 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
             step_text = os.getenv("CONTINUATION_WATCHDOG_DEFAULT_STEP",
                                   "continue with the next safe step")
 
+        # Requirement 8: a new agent becomes supervised on discovery, not by hand.
+        try:
+            auto_register(agents, conn=conn, now=now)
+        except Exception:  # noqa: BLE001 — registration never breaks supervision
+            pass
+
         rows = conn.execute(
             "SELECT e.id, e.type, e.payload FROM event e "
             "LEFT JOIN native_supervision s ON s.event_id = e.id "
@@ -262,7 +393,7 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                         "target_unresolved_or_ambiguous", True)
                 skipped.append({"event_id": eid, "why": "target_unresolved_or_ambiguous"})
                 continue
-            if not is_supervised(target):
+            if not is_supervised(target, conn=conn):
                 _record(conn, eid, target, "skip", "not_in_rollout_allowlist", True)
                 skipped.append({"event_id": eid, "target": target,
                                 "why": "not_in_rollout_allowlist"})

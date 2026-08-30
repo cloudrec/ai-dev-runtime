@@ -145,3 +145,65 @@ def test_a_missing_env_file_does_not_break_the_hook(monkeypatch):
     mod = importlib.import_module("hooks.owneros_hook")
     monkeypatch.setattr(mod, "_RUNTIME_ENV", "/nonexistent/path/.env")
     mod._load_runtime_env()   # must not raise
+
+
+# ── event-driven: the hook hands the fact straight on ───────────────────────
+def test_a_turn_boundary_triggers_a_supervision_pass(monkeypatch):
+    """The supervisor used to learn about a stop on the companion's next tick, costing
+    tens of seconds for no reason: the fact arrived in the hook process the instant the
+    turn ended."""
+    import importlib
+    mod = importlib.import_module("hooks.owneros_hook")
+    fired = []
+    monkeypatch.setattr(mod, "_trigger_supervisor", lambda: fired.append(1))
+    monkeypatch.setattr(mod, "_load_runtime_env", lambda: None)
+
+    class _Cto:
+        @staticmethod
+        def emit(*a, **k):
+            return {"event_id": 1}
+
+    import sys as _s
+    monkeypatch.setitem(_s.modules, "core.control_plane.cto", _Cto)
+    monkeypatch.setattr(_s, "stdin", type("F", (), {"read": staticmethod(lambda: json.dumps(
+        {"hook_event_name": "Stop", "session_id": "s", "cwd": "/opt/x",
+         "last_assistant_message": "done"}))})())
+    mod.main()
+    assert fired == [1], "a turn boundary must kick supervision immediately"
+
+
+def test_a_notification_does_not_trigger_a_supervision_pass(monkeypatch):
+    """Only a turn boundary is the supervisor's business; a question is not, so it must
+    not spawn a process per notification."""
+    import importlib
+    mod = importlib.import_module("hooks.owneros_hook")
+    fired = []
+    monkeypatch.setattr(mod, "_trigger_supervisor", lambda: fired.append(1))
+    monkeypatch.setattr(mod, "_load_runtime_env", lambda: None)
+
+    class _Cto:
+        @staticmethod
+        def emit(*a, **k):
+            return {"event_id": 2}
+
+    import sys as _s
+    monkeypatch.setitem(_s.modules, "core.control_plane.cto", _Cto)
+    monkeypatch.setattr(_s, "stdin", type("F", (), {"read": staticmethod(lambda: json.dumps(
+        {"hook_event_name": "Notification", "notification_type": "agent_needs_input",
+         "session_id": "s", "cwd": "/opt/x"}))})())
+    mod.main()
+    assert fired == []
+
+
+def test_the_trigger_never_blocks_or_raises(monkeypatch):
+    """A hook that blocks blocks the session it observes — the one thing this bridge must
+    never do. A spawn failure is swallowed; the companion tick remains the fallback."""
+    import importlib
+    mod = importlib.import_module("hooks.owneros_hook")
+
+    def _boom(*a, **k):
+        raise OSError("cannot fork")
+
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "Popen", _boom)
+    mod._trigger_supervisor()   # must not raise

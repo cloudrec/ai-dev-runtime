@@ -158,13 +158,26 @@ def test_staged_input_is_never_typed_over(monkeypatch):
     assert calls == [] and r["skipped"][0]["why"] == "pane_has_pending_input"
 
 
-def test_an_agent_outside_the_rollout_is_not_touched(monkeypatch):
+def test_a_deny_listed_agent_is_never_touched(monkeypatch):
+    """Auto-registration means "everything except", so the denylist is what actually
+    protects the expensive projects — and it must beat discovery every time."""
     monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {"auction"})
     conn, _ = ns._conn()
-    _hook_event(conn, cwd="/opt/mess")
+    _hook_event(conn, cwd="/opt/diamond/auction")
     calls = []
-    r = _scan(conn, [_agent(target="mess-opus:0.0", cwd="/opt/mess")], calls)
-    assert calls == [] and r["skipped"][0]["why"] == "not_in_rollout_allowlist"
+    r = _scan(conn, [_agent(target="diamond-auction:0.0", cwd="/opt/diamond/auction")], calls)
+    assert calls == [], "a deny-listed project must never be continued"
+    assert r["skipped"][0]["why"] == "not_in_rollout_allowlist"
+
+
+def test_the_supervisor_never_drives_its_own_session():
+    """ai-dev-runtime is deny-listed: a supervisor that answers its own turn boundaries
+    would loop on itself."""
+    assert "ai-dev-runtime" in ns.AUTO_REGISTER_DENY_PROJECTS
+    r = ns.auto_register([_agent(target="owner-os-wake-policy-opus:0.0",
+                                 cwd="/root/ai-dev-runtime")])
+    assert r["registered"] == []
 
 
 def test_each_event_is_acted_on_at_most_once(monkeypatch):
@@ -217,3 +230,81 @@ def test_stale_events_are_not_acted_on(monkeypatch):
     calls = []
     _scan(conn, [_agent()], calls)
     assert calls == [], "an hour-old stop has been handled by something else"
+
+
+# ── auto-registration (requirement 8: never per-agent manual setup) ──────────
+def test_a_newly_discovered_agent_registers_itself():
+    r = ns.auto_register([_agent(target="brand-new:0.0", cwd="/opt/newproj")])
+    assert r["registered"] == [{"target": "brand-new:0.0", "project": "newproj"}]
+    assert ns.is_supervised("brand-new:0.0") is True
+
+
+def test_deny_listed_projects_never_auto_register(monkeypatch):
+    """Convenience must not reach a project whose gates are expensive to get wrong."""
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {"capacity", "auction",
+                                                            "payment-orchestrator", "email"})
+    agents = [_agent(target="capacity-blockchain:0.0", cwd="/opt/capacity"),
+              _agent(target="diamond-auction:0.0", cwd="/opt/diamond/auction"),
+              _agent(target="email:0.0", cwd="/opt/email"),
+              _agent(target="ok-agent:0.0", cwd="/opt/harmless")]
+    r = ns.auto_register(agents)
+    assert [x["target"] for x in r["registered"]] == ["ok-agent:0.0"]
+    for t in ("capacity-blockchain:0.0", "diamond-auction:0.0", "email:0.0"):
+        assert ns.is_supervised(t) is False, t
+
+
+def test_registration_is_idempotent():
+    a = [_agent(target="dup:0.0", cwd="/opt/dup")]
+    ns.auto_register(a)
+    assert ns.auto_register(a)["registered"] == [], "already known, so not re-registered"
+
+
+def test_dead_or_non_agent_panes_are_not_registered():
+    assert ns.auto_register([_agent(target="dead:0.0", cwd="/opt/d", alive=False)])["registered"] == []
+    a = _agent(target="shell:0.0", cwd="/opt/s"); a["is_agent"] = False
+    assert ns.auto_register([a])["registered"] == []
+
+
+def test_auto_registration_can_be_switched_off(monkeypatch):
+    monkeypatch.setattr(ns, "AUTO_REGISTER", False)
+    r = ns.auto_register([_agent(target="nope:0.0", cwd="/opt/nope")])
+    assert r["registered"] == [] and r["skipped"][0]["why"] == "auto_register_disabled"
+
+
+def test_scan_registers_what_it_sees(monkeypatch):
+    """The path that makes requirement 8 automatic rather than a chore."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "")
+    conn, _ = ns._conn()
+    calls = []
+    _scan(conn, [_agent(target="seen-by-scan:0.0", cwd="/opt/seenproj")], calls)
+    assert "seen-by-scan:0.0" in ns.registered_targets(conn=conn)
+
+
+# ── /goal composition, and why it is not auto-submitted ──────────────────────
+def test_a_goal_needs_a_verifiable_completion_condition():
+    assert ns.compose_goal_step("finish the audit", "tests/audit.md exists and CI is green")
+    assert ns.compose_goal_step("finish the audit", "") is None, "no end condition, no goal"
+    assert ns.compose_goal_step("", "some condition") is None
+
+
+def test_an_overlong_goal_is_refused():
+    assert ns.compose_goal_step("x" * 400, "done") is None
+
+
+def test_a_goal_line_is_not_auto_submitted_by_default():
+    """It changes how the agent behaves for many turns, which is exactly what the
+    fail-closed allowlist exists to keep out of an automated path."""
+    line = ns.compose_goal_step("do the thing", "the thing is done")
+    assert ns.may_autosubmit_goal(line, lambda t: True)["reason"] == "goal_autosubmit_disabled"
+
+
+def test_even_enabled_a_goal_must_still_pass_the_safety_classifier(monkeypatch):
+    monkeypatch.setattr(ns, "GOAL_AUTOSUBMIT", True)
+    line = ns.compose_goal_step("do the thing", "the thing is done")
+    assert ns.may_autosubmit_goal(line, lambda t: False)["reason"] == "failed_safety_classifier"
+    assert ns.may_autosubmit_goal(line, lambda t: True)["ok"] is True
+
+
+def test_non_goal_text_is_rejected_by_the_goal_gate(monkeypatch):
+    monkeypatch.setattr(ns, "GOAL_AUTOSUBMIT", True)
+    assert ns.may_autosubmit_goal("rm -rf /", lambda t: True)["reason"] == "not_a_goal_line"

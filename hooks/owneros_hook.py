@@ -108,6 +108,21 @@ def _identity(payload: dict) -> dict:
             "session_id": payload.get("session_id") or ""}
 
 
+_TRIGGER = "/root/ai-dev-runtime/tools/native_supervise_once.py"
+
+
+def _trigger_supervisor() -> None:
+    """Kick one supervision pass now, without waiting for the poll and without blocking."""
+    try:
+        import subprocess
+        subprocess.Popen(
+            ["/root/ai-dev-runtime/venv/bin/python", _TRIGGER],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except Exception:  # noqa: BLE001 — the polled tick remains the fallback
+        pass
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
@@ -156,12 +171,23 @@ def main() -> int:
 
         _load_runtime_env()
         from core.control_plane import cto
-        cto.emit("claude_hook", etype, project_id=ident["project"], agent_id=ident["agent"],
+        _emitted = cto.emit("claude_hook", etype, project_id=ident["project"], agent_id=ident["agent"],
                  severity=severity, owner_action_required=oar, payload=body,
                  action_taken=f"{ident['agent']} [{ident['project'] or 'unmapped'}]: {ev}",
                  correlation_id=f"claudehook:{ident['session_id'][:12]}",
                  dedup_key=f"claudehook:{ident['session_id'][:12]}:{ev}:{digest}",
                  dedup_window_secs=900)
+        # EVENT-DRIVEN, not polled. The supervisor used to learn about a stop on the
+        # companion's next tick, which cost tens of seconds for no reason: the fact
+        # arrived here, in this process, the instant the turn ended. Hand it straight on.
+        #
+        # DETACHED, because a hook that blocks blocks the session it observes — the one
+        # thing this bridge must never do. The child runs in its own session with its
+        # output discarded, so nothing it does can reach back into the agent's terminal,
+        # and a failure to spawn is swallowed like every other failure here: the
+        # companion's tick is still there as the fallback path.
+        if ev == "Stop" and etype == "agent_turn_stopped":
+            _trigger_supervisor()
     except Exception:  # noqa: BLE001 — observation must never break the observed session
         return 0
     return 0
