@@ -49,6 +49,11 @@ class _S:
         self.exprs.append(expression)
         if "readyState" in expression:
             return True          # the readiness gate is not what these tests exercise
+        if "stop-button" in expression:
+            # Back-pressure probe. Answered STRUCTURALLY, like readyState, so it does not
+            # consume the scripted queue below — otherwise adding an infrastructure check
+            # to the composer would silently shift every expectation in every other test.
+            return getattr(self, "generating", False)
         return self.bools.pop(0) if self.bools else None
 
     def count(self, selector):
@@ -507,3 +512,70 @@ def test_ack_decision_table():
     assert cc.ack_click_decision(["Got it"]) == "allowed"
     assert cc.ack_click_decision(["  Got It  "]) == "allowed"      # trimmed, case-folded
     assert cc.ack_click_decision(["Upgrade"]) == "label_not_allowlisted"
+
+
+# ── 2026-08-30: back-pressure was being reported as a broken composer ────────
+def test_a_turn_in_flight_is_reported_as_back_pressure_not_a_composer_fault():
+    """While generating, ChatGPT replaces the send control with a stop control. Typing
+    then leaves the phrase in the box and the attempt reads
+    `composer_did_not_clear_after_send` — which sends an operator looking for a broken
+    composer instead of ordinary back-pressure."""
+    from tools import cdp_composer as cc
+
+    class _Gen(_FakeSession):
+        def boolean(self, expression):
+            if "stop-button" in expression:
+                return True
+            return super().boolean(expression)
+
+    s = _Gen(trapped=False)
+    assert cc.assistant_is_generating(s) is True
+
+
+def test_no_stop_button_means_no_back_pressure():
+    from tools import cdp_composer as cc
+    assert cc.assistant_is_generating(_FakeSession(trapped=False)) is not True
+
+
+def test_an_unanswerable_page_falls_open_to_the_previous_path():
+    """None (the page could not answer) must not be treated as generating — the old path
+    has to keep running unchanged."""
+    from tools import cdp_composer as cc
+
+    class _Mute(_FakeSession):
+        def boolean(self, expression):
+            return None
+
+    assert cc.assistant_is_generating(_Mute(trapped=False)) is None
+
+
+def test_a_generating_assistant_short_circuits_before_anything_is_typed(wired):
+    """The full path, not just the helper: a turn in flight must produce back-pressure,
+    and the phrase must NOT be left sitting in the composer."""
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.generating = True
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is False
+    assert r["reason"] == "assistant_still_generating"
+    assert s.inserted == [], "nothing may be typed while the assistant is answering"
+
+
+def test_back_pressure_latches_nothing_so_the_event_is_retried(wired):
+    """No latch means the wake stays pending: back-pressure delays a delivery, it never
+    consumes one."""
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.generating = True
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["reason"] == "assistant_still_generating"
+    assert not any("click" in e for e in s.exprs), "no send was attempted"
+
+
+def test_an_unanswerable_probe_does_not_block_delivery(wired):
+    """Fail-OPEN isolation: when the page cannot answer the back-pressure probe (None),
+    the previous path must run unchanged. Treating unknown as 'generating' would stall
+    every delivery on any page whose stop control this selector cannot see."""
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.generating = None
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is True and r["reason"] == "submitted_and_assistant_started_generating"
+    assert s.inserted == ["PHRASE"]

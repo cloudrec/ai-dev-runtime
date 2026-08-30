@@ -300,6 +300,23 @@ def ack_click_decision(names: list) -> str:
     return "allowed"
 
 
+# While a turn is generating, ChatGPT REPLACES the send control with a stop control. The
+# composer still accepts text, so a wake typed now sits in the box, the Enter fallback is
+# ignored, and the attempt is reported as `composer_did_not_clear_after_send` — a reason
+# that says the page refused a send when in truth no send was ever possible.
+#
+# 2026-08-30: six consecutive wake deliveries failed exactly this way while the assistant
+# was still answering the previous wake. Claims were fast and correct; the delivery verdict
+# was simply describing the wrong thing, and an operator reading the log would look for a
+# broken composer instead of ordinary back-pressure.
+_STOP_BUTTON_SEL = "button[data-testid='stop-button'], button[aria-label*='Stop']"
+
+
+def assistant_is_generating(s) -> Optional[bool]:
+    """Is a turn being generated right now? None when the page cannot answer."""
+    return s.boolean(f"!!document.querySelector({_STOP_BUTTON_SEL!r})")
+
+
 def dialog_title(s) -> str:
     """The dialog's accessible TITLE — UI chrome, the same class of metadata this module
     already reads from the sidebar. Never conversation content."""
@@ -595,6 +612,15 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
             # activeElement in its focus trap on three route tabs at once. Three and a
             # half hours of undeliverable wakes read as one undifferentiated failure.
             return {"ok": False, "reason": focus_failure_reason(s)}
+
+        # BACK-PRESSURE, checked before anything is typed. A turn in flight means there is
+        # no send control to click and Enter is ignored, so typing now would only leave the
+        # phrase sitting in the composer and produce a misleading verdict. Nothing is
+        # latched and nothing is typed: the event stays pending and the ordinary backoff
+        # brings it around again once the assistant is free. Fail-open — if the page cannot
+        # answer the question (None), the previous path runs unchanged.
+        if assistant_is_generating(s) is True:
+            return {"ok": False, "reason": "assistant_still_generating"}
 
         # The ONLY string ever sent into the page.
         s.call("Input.insertText", {"text": phrase})
