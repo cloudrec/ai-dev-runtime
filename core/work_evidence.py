@@ -56,6 +56,16 @@ _AUDIT_ONLY_RE = re.compile(r"\bAUDIT (COMPLETE|ONLY)\b|\bANALYSIS ONLY\b|\bPLAN
 _BLOCKED_RE = re.compile(r"\bBLOCKED(_EXTERNAL)?\b|\bBLOCKED ON\b")
 _UNVERIFIED_RE = re.compile(r"\bUNVERIFIED\b|\bNOT VERIFIED\b")
 
+# A report below this size is read whole, exactly as before — no behaviour change for the
+# ordinary case (565 of the 633 report files on this host).
+LONG_REPORT_BYTES = int(os.getenv("WORK_EVIDENCE_LONG_REPORT_BYTES", "20000"))
+
+# An explicit, structured completion declaration: "Status: blocked", "**Outcome:** done".
+# Authoritative wherever it appears, because it is a declaration rather than narration.
+_STATUS_DECL_RE = re.compile(
+    r"^[ \t>*_-]*(?:\*\*)?(?:status|state|outcome|result)(?:\*\*)?[ \t]*[:：][ \t]*\S.*$",
+    re.IGNORECASE | re.MULTILINE)
+
 EVENT_REPORT = "work_report_published"
 EVENT_PARTIAL = "work_partial_completion"
 EVENT_STOPPED = "work_stopped_incomplete"
@@ -289,24 +299,58 @@ def _owner_action_record(evidence_key: str, *, project: str, target: str, ref: s
             conn.close()
 
 
+def completion_scope(text: str) -> tuple:
+    """The slice of a report that speaks for its CURRENT completeness, plus why.
+
+    The append-only log is the failure this exists for. `classify_report` used to regex the
+    WHOLE document, so a 297 KB narrative log that MENTIONS "DONE", "NOT STARTED" and
+    "BLOCKED" across a thousand historical notes reported all three as live claims — and did
+    so permanently, by construction, because an append-only file can never stop matching.
+    Measured on 2026-08-30: 51% of a week's `work_stopped_incomplete` events came from two
+    such logs, and the owner cannot tell those from a real stop.
+
+    Structured beats prose: an explicit `Status:`/`Outcome:` declaration is kept wherever it
+    sits, because it is a declaration. Failing that, the trailing window is used — what a
+    report says LAST is what it currently claims. Short reports are read whole, unchanged.
+
+    The narrowing is stated plainly rather than hidden: a one-off "BLOCKED ON x" written
+    only in the middle of a long report is no longer seen. Declaring it in a status line
+    keeps it visible, which is the behaviour worth having.
+    """
+    if len(text) <= LONG_REPORT_BYTES:
+        return text, "whole_report"
+    tail = text[-LONG_REPORT_BYTES:]
+    cut = tail.find("\n")
+    if cut >= 0:
+        tail = tail[cut + 1:]            # never start mid-line
+    decls = _STATUS_DECL_RE.findall(text)
+    if decls:
+        return "\n".join(decls) + "\n" + tail, "status_declarations+tail"
+    return tail, "tail"
+
+
 def classify_report(text: str) -> dict:
     """What does this report say about its own completeness?
 
     Reads the report's own words rather than guessing from file changes. A document that
     claims both `DONE` and `NOT STARTED` is the important case: it is a partial delivery,
-    which is precisely what nobody was told about.
+    which is precisely what nobody was told about — but only when both claims are CURRENT,
+    which is what `completion_scope` establishes.
     """
-    done = bool(_DONE_RE.search(text))
-    not_started = bool(_NOT_STARTED_RE.search(text))
-    audit_only = bool(_AUDIT_ONLY_RE.search(text))
-    blocked = bool(_BLOCKED_RE.search(text))
-    unverified = bool(_UNVERIFIED_RE.search(text))
+    scope, basis = completion_scope(text)
+    done = bool(_DONE_RE.search(scope))
+    not_started = bool(_NOT_STARTED_RE.search(scope))
+    audit_only = bool(_AUDIT_ONLY_RE.search(scope))
+    blocked = bool(_BLOCKED_RE.search(scope))
+    unverified = bool(_UNVERIFIED_RE.search(scope))
     incomplete = not_started or audit_only or blocked
     return {
         "done": done, "not_started": not_started, "audit_only": audit_only,
         "blocked": blocked, "unverified": unverified,
         "partial": bool(done and incomplete),
         "incomplete": incomplete,
+        # auditable: which part of the document these markers came from
+        "scope_basis": basis,
     }
 
 

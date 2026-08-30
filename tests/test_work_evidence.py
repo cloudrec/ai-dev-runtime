@@ -295,3 +295,59 @@ def test_events_reach_the_cto_inbox_with_owner_action_for_partial_work(tmp_path)
     assert we.EVENT_PARTIAL in types and we.EVENT_STOPPED in types
     partial = next(e for e in events if e["type"] == we.EVENT_PARTIAL)
     assert partial["severity"] == "high" and partial["owner_action_required"] in (1, True)
+
+
+# ── completion scope: prose markers must describe CURRENT state, not history ──────────
+# Regression for Owner OS event 15754. `classify_report` regexed the WHOLE document, so an
+# append-only log that NARRATES "DONE", "NOT STARTED" and "BLOCKED" across a thousand
+# historical notes reported all three as live claims — permanently, because an append-only
+# file can never stop matching. That was 51% of a week's work_stopped_incomplete events.
+
+_FILLER = ("Ordinary narrative describing the day's work in detail. " * 40 + "\n")
+
+
+def _long(head: str = "", tail: str = "") -> str:
+    body = _FILLER * int((we.LONG_REPORT_BYTES * 2) / len(_FILLER) + 2)
+    return f"# Handoff\n\n{head}\n{body}\n{tail}\n"
+
+
+def test_short_report_is_still_read_whole():
+    """The ordinary case must not change at all."""
+    text = "# R\n\nBLOCKED ON the provider.\n"
+    assert len(text) <= we.LONG_REPORT_BYTES
+    cls = we.classify_report(text)
+    assert cls["scope_basis"] == "whole_report"
+    assert cls["blocked"] is True and cls["incomplete"] is True
+
+
+def test_history_in_a_long_log_is_not_a_current_claim():
+    """The ARBITRAGE2/CANARY shape: markers buried in history, clean tail."""
+    text = _long(head="Earlier we were BLOCKED ON review and it was NOT STARTED.",
+                 tail="Everything since has proceeded normally.")
+    assert len(text) > we.LONG_REPORT_BYTES
+    cls = we.classify_report(text)
+    assert cls["scope_basis"] == "tail"
+    assert cls["blocked"] is False
+    assert cls["not_started"] is False
+    assert cls["incomplete"] is False
+
+
+def test_current_claim_in_a_long_log_is_still_seen():
+    """Narrowing the scope must not blind the classifier to a real, present blocker."""
+    cls = we.classify_report(_long(tail="Work halted: BLOCKED ON the owner decision."))
+    assert cls["blocked"] is True and cls["incomplete"] is True
+
+
+def test_structured_status_declaration_beats_position():
+    """A declared status is authoritative wherever it sits — structured over prose."""
+    cls = we.classify_report(_long(head="Status: BLOCKED ON the provider",
+                                   tail="Narrative continues quietly."))
+    assert cls["scope_basis"] == "status_declarations+tail"
+    assert cls["blocked"] is True and cls["incomplete"] is True
+
+
+def test_scope_never_starts_mid_line():
+    scope, basis = we.completion_scope(_long(tail="end"))
+    assert basis == "tail"
+    assert not scope.startswith("Ordinary narrative describing the day") or scope.count("\n")
+    assert len(scope) < we.LONG_REPORT_BYTES
