@@ -330,3 +330,59 @@ def test_denied_registrations_are_purged_not_merely_ignored(monkeypatch):
     monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {"payorch"})
     assert ns.purge_denied(conn=conn) == ["gone:0.0"]
     assert ns.purge_denied(conn=conn) == [], "idempotent"
+
+
+# ── requirement 4: exhausted continuation records ONE terminal state, then goes quiet ──
+# Before this, hitting MAX_CONSECUTIVE simply skipped, silently, every tick, forever: an
+# agent that had stopped converging produced no continuation, no event and no owner signal.
+
+def _gate_conn(tmp_path):
+    import sqlite3
+    c = sqlite3.connect(str(tmp_path / "gate.db"))
+    c.execute(ns._GATE_SCHEMA)
+    return c
+
+
+def test_gate_opens_once_and_emits_exactly_one_event(tmp_path):
+    conn = _gate_conn(tmp_path)
+    seen = []
+
+    def emit(source, etype, **kw):
+        seen.append((etype, kw.get("owner_action_required"), kw.get("severity")))
+        return {"event_id": 4242}
+
+    a = ns.open_gate("x:0.0", reason="cap", conn=conn, now=1000.0, emit_fn=emit)
+    b = ns.open_gate("x:0.0", reason="cap", conn=conn, now=1001.0, emit_fn=emit)
+    assert a["opened"] is True and a["event_id"] == 4242
+    assert b["opened"] is False and b["reason"] == "gate_already_open"
+    assert seen == [("agent_continuation_exhausted", True, "high")]
+
+
+def test_gate_suppresses_further_sends_while_open(tmp_path):
+    conn = _gate_conn(tmp_path)
+    ns.open_gate("x:0.0", reason="cap", conn=conn, now=1000.0,
+                 emit_fn=lambda *a, **k: {"event_id": 1})
+    assert ns.in_gate("x:0.0", conn=conn, now=1000.0) is True
+    assert ns.in_gate("x:0.0", conn=conn, now=1000.0 + ns.GATE_TTL_SECS + 1) is False
+    assert ns.in_gate("other:0.0", conn=conn, now=1000.0) is False
+
+
+def test_progress_clears_the_gate_without_notifying(tmp_path):
+    conn = _gate_conn(tmp_path)
+    seen = []
+    ns.open_gate("x:0.0", reason="cap", conn=conn, now=1000.0,
+                 emit_fn=lambda *a, **k: seen.append(a) or {"event_id": 1})
+    r = ns.clear_gate("x:0.0", conn=conn, now=1100.0)
+    assert r["cleared"] is True
+    assert ns.in_gate("x:0.0", conn=conn, now=1101.0) is False
+    assert len(seen) == 1                       # clearing is silent; only the open spoke
+    # and a genuinely new episode may open again
+    assert ns.open_gate("x:0.0", reason="cap", conn=conn, now=1200.0,
+                        emit_fn=lambda *a, **k: {"event_id": 2})["opened"] is True
+
+
+def test_exhausted_gate_is_a_wake_type():
+    from core import wake_bridge as wb
+    assert "agent_continuation_exhausted" in wb.WAKE_EVENT_TYPES
+    # genuine owner attention, but NOT the fast lifecycle lane
+    assert wb.is_actionable("agent_continuation_exhausted") is False

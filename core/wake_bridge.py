@@ -103,6 +103,10 @@ WAKE_EVENT_TYPES = frozenset({
     # nothing could wake anyone about it, because losing the ability to SEE agents was
     # not itself an event type). Emitted deduped per class per 30 min by core.tmux_control.
     "agent_control_plane_unreachable", "agent_control_plane_split",
+    # the native supervisor has STOPPED continuing an agent because continuation was not
+    # converging. Emitted exactly once per gate episode by core.native_supervisor, so this
+    # is a genuine owner-attention event and not a repeating alarm.
+    "agent_continuation_exhausted",
     # an owner-directed task reaching its end
     "task_completed", "work_stopped_incomplete",
     # closed-loop wake watchdog (task 211): a delivered wake produced no observed

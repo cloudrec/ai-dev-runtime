@@ -46,6 +46,23 @@ MAX_EVENT_AGE_SECS = int(os.getenv("NATIVE_SUPERVISOR_MAX_AGE_SECS", "900"))
 MIN_INTERVAL_SECS = int(os.getenv("NATIVE_SUPERVISOR_MIN_INTERVAL_SECS", "120"))
 MAX_CONSECUTIVE = int(os.getenv("NATIVE_SUPERVISOR_MAX_CONSECUTIVE", "6"))
 
+# ── terminal gate ────────────────────────────────────────────────────────────────────
+# Requirement 4: when continuation is not converging, the supervisor must record ONE
+# terminal state and go quiet — not keep skipping silently every 20 seconds forever.
+#
+# Hitting MAX_CONSECUTIVE in an hour IS the operational definition of "not converging":
+# six automated continuations produced another turn boundary each time. Before this, the
+# loop simply started refusing at the cap and said nothing, so an agent that had stopped
+# making progress became invisible: no continuation, no event, no owner signal. The gate
+# makes that state explicit, exactly once, and stops the sends until it clears.
+GATE_TTL_SECS = int(os.getenv("NATIVE_SUPERVISOR_GATE_TTL_SECS", "21600"))   # 6h
+
+_GATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS native_supervision_gate (
+    target TEXT PRIMARY KEY, since TEXT, since_ts REAL, until_ts REAL,
+    reason TEXT, event_id INTEGER, cleared_ts REAL);
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS native_supervision (
     event_id INTEGER PRIMARY KEY, ts TEXT, ts_epoch REAL, target TEXT, action TEXT,
@@ -289,6 +306,85 @@ def resolve_target(cwd: str, agents: list) -> Optional[str]:
     return hits[0] if len(hits) == 1 else None
 
 
+def open_gate(target: str, *, reason: str, conn=None, now: Optional[float] = None,
+              emit_fn: Optional[Callable] = None) -> dict:
+    """Record the terminal state ONCE and emit one owner-facing event.
+
+    Idempotent by construction: the row is the latch. A second call while the gate stands
+    returns `opened=False` and emits nothing, which is what keeps a stuck agent from
+    becoming an hourly notification.
+    """
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        conn.execute(_GATE_SCHEMA)
+        row = conn.execute(
+            "SELECT until_ts, cleared_ts, event_id FROM native_supervision_gate "
+            "WHERE target=?", (target,)).fetchone()
+        if row and not row[1] and float(row[0] or 0) > now:
+            return {"opened": False, "reason": "gate_already_open",
+                    "event_id": int(row[2] or 0)}
+        if emit_fn is None:
+            from core.control_plane import cto
+            emit_fn = cto.emit
+        res = emit_fn("native_supervisor", "agent_continuation_exhausted",
+                      agent_id=target, severity="high", owner_action_required=True,
+                      payload={"target": target, "reason": reason,
+                               "gate_ttl_secs": GATE_TTL_SECS,
+                               "automated_continuation": "stopped"},
+                      action_taken=(f"{target}: automated continuation stopped — {reason}. "
+                                    f"No further supervisor sends until the gate clears."),
+                      dedup_key=f"nativesup:gate:{target}",
+                      dedup_window_secs=GATE_TTL_SECS, conn=conn) or {}
+        eid = int(res.get("event_id") or 0)
+        conn.execute(
+            "INSERT INTO native_supervision_gate"
+            "(target,since,since_ts,until_ts,reason,event_id,cleared_ts) "
+            "VALUES(?,?,?,?,?,?,NULL) ON CONFLICT(target) DO UPDATE SET "
+            "since=excluded.since, since_ts=excluded.since_ts, until_ts=excluded.until_ts, "
+            "reason=excluded.reason, event_id=excluded.event_id, cleared_ts=NULL",
+            (target, now_iso(), now, now + GATE_TTL_SECS, reason, eid))
+        conn.commit()
+        return {"opened": True, "reason": reason, "event_id": eid}
+    finally:
+        if own:
+            conn.close()
+
+
+def in_gate(target: str, *, conn=None, now: Optional[float] = None) -> bool:
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        conn.execute(_GATE_SCHEMA)
+        row = conn.execute(
+            "SELECT until_ts, cleared_ts FROM native_supervision_gate WHERE target=?",
+            (target,)).fetchone()
+        return bool(row and not row[1] and float(row[0] or 0) > now)
+    finally:
+        if own:
+            conn.close()
+
+
+def clear_gate(target: str, *, reason: str = "progress_observed", conn=None,
+               now: Optional[float] = None) -> dict:
+    """The agent resumed on its own, so the terminal state is no longer true.
+
+    Deliberately NOT owner-facing: recovery is the good news, and the outage already spoke.
+    """
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        conn.execute(_GATE_SCHEMA)
+        cur = conn.execute(
+            "UPDATE native_supervision_gate SET cleared_ts=? "
+            "WHERE target=? AND cleared_ts IS NULL", (now, target))
+        conn.commit()
+        return {"cleared": bool(cur.rowcount), "target": target, "reason": reason}
+    finally:
+        if own:
+            conn.close()
+
+
 def decide(event_type: str, payload: dict) -> dict:
     """What this signal means for continuation. Pure, so the policy is testable alone."""
     if event_type != "agent_turn_stopped":
@@ -432,9 +528,23 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
             # has already passed, and re-reading live state is the point.
             live = next((a for a in agents if a.get("target") == target), None)
             if not live or live.get("state") in ("working", "shell_running"):
+                # Working again under its own steam is the progress signal that retires a
+                # terminal gate: the state the gate described is no longer true.
+                if live:
+                    try:
+                        clear_gate(target, reason="agent_working_again", conn=conn, now=now)
+                    except Exception:  # noqa: BLE001 — never breaks the loop
+                        pass
                 _record(conn, eid, target, "skip", "agent_already_working_again", True)
                 skipped.append({"event_id": eid, "target": target,
                                 "why": "agent_already_working_again"})
+                continue
+            if in_gate(target, conn=conn, now=now):
+                # Terminal state already recorded and already announced once. Stay quiet:
+                # the whole point of the gate is that it does not re-notify.
+                _record(conn, eid, target, "skip", "continuation_gate_open", True)
+                skipped.append({"event_id": eid, "target": target,
+                                "why": "continuation_gate_open"})
                 continue
             if live.get("pending"):
                 # Text is staged in the composer: a human or another controller is mid-
@@ -450,9 +560,17 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                                 "why": "min_interval_not_elapsed"})
                 continue
             if n_hour >= MAX_CONSECUTIVE:
-                _record(conn, eid, target, "skip", "hourly_continuation_cap", True)
+                # Not converging: MAX_CONSECUTIVE automated continuations in the hour each
+                # produced another turn boundary. Record the terminal state ONCE, tell the
+                # owner ONCE, and stop sending — rather than skipping silently forever.
+                g = open_gate(target, reason="continuation_cap_reached_without_progress",
+                              conn=conn, now=now)
+                _record(conn, eid, target, "gate", "continuation_cap_reached_without_progress",
+                        True, {"gate_opened": g.get("opened"),
+                               "gate_event_id": g.get("event_id")})
                 skipped.append({"event_id": eid, "target": target,
-                                "why": "hourly_continuation_cap"})
+                                "why": "continuation_gate_opened" if g.get("opened")
+                                else "continuation_gate_open"})
                 continue
             if not safe_fn(step_text):
                 # The allowlist is the authority on what may ever be auto-submitted.
