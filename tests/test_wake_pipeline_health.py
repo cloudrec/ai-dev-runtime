@@ -468,3 +468,67 @@ def test_once_the_backoff_expires_the_event_counts_again(conn):
     h = wake_bridge.pipeline_health(conn=conn, now=NOW)
     assert h["pending_count"] == 1
     assert h["benched_after_failure"] == 0
+
+
+# ── the skew watcher must watch the companion's ACTUAL delivery code ─────────
+# _WORKER_WATCHED_FILES listed only wake_bridge.py and wake_routes.py, but the
+# companion imports tools/cdp_composer.py for submit_phrase — the composer
+# selectors, the latch boundary, page_responsive/recover_wedged_tab and the whole
+# post-send verification loop live there — and tools/wake_companion.py is its own
+# entrypoint. A fix to either changed how wakes are delivered while raising no
+# skew, which is the exact failure this mechanism exists to catch.
+
+def _watched(worker):
+    import os as _os
+    here = _os.path.dirname(_os.path.abspath(wake_bridge.__file__))
+    return {_os.path.normpath(_os.path.join(here, rel))
+            for rel in wake_bridge._WORKER_WATCHED_FILES[worker]}
+
+
+def test_the_companion_watches_its_own_delivery_code():
+    watched = _watched("wake_companion")
+    assert any(p.endswith("tools/cdp_composer.py") for p in watched), watched
+    assert any(p.endswith("tools/wake_companion.py") for p in watched), watched
+
+
+def test_the_companion_still_watches_the_bridge_modules():
+    """Extending the list must not drop what it already covered."""
+    watched = _watched("wake_companion")
+    for name in ("wake_bridge.py", "wake_routes.py"):
+        assert any(p.endswith(name) for p in watched), (name, watched)
+
+
+def test_every_watched_file_actually_exists():
+    """A path typo would silently contribute mtime 0 and weaken the alarm."""
+    import os as _os
+    missing = {w: sorted(p for p in _watched(w) if not _os.path.exists(p))
+               for w in wake_bridge._WORKER_WATCHED_FILES}
+    assert not any(missing.values()), missing
+
+
+def test_a_change_to_the_composer_drives_the_newest_mtime(monkeypatch):
+    """The behaviour that matters, asserted deterministically.
+
+    Comparing real mtimes is vacuous in a fresh checkout — every file shares the
+    checkout timestamp, so the assertion holds whether or not the composer is
+    watched. Instead make ONLY the composer distinctly newer and require
+    _module_mtime to return it.
+    """
+    import os as _os
+    real = _os.path.getmtime
+    marker = 9_999_999_999.0
+
+    def fake(path):
+        return marker if str(path).endswith("cdp_composer.py") else 1.0
+
+    monkeypatch.setattr(wake_bridge.os.path, "getmtime", fake)
+    assert wake_bridge._module_mtime("wake_companion") == marker, (
+        "cdp_composer.py does not contribute to the companion's newest-mtime")
+    # and a worker that started before it now reads as stale
+    monkeypatch.setattr(wake_bridge.os.path, "getmtime", real)
+
+
+def test_the_orchestrator_watch_list_is_unchanged():
+    watched = _watched("agent_orchestrator")
+    for name in ("agent_control.py", "agent_orchestrator.py", "waiting_transitions.py"):
+        assert any(p.endswith(name) for p in watched), (name, watched)

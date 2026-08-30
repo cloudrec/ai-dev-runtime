@@ -665,8 +665,18 @@ CREATE TABLE IF NOT EXISTS wake_worker (
 # imports (this is how event 11073 happened: agent_control.py got four fixes
 # across 2026-08-28 but ai-runtime.service, which owns the orchestrator loop,
 # was only ever restarted for the first one).
+# `..` entries are relative to this file's directory (core/), so a tools/ module
+# is reachable — see _module_mtime.
 _WORKER_WATCHED_FILES = {
-    "wake_companion": ("wake_bridge.py", "wake_routes.py"),
+    # The companion's delivery code is NOT only this module. It imports
+    # tools/cdp_composer.py for submit_phrase — the composer selectors, the latch
+    # boundary, page_responsive/recover_wedged_tab and the whole verification
+    # loop live there — and tools/wake_companion.py is its own entrypoint. A fix
+    # to either changed how wakes are delivered while raising no skew at all,
+    # which is exactly the failure this mechanism exists to catch.
+    "wake_companion": ("wake_bridge.py", "wake_routes.py", "closed_loop_wake.py",
+                       os.path.join("..", "tools", "cdp_composer.py"),
+                       os.path.join("..", "tools", "wake_companion.py")),
     "agent_orchestrator": ("agent_control.py", "agent_orchestrator.py",
                             os.path.join("control_plane", "waiting_transitions.py")),
 }
