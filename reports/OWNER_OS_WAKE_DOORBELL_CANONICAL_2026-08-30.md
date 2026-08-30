@@ -1613,3 +1613,68 @@ has ended on its own, so the cost of leaving them parked is now only that four
 obsolete HIGH_RISK proposals sit in `waiting_approval`; approving any of them
 would run a repair for a fault verified absent above. `5e1bcdc8` is a separate
 decision on unrelated work.
+
+### Wake 15368 — `runtimejob:5e1bcdc8`, and the last runtimejob watch closes
+
+**15368** `wake_loop_stalled` (`runtimejob:5e1bcdc8`, critical, 15:04:44Z) is the
+terminal escalation for the one watch that was still open. Watch 15025 is now
+`rewoken=1 (15348)`, `escalated=1 (15368)`.
+
+**Open runtimejob watches: 0.** Every runtimejob watch in the table is now
+terminal or resolved; the wake-loop escalation stream from runtime jobs is
+exhausted in full.
+
+**What 5e1bcdc8 is doing: nothing — it has never started.** Read-only from the
+jobs store:
+
+```
+status            waiting_approval        approval_required 1
+kind              code_change             dangerous         1
+risk_level        medium                  autonomy_level    execute_safe
+created_at        2026-08-30T13:26:10Z    started_at        (empty)
+updated_at        2026-08-30T13:26:11Z    heartbeat_at      (empty)
+project_path      /root/ai-dev-runtime    error/plan/outcome (none)
+```
+
+Its goal is **"Host XMRig forensic triage"** — read-only host forensic triage
+after a foreign `/var/www/novatraders/website/xmrig.tar.gz` (~3.55 MB, mtime
+2023-11-23) was found and manually deleted by the owner. Its own instructions
+scope it to inspection only: no destructive changes, no restarts, no credential
+rotation, no firewall changes, no deletion or quarantine.
+
+**Why its wake loop "stalled": the same mechanism, not a defect.** A job parked in
+`waiting_approval` never starts and therefore emits no newer event on its target,
+so `_progress_since` correctly sees no progress; the watchdog re-woke once and
+escalated once, then stopped. `waiting_approval` is deliberately excluded from
+`_RUNTIME_JOB_TERMINAL_STATUSES`, so the watch stayed open until it escalated.
+Both wakes travelled the loop normally — 15368 decided, delivered 15:05:54Z
+`submitted_and_assistant_started_generating`, acknowledged.
+
+**This one is NOT redundant — it is unstarted.** That is a materially different
+decision from the four tmux-repair jobs. Those four propose a repair for a fault
+this session root-caused and guarded, so they are obsolete. 5e1bcdc8's subject —
+a miner archive found on this host — has not been addressed by anything in this
+session, and its triage has never run. Owner input is therefore **genuinely
+required**, not merely a formality: `approval_required=1` and `dangerous=1`, and
+approval is gated through `config/approved_gates.yaml`.
+
+**No safe non-gated action exists for it here.** Nothing can advance the job
+without approval, and running the host forensic triage directly is outside this
+session's stated scope (cryptominer work explicitly excluded). Inspection was
+read-only; nothing was approved, cancelled, retired or run.
+
+**15364 / `35337a2c` confirmed terminal**: watch 14988 `rewoken=15336`,
+`escalated=1 (15364)`; 15364 delivered 15:04:18Z, acknowledged.
+
+**Fault-absence re-verification (read-only):**
+
+```
+tmux_control: ok | listeners 1 | split False       server pid 302442 (original)
+agent_list  : 10 agents | duplicates [] | control_unreachable False
+recovery    : control_unreachable False            skew []
+sessions 10 | agent_control_plane_* events ever: 0 | connect errors since restore: 0
+```
+
+Also observed and unrelated: 15369 `notification_dead_letter` (the pre-existing
+Telegram gate) and 15370 `agent_waiting_input` on `payorch-monitor-clean:0.0`
+(payment project, out of scope, untouched).
