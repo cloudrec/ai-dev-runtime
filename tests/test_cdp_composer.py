@@ -369,10 +369,14 @@ class _FakeSession:
     """Minimal _Session stand-in: a page with an optional dialog focus trap."""
 
     def __init__(self, *, trapped: bool, escapes_to_release: int = 1,
-                 focusable: bool = True):
+                 focusable: bool = True, buttons=None, title: str = "",
+                 click_releases: bool = True):
         self.trapped = trapped
         self.escapes_to_release = escapes_to_release
         self.focusable = focusable
+        self.buttons = list(buttons or [])
+        self.title = title
+        self.click_releases = click_releases
         self.escapes = 0
         self.clicks = []
         self._focused = False
@@ -389,8 +393,21 @@ class _FakeSession:
             expr = params.get("expression", "")
             if ".focus()" in expr:
                 self._focused = self.focusable and not self.trapped
-            if ".click()" in expr:
-                self.clicks.append(expr)
+                return {}
+            if "aria-labelledby" in expr:
+                return {"result": {"value": self.title}}
+            if "querySelectorAll('button')" in expr and "JSON.stringify" in expr:
+                # DATA only: the page reports its buttons; the decision is Python's.
+                import json as _j
+                return {"result": {"value": _j.dumps(self.buttons)}}
+            if "btns[0].click()" in expr:
+                # The page was told to click. If the policy were broken, this is where
+                # an un-allowlisted or choice dialog would get pressed.
+                self.clicks.append(self.buttons[0].strip().lower()
+                                   if self.buttons else "?")
+                if self.click_releases:
+                    self.trapped = False
+                return {"result": {"value": "clicked"}}
             return {}
         return {}
 
@@ -409,13 +426,41 @@ def test_focus_succeeds_without_a_dialog_and_presses_nothing():
     assert s.escapes == 0
 
 
-def test_a_focus_trapping_dialog_is_dismissed_with_escape_only():
-    """Escape, never a click: a click could ACTIVATE one of the dialog's controls, and
-    this code has no idea what they do."""
+def test_a_focus_trapping_dialog_is_dismissed_with_escape_first():
+    """Escape is tried before anything is ever clicked."""
     from tools import cdp_composer as cc
-    s = _FakeSession(trapped=True)
+    s = _FakeSession(trapped=True, buttons=["Got it"])
     assert cc.focus_composer(s, sleep=lambda x: None) is True
     assert s.escapes == 1
+    assert s.clicks == []          # Escape sufficed; nothing was pressed
+
+
+def test_an_alert_dialog_that_ignores_escape_is_acknowledged_by_its_one_button():
+    """ChatGPT's "Too many requests" notice ignores Escape by design — an alert is meant
+    to be acknowledged. With nothing to acknowledge it, a rate limit that had long since
+    expired kept the composer unreachable for 3.5 hours."""
+    from tools import cdp_composer as cc
+    s = _FakeSession(trapped=True, escapes_to_release=99, buttons=["Got it"],
+                     title="Too many requests")
+    assert cc.focus_composer(s, sleep=lambda x: None) is True
+    assert s.clicks == ["got it"]
+
+
+def test_a_dialog_offering_a_CHOICE_is_never_clicked():
+    """Two buttons is a decision ("Upgrade"/"Not now"), and a decision is not this
+    module's to make."""
+    from tools import cdp_composer as cc
+    s = _FakeSession(trapped=True, escapes_to_release=99,
+                     buttons=["Upgrade", "Not now"], title="Upgrade to Pro")
+    assert cc.focus_composer(s, attempts=2, sleep=lambda x: None) is not True
+    assert s.clicks == []
+
+
+def test_an_unrecognised_single_button_is_never_clicked():
+    from tools import cdp_composer as cc
+    s = _FakeSession(trapped=True, escapes_to_release=99, buttons=["Delete everything"],
+                     title="Danger")
+    assert cc.focus_composer(s, attempts=2, sleep=lambda x: None) is not True
     assert s.clicks == []
 
 
@@ -436,9 +481,29 @@ def test_a_focus_failure_with_no_dialog_is_not_retried_as_one():
     assert s.escapes == 0
 
 
-def test_a_trapped_page_is_reported_as_trapped_not_as_a_bare_focus_failure():
-    """The 3.5-hour blackout looked identical to every other focus failure in the log."""
+def test_a_trapped_page_is_reported_with_the_dialog_that_caused_it():
+    """The 3.5-hour blackout was logged 98 times as `composer_not_focused`, and it took a
+    live CDP session to find out the cause was ChatGPT's rate-limit notice."""
     from tools import cdp_composer as cc
-    assert cc.focus_failure_reason(_FakeSession(trapped=True)) == \
-        "composer_focus_trapped_by_dialog"
+    r = cc.focus_failure_reason(_FakeSession(trapped=True, title="Too many requests"))
+    assert r == "composer_focus_trapped_by_dialog:too-many-requests"
     assert cc.focus_failure_reason(_FakeSession(trapped=False)) == "composer_not_focused"
+
+
+def test_a_choice_whose_first_button_looks_benign_is_still_never_clicked():
+    """Isolates the single-button guard specifically: the label allowlist alone would
+    wave this through, and clicking "OK" here would confirm a destructive choice."""
+    from tools import cdp_composer as cc
+    assert cc.ack_click_decision(["OK", "Delete everything"]) == "not_single_button"
+    s = _FakeSession(trapped=True, escapes_to_release=99,
+                     buttons=["OK", "Delete everything"], title="Delete chat?")
+    assert cc.focus_composer(s, attempts=2, sleep=lambda x: None) is not True
+    assert s.clicks == []
+
+
+def test_ack_decision_table():
+    from tools import cdp_composer as cc
+    assert cc.ack_click_decision([]) == "no_dialog_buttons"
+    assert cc.ack_click_decision(["Got it"]) == "allowed"
+    assert cc.ack_click_decision(["  Got It  "]) == "allowed"      # trimmed, case-folded
+    assert cc.ack_click_decision(["Upgrade"]) == "label_not_allowlisted"

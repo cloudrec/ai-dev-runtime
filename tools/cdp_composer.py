@@ -16,6 +16,7 @@ Fail closed everywhere: ambiguity (zero or several matches) is a refusal, never 
 from __future__ import annotations
 
 import json
+import re
 import os
 import time
 import urllib.parse
@@ -237,25 +238,120 @@ def dialog_traps_focus(s) -> Optional[bool]:
     return s.boolean(_DIALOG_TRAPS_FOCUS_JS)
 
 
-def dismiss_focus_trap(s) -> None:
-    """Close a focus-trapping dialog the way a keyboard user would: Escape, nothing else.
+# The ONLY labels this code will click, and only on a dialog whose entire button set is
+# that one button. An acknowledgement modal has one job: be acknowledged. Anything with a
+# choice in it ("Upgrade"/"Not now", "Delete"/"Cancel") is a DECISION, and a decision is
+# not this module's to make — it refuses and reports instead.
+_ACK_BUTTON_LABELS = frozenset({"got it", "ok", "okay", "dismiss", "close", "understood"})
 
-    Deliberately never clicks anything inside the dialog — a click could ACTIVATE one of
-    its controls, and this code has no idea what they do. Escape is the one gesture every
-    dialog implements as "close, change nothing". It is also strictly smaller than what
-    this module already does on this page: type a phrase and press send.
+# The page is asked only for DATA (the buttons' accessible names) and, separately, for a
+# click on a dialog that has exactly one button. The decision of whether to click at all
+# lives here, in Python, where it is tested — an earlier cut put it inside the injected
+# JS, and the test fake reimplemented the same rules in Python, so removing either guard
+# left every test passing. Policy the tests cannot reach is not policy.
+_DIALOG_BUTTONS_JS = """
+(function(){
+  var d = document.querySelector('[role=dialog]');
+  if (!d) return '[]';
+  return JSON.stringify([].slice.call(d.querySelectorAll('button')).map(function(b){
+    return ((b.getAttribute('aria-label') || b.textContent || '').trim()).slice(0, 60);
+  }));
+})()
+"""
+
+_CLICK_ONLY_BUTTON_JS = """
+(function(){
+  var d = document.querySelector('[role=dialog]');
+  if (!d) return 'no_dialog';
+  var btns = d.querySelectorAll('button');
+  if (btns.length !== 1) return 'not_single_button';
+  btns[0].click();
+  return 'clicked';
+})()
+"""
+
+
+def dialog_buttons(s) -> list:
+    """The accessible NAMES of the open dialog's buttons. Chrome-level UI metadata."""
+    r = s.call("Runtime.evaluate", {"expression": _DIALOG_BUTTONS_JS,
+                                    "returnByValue": True})
+    v = ((r.get("result") or {}).get("value"))
+    try:
+        names = json.loads(v) if isinstance(v, str) else []
+    except ValueError:
+        return []
+    return [n for n in names if isinstance(n, str)]
+
+
+def ack_click_decision(names: list) -> str:
+    """May this dialog be acknowledged with a click? FAIL CLOSED.
+
+    Two conditions together make a click an acknowledgement rather than a decision: the
+    dialog has exactly ONE button, and that button's name is a known acknowledgement.
+    A dialog offering a CHOICE ("Upgrade"/"Not now", "Delete"/"Cancel") is a decision,
+    and a decision is not this module's to make.
+    """
+    if not names:
+        return "no_dialog_buttons"
+    if len(names) != 1:
+        return "not_single_button"
+    if names[0].strip().lower() not in _ACK_BUTTON_LABELS:
+        return "label_not_allowlisted"
+    return "allowed"
+
+
+def dialog_title(s) -> str:
+    """The dialog's accessible TITLE — UI chrome, the same class of metadata this module
+    already reads from the sidebar. Never conversation content."""
+    r = s.call("Runtime.evaluate", {"returnByValue": True, "expression":
+               "(function(){var d=document.querySelector('[role=dialog]');if(!d)return '';"
+               "var lb=d.getAttribute('aria-labelledby');"
+               "var t=lb?document.getElementById(lb):null;"
+               "return ((t?t.textContent:'')||'').trim().slice(0,60);})()"})
+    v = ((r.get("result") or {}).get("value"))
+    return v if isinstance(v, str) else ""
+
+
+def dismiss_focus_trap(s) -> str:
+    """Close a focus-trapping dialog: Escape first, then — and only then — a click on a
+    single allowlisted acknowledgement button.
+
+    Escape alone is not enough, and pretending otherwise is how a TRANSIENT condition
+    became a permanent one. The dialog that blocked every wake on 2026-08-30 was
+    ChatGPT's own "Too many requests" notice: an alert dialog with one button ("Got it")
+    that deliberately ignores Escape, because an alert is meant to be acknowledged. With
+    nothing to acknowledge it, a rate limit that had long since expired kept the composer
+    unreachable for hours.
+
+    A click here is bounded by two conditions that together make it an acknowledgement
+    and not a decision: the dialog must contain exactly ONE button, and that button's
+    accessible name must be in `_ACK_BUTTON_LABELS`. Anything else is left alone.
     """
     for ev in ("rawKeyDown", "keyUp"):
         s.call("Input.dispatchKeyEvent", {"type": ev, "key": "Escape", "code": "Escape",
                                           "windowsVirtualKeyCode": 27,
                                           "nativeVirtualKeyCode": 27})
+    if dialog_traps_focus(s) is not True:
+        return "escape"
+    decision = ack_click_decision(dialog_buttons(s))
+    if decision != "allowed":
+        return decision
+    r = s.call("Runtime.evaluate", {"expression": _CLICK_ONLY_BUTTON_JS,
+                                    "returnByValue": True})
+    v = ((r.get("result") or {}).get("value"))
+    return v if isinstance(v, str) else "unknown"
 
 
 def focus_failure_reason(s) -> str:
-    """Name WHY the composer could not be focused. A trapped page and a page that simply
-    will not focus need different answers from whoever reads the delivery log."""
-    return ("composer_focus_trapped_by_dialog" if dialog_traps_focus(s) is True
-            else "composer_not_focused")
+    """Name WHY the composer could not be focused, and name the dialog when there is one.
+
+    The 3.5-hour blackout was logged 98 times as `composer_not_focused` and it took a
+    live CDP session to discover that the cause was ChatGPT's rate-limit notice. The
+    dialog's own title is the whole diagnosis, so it belongs in the reason."""
+    if dialog_traps_focus(s) is not True:
+        return "composer_not_focused"
+    slug = re.sub(r"[^a-z0-9]+", "-", (dialog_title(s) or "").lower()).strip("-")[:40]
+    return f"composer_focus_trapped_by_dialog:{slug}" if slug         else "composer_focus_trapped_by_dialog"
 
 
 def focus_composer(s, attempts: int = 3, sleep=None) -> Optional[bool]:
