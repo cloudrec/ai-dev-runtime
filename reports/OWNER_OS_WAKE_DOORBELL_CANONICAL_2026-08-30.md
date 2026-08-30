@@ -1942,3 +1942,123 @@ tmux with the session list byte-identical across the repair.
 
 Not marking acceptance GREEN as a formal claim — that determination belongs to
 whoever has authority to accept it, on the evidence above.
+
+---
+
+# Part 8 — the silent stop: a structurally idle pane can no longer hide behind its prose
+
+Part 7 closed with an honestly-reported limit: a canary finished its step, stopped
+to ask a question worded "Not proceeding past this question.", and **emitted
+nothing**, because that wording matched none of the four detectors and `classify`
+therefore held the pane `working` (`no_positive_finish_evidence`). An automated
+instruction was received declining to accept that as closed — correctly. A pane
+the inventory itself calls idle, sitting unchanged indefinitely while classified
+as working, is precisely the silent class this whole wake loop exists to catch.
+
+## Why the regexes were not touched
+
+Widening `_FINISH_RE` / `_BLOCKER_RE` / `_OWNER_PROMPT_RE` to catch that sentence
+would manufacture false completions and false prompts across every managed agent.
+Those patterns were tightened *because* of exactly that failure — event 4300
+completed on finish vocabulary lifted from scrollback, event 5051 completed on a
+subprocess notice, and the watcher's own pane was flagged blocked by a quoted
+blocker sentence. Trading a silent stop for fleet-wide false stops is the worse
+bargain, and Part 7's own finding (the line-anchoring attempt on `_MENU_RE`) had
+already shown prose cannot be the discriminator. **No detector was changed.**
+
+## The structural rule (`f7d5aad`)
+
+The rule keys only on evidence the classifier already trusts, and both conditions
+must hold:
+
+1. **The inventory must already call the pane at rest.** `_QUIESCENT_STATES` is an
+   ALLOWLIST — `idle`, `waiting_input`, `unknown` — derived by `agent_control`
+   from active-execution evidence, running shells and transcript writes, never
+   from prose. `working` and `shell_running` are `_ACTIVE_STATES` and
+   short-circuit at the top of `classify`, so **a long-running shell or monitor
+   can never reach this rule** no matter how long its output is unchanged. An
+   unrecognised future state (`compacting`, `queued`, …) is not evidence of rest
+   either and stays `working`.
+2. **The bottom region must have been unchanged for `QUIESCENT_SECS`** (default
+   300, `AGENT_WATCH_QUIESCENT_SECS`). This needed new state:
+   `agent_watch_state.ts` is rewritten on every sweep, so it measures "last
+   looked at", not "how long unchanged". A new `digest_since` column carries the
+   first-seen stamp across unchanged sweeps and restarts on any change. Without
+   it the measured quiet time would only ever be the gap between two consecutive
+   sweeps — at a 20 s poll, permanently below any useful threshold.
+
+The verdict is a new class `quiescent`, mapped to **`work_stopped_incomplete`**
+(severity high, `owner_action_required=False`) — deliberately **not**
+`task_completed`. No finish was stated, so claiming one would be a fabrication.
+Quietness still never completes; that rule is intact.
+
+Dedupe is unchanged and holds: one event per digest, re-armed only when the agent
+goes back to work. A settled stop reports once, not once per sweep.
+
+`agent_watch.py` also joins the companion's skew watch list — the companion runs
+`agent_watch.scan()` every tick, so a fix here changes how it sees the fleet.
+
+## Fixtures and mutation verification
+
+Twelve new fixtures, covering every case the instruction named and three more the
+first attempt missed:
+
+| Case | Fixture |
+| --- | --- |
+| (a) the canary phrasing that just failed | `quiescent` after dwell; `working` before; never `completed` |
+| (b) a genuine numbered menu | `PROMPT_TAIL` and `CHEMMY_MENU_REST` stay `owner_prompt` at any dwell; blocker phrase stays `blocker` |
+| (c) long-running shell / active pane | `shell_running` and `working` stay `working` at 100× the threshold; an unrecognised state too |
+| (d) settled idle pane | emits exactly one `work_stopped_incomplete`, severity high, `oar=False`; a stated finish still `task_completed` |
+| (e) dedupe | one event across eight sweeps; re-arm after real work yields a fresh event; dwell accumulates across sweeps; changed text resets it |
+
+Five mutations, each killed by its own isolating test:
+
+```
+drop the dwell requirement        -> test_a_dwell_is_required…                    FAILED
+drop the structural at-rest gate  -> test_c_an_unrecognised_inventory_state…      FAILED
+map quiescent to task_completed   -> test_a_quiescence_never_claims_completion    FAILED
+reset digest_since every sweep    -> test_e_the_dwell_accumulates_from_the_first… FAILED
+clock ignores text change         -> test_e_changing_text_resets_the_dwell…       FAILED
+```
+
+Three of those five initially SURVIVED, because the first fixtures did not isolate
+them — the shell case is already protected by `_ACTIVE_STATES` upstream, and the
+two clock mutations both need either three quiet sweeps or gaps longer than the
+threshold to become visible. The fixtures were rewritten until each mutation had a
+test that actually distinguishes it. One further fixture correction is recorded
+rather than hidden: `digest_of` deliberately strips volatile digits, so a first
+attempt at "changing text resets the clock" used `line 0/1/2…` variants that
+normalise identically. That interaction is now pinned by its own test as a
+decision, not an accident.
+
+Gate: **738 passed**, 0 failed.
+
+## Deploy record
+
+* Backup: `backups/predeploy_quiescence_20260830T161848Z/` — `control_plane.db`,
+  `agent_control.db`, `runtime_jobs.db`, `configs/.env`, both systemd units.
+* Rollback tag: `rollback/pre-quiescence-20260830T161848Z` → `faf4e83`.
+* **Both watchers restarted together** (`ai-runtime.service`,
+  `owner-os-wake-companion.service`): `Result=success`, `NRestarts=0`, exactly one
+  process each, `worker_skew()` empty.
+* `digest_since` migrated live and populated on the first sweep at 16:19:29Z — the
+  clock starts at deploy, so nothing fires retroactively.
+
+Rollback:
+
+```sh
+git checkout rollback/pre-quiescence-20260830T161848Z -- core/agent_watch.py core/wake_bridge.py
+systemctl restart ai-runtime.service owner-os-wake-companion.service
+```
+The `digest_since` column is additive and harmless if the code is rolled back.
+
+## Expected first-effect, stated in advance
+
+At deploy, eight panes held `cls=working`; six of them are in a reachable
+inventory state (`capacity-blockchain`, `cp-canary`, `diamond-auction`, `email`,
+`gaika-opus`, `mess-opus`), and `owner-os-wake-policy-opus` /
+`payorch-monitor-clean` were `working` in the inventory and therefore excluded.
+Each eligible pane fires at most once, only after 300 s unchanged, and only if it
+was last seen working — so genuinely-stopped panes are reported once and active
+ones reset their own clock. Several belong to unrelated projects; surfacing a stop
+there is the system doing its job, not this session touching those projects.
