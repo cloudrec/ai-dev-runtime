@@ -4306,3 +4306,48 @@ No other safe non-restart work remains. Every other open item needs an owner: a 
 `TELEGRAM_CHAT_ID`, the restart itself, cp-canary recovery (classifier-blocked), the ACAP C2
 write. Nothing was restarted; no credential, secret, external account, payment path or
 production integration was touched. 32 unrelated WIP files untracked and byte-identical.
+
+---
+
+# Part 30 — closeout: everything green, everything remaining is owner-gated
+
+## Verification
+
+| | |
+|---|---|
+| Whole repository | **2 822 passed, 1 warning, exit 0, 12 m 10 s** — 2 821 before, plus the one new observability test |
+| Warning | pre-existing `tarfile` DeprecationWarning in `test_core.py::TestBackupEngine::test_rollback`, unrelated |
+| HEAD | `ad0aab6` |
+| Worktree | clean — 0 modified, 0 staged |
+| Owner WIP | 32 untracked; `md5sum -c` exit 0 on all 32, and the file set diffs identical to the recorded baseline |
+| Branch | `ai-runtime/220-windows-bridge`, 37 ahead / 0 behind `origin` |
+
+## Committed and inert — what one approved restart activates
+
+| Commit | Effect |
+|---|---|
+| `c403ca0` | one dead-letter alarm per channel instead of one per message |
+| `a9ff86e` | a numbered sentence no longer reads as a decision menu |
+| `66fe932` | the continuation cap stops firing on intentional waits and unassigned agents |
+| `01f53c7` | a prompt wake stops escalating once the prompt is gone |
+| `a5b930e` | SLO alarms filed under the source project, route kept a separate fact |
+| `ad0aab6` | inventory state and class reason recorded on every agent_watch event |
+
+`worker_skew()` measured the drift directly: `wake_companion` running code 4 427 s older than
+the tree.
+
+## The exact remaining gates — all owner-only
+
+1. **Restart** `owner-os-wake-companion.service` (and `ai-runtime.service` for the notifier
+   dead-letter fix) — activates all six above. Nothing else unblocks them.
+2. **`TELEGRAM_CHAT_ID`** — the channel has never delivered once in 27 days;
+   `chat not found`, token valid. One credential value.
+3. **cp-canary recovery** — blocked by the host auto-mode classifier, not by code.
+4. **ACAP C2 `/etc/systemd/system` write** — no sanctioned control-plane path exists and the
+   gate registry expired 2026-08-11.
+5. **Push** — no authorization exists; the canonical record says "local commits only, no
+   remote push" in three places. The branch would fast-forward, but it cannot be scoped:
+   publishing any one of today's commits publishes all 37.
+
+No safe non-restart work remains. Nothing was restarted; no credential, secret, external
+account, payment path or production integration was touched.
