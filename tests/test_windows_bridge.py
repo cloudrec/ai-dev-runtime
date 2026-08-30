@@ -516,3 +516,31 @@ def test_a_normal_result_still_completes(device):
                       result={"state": "idle"})
     assert out["status"] == "done"
     assert wb.get_command(cmd["command_id"])["status"] == "done"
+
+
+# ── attribution must never default to "owner" ────────────────────────────────
+# A missing/empty `created_by` silently becoming "owner" is exactly how an
+# unattributed (or automated) caller's command could be mistaken for owner
+# approval in the audit trail. Unknown must stay unknown.
+
+def _created_by(tmp_path, command_id):
+    row = sqlite3.connect(str(tmp_path / "cp.db")).execute(
+        "SELECT created_by FROM win_command WHERE command_id=?", (command_id,)).fetchone()
+    return row[0] if row else None
+
+
+def test_missing_attribution_is_never_relabeled_owner(device, tmp_path):
+    cmd = wb.enqueue(device["device_id"], "agent.status", workspace_id="gaika-basket")
+    assert _created_by(tmp_path, cmd["command_id"]) != "owner"
+
+
+def test_empty_string_attribution_is_never_relabeled_owner(device, tmp_path):
+    cmd = wb.enqueue(device["device_id"], "agent.status", workspace_id="gaika-basket",
+                     created_by="")
+    assert _created_by(tmp_path, cmd["command_id"]) != "owner"
+
+
+def test_a_real_attributed_caller_is_preserved(device, tmp_path):
+    cmd = wb.enqueue(device["device_id"], "agent.status", workspace_id="gaika-basket",
+                     created_by="api:bearer/chatgpt-continuation")
+    assert _created_by(tmp_path, cmd["command_id"]) == "api:bearer/chatgpt-continuation"

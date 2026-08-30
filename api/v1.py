@@ -1207,7 +1207,7 @@ async def windows_command(req: WinCommandReq, request: Request,
     return await asyncio.to_thread(
         _win_call, windows_bridge.dispatch, req.device_id, req.action,
         workspace_id=req.workspace_id, params=req.params,
-        command_id=req.command_id, created_by=actor or "owner",
+        command_id=req.command_id, created_by=actor or "unattributed",
         wait_secs=max(0.0, min(float(req.wait_secs or 0), 120.0)))
 
 

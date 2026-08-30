@@ -608,7 +608,7 @@ def validate_params(action: str, params: Any) -> dict:
 
 def enqueue(device_id: str, action: str, *, workspace_id: str = "",
             params: Optional[dict] = None, command_id: str = "",
-            created_by: str = "owner", conn=None,
+            created_by: str = "unattributed", conn=None,
             now: Optional[float] = None) -> dict:
     """Queue one allowlisted command for a device. Idempotent on command_id."""
     clean_params = validate_params(action, params)
@@ -651,7 +651,10 @@ def enqueue(device_id: str, action: str, *, workspace_id: str = "",
             "INSERT INTO win_command (command_id,device_id,workspace_id,action,params,"
             "status,created_by,created_at,created_ts) VALUES (?,?,?,?,?,'pending',?,?,?)",
             (command_id, device_id, workspace_id, action, json.dumps(clean_params),
-             (created_by or "owner")[:60], now_iso(), now))
+             # A missing/empty attribution must never be relabeled "owner" — that is
+             # exactly how an unattributed (or automated) caller's command could be
+             # mistaken for owner approval in the audit trail. Unknown stays unknown.
+             (created_by or "unattributed")[:60], now_iso(), now))
         conn.commit()
         row = _row(conn.execute("SELECT * FROM win_command WHERE command_id=?",
                                 (command_id,)))
@@ -825,7 +828,7 @@ def wait_for_result(command_id: str, *, timeout_secs: float = 30.0,
 
 def dispatch(device_id: str, action: str, *, workspace_id: str = "",
              params: Optional[dict] = None, command_id: str = "",
-             created_by: str = "owner", wait_secs: float = 0.0) -> dict:
+             created_by: str = "unattributed", wait_secs: float = 0.0) -> dict:
     """Enqueue + optionally wait. The one call the owner-facing API and the
     agent fabric both use, so there is exactly one place where a Windows
     command is created."""
