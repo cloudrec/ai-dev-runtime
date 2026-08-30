@@ -36,6 +36,34 @@ import sys
 
 sys.path.insert(0, "/root/ai-dev-runtime")
 
+_RUNTIME_ENV = "/root/ai-dev-runtime/configs/.env"
+
+
+def _load_runtime_env() -> None:
+    """A hook runs as a bare process with none of the service environment.
+
+    Without this the wake bridge reads `WAKE_BRIDGE_ENABLED` as unset, decides it is
+    disabled, and `cto.emit` records the event durably but mints NO wake decision — which
+    is exactly what the first live run showed: two real `agent_waiting_input` events from
+    native Notification hooks, both with "no decision". The event log was right and the
+    doorbell never rang.
+
+    Only keys that are not already set are filled in, so an explicit environment (tests,
+    an operator running the hook by hand) always wins.
+    """
+    try:
+        with open(_RUNTIME_ENV, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k, v = k.strip(), v.strip().strip('"').strip("'")
+                if k and k not in os.environ:
+                    os.environ[k] = v
+    except Exception:  # noqa: BLE001 — a missing env file must not break the session
+        pass
+
 # Event mapping. LEFT: what Claude Code tells us. RIGHT: the Owner OS class that already
 # has routing, a lane and a rate limit. Nothing invents a new wake class.
 #
@@ -126,6 +154,7 @@ def main() -> int:
         }
         body = {k: v for k, v in body.items() if v not in (None, "", {})}
 
+        _load_runtime_env()
         from core.control_plane import cto
         cto.emit("claude_hook", etype, project_id=ident["project"], agent_id=ident["agent"],
                  severity=severity, owner_action_required=oar, payload=body,

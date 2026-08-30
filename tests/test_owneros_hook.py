@@ -9,6 +9,7 @@ translation, and above all pin that observing a session can never break it.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 
@@ -116,3 +117,31 @@ def test_identity_derives_project_from_cwd_and_never_guesses_a_route():
 def test_a_teammate_name_is_preferred_as_the_agent_identity():
     from hooks.owneros_hook import _identity
     assert _identity({"teammate_name": "worker-a", "cwd": "/opt/x"})["agent"] == "worker-a"
+
+
+def test_the_hook_loads_the_runtime_env_so_the_wake_bridge_is_actually_enabled(monkeypatch):
+    """First live run: two real agent_waiting_input events from native Notification hooks,
+    both recorded durably and both with NO wake decision — the bridge read
+    WAKE_BRIDGE_ENABLED as unset in the bare hook process. The event log was right and the
+    doorbell never rang."""
+    import importlib
+    monkeypatch.delenv("WAKE_BRIDGE_ENABLED", raising=False)
+    mod = importlib.import_module("hooks.owneros_hook")
+    mod._load_runtime_env()
+    assert os.environ.get("WAKE_BRIDGE_ENABLED"), "the bridge must be enabled in-process"
+
+
+def test_an_explicit_environment_always_wins_over_the_file(monkeypatch):
+    """Tests and hand-runs must never be silently overridden by the service config."""
+    import importlib
+    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "0")
+    mod = importlib.import_module("hooks.owneros_hook")
+    mod._load_runtime_env()
+    assert os.environ["WAKE_BRIDGE_ENABLED"] == "0"
+
+
+def test_a_missing_env_file_does_not_break_the_hook(monkeypatch):
+    import importlib
+    mod = importlib.import_module("hooks.owneros_hook")
+    monkeypatch.setattr(mod, "_RUNTIME_ENV", "/nonexistent/path/.env")
+    mod._load_runtime_env()   # must not raise
