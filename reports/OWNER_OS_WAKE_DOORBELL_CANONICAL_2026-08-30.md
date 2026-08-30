@@ -227,3 +227,81 @@ duplicate.
 * Dedupe negative proof (no repeated wake after resolution) not yet run.
 
 **Acceptance is therefore NOT GREEN.**
+
+---
+
+# Acceptance run, part 2 — second root cause found BY the canaries
+
+## Root cause #2: the DECISION gate was starved as well as the send gate
+
+`claim_send` (send gate) was fixed earlier. `should_wake` (decision gate) carried
+the **identical** asymmetry — actionable branch scoped to `actionable=1`,
+non-actionable branch scoped to nothing — so every actionable *decision* reset the
+non-actionable floor.
+
+Fixing only the send gate was not enough: an event skipped at the decision gate
+never becomes a `wake` row at all, so it can never reach a claim, and
+`_redecide_cooldown_skips` re-runs the same query and gets the same skip.
+**Permanent silence, not a delay.**
+
+**Found by canary B, not by inspection.** Event 13946 (`work_stopped_incomplete`,
+cp-canary) sat in `skip/cooldown_active` while the owner-os route's last
+NON-actionable claim was 2230s old — far outside its own 900s window.
+
+Deployed `84dc207`. Two tests; 55 wake tests; gate 187 passed; mutation-verified.
+Backup + rollback tag first; both importing workers restarted; skew empty.
+
+## Scenario A — `agent_waiting_input`: **FULL PASS, twice**
+
+* **13926** — full closed loop with causally-keyed continuation (above).
+* **13950** — second independent pass: `delivered=1`,
+  `submitted_and_assistant_started_generating`, route `owner-os`, then
+  `closed-loop-watch: deregistered cp-canary:0.0 for event 13950 —
+  pane_alive_and_working`.
+
+## Scenario B — `work_stopped_incomplete`: class PROVEN, canary instance QUEUED
+
+**The event type now reaches a wake decision, which was impossible before:**
+
+| Event | Evidence |
+| --- | --- |
+| **13946** | `work_stopped_incomplete`, `cp-canary:0.0`, emitted by the real `work_evidence.scan()` after the canary wrote a report its own words mark `BLOCKED` / `NOT STARTED` and went idle |
+| **13775** | `work_stopped_incomplete`, `arbitrage2-opus:0.0`, `oar=1` — **decided `wake`** at 02:51:56 (non-actionable), claim counting down `120s -> 95s -> 63s` |
+
+Before the two fixes, no `work_stopped_incomplete` could obtain a wake decision at
+all. That gate is now open and demonstrably passing real traffic.
+
+**Why the canary's own 13946 has not delivered yet — and it is not a bug:**
+
+The non-actionable lane is deliberately **one wake per 900s per route** (the rate
+limit was kept; only the wrong lane resetting it was fixed).
+`_redecide_cooldown_skips` drains oldest-first and correctly excludes events past
+`MAX_WAKE_AGE_SECS`. Measured live:
+
+```
+non-actionable events competing within the 3h window: 86
+lane capacity: 1 per 900s per route
+=> ~21.5 hours to drain
+```
+
+13946 is behind most of that queue by FIFO. The backlog is the three-week
+accumulation the starvation bug itself created.
+
+**This is a capacity question, not a correctness one, and it is an owner decision**
+because draining faster means more owner-facing wakes per hour. Options:
+raise non-actionable throughput temporarily to clear the backlog; retire the
+pre-fix backlog as historical; or accept the ~21.5h drain.
+
+## Status: **NOT GREEN**
+
+| Scenario | Status |
+| --- | --- |
+| A `agent_waiting_input` | **PASS** (13926 with continuation proof, 13950) |
+| B `work_stopped_incomplete` | class proven to decision+claim (13775); canary 13946 queued behind an 86-event backlog |
+| C completion / `task_completed` | not run |
+| D `agent_process_failed` | not run |
+| dedupe negative proof | not run |
+
+Both root causes found during this run were found **by** the canaries, not by
+review: the missing quarantine-release path (which had made the harness unusable
+since 2026-08-07) and the decision-gate half of the starvation defect.
