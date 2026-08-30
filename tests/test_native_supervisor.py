@@ -386,3 +386,126 @@ def test_exhausted_gate_is_a_wake_type():
     assert "agent_continuation_exhausted" in wb.WAKE_EVENT_TYPES
     # genuine owner attention, but NOT the fast lifecycle lane
     assert wb.is_actionable("agent_continuation_exhausted") is False
+
+
+# ── a transient skip must not consume its event (the idle dead-end) ───────────────────
+# Recording a skip consumes the event: the candidate query joins on event_id. For a
+# reason that describes a PASSING MOMENT that is a dead-end. Observed live 2026-08-30:
+# an agent still mid-turn was skipped `agent_already_working_again` and its event
+# consumed; the agent then finished and went idle, but the turn boundary it would have
+# reported WAS the consumed event, so none ever arrived again. /opt/mess and /opt/seo sat
+# idle, supervised, ungated and untouched.
+
+def test_working_agent_skip_does_not_consume_the_event(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    eid = _hook_event(conn)
+    calls = []
+    r = _scan(conn, [_agent(state="working")], calls)
+    assert calls == []
+    assert r["skipped"][0]["why"] == "agent_already_working_again"
+    assert r["skipped"][0]["transient"] is True
+    # the event is still a candidate, so the agent settling later is not a dead-end
+    left = conn.execute(
+        "SELECT COUNT(*) FROM event e LEFT JOIN native_supervision s ON s.event_id=e.id "
+        "WHERE e.id=? AND s.event_id IS NULL", (eid,)).fetchone()[0]
+    assert left == 1
+
+
+def test_the_agent_is_continued_once_it_settles(monkeypatch):
+    """The whole point: no new hook event is needed, and exactly one send happens."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    _hook_event(conn)
+    calls = []
+    _scan(conn, [_agent(state="working")], calls)      # mid-turn
+    _scan(conn, [_agent()], calls)                     # settled — no new event
+    assert len(calls) == 1
+    _scan(conn, [_agent()], calls)                     # and never twice
+    assert len(calls) == 1
+
+
+def test_a_terminal_skip_still_consumes_the_event(monkeypatch):
+    """Non-transient reasons must stay one-shot, or the loop re-litigates them forever."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "")        # nothing in the rollout
+    conn, _ = ns._conn()
+    # a denylisted project: never auto-registered, so the skip is genuinely terminal
+    eid = _hook_event(conn, cwd="/opt/capacity")
+    calls = []
+    r = _scan(conn, [_agent(target="capacity-blockchain:0.0", cwd="/opt/capacity")], calls)
+    assert calls == []
+    assert r["skipped"][0].get("transient") in (False, None)
+    left = conn.execute(
+        "SELECT COUNT(*) FROM event e LEFT JOIN native_supervision s ON s.event_id=e.id "
+        "WHERE e.id=? AND s.event_id IS NULL", (eid,)).fetchone()[0]
+    assert left == 0
+
+
+# ── the quiescence sweep: emergency fallback for a consumed-event dead-end ────────────
+
+def _watch_state(conn, target, quiet_secs, now=None):
+    now = now or time.time()
+    conn.execute("CREATE TABLE IF NOT EXISTS agent_watch_state ("
+                 "target TEXT PRIMARY KEY, cls TEXT, digest TEXT, at TEXT, ts REAL,"
+                 "notified_cls TEXT, notified_digest TEXT, notified_at TEXT,"
+                 "notified_ts REAL, emissions INTEGER DEFAULT 0, miss_count INTEGER,"
+                 "digest_since REAL)")
+    conn.execute("INSERT OR REPLACE INTO agent_watch_state(target,cls,digest_since) "
+                 "VALUES(?,?,?)", (target, "idle", now - quiet_secs))
+    conn.commit()
+
+
+def test_sweep_rescues_an_agent_with_no_event_left_to_react_to(monkeypatch):
+    """The /opt/mess and /opt/seo state: at rest, supervised, and nothing to react to."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", ns.IDLE_SWEEP_QUIET_SECS + 60)
+    calls = []
+    r = _scan(conn, [_agent()], calls)              # no hook event at all
+    assert len(calls) == 1
+    assert r["acted"][0]["via"] == "idle_sweep"
+
+
+def test_sweep_declines_without_quiescence_evidence(monkeypatch):
+    """No watcher row means no evidence of rest — decline rather than guess."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    calls = []
+    _scan(conn, [_agent()], calls)
+    assert calls == []
+
+
+def test_sweep_declines_while_the_agent_is_only_briefly_quiet(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", 10)
+    calls = []
+    _scan(conn, [_agent()], calls)
+    assert calls == []
+
+
+def test_sweep_respects_external_wait_and_the_terminal_gate(monkeypatch):
+    """It adds no authority: every gate the event path applies is applied here too."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", ns.IDLE_SWEEP_QUIET_SECS + 60)
+    ns.mark_external_wait("cp-canary:0.0", reason="armed monitor", conn=conn)
+    calls = []
+    _scan(conn, [_agent()], calls)
+    assert calls == []
+    ns.clear_external_wait("cp-canary:0.0", conn=conn)
+    ns.open_gate("cp-canary:0.0", reason="cap", conn=conn,
+                 emit_fn=lambda *a, **k: {"event_id": 1})
+    _scan(conn, [_agent()], calls)
+    assert calls == []
+
+
+def test_sweep_does_not_double_send_with_the_event_path(monkeypatch):
+    """An agent continued from its own event is not swept again in the same pass."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", ns.IDLE_SWEEP_QUIET_SECS + 60)
+    _hook_event(conn)
+    calls = []
+    _scan(conn, [_agent()], calls)
+    assert len(calls) == 1

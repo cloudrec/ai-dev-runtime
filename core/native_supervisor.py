@@ -46,6 +46,61 @@ MAX_EVENT_AGE_SECS = int(os.getenv("NATIVE_SUPERVISOR_MAX_AGE_SECS", "900"))
 MIN_INTERVAL_SECS = int(os.getenv("NATIVE_SUPERVISOR_MIN_INTERVAL_SECS", "120"))
 MAX_CONSECUTIVE = int(os.getenv("NATIVE_SUPERVISOR_MAX_CONSECUTIVE", "6"))
 
+# ── transient vs terminal skips ──────────────────────────────────────────────────────
+# A skip recorded in `native_supervision` CONSUMES its event: the candidate query joins on
+# event_id, so the event is never looked at again. That is right for a terminal reason —
+# the project is not in the rollout, the wait is deliberate, the event was not a turn
+# boundary — and WRONG for a reason that describes a passing moment.
+#
+# The dead-end it caused, observed live on 2026-08-30: an agent still mid-turn when the
+# scan ran was skipped `agent_already_working_again` and its event consumed. The agent then
+# finished and went idle — but the turn boundary it would have reported was the very event
+# just consumed, so no new one ever arrived. `/opt/mess` and `/opt/seo` both sat idle,
+# supervised, ungated and untouched, because the loop was purely reactive over unconsumed
+# events and there were none left.
+#
+# Transient skips are therefore NOT recorded, so the next tick re-evaluates them. This is
+# self-limiting rather than a retry storm: MAX_EVENT_AGE_SECS already bounds how long an
+# event stays a candidate, no send happens while skipping, and the send itself is still
+# governed by MIN_INTERVAL_SECS, MAX_CONSECUTIVE and the terminal gate.
+TRANSIENT_SKIP_REASONS = frozenset({
+    "agent_already_working_again",
+    "min_interval_not_elapsed",
+    "pane_has_pending_input",
+})
+
+# ── quiescence sweep: the EMERGENCY fallback, never the primary path ──────────────────
+# Events remain the first-class signal. But a purely reactive loop cannot rescue an agent
+# whose last turn boundary was already consumed — the state /opt/mess and /opt/seo were
+# found in. The sweep looks at supervised agents that are simply AT REST with nothing left
+# to react to, and only after a long quiet period, so it can never outrun the event path.
+#
+# It adds no new authority: every gate the event path applies is applied here too —
+# registration, external wait, terminal gate, pending input, MIN_INTERVAL_SECS,
+# MAX_CONSECUTIVE and the safety classifier. Its only extra condition is that the target
+# has been untouched by supervision for IDLE_SWEEP_QUIET_SECS.
+IDLE_SWEEP_ENABLED = os.getenv("NATIVE_SUPERVISOR_IDLE_SWEEP", "1") not in ("0", "false", "no")
+IDLE_SWEEP_QUIET_SECS = int(os.getenv("NATIVE_SUPERVISOR_IDLE_SWEEP_QUIET_SECS", "300"))
+_AT_REST = frozenset({"idle", "completed", "unknown", ""})
+
+
+def _quiet_secs(conn, target: str, now: float) -> Optional[float]:
+    """How long `agent_watch` has observed this target unchanged, or None.
+
+    The quiescence watcher is the authority here, which is what keeps this an EMERGENCY
+    fallback: no row means no evidence of rest, and the sweep declines rather than
+    guessing from a pane state sampled once.
+    """
+    try:
+        row = conn.execute(
+            "SELECT digest_since, cls FROM agent_watch_state WHERE target=?",
+            (target,)).fetchone()
+    except Exception:  # noqa: BLE001 — the watcher may not have run yet
+        return None
+    if not row or row[0] is None:
+        return None
+    return max(0.0, now - float(row[0]))
+
 # ── terminal gate ────────────────────────────────────────────────────────────────────
 # Requirement 4: when continuation is not converging, the supervisor must record ONE
 # terminal state and go quiet — not keep skipping silently every 20 seconds forever.
@@ -526,6 +581,13 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                 continue
             # The pane must still be at rest RIGHT NOW — the event describes a moment that
             # has already passed, and re-reading live state is the point.
+            def _skip(tgt: str, why: str) -> None:
+                """Record a skip unless it describes a passing moment (see above)."""
+                if why not in TRANSIENT_SKIP_REASONS:
+                    _record(conn, eid, tgt, "skip", why, True)
+                skipped.append({"event_id": eid, "target": tgt, "why": why,
+                                "transient": why in TRANSIENT_SKIP_REASONS})
+
             live = next((a for a in agents if a.get("target") == target), None)
             if not live or live.get("state") in ("working", "shell_running"):
                 # Working again under its own steam is the progress signal that retires a
@@ -535,9 +597,7 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                         clear_gate(target, reason="agent_working_again", conn=conn, now=now)
                     except Exception:  # noqa: BLE001 — never breaks the loop
                         pass
-                _record(conn, eid, target, "skip", "agent_already_working_again", True)
-                skipped.append({"event_id": eid, "target": target,
-                                "why": "agent_already_working_again"})
+                _skip(target, "agent_already_working_again")
                 continue
             if in_gate(target, conn=conn, now=now):
                 # Terminal state already recorded and already announced once. Stay quiet:
@@ -549,15 +609,11 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
             if live.get("pending"):
                 # Text is staged in the composer: a human or another controller is mid-
                 # interaction. Never type over that.
-                _record(conn, eid, target, "skip", "pane_has_pending_input", True)
-                skipped.append({"event_id": eid, "target": target,
-                                "why": "pane_has_pending_input"})
+                _skip(target, "pane_has_pending_input")
                 continue
             last, n_hour = _recent_for_target(conn, target, now)
             if (now - last) < MIN_INTERVAL_SECS:
-                _record(conn, eid, target, "skip", "min_interval_not_elapsed", True)
-                skipped.append({"event_id": eid, "target": target,
-                                "why": "min_interval_not_elapsed"})
+                _skip(target, "min_interval_not_elapsed")
                 continue
             if n_hour >= MAX_CONSECUTIVE:
                 # Not converging: MAX_CONSECUTIVE automated continuations in the hour each
@@ -595,6 +651,55 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
             (acted if ok else skipped).append(
                 {"event_id": eid, "target": target, "idempotency_key": idem,
                  "delivered": ok, "agent_created": res.get("agent_created")})
+        if IDLE_SWEEP_ENABLED:
+            acted_targets = {a.get("target") for a in acted}
+            for a in agents:
+                target = a.get("target") or ""
+                if not target or target in acted_targets:
+                    continue
+                if (a.get("state") or "") not in _AT_REST or a.get("pending"):
+                    continue
+                if not is_supervised(target, conn=conn):
+                    continue
+                if in_external_wait(target, conn=conn, now=now) or in_gate(
+                        target, conn=conn, now=now):
+                    continue
+                quiet = _quiet_secs(conn, target, now)
+                if quiet is None or quiet < IDLE_SWEEP_QUIET_SECS:
+                    # No quiescence evidence, or not quiet long enough. The event path
+                    # owns everything before this point.
+                    continue
+                last, n_hour = _recent_for_target(conn, target, now)
+                if (now - last) < max(MIN_INTERVAL_SECS, IDLE_SWEEP_QUIET_SECS):
+                    continue
+                if n_hour >= MAX_CONSECUTIVE:
+                    g = open_gate(target, reason="idle_sweep_cap_reached_without_progress",
+                                  conn=conn, now=now)
+                    _record(conn, 0, target, "gate",
+                            "idle_sweep_cap_reached_without_progress", True,
+                            {"gate_opened": g.get("opened")})
+                    continue
+                if not safe_fn(step_text):
+                    _record(conn, 0, target, "refuse", "step_failed_safety_classifier", False)
+                    continue
+                idem = f"nativesup:idle:{target}:{int(now // IDLE_SWEEP_QUIET_SECS)}"
+                try:
+                    res = send_fn(target, step_text, idempotency_key=idem,
+                                  actor="native_supervisor", source="idle_sweep")
+                except Exception as e:  # noqa: BLE001
+                    _record(conn, 0, target, "continue",
+                            f"send_failed:{type(e).__name__}", False,
+                            {"error": str(e)[:200]})
+                    continue
+                ok = bool(res.get("delivered"))
+                _record(conn, 0, target, "continue",
+                        "continued_same_agent_idle_sweep" if ok
+                        else f"not_delivered:{res.get('refused')}", ok,
+                        {k: res.get(k) for k in
+                         ("delivered", "submitted", "queued", "duplicate", "agent_created")})
+                (acted if ok else skipped).append(
+                    {"event_id": 0, "target": target, "idempotency_key": idem,
+                     "delivered": ok, "via": "idle_sweep"})
         return {"acted": acted, "skipped": skipped}
     finally:
         if own:
