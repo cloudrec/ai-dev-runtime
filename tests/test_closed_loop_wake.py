@@ -968,3 +968,73 @@ def test_a_crashed_pane_still_wakes_even_for_a_prompt_wake():
     conn, _ = clw._conn()
     _prompt_watch(conn, event_id=9204, target="crashed-one:0.0", cls="crashed")
     assert clw.deregister_resolved(conn=conn, now=2000.0) == []
+
+
+# ── the watch must keep the SOURCE project, with the route as a separate fact ─────────
+# `pending_wake` never returned the originating project, so the companion passed the ROUTE
+# KEY as `project_id`. Every SLO alarm about a /opt/seo agent was therefore filed under
+# `owner-os`, the chat it was delivered to (events 16068, 16102).
+
+def test_pending_wake_exposes_the_originating_project():
+    """The companion cannot pass what it is never given."""
+    import inspect
+    from core import wake_bridge as _wb
+    src = inspect.getsource(_wb.pending_wake)
+    assert '"project_id": project_id' in src
+    assert '"route_key": target["route_key"]' in src
+
+
+def test_the_watch_keeps_project_and_route_apart():
+    conn, _ = clw._conn()
+    conn.execute("INSERT INTO event (id,ts,ts_epoch,source,type,agent_id,severity,payload) "
+                 "VALUES (?,?,?,?,?,?,?,'{}')",
+                 (9300, "t", 1000.0, "agent_watch", "agent_waiting_input",
+                  "mess-postsignup-cleanup-sonnet-v4:0.0", "high"))
+    conn.commit()
+    clw.register_delivery(event_id=9300, target="mess-postsignup-cleanup-sonnet-v4:0.0",
+                          project_id="seo", route_key="owner-os",
+                          event_type="agent_waiting_input", conn=conn, now=1000.0)
+    row = conn.execute("SELECT project_id, route_key FROM wake_loop_watch "
+                       "WHERE event_id=9300").fetchone()
+    assert row == ("seo", "owner-os")
+
+
+def test_the_watchdog_files_its_alarm_under_the_source_project():
+    """The alarm names the agent's project; the route travels as routing context."""
+    conn, _ = clw._conn()
+    conn.execute("INSERT INTO event (id,ts,ts_epoch,source,type,agent_id,severity,payload) "
+                 "VALUES (?,?,?,?,?,?,?,'{}')",
+                 (9301, "t", 1000.0, "agent_watch", "work_stopped_incomplete",
+                  "seo-worker:0.0", "high"))
+    conn.commit()
+    clw.register_delivery(event_id=9301, target="seo-worker:0.0", project_id="seo",
+                          route_key="owner-os", event_type="work_stopped_incomplete",
+                          conn=conn, now=1000.0)
+    seen = []
+
+    def emit(source, etype, **kw):
+        seen.append((etype, kw.get("project_id"), (kw.get("payload") or {}).get("route_key")))
+        return {"event_id": 9999}
+
+    clw.slo_scan(conn=conn, now=1000.0 + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert seen and seen[0][0] == "wake_loop_no_progress"
+    assert seen[0][1] == "seo"          # filed under the agent's real project
+    assert seen[0][2] == "owner-os"     # route preserved, as routing context
+
+
+def test_a_row_predating_the_route_column_still_scans():
+    """A live DB has watches written before route_key existed."""
+    conn, _ = clw._conn()
+    conn.execute("INSERT INTO wake_loop_watch (event_id,target,project_id,delivered_ts,"
+                 "delivered_at) VALUES (?,?,?,?,?)", (9302, "old:0.0", "owner-os", 1.0, "t"))
+    conn.commit()
+    clw.slo_scan(conn=conn, now=2.0, emit_fn=lambda *a, **k: {"event_id": 1})
+
+
+def test_the_companion_passes_project_and_route_separately():
+    """The third link: the companion must forward both, not substitute one for the other."""
+    src = open("/root/ai-dev-runtime/tools/wake_companion.py", encoding="utf-8").read()
+    call = src[src.index("closed_loop_wake.register_delivery("):][:400]
+    assert 'project_id=p.get("project_id"' in call
+    assert 'route_key=p.get("route_key"' in call
+    assert 'project_id=p.get("route_key"' not in call     # the original defect

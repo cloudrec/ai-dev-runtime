@@ -1484,6 +1484,10 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
                                          project_id=project_id, agent_id=agent_id),
                 "trigger_class": trigger_class_for(event_type),
                 "agent_id": agent_id, "event_type": event_type,
+                # The project the wake CAME FROM, distinct from the route it goes TO.
+                # Both are needed downstream: the SLO watchdog files its alarms under the
+                # originating project, while routing stays a separate fact.
+                "project_id": project_id,
                 "route_key": target["route_key"], "route_reason": target["route_reason"],
                 "coalesced": coalesced["superseded_event_ids"]}
     finally:

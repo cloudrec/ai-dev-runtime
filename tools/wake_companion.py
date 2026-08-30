@@ -120,7 +120,9 @@ def tick(wb) -> dict:
                 from core import closed_loop_wake
                 closed_loop_wake.register_delivery(
                     event_id=p["event_id"], target=p.get("agent_id", ""),
-                    project_id=p.get("route_key", ""),
+                    # the project the wake came FROM; the route it went TO is separate
+                    project_id=p.get("project_id", ""),
+                    route_key=p.get("route_key", ""),
                     event_type=p.get("event_type", ""))
             except Exception:  # noqa: BLE001
                 pass

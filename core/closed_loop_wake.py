@@ -50,6 +50,11 @@ _WATCH_COLUMNS = (
     ("resolved", "INTEGER DEFAULT 0"),
     ("resolved_reason", "TEXT"),
     ("resolved_ts", "REAL"),
+    # Where the wake was DELIVERED, kept apart from where it came from. The companion
+    # used to pass the route key as `project_id` because `pending_wake` never returned
+    # the originating project, so every SLO alarm about a /opt/seo agent was filed under
+    # `owner-os` — the chat it was delivered to (events 16068, 16102).
+    ("route_key", "TEXT"),
 )
 
 
@@ -341,7 +346,8 @@ def deregister_resolved(*, conn=None, now: Optional[float] = None, agents=None) 
 
 # ── SLO watchdog ─────────────────────────────────────────────────────────────
 def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
-                      event_type: str = "", conn=None, now: Optional[float] = None) -> None:
+                      event_type: str = "", route_key: str = "", conn=None,
+                      now: Optional[float] = None) -> None:
     """Start SLO tracking for a wake that a companion delivery just confirmed landed
     (a real ChatGPT user turn). Idempotent — a re-delivery of the same event id (which
     should never happen past the submission latch, but this must never crash if it
@@ -362,9 +368,10 @@ def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
         if wb.trigger_class_for(event_type) == wb.TRIGGER_CLASS_LOOP_WATCHDOG:
             return
         conn.execute(
-            "INSERT OR IGNORE INTO wake_loop_watch (event_id,target,project_id,"
-            "delivered_ts,delivered_at) VALUES (?,?,?,?,?)",
-            (int(event_id), target or "", project_id or "", now, now_iso()))
+            "INSERT OR IGNORE INTO wake_loop_watch (event_id,target,project_id,route_key,"
+            "delivered_ts,delivered_at) VALUES (?,?,?,?,?,?)",
+            (int(event_id), target or "", project_id or "", route_key or "",
+             now, now_iso()))
         conn.commit()
     finally:
         if own:
@@ -401,9 +408,10 @@ def slo_scan(*, conn=None, now: Optional[float] = None,
         rewoken, escalated = [], []
         rows = conn.execute(
             "SELECT event_id, target, project_id, delivered_ts, rewoken, rewoken_ts, "
-            "escalated FROM wake_loop_watch WHERE escalated=0 "
+            "escalated, COALESCE(route_key,'') FROM wake_loop_watch WHERE escalated=0 "
             "AND COALESCE(resolved,0)=0").fetchall()
-        for eid, target, project_id, delivered_ts, is_rewoken, rewoken_ts, is_escalated in rows:
+        for (eid, target, project_id, delivered_ts, is_rewoken, rewoken_ts, is_escalated,
+             route_key) in rows:
             if not target:
                 continue
             if _progress_since(conn, target, delivered_ts):
@@ -415,7 +423,8 @@ def slo_scan(*, conn=None, now: Optional[float] = None,
                     "closed_loop_wake", "wake_loop_no_progress", project_id=project_id,
                     agent_id=target, severity="high", owner_action_required=True,
                     payload={"target": target, "original_event_id": eid,
-                             "slo_secs": WAKE_LOOP_SLO_SECS},
+                             "slo_secs": WAKE_LOOP_SLO_SECS,
+                             "route_key": route_key},
                     action_taken=(f"{target}: wake {eid} delivered but no progress in "
                                   f"{WAKE_LOOP_SLO_SECS}s — re-waking once"),
                     correlation_id=f"agentwatch:{target}",
@@ -435,7 +444,7 @@ def slo_scan(*, conn=None, now: Optional[float] = None,
                 "closed_loop_wake", "wake_loop_stalled", project_id=project_id,
                 agent_id=target, severity="critical", owner_action_required=True,
                 payload={"target": target, "original_event_id": eid,
-                         "slo_secs": WAKE_LOOP_SLO_SECS},
+                         "slo_secs": WAKE_LOOP_SLO_SECS, "route_key": route_key},
                 action_taken=(f"{target}: wake {eid} re-woken with still no progress — "
                               "escalating"),
                 correlation_id=f"agentwatch:{target}",
