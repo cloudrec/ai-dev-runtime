@@ -1106,37 +1106,55 @@ stopped and asked its question:
 | Coalescing | superseded by audit **111207** → event **15230**, *also the canary's own* `agent_waiting_input` (14:19:24Z) |
 | Route | `owner-os` fallback (`cp-canary-v2` is unbound — the intended behaviour, no binding created) |
 
-**The new finding.** Across Parts 4 and 5 the one leg never observed was a
-causal ChatGPT→canary continuation, recorded honestly each time as "not
-observed, cannot be forced". There is a mechanical reason, and it is visible in
-this run's own timestamps:
+**A correction, and the gap is closed.** This section first argued that a
+ChatGPT→canary continuation was *structurally unlikely* — because internal
+controllers continue the canary within 25–60 s of it going idle while its wake
+queues for minutes. The first half of that is true and measured; the conclusion
+drawn from it was wrong, and it was wrong because the query behind it was. A
+correlation limited to a 40-minute window, using a column name the `deliveries`
+table does not have (`ts`, not `created_ts`), returned nothing and was read as
+absence. Corrected, the same table holds **28 `api:`-attributed deliveries to
+`cp-canary:0.0` today**, four of them complete causal continuations of a
+delivered canary wake:
+
+| Event | Wake delivered (route `owner-os`) | Continuation key | Gap | Attribution |
+| --- | --- | --- | --- | --- |
+| **14364** `agent_waiting_input` | 07:24:15Z, `submitted_and_assistant_started_generating` | `cp-canary-wake-`**`14364`**`-continue-20260830` | **59 s** | `api:bearer`, `172.20.0.6 ua=python-httpx` |
+| **14340** `agent_waiting_input` | 07:12:38Z, same | `cp-canary-wake-`**`14340`**`-continue-safe` | 169 s | `api:bearer` |
+| **14316** `agent_waiting_input` | 07:03:40Z, same | `cp-canary-`**`14316`**`-safe-next` (`agent_answer`) | 127 s | `api:bearer` |
+| **14306** `agent_waiting_input` | 06:58:58Z, same | `cp-canary-`**`14306`**`-exact-blocker-20260830-0901` | 179 s | `api:bearer` |
+
+Every one: **same target**, `duplicate=false`, `agent_created=false`,
+`pane_changed=true`, exactly one `wake_submitted`, correct bound conversation
+(`6a7d37d0-…`). Two of the four idempotency keys **carry the wake's own event
+id**, which is the same causal standard Scenario A's 13926 proof used — not
+coincidence, but the awakened side naming the event it woke for.
+
+**So the leg recorded across Parts 4 and 5 as "never observed" is observed, on
+the canary itself, four times over.** The honest reading of the earlier reports
+is that their observation windows (≈29 min, then ≈90 min, then ≈50 min) did not
+contain one, and this session's first attempt to look wider asked the database
+the wrong question.
+
+What remains true from the measurement that led to the wrong conclusion: the
+canary IS also continued by internal controllers within 25–60 s of going idle —
 
 ```
 14:15:59  agent_waiting_input 15228           (canary stops, asks its question)
 14:16:22  agent_continuation_blocked          (watchdog refuses: unsafe_pending_text)
 14:16:24  agent_send -> cp-canary:0.0         (internal controller, no actor, uuid key)
-14:18:15  agent_send -> cp-canary:0.0         (again)
 14:19:24  agent_waiting_input 15230           (canary stops again)
 14:19:59  agent_send -> cp-canary:0.0         (again)
 15:15:10  closed-loop-watch: deregistered cp-canary:0.0 — pane_alive_and_working
-          … meanwhile the wake for 15228/15230 is still queued behind the route backlog
 ```
 
-**The canary is continued by internal controllers within 25–60 seconds of going
-idle, while its wake waits minutes in the route queue.** By the time a wake
-could be delivered and acted on, the canary is working again and the closed-loop
-watch correctly deregisters it. A ChatGPT→canary continuation is therefore not
-merely unobserved — on this agent, under this configuration, it is *structurally
-unlikely to ever occur*, because the thing ChatGPT would be woken to continue has
-already been continued. That is not a defect in the wake loop; it is the
-disposable canary being the one agent the internal auto-continuation machinery
-is most attentive to.
+— so the two mechanisms coexist, and which reaches the canary first depends on
+how deep its wake sits in the route queue. That is a latency property, not a
+correctness one, and it explains why the ChatGPT-side continuation is
+intermittent rather than absent.
 
-The same-target causal continuation is proven on **real production agents**
-(Part 5: 13799 → `mess-qa-final-sonnet:0.0` at 205 s; 13404 →
-`jobhunter-video-sonnet:0.0` at 66 s; 13922 → `owner-os-opus-windows:0.0` at
-23 s), and ChatGPT was observed doing exactly that during this session, on four
-different agents within one hour:
+ChatGPT was also observed continuing four **non-canary** production agents
+during this session, within one hour:
 
 ```
 14:14:38  gaika-opus:0.0          gaika-continue-safe-regression-20260830-1714     api:bearer
@@ -1146,9 +1164,14 @@ different agents within one hour:
 ```
 
 Wake → correct route → ChatGPT reads live Owner OS → ChatGPT continues the exact
-same agent, no duplicate: that loop is demonstrably running in production right
-now. What this session did not do is manufacture that signature on the canary,
-for the reason measured above.
+same agent, no duplicate: that loop is running in production, on the canary and
+on real agents alike.
+
+This session's own canary instance (15228 → 15230) is decided, routed and
+queued; at the measured drain rate it sat 8 wakes deep on the `owner-os` route
+behind the backlog the 3.5-hour composer blackout created. Its delivery is a
+matter of queue position, and the class it belongs to is proven four times over
+above.
 
 ## Deploy record
 
@@ -1192,7 +1215,7 @@ No schema, config, credential or routing change to unwind. Never
 | Wake delivery blackout (3.5 h) | **ROOT-CAUSED AND FIXED**; deliveries resumed 14:11:46Z |
 | Dedupe / retry / suppression / semantics / rebind | **ALL REVERIFIED** post-deploy |
 | Canary stop → event → decision → correct route | **PROVEN** (15228 → 15230, route `owner-os`) |
-| ChatGPT → canary continuation | **NOT OBSERVED, and now explained**: internal controllers continue the canary in 25–60 s while its wake queues for minutes |
+| ChatGPT → canary continuation | **PROVEN, four times today** (14306/14316/14340/14364; gaps 59–179 s; two keys carry the wake event id) — closes the leg Parts 4–5 recorded as never observed, and corrects this report's own first draft, which read a bad query as absence |
 | ChatGPT → same-agent continuation, generally | **OBSERVED LIVE** on four production agents within the hour |
 
 Not marking GREEN as a formal acceptance claim — that determination belongs to
