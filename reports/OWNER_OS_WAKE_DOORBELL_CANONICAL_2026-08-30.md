@@ -2632,3 +2632,70 @@ Six defects were found and fixed against real production panes today, each
 backup-first, each mutation-verified, none weakening a cooldown, dedupe,
 exactly-once or suppression rule, and no synthetic product event was ever used to
 stand in for a real one.
+
+## Re-check at 17:58Z — still blocked, and the recovery path is feeding the problem
+
+Read-only re-measurement, not the 17:50 snapshot:
+
+```
+mem    11960 MB total · 10080 used · 322 free · 1879 available
+swap   20479 MB of 20479 = 100%          (unchanged, fully consumed)
+load   29.00, 28.49, 21.27               (RISEN from 25.11)
+swap   si 4296 / so 4936 pages/s         (still thrashing)
+CDP    /json/version -> HTTP 200 in 2.707s   (answers now, but slowly)
+```
+
+CDP responds again, so the earlier total unreachability has eased — but **delivery
+is still failing on every attempt** and the underlying pressure has not cleared:
+
+```
+17:53:33  ev 15402  renderer_unresponsive
+17:52:47  ev 15401  renderer_unresponsive
+17:51:25  ev 15393  cdp_error:WebSocketTimeoutException
+17:48:58  ev 15367  renderer_unresponsive
+successful deliveries since the wedge deploy (17:47:15Z): 0
+```
+
+A direct CDP session opened by this session to the owner-os tab also timed out.
+
+### The finding that changes the recommendation
+
+Chrome now holds **41 pages, 25 of them the bare `https://chatgpt.com/` root**,
+plus **5 duplicate tabs on the single owner-os conversation** — up from one tab
+and 61 processes to 68 processes in eight minutes.
+
+That is a feedback loop, and it is in the delivery path itself:
+`submit_phrase` calls `recover_wedged_tab()` whenever `page_responsive()` is
+false — which, under host memory exhaustion, is *always*. Each recovery opens a
+replacement tab through the browser endpoint, then cannot verify it within its
+window, so the old tab is never closed and the new one stays. Every failed
+delivery therefore adds a tab and a renderer to the very exhaustion that caused
+the failure.
+
+This is **pre-existing** — that call site predates today's work (it was written
+for the 4214 hung-renderer incident, where opening one replacement was exactly
+right) — but it is destructive in this new condition, where the problem is the
+host and not the tab. It also means the host will keep degrading on its own for
+as long as wakes keep being attempted.
+
+### The exact minimal gate
+
+Nothing was killed, restarted, closed or reconfigured. What is needed, in
+descending order of effect per unit of disruption — all of it an owner decision:
+
+| Candidate | Recovers | Note |
+| --- | --- | --- |
+| The 25 orphaned `chatgpt.com` root tabs + 4 of the 5 duplicate owner-os tabs | a large share of Chrome's 1.73 GB, and stops the growth | debris of failed recoveries; closing them affects no conversation |
+| `fastnetmon` (pid 1587364, up 3d) | **1543 MB**, one process | the single largest consumer on the box |
+| `celery` (pid 997814) | 811 MB | |
+| 6 of the 10 `claude` agents currently `idle` — `cp-canary`, `email`, `gaika-opus`, `mess-opus`, `mess-postsignup-cleanup-sonnet-v4`, `payorch-monitor-clean` | ≈1.8 GB combined | each belongs to a project; `arbitrage2-fable`, `capacity-blockchain` and `owner-os-wake-policy` are actively working |
+
+Freeing roughly **3–4 GB of RSS** should let swap drain and make Chrome
+responsive enough to deliver. Until then the delivery leg cannot be exercised by
+anyone, and no change to the wake pipeline would alter that.
+
+**A code-level gate also exists, separate from the host decision:** the recovery
+path needs a guard so it does not open a replacement tab when the *browser
+endpoint itself* is degraded, rather than the single tab — otherwise recovery
+will keep amplifying any future host-pressure episode. That fix was not made in
+this turn because the instruction scoped it to a read-only re-check.
