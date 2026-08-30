@@ -143,3 +143,74 @@ occur naturally on a managed agent and be observed delivering. The mechanism is
 now proven for the non-actionable class via 13762, but those specific types have
 not yet fired since the deploy. They cannot be manufactured without mutating a
 product agent, which the directive forbids.
+
+---
+
+# P0 acceptance canaries — live run (2026-08-30 02:0x-02:1x UTC)
+
+## Harness blocker found and fixed first
+
+`cp-canary:0.0` — the project's own disposable canary, registered in
+`config/managed_sessions.yaml` with `live_actuation: true` — had been
+**quarantined since 2026-08-07** (`crash loop: 3 recoveries within 21600s`), and
+**no quarantine release path existed anywhere in the code**. `recover()` writes
+the latch; nothing removed it. A safety brake with no release is a broken brake,
+and it is why no safe E2E canary could run.
+
+Fixed in `fa142aa` + `2cf0994`: `session_recovery.release_quarantine()`, scoped so
+only a target present in the managed registry can be released (`payment:0.0` is
+absent and stays unreleasable), audited through the same `_log` sink as every
+recovery decision, historical audit rows untouched. 4 tests; gate 175 passed;
+registry guard mutation-verified.
+
+A bug in the first cut was caught before use: it iterated
+`load_registry()["sessions"]` as a list when it is a dict keyed by target, and the
+test fixture repeated the same wrong shape — making the guard vacuously
+permissive. Both fixed and re-mutation-verified.
+
+Released for the canary only; `mess-qa-automation:0.0` verified still quarantined.
+
+## Canary revival — real managed path
+
+`session_recovery.recover('cp-canary:0.0', explicit=True)` (not raw tmux).
+Observed live by the production path: `agent_list()` -> `is_agent: True`,
+`alive: True`, cwd `/root/cp-canary-v2`, pid 904921. Durable event **13911**
+`agent_recovered` (severity high) emitted by the observer; control-plane registry
+records `lifecycle_state: recovered`.
+
+## Scenario A — `agent_waiting_input`: **PASS through assistant-start**
+
+Work delivered through the production actuation path
+(`agent_control.agent_send`, idempotency key `p0-canary-A-waiting-input`,
+`delivered=True submitted=True queued=False`) — one substantial block, confined to
+`/root/cp-canary-v2`, no external effect. The canary worked, then stopped.
+
+| Leg | Evidence |
+| --- | --- |
+| Observer event | **13926** `agent_waiting_input`, `agent_id=cp-canary:0.0`, `project_id=cp-canary-v2`, severity high, `owner_action_required=1`, 02:12:17Z |
+| Decision | `wake_audit` **104750** — decision `wake`, `actionable=1`, `actionable_waiting_transition` |
+| Claim | `wake_send` 02:12:50 `allowed=0 actionable_cooldown_active:23s`; 02:13:18 `allowed=1 claimed_actionable` |
+| Route | `owner-os` — fallback with `route_reason: unmapped_route:cp-canary-v2`, conversation `6a7d37d0-...` |
+| Delivery | `wake_delivery` **delivered=1**, `submitted_and_assistant_started_generating` |
+| Exactly-once | `wake_submitted` count **1**, source `companion` |
+| Retire | `wake_audit.acknowledged=1` at 02:13:20 |
+
+**Bounded-retry proof, incidentally:** the first claim was refused by the
+actionable cooldown and the second succeeded 28s later — the retry path works and
+did not lose a still-actionable wake.
+
+**Route note (not a defect, but recorded):** `cp-canary-v2` has no
+`wake_route` binding, so it correctly falls back to the `owner-os` control chat
+with an explicit `unmapped_route` reason. No URL was guessed and no binding was
+created; the canonical rebind flow was not needed because the fallback is the
+intended behaviour for an unbound project.
+
+## NOT YET PROVEN
+
+* A's **continuation leg** — that the awakened ChatGPT turn re-reads Owner OS and
+  resumes this same canary — is not yet evidenced.
+* Scenarios **B** (`work_stopped_incomplete`), **C** (completion), **D**
+  (`agent_process_failed`) not yet run.
+* Dedupe negative proof (no repeated wake after resolution) not yet run.
+
+**Acceptance is therefore NOT GREEN.**
