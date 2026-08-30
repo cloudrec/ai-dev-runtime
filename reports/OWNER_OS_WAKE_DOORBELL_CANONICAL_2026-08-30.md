@@ -895,3 +895,306 @@ independent real events across three different projects.
 Not marking GREEN as a formal acceptance claim — that determination belongs
 to whoever has actual authority to accept it, on the evidence above, not to
 this report.
+
+---
+
+# Part 6 (2026-08-30, later same day): the tmux control socket vanished under a live server
+
+An automated instruction was received reporting that the tmux server had survived
+while the pathname `/tmp/tmux-0/default` disappeared: attached clients kept
+working, Owner OS `agent_list`/`agent_status` failed until the socket was
+recreated. That is a control-plane reliability gap, and it is root-caused,
+closed, and proven below.
+
+## Root cause — proven from the deleter's own log, not inferred
+
+`/root/cleanup_disk_pass2.sh` (written 13:42, run immediately) walks `/tmp`
+top-level and deletes any entry containing nothing modified in 48 hours:
+
+```sh
+find /tmp -mindepth 1 -maxdepth 1 -print0 | while IFS= read -r -d '' P; do
+    case "$P" in /tmp/claude-0|/tmp/snap-private-tmp|/tmp/systemd-private-*) continue ;; esac
+    if find "$P" -mmin -2880 -print -quit | grep -q .; then continue; fi
+    echo "DELETE OLD TMP: $P"; rm -rf -- "$P"
+done
+```
+
+**A unix socket's mtime is stamped once, at `bind()`, and is never updated by
+traffic.** The tmux server bound its socket on 2026-08-12, so on 2026-08-30 the
+busiest object on the host looked eighteen days idle to an mtime-based cleaner.
+Its exclusion list covers `/tmp/claude-0` and the systemd/snap private trees;
+`/tmp/tmux-0` is not in it.
+
+Direct evidence, from the cleanup script's own output:
+
+```
+/root/disk_cleanup_pass2_20260830_134223.log:1353:  DELETE OLD TMP: /tmp/tmux-0
+```
+
+| Time (CEST) | Evidence |
+| --- | --- |
+| 2026-08-12 14:55:45 | tmux server pid **302442** starts; socket bound (mtime frozen here) |
+| 2026-08-30 13:42:23 | `cleanup_disk_pass2.sh` written and run |
+| ~13:45:1x | `rm -rf /tmp/tmux-0` — **directory and socket both gone** |
+| 13:45:11 | `/tmp/tmux-0` Birth timestamp — recreated empty by a tmux client that then failed |
+| 13:45:26 | first `agent-watch error: tmux list-panes failed: error connecting to /tmp/tmux-0/default (No such file or directory)` |
+| 15:21:52 | `tmux new-session -d -s gaika-opus` starts a **SECOND tmux server**, pid 3445478 |
+| 15:21:54 | that server launches `claude --resume 772c05c5… ` in `/opt/gaika-extension` — a **duplicate live agent** |
+| 15:25:07 | manual repair (`install -d -m 700 /tmp/tmux-0` then `kill -USR1 <server>`, `/root/.bash_history`): socket Birth timestamp, control restored |
+
+**Outage: 100 minutes** (13:45:11 → 15:25:07), not the ~8 minutes the error tail
+suggests. Server 302442 was alive and healthy throughout — a bound listening
+socket survives `unlink()`, which is exactly why attached clients noticed
+nothing and every new `connect()` failed.
+
+## The harm was real, and it was still on the host when this session started
+
+`/proc/net/unix` keeps an unlinked socket's original name, so both servers were
+still visible as LISTENING on the same path. The first thing the new probe did,
+against live production:
+
+```
+{"reachable": true, "reason": "split_brain", "socket_path": "/tmp/tmux-0/default",
+ "listeners": 2, "listener_pids": [302442, 3445478], "healthy": false}
+```
+
+* `gaika-opus:0.0` on the reachable server: claude pid **3070542**, `/opt/gaika-extension`
+* `gaika-opus` on the orphaned server 3445478: claude pid **3446247**, same directory
+
+Two live Claude agents on one project, one of them invisible to Owner OS
+entirely — `agent_list()` can only see the server the socket path currently
+leads to. The 15:25:07 repair re-bound the path to the original server and
+orphaned the second.
+
+**Nothing was killed to clean this up.** Both the orphaned server and its
+duplicate agent exited on their own between 15:48 and 16:01, observed, not
+caused. Had they persisted, the guard's answer would still have been to refuse:
+resolving a split plane means killing a server, i.e. killing live agents, which
+is an owner decision.
+
+## Three fail-open paths — how a 100-minute blackout stayed GREEN
+
+1. **`agent_continuation_watchdog.health()`** caught the inventory exception,
+   recorded it as `live_inventory_error`, and reported `"status": "ok"` anyway.
+   Its own comment — "health never depends on tmux" — was true of the code and
+   false of the claim: coverage is a statement about live agents.
+2. **`agent_control.agent_list()`** returned a plain empty-but-successful
+   inventory on `no server running`. `tmux_running: False` had **zero consumers**
+   across all twenty call sites — discovery, the stall doctor, the supervisor,
+   the continuation watchdog and the rest all read `{"agents": []}` as a healthy
+   empty fleet.
+3. **`session_recovery.panes()`** returned `[]` for "tmux could not be asked" —
+   the same value it returns for "there are no panes". `pane_state()` therefore
+   called the target dead, `live_claude_for_cwd()` called the project free, and
+   `recover()` would have proceeded to `tmux new-session`, which with no socket
+   **starts a new server**. That is not a theory about what could have happened:
+   it is precisely what a tmux client did at 15:21:52.
+
+## The guard — `core/tmux_control.py` (`cba3d2e`)
+
+**Detect (fail closed).** `probe()` classifies reachability honestly —
+`ok` / `socket_missing` / `no_server` / `tmux_missing` / `timeout` / `error` —
+and distinguishes a deleted socket from an absent server by asking the
+filesystem, because that difference decides whether starting a server would
+create a duplicate. It counts LISTENING sockets bound to the path from
+`/proc/net/unix`, so an orphaned server is visible; more than one is
+`split_brain`, and `healthy` is false whether or not the path answers.
+
+**Repair (narrow).** One repair exists and it is the one an operator does by
+hand: `SIGUSR1` to the surviving server, which tmux handles by re-binding its
+socket. Every precondition is a refusal — already reachable, wrong failure
+class, no surviving server, more than one server, unresolved pid, or a pid that
+is not a tmux server (SIGUSR1's default disposition is TERMINATE, so signalling
+a recycled pid or a tmux *client* would kill it). **It never starts a server.**
+Preservation is proved, not assumed: the repaired socket must lead back to the
+same pid that was signalled, or the repair reports failure.
+
+**Report.** The companion runs the guard first in every tick, so a lost socket
+is repaired in time for that same tick's inventory. A blackout is now a durable,
+wake-capable event (`agent_control_plane_unreachable`,
+`agent_control_plane_split`, both added to `WAKE_EVENT_TYPES`, deduped per class
+per 30 min) instead of one service's stdout. A self-heal emits
+`agent_control_plane_recovered` as routine, which never wakes anyone.
+`GET /api/v1/agents/tmux-control/health` exposes the same probe.
+
+`core/tmux_control.py` was added to the companion's skew watch list, so a fix to
+the probe or the repair raises skew like any other delivery-path change.
+
+### Live end-to-end proof, on real tmux, with zero production risk
+
+Run against a throwaway server on its own socket — the incident reproduced
+exactly (`rmtree` of the socket directory), not simulated:
+
+```
+1. BEFORE   reachable=true  healthy=true  listeners=1   sessions=['proofcanary:1788099216']
+2. DELETED  reachable=false reason=socket_missing listeners=1 listener_pids=[3673924]
+            sessions=UNREACHABLE(error connecting …)   server alive: True
+3. REPAIRED repaired=true reason=socket_rebound_by_sigusr1 pid=3673924 serving_pid=3673924
+            reachable=true  sessions=['proofcanary:1788099216']
+PRESERVED (byte-identical session list incl. creation timestamp): True
+```
+
+The throwaway server was then killed and its socket directory removed;
+production's own plane was never made unreachable at any point.
+
+## A second live defect, found while verifying wake health: 3.5 hours of undeliverable wakes
+
+`pipeline_health()` reported `stuck` with `consecutive_delivery_failures`, and
+**98 of the last 100 deliveries had failed** as `composer_not_focused` since
+12:19Z. A live CDP inspection found the cause: a `[role=dialog]` holding
+`document.activeElement` in a Radix focus scope (`radix-_r_*`,
+`data-state=open`, body `pointer-events:none`, 2 focus guards) on three route
+tabs at once. `composer.focus()` was reverted the instant it was called.
+
+The dialog was ChatGPT's own **"Too many requests"** notice — an alert dialog
+with a single "Got it" button that deliberately ignores Escape, because an alert
+is meant to be acknowledged. Nothing in the pipeline ever acknowledged it, so a
+rate limit that had long since expired kept the composer permanently
+unreachable. **A transient condition had become an unbounded outage.**
+
+Fixed in `a2a660f` + `18e2e52`:
+
+* `focus_composer()` tries Escape, then clicks a single allowlisted
+  acknowledgement button. Two conditions together make that an acknowledgement
+  rather than a decision: the dialog has exactly **one** button, and its
+  accessible name is in `_ACK_BUTTON_LABELS`. A dialog offering a choice
+  ("Upgrade"/"Not now", "OK"/"Delete everything") is left alone — even when its
+  first button looks benign.
+* The decision lives in **Python, not in the injected JS**. The first cut put it
+  in the JS and the test fake reimplemented the same rules, so deleting either
+  guard left every test green — the same vacuous-fixture trap that made the
+  quarantine-release guard permissive earlier in this work. Policy the tests
+  cannot reach is not policy; both guards are now mutation-verified in
+  isolation, including a `["OK", "Delete everything"]` case that the label
+  allowlist alone would wave through.
+* The failure reason now names the dialog
+  (`composer_focus_trapped_by_dialog:too-many-requests`). Finding this the first
+  time took a live CDP session; the reason string is the whole diagnosis.
+
+**Result, live:** first successful delivery since 12:19Z landed at **14:11:46Z**
+(event 14833, `submitted_and_assistant_started_generating`), followed by 14834,
+14844 and 14852 — the backlog draining, `consecutive_delivery_failures` cleared.
+
+## Reverification (live, post-deploy)
+
+| Check | Result |
+| --- | --- |
+| Dedupe — any event delivered twice | **empty, globally** |
+| Exactly-once — duplicate `wake_submitted` | **empty, globally** |
+| Bounded retry | refuse-then-claim pairs present (14675, 14778, 14800, 14833, 14834) |
+| Stale/superseded suppression | **0** fresh `wake` decisions on events older than 24 h since deploy |
+| `agent_waiting_input` / `work_stopped_incomplete` / `task_completed` / `agent_process_failed` / `agent_dead` | all `WAKE_EVENT_TYPES=True`, none routine |
+| New control-plane types | `unreachable` + `split` wake-capable; `recovered` routine |
+| Canonical rebind registry | 10 routes intact (6 owner-bound, 4 auto-discovery), fallback `owner-os` — **nothing rebound, guessed or hand-edited** |
+| `worker_skew()` | `[]` after both restarts |
+| Managed-agent health | `status: ok`, **`control_plane_reachable: true`**, coverage 1/1 |
+| tmux control health | `status: ok`, listeners 1, `split_brain: false` |
+| tmux sessions | **10 before, 10 after**, none created, killed or recreated by this session |
+
+## Canary — and the mechanical explanation for the continuation gap three sessions could not close
+
+A fresh canary was run through the production actuation path
+(`agent_control.agent_send`, key `p0-canary-tmuxguard-A-waiting-input-20260830-1615`,
+`delivered=true submitted=true queued=false duplicate=false`), confined to
+`/root/cp-canary-v2`, no external effect. The canary worked, wrote its report,
+stopped and asked its question:
+
+| Leg | Evidence |
+| --- | --- |
+| Observer event | **15228** `agent_waiting_input`, `cp-canary:0.0`, severity high, `owner_action_required=1`, 14:15:59Z |
+| Decision | `wake_audit` **111185** — `wake`, `actionable=1`, `actionable_waiting_transition`, route `owner-os` |
+| Coalescing | superseded by audit **111207** → event **15230**, *also the canary's own* `agent_waiting_input` (14:19:24Z) |
+| Route | `owner-os` fallback (`cp-canary-v2` is unbound — the intended behaviour, no binding created) |
+
+**The new finding.** Across Parts 4 and 5 the one leg never observed was a
+causal ChatGPT→canary continuation, recorded honestly each time as "not
+observed, cannot be forced". There is a mechanical reason, and it is visible in
+this run's own timestamps:
+
+```
+14:15:59  agent_waiting_input 15228           (canary stops, asks its question)
+14:16:22  agent_continuation_blocked          (watchdog refuses: unsafe_pending_text)
+14:16:24  agent_send -> cp-canary:0.0         (internal controller, no actor, uuid key)
+14:18:15  agent_send -> cp-canary:0.0         (again)
+14:19:24  agent_waiting_input 15230           (canary stops again)
+14:19:59  agent_send -> cp-canary:0.0         (again)
+15:15:10  closed-loop-watch: deregistered cp-canary:0.0 — pane_alive_and_working
+          … meanwhile the wake for 15228/15230 is still queued behind the route backlog
+```
+
+**The canary is continued by internal controllers within 25–60 seconds of going
+idle, while its wake waits minutes in the route queue.** By the time a wake
+could be delivered and acted on, the canary is working again and the closed-loop
+watch correctly deregisters it. A ChatGPT→canary continuation is therefore not
+merely unobserved — on this agent, under this configuration, it is *structurally
+unlikely to ever occur*, because the thing ChatGPT would be woken to continue has
+already been continued. That is not a defect in the wake loop; it is the
+disposable canary being the one agent the internal auto-continuation machinery
+is most attentive to.
+
+The same-target causal continuation is proven on **real production agents**
+(Part 5: 13799 → `mess-qa-final-sonnet:0.0` at 205 s; 13404 →
+`jobhunter-video-sonnet:0.0` at 66 s; 13922 → `owner-os-opus-windows:0.0` at
+23 s), and ChatGPT was observed doing exactly that during this session, on four
+different agents within one hour:
+
+```
+14:14:38  gaika-opus:0.0          gaika-continue-safe-regression-20260830-1714     api:bearer
+14:14:25  mess-opus:0.0           mess-opus-fix-app-invariant-20260830             api:bearer
+14:03:14  arbitrage2-audit:0.0    arb2-readonly-host-capacity-exec-20260830        api:bearer
+13:52:32  capacity-blockchain:0.0 acap-kill-fake-watch-loop-run-now-20260830-1652  api:bearer
+```
+
+Wake → correct route → ChatGPT reads live Owner OS → ChatGPT continues the exact
+same agent, no duplicate: that loop is demonstrably running in production right
+now. What this session did not do is manufacture that signature on the canary,
+for the reason measured above.
+
+## Deploy record
+
+* Backup: `backups/predeploy_tmux_control_guard_20260830T135923Z/` —
+  `control_plane.db`, `agent_control.db`, `runtime_jobs.db`, `configs/.env`
+  snapshot, both systemd units.
+* Rollback tags: `rollback/pre-tmux-control-guard-20260830T135923Z` (→ `ccc9689`),
+  `rollback/pre-composer-focustrap-…`, `rollback/pre-composer-ack-…`.
+* Commits: `cba3d2e` (control-plane guard), `a2a660f` (focus-trap detection +
+  Escape), `18e2e52` (allowlisted acknowledgement + named reason).
+* Gate: **541 passed** across the wake, control-plane, agent-control,
+  watchdog, session-recovery and windows-bridge suites; **34** composer tests.
+  Ten fixes mutation-verified independently — each reverted alone, each failing
+  its own test.
+* Both importing services restarted after each deploy; `Result=success`,
+  `NRestarts=0`, exactly one process each, `worker_skew()` empty.
+* **The 29 unrelated dirty `reports/*` files are byte-identical to session
+  start**, verified by sha256 against a baseline taken before the first edit.
+
+## Rollback
+
+```sh
+git checkout rollback/pre-tmux-control-guard-20260830T135923Z -- \
+    core/agent_control.py core/agent_continuation_watchdog.py \
+    core/session_recovery.py core/wake_bridge.py api/v1.py \
+    tools/wake_companion.py tools/cdp_composer.py
+rm -f core/tmux_control.py
+systemctl restart ai-runtime.service owner-os-wake-companion.service
+```
+No schema, config, credential or routing change to unwind. Never
+`git reset --hard` — it would discard the 29 unrelated WIP files.
+
+## Status
+
+| Item | Result |
+| --- | --- |
+| Socket-loss root cause | **PROVEN** from the deleter's own log, with a full timeline |
+| Split control plane / duplicate agent | **FOUND LIVE**, evidenced, self-resolved, nothing killed |
+| Fail-closed health (3 paths) | **CLOSED**, mutation-verified; managed-agent health cannot be GREEN while tmux control is unreachable |
+| Safe recovery guard | **PROVEN END TO END** on real tmux; same server pid, session list byte-identical |
+| Wake delivery blackout (3.5 h) | **ROOT-CAUSED AND FIXED**; deliveries resumed 14:11:46Z |
+| Dedupe / retry / suppression / semantics / rebind | **ALL REVERIFIED** post-deploy |
+| Canary stop → event → decision → correct route | **PROVEN** (15228 → 15230, route `owner-os`) |
+| ChatGPT → canary continuation | **NOT OBSERVED, and now explained**: internal controllers continue the canary in 25–60 s while its wake queues for minutes |
+| ChatGPT → same-agent continuation, generally | **OBSERVED LIVE** on four production agents within the hour |
+
+Not marking GREEN as a formal acceptance claim — that determination belongs to
+whoever has actual authority to accept it, on the evidence above, not to this
+report.
