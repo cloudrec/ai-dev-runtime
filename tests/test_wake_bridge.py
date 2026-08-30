@@ -783,3 +783,50 @@ def test_the_event_id_self_join_is_indexed_not_a_linear_scan():
     finally:
         c.close()
     assert "ix_wake_audit_event_decision" in plan, plan
+
+
+def _wake_row(event_id, route="owner-os", ts=1000.0):
+    """A row already at decision='wake' — the shape the coalescing 'kept'
+    selection picks from, distinct from `_skip_row`'s decision='skip'."""
+    conn, own = wb._conn(None)
+    try:
+        conn.execute("INSERT INTO wake_audit (ts,at,event_id,decision,reason,actionable,"
+                     "route_key,acknowledged) VALUES (?,?,?,'wake','urgent_event_not_yet_signalled',0,?,0)",
+                     (ts, "2026-08-30T00:00:00+00:00", event_id, route))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def test_a_wake_row_whose_event_is_already_too_old_is_never_the_kept_survivor():
+    """The 'kept' survivor must never be a row that is itself about to be expired —
+    every fresher row folded into a doomed survivor is orphaned for good once it
+    expires (superseded rows are excluded from every future candidate query).
+    Reproduced live 2026-08-30: a fresh canary work_stopped_incomplete event was
+    coalesced into an unrelated, much older event that expired
+    (event_older_than_max_age) minutes later, taking the fresh event's only
+    chance at delivery with it."""
+    now = 10_000_000.0
+    old_ts = now - wb.MAX_WAKE_AGE_SECS - 1
+    fresh_ts = now - 10
+    _insert_event(931, ts_epoch=fresh_ts, type="work_stopped_incomplete")
+    _insert_event(932, ts_epoch=old_ts, type="notification_dead_letter")
+    # fresh row inserted FIRST (lower audit id) — the old row, decided LATER
+    # (higher audit id) by a redecide, must still never win "kept" over it.
+    _wake_row(931, ts=100.0)
+    _wake_row(932, ts=200.0)
+    r = wb.coalesce_generic_backlog(now=now)
+    assert 931 not in r["superseded_event_ids"], (
+        "a fresh event must never be folded into an already-too-old survivor")
+    assert r["kept_event_id"] == 931
+
+
+def test_an_already_too_old_wake_row_is_excluded_even_as_the_only_candidate():
+    now = 10_000_000.0
+    old_ts = now - wb.MAX_WAKE_AGE_SECS - 1
+    _insert_event(941, ts_epoch=old_ts, type="notification_dead_letter")
+    _wake_row(941)
+    r = wb.coalesce_generic_backlog(now=now)
+    assert 941 not in r["kept_event_ids"]
+    assert 941 not in r["superseded_event_ids"]

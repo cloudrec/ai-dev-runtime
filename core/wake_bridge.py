@@ -1480,12 +1480,28 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
         # function, both hung past 30s against the production db. Unknown age
         # (no matching event row) is never a reason to exclude — same convention
         # as `expire_stale`/`_redecide_cooldown_skips`.
+        # The age bound applies to BOTH branches, not just skip. A `wake`-decision
+        # row whose event is already past MAX_WAKE_AGE_SECS is not protected by
+        # expire_stale here — that runs once per tick, but a row can sit as this
+        # group's "kept" survivor across MULTIPLE ticks (e.g. its route is
+        # contended) and cross the age threshold WHILE it holds that position,
+        # absorbing fresher members via coalescing before expire_stale ever
+        # catches it. Once it expires, every member folded into it is permanently
+        # orphaned: their own rows are `superseded_by` a row that will never
+        # deliver, and superseded rows are excluded from every future candidate
+        # query, so they can never be reconsidered either. Reproduced live
+        # 2026-08-30: a fresh canary work_stopped_incomplete event (14299) was
+        # coalesced through a chain that ended up "kept" by event 14111 — an
+        # unrelated, much older event whose OWN age had not yet crossed the
+        # ceiling at coalescing time, but did shortly after, expiring it
+        # (`event_older_than_max_age`) with 14299 never delivered and never
+        # eligible to try again.
         rows = conn.execute(
             "SELECT a.id, a.event_id, COALESCE(a.project_id,''), "
             "COALESCE(a.route_key,''), COALESCE(a.agent_id,'') FROM wake_audit a "
             "LEFT JOIN event e ON e.id = a.event_id "
-            "WHERE (a.decision='wake' OR (a.decision='skip' AND a.reason='cooldown_active' "
-            "       AND (e.ts_epoch IS NULL OR e.ts_epoch > ?))) "
+            "WHERE (a.decision='wake' OR (a.decision='skip' AND a.reason='cooldown_active')) "
+            "AND (e.ts_epoch IS NULL OR e.ts_epoch > ?) "
             "AND a.acknowledged=0 AND a.superseded_by IS NULL AND COALESCE(a.actionable,0)=0 "
             "AND NOT EXISTS (SELECT 1 FROM wake_audit w WHERE w.event_id=a.event_id "
             "                AND w.decision='wake' AND w.id<>a.id) "
