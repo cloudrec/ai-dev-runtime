@@ -2062,3 +2062,35 @@ Each eligible pane fires at most once, only after 300 s unchanged, and only if i
 was last seen working — so genuinely-stopped panes are reported once and active
 ones reset their own clock. Several belong to unrelated projects; surfacing a stop
 there is the system doing its job, not this session touching those projects.
+
+## Live proof — the silent stop is now reported, on the pane that failed
+
+The canary pane was left holding the exact text that produced nothing in Part 7,
+so the fix was tested against the failing case itself rather than a fresh one.
+At 16:19:29Z the deploy started its dwell clock; at 16:25:04Z, 335 s later:
+
+```
+event 15412  work_stopped_incomplete  cp-canary:0.0  project cp-canary-v2  severity high  oar=0
+payload: {"class": "quiescent", "digest": "7938e7b142162d2e",
+          "excerpt": "Not proceeding past this question. 6:02 PM"}
+```
+
+That excerpt is the sentence that matched no detector. The pane is unchanged; only
+the classifier's ability to see a structural stop changed.
+
+**The burst matched the prediction made before deploy** — six panes, once each:
+
+```
+15411 capacity-blockchain:0.0     15414 email:0.0
+15412 cp-canary:0.0               15415 gaika-opus:0.0
+15413 diamond-auction:0.0         15416 payorch-monitor-clean:0.0
+```
+
+`agent_watch_state` shows all six at `cls=quiescent` with `notified_cls=quiescent`
+— dedupe armed, so each reports once and not once per sweep. `mess-opus:0.0` was
+excluded by its own clock resetting at 16:20:36Z when its output changed, which is
+the reset rule working live rather than in a fixture.
+
+Wake decision for 15412: `wake_audit` 111691, `skip / cooldown_active`,
+`actionable=0` — the non-actionable lane's own rate limit, unchanged by this work,
+and redecided on the next pass exactly as every other non-actionable event is.
