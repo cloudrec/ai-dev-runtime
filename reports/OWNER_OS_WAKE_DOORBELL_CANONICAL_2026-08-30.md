@@ -1678,3 +1678,54 @@ sessions 10 | agent_control_plane_* events ever: 0 | connect errors since restor
 Also observed and unrelated: 15369 `notification_dead_letter` (the pre-existing
 Telegram gate) and 15370 `agent_waiting_input` on `payorch-monitor-clean:0.0`
 (payment project, out of scope, untouched).
+
+### Wake 15374 — a DERIVED blocker, not a real pending prompt
+
+**15374** `agent_prompt_needs_response`, `owner-os-wake-policy-opus:0.0`
+(this session's own pane), severity high, `owner_action_required=1`, 15:08:52Z.
+
+**There is no pending prompt.** The event's own payload proves it — its `excerpt`
+is this session's previous REPORT text:
+
+```
+class: owner_prompt   digest: bf5eebc1ccc4599c
+excerpt: "…on payorch-monitor-clean:0.0 (payment project). Owner decisions
+          outstanding — two, now distinct: 1. Obsolete: retire cd01ad71,
+          8ee3aa76, a6f4c391, 35337a2c … 2. Unstarted, subject unaddressed:
+          approve or decline 5e1bcdc8 (read-only XMRig triage)…"
+```
+
+Corroborated independently: `agent_control.agent_list()` reports this pane as
+`state: working`, **`pending: None`** — no queued or awaiting input of any kind.
+
+**The artifact, stated plainly so it is not misread later:** an agent that
+*reports* outstanding owner gates in its pane can have that report re-classified
+by the pane watcher as an `owner_prompt`, which emits
+`agent_prompt_needs_response` and wakes the loop — asking the agent to answer its
+own restatement of the gates. The only "answer" would be to decide the gated
+jobs, which is exactly what must not happen without owner authorization. It is
+bounded, not a loop: `agent_watch_state` holds a stable digest
+(`bf5eebc1ccc4599c` as both `cls` and `notified_digest`), so dedupe suppresses
+repeats of the same text.
+
+15374 itself travelled the loop normally — audit 111456 `wake`, route `owner-os`,
+delivered 15:09:17Z `submitted_and_assistant_started_generating`, acknowledged.
+
+**Nothing was answered and no gate was crossed.** No safe answer exists that does
+not decide an owner-gated job.
+
+**Standing diagnostics at this point (read-only):**
+
+```
+tmux_control: ok | listeners 1 | split False       server pid 302442 (original)
+agent_list  : 10 agents | duplicates [] | control_unreachable False
+recovery    : control_unreachable False            skew []
+sessions 10 | agent_control_plane_* events ever: 0 | connect errors since restore: 0
+dedupe duplicates: 0 | open runtimejob watches: 0 | pending unsubmitted wakes: 3
+29 unrelated WIP files: byte-identical to session start
+```
+
+**`pipeline.status` is now `waiting`, no longer `stuck`** —
+`waiting_on_cooldown:owner-os:823s`, which is the ordinary healthy state of a
+route inside its cooldown. The backlog created by the 3.5-hour composer blackout
+has fully drained.
