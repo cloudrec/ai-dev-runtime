@@ -1206,11 +1206,23 @@ on real agents alike.
 | Retire | `wake_audit.acknowledged=1` |
 | No duplicate | exactly **one** `cp-canary` pane; global dedupe query still empty |
 
+| **Continuation** | `deliveries` key **`cp-canary-event-15230-continue-safe-20260830-1643`** → **same target** `cp-canary:0.0`, `agent_answer`, delivered 14:43:47Z |
+| Who | `delivery_attribution`: `actor=api:bearer`, `source=172.20.0.6:35796 ua=python-httpx/0.27.0` — the awakened ChatGPT side calling back into the Owner OS API, i.e. it re-read live state rather than trusting the wake payload |
+| Causality | the idempotency key **carries the wake event id 15230** — the same standard Scenario A's 13926 proof used |
+| Gap | **238 s** after the wake was delivered |
+| Same agent, no duplicate | `duplicate=0`, `agent_created=0`, exactly **one** `cp-canary` pane, global dedupe query empty |
+
+**This is the complete loop the directive asked to prove, in one fresh run:**
+real stop → observer event → decision → coalescing → claim → correct bound chat →
+exactly-one submission → assistant started → ChatGPT re-read live Owner OS →
+continued the exact same canary agent → no duplicate.
+
 Queue latency (14:15:59Z stop → 14:39:49Z delivery, 24 min) is entirely the
 backlog the 3.5-hour composer blackout created draining at the designed
 one-per-cooldown-per-route rate: the canary's wake was 8 deep on `owner-os` when
 it was decided and was delivered as soon as it reached the front. Nothing was
-accelerated, retired or rerouted to make that happen.
+accelerated, retired or rerouted to make that happen. The ChatGPT side then
+answered 238 s later, unprompted by this session.
 
 ### The same run's B-class event
 
@@ -1276,7 +1288,7 @@ No schema, config, credential or routing change to unwind. Never
 | Wake delivery blackout (3.5 h) | **ROOT-CAUSED AND FIXED**; deliveries resumed 14:11:46Z |
 | Dedupe / retry / suppression / semantics / rebind | **ALL REVERIFIED** post-deploy |
 | Canary stop → event → decision → claim → delivery → assistant started | **PROVEN END TO END** (15228 → 15230; claim 14:39:20Z, delivered 14:39:49Z, `wake_submitted`=1, acknowledged, one pane, no duplicate) |
-| ChatGPT → canary continuation | **PROVEN, four times today** (14306/14316/14340/14364; gaps 59–179 s; two keys carry the wake event id) — closes the leg Parts 4–5 recorded as never observed, and corrects this report's own first draft, which read a bad query as absence |
+| ChatGPT → canary continuation | **PROVEN on this session's own fresh run** — `cp-canary-event-15230-continue-safe-20260830-1643`, `api:bearer`, 238 s after the wake, key carries event 15230, `duplicate=0`, `agent_created=0`, one pane. Plus four earlier proofs today (14306/14316/14340/14364). Closes the leg Parts 4–5 recorded as never observed, and corrects this report's own first draft, which read a bad query as absence |
 | ChatGPT → same-agent continuation, generally | **OBSERVED LIVE** on four production agents within the hour |
 
 Not marking GREEN as a formal acceptance claim — that determination belongs to
