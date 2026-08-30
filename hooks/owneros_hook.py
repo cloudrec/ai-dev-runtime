@@ -88,8 +88,21 @@ def _map(ev: str, payload: dict):
         # The only branch that can produce an actionable wake, and only for the
         # notification types that genuinely mean a human is being asked.
         t = (payload.get("notification_type") or "").strip()
-        if t in ("agent_needs_input", "idle_prompt"):
+        if t == "agent_needs_input":
+            # The agent is ASKING. That is an owner-facing question.
             return ("agent_waiting_input", "high", True)
+        if t == "idle_prompt":
+            # "Claude is waiting for your input" fires whenever a pane SITS at the prompt.
+            # Idle is not a question, and mapping it to an actionable wake paged the owner
+            # for every quiet agent: measured 2026-08-30, 18 of 19 native waiting-input
+            # events were idle_prompt and 11 of them became delivered wakes — roughly a
+            # dozen owner interruptions an hour saying only "an agent is idle".
+            #
+            # It is still worth RECORDING: idleness is precisely what the supervisor acts
+            # on, and an agent that never ends a turn may emit this when it emits no Stop.
+            # So it becomes the same routine turn-boundary record — useful, never a
+            # doorbell. This is the `Stop`-fires-every-turn trap in another costume.
+            return ("agent_turn_stopped", _ROUTINE, False)
         if t == "agent_completed":
             return ("task_completed", "high", False)
         return None

@@ -53,6 +53,26 @@ def test_needing_input_wakes():
     assert etype == "agent_waiting_input" and oar is True and sev == "high"
 
 
+def test_merely_being_idle_is_not_a_question():
+    """`idle_prompt` fires whenever a pane SITS at the prompt. Measured 2026-08-30: 18 of
+    19 native waiting-input events were idle_prompt and 11 became delivered wakes — about
+    a dozen owner interruptions an hour saying only "an agent is idle". It is recorded,
+    because idleness is what the supervisor acts on, but it never rings the doorbell."""
+    etype, sev, oar = _map("Notification", notification_type="idle_prompt",
+                           message="Claude is waiting for your input")
+    assert etype == "agent_turn_stopped" and oar is False and sev == "info"
+    from core import wake_bridge as wb
+    assert etype not in wb.WAKE_EVENT_TYPES
+    assert etype in wb.ROUTINE_EVENT_TYPES
+
+
+def test_the_supervisor_can_still_act_on_an_idle_prompt():
+    """Demoting it must not blind the supervisor: idle is exactly its trigger."""
+    from core import native_supervisor as ns
+    etype, _, _ = _map("Notification", notification_type="idle_prompt")
+    assert ns.decide(etype, {})["action"] == "continue"
+
+
 def test_completion_and_failure_wake():
     assert _map("Notification", notification_type="agent_completed")[0] == "task_completed"
     assert _map("TaskCompleted", task_id="t1", task_subject="s")[0] == "task_completed"
