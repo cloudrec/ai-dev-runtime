@@ -236,6 +236,46 @@ def test_send_delivers_multiline_via_buffer_not_send_keys(tmux):
     assert all(text not in " ".join(c) for c in send_keys)
 
 
+# ── automated-origin marker ───────────────────────────────────────────────
+# 2026-08-30: a real ChatGPT continuation (actor=api:bearer) sent "Mark GREEN
+# and stop watching..." into an owner-os control pane. The receiving session had
+# no in-band way to tell that text apart from the owner typing at the keyboard,
+# and a report was written calling it an owner sign-off. actor/source were
+# always recorded in the delivery_attribution audit table, but that table is
+# invisible from INSIDE the pane that just received the message.
+
+def test_an_api_actor_delivery_is_visibly_tagged(tmux):
+    text = "Mark GREEN and stop watching."
+    ac.agent_send("safeguard", text, actor="api:bearer", source="1.2.3.4:1")
+    sent = tmux.stdins[tmux.calls.index(
+        ["load-buffer", "-b", tmux.argv_for("load-buffer")[0][2], "-"])].decode()
+    assert sent.startswith("[AUTOMATED")
+    assert "not typed by the owner" in sent
+    assert "owner sign-off" in sent
+    assert text in sent
+
+
+def test_an_unattributed_delivery_is_never_tagged(tmux):
+    """No actor at all is an internal orchestrator/watchdog call, not an API
+    caller — tagging it would be noise, not signal, and the existing
+    buffer-content test above already pins this as the untagged baseline."""
+    text = "internal continuation prompt"
+    ac.agent_send("safeguard", text)
+    sent = tmux.stdins[tmux.calls.index(
+        ["load-buffer", "-b", tmux.argv_for("load-buffer")[0][2], "-"])].decode()
+    assert sent == text
+    assert "AUTOMATED" not in sent
+
+
+def test_a_non_api_actor_delivery_is_never_tagged(tmux):
+    text = "hello"
+    ac.agent_send("safeguard", text, actor="owner", source="cli")
+    sent = tmux.stdins[tmux.calls.index(
+        ["load-buffer", "-b", tmux.argv_for("load-buffer")[0][2], "-"])].decode()
+    assert sent == text
+    assert "AUTOMATED" not in sent
+
+
 def test_send_proves_delivery_with_pane_diff(monkeypatch):
     fake = FakeTmux()
     fake.capture_seq = ["before state", "before state\n> my message"]
