@@ -299,3 +299,57 @@ def test_every_registered_project_dir_exists(real_project_config):
                for t, e in (reg.get("sessions") or {}).items()
                if not sr.authoritative_cwd(t, e)["exists"]]
     assert not missing, f"registered project dirs that do not exist: {missing}"
+
+
+# ── quarantine must be releasable ────────────────────────────────────────────
+# recover() writes a quarantine after a crash loop, and until 2026-08-30 NO code
+# path anywhere removed it. A quarantined session was therefore dead permanently:
+# cp-canary:0.0 — this project's own disposable canary, the target safe end-to-end
+# tests are supposed to run on — had been unrecoverable since 2026-08-07 for
+# "crash loop: 3 recoveries within 21600s". A safety brake with no release is a
+# broken brake, and it is what blocked the P0 wake acceptance canaries.
+
+_CANARY = "cp-canary:0.0"
+_CANARY_REG = {"sessions": [{"target": _CANARY, "session": "cp-canary",
+                             "cwd": "/tmp/cp-canary", "conversation_id": "c1",
+                             "enabled": True}]}
+
+
+def _quarantine(target, reason="crash loop: 3 recoveries within 21600s"):
+    c = sr._db()
+    c.execute("INSERT OR REPLACE INTO session_quarantine VALUES (?,?,?)",
+              (target, "2026-08-07T03:26:39+00:00", reason))
+    c.commit()
+    c.close()
+
+
+def test_a_quarantined_registered_session_can_be_released():
+    _quarantine(_CANARY)
+    assert sr.is_quarantined(_CANARY) is not None
+    r = sr.release_quarantine(_CANARY, reason="e2e canary", registry=_CANARY_REG)
+    assert r["released"] is True
+    assert "crash loop" in r["was_reason"]
+    assert sr.is_quarantined(_CANARY) is None
+
+
+def test_an_unregistered_target_can_never_be_released():
+    """The registry is the authority: payment is absent from it and must stay absent."""
+    _quarantine("payment:0.0")
+    r = sr.release_quarantine("payment:0.0", registry=_CANARY_REG)
+    assert r["released"] is False and r["reason"] == "not_in_registry"
+    assert sr.is_quarantined("payment:0.0") is not None, "must remain quarantined"
+
+
+def test_releasing_a_target_that_is_not_quarantined_is_a_noop():
+    r = sr.release_quarantine(_CANARY, registry=_CANARY_REG)
+    assert r["released"] is False and r["reason"] == "not_quarantined"
+
+
+def test_the_release_is_audited_like_every_other_recovery_decision():
+    _quarantine(_CANARY)
+    sr.release_quarantine(_CANARY, reason="e2e canary", registry=_CANARY_REG)
+    c = sr._db()
+    row = c.execute("SELECT action,ok FROM session_recovery WHERE target=? "
+                    "ORDER BY rowid DESC LIMIT 1", (_CANARY,)).fetchone()
+    c.close()
+    assert row and row[0] == "release_quarantine" and row[1] == 1

@@ -131,6 +131,50 @@ def is_quarantined(target: str, conn=None) -> Optional[dict]:
             conn.close()
 
 
+def release_quarantine(target: str, *, reason: str = "", registry: Optional[dict] = None,
+                       conn=None) -> dict:
+    """Lift a session quarantine so the target can be recovered again.
+
+    Quarantine is written by `recover()` after a crash loop and, until now, there
+    was NO code path anywhere that removed it. A quarantined session was therefore
+    dead permanently: `cp-canary:0.0` — the project's own disposable canary, the
+    thing safe end-to-end tests are supposed to run on — has been unrecoverable
+    since 2026-08-07 for `crash loop: 3 recoveries within 21600s`. A safety brake
+    with no release is a broken brake.
+
+    Scoped deliberately:
+
+    * only a target in `config/managed_sessions.yaml` may be released, so this can
+      never resurrect something the registry does not already authorise (payment
+      is absent from that file and stays absent);
+    * the release is audited through the same `_log` sink as every recovery
+      decision, so lifting a brake is as visible as applying one;
+    * historical audit rows are never touched — this removes the live quarantine
+      latch only.
+    """
+    reg = registry if registry is not None else load_registry()
+    entries = {e.get("target"): e for e in (reg.get("sessions") or [])}
+    own = conn is None
+    conn = conn or _db()
+    try:
+        if target not in entries:
+            _log(conn, target, "release_quarantine", False, "not_in_registry")
+            return {"released": False, "reason": "not_in_registry",
+                    "note": "only a registered managed session may be released"}
+        q = is_quarantined(target, conn=conn)
+        if not q:
+            return {"released": False, "reason": "not_quarantined"}
+        conn.execute("DELETE FROM session_quarantine WHERE target=?", (target,))
+        conn.commit()
+        _log(conn, target, "release_quarantine", True, reason or "manual_release",
+             {"was_since": q["since"], "was_reason": q["reason"]})
+        return {"released": True, "target": target, "was_since": q["since"],
+                "was_reason": q["reason"], "reason": reason or "manual_release"}
+    finally:
+        if own:
+            conn.close()
+
+
 def recent_recoveries(target: str, window_secs: float, conn=None) -> int:
     """EVERY revive attempt inside the window, successful or not.
 
