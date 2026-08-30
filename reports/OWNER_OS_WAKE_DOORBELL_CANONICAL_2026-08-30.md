@@ -2094,3 +2094,53 @@ the reset rule working live rather than in a fixture.
 Wake decision for 15412: `wake_audit` 111691, `skip / cooldown_active`,
 `actionable=0` — the non-actionable lane's own rate limit, unchanged by this work,
 and redecided on the next pass exactly as every other non-actionable event is.
+
+## The new class travels the whole pipeline — proven end to end
+
+Event **15413** is a `quiescent` stop that reached a real ChatGPT chat, 43 s after
+it was detected:
+
+| Leg | Evidence |
+| --- | --- |
+| Event | **15413** `work_stopped_incomplete`, `diamond-auction:0.0`, severity high, `oar=0`, payload `{"class": "quiescent", "digest": "f74cac57f157a547"}` — a pane that before this deploy would have stayed `working` and emitted nothing |
+| Decision | `wake_audit` **111692** — `wake`, `urgent_event_not_yet_signalled`, non-actionable, route **`auction`** |
+| Claim | `wake_send` **28963**, 16:25:26Z, `allowed=1 claimed` |
+| Delivery | `wake_delivery` **5049**, 16:26:09Z, **`delivered=1`**, `submitted_and_assistant_started_generating`, conversation `6a802654-…` — the auction project's **own bound chat**, not the fallback |
+| Exactly-once | `wake_submitted` = **1** |
+| Retire | `wake_audit.acknowledged=1` |
+| Dedupe | global duplicate-delivery query still **empty** |
+
+So the silent-stop class now completes: structural detection → event → decision →
+claim → correct per-project route → exactly-once delivery → assistant started.
+
+**The canary's own instance (15412) is queued, not lost.** It coalesced through an
+18-hop chain on the busy `owner-os` route and its tip currently holds a live
+`wake` decision (audit 111761). That is the non-actionable lane's documented rate
+limit — one wake per 900 s per route, unchanged by this work and owner-gated since
+Part 3 — not a defect, and the same behaviour every non-actionable event on that
+route has shown all session. The canary's own same-target ChatGPT continuation was
+already proven twice today on this exact agent (`cp-canary-event-15230-continue-
+safe-20260830-1643` at 14:43:47Z, 238 s; `cp-canary-wake-15332-continue-20260830-
+1658b` at 14:58:54Z), so the leg is evidenced; what is queued is one more instance
+of an already-proven path.
+
+`diamond-auction` belongs to an unrelated project. Surfacing its stop is the
+system doing its job; nothing in that project was touched.
+
+## Final verdict on the silent-stop gap
+
+**Closed, and proven on the case that exposed it.** The same pane, holding the
+same sentence that matched no detector, went from emitting nothing to emitting
+`work_stopped_incomplete` (15412) — and the class it belongs to completes the full
+pipeline to a delivered, assistant-started wake on the correct route (15413). No
+detector was widened, no prose rule was invented, `task_completed` remains
+unreachable from quietness, long-running shells and active panes remain untouched
+by construction, and the report-once property now holds twice over: by digest
+dedupe, and because a reported pane settles to `idle` so the branch cannot
+re-enter until it genuinely works again.
+
+Six defects in Part 6, plus this one, all found live, all fixed backup-first with
+mutation-verified tests. **Technical wake acceptance is GREEN**, subject to the
+same three non-technical gates recorded in Part 7 — the owner-gated jobs, the
+external `/tmp/tmux-*` ops follow-up, and the derived-prompt classification, which
+remains documented rather than papered over.
