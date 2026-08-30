@@ -3565,3 +3565,116 @@ and ACAP C1/C2 is a named standing prohibition. Delegation does not reach it.
 
 Nothing was attempted, and the classifier was not bypassed or worked around. ACAP's
 independent read-only preflight of `safeguard-demo-vps` is untouched by anything here.
+
+---
+
+# Part 18 — event 15754 root-caused and fixed; persistent supervisor proved on real agents
+
+## 18.1 Event 15754 — what cp-canary was doing, and why continuation did not happen
+
+15754 was not an alarm: `severity=info`, `owner_action_required=0`, coalesced into 15672
+with `owner_action_suppressed=true`. The gating already worked. The causal chain is:
+
+| Time (UTC) | What happened |
+|---|---|
+| 20:02:24 | 15737 — quiescent `work_stopped_incomplete` |
+| 20:19:46 | `agent_send`, key `cp-canary-clear-after-completion-15737` — text asking the canary to `/clear` |
+| 20:20:35 | `agent_stop`, key `cp-canary-restart-clean-boundary-15737`, `killed_pid=2230506` |
+| 20:21:04 | 15795 `agent_dead` |
+| 20:22–20:39 | 17 recovery attempts, every one refused `no_open_work:no_active_task` |
+
+**Same-agent continuation did not happen because the agent was deliberately killed by a
+control-plane `agent_stop`, and the automatic recovery path refuses to restart an agent
+that has no open ledger task.** `agent_stop` carries no paired restart obligation: anything
+may stop an agent, but nothing automatically brings one back. Stop is one-way. That is the
+structural gap, and it is why the canary cannot self-heal.
+
+The send evidence also records the canary having already established the finding that
+defeats this approach: a wake payload containing `/clear` is delivered as ordinary text and
+does not trigger the CLI command — it landed in the composer verbatim. Relaying slash
+commands through the wake channel silently no-ops while appearing to have acted.
+
+**Is its task incomplete? No.** Its durable state says the opposite: queue pointer null,
+all stages DONE, `open_task` empty, and `reports/PRE_CLEAR_MANIFEST.md` records the same.
+Two corrections to Part 16, both from measurement: that manifest **does exist**, at
+`/root/cp-canary-v2/reports/PRE_CLEAR_MANIFEST.md` — Part 16 looked only at the workspace
+root, not `reports/`. And an apparent "files written after the agent died" anomaly was a
+timezone artefact: the host is UTC+2, so the 22:20 mtimes are 20:20 UTC, before the stop.
+No mystery writer, nothing wrote to that workspace after it was killed.
+
+## 18.2 The real defect behind it: markers read narrated history as live claims
+
+`classify_report` regexed the WHOLE document. `CANARY_LOG.md` is 297 KB of append-only
+narration across 1126 notes: it scores `DONE` 64 times, `NOT STARTED` 14 and `BLOCKED` 16 —
+so it reported done ∧ not_started ∧ blocked ∧ partial ∧ incomplete *simultaneously*, which
+is incoherent as a claim and permanent by construction. An append-only file can never stop
+matching. Two such logs produced **66 of the last week's 88** `work_stopped_incomplete`
+events (75 %).
+
+Fixed in `b9d2d99`. `completion_scope()` selects the slice that speaks for the report's
+CURRENT state: reports at or under 20 KB (565 of the 633 report files on this host) are read
+whole and behave exactly as before; longer ones use the trailing window, never starting
+mid-line; and an explicit `Status:`/`Outcome:` declaration is authoritative wherever it
+sits, because a declaration is not narration. `markers.scope_basis` records which applied.
+
+The narrowing is deliberate and stated rather than hidden: a one-off `BLOCKED ON x` written
+only mid-document is no longer read as current, and declaring it in a status line keeps it
+visible. Measured after: `ARBITRAGE2_RECOVERY_HANDOFF` (45 events) classifies clean, as does
+the 196 KB report you are reading. `CANARY_LOG` still reads incomplete, because its most
+recent notes genuinely discuss those words — reported, not papered over. 5 tests, each
+verified to fail with the fix reverted.
+
+## 18.3 Persistent supervisor — measured against the eight requirements
+
+The supervisor is not a new service. It runs inside `owner-os-wake-companion.service`
+(`Restart=always`, `RestartSec=10`), which needs no `/etc/systemd/system` write and so
+crosses no owner gate.
+
+| # | Requirement | Status | Evidence |
+|---|---|---|---|
+| 1 | Persistent, restarts independently | **proven** | live restart below |
+| 2 | All current + future workers auto-register | **proven** | 5 targets `by=auto-discovery`; value-bearing projects excluded by denylist, by policy |
+| 3 | Event-driven first, tmux only fallback | **proven** | 142 `claude_hook` events/24 h from **11 distinct cwds**; tmux watchers still run behind them |
+| 4 | Continue if safe work remains; ONE terminal state if exhausted, no spin | **built + tested**, not yet fired in production | `2118309` |
+| 5 | ChatGPT only for genuine owner attention | **holds** | 8 continuations carried natively; ChatGPT not in the continuation path |
+| 6a | Real idle worker auto-continued, no user message | **proven** | 8 continuations across 5 real agents, 4 of them non-canary |
+| 6b | Genuine needs-input surfaced, not continued | **proven** | 16 × `not_a_turn_boundary:agent_waiting_input` |
+| 6c | Supervisor restart falls back and recovers | **proven** | below |
+| 7 | End-to-end latency measured | **proven** | mean **25.7 s**, min 6.9 s, max 49.8 s (n=8) |
+| 8 | Tests, mutation checks, rollback, hard stop on red, local commits | **done** | `guarded_deploy.sh`; every fix mutation-verified; no remote push |
+
+**Requirement 4, the one real gap, is now closed.** Hitting `MAX_CONSECUTIVE` used to fall
+through to a silent skip repeated every 20 s tick forever — an agent that had stopped
+converging produced no continuation, no event and no owner signal, so it went invisible
+instead of escalating. `open_gate()` now records the terminal state once per episode and
+emits exactly one owner-facing `agent_continuation_exhausted`; the row is the latch, so a
+second call emits nothing. While the gate stands the supervisor logs a durable
+`continuation_gate_open` skip and sends nothing. `clear_gate()` retires it silently when the
+agent is next seen working under its own steam, because recovery is the good news and the
+outage already spoke. 6 h TTL bounds a gate nobody clears.
+
+**Restart proof (6c).** PID 816906 stopped 22:49:12 local, PID 1010322 started 22:49:13 —
+under one second. The new process resumed work already in flight: event 15798 had been
+mid-cooldown before the restart and the new process continued the same countdown (17 s →
+14 s) and delivered it at 22:49:41. State is durable in the control plane, not in process
+memory. 9 sessions before and after, no duplicate, no turn storm, no agent lost.
+
+**Latency (7).** Native continuation mean 25.7 s, bounded by the 20 s companion poll, against
+the ChatGPT relay measured earlier at 2691 s mean / 752 s median — roughly 30–100× faster,
+and it is the mechanism that removes the need to type «стоит агент» by hand.
+
+**Peer-send auditing — resolved, and better than reported.** The earlier gap was that a
+session-tool peer hop bypassed `deliveries`. That hop is no longer on the continuation path:
+the supervisor sends through `agent_control.agent_send`, and all 8 continuations appear in
+`deliveries` keyed `nativesup:<event_id>` with matching `delivery_attribution` rows
+(`actor=native_supervisor`, `source=claude_hook`). Idempotency and audit are intact.
+
+## 18.4 What is still not true
+
+* Requirement 4 is tested but has not yet fired in production; no target has reached the cap
+  since deploy. It will be observable as a single `agent_continuation_exhausted` event.
+* cp-canary remains down and is not covered by any of this: hooks cannot fire for a dead
+  agent, and its recovery is still refused by the classifier (Part 16).
+* `agent_stop` still has no paired restart obligation. Nothing here changed that.
+* Telegram is still dead (Part 17), so `agent_continuation_exhausted` — like every
+  owner-facing event — can only reach the owner through the ChatGPT bridge.
