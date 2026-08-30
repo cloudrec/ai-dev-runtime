@@ -305,3 +305,100 @@ pre-fix backlog as historical; or accept the ~21.5h drain.
 Both root causes found during this run were found **by** the canaries, not by
 review: the missing quarantine-release path (which had made the harness unusable
 since 2026-08-07) and the decision-gate half of the starvation defect.
+
+---
+
+# Acceptance part 3 — everything not behind the backlog gate
+
+Backlog **preserved untouched**: nothing retired, deleted, rewritten or
+accelerated; no rate limit or route changed.
+
+## Dedupe / exactly-once — **PASS**
+
+Proven on both fully-closed actionable loops:
+
+| Check | 13926 | 13950 |
+| --- | --- | --- |
+| wake decisions | 1 | 1 |
+| `wake_submitted` rows | 1 | 1 |
+| deliveries (delivered=1) | 1 | 1 |
+| allowed claims / attempts | 1 / 2 | 1 / 1 |
+| acknowledged | yes 02:13:20 | yes 02:32:50 |
+| repeat wake after resolution | **0** | **0** |
+| claims after ack | **0** | **0** |
+| closed-loop deregistration | exactly 1 | exactly 1 |
+
+The 2-attempt figure for 13926 is a cooldown refusal followed by success — the
+bounded retry, not a duplicate. **No canary event was ever delivered twice**
+(`having sum(delivered)>1` returns empty across every canary event).
+
+## Scenario A — **PASS ×8**
+
+Every `agent_waiting_input` from the canary this run reached
+decision -> claim -> delivery with exactly-once semantics:
+**13926, 13936, 13950, 13957, 13977, 13983, 13990, 13995** — all `wake`,
+`claims=1`, `delivered=1`. 13926 additionally carries the continuation proof.
+
+## Scenario C — `task_completed` — **PASS end-to-end (real production event)**
+
+| Leg | Evidence |
+| --- | --- |
+| Event | **13799** `task_completed`, agent `mess-qa-final-sonnet:0.0` |
+| Decision | `wake`, non-actionable, `urgent_event_not_yet_signalled` |
+| Claim | `allowed=1 claimed`, route **`mess`** |
+| Delivery | **delivered=1** `submitted_and_assistant_started_generating`, route `mess` |
+| Exactly-once | `wake_submitted` = 1 |
+
+A real completion event on a real agent, routed to that project's **own** bound
+chat (not the fallback), delivered with the assistant started. Nothing was
+manufactured to produce it.
+
+## Scenario D — `agent_process_failed` — decision obtained, delivery queued
+
+Event **13794** (`chemmy-fast:0.0`, `owner_action_required=1`) holds a `wake`
+decision; its claim is queued in the non-actionable lane behind the backlog.
+**No product-agent failure was manufactured**, per instruction.
+
+## Scenario B — canary instances queued
+
+`work_stopped_incomplete` from the canary: **13946, 13967, 13969, 13971** — all
+emitted by the real `work_evidence.scan()`, all decided, all queued. Class already
+proven to reach decision + claim via 13775.
+
+## Class semantics verified in isolation
+
+`task_completed`, `agent_process_failed`, `agent_dead`, `work_stopped_incomplete`:
+all `WAKE_EVENT_TYPES=True`, `is_significant=True`
+(`severity_at_wake_threshold`), all correctly non-actionable.
+
+Gate: **129 passed** (`wake_bridge`, `wake_actionable_transitions`,
+`wake_pipeline_health`, `session_recovery_false_resurrection`).
+
+## Production health
+
+Both workers `active`, `Result=success`, `NRestarts=0`, **exactly one process
+each** (an earlier "2" was `pgrep` matching its own shell). `worker_skew()` empty.
+**29 unrelated WIP files byte-identical to session start**, verified by diffing the
+porcelain list.
+
+8 log errors since the restart are all `cdp_error:WebSocketTimeoutException` — the
+pre-existing transient CDP class (37 over the prior 3 days), **not introduced by
+this deploy**; events 13936 and 13957 hit it and subsequently delivered, so the
+retry path absorbed them.
+
+## Status
+
+| Scenario | Result |
+| --- | --- |
+| A `agent_waiting_input` | **PASS ×8**, one with full continuation proof |
+| B `work_stopped_incomplete` | class proven to decision+claim; canary instances queued |
+| C `task_completed` | **PASS end-to-end**, correct project route |
+| D `agent_process_failed` | decision obtained; delivery queued |
+| dedupe / exactly-once | **PASS** |
+| no wrong-chat routing | **PASS** (owner-os, mess, gaika-extension all correct) |
+
+**The ONLY remaining blocker is owner-gated:** 86 non-actionable events compete for
+one slot per 900s per route (~21.5h drain), a backlog created by the starvation
+bug itself. B and D deliveries sit behind it. Clearing it faster, or retiring it,
+changes owner-facing wake volume or discards queued alerts — an owner decision,
+deliberately not taken. Everything not behind that gate now passes.
