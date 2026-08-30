@@ -1708,6 +1708,14 @@ bounded, not a loop: `agent_watch_state` holds a stable digest
 (`bf5eebc1ccc4599c` as both `cls` and `notified_digest`), so dedupe suppresses
 repeats of the same text.
 
+Refinement, measured: dedupe is per-TEXT, not per-condition. **15377**
+(15:11:33Z) is the same artifact with a different digest (`0fad5db0935aa6fa`)
+because the restatement's wording changed. So each freshly-worded restatement of
+the same unchanged gates produces one new derived prompt event. Bounded in
+severity (no gate is ever crossed, and the wake path handles each normally), but
+it means the honest cost of restating owner gates in the pane is one wake per
+distinct wording.
+
 15374 itself travelled the loop normally — audit 111456 `wake`, route `owner-os`,
 delivered 15:09:17Z `submitted_and_assistant_started_generating`, acknowledged.
 
