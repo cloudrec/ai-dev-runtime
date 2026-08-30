@@ -192,6 +192,7 @@ def auto_register(agents: list, *, conn=None, now: Optional[float] = None,
     try:
         if not AUTO_REGISTER:
             return {"registered": [], "skipped": [{"why": "auto_register_disabled"}]}
+        purge_denied(conn=conn)
         known = {r[0] for r in conn.execute("SELECT target FROM native_supervised_target")}
         registered, skipped = [], []
         for a in agents or []:
@@ -216,9 +217,38 @@ def auto_register(agents: list, *, conn=None, now: Optional[float] = None,
 
 
 def registered_targets(conn=None) -> set:
+    """Registered AND not deny-listed.
+
+    The denylist has to be evaluated on READ, not only at registration time. A target
+    registered before a denylist changed would otherwise stay supervised for ever —
+    which is not hypothetical: `owner-os-wake-policy-opus` (project `ai-dev-runtime`,
+    the supervisor's own session) was registered by an earlier build and still read as
+    supervised after `ai-dev-runtime` was added to the denylist. A supervisor that
+    answers its own turn boundaries loops on itself.
+    """
     conn, own = _conn(conn)
     try:
-        return {r[0] for r in conn.execute("SELECT target FROM native_supervised_target")}
+        return {r[0] for r in conn.execute(
+            "SELECT target, COALESCE(project,'') FROM native_supervised_target")
+            if r[1] not in AUTO_REGISTER_DENY_PROJECTS}
+    finally:
+        if own:
+            conn.close()
+
+
+def purge_denied(conn=None) -> list:
+    """Drop registrations whose project is now deny-listed. Idempotent, and safe to run
+    on every pass — a denylist change takes effect without anyone remembering to clean up."""
+    conn, own = _conn(conn)
+    try:
+        rows = [r[0] for r in conn.execute(
+            "SELECT target, COALESCE(project,'') FROM native_supervised_target")
+            if r[1] in AUTO_REGISTER_DENY_PROJECTS]
+        for t in rows:
+            conn.execute("DELETE FROM native_supervised_target WHERE target=?", (t,))
+        if rows:
+            conn.commit()
+        return rows
     finally:
         if own:
             conn.close()

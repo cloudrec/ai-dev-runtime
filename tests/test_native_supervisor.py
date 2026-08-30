@@ -308,3 +308,25 @@ def test_even_enabled_a_goal_must_still_pass_the_safety_classifier(monkeypatch):
 def test_non_goal_text_is_rejected_by_the_goal_gate(monkeypatch):
     monkeypatch.setattr(ns, "GOAL_AUTOSUBMIT", True)
     assert ns.may_autosubmit_goal("rm -rf /", lambda t: True)["reason"] == "not_a_goal_line"
+
+
+def test_the_denylist_revokes_a_target_registered_before_it_changed(monkeypatch):
+    """Found live: owner-os-wake-policy-opus (project ai-dev-runtime, the supervisor's OWN
+    session) was registered by an earlier build and still read as supervised after
+    ai-dev-runtime was deny-listed. The denylist has to be evaluated on READ, not only at
+    registration time."""
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", set())
+    conn, _ = ns._conn()
+    ns.auto_register([_agent(target="self:0.0", cwd="/root/ai-dev-runtime")], conn=conn)
+    assert ns.is_supervised("self:0.0", conn=conn) is True
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {"ai-dev-runtime"})
+    assert ns.is_supervised("self:0.0", conn=conn) is False, "a denylist change must revoke"
+
+
+def test_denied_registrations_are_purged_not_merely_ignored(monkeypatch):
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", set())
+    conn, _ = ns._conn()
+    ns.auto_register([_agent(target="gone:0.0", cwd="/opt/payorch")], conn=conn)
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {"payorch"})
+    assert ns.purge_denied(conn=conn) == ["gone:0.0"]
+    assert ns.purge_denied(conn=conn) == [], "idempotent"
