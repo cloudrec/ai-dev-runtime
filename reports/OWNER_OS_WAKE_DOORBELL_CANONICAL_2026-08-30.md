@@ -1192,11 +1192,25 @@ Wake → correct route → ChatGPT reads live Owner OS → ChatGPT continues the
 same agent, no duplicate: that loop is running in production, on the canary and
 on real agents alike.
 
-This session's own canary instance (15228 → 15230) is decided, routed and
-queued; at the measured drain rate it sat 8 wakes deep on the `owner-os` route
-behind the backlog the 3.5-hour composer blackout created. Its delivery is a
-matter of queue position, and the class it belongs to is proven four times over
-above.
+### This session's own canary run — delivered end to end
+
+| Leg | Evidence |
+| --- | --- |
+| Work delivered | `agent_control.agent_send`, key `p0-canary-tmuxguard-A-waiting-input-20260830-1615`, `delivered=true submitted=true queued=false duplicate=false`, actor `owner-os-session` |
+| Stop observed | **15228** `agent_waiting_input`, `cp-canary:0.0`, severity high, `owner_action_required=1`, 14:15:59Z (real observer, after the canary wrote its report and asked its question) |
+| Decision | `wake_audit` **111185** — `wake`, `actionable=1`, `actionable_waiting_transition`, route `owner-os` |
+| Coalescing | superseded into **111207** → event **15230**, the canary's own second `agent_waiting_input` |
+| Claim | `wake_send` **28778**, 14:39:20Z, `allowed=1 claimed_actionable`, route `owner-os` |
+| Delivery | `wake_delivery` **5000**, 14:39:49Z, **`delivered=1`**, `submitted_and_assistant_started_generating`, conversation `6a7d37d0-…` |
+| Exactly-once | `wake_submitted` = **1**, source `companion` |
+| Retire | `wake_audit.acknowledged=1` |
+| No duplicate | exactly **one** `cp-canary` pane; global dedupe query still empty |
+
+Queue latency (14:15:59Z stop → 14:39:49Z delivery, 24 min) is entirely the
+backlog the 3.5-hour composer blackout created draining at the designed
+one-per-cooldown-per-route rate: the canary's wake was 8 deep on `owner-os` when
+it was decided and was delivered as soon as it reached the front. Nothing was
+accelerated, retired or rerouted to make that happen.
 
 ### The same run's B-class event
 
@@ -1228,8 +1242,9 @@ because a socket's mtime never moves after `bind()`.
   `rollback/pre-composer-focustrap-…`, `rollback/pre-composer-ack-…`.
 * Commits: `cba3d2e` (control-plane guard), `a2a660f` (focus-trap detection +
   Escape), `18e2e52` (allowlisted acknowledgement + named reason).
-* Gate: **541 passed** across the wake, control-plane, agent-control,
-  watchdog, session-recovery and windows-bridge suites; **34** composer tests.
+* Gate: **579 passed, 0 failed** across the wake, control-plane, agent-control,
+  watchdog, session-recovery, windows-bridge and composer suites — re-run in full
+  after the last deploy.
   Ten fixes mutation-verified independently — each reverted alone, each failing
   its own test.
 * Both importing services restarted after each deploy; `Result=success`,
@@ -1260,7 +1275,7 @@ No schema, config, credential or routing change to unwind. Never
 | Safe recovery guard | **PROVEN END TO END** on real tmux; same server pid, session list byte-identical |
 | Wake delivery blackout (3.5 h) | **ROOT-CAUSED AND FIXED**; deliveries resumed 14:11:46Z |
 | Dedupe / retry / suppression / semantics / rebind | **ALL REVERIFIED** post-deploy |
-| Canary stop → event → decision → correct route | **PROVEN** (15228 → 15230, route `owner-os`) |
+| Canary stop → event → decision → claim → delivery → assistant started | **PROVEN END TO END** (15228 → 15230; claim 14:39:20Z, delivered 14:39:49Z, `wake_submitted`=1, acknowledged, one pane, no duplicate) |
 | ChatGPT → canary continuation | **PROVEN, four times today** (14306/14316/14340/14364; gaps 59–179 s; two keys carry the wake event id) — closes the leg Parts 4–5 recorded as never observed, and corrects this report's own first draft, which read a bad query as absence |
 | ChatGPT → same-agent continuation, generally | **OBSERVED LIVE** on four production agents within the hour |
 
