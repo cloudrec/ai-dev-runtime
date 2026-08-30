@@ -912,3 +912,59 @@ def test_an_unknown_cwd_makes_no_claim():
     conn, _ = clw._conn()
     _hook_wake(conn, event_id=9102, cwd="", target="session:no-cwd")
     assert clw.deregister_resolved(conn=conn, now=2000.0, agents=[]) == []
+
+
+# ── a prompt wake whose prompt is gone must stop escalating (16042→16068→16102) ────────
+# The premise of agent_prompt_needs_response is that a question is on screen. That pane was
+# idle, with no pending input and no assigned task, and the watchdog re-woke it and then
+# escalated to CRITICAL over a question nobody was asking.
+
+def _prompt_watch(conn, event_id=9200, etype="agent_prompt_needs_response",
+                  target="seo-worker:0.0", cls="idle"):
+    conn.execute("INSERT INTO event (id,ts,ts_epoch,source,type,agent_id,severity,payload) "
+                 "VALUES (?,?,?,?,?,?,?,'{}')",
+                 (event_id, "t", 1000.0, "agent_watch", etype, target, "high"))
+    conn.execute("CREATE TABLE IF NOT EXISTS agent_watch_state ("
+                 "target TEXT PRIMARY KEY, cls TEXT, digest TEXT, at TEXT, ts REAL,"
+                 "notified_cls TEXT, notified_digest TEXT, notified_at TEXT,"
+                 "notified_ts REAL, emissions INTEGER DEFAULT 0, miss_count INTEGER,"
+                 "digest_since REAL)")
+    conn.execute("INSERT OR REPLACE INTO agent_watch_state(target,cls) VALUES(?,?)",
+                 (target, cls))
+    conn.commit()
+    clw.register_delivery(event_id=event_id, target=target, project_id="owner-os",
+                          conn=conn, now=1000.0)
+
+
+def test_a_prompt_wake_resolves_once_the_prompt_is_gone():
+    conn, _ = clw._conn()
+    _prompt_watch(conn)
+    out = clw.deregister_resolved(conn=conn, now=2000.0)
+    assert out and out[0]["reason"] == "prompt_no_longer_present"
+
+
+def test_an_agent_still_prompting_keeps_escalating():
+    """The genuine case must be untouched."""
+    conn, _ = clw._conn()
+    _prompt_watch(conn, event_id=9201, target="still-asking:0.0", cls="owner_prompt")
+    assert clw.deregister_resolved(conn=conn, now=2000.0) == []
+
+
+def test_a_blocker_class_pane_keeps_escalating():
+    conn, _ = clw._conn()
+    _prompt_watch(conn, event_id=9202, target="blocked:0.0", cls="blocker")
+    assert clw.deregister_resolved(conn=conn, now=2000.0) == []
+
+
+def test_a_non_prompt_wake_is_not_resolved_by_going_idle():
+    """This must NOT become the general 'idle means done' claim."""
+    conn, _ = clw._conn()
+    _prompt_watch(conn, event_id=9203, etype="work_stopped_incomplete",
+                  target="stopped:0.0", cls="idle")
+    assert clw.deregister_resolved(conn=conn, now=2000.0) == []
+
+
+def test_a_crashed_pane_still_wakes_even_for_a_prompt_wake():
+    conn, _ = clw._conn()
+    _prompt_watch(conn, event_id=9204, target="crashed-one:0.0", cls="crashed")
+    assert clw.deregister_resolved(conn=conn, now=2000.0) == []

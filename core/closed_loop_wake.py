@@ -89,6 +89,16 @@ _RUNTIME_JOB_TARGET_PREFIX = "runtimejob:"
 # critical at 21:18:49Z, with no possible end.
 _SESSION_TARGET_PREFIX = "session:"
 
+# Wakes whose whole premise is "this agent is asking the owner something RIGHT NOW".
+# agent_watch mints these from its `owner_prompt` and `blocker` classes.
+_PROMPT_EVENT_TYPES = frozenset({
+    "agent_prompt_needs_response", "agent_waiting_input", "agent_needs_response",
+    "agent_prompt_needs_response",
+})
+# agent_watch classes that positively contradict "a prompt is on screen". `owner_prompt`
+# and `blocker` are the prompting classes; `crashed` is a failure and must keep waking.
+_NOT_PROMPTING_CLASSES = frozenset({"idle"})
+
 
 def _session_target_gone(conn, event_id: int, target: str, agents=None) -> bool:
     """Is the session behind this watch provably gone?
@@ -273,6 +283,26 @@ def _resolution_reason(conn, *, event_id: int, target: str,
         # fresh watch regardless.
         if row and row[0] == "completed":
             return "agent_parked_completed"
+        # The premise of a prompt wake is that a question is on screen. When agent_watch
+        # has since reclassified the pane away from `owner_prompt`/`blocker`, that premise
+        # is GONE, and re-waking and escalating to critical chases a question nobody is
+        # asking. Event 16042→16068→16102: `agent_prompt_needs_response` for a pane that
+        # was idle with no pending input and no assigned task, escalated to critical.
+        #
+        # This is deliberately NOT the general "idle means done" claim the comment above
+        # refuses to make. It resolves only watches whose ORIGINAL event asserted a live
+        # prompt, and only on the narrower fact that the asserted prompt is absent. A
+        # genuinely waiting agent still classifies `owner_prompt`/`blocker` and keeps
+        # escalating; crash, failure and stop watches are untouched; and with no
+        # agent_watch row at all nothing is claimed.
+        if row and row[0] in _NOT_PROMPTING_CLASSES:
+            try:
+                ev = conn.execute("SELECT type FROM event WHERE id=?",
+                                  (event_id,)).fetchone()
+            except Exception:  # noqa: BLE001
+                ev = None
+            if ev and ev[0] in _PROMPT_EVENT_TYPES:
+                return "prompt_no_longer_present"
     except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
         pass
     return None
