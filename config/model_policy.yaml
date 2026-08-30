@@ -1,0 +1,46 @@
+# Owner model policy — effective 2026-08-04, until the owner revokes it explicitly.
+#
+# This file is the machine-readable record. Anything selecting a model for managed work
+# MUST honour it. Fable is DISABLED: it may not be chosen as a primary agent, a subagent,
+# or a fallback, and no automatic selection may reach for it.
+
+fable:
+  enabled: false
+  reason: "owner policy 2026-08-04 — not to be used at all until explicitly revoked"
+  allowed_as_primary: false
+  allowed_as_subagent: false
+  allowed_as_fallback: false
+
+sonnet:
+  enabled: true
+  use_for:
+    - tests
+    - log analysis
+    - local fixes
+    - migrations
+    - documentation
+    - reports
+    - repeatable checks
+  constraints:
+    max_concurrent_subagents: 1
+    scope: "one clearly bounded block, only when it genuinely saves Opus time and
+            creates no race with an existing session"
+
+opus:
+  enabled: true
+  owns_the_task: true
+  use_for:
+    - architecture
+    - complex or ambiguous defects
+    - security
+    - final verification
+    - deploy / restart / release
+    - final acceptance
+  duties:
+    - "personally verify any Sonnet result before merge, deploy or a PASS verdict"
+    - "never create a duplicate of an existing session"
+
+selection_rules:
+  - "never auto-select Fable for any role"
+  - "one Sonnet subagent maximum, for a bounded block"
+  - "Opus remains the task owner and the only issuer of a PASS"

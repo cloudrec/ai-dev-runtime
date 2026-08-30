@@ -37,3 +37,11 @@ runtime_jobs.db
 runtime_jobs.db.corrupt-*
 runtime_releases.db
 agent_control.db
+
+# Control Plane V2 runtime state
+control_plane.db
+control_plane.db-*
+checkpoints/
+
+# fleet health monitor runtime state (per-host consecutive fail/ok counts)
+state/fleet_health_state.json

@@ -1,0 +1,56 @@
+[Unit]
+Description=Owner OS fleet health monitor (server-down Telegram alerting)
+Documentation=file:/root/ai-dev-runtime/reports/SERVER_DOWN_TELEGRAM_ALERTS_2026-08-16.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/ai-dev-runtime
+EnvironmentFile=/root/ai-dev-runtime/configs/.env
+Environment=FLEET_HEALTH_STATE_PATH=/root/ai-dev-runtime/state/fleet_health_state.json
+ExecStart=/root/ai-dev-runtime/venv/bin/python /root/ai-dev-runtime/tools/fleet_health_run.py
+TimeoutStartSec=120
+Nice=10
+
+# Deliberately no SuccessExitStatus= override, matching payorch-cert-monitor.service's
+# reasoning: exit 1 (a host is down) must mark the unit failed so `systemctl --failed`
+# surfaces it even if Telegram delivery itself is down. exit 0 = fleet fully healthy.
+
+# --- hardening ---------------------------------------------------------------------
+# Read-only probes only (HTTP GET / TCP connect) plus one outbound HTTPS POST to the
+# Telegram API. No local writes except its own state file and no privilege needed.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# NOT ProtectHome=true: that hides /root entirely (empty tmpfs), which breaks this
+# unit's own venv/script/state, all of which live under /root/ai-dev-runtime — first
+# deploy failed with 203/EXEC for exactly this reason. read-only still denies writes
+# anywhere under /root except the explicit ReadWritePaths= below.
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @reboot @swap @obsolete
+CapabilityBoundingSet=
+AmbientCapabilities=
+# No IPAddressAllow= allowlist here (unlike payorch-cert-monitor): this service must
+# also reach api.telegram.org, whose IP ranges are not fixed/small enough to allowlist
+# safely without risking a silent alerting outage if Telegram rotates addresses.
+ReadWritePaths=/root/ai-dev-runtime/state
+PrivateUsers=true
+
+[Install]
+WantedBy=multi-user.target

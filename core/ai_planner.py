@@ -354,7 +354,8 @@ def _sanitize_raw(text: str, cap: int = 4000) -> str:
 
 
 def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
-        timeout: int | None = None, heartbeat_cb=None, kind: str | None = None) -> dict:
+        timeout: int | None = None, heartbeat_cb=None, kind: str | None = None,
+        model: str | None = None) -> dict:
     """heartbeat_cb(elapsed_seconds), if given, is called roughly every
     RUNTIME_PLAN_HEARTBEAT_SECS while the provider call is still running, so
     long-running plans surface progress instead of going silent until they
@@ -362,6 +363,9 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
 
     `kind` is the job kind (see core.job_kinds). A non-code kind is allowed to
     produce a plan with no file operations; code changes still must touch a file.
+
+    `model`, if given (e.g. from core.model_router), overrides RUNTIME_CLAUDE_MODEL
+    for this call only — same override precedence as smoke()'s `model` param.
     """
     if not available():
         raise PlannerError("provider_not_configured")
@@ -380,9 +384,10 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
     except Exception:
         listing = "(unavailable)"
     prompt = _build_prompt(goal, instructions, project_path, allowed_paths, listing)
+    use_model = model or _MODEL or None
     cmd = [_CLAUDE, "-p"]
-    if _MODEL:
-        cmd += ["--model", _MODEL]
+    if use_model:
+        cmd += ["--model", use_model]
     # The planner only ever needs to emit text — it must never act. `--tools ""`
     # is what actually stops the CLI going agentic on task-shaped instructions.
     # `--setting-sources ""` and `--strict-mcp-config` stop the operator's live
@@ -393,27 +398,56 @@ def plan(goal: str, instructions: str, project_path: str, allowed_paths: list,
 
     stdout, stderr, timed_out, returncode = _invoke_cli(cmd, prompt, effective_timeout, heartbeat_cb)
 
-    if timed_out:
-        raise PlannerError("planner timed out", timed_out=True)
-
     try:
         envelope = json.loads(stdout) if stdout.strip() else None
     except json.JSONDecodeError:
         envelope = None
     acct = _accounting(envelope)
 
+    from core import job_kinds
+    allow_empty = kind is not None and not job_kinds.requires_code_changes(kind)
+    plan_text = envelope["result"] if envelope is not None and "result" in envelope else stdout
+
+    if timed_out:
+        # The deadline is on the *process*, not on the work. The CLI can emit a
+        # complete plan and only then linger past the deadline (slow teardown, a
+        # detached grandchild still holding the pipe) until the group is killed.
+        # Discarding a plan the provider already delivered turns a satisfiable
+        # job into a `fallback_plan_only` NON-implementation — that is what job
+        # 86 (task_id=86) lost. So salvage a delivered plan that parses AND
+        # validates; a timeout with nothing usable is still a planner failure.
+        # The returncode check below is deliberately skipped here: a killed
+        # process group always reports failure, which says nothing about whether
+        # the bytes it already wrote are a good plan.
+        if stdout.strip() and not (envelope is not None and envelope.get("is_error")):
+            try:
+                salvaged = _validate(_extract_json(plan_text), allowed_paths,
+                                     allow_empty_files=allow_empty)
+            except PlannerError:
+                pass  # nothing usable was delivered — fall through to the timeout
+            else:
+                # Mark it. Without this the salvage is INVISIBLE: a salvaged plan
+                # was indistinguishable in the job record from an ordinary slow
+                # plan, so "did salvage ever fire?" could only be inferred from
+                # heartbeat timing. Mirrors how build_fallback_plan marks its own
+                # output, and carries the accounting the provider had already
+                # reported before it was killed.
+                salvaged["salvaged_after_timeout"] = True
+                salvaged["planner_tokens"] = acct["tokens"]
+                salvaged["planner_cost_usd"] = acct["cost_usd"]
+                salvaged["planner_duration_ms"] = acct["duration_ms"]
+                return salvaged
+        raise PlannerError("planner timed out", timed_out=True, **acct)
+
     if returncode != 0 or (envelope is not None and envelope.get("is_error")):
         raise PlannerError(_classify_failure(stdout, stderr, envelope), **acct)
     if not stdout.strip():
         raise PlannerError("planner produced empty output", **acct)
 
-    plan_text = envelope["result"] if envelope is not None and "result" in envelope else stdout
     raw = _sanitize_raw(plan_text)
     try:
         plan_obj = _extract_json(plan_text)
-        from core import job_kinds
-        return _validate(plan_obj, allowed_paths,
-                         allow_empty_files=kind is not None and not job_kinds.requires_code_changes(kind))
+        return _validate(plan_obj, allowed_paths, allow_empty_files=allow_empty)
     except PlannerError as e:
         # Re-raise with the sanitized raw response + accounting attached so the
         # caller can record diagnostics and fall back deterministically.

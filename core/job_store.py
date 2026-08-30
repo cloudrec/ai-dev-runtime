@@ -27,7 +27,12 @@ STATUSES = ["draft", "waiting_approval", "queued", "planning", "backing_up", "br
 _INTERRUPTIBLE = {"planning", "backing_up", "branching", "editing", "validating",
                   "testing", "committing", "pushing", "deploying"}
 _JSON_FIELDS = {"constraints", "allowed_paths", "forbidden_paths", "plan", "changed_files",
-                "validation", "tests", "git_info", "logs", "artifacts"}
+                "validation", "tests", "git_info", "logs", "artifacts",
+                # task 220: the structured escalation_reason the model router's
+                # hard gate reads. It used to be passed in-memory only, so a job
+                # loaded back out of this table always arrived without it and
+                # opus/fable were unreachable in real dispatch.
+                "escalation_reason"}
 
 
 def _now() -> str:
@@ -56,13 +61,16 @@ def init_db() -> None:
             plan TEXT, changed_files TEXT, validation TEXT, tests TEXT, git_info TEXT,
             logs TEXT, error TEXT, artifacts TEXT,
             created_at TEXT, started_at TEXT, finished_at TEXT, updated_at TEXT,
-            heartbeat_at TEXT, kind TEXT, outcome TEXT
+            heartbeat_at TEXT, kind TEXT, outcome TEXT,
+            requested_model TEXT, escalation_reason TEXT
         )""")
         # Additive migrations: each guarded independently so a partially migrated
         # database converges rather than aborting on the first existing column.
         for ddl in ("ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT",
                     "ALTER TABLE jobs ADD COLUMN kind TEXT",
-                    "ALTER TABLE jobs ADD COLUMN outcome TEXT"):
+                    "ALTER TABLE jobs ADD COLUMN outcome TEXT",
+                    "ALTER TABLE jobs ADD COLUMN requested_model TEXT",
+                    "ALTER TABLE jobs ADD COLUMN escalation_reason TEXT"):
             try:
                 c.execute(ddl)
             except sqlite3.OperationalError:
@@ -103,6 +111,12 @@ def create_job(**kw) -> dict:
         "status": kw.get("status", "draft"), "risk_level": kw.get("risk_level", "medium"),
         "dangerous": int(kw.get("dangerous", 0)),
         "kind": job_kinds.classify(kw.get("goal") or "", kw.get("instructions") or "", kw.get("kind")),
+        # Explicit model selection + its justification, both durable. Neither is
+        # a bypass: core.model_router still applies the risk floor and the task
+        # 213 hard gate to whatever is asked for here.
+        "requested_model": kw.get("requested_model") or None,
+        "escalation_reason": (json.dumps(kw["escalation_reason"])
+                              if kw.get("escalation_reason") else None),
         "outcome": None,
         "plan": None, "changed_files": json.dumps([]), "validation": None, "tests": None,
         "git_info": None, "logs": json.dumps([]), "error": None, "artifacts": json.dumps([]),
@@ -112,7 +126,9 @@ def create_job(**kw) -> dict:
     ph = ",".join("?" * len(fields))
     with _LOCK, _conn() as c:
         c.execute(f"INSERT INTO jobs ({cols}) VALUES ({ph})", list(fields.values()))
-    return get_job(job_id)
+    job = get_job(job_id)
+    _emit_transition(job, fields["status"], prev_status="")
+    return job
 
 
 def get_job(job_id: str) -> dict | None:
@@ -130,6 +146,21 @@ def list_jobs(limit: int = 100, status: str | None = None) -> list[dict]:
     return [_row_to_dict(r) for r in rows]
 
 
+def _emit_transition(job: dict | None, status: str, prev_status: str = "") -> None:
+    """Mirror a lifecycle transition into the Owner OS event pipeline.
+
+    Best-effort and lazily imported: the job store must keep working when the
+    control plane is unavailable (tests, standalone tools), and a failed event
+    write may never fail the job write it describes."""
+    if not job or not status or status == prev_status:
+        return
+    try:
+        from core import runtime_events
+        runtime_events.safe_emit_transition(job, status, prev_status=prev_status)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def update_job(job_id: str, **fields) -> dict | None:
     if not fields:
         return get_job(job_id)
@@ -144,9 +175,16 @@ def update_job(job_id: str, **fields) -> dict | None:
     sets.append("updated_at=?")
     vals.append(_now())
     vals.append(job_id)
+    prev_status = None
     with _LOCK, _conn() as c:
+        if "status" in fields:
+            r = c.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            prev_status = r["status"] if r else None
         c.execute(f"UPDATE jobs SET {','.join(sets)} WHERE id=?", vals)
-    return get_job(job_id)
+    job = get_job(job_id)
+    if "status" in fields and job:
+        _emit_transition(job, job["status"], prev_status=prev_status or "")
+    return job
 
 
 def append_log(job_id: str, level: str, msg: str) -> None:
@@ -182,12 +220,16 @@ def reap_orphaned() -> int:
              "AND (heartbeat_at IS NULL OR heartbeat_at < ?)") %
             ",".join("?" * len(_INTERRUPTIBLE)),
             tuple(_INTERRUPTIBLE) + (cutoff,)).fetchall()
+        reaped = []
         for r in rows:
             err = (f"orphaned: no heartbeat for >{_HEARTBEAT_STALE_SECS}s during "
                    f"'{r['status']}' — worker died; reaped to a terminal state")
             c.execute("UPDATE jobs SET status='failed', error=?, finished_at=?, updated_at=? WHERE id=?",
                       (err, _now(), _now(), r["id"]))
+            reaped.append((r["id"], r["status"]))
             n += 1
+    for job_id, prev in reaped:
+        _emit_transition(get_job(job_id), "failed", prev_status=prev)
     return n
 
 
@@ -206,8 +248,12 @@ def recover_interrupted() -> int:
              "AND (heartbeat_at IS NULL OR heartbeat_at < ?)") %
             ",".join("?" * len(_INTERRUPTIBLE)),
             tuple(_INTERRUPTIBLE) + (cutoff,)).fetchall()
+        recovered = []
         for r in rows:
             c.execute("UPDATE jobs SET status='waiting_approval', error=?, updated_at=? WHERE id=?",
                       (f"interrupted during '{r['status']}' by service restart — re-approval required", _now(), r["id"]))
+            recovered.append((r["id"], r["status"]))
             n += 1
+    for job_id, prev in recovered:
+        _emit_transition(get_job(job_id), "waiting_approval", prev_status=prev)
     return n

@@ -1,0 +1,34 @@
+{
+  "label": "6h",
+  "samples": 360,
+  "window_hours": 6.19,
+  "first": "2026-08-04T23:16:25",
+  "last": "2026-08-05T05:27:49",
+  "sampling_gaps_over_150s": [],
+  "duplicate_pane_samples": [],
+  "gate_answers": [],
+  "max_stall_streak_per_managed_session": {
+    "cp-canary:0.0": 2,
+    "mess-qa-automation:0.0": 37,
+    "arbitrage2-opus:0.0": 3
+  },
+  "recoveries_6h": {
+    "arbitrage2-opus:0.0": 0,
+    "cp-canary:0.0": 0,
+    "mess-qa-automation:0.0": 0
+  },
+  "quarantined": [],
+  "terminal_markers": [
+    [
+      "mess-qa-automation:0.0",
+      "terminal_blocked"
+    ]
+  ],
+  "service_states_seen": [
+    "active"
+  ],
+  "audit_log_ok": false,
+  "sample_errors": 0,
+  "clean": false,
+  "written_at": "2026-08-05T05:28:16"
+}

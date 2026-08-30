@@ -24,11 +24,18 @@ from core import job_store  # noqa: E402
 
 
 def setup_module(_m):
-    try:
-        os.remove(os.environ["RUNTIME_DB"])
-    except FileNotFoundError:
-        pass
+    # conftest.py points RUNTIME_DB at ONE shared temp file for the whole pytest
+    # session (deliberately, so no test run can ever resolve to the live
+    # production db). Removing that shared FILE here raced other test modules'
+    # still-live background threads (job_executor's heartbeat, or an async
+    # dispatch thread not yet joined) writing to it mid-run, which surfaced as
+    # sqlite3.OperationalError: attempt to write a readonly database in
+    # unrelated test files. Clearing the ROWS instead leaves the file (and any
+    # other module's open connection) intact, while still giving this module
+    # the same "starts empty" guarantee the old os.remove() gave it.
     job_store.init_db()
+    with job_store._LOCK, job_store._conn() as c:
+        c.execute("DELETE FROM jobs")
 
 
 def _repo(tmp_path, files=("a.py", "b.py", "c.txt"), git=True):
@@ -186,10 +193,29 @@ def test_incomplete_temp_cleanup_on_entry(tmp_path):
     bdir.mkdir(exist_ok=True)
     stale = bdir / "backup_20000101_000000_000000.tar.gz.tmp"
     stale.write_bytes(b"partial garbage")
+    # a leftover from a CRASHED run is old by definition — age it past the guard
+    old = time.time() - BackupEngine._STALE_TMP_SECS - 5
+    os.utime(stale, (old, old))
     eng = BackupEngine(str(repo))
     eng.snapshot(reason="test")            # cleans stale temp on entry
     assert not stale.exists()
     assert not any(p.name.endswith(".tmp") for p in bdir.iterdir())
+
+
+def test_fresh_tmp_of_concurrent_snapshot_is_not_deleted(tmp_path):
+    """2026-08-15 regression: two runtime jobs on one project snapshot at once;
+    the second's entry-cleanup deleted the first's in-progress tmp, and the
+    first's os.replace() failed with ENOENT. A FRESH tmp is a live snapshot in
+    flight, never debris."""
+    repo = _repo(tmp_path)
+    bdir = repo / ".ai-runtime-backups"
+    bdir.mkdir(exist_ok=True)
+    inflight = bdir / "backup_20260815_094639_038792.tar.gz.tmp"
+    inflight.write_bytes(b"another job is writing this right now")
+    eng = BackupEngine(str(repo))
+    meta = eng.snapshot(reason="concurrent job")
+    assert inflight.exists(), "entry-cleanup must not touch a fresh concurrent tmp"
+    assert meta.get("id")
 
 
 def test_failed_backup_removes_its_temp_and_keeps_last_valid(tmp_path, monkeypatch):

@@ -52,6 +52,19 @@ systemctl stop ai-runtime       # остановка
 journalctl -u ai-runtime -f     # логи в реальном времени
 ```
 
+## Owner OS: новый чат ChatGPT?
+
+Стучалка (wake bridge) не хранит ссылку в коде, `.env` или systemd — только в
+`control_plane.db` → `wake_target`. Одна команда, без рестарта:
+
+```bash
+tools/rebind_chat.py https://chatgpt.com/c/<conversation-id>
+tools/rebind_chat.py --show      # что стучалка разбудит прямо сейчас
+```
+
+Полная процедура, backup/аудит, smoke test и список «чего НЕ делать» —
+[docs/OWNER_OS_CHAT_REBIND.md](docs/OWNER_OS_CHAT_REBIND.md).
+
 ## Структура
 
 ```

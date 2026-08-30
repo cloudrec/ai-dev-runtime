@@ -19,12 +19,16 @@ def _fake_cli(tmp_path, body):
 
 
 def setup_module(_m):
-    # fresh db
-    try:
-        os.remove(os.environ["RUNTIME_DB"])
-    except FileNotFoundError:
-        pass
+    # conftest.py points RUNTIME_DB at ONE shared temp file for the whole pytest
+    # session. Removing it here raced other test modules' still-live background
+    # threads (job_executor's heartbeat, or an unjoined dispatch thread) writing
+    # to it mid-run -> sqlite3.OperationalError: attempt to write a readonly
+    # database in unrelated files. Clearing the ROWS instead leaves the file
+    # (and any other module's open connection) intact, while still giving this
+    # module the same "starts empty" guarantee the old os.remove() gave it.
     job_store.init_db()
+    with job_store._LOCK, job_store._conn() as c:
+        c.execute("DELETE FROM jobs")
 
 
 def test_job_create_persist_get():
@@ -98,7 +102,7 @@ def test_planner_success_path_via_fake_cli(tmp_path, monkeypatch):
     })
     _reload(monkeypatch, cli)
 
-    result = ai_planner.plan("g", "i", "/tmp", [])
+    result = ai_planner.plan("g", "i", str(tmp_path), [])
     assert result["summary"] == "ok"
     assert result["files"][0]["path"] == "a.py"
 
@@ -117,7 +121,7 @@ def test_planner_timeout_kills_process_group_and_fires_heartbeats(tmp_path, monk
 
     hits = []
     with pytest.raises(ai_planner.PlannerError, match="timed out"):
-        ai_planner.plan("g", "i", "/tmp", [], heartbeat_cb=lambda e: hits.append(e))
+        ai_planner.plan("g", "i", str(tmp_path), [], heartbeat_cb=lambda e: hits.append(e))
     assert len(hits) >= 2
 
     # nothing left running under the fake CLI's name — the process group,
@@ -134,8 +138,14 @@ def test_planner_hanging_parent_with_no_children_still_times_out(tmp_path, monke
 
     start = __import__("time").monotonic()
     with pytest.raises(ai_planner.PlannerError, match="timed out"):
-        ai_planner.plan("g", "i", "/tmp", [])
+        ai_planner.plan("g", "i", str(tmp_path), [])
     elapsed = __import__("time").monotonic() - start
+    # The project_path is tmp_path, not "/tmp". plan() walks project_path to build
+    # the prompt file listing BEFORE it starts the subprocess, and that walk is not
+    # covered by RUNTIME_PLAN_TIMEOUT. Pointed at a shared /tmp holding thousands of
+    # entries, a single scandir cost 5-8s and this assertion failed at ~14s while
+    # _invoke_cli itself returned in 2.04s — i.e. it failed on host noise, not on
+    # the timeout it is testing. An empty tmp_path keeps it measuring the timeout.
     assert elapsed < 10  # bounded by the 2s timeout, not the fake CLI's 30s sleep
 
     ps = subprocess.run(["pgrep", "-af", cli], capture_output=True, text=True)
@@ -145,35 +155,39 @@ def test_planner_hanging_parent_with_no_children_still_times_out(tmp_path, monke
 def test_planner_hanging_child_survives_parent_exit_but_group_is_reaped(tmp_path, monkeypatch):
     # Parent forks a detached-looking child and exits immediately itself while
     # the child keeps running — the leaked child must still die with the group.
+    # UNIQUE sleep duration: a global `pgrep "sleep 30"` collides with any
+    # unrelated `sleep 30` on the box (2026-08-03: another agent's poll loop made
+    # this test fail while the reap itself worked fine).
+    marker = "30.7391"
     cli = _fake_cli(tmp_path, (
         "import subprocess, sys\n"
-        "subprocess.Popen(['sleep', '30'])\n"
+        f"subprocess.Popen(['sleep', '{marker}'])\n"
         "sys.exit(0)\n"
     ))
     _reload(monkeypatch, cli, timeout=10)
 
     # Parent exits fast with no stdout -> classified as empty output, not a hang.
     with pytest.raises(ai_planner.PlannerError, match="empty output"):
-        ai_planner.plan("g", "i", "/tmp", [])
+        ai_planner.plan("g", "i", str(tmp_path), [])
 
     import time as _t
     _t.sleep(0.5)
-    ps = subprocess.run(["pgrep", "-af", "sleep 30"], capture_output=True, text=True)
-    assert "sleep 30" not in ps.stdout
+    ps = subprocess.run(["pgrep", "-af", f"sleep {marker}"], capture_output=True, text=True)
+    assert f"sleep {marker}" not in ps.stdout
 
 
 def test_planner_malformed_response_raises(tmp_path, monkeypatch):
     cli = _fake_cli(tmp_path, "print('not json at all')\n")
     _reload(monkeypatch, cli)
     with pytest.raises(ai_planner.PlannerError, match="did not return JSON"):
-        ai_planner.plan("g", "i", "/tmp", [])
+        ai_planner.plan("g", "i", str(tmp_path), [])
 
 
 def test_planner_empty_stdout_raises(tmp_path, monkeypatch):
     cli = _fake_cli(tmp_path, "pass\n")
     _reload(monkeypatch, cli)
     with pytest.raises(ai_planner.PlannerError, match="empty output"):
-        ai_planner.plan("g", "i", "/tmp", [])
+        ai_planner.plan("g", "i", str(tmp_path), [])
 
 
 def test_planner_immediate_provider_error_is_classified(tmp_path, monkeypatch):
@@ -184,7 +198,7 @@ def test_planner_immediate_provider_error_is_classified(tmp_path, monkeypatch):
     ))
     _reload(monkeypatch, cli)
     with pytest.raises(ai_planner.PlannerError, match="claude cli error"):
-        ai_planner.plan("g", "i", "/tmp", [])
+        ai_planner.plan("g", "i", str(tmp_path), [])
 
 
 def test_planner_account_limit_error_is_classified(tmp_path, monkeypatch):
@@ -192,7 +206,7 @@ def test_planner_account_limit_error_is_classified(tmp_path, monkeypatch):
     cli = _fake_cli(tmp_path, f"print('{envelope}')\n")
     _reload(monkeypatch, cli)
     with pytest.raises(ai_planner.PlannerError, match="provider_limit_exceeded"):
-        ai_planner.plan("g", "i", "/tmp", [])
+        ai_planner.plan("g", "i", str(tmp_path), [])
 
 
 def test_planner_interactive_looking_stderr_is_classified(tmp_path, monkeypatch):
@@ -203,7 +217,7 @@ def test_planner_interactive_looking_stderr_is_classified(tmp_path, monkeypatch)
     ))
     _reload(monkeypatch, cli)
     with pytest.raises(ai_planner.PlannerError, match="provider_interactive_prompt_detected"):
-        ai_planner.plan("g", "i", "/tmp", [])
+        ai_planner.plan("g", "i", str(tmp_path), [])
 
 
 def test_planner_oversized_output_is_bounded_not_hung(tmp_path, monkeypatch):
@@ -215,7 +229,7 @@ def test_planner_oversized_output_is_bounded_not_hung(tmp_path, monkeypatch):
     import time as _t
     start = _t.monotonic()
     with pytest.raises(ai_planner.PlannerError):
-        ai_planner.plan("g", "i", "/tmp", [])
+        ai_planner.plan("g", "i", str(tmp_path), [])
     assert _t.monotonic() - start < 10
 
 

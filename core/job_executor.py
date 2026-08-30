@@ -9,12 +9,21 @@ import hashlib
 import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
 
 from core import ai_planner, git_write, job_kinds, job_store, job_validation
+from core import job_workspace
+from core import model_router
+from core import policy_engine
 from core.backup_engine import BackupEngine
 from core.file_engine import FileEngine
+
+# Owner OS Operating Constitution enforcement. ON by default: a runtime job is exactly
+# the path that must not depend on an agent having read the rules. Set to 0 only to
+# diagnose the policy layer itself — the audit records which mode a decision ran in.
+POLICY_ENFORCE = os.getenv("OWNER_OS_POLICY_ENFORCE", "1") not in ("0", "false", "no", "")
 
 AUTONOMY_ORDER = ["observe", "suggest", "prepare", "execute_safe", "execute_full", "deploy"]
 _MAX_REPAIRS = int(os.getenv("RUNTIME_MAX_REPAIRS", "1"))
@@ -29,6 +38,150 @@ _READ_ONLY_RE = re.compile(
 # comfortably under job_store._HEARTBEAT_STALE_SECS (20s) so a live job never
 # looks orphaned to recover_interrupted(), even during a long silent test run.
 _HEARTBEAT_INTERVAL_SECS = int(os.getenv("RUNTIME_HEARTBEAT_INTERVAL_SECS", "5"))
+# Isolated per-job worktrees (core.job_workspace). ON by default: checking out a
+# work branch inside the live project tree is the defect that failed
+# OWNER-151/180/182/192/193/200 on owner dirty files. Read at call time so the
+# toggle works without a reload.
+def _isolated_workspaces() -> bool:
+    return os.getenv("RUNTIME_ISOLATED_WORKSPACES", "1") not in ("0", "", "false", "no")
+
+
+# ── task-209 model router wiring ─────────────────────────────────────────────
+# Dispatches every planner call (initial plan + each bounded repair attempt)
+# through core.model_router instead of the single static RUNTIME_CLAUDE_MODEL.
+# ON by default; read at call time like the other env toggles in this file.
+# The router itself never blocks a job: any failure here falls back to
+# ai_planner's own default (RUNTIME_CLAUDE_MODEL / provider default).
+def _router_enabled() -> bool:
+    return os.getenv("RUNTIME_MODEL_ROUTER", "1") not in ("0", "", "false", "no")
+
+
+# job kind -> model_router task_class. Kinds not listed here fall through to
+# the raw kind string (route() then applies its own unknown-class default:
+# sonnet, non-strict — fail toward cheap, never toward expensive).
+_KIND_TASK_CLASS = {
+    job_kinds.CODE_CHANGE: "routine_implementation",
+    job_kinds.OPERATIONAL: "routine_implementation",
+    job_kinds.CONTENT_PRODUCTION: "docs",
+    job_kinds.DEPLOYMENT: "release_design",
+    job_kinds.DATA_HANDOFF: "context_pack",
+    job_kinds.CONTEXT_RESTORE: "context_pack",
+}
+
+
+def _task_class_for_kind(kind: str | None) -> str:
+    return _KIND_TASK_CLASS.get(kind, "")
+
+
+_MONEY_RE = re.compile(r"(payment|billing|invoice|refund|wallet|payout|money)", re.I)
+_SECURITY_RE = re.compile(r"(secret|credential|password|token|api[_ -]?key|security|auth)", re.I)
+
+
+def _risk_for_job(job: dict) -> str:
+    """money wins over security if both fire; job.risk_level high/critical always
+    floors to "high" regardless of goal/instructions text."""
+    if (job.get("risk_level") or "") in ("high", "critical"):
+        return "high"
+    text = f"{job.get('goal') or ''} {job.get('instructions') or ''}".lower()
+    if _MONEY_RE.search(text):
+        return "money"
+    if _SECURITY_RE.search(text):
+        return "security"
+    return "normal"
+
+
+def _lineage_attempts(job: dict) -> list:
+    """Prior FAILED runtime jobs for the same task_id, created before this job,
+    as model_router prior_attempts. Bound to the 5 most recent. Never raises —
+    lineage inspection must never break dispatch."""
+    try:
+        task_id = job.get("task_id")
+        if not task_id:
+            return []
+        this_id = job.get("id")
+        created_at = job.get("created_at") or ""
+        out = []
+        # list_jobs() is ordered created_at DESC, so the first matches found are
+        # already the most recent — no separate sort needed.
+        for j in job_store.list_jobs(limit=200):
+            if j.get("id") == this_id or j.get("task_id") != task_id:
+                continue
+            if j.get("status") != "failed":
+                continue
+            if created_at and (j.get("created_at") or "") >= created_at:
+                continue
+            model_name = None
+            for art in reversed(j.get("artifacts") or []):
+                if isinstance(art, dict) and isinstance(art.get("model_selection"), dict):
+                    model_name = art["model_selection"].get("model")
+                    break
+            if not model_name:
+                continue
+            out.append({"model": model_name, "outcome": "failure"})
+            if len(out) >= 5:
+                break
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _route_model(job: dict, kind: str | None, *, extra_attempts=(), stage: str = "plan"):
+    """Decide + record a model for one planner call. Returns
+    (model_id_or_None, decision_id_or_None, model_name_or_None). Disabled router
+    or ANY failure here returns (None, None, None) — the caller then passes
+    model=None into ai_planner.plan(), which falls back to its own configured
+    default. Router availability must never fail or block a job.
+
+    `job["escalation_reason"]`, if set, is the ONLY way an opus/fable-eligible
+    class actually dispatches at that tier (task 213 hard gate in
+    core.model_router) — ordinary/automated dispatch never sets it, so
+    routine/load/perf/docs/repo-inspection/concrete-fix jobs always land on
+    sonnet even if their task_class or risk floor would otherwise reach for
+    a pricier model.
+
+    `job["requested_model"]` (task 220) is the owner/caller naming a tier for
+    THIS job. Both fields are columns on the jobs table, so they survive the
+    round-trip through the store: before task 220 they were in-memory only,
+    which is why an explicitly-requested opus job still dispatched on sonnet
+    once the executor re-read the job (owner_task #220 / runtime job #81)."""
+    if not _router_enabled():
+        return (None, None, None)
+    job_id = job.get("id")
+    try:
+        task_class = _task_class_for_kind(kind) or (kind or "unknown")
+        risk = _risk_for_job(job)
+        attempts = list(_lineage_attempts(job)) + list(extra_attempts)
+        escalation_reason = job.get("escalation_reason")
+        decision = model_router.route(
+            task_class, risk=risk, prior_attempts=attempts,
+            context_pack=f"planner-prompt:{stage} (goal+instructions+file-listing<=80 lines)",
+            task_ref=f"runtimejob:{job_id}:{stage}",
+            escalation_reason=escalation_reason if isinstance(escalation_reason, dict) else None,
+            explicit_model=(job.get("requested_model") or None))
+        cur = job_store.get_job(job_id) or job
+        job_store.update_job(job_id, artifacts=(cur.get("artifacts") or []) + [{
+            "model_selection": {
+                "stage": stage, "decision_id": decision["decision_id"],
+                "model": decision["model"], "model_id": decision["model_id"],
+                "reason": decision["reason"], "task_class": task_class, "risk": risk,
+                "requested_model": decision.get("requested_model"),
+                "explicit_model": decision.get("explicit_model"),
+                "explicit_granted": decision.get("explicit_granted"),
+                "escalation_valid": decision.get("escalation_valid"),
+            },
+        }])
+        job_store.append_log(job_id, "info",
+                             f"model routing ({stage}): {task_class}/{risk} -> "
+                             f"{decision['model']} [decision {decision['decision_id']}] "
+                             f"{decision['reason'][:120]}")
+        return (decision["model_id"], decision["decision_id"], decision["model"])
+    except Exception:  # noqa: BLE001 — routing must never fail or block a job
+        try:
+            job_store.append_log(job_id, "warn",
+                                 "model routing unavailable — planner uses configured default")
+        except Exception:  # noqa: BLE001
+            pass
+        return (None, None, None)
 
 
 def _idx(level: str) -> int:
@@ -58,13 +211,51 @@ def _hash(path: str) -> str:
         return "absent"
 
 
+def _kill_step_group(proc: subprocess.Popen) -> None:
+    """Reap the step's whole process group. `proc` was started with
+    start_new_session=True, so it is the group leader and pgid == proc.pid by
+    construction — never look it up via os.getpgid(), which raises once proc has
+    been reaped and would silently skip cleanup. Same discipline as
+    ai_planner._kill_process_group."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def _run_step(project_path: str, step: str) -> tuple[bool, str]:
     parts = shlex.split(step)
     if not parts:
         return True, ""
-    p = subprocess.run(parts, cwd=project_path, capture_output=True, text=True,
-                       timeout=_TEST_TIMEOUT, shell=False)
-    return p.returncode == 0, (p.stdout + p.stderr)
+    # start_new_session makes the step its own process-group leader so a timeout
+    # can reap everything it spawned. subprocess.run(timeout=) kills ONLY the
+    # direct child: a `pytest` killed at RUNTIME_TEST_TIMEOUT left every process
+    # its tests had spawned running on the server indefinitely. That is not
+    # hypothetical here — this repo's own suite spawns long-lived CLI stubs, and
+    # 7 recorded jobs (tasks 162/182/193/220/221) hit that cap on the full suite.
+    proc = subprocess.Popen(parts, cwd=project_path, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, shell=False,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=_TEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _kill_step_group(proc)
+        # Drain whatever the step wrote before it died, then re-raise unchanged:
+        # _run_tests records str(e), and the existing
+        # "Command '[...]' timed out after N seconds" text is what operators and
+        # the stored `tests` blobs already carry.
+        try:
+            proc.communicate(timeout=10)
+        except Exception:  # noqa: BLE001 — draining must never mask the timeout
+            pass
+        raise
+    return proc.returncode == 0, (out + err)
 
 
 def _run_tests(project_path: str, commands: list[str]) -> dict:
@@ -177,6 +368,42 @@ def _write_report(job: dict) -> None:
         pass
 
 
+def _job_action(job: dict) -> str:
+    """The action text the policy classifies: what the job says it will do."""
+    return f"{job.get('goal') or ''} {job.get('instructions') or ''}".strip()
+
+
+def _rollback_evidence(job: dict) -> dict:
+    """The rollback reference this job actually recorded, or nothing.
+
+    Reads the job's own artifacts rather than assuming a backup happened: an unrecorded
+    backup is, for policy purposes, not a backup (R1.7).
+    """
+    for art in reversed(job.get("artifacts") or []):
+        if isinstance(art, dict) and art.get("rollback"):
+            return art["rollback"]
+    return {}
+
+
+def _completion_evidence(job: dict) -> dict:
+    """Structured evidence assembled from what the pipeline actually recorded."""
+    git_info = job.get("git_info") or {}
+    tests = job.get("tests") or {}
+    ev = {
+        "rollback": _rollback_evidence(job),
+        "baseline": {"head": git_info.get("commit") or git_info.get("base") or "",
+                     "branch": git_info.get("branch") or "",
+                     "clean_tree": True},
+        "changed_files": job.get("changed_files") if job.get("changed_files") is not None else [],
+        "summary": (job.get("goal") or "")[:200],
+    }
+    if tests or job.get("validation"):
+        ev["tests"] = {"ok": bool(tests.get("ok", (job.get("validation") or {}).get("ok")))}
+    if job.get("artifacts"):
+        ev["artifacts"] = job["artifacts"]
+    return ev
+
+
 def _finish(job_id: str, status: str, **extra):
     # Every terminal state carries an explicit outcome: a job that ends without
     # one is exactly the ambiguity this model removes. Failure paths default to
@@ -188,6 +415,32 @@ def _finish(job_id: str, status: str, **extra):
     # fallback PLAN as a completed implementation; this is the one chokepoint
     # every terminal transition goes through, so that cannot recur.
     status = job_kinds.terminal_status_for(extra.get("outcome"), status)
+    # Constitution completion gate (R4): a `completed` claim must be backed by the
+    # structured evidence its risk class demands. Without it the job is recorded as
+    # UNVERIFIED — honest about what is known — instead of green. Non-success terminal
+    # states are not gated: a failure needs no evidence to be believed.
+    if POLICY_ENFORCE and status == job_kinds.STATUS_COMPLETED:
+        cur = job_store.get_job(job_id) or {}
+        merged = {**cur, **{k: v for k, v in extra.items() if k in
+                            ("changed_files", "tests", "validation", "git_info", "artifacts")}}
+        try:
+            gate = policy_engine.completion_gate(
+                action=_job_action(merged), evidence=_completion_evidence(merged),
+                actor="runtime_job", project=merged.get("project_path") or "",
+                task_id=job_id, claimed_status="completed")
+        except policy_engine.PolicyError as e:      # unreadable policy ⇒ stop, never pass
+            gate = {"allowed": False, "status": "blocked", "reason": f"policy unavailable: {e}",
+                    "missing_evidence": [], "violated_rules": ["R8.1-fail-closed"]}
+        if not gate["allowed"]:
+            status = "blocked"
+            extra["error"] = (f"completion gate: {gate['reason']}"[:400]
+                              if gate.get("reason") else "completion gate refused DONE")
+            try:
+                job_store.append_log(job_id, "warn",
+                                     f"completion gate refused `completed` — missing "
+                                     f"{gate.get('missing_evidence')}; recorded as {status}")
+            except Exception:  # noqa: BLE001 — logging must never undo the gate's decision
+                pass
     job = job_store.update_job(job_id, status=status, finished_at=job_store._now(), **extra)
     if job:
         _write_report(job)
@@ -254,9 +507,10 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         job_store.append_log(job_id, "info", f"planning… still running ({int(elapsed)}s elapsed)")
 
     fallback_used = False
+    m_id, m_dec, m_name = _route_model(job, kind)
     try:
         plan = ai_planner.plan(job["goal"] or "", job["instructions"] or "", pp, job.get("allowed_paths") or [],
-                               heartbeat_cb=_heartbeat, kind=kind)
+                               heartbeat_cb=_heartbeat, kind=kind, model=m_id)
     except ai_planner.PlannerError as e:
         reason = str(e)
         # No provider at all -> genuinely cannot proceed; stay blocked (a
@@ -277,6 +531,16 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
             "duration_ms": getattr(e, "duration_ms", None),
             "timed_out": bool(getattr(e, "timed_out", False)),
         }
+        if m_dec:
+            try:
+                _tok = diag.get("tokens")
+                model_router.record_outcome(
+                    m_dec, outcome="failure",
+                    tokens_in=(_tok.get("input_tokens") or 0) if isinstance(_tok, dict) else 0,
+                    tokens_out=(_tok.get("output_tokens") or 0) if isinstance(_tok, dict) else 0,
+                    note=reason[:200])
+            except Exception:  # noqa: BLE001 — routing outcome recording must never block a job
+                pass
         job_store.append_log(job_id, "warn",
                              f"planner failed ({reason[:120]}) — building deterministic fallback plan")
         try:
@@ -289,16 +553,42 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
             return
         fallback_used = True
         # Mark in job metadata that fallback planning was used + preserve accounting.
-        job_store.update_job(job_id, artifacts=(job.get("artifacts") or []) + [{
+        # Re-fetch: the in-memory `job` predates the plan stage, and appending from
+        # it silently drops artifacts recorded since (the model_selection artifact
+        # was lost exactly this way on job b34772f4, 2026-08-15).
+        _cur = job_store.get_job(job_id) or job
+        job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
             "fallback_planning": True, "reason": reason[:200],
             "timed_out": diag["timed_out"], "tokens": diag["tokens"],
             "cost_usd": diag["cost_usd"], "duration_ms": diag["duration_ms"],
         }])
         job_store.append_log(job_id, "info",
                              "fallback plan generated — continuing to execution (no planner retry)")
+    else:
+        if m_dec:
+            try:
+                model_router.record_outcome(m_dec, outcome="success", note="plan produced")
+            except Exception:  # noqa: BLE001 — routing outcome recording must never block a job
+                pass
     job_store.update_job(job_id, plan=plan, risk_level=plan.get("risk_level", job["risk_level"]))
     if fallback_used:
         job_store.append_log(job_id, "info", f"FALLBACK PLAN in use ({len(plan['files'])} safe file op)")
+    if plan.get("salvaged_after_timeout"):
+        # The provider blew its deadline but had ALREADY written a complete,
+        # valid plan, so the plan was used instead of being discarded into a
+        # fallback. Recorded explicitly: without it this is indistinguishable
+        # from an ordinary slow plan, and the only way to answer "did salvage
+        # fire?" was inferring it from heartbeat timing.
+        job_store.append_log(job_id, "warn",
+                             "planner exceeded its deadline but had already delivered a "
+                             "complete plan — SALVAGED, no fallback used")
+        _cur = job_store.get_job(job_id) or job
+        job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
+            "planner_salvaged_after_timeout": True,
+            "tokens": plan.get("planner_tokens"),
+            "cost_usd": plan.get("planner_cost_usd"),
+            "duration_ms": plan.get("planner_duration_ms"),
+        }])
     job_store.append_log(job_id, "info", f"plan: {plan.get('summary','')[:120]} ({len(plan['files'])} file ops)")
 
     # observe/suggest -> plan only, stop here. A plan is not an implementation,
@@ -333,10 +623,54 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         _finish(job_id, "failed", error=f"backup failed: {str(e)[:400]}")
         return
 
+    # 2b) CONSTITUTION PREFLIGHT (R1/R2/R3/R7) — evaluated with the rollback path in
+    # hand and BEFORE the first edit, so a prohibited, owner-gated, out-of-scope or
+    # duplicated job stops without having touched the workspace.
+    rollback_ref = {"kind": "file_backup", "ref": str(backup_meta.get("id") or ""),
+                    "verified": bool(backup_meta.get("id"))}
+    # Append to the artifacts as they stand NOW, not to the snapshot taken when the
+    # pipeline started: earlier stages (e.g. fallback planning) record artifacts too, and
+    # writing back a stale list would silently drop them.
+    _cur = job_store.get_job(job_id) or job
+    job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) +
+                         [{"backup_id": backup_meta.get("id"), "rollback": rollback_ref}])
+    if POLICY_ENFORCE:
+        try:
+            gate = policy_engine.preflight(
+                action=_job_action(job), actor="runtime_job", project=pp, task_id=job_id,
+                scope=(job.get("allowed_paths") or None),
+                evidence={"rollback": rollback_ref},
+                owner_approved=not job.get("approval_required"))
+        except policy_engine.PolicyError as e:      # unreadable policy ⇒ stop, never proceed
+            _finish(job_id, "blocked", error=f"policy unavailable: {str(e)[:300]}")
+            return
+        if not gate["allowed"]:
+            job_store.append_log(job_id, "warn",
+                                 f"policy {gate['decision']} ({gate['risk_class']}): "
+                                 f"{gate['reason']}")
+            _finish(job_id, "blocked",
+                    error=f"policy {gate['decision']}: {gate['reason']}"[:400])
+            return
+        job_store.append_log(job_id, "info",
+                             f"policy preflight ALLOW (risk {gate['risk_class']}, "
+                             f"rollback {rollback_ref['kind']}:{rollback_ref['ref']})")
+
     # Paths this job brought into existence, tracked so a rollback can undo them.
     created_paths: list[str] = []
+    # Set by the branch stage when the job runs in an isolated worktree. Kept in a
+    # dict so _rollback (defined before the branch stage runs) sees the final value.
+    ws: dict = {"workspace": None}
 
     def _rollback(reason: str):
+        # An isolated job never modified the primary tree, so there is nothing to
+        # restore there — restoring the pre-job snapshot over the live tree would
+        # actually DESTROY owner edits made while the job ran. Discarding the
+        # worktree is the whole rollback.
+        if ws["workspace"]:
+            job_store.append_log(job_id, "warn",
+                                 f"rolled back ({reason}) — isolated worktree discarded, "
+                                 f"primary tree untouched")
+            return
         try:
             backup.rollback(backup_meta["id"])
             job_store.append_log(job_id, "warn", f"rolled back ({reason})")
@@ -354,24 +688,62 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
                                  f"workspace hygiene: removed {len(removed)} file(s) created by this "
                                  f"job so they cannot poison later jobs: {removed}")
 
-    # 3) BRANCH
+    # 3) BRANCH — in an ISOLATED worktree, never a checkout inside the live tree.
+    # The direct `checkout -b` in the shared working tree is what failed
+    # OWNER-151/180/182/192/193/200 with "Your local changes ... would be
+    # overwritten by checkout" whenever the owner had dirty files; the worktree
+    # path leaves the primary tree — dirty files included — byte-for-byte alone.
     branch = None
+    work_pp = pp
     if git_write.is_repo(pp):
         job_store.update_job(job_id, status="branching")
         try:
             git_write.fetch(pp)
             base = git_write.resolve_base_branch(pp, job["base_branch"])
             job_store.append_log(job_id, "info", f"base branch resolved: {base}")
-            branch = git_write.create_work_branch(pp, job.get("task_id"), job["goal"] or "", base)
-            job_store.append_log(job_id, "info", f"work branch: {branch}")
+            if _isolated_workspaces():
+                created = job_workspace.create(pp, job_id, job.get("task_id"),
+                                               job["goal"] or "", base)
+                ws["workspace"] = created
+                branch = created["branch"]
+                work_pp = created["path"]
+                job_store.append_log(job_id, "info",
+                                     f"work branch: {branch} (isolated worktree {work_pp})")
+            else:
+                branch = git_write.create_work_branch(pp, job.get("task_id"), job["goal"] or "", base)
+                job_store.append_log(job_id, "info", f"work branch: {branch}")
         except git_write.GitWriteError as e:
             _finish(job_id, "failed", error=f"branch failed: {e}")
             return
 
+    # Stages 4-8 operate on `work_pp`: the isolated worktree when one exists,
+    # otherwise the project tree itself (non-repo projects, or isolation off).
+    # The worktree is removed on EVERY exit path — its branch and commits
+    # survive; only the scratch directory goes.
+    try:
+        _run_work_stages(job_id, job, pp, work_pp, plan, kind, branch, tests_ctx={
+            "fallback_used": fallback_used, "rollback": _rollback,
+            "created_paths": created_paths, "heartbeat": _heartbeat, "plan_model_name": m_name})
+    finally:
+        if ws["workspace"]:
+            removed = job_workspace.remove(pp, ws["workspace"]["path"])
+            job_store.append_log(job_id, "info",
+                                 f"isolated worktree removed: {removed} "
+                                 f"({ws['workspace']['path']})")
+
+
+def _run_work_stages(job_id: str, job: dict, pp: str, work_pp: str, plan: dict,
+                     kind: str, branch, tests_ctx: dict) -> None:
+    fallback_used = tests_ctx["fallback_used"]
+    _rollback = tests_ctx["rollback"]
+    created_paths = tests_ctx["created_paths"]
+    _heartbeat = tests_ctx["heartbeat"]
+    plan_model_name = tests_ctx.get("plan_model_name")
+
     # 4) EDIT
     job_store.update_job(job_id, status="editing")
     try:
-        changed = _apply_files(pp, plan["files"])
+        changed = _apply_files(work_pp, plan["files"])
         created_paths.extend(changed)
         job_store.update_job(job_id, changed_files=changed)
         job_store.append_log(job_id, "info", f"applied {len(changed)} file operation(s)")
@@ -389,7 +761,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     job_store.update_job(job_id, status="testing")
 
     if not job_kinds.requires_repo_tests(kind):
-        validation = job_validation.validate(kind, pp, plan, changed, run_commands=_run_tests)
+        validation = job_validation.validate(kind, work_pp, plan, changed, run_commands=_run_tests)
         job_store.update_job(job_id, validation=validation, tests={
             "ok": validation["ok"], "results": [], "skipped_repo_suite": True,
             "reason": f"kind={kind} is validated by {validation['validation_kind']}",
@@ -410,7 +782,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         job_store.append_log(job_id, "info", f"task validation passed ({validation['validation_kind']})")
         tests = {"ok": True, "results": [], "skipped_repo_suite": True}
     else:
-        tests = _run_tests(pp, plan.get("test_commands") or [])
+        tests = _run_tests(work_pp, plan.get("test_commands") or [])
         attempt = 0
         # When a fallback plan is in use the provider planner is known-broken —
         # re-invoking it for a repair attempt would just fail/time out again, so skip
@@ -418,12 +790,21 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         while not tests["ok"] and attempt < _MAX_REPAIRS and not fallback_used:
             attempt += 1
             job_store.append_log(job_id, "warn", f"tests failed — repair attempt {attempt}")
+            # Real escalation ladder: a sonnet plan whose tests fail escalates the
+            # repair attempt toward opus (model_router's escalation ladder), via
+            # the prior plan-stage outcome fed in as an extra prior_attempt.
+            r_id, r_dec, _r_name = _route_model(
+                job, kind,
+                extra_attempts=([{"model": plan_model_name, "outcome": "failure"}]
+                                if plan_model_name else []),
+                stage=f"repair{attempt}")
             try:
                 fails = "\n".join(r["output"][-500:] for r in tests["results"] if not r["passed"])
                 repair = ai_planner.plan(job["goal"] or "", (job["instructions"] or "") +
                                          f"\n\nThe previous attempt FAILED tests:\n{fails}\nFix it.",
-                                         pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat)
-                repair_changed = _apply_files(pp, repair["files"])
+                                         work_pp, job.get("allowed_paths") or [], heartbeat_cb=_heartbeat,
+                                         model=r_id)
+                repair_changed = _apply_files(work_pp, repair["files"])
                 created_paths.extend(repair_changed)
                 by_path = {c["path"]: c for c in changed}
                 by_path.update({c["path"]: c for c in repair_changed})
@@ -433,7 +814,13 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
             except Exception as e:  # noqa: BLE001
                 job_store.append_log(job_id, "error", f"repair failed: {e}")
                 break
-            tests = _run_tests(pp, plan.get("test_commands") or [])
+            tests = _run_tests(work_pp, plan.get("test_commands") or [])
+            if r_dec:
+                try:
+                    model_router.record_outcome(
+                        r_dec, outcome="success" if tests["ok"] else "failure")
+                except Exception:  # noqa: BLE001 — routing outcome recording must never block a job
+                    pass
         job_store.update_job(job_id, tests=tests, validation={
             "ok": tests["ok"], "validation_kind": job_kinds.validation_kind_for(kind),
             "repo_suite_used": True,
@@ -461,9 +848,9 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     elif branch and job.get("auto_commit", True):
         job_store.update_job(job_id, status="committing")
         try:
-            git_write.add_paths(pp, [c["path"] for c in changed if c["operation"] != "delete"] +
+            git_write.add_paths(work_pp, [c["path"] for c in changed if c["operation"] != "delete"] +
                                 [c["path"] for c in changed if c["operation"] == "delete"])
-            secrets = git_write.scan_staged_for_secrets(pp)
+            secrets = git_write.scan_staged_for_secrets(work_pp)
             if secrets:
                 _rollback("secret in staged diff")
                 _finish(job_id, "failed", error=f"aborted: {secrets}")
@@ -471,8 +858,9 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
             tcount = sum(1 for r in tests.get("results", []) if r["passed"])
             msg = (f"feat(runtime): {plan.get('summary','autonomous change')}\n\n"
                    f"Task: OWNER-{job.get('task_id')}\nRuntime job: {job_id}\nTests: {tcount} passed")
-            commit_hash = git_write.commit(pp, msg)
-            git_info.update({"commit": commit_hash, "remote": git_write.remote_url(pp)})
+            commit_hash = git_write.commit(work_pp, msg)
+            git_info.update({"commit": commit_hash, "remote": git_write.remote_url(work_pp),
+                             "isolated_workspace": work_pp != pp})
             job_store.append_log(job_id, "info", f"committed {commit_hash} on {branch}")
         except git_write.GitWriteError as e:
             _rollback("commit error")
@@ -483,7 +871,7 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
     if branch and job.get("auto_push") and _idx(job["autonomy_level"]) >= _idx("execute_safe"):
         job_store.update_job(job_id, status="pushing")
         try:
-            res = git_write.push(pp, branch)
+            res = git_write.push(work_pp, branch)
             git_info["pushed"] = True
             job_store.append_log(job_id, "info", f"pushed {branch}")
         except git_write.GitWriteError as e:

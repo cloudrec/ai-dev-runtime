@@ -9,6 +9,7 @@ pre-merge commit / merge --abort), so a bad delivery never corrupts the branch.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 
 from core import git_write as gw
@@ -17,6 +18,47 @@ _TEST_TIMEOUT = int(os.getenv("RUNTIME_TEST_TIMEOUT", "180"))
 _DEFAULT_TESTS = ["python3 -m pytest -q"]
 
 
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """Reap the step's whole process group. `proc` leads its own group by
+    construction (start_new_session=True), so pgid == proc.pid — never look it up
+    via os.getpgid(), which raises once proc is reaped and would skip cleanup."""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _run_one(project_path: str, parts: list) -> tuple:
+    """Run one delivery test step under its own process group.
+
+    subprocess.run(timeout=) kills ONLY the direct child, so a `pytest` killed at
+    RUNTIME_TEST_TIMEOUT left everything its tests had spawned running on the
+    server. This path is exposed to exactly that: _DEFAULT_TESTS is the full
+    suite, which measured 742-1171s against a 600s cap. Mirrors
+    job_executor._run_step; the timeout is re-raised unchanged so the caller's
+    recorded `str(e)` text is unaffected. Tokenization is deliberately left to the
+    caller's cmd.split() — fixing that is a separate behaviour change."""
+    proc = subprocess.Popen(parts, cwd=project_path, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, shell=False,
+                            start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=_TEST_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        try:
+            proc.communicate(timeout=10)
+        except Exception:  # noqa: BLE001 — draining must never mask the timeout
+            pass
+        raise
+    return proc.returncode == 0, (out + err)
+
 def _run_tests(project_path: str, commands: list[str]) -> dict:
     results, ok = [], True
     for cmd in (commands or _DEFAULT_TESTS)[:5]:
@@ -24,10 +66,8 @@ def _run_tests(project_path: str, commands: list[str]) -> dict:
         if not parts:
             continue
         try:
-            p = subprocess.run(parts, cwd=project_path, capture_output=True, text=True,
-                               timeout=_TEST_TIMEOUT, shell=False)
-            passed = p.returncode == 0
-            results.append({"cmd": cmd, "passed": passed, "output": (p.stdout + p.stderr)[-1500:]})
+            passed, out = _run_one(project_path, parts)
+            results.append({"cmd": cmd, "passed": passed, "output": out[-1500:]})
             ok = ok and passed
         except Exception as e:  # noqa: BLE001
             results.append({"cmd": cmd, "passed": False, "output": str(e)[:400]})

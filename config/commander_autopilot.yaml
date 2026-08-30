@@ -1,0 +1,66 @@
+# Commander Autopilot — persistent registry of critical projects.
+#
+# The autopilot EVALUATES every registered agent each tick (state + unfinished tasks +
+# background subagents + last proven progress) and, when an agent is idle/waiting with
+# documented pre-approved SAFE unfinished work, delivers the exact next step to the EXISTING
+# agent via the canonical lease-gated Actuator and confirms the transition to working.
+#
+# SAFETY: actuation is routed through core.control_plane.actuator, which is confined to
+# CONTROL_PLANE_CANARY_AGENTS. An agent NOT in that allowlist is EVALUATED ONLY (read-only);
+# enabling its live actuation is an explicit owner gate (add it to CANARY_AGENTS). The step
+# text is additionally classified autonomous_safe (deny-by-default on destructive / live /
+# payment / credential / publication / push / deploy / ssh) before any delivery.
+#
+# end_state = the acceptance/definition-of-done; next_step = the documented SAFE continuation
+# delivered when the agent is idle/waiting with unfinished work.
+
+agents:
+  owneros-direct-fix:0.0:
+    project: ai-dev-runtime
+    root: /root/ai-dev-runtime
+    end_state: "Owner OS Commander autopilot green; observability + acceptance reports complete."
+    next_step: "continue with the next safe internal observability/report task; run tests; commit locally."
+    live_actuation: false          # owner gate — evaluate only until added to CANARY_AGENTS
+
+  cp-canary:0.0:
+    project: cp-canary-v2
+    root: /root/cp-canary-v2
+    end_state: "Disposable canary green; each safe dated log note recorded, no external effect."
+    next_step: "continue with the next safe canary note; append a dated line to the log; do nothing external."
+    live_actuation: true           # the authorized disposable canary (in CANARY_AGENTS)
+
+  payment:0.0:
+    project: payment-orchestrator
+    root: /opt/payment-orchestrator
+    end_state: "Server connection-mapping recovered (correct user/IdentityFile/alias); DR + Git reports corrected."
+    next_step: "continue the read-only connection-mapping recovery and record progress in the report; run read-only checks only."
+    live_actuation: false          # owner gate + payment execution must not be touched
+
+  arbitrage2-opus:0.0:
+    project: arbitrage2
+    root: /opt/arbitrage2
+    end_state: "June stable-period audit + clean-restart plan complete; no live trading."
+    # Owner-approved 2026-08-04 (re-approved after a brief canary-only interval), NARROW:
+    # resume the EXISTING session only, isolated paper-only work. The delivered text is a
+    # read-only audit continuation — the autopilot never instructs trading, orders, venues
+    # or key use. Any paper analysis is the agent's own approved plan, not an autopilot
+    # order. No real trading, ever.
+    next_step: "continue the next safe read-only audit step and update the audit report"
+    # OWNER PAUSE 2026-08-05: "Do not work on Arbitrage2 while its owner pause is active."
+    # Was true (owner-approved read-only resume). A pause on the project extends to the
+    # autopilot acting on it. Third of three independent gates now closed: this flag,
+    # `enabled: false` in config/project_queues.yaml, and removal from
+    # CONTROL_PLANE_CANARY_AGENTS. Restore only on an explicit owner instruction.
+    live_actuation: false
+
+  mess-qa-automation:0.0:
+    project: mess-qa-automation
+    root: /opt/mess-qa-automation
+    end_state: "QA automation suite green; reports produced; no destructive or external side effects."
+    # Owner-approved 2026-08-04 (re-approved after a brief canary-only interval), NARROW:
+    # resume the EXISTING session only, confined to the already-approved 0.1.91 staged
+    # work. The delivered text names NO build, sign, publish, release or restart action —
+    # live MESS publication and restart stay prohibited, so the autopilot never instructs
+    # them. What the agent does inside its own approved staged plan is its decision.
+    next_step: "continue the next safe internal qa audit step; run the tests; commit locally"
+    live_actuation: true           # owner-approved live resume (staged internal work)

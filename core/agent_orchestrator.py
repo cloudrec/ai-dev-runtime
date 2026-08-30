@@ -902,6 +902,22 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         except Exception:  # noqa: BLE001
             pass
 
+        # Actionable waiting transition: the SAME edge as above, but published as a durable
+        # CTO event so the wake bridge is consulted. The commander mirror above reaches the
+        # legacy notifier only; a live agent that stopped and is waiting for a response had
+        # no CTO event at all, so wake selection could not see the stall (2026-08-13 03:58).
+        # Deduped by target + progress fingerprint inside the module: steady waiting is
+        # announced once, and waiting again after new progress is a new event.
+        try:
+            from core.control_plane import waiting_transitions as _wt
+            _wt.observe(target=key, prev_state=prev.get("state"), cur_state=state,
+                        project=rec["project"] or session,
+                        conversation_id=str(rec.get("conversation_id") or ""),
+                        progress=agent.get("_tail") or "",
+                        evidence=agent.get("_tail") or "")
+        except Exception:  # noqa: BLE001 — observation must never break the sweep
+            pass
+
         # Source-side retraction: an agent ACTIVE/COMPLETED again → retract its still-
         # unacked stale condition events so the notifier never delivers a contradicted
         # alert (the notifier's pre-delivery revalidation stays as a second barrier).
@@ -1154,6 +1170,11 @@ def status() -> dict:
         direct_agents, duplicates, direct_meta = direct_agents_snapshot()
     except Exception:  # noqa: BLE001
         direct_agents = []
+    try:
+        from core import agent_continuation_watchdog as _cw
+        cw_health = _cw.health()
+    except Exception:  # noqa: BLE001
+        cw_health = {"enabled": None}
     return {"states": ORCH_STATES, "budget_locked": budget_locked(),
             "records": recs, "commander_events": events,
             "unacked_events": [e for e in events if not e["acknowledged"]],
@@ -1163,6 +1184,7 @@ def status() -> dict:
             "direct_agents": direct_agents,
             "direct_agent_duplicates": duplicates,
             "direct_agents_meta": direct_meta,
+            "continuation_watchdog": cw_health,
             "checked_at": _now_iso()}
 
 
@@ -1179,10 +1201,29 @@ async def run_loop() -> None:
     log.info(f"agent orchestrator started (interval {interval}s)")
     while True:
         try:
+            from core import wake_bridge as _wb
+            _wb.register_worker("agent_orchestrator")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"orchestrator worker registration error: {e}")
+        try:
             res = await asyncio.to_thread(refresh_and_resolve, True)
             if res.get("resolved") or res.get("escalations"):
                 log.info(f"orchestrator: resolved={len(res.get('resolved', []))} "
                          f"escalations={len(res.get('escalations', []))}")
         except Exception as e:  # noqa: BLE001
             log.warning(f"orchestrator tick error: {e}")
+        # Direct-agent lifecycle: reliable completion / interruption events for
+        # tmux agents OUTSIDE the plan (the inline path structurally cannot cover
+        # baseline completion or dead panes). Additive + best-effort — a failure
+        # here never breaks the orchestrator sweep.
+        try:
+            from core import direct_agent_lifecycle as _dal
+            if _dal.ENABLED:
+                inv = await asyncio.to_thread(ac.agent_list)
+                dres = await asyncio.to_thread(_dal.sweep, inv)
+                if dres.get("events"):
+                    log.info(f"direct lifecycle: emitted={len(dres['events'])} "
+                             f"{[e['event_type'] for e in dres['events']]}")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"direct lifecycle sweep error: {e}")
         await asyncio.sleep(interval)

@@ -294,11 +294,34 @@ def find_claude_in_pane(pane_pid: Optional[int]) -> Optional[dict]:
 
 
 # ── idempotency + audit ─────────────────────────────────────────────────────
+def _migrate_delivery_attribution(conn: sqlite3.Connection) -> None:
+    """Create the attribution sidecar. Idempotent; safe to call on every open.
+
+    Deliberately a SIDECAR TABLE rather than two columns on `deliveries`. An older
+    build writes that table with a POSITIONAL `INSERT ... VALUES (?,?,?,?,?,?)`, so
+    adding columns would make every delivery fail with "table deliveries has 8 columns
+    but 6 values were supplied" — for the currently running service (which is one
+    version behind by owner decision) and for any rollback to it. A separate table is
+    compatible in BOTH directions: old code ignores it, new code fills it, and no
+    delivery can ever fail because of attribution.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS delivery_attribution (
+        idempotency_key TEXT PRIMARY KEY, actor TEXT, source TEXT,
+        recorded_at TEXT, recorded_ts REAL)""")
+
+
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(_db_path(), timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS deliveries (
         idempotency_key TEXT PRIMARY KEY, target TEXT, action TEXT,
         result TEXT, created_at TEXT, created_ts REAL)""")
+    # 2026-08-04 attribution migration (backward compatible): `deliveries` recorded WHAT
+    # was delivered but never WHO sent it, so answering "who wrote this row?" meant
+    # correlating the API access log, the docker network and the caller's source by hand
+    # (see reports/ACTUATOR_BLIND_PANE_AND_DELIVERY_ATTRIBUTION_2026-08-04.md). Added as
+    # nullable columns — pre-existing rows keep reading fine with actor/source NULL, and
+    # an older build writing to a migrated DB still works (named-column INSERT below).
+    _migrate_delivery_attribution(conn)
     # Supervisor decisions per (target, prompt hash) — persisted so the same
     # prompt is never re-processed or re-alerted after a service restart.
     conn.execute("""CREATE TABLE IF NOT EXISTS supervisor_prompts (
@@ -489,13 +512,136 @@ _MODE_PLAN_RE = re.compile(r"\bplan mode on\b", re.I)
 NONSTALL_MODES = ("auto", "accept_edits")
 
 
-def pending_input_text(target: str, tail: str | None = None) -> str:
+def last_submitted_text(cwd: str) -> str:
+    """The most recent message actually SUBMITTED in this project's Claude conversation.
+
+    Read from the conversation transcript, which records every submitted user message. This
+    is the only reliable way to tell Claude Code's dim RECALL GHOST from dim STAGED INPUT:
+    the ghost is, by definition, the last submitted command; staged input is not.
+    Returns '' when no transcript can be read — the caller then stays conservative.
+    """
+    import glob
+    import json as _json
+    try:
+        proj = "/root/.claude/projects/" + cwd.replace("/", "-")
+        files = sorted(glob.glob(proj + "/*.jsonl"), key=os.path.getmtime)
+        if not files:
+            return ""
+        last = ""
+        with open(files[-1], "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                try:
+                    d = _json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if d.get("type") != "user":
+                    continue
+                m = d.get("message") or {}
+                c = m.get("content")
+                t = c if isinstance(c, str) else " ".join(
+                    x.get("text", "") for x in (c or []) if isinstance(x, dict))
+                if (t or "").strip():
+                    last = t.strip()
+        return last
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# How fresh a transcript write has to be to count as "still working right now".
+# Generous: the companion polls on a ~20s cadence and a capture/tmux round-trip
+# costs real time, so this only has to beat that gap, not be split-second exact.
+RECENTLY_ACTIVE_SECS = int(os.getenv("AGENT_CONVERSATION_RECENT_SECS", "10"))
+
+
+def conversation_recently_active(cwd: str, within_secs: int = RECENTLY_ACTIVE_SECS) -> bool:
+    """Was this project's Claude transcript written to within the last
+    `within_secs`? A file Claude Code appends to continuously while it is
+    thinking/streaming — independent of what any single pane-text capture
+    happened to show at the same instant. gaika-server 2026-08-28 (event
+    10801): the pane's active-run text ("Wibbling… (thinking)") did not match
+    any known spinner pattern, so a composer/pending heuristic classified a
+    genuinely-thinking agent as waiting_input. This is the general backstop:
+    real recent activity, proven independently of pane-text regexes, must
+    always win over a pending-input guess — never the other way around."""
+    import glob
+    try:
+        proj = "/root/.claude/projects/" + cwd.replace("/", "-")
+        files = glob.glob(proj + "/*.jsonl")
+        if not files:
+            return False
+        newest_mtime = max(os.path.getmtime(f) for f in files)
+        return (time.time() - newest_mtime) < within_secs
+    except Exception:  # noqa: BLE001 — unreadable transcript must never block classification
+        return False
+
+
+def _is_recall_ghost(dim_text: str, cwd: str) -> bool:
+    """Is this dim line the recall ghost of what was last submitted?
+
+    LIVE, both directions, 2026-08-05:
+      * cp-canary showed a dim line that survived C-u and reappeared — a true ghost.
+      * mess-qa-automation sat idle ~40 min holding a dim `continue with slice 2` that was
+        REAL staged input; treating dim as always-ghost made it invisible and the owner had
+        to submit it by hand at 20:42:24Z.
+    So `dim` alone decides nothing. The ghost equals the last submitted message; staged input
+    does not. With no transcript to compare against we return True (unchanged, conservative
+    behaviour) and the caller raises the text as a stall rather than acting blind.
+    """
+    d = (dim_text or "").strip()
+    if not d:
+        return True
+    last = (last_submitted_text(cwd) or "").strip()
+    if not last:
+        return True                      # cannot verify → do not auto-submit
+    first_line = last.splitlines()[0].strip() if last else ""
+    return d == last or d == first_line or last.startswith(d) or d.startswith(first_line)
+
+
+DIM_PREFIX = "\x00dim\x00"
+
+
+def prompt_text_from_styled(after: str) -> str:
+    """Extract REAL staged input from the styled (`capture-pane -e`) text after the
+    last `❯`. Claude Code renders the RECALL GHOST of the last submitted command in
+    DIM (SGR 2) — visually identical to typed text in a plain capture. LIVE
+    2026-08-03 cp-canary: the ghost `continue with the next safe canary note` read
+    as pending input, deferring every poke and blocking rotation indefinitely.
+    Dim ghost → '' ; numbered menu selection (`❯ 1. Yes`) → ''."""
+    content = _SGR_RE.sub("", after).replace("\xa0", " ").strip()
+    if re.match(r"^\d+\.", content):       # menu option, not the input line
+        return ""
+    if "\x1b[2m" in after:
+        # Dim: ghost OR real staged input. Only the caller knows the cwd needed to check
+        # against the last submitted message, so report it separately rather than guessing.
+        return DIM_PREFIX + content
+    return content
+
+
+def pending_input_text(target: str, tail: str | None = None, cwd: str = "") -> str:
     """Text typed into the agent's input line but NOT yet submitted (e.g. an
     owner/ChatGPT-queued instruction). CRITICAL for /clear safety: agent_send
     pastes then hits Enter WITHOUT clearing the line, so sending `/clear` while
     this is non-empty would concatenate and SUBMIT the queued text — possibly an
     external/financial/production action. A context rotation must refuse when this
-    is non-empty. A numbered menu selection (`❯ 1. Yes`) is not input-line text."""
+    is non-empty. A numbered menu selection (`❯ 1. Yes`) is not input-line text.
+
+    Prefers a STYLED capture (`-e`) so the dim recall ghost of the last submitted
+    command is never mistaken for staged input; falls back to the plain `tail`
+    heuristic (ghost-blind, conservative) only when the styled capture fails."""
+    rc, out, _ = _tmux(["capture-pane", "-e", "-p", "-t", target, "-S", "-10"])
+    if rc == 0:
+        prompt_lines = [ln for ln in out.splitlines() if "❯" in ln]
+        if not prompt_lines:
+            return ""
+        raw = prompt_text_from_styled(prompt_lines[-1].split("❯", 1)[1])
+        if raw.startswith(DIM_PREFIX):
+            dim = raw[len(DIM_PREFIX):]
+            # A dim line is the recall ghost ONLY if it matches the last submitted message.
+            # Without a cwd we cannot check, so we keep the old conservative answer.
+            if not cwd or _is_recall_ghost(dim, cwd):
+                return ""
+            return dim
+        return raw
     text = tail if tail is not None else _pane_tail(target, 10)
     for line in reversed((text or "").splitlines()):
         m = re.search(r"❯\s?(.*)$", line.rstrip())
@@ -577,7 +723,10 @@ def _seen_delivery(key: str) -> Optional[dict]:
     """Return a prior delivery for this key, or None. Expired rows are dropped."""
     conn = _db()
     try:
-        conn.execute("DELETE FROM deliveries WHERE created_ts < ?", (time.time() - _IDEMPOTENCY_TTL_SECS,))
+        cutoff = time.time() - _IDEMPOTENCY_TTL_SECS
+        conn.execute("DELETE FROM deliveries WHERE created_ts < ?", (cutoff,))
+        # keep the attribution sidecar on the same retention as the rows it describes
+        conn.execute("DELETE FROM delivery_attribution WHERE recorded_ts < ?", (cutoff,))
         conn.commit()
         row = conn.execute("SELECT result FROM deliveries WHERE idempotency_key=?", (key,)).fetchone()
         return json.loads(row[0]) if row else None
@@ -585,12 +734,95 @@ def _seen_delivery(key: str) -> Optional[dict]:
         conn.close()
 
 
-def _record_delivery(key: str, target: str, action: str, result: dict) -> None:
+def _record_delivery(key: str, target: str, action: str, result: dict,
+                     actor: Optional[str] = None, source: Optional[str] = None) -> None:
+    """Record the delivery WITH its caller. `actor` = who asked (authenticated principal
+    / declared caller), `source` = where from (client address, transport). Both are
+    observability only — no safety gate reads them, and both may be None for an internal
+    caller that has no external principal."""
     conn = _db()
     try:
-        conn.execute("INSERT OR REPLACE INTO deliveries VALUES (?,?,?,?,?,?)",
-                     (key, target, action, json.dumps(result), _now(), time.time()))
+        now, ts = _now(), time.time()
+        # Named columns, not positional — so a future column cannot break the write.
+        conn.execute(
+            "INSERT OR REPLACE INTO deliveries "
+            "(idempotency_key, target, action, result, created_at, created_ts) "
+            "VALUES (?,?,?,?,?,?)",
+            (key, target, action, json.dumps(result), now, ts))
+        # Attribution goes to the sidecar and must NEVER be able to fail a delivery.
+        if actor or source:
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO delivery_attribution "
+                    "(idempotency_key, actor, source, recorded_at, recorded_ts) "
+                    "VALUES (?,?,?,?,?)",
+                    (key, (actor or None), (source or None), now, ts))
+            except Exception as e:  # noqa: BLE001  # pragma: no cover - see _record_attribution
+                # Never propagate: an unattributed delivery is acceptable, a failed
+                # delivery is not.
+                try:
+                    audit("delivery_attribution_failed", target, key, error=str(e)[:200])
+                except Exception:  # noqa: BLE001
+                    pass
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _record_attribution(key: str, actor: Optional[str], source: Optional[str]) -> None:
+    """Insert an attribution row for a delivery that was NOT written by
+    `_record_delivery` (the duplicate-replay path). Never overwrites."""
+    conn = _db()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO delivery_attribution "
+            "(idempotency_key, actor, source, recorded_at, recorded_ts) VALUES (?,?,?,?,?)",
+            (key, (actor or None), (source or None), _now(), time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _note_duplicate_attribution(key: str, target: str, actor: Optional[str],
+                                source: Optional[str]) -> None:
+    """Attribute a DUPLICATE (suppressed) delivery. First writer wins: the original
+    attribution is never overwritten, because the original is the caller who actually
+    reached the pane. A replay by a DIFFERENT caller is audited as a conflict so the
+    key-reuse is visible instead of silent."""
+    if not (actor or source):
+        return
+    try:
+        prior = delivery_attribution(key)
+        if prior is None:
+            _record_attribution(key, actor, source)
+            return
+        if (prior.get("actor"), prior.get("source")) != (actor or None, source or None):
+            audit("delivery_duplicate_other_actor", target, key,
+                  original_actor=prior.get("actor"), original_source=prior.get("source"),
+                  replay_actor=actor, replay_source=source)
+    except Exception as e:  # noqa: BLE001
+        try:
+            audit("delivery_attribution_failed", target, key, error=str(e)[:200])
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def delivery_attribution(key: str) -> Optional[dict]:
+    """Who sent the delivery with this idempotency key, if it was recorded.
+
+    Observability only — `actor` is partly self-declared by the caller (the auth method
+    prefix is not), so this answers "who says they sent it, over which authenticated
+    transport, from where", not "who is authorised".
+    """
+    conn = _db()
+    try:
+        row = conn.execute(
+            "SELECT idempotency_key, actor, source, recorded_at FROM delivery_attribution "
+            "WHERE idempotency_key=?", (key,)).fetchone()
+        if not row:
+            return None
+        return {"idempotency_key": row[0], "actor": row[1], "source": row[2],
+                "recorded_at": row[3]}
     finally:
         conn.close()
 
@@ -636,7 +868,65 @@ AGENT_STATES = ("working", "shell_running", "waiting_input", "idle", "waiting_ow
 #   * a streaming token counter with an arrow: "↓ 2.4k tokens" / "↑ …".
 # Past-tense spinners ("Worked for", "Brewed for 11m 24s") are NOT active.
 _STATE_ACTIVE_RUN_RE = re.compile(
-    r"(esc to interrupt|…\s*\(\d+\s*m?s\b|[↑↓]\s*[\d.]+\s*k?\s*tokens\b)", re.I)
+    r"(esc to interrupt"
+    # a live spinner timer with the mid-dot separator: "(8s ·" / "(11m 24s ·" — this
+    # form appears ONLY while a turn/tool is running (Pouncing…/Noodling…/Beboppin…/
+    # Hyperspacing…/Osmosing…/Shimmying… all render it), so a whimsical gerund is caught
+    # even when the word itself is unknown.
+    r"|\(\d+\s*m?s(\s+\d+s)?\s*·"
+    r"|·\s*thinking\b"
+    r"|…\s*\(\d+\s*m?s\b"
+    # gaika-server 2026-08-28 (event 10801): a whimsical-gerund spinner ("Wibbling…
+    # (thinking)") with no digit/duration in the parenthesis at all — the existing
+    # "…​ (Ns" form requires a number and missed it, so an actively-thinking turn
+    # fell through every active-run signal into idle, and pending_input then
+    # misread the composer as waiting_input while the agent was genuinely working.
+    r"|\(thinking\)"
+    # Claude Code footer shows "· N shell ·" while a BACKGROUND shell command runs
+    # (e.g. a live monitor launched via the Bash tool). The pane foreground stays
+    # `claude`, so the pane-command heuristic misses it — this footer marker means the
+    # agent is actively running a shell and must NOT be read as idle.
+    r"|·\s*\d+\s+shells?\b"
+    # A RUNNING background subagent (Fable/Task tool) is real work in progress. The live
+    # mess-qa-automation pane (2026-08-03) showed "✻ Waiting for 1 background agent to
+    # finish" yet classified idle — and was then listed as a poke candidate mid-audit.
+    # gaika-server 2026-08-28 (event 11050): a narrower terminal wrapped the SAME phrase
+    # as "Waiting for 2 background\n  agents to finish" — the literal single spaces below
+    # required an exact one-line render, so the wrap silently broke the match and a
+    # parent genuinely waiting on two live child forks was woken as owner-input-blocked.
+    # \s+ tolerates a wrap at any word boundary in the phrase, not just this one.
+    r"|waiting\s+for\s+\d+\s+background\s+agents?\b"
+    # Context compaction is live work — poking or /clear-ing during it corrupts state.
+    r"|\bcompacting\b"
+    # Live minute-form spinner "(19m 23s ·" — the second-form "(8s ·" pattern above missed
+    # it, so a long turn was only caught when a token counter shared the captured tail.
+    r"|\(\d+m\s+\d+s\s*·"
+    r"|[↑↓]\s*[\d.]+\s*k?\s*tokens\b)", re.I)
+# A monitoring-only session: the agent itself is at rest at the composer, but the
+# harness is running live background monitors for it. Claude Code renders these in the
+# FOOTER mode line as a counter: "⏵⏵ auto mode on · 2 monitors · ← 3 agents". That is
+# live state — the counter drops when a monitor is stopped or dies — so it is real work
+# in progress, exactly like the "· N shells ·" marker `_STATE_ACTIVE_RUN_RE` already
+# knows. Without it a session whose whole job IS to watch reads as `idle`, and `idle` is
+# a poke/continuation candidate (commander_autopilot.POKE_STATES,
+# agent_continuation_watchdog at_rest), so Owner OS saw a healthy watcher as stalled.
+#
+# NOT the prose form. A finished turn prints "✻ Sautéed for 1m 11s · done · 2 monitors
+# still running", which is FROZEN scrollback: it keeps claiming monitors after they have
+# stopped, and that is the stale evidence requirement this must not fall for. Two guards
+# separate the footer from the prose: the count and the word must share a line (the prose
+# form wraps, and wrap position is terminal-width dependent), and a following "still" is
+# rejected outright. A zero count is not a match — "0 monitors" is not work.
+#
+# Deliberately conservative: the leading "·" is required, so an unobserved footer variant
+# fails CLOSED (reads at-rest) rather than falsely reporting an idle agent as busy.
+_STATE_BACKGROUND_MONITOR_RE = re.compile(
+    r"·[ \t]*[1-9]\d*[ \t]+monitors?\b(?![ \t]+still)", re.I)
+# How much of the tail counts as "the current footer". The mode line is the LAST line of
+# the pane, so this only has to span the composer box below the last spinner line; keeping
+# it short is what stops a stale prose line higher up from being read as live.
+_MONITOR_FOOTER_TAIL = 400
+
 # Blocked on something outside the agent's control (vendor key, credentials, quota).
 # NARROW on purpose: generic words like "waiting for", "timed out", "network error",
 # "reconnect", "502/503" appear constantly in benign SHELL/tool output and must NOT
@@ -653,8 +943,165 @@ _STATE_WAIT_OWNER_RE = re.compile(
     r"which (option|approach)|choose an option|awaiting your (approval|decision|confirmation))", re.I)
 
 
+# ── system/tool-permission & confirmation dialog detection (RU + EN) ─────────
+# The watcher must NEVER auto-answer a dialog: any Enter/paste on a pane showing
+# one ANSWERS it. 2026-08-03 disclosure: dialog recognition was ENGLISH-ONLY
+# (_STATE_WAIT_OWNER_RE), so «Продолжить? (да/нет)» read as `idle` and the
+# continuation watchdog would press Enter straight onto it. Detection here is
+# FAIL-CLOSED and must survive ANSI styling, box-drawing frames and glyph noise.
+# Full ANSI escapes (SGR + cursor/OSC), not just colour codes.
+_ANSI_ANY_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07\x1b]*(\x07|\x1b\\)")
+# Box-drawing / block glyphs Claude Code (and TUIs generally) frame dialogs with.
+_BOX_NOISE_RE = re.compile(r"[│┃┆┇┊┋║╎╏┌┐└┘├┤╭╮╰╯─━═╔╗╚╝▏▕▌▐░▒▓]")
+_DIALOG_RE = re.compile(
+    # — English: tool-permission / proceed / trust / destructive-confirm dialogs —
+    r"(do you want to (proceed|continue|allow|run|make|create|apply|overwrite|delete)"
+    r"|would you like to (proceed|continue|allow)"
+    r"|do you trust the (files|contents)"
+    r"|trust (this|the) (folder|workspace|directory|files)"
+    r"|yes, and don.?t ask again"
+    r"|\b1[.)]\s*yes\b.{0,160}?\b2[.)]"            # numbered option list: 1. Yes … 2. …
+    r"|❯\s*\d{1,2}[.)]\s"                          # menu cursor on a numbered option
+    r"|\((y/n|yes/no|да/нет|д/н)\)|\[(y/n|yes/no|да/нет|д/н)\]"
+    r"|are you sure"
+    r"|press enter to (continue|confirm|proceed)"
+    r"|type\s+\S{1,40}\s+to confirm"
+    # credential / secret prompts — auto-answering one can leak or wedge a login
+    r"|(enter|input)\s+(your\s+)?(password|passphrase|token|api.?key|secret|otp|2fa)"
+    r"|password:|passphrase"
+    # deploy / publish confirmations
+    r"|confirm (the )?(deployment|deploy|publish|publication|release|push)\b"
+    r"|deploy to production\?"
+    # — Russian equivalents —
+    r"|разрешить\?"                                # "Allow?"
+    r"|продолжить\?|продолжаем\?"                  # "Continue?"
+    r"|подтвердит(е|ь)|подтверждени"               # confirm / confirmation
+    r"|вы уверены|точно (удалить|продолжить|выполнить|стереть)"
+    r"|\b1[.)]\s*да\b"                             # numbered «1. Да»
+    r"|введите (пароль|токен|ключ|секрет|код)"
+    r"|пароль:|нажмите (enter|ввод)"
+    r"|доверяете)", re.I)
+
+
+def _dialog_scan_text(text: str) -> str:
+    """Normalise pane text for dialog matching: strip ANSI escapes, box-drawing
+    frames and NBSP, collapse whitespace — so a styled/framed dialog matches the
+    same as plain text (numbered options may span frame lines)."""
+    t = _ANSI_ANY_RE.sub("", text or "").replace("\xa0", " ")
+    t = _BOX_NOISE_RE.sub(" ", t)
+    return re.sub(r"\s+", " ", t)
+
+
+# ── M1 (2026-08-04 targeted review): SHAPE-INDEPENDENT dialog detection ──────
+# `_DIALOG_RE` above is a denylist of KNOWN phrasings, so an unseen wording evades it —
+# the review's live probe `"Allow this tool to run?\n> approve / deny"` was NOT detected
+# and would have been auto-answered. A prompt awaiting a human answer has STRUCTURE
+# regardless of wording: a short question at the end of the pane, and/or a small set of
+# mutually exclusive choices offered right after it. Match that structure in any
+# language. Over-refusal here only delays a poke; under-refusal answers a dialog.
+_CHOICE_WORD = (r"(?:y|n|yes|no|allow|deny|permit|reject|approve|accept|decline|confirm|"
+                r"cancel|abort|skip|proceed|continue|retry|trust|always|never|ok|quit|exit|"
+                r"да|нет|разреш\w*|запрет\w*|подтверд\w*|отмен\w*|принять|отклонить|"
+                r"продолжить|пропустить|всегда|никогда|выйти)")
+# "approve / deny", "разрешить / запретить", "(y/n)" — a slash-separated choice pair.
+_SLASH_CHOICE_RE = re.compile(rf"\b{_CHOICE_WORD}\s*/\s*{_CHOICE_WORD}\b", re.I)
+# A line offering one option: bullet, arrow, menu cursor or "1." / "2)".
+_OPTION_LINE_RE = re.compile(r"^\s*(?:[❯>»▸▶\*•\-–—]|\(?\d{1,2}[.)])\s*\S")
+_QUESTION_END_RE = re.compile(r"[?？]\s*$")
+# Permission/authorisation intent — enough on its own when options are on offer.
+_PERMISSION_WORD_RE = re.compile(
+    r"\b(allow|permit|grant|authori[sz]e|approve|deny|trust|permission|confirm|"
+    r"разреш\w*|запрет\w*|довер\w*|подтверд\w*|полномочи\w*)\b", re.I)
+
+_STRUCT_SCAN_LINES = 12      # how far back from the pane tip a dialog may start
+_MAX_QUESTION_LEN = 200      # prose paragraphs ending in "?" are not prompts
+_MAX_OPTION_LEN = 80         # an option line is short by nature
+
+
+def _dialog_scan_lines(text: str) -> list:
+    """Per-line normalisation (ANSI, box frames, NBSP stripped) that PRESERVES line
+    structure — `_dialog_scan_text` collapses it, which structural matching needs."""
+    out = []
+    for raw in (text or "").splitlines():
+        line = _ANSI_ANY_RE.sub("", raw).replace("\xa0", " ")
+        line = _BOX_NOISE_RE.sub(" ", line).strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _structural_dialog(pane_tail: str) -> Optional[str]:
+    """A wording-independent 'this pane is asking a human something' signature."""
+    lines = _dialog_scan_lines((pane_tail or "")[-1500:])[-_STRUCT_SCAN_LINES:]
+    if not lines:
+        return None
+
+    def _options_after(idx: int) -> list:
+        opts = []
+        for line in lines[idx:idx + 5]:
+            if len(line) <= _MAX_OPTION_LEN and _OPTION_LINE_RE.match(line):
+                opts.append(line)
+        return opts
+
+    for i, line in enumerate(lines):
+        # 1) a short question, with choices offered on it or just below it
+        if _QUESTION_END_RE.search(line) and len(line) <= _MAX_QUESTION_LEN:
+            if _SLASH_CHOICE_RE.search(line):
+                return f"question+choices:{line[:60]}"
+            window = lines[i + 1:i + 5]
+            if any(_SLASH_CHOICE_RE.search(w) for w in window):
+                return f"question+choices:{line[:60]}"
+            opts = _options_after(i + 1)
+            if len(opts) >= 2:
+                return f"question+options:{line[:60]}"
+            if opts and _PERMISSION_WORD_RE.search(opts[0]):
+                return f"question+permission_option:{line[:60]}"
+            if _PERMISSION_WORD_RE.search(line):
+                return f"permission_question:{line[:60]}"
+        # 2) no question mark, but an explicit permission choice is on offer
+        if _SLASH_CHOICE_RE.search(line) and _PERMISSION_WORD_RE.search(line):
+            return f"permission_choices:{line[:60]}"
+    return None
+
+
+def dialog_signature(pane_tail: str) -> Optional[str]:
+    """The matched dialog marker when the end of the pane looks like a system/
+    tool-permission or confirmation dialog (RU or EN), else None. Consumers must
+    treat ANY non-None return as 'a human answer is required' — never auto-send
+    text or Enter to such a pane. Two independent detectors: the known-phrasing
+    denylist, then the shape-independent structural one (M1)."""
+    m = _DIALOG_RE.search(_dialog_scan_text((pane_tail or "")[-1500:]))
+    if m:
+        return m.group(0)[:80].strip() or "dialog"
+    return _structural_dialog(pane_tail)
+
+
+def looks_like_dialog(pane_tail: str) -> bool:
+    return dialog_signature(pane_tail) is not None
+
+
+# Spinner glyphs Claude Code uses for the LIVE status line. The live status block is
+# always rendered at the BOTTOM of the pane (last spinner line → input box), so an
+# active-execution marker in an OLDER spinner line is stale scrollback, not live work.
+# The 2026-08-03 cp-canary pane sat 40+ minutes false-"working" on a stale
+# "✻ … · 1 shell still running" line whose shell had already completed two blocks later.
+_SPINNER_GLYPHS = ("✻", "✶", "✽", "✳", "✢", "✷", "✵", "✺")
+
+
+def live_status_region(tail: str) -> str:
+    """The pane text from the LAST spinner-glyph line to the end — the only region where
+    active-execution markers are live. Conservative fallback: no spinner line → the whole
+    tail (absence of a spinner must never hide real evidence like 'esc to interrupt')."""
+    lines = (tail or "").splitlines()
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].lstrip()[:1] in _SPINNER_GLYPHS:
+            return "\n".join(lines[i:])
+    return tail or ""
+
+
 def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str | None = None,
-                   *, pending_input: str = "", shell_running: bool = False) -> str:
+                   *, pending_input: str = "", shell_running: bool = False,
+                   recently_active: bool = False) -> str:
     """Observable state of an agent pane.
 
     `working` requires concrete active-execution evidence — a live spinner timer,
@@ -664,15 +1111,31 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
     means a command was typed/pasted but NOT submitted → `waiting_input`, so such
     an agent is never lost as plain idle. `prev_tail` is accepted for signature
     compatibility but does not influence `working`. New signals default off so the
-    behaviour is unchanged for callers that do not pass them."""
+    behaviour is unchanged for callers that do not pass them.
+
+    `recently_active` (event 10857, gaika-server 2026-08-28): independent proof —
+    this project's Claude transcript file was written to within the last few
+    seconds — that the agent is genuinely still working, regardless of whether the
+    pane's CURRENT spinner text happens to match any known active-run pattern.
+    `_STATE_ACTIVE_RUN_RE` cannot enumerate every whimsical-gerund rendering
+    Claude Code ever ships ("Wibbling… (thinking)" fixed one shape at event
+    10801's `\\(thinking\\)`; "Razzle-dazzling…" — no parenthesis, no duration, no
+    "thinking" at all — proved the next one always exists). Checked AFTER a real
+    permission dialog (`waiting_owner` is a genuine, structural, higher-priority
+    signal a live transcript write does not override) but BEFORE every other
+    at-rest reading — a composer/pending-input guess, a stale external-block
+    phrase from scrollback, or the default `idle` fallthrough must never win over
+    proof this fresh."""
     if not alive:
         return "dead"
     if not is_agent:
         return "stale"          # alive pane, no live Claude process
     tail = (output_tail or "")[-1500:]
 
-    # 1) concrete active-execution evidence — the only path to "working".
-    if _STATE_ACTIVE_RUN_RE.search(tail):
+    # 1) concrete active-execution evidence — the only path to "working". Markers count
+    #    only in the LIVE status region (last spinner line → end): a stale spinner line
+    #    higher in scrollback must never read as live work.
+    if _STATE_ACTIVE_RUN_RE.search(live_status_region(tail)):
         return "working"
     # 1b) a live shell command running in the pane is work in progress (shell-
     #     running), NOT idle and NOT an external block.
@@ -680,9 +1143,17 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
         return "shell_running"
     # 2) an ACTIVE permission dialog is waiting_owner even if the command it shows
     #    contains an external-looking word; the command text is not evidence of a
-    #    real external block. Checked BEFORE the external heuristic.
-    if _STATE_WAIT_OWNER_RE.search(tail):
+    #    real external block. Checked BEFORE the external heuristic. Recognition is
+    #    bilingual (RU/EN) and styling/box-frame tolerant, and since M1 (2026-08-04)
+    #    also SHAPE-INDEPENDENT via `dialog_signature` — an unrecognised-language or
+    #    unseen-wording dialog previously read as `idle` and was one Enter away from
+    #    being auto-answered.
+    if _STATE_WAIT_OWNER_RE.search(tail) or dialog_signature(tail):
         return "waiting_owner"
+    # 2b) proof-of-activity independent of pane text — see the docstring. Outranks
+    #     every remaining at-rest reading below, including pending_input.
+    if recently_active:
+        return "working"
     # 3) a typed/pasted but unsubmitted command → waiting_input (owner must submit).
     #    Recovers idle agents with a staged command that were previously lost.
     if pending_input and pending_input.strip():
@@ -692,12 +1163,31 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
     #    output higher up cannot trip it.
     if _STATE_EXTERNAL_RE.search(tail[-500:]):
         return "externally_blocked"
+    # 5) at rest at the composer, but live background monitors are running for this
+    #    session — monitoring IS the work, so this is `shell_running`, not `idle`.
+    #    Placed LAST on purpose: it can only ever upgrade what would have been `idle`.
+    #    Every stronger reading above still wins — a real dialog is still `waiting_owner`,
+    #    a staged line the owner must submit is still `waiting_input`, and a genuine
+    #    external block is still `externally_blocked`. `shell_running` is reused rather
+    #    than adding a public state: it already means "real work in progress, not idle and
+    #    not blocked", and every consumer (agent_orchestrator._ACTIVE, the continuation
+    #    watchdog's active skip, waiting_transitions.PROGRESS_STATES) already treats it so.
+    if _STATE_BACKGROUND_MONITOR_RE.search(tail[-_MONITOR_FOOTER_TAIL:]):
+        return "shell_running"
     return "idle"
 
 
-def _pane_tail(target: str, lines: int = 25) -> str:
+def pane_capture(target: str, lines: int = 25) -> tuple:
+    """(capture_ok, tail). `capture_ok` is False when tmux could not read the pane —
+    the distinction `_pane_tail` erases by returning "" for both a failed capture and
+    a genuinely blank pane. Consumers that act on a pane MUST refuse when it is False
+    (M2/actuator guard): every tail-based guard reads "" as 'the pane is clear'."""
     rc, out, _ = _tmux(["capture-pane", "-p", "-t", target, "-S", f"-{lines}"])
-    return redact(out) if rc == 0 else ""
+    return (rc == 0, redact(out) if rc == 0 else "")
+
+
+def _pane_tail(target: str, lines: int = 25) -> str:
+    return pane_capture(target, lines)[1]
 
 
 # Foreground commands that mean the pane is at rest (an interactive shell or the
@@ -714,20 +1204,39 @@ def _pane_shell_running(pane: dict) -> bool:
     return bool(cmd) and cmd not in _IDLE_FG_COMMANDS
 
 
-def _pane_pending_input(target: str) -> str:
+def _pane_pending_input(target: str, cwd: str = "") -> str:
     """Real, non-empty text typed/pasted at the `❯` prompt but NOT submitted.
-    Returns '' for an empty prompt or a dim RECALL GHOST (SGR 2), so a ghost is
-    never mistaken for a staged command."""
+
+    The docstring has always promised '' for a dim RECALL GHOST (SGR 2), but the
+    code never actually delivered that: `prompt_text_from_styled` tags dim text
+    with `DIM_PREFIX` and returns it VERBATIM, and every caller's truthiness
+    check (`if pending_input and pending_input.strip()`) treats a
+    `DIM_PREFIX`-tagged string as non-empty regardless. gaika-server 2026-08-28:
+    Claude Code's own dim recall-ghost redraw of its last completed turn (varying
+    text each tick — "check status", "check status tomorrow", "next safe roadmap
+    item…") kept reading as a genuine staged command, so `classify_state` never
+    left `waiting_input` and `waiting_transitions` re-emitted a fresh actionable
+    wake on every tick the redrawn text happened to change — a real gate never
+    existed (`pending=null` in every other consumer, e.g. stall_doctor via
+    `pending_input_text`, which already does the check below).
+
+    With a `cwd`, a dim line is resolved exactly like `pending_input_text` does:
+    the recall ghost of what was ACTUALLY last submitted (`_is_recall_ghost`)
+    reads as '' (not pending); anything dim that does not match reads as real,
+    unchanged. Without a `cwd` (a caller that cannot supply one) the behaviour
+    is UNCHANGED from before this fix — dim or not, non-empty text is returned
+    as-is — so no existing caller's safety semantics move under it."""
     rc, out, _ = _tmux(["capture-pane", "-e", "-p", "-t", target, "-S", "-6"])
     if rc != 0:
         return ""
     prompt_lines = [ln for ln in out.splitlines() if "❯" in ln]
     if not prompt_lines:
         return ""
-    after = prompt_lines[-1].split("❯", 1)[1]
-    if "\x1b[2m" in after:                 # dim ghost = recall hint, not staged input
-        return ""
-    return _SGR_RE.sub("", after).replace("\xa0", " ").strip()
+    raw = prompt_text_from_styled(prompt_lines[-1].split("❯", 1)[1])
+    if cwd and raw.startswith(DIM_PREFIX):
+        dim = raw[len(DIM_PREFIX):]
+        return "" if _is_recall_ghost(dim, cwd) else dim
+    return raw
 
 
 def agent_list() -> dict:
@@ -749,13 +1258,21 @@ def agent_list() -> dict:
         tail = _pane_tail(pane["target"]) if (is_agent and pane["alive"]) else ""
         # Extra signals only for an at-rest agent (skip when already active/working)
         # so an active agent costs no extra tmux capture.
-        shell_running, pending = False, ""
-        if is_agent and pane["alive"] and not _STATE_ACTIVE_RUN_RE.search(tail[-1500:]):
+        shell_running, pending, recently_active = False, "", False
+        if is_agent and pane["alive"] and not _STATE_ACTIVE_RUN_RE.search(
+                live_status_region(tail[-1500:])):
             shell_running = _pane_shell_running(pane)
+            cwd = (claude or {}).get("cwd", "")
+            # Independent-of-pane-text backstop (events 10801/10857): a transcript
+            # actively being written to is real work in progress no matter what the
+            # tail-text spinner regex did or didn't catch. Never let a pending-input
+            # guess, or the plain `idle` fallthrough, override proof this fresh.
             if not shell_running:
-                pending = _pane_pending_input(pane["target"])
-        state = classify_state(pane["alive"], is_agent, tail,
-                               pending_input=pending, shell_running=shell_running)
+                recently_active = conversation_recently_active(cwd)
+                if not recently_active:
+                    pending = _pane_pending_input(pane["target"], cwd=cwd)
+        state = classify_state(pane["alive"], is_agent, tail, pending_input=pending,
+                               shell_running=shell_running, recently_active=recently_active)
         # Last non-blank pane line as a short activity snippet + a redacted queued-input
         # preview (a typed/pasted-but-unsubmitted command). Both secret-redacted.
         last_line = ""
@@ -763,6 +1280,17 @@ def agent_list() -> dict:
             if _ln.strip():
                 last_line = redact(_ln.strip())[:160]
                 break
+        # OWNER TRUTH (payment): an externally_blocked caused by a recoverable key/credential/
+        # user selection issue is INTERNAL recovery, not an owner gate — downgrade the REPORTED
+        # state so the seo-backend agent_notifier (which reads this over HTTP) does not
+        # repeatedly notify the owner to install keys. Genuine vendor blocks and exhaustive
+        # absence/revocation are left intact. Pure/no side effects; scoped to recovery agents.
+        if is_agent and state == "externally_blocked":
+            try:
+                from core.control_plane import access_recovery as _ar
+                state, _ = _ar.reported_state(pane["target"], state, tail)
+            except Exception:  # noqa: BLE001 — reporting reclassification must never break inventory
+                pass
         agents.append({
             **pane,
             "command": redact(pane["command"]),
@@ -808,16 +1336,20 @@ def agent_status(target: str) -> dict:
             f"{', '.join(m['target'] for m in matches)}")
 
     agent = matches[0]
-    evidence = conversation_evidence(agent.get("claude_cwd") or agent.get("cwd") or "")
+    agent_cwd = agent.get("claude_cwd") or agent.get("cwd") or ""
+    evidence = conversation_evidence(agent_cwd)
     rc, out, _ = _tmux(["capture-pane", "-p", "-t", agent["target"], "-S", "-40"])
     recent = redact(out) if rc == 0 else ""
-    shell_running, pending = False, ""
-    if agent["alive"] and agent["is_agent"] and not _STATE_ACTIVE_RUN_RE.search(recent[-1500:]):
+    shell_running, pending, recently_active = False, "", False
+    if agent["alive"] and agent["is_agent"] and not _STATE_ACTIVE_RUN_RE.search(
+            live_status_region(recent[-1500:])):
         shell_running = _pane_shell_running(agent)
         if not shell_running:
-            pending = _pane_pending_input(agent["target"])
-    state = classify_state(agent["alive"], agent["is_agent"], recent,
-                           pending_input=pending, shell_running=shell_running)
+            recently_active = conversation_recently_active(agent_cwd)
+            if not recently_active:
+                pending = _pane_pending_input(agent["target"], cwd=agent_cwd)
+    state = classify_state(agent["alive"], agent["is_agent"], recent, pending_input=pending,
+                           shell_running=shell_running, recently_active=recently_active)
     audit("agent_status", agent["target"], found=True, alive=agent["alive"], is_agent=agent["is_agent"])
     return {
         "target": agent["target"],
@@ -934,7 +1466,69 @@ def _pane_is_live_agent(target: str) -> dict:
     return pane
 
 
-def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]) -> dict:
+# Claude Code QUEUES input that arrives mid-turn: the text is accepted, the pane
+# shows "Press up to edit queued messages", and nothing executes until the current
+# turn ends. tmux's Enter still returns 0, so a delivery path that proves itself by
+# that exit code reports submitted=true for a message the agent has not read. That is
+# how an agent stands still while every delivery looks successful — the owner's
+# report, and the same class of defect the continuation watchdog was built for on a
+# different path.
+_QUEUED_HINT_RE = re.compile(r"press\s+up\s+to\s+edit\s+queued\s+message|queued\s+message",
+                             re.IGNORECASE)
+
+
+def looks_queued(pane_text: str) -> bool:
+    """Did the pane just tell us the message is sitting in a queue?"""
+    return bool(_QUEUED_HINT_RE.search(pane_text or ""))
+
+
+# Claude Code's own "I am mid-turn" indicator: a spinner glyph, a gerund, an
+# ellipsis and an elapsed timer ("· Concocting… (2m 28s)"), usually with an
+# interrupt hint. classify_state() does not recognise this - it reported `idle`
+# for a pane actively running a test suite - so a send gated only on that
+# classification would still stack a message onto a working agent.
+# How much of the tail counts as "now". Claude's status line sits directly above
+# the composer, so a handful of lines is enough and keeps stale spinners out.
+_WORKING_WINDOW_LINES = 8
+_CLAUDE_WORKING_RE = re.compile(
+    r"(^|\n)\s*[·✢✳✻✽*✶✻]\s+\w+[…\.]{1,3}\s*\(\d+[hms]|esc\s+to\s+interrupt",
+    re.IGNORECASE)
+
+
+def claude_is_working(pane_tail: str) -> bool:
+    """Is Claude mid-turn RIGHT NOW, judged from the live status region only?
+
+    Scoped to the LAST FEW LINES because the same spinner text scrolls harmlessly
+    through history, and live_status_region() does not trim it - a match up there
+    would refuse every send to that agent forever. Proven by a test that puts a
+    finished spinner above forty lines of output.
+    """
+    tail = "\n".join((pane_tail or "").splitlines()[-_WORKING_WINDOW_LINES:])
+    return bool(_CLAUDE_WORKING_RE.search(tail))
+
+
+def _busy_for_send(target: str) -> str:
+    """Is this pane mid-turn, so a message would queue instead of executing?
+
+    Returns the blocking state, or "" when the agent can take a prompt now. An
+    unreadable pane returns "" deliberately: refusing on unknown would make the
+    control plane unusable exactly when it is needed, and the post-send queue
+    check below still catches the case honestly.
+    """
+    try:
+        tail = _pane_tail(target, lines=12)
+    except Exception:  # noqa: BLE001
+        return ""
+    if looks_queued(tail):
+        return "queued_messages_pending"
+    if claude_is_working(tail):
+        return "working"
+    state = classify_state(True, True, tail)
+    return state if state in ("working", "shell_running") else ""
+
+
+def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str],
+             actor: Optional[str] = None, source: Optional[str] = None) -> dict:
     """Deliver multiline text to a pane through a tmux buffer.
 
     A tmux buffer is used rather than `send-keys` because send-keys would
@@ -949,7 +1543,12 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
 
     prior = _seen_delivery(key)
     if prior is not None:
-        audit(action, resolved, key, duplicate=True, delivered=False)
+        # 2026-08-04 review gap: a duplicate was recorded as "not delivered" and nothing
+        # else, so a SECOND caller replaying someone else's idempotency key left no trace
+        # at all. Attribute the replay without ever overwriting the original attribution.
+        _note_duplicate_attribution(key, resolved, actor, source)
+        audit(action, resolved, key, duplicate=True, delivered=False,
+              actor=actor, source=source)
         return {**prior, "duplicate": True, "delivered": False,
                 "note": "idempotency key already used — not delivered again"}
 
@@ -970,12 +1569,21 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
     time.sleep(0.4)
     rc_after, after, _ = _tmux(["capture-pane", "-p", "-t", resolved, "-S", "-5"])
     pane_changed = (rc_before == 0 and rc_after == 0 and before != after)
+    # A wider capture than the diff window: the queue hint renders below the input
+    # line and would fall outside the 5 lines used to prove the pane changed.
+    _rc_q, wide, _ = _tmux(["capture-pane", "-p", "-t", resolved, "-S", "-30"])
+    queued = looks_queued(wide)
     result = {
         "target": resolved,
         "action": action,
         "idempotency_key": key,
-        "delivered": rc_enter == 0,
-        "submitted": rc_enter == 0,
+        # Enter returning 0 means the keystroke reached tmux, NOT that Claude read
+        # the message. If the pane says the message is queued, it is queued.
+        "delivered": rc_enter == 0 and not queued,
+        "submitted": rc_enter == 0 and not queued,
+        "queued": queued,
+        "queued_reason": ("message accepted into Claude's queue behind the active "
+                          "turn; it will not execute until that turn ends") if queued else "",
         "duplicate": False,
         "bytes": len(text.encode("utf-8")),
         "pane_changed": pane_changed,
@@ -985,22 +1593,54 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
     }
     if rc_enter != 0:
         result["error"] = enter_err.strip()[:200]
-    _record_delivery(key, resolved, action, result)
+    _record_delivery(key, resolved, action, result, actor=actor, source=source)
     audit(action, resolved, key, delivered=result["delivered"], pane_changed=pane_changed,
-          bytes=result["bytes"])
+          bytes=result["bytes"], actor=actor, source=source)
     return result
 
 
-def agent_send(target: str, text: str, idempotency_key: Optional[str] = None) -> dict:
-    """Send a message to an existing agent. Never creates one."""
+def agent_send(target: str, text: str, idempotency_key: Optional[str] = None,
+               actor: Optional[str] = None, source: Optional[str] = None,
+               allow_queue: bool = False) -> dict:
+    """Send a message to an existing agent. Never creates one.
+
+    REFUSES while the agent is mid-turn, because Claude Code does not reject a
+    message sent then - it QUEUES it. The reviewer's next task would sit behind
+    the active turn showing "Press up to edit queued messages", tmux's Enter
+    would still return 0, and the delivery would be reported as submitted while
+    the agent stood still. Sending again then stacks a second queued message, so
+    the failure compounds: the owner sees an idle-looking agent and a queue of
+    instructions nobody read.
+
+    A waiting agent therefore receives exactly ONE executable prompt. The caller
+    is told to retry rather than being given a false success; `allow_queue=True`
+    is the deliberate escape hatch for a caller that really does want to stack a
+    message behind the current turn.
+
+    `actor`/`source` are recorded for attribution only (who asked, from where)."""
     validate_target(target)
-    return _deliver(target, text, "agent_send", idempotency_key)
+    if not allow_queue:
+        busy = _busy_for_send(target)
+        if busy:
+            audit("agent_send", target, idempotency_key, delivered=False,
+                  refused=busy, actor=actor, source=source)
+            return {"target": target, "action": "agent_send", "delivered": False,
+                    "submitted": False, "queued": False, "refused": busy,
+                    "reason": f"agent is {busy}; a message sent now would be queued "
+                              f"behind the active turn instead of executed — retry "
+                              f"when it is idle or waiting"}
+    return _deliver(text=text, target=target, action="agent_send",
+                    idempotency_key=idempotency_key, actor=actor, source=source)
 
 
-def agent_answer(target: str, text: str, idempotency_key: Optional[str] = None) -> dict:
-    """Answer a prompt an existing agent is waiting on. Never creates one."""
+def agent_answer(target: str, text: str, idempotency_key: Optional[str] = None,
+                 actor: Optional[str] = None, source: Optional[str] = None) -> dict:
+    """Answer a prompt an existing agent is waiting on. Never creates one.
+
+    `actor`/`source` are recorded for attribution only (who asked, from where)."""
     validate_target(target)
-    return _deliver(target, text, "agent_answer", idempotency_key)
+    return _deliver(target, text, "agent_answer", idempotency_key,
+                    actor=actor, source=source)
 
 
 def find_live_agent_for_dir(project_dir: str) -> Optional[dict]:
@@ -1013,6 +1653,38 @@ def find_live_agent_for_dir(project_dir: str) -> Optional[dict]:
         if agent_cwd == resolved:
             return agent
     return None
+
+
+def _pid_alive(pid: str) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _session_liveness(name: str) -> dict:
+    """Count panes in a session and how many are LIVE. A pane is live only if tmux
+    does not mark it dead AND its process is still alive (belt + suspenders, so a
+    zombie/remain-on-exit pane is never mistaken for live). Used to prove a session
+    is fully dead before fenced cleanup."""
+    rc, out, _ = _tmux(["list-panes", "-t", name, "-F", "#{pane_dead}\t#{pane_pid}"])
+    if rc != 0:
+        return {"panes": 0, "dead": 0, "live": 0}
+    panes = dead = live = 0
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        is_dead = parts[0] == "1"
+        pid = parts[1] if len(parts) > 1 else ""
+        panes += 1
+        if is_dead or not _pid_alive(pid):
+            dead += 1
+        else:
+            live += 1
+    return {"panes": panes, "dead": dead, "live": live}
 
 
 def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
@@ -1042,14 +1714,28 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
     name = validate_session(session_name or f"agent-{os.path.basename(resolved)[:40]}")
     rc, _, _ = _tmux(["has-session", "-t", name])
     if rc == 0:
-        audit("agent_resume", name, resumed=False, reason="tmux session name already exists")
-        return {
-            "resumed": False,
-            "reason": f"tmux session {name!r} already exists — refusing to create a duplicate session",
-            "existing_session": name,
-            "duplicate_created": False,
-            "agent_created": False,
-        }
+        # The session NAME exists — but it may be a ZOMBIE whose panes are all dead
+        # (e.g. the Claude process was SIGTERMed). A dead session must NOT block a
+        # same-conversation recovery. Prove EVERY pane is dead, then fenced-clean it;
+        # if any pane is still live, refuse (a real duplicate risk).
+        liveness = _session_liveness(name)
+        if liveness["panes"] > 0 and liveness["live"] == 0:
+            _tmux(["kill-session", "-t", name])          # fenced: only after all-dead proof
+            audit("agent_resume", name, cleanup="dead_session",
+                  panes=liveness["panes"], dead=liveness["dead"])
+            # fall through to (re)create the session below
+        else:
+            audit("agent_resume", name, resumed=False,
+                  reason="tmux session name already exists with a LIVE pane", **liveness)
+            return {
+                "resumed": False,
+                "reason": f"tmux session {name!r} already exists with a live pane — "
+                          "refusing to create a duplicate session",
+                "existing_session": name,
+                "session_liveness": liveness,
+                "duplicate_created": False,
+                "agent_created": False,
+            }
 
     argv = ["new-session", "-d", "-s", name, "-c", resolved, "claude"]
     if conversation_id:

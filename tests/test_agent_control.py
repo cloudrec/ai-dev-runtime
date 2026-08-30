@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 
 import pytest
 
@@ -539,6 +540,255 @@ def test_pending_input_text_detects_queued_instruction():
     assert ac.pending_input_text("x:0.0", tail="Do you want to proceed?\n❯ 1. Yes\n  2. No") == ""
 
 
+# ── _pane_pending_input dim recall-ghost fix (gaika-server 2026-08-28) ────────
+# waiting_transitions/classify_state kept reading Claude Code's own dim recall-
+# ghost redraw of its last completed turn — varying text each tick ("check
+# status", "check status tomorrow", "next safe roadmap item…") — as a genuine
+# staged command, so an intentionally idle/parked agent (pending=null in every
+# other consumer) kept getting fresh false `waiting_input`/actionable wakes.
+
+def _dim_pane(content: str) -> str:
+    return f"──────\n❯ \x1b[2m{content}\x1b[0m\n──────\n  ⏵⏵ auto mode on"
+
+
+def test_dim_recall_ghost_matching_last_submitted_is_not_pending(monkeypatch):
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, _dim_pane("check status"), ""))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "check status")
+    assert ac._pane_pending_input("gaika-server:0.0", cwd="/opt/gaika-server") == ""
+
+
+def test_dim_text_not_matching_last_submitted_is_still_real_pending(monkeypatch):
+    # dim rendering alone never decides ghost-vs-staged (mess-qa-automation 2026-08-05):
+    # a dim line that does NOT match what was actually last submitted is real input.
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, _dim_pane("continue with slice 2"), ""))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "an unrelated earlier command")
+    assert ac._pane_pending_input("mess-qa-automation:0.0", cwd="/opt/mess") == "continue with slice 2"
+
+
+def test_no_cwd_keeps_old_behaviour_unchanged(monkeypatch):
+    # callers that cannot supply a cwd (e.g. context_budget's /clear-safety check) must see
+    # EXACTLY the pre-fix behaviour: a dim ghost still reads as non-empty pending text.
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, _dim_pane("check status"), ""))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "check status")
+    out = ac._pane_pending_input("gaika-server:0.0")
+    assert out and out.strip()             # still truthy — no behaviour change without cwd
+
+
+def test_plain_non_dim_pending_text_unaffected_by_cwd(monkeypatch):
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (
+        0, "──────\n❯ deploy the fix to staging\n──────\n  ⏵⏵ auto mode on", ""))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "deploy the fix to staging")
+    assert ac._pane_pending_input("x:0.0", cwd="/opt/x") == "deploy the fix to staging"
+
+
+def test_end_to_end_ghost_no_longer_classifies_as_waiting_input(monkeypatch):
+    """The exact gaika-server shape: an at-rest pane whose only 'signal' is the dim
+    recall-ghost redraw must classify idle, not waiting_input — so
+    waiting_transitions never sees an edge into waiting and never re-wakes."""
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, _dim_pane("check status tomorrow"), ""))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "check status tomorrow")
+    pending = ac._pane_pending_input("gaika-server:0.0", cwd="/opt/gaika-server")
+    idle_tail = "✻ Sautéed for 24s · done 3:43 PM\n  ⏵⏵ auto mode on"
+    assert ac.classify_state(True, True, idle_tail, pending_input=pending) == "idle"
+
+
+# ── active work must never classify as waiting_input (gaika-server, event 10801,
+# 2026-08-28): a whimsical-gerund spinner with no digit/duration in the parens
+# ("Wibbling… (thinking)") matched no known active-run pattern, and a composer/
+# pending heuristic then misread the still-thinking agent as waiting_input. ──
+
+def test_gerund_thinking_spinner_without_a_duration_is_working():
+    tail = "  Wibbling… (thinking)\n───\n❯\n───\n  ⏵⏵ auto mode on"
+    assert ac.classify_state(True, True, tail) == "working"
+
+
+def test_conversation_recently_active_true_for_a_fresh_transcript_write(monkeypatch):
+    monkeypatch.setattr("glob.glob", lambda pattern: ["/fake/gaika-server/session.jsonl"])
+    monkeypatch.setattr("os.path.getmtime", lambda f: time.time() - 2)
+    assert ac.conversation_recently_active("/opt/gaika-extension") is True
+
+
+def test_conversation_recently_active_false_for_a_stale_transcript(monkeypatch):
+    monkeypatch.setattr("glob.glob", lambda pattern: ["/fake/gaika-server/session.jsonl"])
+    monkeypatch.setattr("os.path.getmtime", lambda f: time.time() - 120)
+    assert ac.conversation_recently_active("/opt/gaika-extension") is False
+
+
+def test_conversation_recently_active_false_with_no_transcript(monkeypatch):
+    monkeypatch.setattr("glob.glob", lambda pattern: [])
+    assert ac.conversation_recently_active("/opt/never-run-here") is False
+
+
+def test_recent_transcript_activity_overrides_a_pending_input_guess(monkeypatch):
+    """The general backstop the incident actually needs: even if the pane text
+    looks exactly like a real pending line (any composer heuristic could fire),
+    proof of very-recent transcript activity must win — agent_list() must never
+    classify this pane waiting_input while it is provably still working."""
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, "PANE", ""))
+    monkeypatch.setattr(ac, "parse_panes", lambda out: [
+        {"target": "gaika-server:0.0", "session": "gaika-server", "alive": True,
+         "pid": 1, "command": "claude", "cwd": "/opt/gaika-extension"}])
+    monkeypatch.setattr(ac, "find_claude_in_pane",
+                        lambda pid: {"pid": pid, "cwd": "/opt/gaika-extension"})
+    monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k: "  Continuing the audit.")
+    monkeypatch.setattr(ac, "_pane_shell_running", lambda pane: False)
+    monkeypatch.setattr(ac, "conversation_recently_active", lambda cwd: True)
+
+    def _fail_if_called(target, cwd=""):
+        raise AssertionError("pending-input heuristic must not run while recently active")
+    monkeypatch.setattr(ac, "_pane_pending_input", _fail_if_called)
+    monkeypatch.setattr(ac, "audit", lambda *a, **k: None)
+    inv = ac.agent_list()
+    st = [x for x in inv["agents"] if x["target"] == "gaika-server:0.0"][0]["state"]
+    assert st != "waiting_input"
+    assert st == "working"
+
+
+# ── event 10857 (gaika-server, 2026-08-28): recently_active must win over the
+# plain `idle` fallthrough too, not only over a pending-input guess. Live
+# evidence: agent_status reported idle/pending=null while the pane showed an
+# active foreground stability command AND live "Razzle-dazzling…" thinking — a
+# bare gerund spinner with no duration/"(thinking)" suffix at all, so no
+# _STATE_ACTIVE_RUN_RE pattern could ever have caught it; only independent proof
+# of recent transcript activity closes this class of gap in general. ──────────
+
+def test_recently_active_wins_over_idle_fallthrough():
+    """No active-run match, no pending input, no dialog, no external-block text
+    — classify_state must still say working when recently_active is proven,
+    never fall through to idle."""
+    tail = "  ✽ Razzle-dazzling…\n  ✔ Update installed · Re…\n───\n❯ \n───\n  ⏵⏵ auto mode on"
+    assert ac.classify_state(True, True, tail, recently_active=True) == "working"
+    # sanity: without the signal, the exact same tail still falls through to idle
+    assert ac.classify_state(True, True, tail, recently_active=False) == "idle"
+
+
+def test_recently_active_does_not_override_a_real_permission_dialog():
+    """A genuine, structural dialog signal stays higher-priority than a fresh
+    transcript write — recently_active must never mask an actual owner-facing
+    prompt."""
+    tail = "Do you want to proceed?\n❯ 1. Yes\n  2. No"
+    assert ac.classify_state(True, True, tail, recently_active=True) == "waiting_owner"
+
+
+def test_gaika_server_agent_list_reports_working_not_idle_for_bare_gerund_spinner(monkeypatch):
+    """The exact event 10857 shape end-to-end: no digit/duration/thinking marker
+    in the spinner at all, empty composer, but a fresh transcript write —
+    agent_list() must classify working, not idle."""
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, "PANE", ""))
+    monkeypatch.setattr(ac, "parse_panes", lambda out: [
+        {"target": "gaika-server:0.0", "session": "gaika-server", "alive": True,
+         "pid": 1, "command": "claude", "cwd": "/opt/gaika-extension"}])
+    monkeypatch.setattr(ac, "find_claude_in_pane",
+                        lambda pid: {"pid": pid, "cwd": "/opt/gaika-extension"})
+    monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k:
+                        "  ✽ Razzle-dazzling…\n  ✔ Update installed · Re…\n───\n❯ \n───\n  ⏵⏵ auto mode on")
+    monkeypatch.setattr(ac, "_pane_shell_running", lambda pane: False)
+    monkeypatch.setattr(ac, "conversation_recently_active", lambda cwd: True)
+    monkeypatch.setattr(ac, "audit", lambda *a, **k: None)
+    inv = ac.agent_list()
+    st = [x for x in inv["agents"] if x["target"] == "gaika-server:0.0"][0]["state"]
+    assert st == "working"
+
+
+# ── event 11050 (gaika-server, 2026-08-28): a parent waiting on LIVE background
+# child forks was woken as owner-input-blocked. The active-run pattern that
+# already exists for exactly this shape ("waiting for N background agents")
+# required a literal single space, but a narrower terminal wrapped the phrase
+# across two lines ("background\n  agents") — the match silently missed. ──────
+
+def _wrapped_background_agents_tail() -> str:
+    return ("  completion notifications land.\n\n"
+            "✻ Waiting for 2 background\n  agents to finish\n"
+            "  ✔ Update installed · Re…\n───\n"
+            "❯ continue waiting, check b…\n───\n"
+            "  [CAVEMAN]\n  ⏵⏵ auto mode on      · …\n\n"
+            "  ● main\n  ◯ general-purpose 1m 53s ·\n  ◯ general-purpose 1m 40s ·")
+
+
+def test_parent_waiting_on_wrapped_background_agents_text_is_working():
+    assert ac.classify_state(True, True, _wrapped_background_agents_tail()) == "working"
+
+
+def test_parent_waiting_on_single_line_background_agent_text_is_still_working():
+    """Unchanged behaviour for the original, non-wrapped shape (mess-qa-automation,
+    2026-08-03) that the pattern already covered before this fix."""
+    tail = "✻ Waiting for 1 background agent to finish\n\n❯ \n"
+    assert ac.classify_state(True, True, tail) == "working"
+
+
+def test_gaika_server_agent_list_reports_working_for_parent_with_live_children(monkeypatch):
+    """The exact event 11050 shape end-to-end: composer holds a plausible-looking
+    'continue waiting…' line, which — without the fix — would have been read as
+    real pending input once the active-run check missed the wrapped phrase.
+    agent_list() must classify working, never waiting_input, while live child
+    forks are running."""
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, "PANE", ""))
+    monkeypatch.setattr(ac, "parse_panes", lambda out: [
+        {"target": "gaika-server:0.0", "session": "gaika-server", "alive": True,
+         "pid": 1, "command": "claude", "cwd": "/opt/gaika-extension"}])
+    monkeypatch.setattr(ac, "find_claude_in_pane",
+                        lambda pid: {"pid": pid, "cwd": "/opt/gaika-extension"})
+    monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k: _wrapped_background_agents_tail())
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("pending-input/shell heuristics must not run — "
+                             "the active-run check must already resolve this")
+    monkeypatch.setattr(ac, "_pane_shell_running", _fail_if_called)
+    monkeypatch.setattr(ac, "_pane_pending_input", _fail_if_called)
+    monkeypatch.setattr(ac, "conversation_recently_active", _fail_if_called)
+    monkeypatch.setattr(ac, "audit", lambda *a, **k: None)
+    inv = ac.agent_list()
+    st = [x for x in inv["agents"] if x["target"] == "gaika-server:0.0"][0]["state"]
+    assert st == "working"
+
+
+# ── event 11073 (gaika-server, 2026-08-28): a fresh false agent_waiting_input
+# AFTER the 11050 wrap-tolerance fix landed in this file — but the fix was
+# never a code defect for this exact evidence. ai-runtime.service, the process
+# that actually runs agent_orchestrator.run_loop() -> waiting_transitions ->
+# agent_waiting_input, was never restarted across three straight
+# agent_control.py fixes; it kept running pre-fix code from before this
+# session even started. Verified live: this evidence resolves to "working"
+# under the code that was already committed at the time of the wake — the gap
+# was a deploy skew (see test_wake_pipeline_health.py's per-worker skew
+# tests), not a missing pattern. This test locks in the exact evidence shape
+# so a future regression in either the regex or the deploy path is caught. ──
+
+def _event_11073_tail() -> str:
+    return ("  Ran 1 shell command\n"
+            "  ● Still waiting.\n\n"
+            "✻ Waiting for 2 background\n  agents to finish\n"
+            "  ✔ Update installed · Re…\n───\n"
+            "❯ continue waiting, check b…\n───\n"
+            "  [CAVEMAN]\n  ⏵⏵ auto mode on      · …\n\n"
+            "  ● main\n  ◯ general-purpose 3m 9s ·\n  ◯ general-purpose 3m 5s ·")
+
+
+def test_event_11073_active_test_run_with_live_child_is_working():
+    assert ac.classify_state(True, True, _event_11073_tail()) == "working"
+
+
+def test_event_11073_agent_list_end_to_end_is_working_not_pending(monkeypatch):
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, "PANE", ""))
+    monkeypatch.setattr(ac, "parse_panes", lambda out: [
+        {"target": "gaika-server:0.0", "session": "gaika-server", "alive": True,
+         "pid": 1, "command": "claude", "cwd": "/opt/gaika-extension"}])
+    monkeypatch.setattr(ac, "find_claude_in_pane",
+                        lambda pid: {"pid": pid, "cwd": "/opt/gaika-extension"})
+    monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k: _event_11073_tail())
+
+    def _fail_if_called(*a, **k):
+        raise AssertionError("pending-input/shell heuristics must not run — "
+                             "the active-run check must already resolve this")
+    monkeypatch.setattr(ac, "_pane_shell_running", _fail_if_called)
+    monkeypatch.setattr(ac, "_pane_pending_input", _fail_if_called)
+    monkeypatch.setattr(ac, "conversation_recently_active", _fail_if_called)
+    monkeypatch.setattr(ac, "audit", lambda *a, **k: None)
+    inv = ac.agent_list()
+    st = [x for x in inv["agents"] if x["target"] == "gaika-server:0.0"][0]["state"]
+    assert st == "working"
+
+
 def test_detect_exec_mode():
     assert ac.detect_exec_mode("⏵⏵ auto mode on (shift+tab to cycle) · ← 3 agents") == "auto"
     assert ac.detect_exec_mode("⏵⏵ accept edits on (shift+tab to cycle)") == "accept_edits"
@@ -649,3 +899,77 @@ def test_shell_running_and_waiting_input_and_no_false_external():
     # active run beats the new signals.
     assert ac.classify_state(True, True, "esc to interrupt", shell_running=True,
                              pending_input="x") == "working"
+
+
+# ── monitoring-only session must not read as a stall ────────────────────────
+# Owner OS repeatedly raised `agent_waiting_input`/idle for owner-os-opus-windows
+# while that session's whole job was running live background monitors. `idle` is a
+# poke/continuation candidate, so a healthy watcher looked stalled. The footer mode
+# line carries a live "· N monitors ·" counter, which is the same class of evidence
+# as the "· N shells ·" marker the active-run regex already knows.
+MONITOR_AT_REST = (
+    "  Repo untouched. Silent until something real.\n\n"
+    "✻ Brewed for 3m 58s · done 11:43 PM\n\n"
+    "─" * 40 + "\n"
+    "❯ \n"
+    + "─" * 40 + "\n"
+    "  [CAVEMAN]\n"
+    "  ⏵⏵ auto mode on · 2 monitors · ← 3 agents\n"
+)
+
+
+def test_active_monitors_with_idle_prompt_are_not_a_stall():
+    # (1) live monitors + an EMPTY composer is work in progress, not idle and never
+    # a false waiting_input.
+    state = ac.classify_state(True, True, MONITOR_AT_REST, pending_input="", shell_running=False)
+    assert state == "shell_running"
+    assert state != "waiting_input"
+    # singular renders as "1 monitor"
+    one = MONITOR_AT_REST.replace("2 monitors", "1 monitor")
+    assert ac.classify_state(True, True, one, pending_input="") == "shell_running"
+
+
+def test_genuine_pending_prompt_still_waiting_input_with_monitors_running():
+    # (2) monitors running does NOT mask a real staged line the owner must submit.
+    assert ac.classify_state(True, True, MONITOR_AT_REST,
+                             pending_input="keep monitoring") == "waiting_input"
+    # a real dialog still outranks the monitor signal too
+    dialog = MONITOR_AT_REST.replace("❯ \n", "❯ Do you want to proceed?\n")
+    assert ac.classify_state(True, True, dialog, pending_input="") == "waiting_owner"
+
+
+def test_no_monitors_idle_pane_stays_idle():
+    # (3) the signal must not leak into ordinary at-rest panes.
+    plain = MONITOR_AT_REST.replace(" · 2 monitors", "")
+    assert ac.classify_state(True, True, plain, pending_input="") == "idle"
+    assert ac.classify_state(True, True, IDLE_MESS, pending_input="") == "idle"
+
+
+def test_stale_or_crashed_monitor_evidence_does_not_count_as_active():
+    # (4) the FROZEN turn-summary line keeps claiming monitors after they have
+    # stopped or died. Only the live footer counter counts.
+    stale_prose = (
+        "  earlier report\n\n"
+        "✻ Sautéed for 1m 11s · done 11:46 PM · 2 monitors still running\n\n"
+        + "─" * 40 + "\n"
+        "❯ \n"
+        + "─" * 40 + "\n"
+        "  ⏵⏵ auto mode on · ← 3 agents\n"
+    )
+    assert ac.classify_state(True, True, stale_prose, pending_input="") == "idle"
+    # the wrapped form of the same prose (count and word split across lines)
+    wrapped = stale_prose.replace("· 2 monitors still running",
+                                  "· 2\n  monitors still running")
+    assert ac.classify_state(True, True, wrapped, pending_input="") == "idle"
+    # every monitor stopped: a zero counter is not work
+    assert ac.classify_state(True, True, MONITOR_AT_REST.replace("2 monitors", "0 monitors"),
+                             pending_input="") == "idle"
+    # a monitors counter buried in deep scrollback is not the current footer
+    buried = MONITOR_AT_REST + ("  filler line\n" * 60) + "❯ \n  ⏵⏵ auto mode on\n"
+    assert ac.classify_state(True, True, buried, pending_input="") == "idle"
+
+
+def test_monitor_signal_never_overrides_a_real_external_block():
+    blocked = MONITOR_AT_REST.replace("  [CAVEMAN]\n",
+                                      "  Blocked: vendor key required to continue\n")
+    assert ac.classify_state(True, True, blocked, pending_input="") == "externally_blocked"

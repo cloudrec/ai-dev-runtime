@@ -128,6 +128,98 @@ async def _start_agent_orchestrator():
         logger.warning(f"agent orchestrator not started: {e}")
 
 
+@app.on_event("startup")
+async def _start_control_plane():
+    # Control Plane V2 engine (P1 SHADOW, observe-only): continuous zero-config agent
+    # discovery + classification + durable source-of-truth + CTO inbox + fail-closed
+    # delivery health. Issues NO pane commands (actuation is a later, owner-gated phase).
+    # Gated by CONTROL_PLANE_ENABLED.
+    import asyncio
+    try:
+        from core.control_plane.engine import run_loop as _cp_loop
+        asyncio.create_task(_cp_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"control plane not started: {e}")
+
+
+@app.on_event("startup")
+async def _start_continuation_watchdog():
+    # Server-side direct-agent continuation watchdog: submits a documented SAFE next
+    # step for an approved idle agent and PROVES the submission (submitted + pane
+    # changed + prompt consumed + conversation modified + state transitioned),
+    # retrying Enter once and raising a blocker if it will not submit. Independent of
+    # any external/hourly automation. Gated by CONTINUATION_WATCHDOG_ENABLED.
+    import asyncio
+    try:
+        from core.agent_continuation_watchdog import run_loop as _cw_loop
+        asyncio.create_task(_cw_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"continuation watchdog not started: {e}")
+
+
+@app.on_event("startup")
+async def _start_wake_pipeline_watch():
+    # Says out loud when the wake pipeline stops moving: a wake decided and never
+    # delivered, or a companion process that died (its claim silence is the only
+    # signal - the last successful delivery keeps looking recent). Log-only by
+    # design: it emits no event and actuates nothing, because the wake path
+    # feeding itself is a failure this system has already had.
+    import asyncio
+    try:
+        from core.wake_bridge import pipeline_watch_loop
+        asyncio.create_task(pipeline_watch_loop(
+            log=lambda level, msg: getattr(logger, level, logger.info)(msg)))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"wake pipeline watch not started: {e}")
+
+
+@app.on_event("startup")
+async def _start_commander_autopilot():
+    # Commander autopilot: per-minute evaluation of critical projects (state + unfinished
+    # tasks + background subagents + last proven progress) and auto-delivery of the exact
+    # SAFE next step to an idle/waiting agent with unfinished pre-approved work. DORMANT by
+    # default (COMMANDER_AUTOPILOT_ENABLED off = owner gate); even enabled, actuation stays
+    # confined to CONTROL_PLANE_CANARY_AGENTS. No scope expansion without an owner decision.
+    import asyncio
+    try:
+        from core.commander_autopilot import run_loop as _ap_loop
+        asyncio.create_task(_ap_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"commander autopilot not started: {e}")
+
+
+@app.on_event("startup")
+async def _start_project_supervisor():
+    # Server-resident project supervisor: validates an agent's handoff against
+    # git, picks the next ALREADY-RECORDED roadmap block, and re-prompts the same
+    # agent — so ordinary block-to-block continuation does not wait on a ChatGPT
+    # wake, which cannot be invoked event-driven from here anyway. Wake stays the
+    # checkpoint channel (gate / failure / milestone).
+    # DORMANT unless PROJECT_SUPERVISOR_PROJECTS names a project.
+    import asyncio
+    try:
+        from core.project_supervisor import run_loop as _ps_loop
+        asyncio.create_task(_ps_loop(
+            log=lambda level, msg: getattr(logger, level, logger.info)(msg)))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"project supervisor not started: {e}")
+
+
+@app.on_event("startup")
+async def _start_context_budget():
+    # Context budget / checkpoint / rotation: tracks conversation size + phase for every
+    # registered critical agent (read-only, durable), writes an ATOMIC verified checkpoint
+    # at a safe boundary over the soft threshold, and rotates (clear + resume from the
+    # checkpoint) over the hard threshold — actuation confined to CANARY_AGENTS via the
+    # lease-gated Actuator; a non-canary agent over budget raises an owner-gated event.
+    import asyncio
+    try:
+        from core.context_budget import run_loop as _cb_loop
+        asyncio.create_task(_cb_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"context budget not started: {e}")
+
+
 # ---- движок и очередь ----
 engine = RuntimeEngine()
 

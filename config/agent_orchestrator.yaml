@@ -16,6 +16,7 @@ allowed_roots:
   - /opt
   - /root/ai-dev-runtime
   - /root/safeguard-remote-agent
+  - /root/cp-canary-v2
 
 sessions:
   seo-audit:
@@ -94,3 +95,36 @@ sessions:
     mode: hold
     hold_state: waiting_owner
     note: "Waiting for owner testing — monitor only, never advance."
+
+  arbitrage2-opus:
+    project: arbitrage2
+    root: /opt/arbitrage2
+    approved_goal: "arbitrage2 fault-matrix extension + replay harness (paper/analysis + code/tests only)"
+    mode: auto
+    # Continuation watchdog opt-in: submit the agent's already-typed SAFE next step
+    # and verify it lands; proactive_continue lets the watchdog deliver the documented
+    # safe step when the input line is empty (bounded by CONTINUATION_WATCHDOG_MAX_PER_CONV).
+    proactive_continue: true
+    safe_continuation: "Continue with the fault-matrix extension and replay harness"
+    # BOUNDED SCOPE (owner-approved 2026-08-03): analysis + code/tests strictly inside
+    # /opt/arbitrage2. Never start/stop trading services, never touch exchange
+    # credentials/secrets/.env, never place live/mainnet orders, never push/publish.
+    # advance_phases OFF and no auto_push/service_ops → those stay owner-gated. The
+    # watchdog additionally refuses any destructive/live/payment/credential/publish text.
+    advance_phases: false
+
+  cp-canary:
+    # DISPOSABLE, non-production Control Plane V2 canary (owner-approved 2026-08-03).
+    # Doc-only project at /root/cp-canary-v2 — no credentials, network, publication,
+    # payments, or destructive scope (enforced by its CLAUDE.md + the actuator policy gate).
+    project: cp-canary-v2
+    root: /root/cp-canary-v2
+    approved_goal: "Control Plane V2 disposable canary — harmless local notes only"
+    mode: auto
+    # Canary is GREEN (2 verified actuator deliveries). proactive_continue set false to
+    # quiesce the disposable agent (no perpetual token use); it stays managed + actuator-
+    # routed (legacy retired for it). Set true to resume autonomous continuation via the
+    # Actuator.
+    proactive_continue: false
+    safe_continuation: "Continue with the next safe canary note"
+    advance_phases: false

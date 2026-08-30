@@ -1,0 +1,435 @@
+"""Server-side direct-agent continuation watchdog.
+
+Reproduces the 2026-08-03 typed-but-not-submitted bug and proves the fix: verified
+submission (submitted + pane changed + prompt consumed + conversation modified +
+state transitioned), one safe Enter retry, blocker on failure, idempotency /
+duplicate prevention, owner gate for unsafe text, dead pane, false idle while
+thinking, and recovery after a service restart.
+"""
+from __future__ import annotations
+
+import pytest
+
+from core import agent_continuation_watchdog as cw
+
+
+NOW = 1_700_000_000.0
+DWELL = cw.IDLE_CONFIRM_SECS
+
+
+@pytest.fixture(autouse=True)
+def _isolated_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "t.db"))
+    monkeypatch.setattr(cw, "ENABLED", True)
+    monkeypatch.setattr(cw, "VERIFY_TIMEOUT", 1)   # keep failure-path polls short
+    yield
+
+
+# ── pure: is_safe_continuation ───────────────────────────────────────────────
+def test_safe_continuation_allows_benign_prose():
+    assert cw.is_safe_continuation("continue with the next safe step")
+    assert cw.is_safe_continuation("proceed to the next checkpoint")
+
+
+def test_safe_continuation_blocks_destructive_live_payment_credential_publish():
+    for bad in ["rm -rf /", "git push origin main", "publish the release",
+                "charge the customer via stripe", "export API_KEY=secret",
+                "systemctl restart trading", "withdraw funds to wallet",
+                "run on mainnet"]:
+        assert not cw.is_safe_continuation(bad), bad
+
+
+# ── pure: verify (the five proofs) ───────────────────────────────────────────
+def _snap(tail, pending, conv, state, activity):
+    return {"tail": tail, "pending": pending, "conv_mtime": conv, "state": state,
+            "activity": activity}
+
+
+def test_verify_ok_when_all_proofs_hold():
+    before = _snap("t0", "continue", "m0", "idle", "a0")
+    after = _snap("t1", "", "m1", "working", "a1")
+    v = cw.verify(before, after, expected_pending="continue", enter_rc=0)
+    assert v["ok"] and v["submitted"] and v["pane_changed"] and v["prompt_consumed"]
+    assert v["conversation_modified"] and v["state_transitioned"]
+
+
+def test_verify_fails_when_prompt_not_consumed_typed_but_not_submitted():
+    # the exact bug: pane changed (text pasted) but the line still holds the text
+    before = _snap("t0", "continue", "m0", "idle", "a0")
+    after = _snap("t0 [enter]", "continue", "m0", "idle", "a0")
+    v = cw.verify(before, after, expected_pending="continue", enter_rc=0)
+    assert v["prompt_consumed"] is False and v["ok"] is False
+
+
+def test_verify_fails_when_enter_keystroke_failed():
+    before = _snap("t0", "continue", "m0", "idle", "a0")
+    after = _snap("t1", "", "m1", "working", "a1")
+    assert cw.verify(before, after, expected_pending="continue", enter_rc=1)["ok"] is False
+
+
+# ── pure: decide ─────────────────────────────────────────────────────────────
+def _agent(target="proj:0.0", state="idle", alive=True, is_agent=True, tail="", pending=""):
+    return {"target": target, "session": target.split(":")[0], "alive": alive,
+            "is_agent": is_agent, "state": state, "_tail": tail, "_pending": pending,
+            "claude_cwd": "/opt/proj"}
+
+
+def _confirmed_prev():
+    return {"idle_since_ts": NOW - DWELL - 5, "last_state": "idle"}
+
+
+def _d(agent, pending, state, prev=None, eligible=True, proactive=False, conv_count=0,
+       continuation="continue with the next safe step"):
+    return cw.decide(agent=agent, cfg={}, pending=pending, state=state,
+                     prev_target=prev or _confirmed_prev(), now_ts=NOW, eligible=eligible,
+                     continuation=continuation, proactive=proactive, conv_count=conv_count)
+
+
+def test_decide_submits_safe_typed_but_unsubmitted_text():
+    d = _d(_agent(), "continue with the next safe step", "idle")
+    assert d["action"] == "submit" and d["step_text"] == "continue with the next safe step"
+
+
+def test_decide_blocks_unsafe_typed_text_owner_gate():
+    d = _d(_agent(), "git push origin main", "idle")
+    assert d["action"] == "blocker" and d["reason"] == "unsafe_pending_text"
+
+
+def test_decide_skips_when_not_allowlisted():
+    assert _d(_agent(), "continue", "idle", eligible=False)["action"] == "skip"
+
+
+def test_decide_skips_dead_pane():
+    assert _d(_agent(alive=False), "continue", "idle")["action"] == "skip"
+
+
+def test_decide_skips_while_active_or_thinking():
+    assert _d(_agent(), "", "working")["action"] == "skip"
+    assert _d(_agent(tail="… esc to interrupt"), "continue", "idle")["reason"] == "thinking"
+
+
+def test_decide_skips_waiting_owner_that_is_the_supervisors_job():
+    assert _d(_agent(state="waiting_owner"), "", "waiting_owner")["reason"] == "waiting_owner_supervisor"
+
+
+def test_decide_requires_idle_dwell_confirmation():
+    fresh = {"idle_since_ts": NOW - 1, "last_state": "idle"}   # only 1s idle
+    assert _d(_agent(), "continue", "idle", prev=fresh)["reason"] == "idle_not_confirmed"
+
+
+def test_decide_proactive_deliver_only_when_opted_in_and_capped():
+    # a READABLE clean pane: since the M2 unobservable-pane guard (2026-08-04) an
+    # all-empty capture means capture-pane failed, which is refused separately —
+    # this test is about the opt-in + cap, not about blindness.
+    clean = _agent(tail="❯ ready")
+    assert _d(clean, "", "idle", proactive=False)["action"] == "skip"
+    assert _d(clean, "", "idle", proactive=True)["action"] == "deliver"
+    assert _d(clean, "", "idle", proactive=True, conv_count=cw.MAX_CONTINUATIONS)["action"] == "skip"
+
+
+# ── blocked-step cooldown re-attempt (verified stays permanent) ──────────────
+def _iso(ts):
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
+
+
+def test_verified_step_is_never_repeated():
+    assert cw.should_skip_prior({"verified": True, "blocked": False, "attempts": 3}, NOW) is True
+
+
+def test_blocked_step_skipped_within_cooldown_reattempted_after():
+    within = {"verified": False, "blocked": True, "attempts": 2,
+              "updated_at": _iso(NOW - 10)}
+    after = {"verified": False, "blocked": True, "attempts": 2,
+             "updated_at": _iso(NOW - cw.BLOCKED_RETRY_COOLDOWN_SECS - 5)}
+    assert cw.should_skip_prior(within, NOW) is True            # cooling down
+    assert cw.should_skip_prior(after, NOW) is False            # re-attempt allowed
+
+
+def test_blocked_step_gives_up_after_attempt_cap():
+    capped = {"verified": False, "blocked": True, "attempts": cw.MAX_STEP_ATTEMPTS,
+              "updated_at": _iso(NOW - cw.BLOCKED_RETRY_COOLDOWN_SECS - 100)}
+    assert cw.should_skip_prior(capped, NOW) is True            # permanent
+
+
+# ── fake controller for deliver_and_verify / run_once ────────────────────────
+class FakeCtrl:
+    def __init__(self, agents, sessions, behavior):
+        self.agents = agents
+        self.cfg = {"sessions": sessions}
+        self.behavior = behavior            # target -> {will_submit, submit_on_enter}
+        self.emitted = []
+        self.state = {}
+        for a in agents:
+            self.state[a["target"]] = {
+                "pending": a.get("_pending", ""), "conv": "m0",
+                "state": a.get("state", "idle"), "tail": a.get("_tail", ""), "enters": 0}
+
+    def inventory(self):
+        return {"agents": self.agents}
+
+    def load_config(self):
+        return self.cfg
+
+    def snapshot(self, target, cwd):
+        s = self.state[target]
+        return {"tail": s["tail"], "pending": s["pending"], "conv_mtime": s["conv"],
+                "state": s["state"], "activity": s["tail"]}
+
+    def _try_submit(self, target):
+        s = self.state[target]
+        s["enters"] += 1
+        plan = self.behavior.get(target, {"will_submit": True, "submit_on_enter": 1})
+        if plan.get("will_submit", True) and s["enters"] >= plan.get("submit_on_enter", 1):
+            s["pending"] = ""; s["conv"] = "m1"; s["state"] = "working"
+            s["tail"] = s["tail"] + " [submitted]"
+        else:
+            s["tail"] = s["tail"] + " [enter]"      # text pasted, NOT consumed
+        return 0                                     # tmux keystroke rc always 0
+
+    def enter(self, target):
+        return self._try_submit(target)
+
+    def robust_submit(self, target, text):
+        s = self.state[target]
+        s["pending"] = text
+        s["tail"] = s["tail"] + " [rs]"
+        return self._try_submit(target) == 0
+
+    def send(self, target, text, idem):
+        s = self.state[target]
+        s["pending"] = text; s["tail"] = s["tail"] + " [pasted]"
+        rc = self._try_submit(target)
+        return {"submitted": rc == 0, "pane_changed": True}
+
+    def emit(self, target, project, et, payload, dedup_key):
+        self.emitted.append((target, et, dedup_key))
+        return True
+
+
+def _no_sleep(_):
+    pass
+
+
+# ── deliver_and_verify ───────────────────────────────────────────────────────
+def test_deliver_and_verify_submit_success_first_try():
+    ctrl = FakeCtrl([_agent(pending="continue")], {}, {"proj:0.0": {"will_submit": True}})
+    out = cw.deliver_and_verify(ctrl, target="proj:0.0", cwd="/opt/proj", action="submit",
+                                step_text="continue", expected_pending="continue", sleep=_no_sleep)
+    assert out["verify"]["ok"] is True and out["retried"] is False
+
+
+def test_deliver_and_verify_retries_enter_once_then_succeeds():
+    # typed-but-not-submitted: first Enter does nothing, second submits
+    ctrl = FakeCtrl([_agent(pending="continue")], {},
+                    {"proj:0.0": {"will_submit": True, "submit_on_enter": 2}})
+    out = cw.deliver_and_verify(ctrl, target="proj:0.0", cwd="/opt/proj", action="submit",
+                                step_text="continue", expected_pending="continue", sleep=_no_sleep)
+    assert out["verify"]["ok"] is True and out["retried"] is True
+
+
+def test_missed_enter_is_recovered_by_robust_resubmit():
+    # Live failure mode: a bare Enter does NOT land (submit_on_enter=2). The retry
+    # must use the reliable clear+paste+Enter path and land the submission.
+    ctrl = FakeCtrl([_agent(pending="continue")], {},
+                    {"proj:0.0": {"will_submit": True, "submit_on_enter": 2}})
+    out = cw.deliver_and_verify(ctrl, target="proj:0.0", cwd="/opt/proj", action="submit",
+                                step_text="continue", expected_pending="continue", sleep=_no_sleep)
+    assert out["retried"] is True and out["verify"]["ok"] is True
+    assert ctrl.state["proj:0.0"]["pending"] == ""     # line consumed
+
+
+def test_deliver_and_verify_gives_up_when_never_submits():
+    ctrl = FakeCtrl([_agent(pending="continue")], {}, {"proj:0.0": {"will_submit": False}})
+    out = cw.deliver_and_verify(ctrl, target="proj:0.0", cwd="/opt/proj", action="submit",
+                                step_text="continue", expected_pending="continue", sleep=_no_sleep)
+    assert out["verify"]["ok"] is False and out["retried"] is True
+
+
+# ── run_once integration (dwell needs two passes) ────────────────────────────
+def _run_twice(ctrl):
+    cw.run_once(ctrl, now_ts=NOW, sleep=_no_sleep)                 # seeds idle dwell
+    return cw.run_once(ctrl, now_ts=NOW + DWELL + 5, sleep=_no_sleep)  # acts
+
+
+def test_run_once_submits_typed_but_not_submitted_bug_and_verifies():
+    agents = [_agent(pending="continue with the next safe step")]
+    ctrl = FakeCtrl(agents, {"proj": {"mode": "auto", "project": "proj"}},
+                    {"proj:0.0": {"will_submit": True}})
+    res = _run_twice(ctrl)
+    acts = res["actions"]
+    assert acts and acts[0]["verified"] is True and acts[0]["action"] == "submit"
+    assert any(et == cw.EVENT_CONTINUED for _, et, _ in ctrl.emitted)
+    assert cw.health()["verified"] >= 1
+
+
+def test_run_once_retries_then_blocks_when_not_verifiable():
+    agents = [_agent(pending="continue with the next safe step")]
+    ctrl = FakeCtrl(agents, {"proj": {"mode": "auto"}}, {"proj:0.0": {"will_submit": False}})
+    res = _run_twice(ctrl)
+    a = res["actions"][0]
+    assert a["blocked"] is True and a["verify"]["ok"] is False
+    assert any(et == cw.EVENT_BLOCKED for _, et, _ in ctrl.emitted)
+
+
+def test_run_once_unsafe_pending_is_blocked_never_submitted():
+    agents = [_agent(pending="git push origin main")]
+    ctrl = FakeCtrl(agents, {"proj": {"mode": "auto"}}, {"proj:0.0": {"will_submit": True}})
+    res = _run_twice(ctrl)
+    assert res["actions"][0]["action"] == "blocker"
+    # no Enter/submit was ever attempted
+    assert ctrl.state["proj:0.0"]["enters"] == 0
+    assert any(et == cw.EVENT_BLOCKED for _, et, _ in ctrl.emitted)
+
+
+def test_run_once_skips_dead_and_non_allowlisted():
+    agents = [_agent(target="dead:0.0", alive=False, pending="continue"),
+              _agent(target="other:0.0", pending="continue")]      # 'other' not in config
+    ctrl = FakeCtrl(agents, {"proj": {"mode": "auto"}}, {})
+    res = _run_twice(ctrl)
+    assert res["actions"] == [] and res["health"]["agents_checked"] == 0
+
+
+def test_duplicate_prevention_same_step_not_repeated():
+    agents = [_agent(pending="continue with the next safe step")]
+    ctrl = FakeCtrl(agents, {"proj": {"mode": "auto"}}, {"proj:0.0": {"will_submit": True}})
+    _run_twice(ctrl)
+    enters_after_first = ctrl.state["proj:0.0"]["enters"]
+    # agent went idle again but conversation unchanged (m1) → same step_hash → no repeat
+    ctrl.state["proj:0.0"]["state"] = "idle"
+    ctrl.state["proj:0.0"]["pending"] = "continue with the next safe step"
+    res3 = cw.run_once(ctrl, now_ts=NOW + 2 * DWELL + 20, sleep=_no_sleep)
+    assert all(not a.get("verified") for a in res3["actions"]) or res3["actions"] == []
+    assert ctrl.state["proj:0.0"]["enters"] == enters_after_first   # no new Enter
+
+
+def test_recovery_after_restart_does_not_repeat_verified_step():
+    agents = [_agent(pending="continue with the next safe step")]
+    ctrl = FakeCtrl(agents, {"proj": {"mode": "auto"}}, {"proj:0.0": {"will_submit": True}})
+    _run_twice(ctrl)
+    enters = ctrl.state["proj:0.0"]["enters"]
+    # simulate a service restart: brand-new controller + module reload, SAME db file
+    ctrl2 = FakeCtrl([_agent(pending="continue with the next safe step")],
+                     {"proj": {"mode": "auto"}}, {"proj:0.0": {"will_submit": True}})
+    ctrl2.state["proj:0.0"]["conv"] = "m1"      # same conversation as after the submit
+    res = cw.run_once(ctrl2, now_ts=NOW + 100, sleep=_no_sleep)
+    cw.run_once(ctrl2, now_ts=NOW + 100 + DWELL + 5, sleep=_no_sleep)
+    # idempotency ledger (persisted in the db) blocks re-submitting the done step
+    assert ctrl2.state["proj:0.0"]["enters"] == 0
+    assert enters >= 1
+
+
+def test_health_surface_reports_last_action():
+    agents = [_agent(pending="continue with the next safe step")]
+    ctrl = FakeCtrl(agents, {"proj": {"mode": "auto"}}, {"proj:0.0": {"will_submit": True}})
+    _run_twice(ctrl)
+    h = cw.health(load_config=lambda: ctrl.cfg)
+    assert h["enabled"] is True and h["last_run_at"] is not None
+    assert "continued" in (h["last_action"] or "")
+
+
+# ── configured real-session eligibility + zero-eligible misconfiguration ─────
+def _cfg(sessions):
+    return {"sessions": sessions}
+
+
+def test_configured_real_session_eligibility():
+    # arbitrage2-opus configured managed-auto → eligible; hold/monitor → not.
+    cfg = _cfg({
+        "arbitrage2-opus": {"mode": "auto", "root": "/opt/arbitrage2",
+                            "proactive_continue": True},
+        "polyinput": {"mode": "hold"},
+        "safeguard": {"mode": "hold"},
+    })
+    elig = cw.eligible_sessions(lambda: cfg)
+    assert "arbitrage2-opus" in elig
+    assert "polyinput" not in elig and "safeguard" not in elig
+
+
+def test_real_config_file_makes_arbitrage2_opus_eligible():
+    # the actual shipped orchestrator config must make arbitrage2-opus actionable
+    from core import agent_orchestrator as orch
+    elig = cw.eligible_sessions(orch.load_config)
+    assert "arbitrage2-opus" in elig
+
+
+def test_health_flags_zero_eligible_as_misconfiguration():
+    # enabled watchdog with NO managed-auto session must NOT look healthy
+    h = cw.health(load_config=lambda: _cfg({"polyinput": {"mode": "hold"}}))
+    assert h["status"] == "warning"
+    assert "no_eligible_sessions" in h["warning"]
+    assert h["eligible_count"] == 0
+
+
+def test_health_ok_when_eligible_session_present():
+    h = cw.health(load_config=lambda: _cfg({"arbitrage2-opus": {"mode": "auto"}}))
+    assert h["status"] == "ok" and h["eligible_count"] >= 1
+    assert "arbitrage2-opus" in h["eligible_sessions"]
+
+
+# ── coverage, not just configuration ───────────────────────────────────────
+# The existing warning catches "zero managed-auto sessions configured". The next
+# step of that same blind spot is sessions configured that are NOT RUNNING: the
+# watchdog checks nothing, reports ok, and the owner believes idle agents are
+# being continued automatically while every live agent sits outside the
+# allowlist. That was the live state: 4 configured, 0 alive, 12 live agents.
+
+def _health_with(monkeypatch, *, configured, live):
+    from core import agent_continuation_watchdog as cw
+    monkeypatch.setattr(cw, "eligible_sessions", lambda _lc: set(configured))
+    monkeypatch.setattr(cw, "ENABLED", True)
+    return cw.health(load_config=lambda: {},
+                     live_sessions=lambda: {f"{s}:0.0" for s in live})
+
+
+def test_configured_sessions_that_are_not_running_are_flagged(monkeypatch):
+    h = _health_with(monkeypatch, configured=["cp-canary", "job"],
+                     live=["gaika-ext-audit", "payorch-monitor-clean"])
+    assert h["status"] == "warning"
+    assert h["warning"].startswith("covering_nothing")
+    assert h["coverage"] == "0/2"
+    assert "gaika-ext-audit" in h["unmanaged_live"]
+
+
+def test_real_coverage_reports_ok(monkeypatch):
+    h = _health_with(monkeypatch, configured=["cp-canary", "job"],
+                     live=["cp-canary", "gaika-ext-audit"])
+    assert h["status"] == "ok"
+    assert h["eligible_live"] == ["cp-canary"]
+    assert h["unmanaged_live"] == ["gaika-ext-audit"]
+    assert h["coverage"] == "1/2"
+
+
+def test_no_live_agents_at_all_is_not_an_alarm(monkeypatch):
+    """Nothing running is quiet, not broken."""
+    h = _health_with(monkeypatch, configured=["cp-canary"], live=[])
+    assert h["status"] == "ok"
+    assert h["coverage"] == "0/0"
+
+
+def test_zero_configured_still_reports_the_original_misconfiguration(monkeypatch):
+    h = _health_with(monkeypatch, configured=[], live=["gaika-ext-audit"])
+    assert h["status"] == "warning"
+    assert h["warning"].startswith("no_eligible_sessions")
+
+
+def test_a_broken_tmux_inventory_never_breaks_health(monkeypatch):
+    from core import agent_continuation_watchdog as cw
+
+    def boom():
+        raise RuntimeError("tmux gone")
+    monkeypatch.setattr(cw, "eligible_sessions", lambda _lc: {"cp-canary"})
+    monkeypatch.setattr(cw, "ENABLED", True)
+    h = cw.health(load_config=lambda: {}, live_sessions=boom)
+    assert h["status"] == "ok"
+    assert "live_inventory_error" in h
+
+
+def test_without_an_injected_inventory_health_stays_hermetic(monkeypatch):
+    """No caller-supplied inventory means no tmux call and no coverage claim."""
+    from core import agent_continuation_watchdog as cw
+    monkeypatch.setattr(cw, "eligible_sessions", lambda _lc: {"cp-canary"})
+    monkeypatch.setattr(cw, "ENABLED", True)
+    h = cw.health(load_config=lambda: {})
+    assert h["status"] == "ok"
+    assert "coverage" not in h
