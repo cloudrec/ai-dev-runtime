@@ -1343,3 +1343,61 @@ succeeded in the same window.
 3. **Telegram `owner_push`** (`Bad Request: chat not found`) and the unread
    `cto_inbox` remain exactly as Part 1 left them. The wake path does not depend
    on either.
+
+## Follow-up: events 15330 / 15331 investigated — no live defect, no fix applied
+
+An automated instruction was received to determine whether `wake_loop_stalled`
+15330 indicates a loop that is actually stuck, or stale watchdog noise. Evidence:
+
+**What the two alerts are.** Both targets are runtime jobs, not panes:
+
+| Watch | Target | Original event | Job | Status |
+| --- | --- | --- | --- | --- |
+| 14833 | `runtimejob:cd01ad71` | `owner_decision_required`, 11:47:10Z | "Restore Owner OS tmux backend" (HIGH_RISK) | `waiting_approval` |
+| 14912 | `runtimejob:a6f4c391` | `owner_decision_required`, 12:29:36Z | "Recreate lost live tmux socket" (HIGH_RISK) | `waiting_approval` |
+
+**The loop is not stuck — it delivered these very alerts.**
+
+```
+14833  wake delivered 14:11:46Z  -> no new event on target within 900s SLO
+       re-woken once  15248 @ 14:27:49Z  -> still no progress
+       escalated once 15330 @ 14:43:45Z  -> wake_loop_watch: rewoken=1 escalated=1  (TERMINAL)
+14912  wake delivered 14:27:00Z  -> re-woken once 15331 @ 14:43:45Z (escalated=0)
+15330  DELIVERED 14:48:04Z  submitted_and_assistant_started_generating
+15331  DELIVERED 14:50:04Z  submitted_and_assistant_started_generating
+```
+
+The watchdog is bounded exactly as designed — re-wake once, escalate once, then
+stop — and 14833's watch is already terminal. Its escalations then travelled the
+wake path successfully, which is itself end-to-end proof the loop is alive.
+
+**Nor is it stale noise.** `_progress_since` counts a newer event on the target;
+a job parked in `waiting_approval` emits none, and `waiting_approval` is
+deliberately NOT in `_RUNTIME_JOB_TERMINAL_STATUSES`, so the watch correctly
+stays open. The condition the alerts describe — two runtime jobs awaiting an
+owner decision that nothing has answered — is literally true right now.
+
+**What is obsolete is the jobs' purpose, not the watchdog.** Both were created
+DURING the socket outage (11:45Z–13:25Z) to repair the very failure this session
+has since root-caused, guarded and proven: the socket was restored at 13:25Z, and
+a recurrence is now bounded to one companion tick. Their work is done.
+
+**No fix applied.** There is no wake-loop defect to fix, so no runtime or
+wake-policy change was made and no other service was touched. Approving,
+cancelling or otherwise resolving two HIGH_RISK jobs sitting in
+`waiting_approval` is an owner decision — job approval is gated through
+`config/approved_gates.yaml`, never through an API-supplied value — and it was
+deliberately not taken.
+
+**Verification after investigation:** 24 delivered / 3 failed in the preceding 30
+minutes (all three the pre-existing `cdp_error:WebSocketTimeoutException` class;
+15197 among them subsequently delivered at 14:48:38Z, so the retry path absorbed
+them). `worker_skew()` empty, `tmux_control` `ok`, global dedupe query empty.
+`pipeline.status` cites one route: `pending_wake_stuck:auction:3468s` — event
+**15005** `agent_recovered`, non-actionable, from 13:24:55Z inside the blackout
+window, waiting its route's 900 s lane.
+
+**Owner-gated follow-up added:** runtime jobs `cd01ad71` ("Restore Owner OS tmux
+backend") and `a6f4c391` ("Recreate lost live tmux socket") are still
+`waiting_approval` and are now redundant. Until they are approved, cancelled or
+otherwise retired, 14912's watch may emit one further escalation.
