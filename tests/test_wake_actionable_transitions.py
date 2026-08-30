@@ -224,3 +224,123 @@ def test_an_actionable_claim_is_not_refused_by_the_generic_send_cooldown():
     burst = wb.claim_send("companion", event_id=3922, actionable=True, now=1015.0)
     assert burst["allowed"] is False
     assert burst["reason"].startswith("actionable_cooldown_active")
+
+
+# ── 2026-08-30: managed-agent lifecycle terminals belong in the FAST lane ────
+# Event 15448 (`work_stopped_incomplete`, mess-opus:0.0) was detected immediately by the
+# quiescence rule and then faced up to COOLDOWN_SECS before its project chat could be
+# woken. A stopped managed agent is a project standing still, not history to be read
+# whenever. Detection was never the problem; the lane was.
+
+def test_lifecycle_terminals_take_the_fast_lane():
+    from core import wake_bridge as wb
+    for t in ("work_stopped_incomplete", "task_completed",
+              "agent_process_failed", "agent_dead"):
+        assert wb.is_lifecycle(t), t
+        assert wb.is_actionable(t), f"{t} must not wait out the generic floor"
+
+
+def test_the_waiting_input_fast_path_is_unchanged():
+    from core import wake_bridge as wb
+    for t in ("agent_waiting_input", "agent_needs_response",
+              "agent_prompt_needs_response", "owner_decision_required",
+              "agent_crash_loop", "wake_loop_no_progress", "wake_loop_stalled"):
+        assert wb.is_actionable(t), t
+        assert not wb.is_lifecycle(t), f"{t} is a waiting transition, not a lifecycle stop"
+
+
+def test_notification_noise_is_NOT_made_fast():
+    """The narrowness is the point. Channel-health chatter arrives constantly; putting it
+    in the fast lane would be noise, not latency."""
+    from core import wake_bridge as wb
+    for t in ("notification_dead_letter", "notifications_red",
+              "notification_channel_down"):
+        assert not wb.is_lifecycle(t), t
+        assert not wb.is_actionable(t), f"{t} must stay in the generic lane"
+
+
+def test_routine_chatter_stays_out_of_the_fast_lane():
+    from core import wake_bridge as wb
+    for t in ("agent_recovered", "work_report_published", "agent_state",
+              "runtime_job_state", "agent_control_plane_recovered"):
+        assert not wb.is_actionable(t), t
+
+
+def test_lifecycle_is_audited_under_its_own_reason():
+    """The audit should say WHICH authority spoke: "the agent stopped" is not "the agent
+    is waiting for an answer", even though both take the same lane."""
+    from core import wake_bridge as wb
+    assert wb.is_significant(event_type="work_stopped_incomplete",
+                             severity="high")["reason"] == "lifecycle_terminal_transition"
+    assert wb.is_significant(event_type="agent_waiting_input",
+                             severity="high")["reason"] == "actionable_waiting_transition"
+    for t in ("work_stopped_incomplete", "task_completed", "agent_dead"):
+        assert wb.is_significant(event_type=t, severity="high")["actionable"] is True
+
+
+def test_a_lifecycle_stop_is_not_blocked_by_a_stale_generic_backlog(tmp_path, monkeypatch):
+    """The acceptance case, at the decision gate: a generic wake seconds ago must not make
+    a managed-agent stop wait out COOLDOWN_SECS."""
+    from core import wake_bridge as wb
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import wake_routes as wr
+    conn = wb._conn()[0]
+    # Without a real binding the target resolves to the FALLBACK route, the route-scoped
+    # floor below never matches the inserted row, and the test would pass vacuously.
+    wr.bind_route("mess", "https://chatgpt.com/c/6a92e516-a50c-83eb-a1af-1bb4634f4845",
+                  by="test", conn=conn)
+    now = 10_000.0
+    conn.execute(
+        "INSERT INTO wake_audit (ts,at,event_id,decision,reason,event_type,actionable,"
+        "project_id,agent_id,route_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (now - 5, "t", 900, "wake", "urgent_event_not_yet_signalled",
+         "notifications_red", 0, "mess", "", "mess"))
+    conn.commit()
+    d = wb.should_wake(event_id=901, event_type="work_stopped_incomplete",
+                       severity="high", owner_action_required=False,
+                       project_id="mess", agent_id="mess-opus:0.0",
+                       conn=conn, now=now)
+    assert d["wake"] is True, d
+    assert d["actionable"] is True
+
+
+def test_exactly_once_still_wins_over_the_fast_lane(tmp_path, monkeypatch):
+    """Being fast must never become being duplicated: the per-event dedupe is checked
+    before any lane logic and is unchanged."""
+    from core import wake_bridge as wb
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    conn = wb._conn()[0]
+    now = 10_000.0
+    conn.execute(
+        "INSERT INTO wake_audit (ts,at,event_id,decision,reason,event_type,actionable,"
+        "project_id,agent_id,route_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (now - 5, "t", 902, "wake", "lifecycle_terminal_transition",
+         "work_stopped_incomplete", 1, "mess", "mess-opus:0.0", "mess"))
+    conn.commit()
+    d = wb.should_wake(event_id=902, event_type="work_stopped_incomplete",
+                       severity="high", owner_action_required=False,
+                       project_id="mess", agent_id="mess-opus:0.0",
+                       conn=conn, now=now)
+    assert d["wake"] is False and d["reason"] == "already_woke_for_this_event"
+
+
+def test_the_fast_lane_still_has_its_own_bounded_floor(tmp_path, monkeypatch):
+    """Fast is not unbounded: two distinct lifecycle stops on one route cannot burst."""
+    from core import wake_bridge as wb
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import wake_routes as wr
+    conn = wb._conn()[0]
+    wr.bind_route("mess", "https://chatgpt.com/c/6a92e516-a50c-83eb-a1af-1bb4634f4845",
+                  by="test", conn=conn)
+    now = 10_000.0
+    conn.execute(
+        "INSERT INTO wake_audit (ts,at,event_id,decision,reason,event_type,actionable,"
+        "project_id,agent_id,route_key) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (now - 1, "t", 903, "wake", "lifecycle_terminal_transition",
+         "task_completed", 1, "mess", "other:0.0", "mess"))
+    conn.commit()
+    d = wb.should_wake(event_id=904, event_type="agent_dead", severity="high",
+                       owner_action_required=False, project_id="mess",
+                       agent_id="mess-opus:0.0", conn=conn, now=now)
+    assert d["wake"] is False and d["reason"] == "actionable_cooldown_active"
+    assert d["wait_secs"] <= wb.ACTIONABLE_COOLDOWN_SECS

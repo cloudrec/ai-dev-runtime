@@ -160,9 +160,48 @@ ACTIONABLE_EVENT_TYPES = frozenset({
 })
 
 
+# Managed-agent LIFECYCLE terminals: the agent STOPPED, finished, or died. These were
+# treated as generic history and shared the 900s floor, which is wrong for the same reason
+# the actionable class exists at all. History is a record the assistant reads whenever it
+# next looks; a managed agent that has stopped is a project standing still, and every
+# minute it waits behind a generic backlog is a minute of work not happening.
+#
+# 2026-08-30, the case that forced this: event 15448 `work_stopped_incomplete` on
+# `mess-opus:0.0` was detected correctly and immediately by the quiescence rule, then sat
+# in the generic lane facing up to 900s before its project chat could be woken. Detection
+# was never the problem; the lane was.
+#
+# Deliberately NARROW. `notification_dead_letter`, `notifications_red` and
+# `notification_channel_down` are channel-health chatter, arrive constantly, and stay in
+# the generic lane exactly as before — making those fast would be noise, not latency.
+LIFECYCLE_EVENT_TYPES = frozenset({
+    "work_stopped_incomplete",     # incl. the `quiescent` structural stop from agent_watch
+    "task_completed",
+    "agent_process_failed", "agent_dead",
+})
+
+
+def is_lifecycle(event_type: str = "") -> bool:
+    """A managed agent that stopped, finished or died — a terminal state of real work."""
+    return (event_type or "").strip() in LIFECYCLE_EVENT_TYPES
+
+
 def is_actionable(event_type: str = "") -> bool:
-    """A live agent waiting for a response now, as opposed to a durable record of history."""
-    return (event_type or "").strip() in ACTIONABLE_EVENT_TYPES
+    """Does this event get the FAST lane?
+
+    Two kinds qualify, and they share one bounded floor rather than growing a third lane:
+    a live agent waiting for a response now, and a managed agent whose work has stopped.
+    A third lane would need its own lookback scope in BOTH the decision gate and the send
+    gate, and getting exactly that scoping wrong is what starved the non-actionable lane
+    twice already (`claim_send` and `should_wake`). One shared, already-correct floor is
+    the safer shape.
+
+    The cost is stated plainly: a `waiting_input` event can now queue behind a lifecycle
+    event on the same route for at most ACTIONABLE_COOLDOWN_SECS. Its own floor is
+    unchanged, and the alternative it replaces is a lifecycle stop waiting COOLDOWN_SECS.
+    """
+    t = (event_type or "").strip()
+    return t in ACTIONABLE_EVENT_TYPES or t in LIFECYCLE_EVENT_TYPES
 
 
 def is_significant(*, event_type: str = "", severity: str = "",
@@ -177,8 +216,13 @@ def is_significant(*, event_type: str = "", severity: str = "",
     spoke. It admits nothing that `WAKE_EVENT_TYPES` would not have admitted anyway.
     """
     t = (event_type or "").strip()
-    if is_actionable(t):
+    if t in ACTIONABLE_EVENT_TYPES:
         return {"significant": True, "reason": "actionable_waiting_transition",
+                "actionable": True}
+    if is_lifecycle(t):
+        # Same fast lane, distinct audit reason: the audit should say which authority
+        # spoke, and "the agent stopped" is not "the agent is waiting for an answer".
+        return {"significant": True, "reason": "lifecycle_terminal_transition",
                 "actionable": True}
     if severity in WAKE_SEVERITIES:
         return {"significant": True, "reason": "severity_at_wake_threshold"}

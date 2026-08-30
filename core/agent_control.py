@@ -884,8 +884,11 @@ _STATE_ACTIVE_RUN_RE = re.compile(
     r"|\(thinking\)"
     # Claude Code footer shows "· N shell ·" while a BACKGROUND shell command runs
     # (e.g. a live monitor launched via the Bash tool). The pane foreground stays
-    # `claude`, so the pane-command heuristic misses it — this footer marker means the
-    # agent is actively running a shell and must NOT be read as idle.
+    # `claude`, so the pane-command heuristic misses it — this footer marker means work
+    # is attached to the pane and it must NOT be read as idle. NOTE: this marker alone
+    # does not prove the FOREGROUND turn is live; `classify_state` refines it against
+    # `_TURN_DONE_RE`. Every other consumer of this pattern keeps the older, broader
+    # meaning ("something is running here"), which is what they each want.
     r"|·\s*\d+\s+shells?\b"
     # A RUNNING background subagent (Fable/Task tool) is real work in progress. The live
     # mess-qa-automation pane (2026-08-03) showed "✻ Waiting for 1 background agent to
@@ -902,6 +905,31 @@ _STATE_ACTIVE_RUN_RE = re.compile(
     # it, so a long turn was only caught when a token counter shared the captured tail.
     r"|\(\d+m\s+\d+s\s*·"
     r"|[↑↓]\s*[\d.]+\s*k?\s*tokens\b)", re.I)
+# BACKGROUND work markers. Claude Code's footer shows "· N shell" while a shell launched
+# through the Bash tool is still running, and that marker persists in the chrome
+# ("⏵⏵ auto mode on · 1 shell · ← 3 agents") after the FOREGROUND turn has finished.
+# It used to live in `_STATE_ACTIVE_RUN_RE`, which made it indistinguishable from a live
+# turn and pinned such a pane at `working` forever.
+#
+# 2026-08-30, capacity-blockchain:0.0: the turn line read
+#   "✻ Brewed for 39s · done 6:59 PM · 1 shell still running"
+# with an EMPTY `❯` prompt below it and `pane_current_command=claude`. The agent had
+# finished, said so, and was sitting at the prompt, while a background `pytest` it had
+# launched kept the footer marker alive. `agent_status` reported `working`, which masked
+# the stop from every downstream consumer — including the quiescence rule, whose whole
+# job is to notice exactly this.
+_BACKGROUND_SHELL_RE = re.compile(r"·\s*\d+\s+shells?\b", re.I)
+# The FOREGROUND-only twin of `_STATE_ACTIVE_RUN_RE`: every marker that means "this turn
+# is running right now", with the background-shell footer removed. Built from the shared
+# pattern so the two can never drift — adding a marker there adds it here.
+_FOREGROUND_ACTIVE_RE = re.compile(
+    _STATE_ACTIVE_RUN_RE.pattern.replace(r"|·\s*\d+\s+shells?\b", ""), re.I)
+# The foreground turn's own completion stamp: "· done 6:59 PM". Claude Code prints it on
+# the spinner line when the turn ends, so its presence is positive evidence that the
+# FOREGROUND is finished, whatever background work is still attached to the pane.
+_TURN_DONE_RE = re.compile(r"·\s*done\s+\d{1,2}:\d{2}\s*(?:am|pm)?\b", re.I)
+
+
 # A monitoring-only session: the agent itself is at rest at the composer, but the
 # harness is running live background monitors for it. Claude Code renders these in the
 # FOOTER mode line as a counter: "⏵⏵ auto mode on · 2 monitors · ← 3 agents". That is
@@ -1135,7 +1163,16 @@ def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str
     # 1) concrete active-execution evidence — the only path to "working". Markers count
     #    only in the LIVE status region (last spinner line → end): a stale spinner line
     #    higher in scrollback must never read as live work.
-    if _STATE_ACTIVE_RUN_RE.search(live_status_region(tail)):
+    region = live_status_region(tail)
+    if _FOREGROUND_ACTIVE_RE.search(region):
+        return "working"
+    # 1a) A BACKGROUND shell is not a foreground turn. The footer marker still means real
+    #     work is attached to the pane, so it keeps reading as `working` — UNLESS the turn
+    #     line also carries its own completion stamp, which is positive evidence the
+    #     foreground finished. Fail-safe by construction: with no `done` stamp we cannot
+    #     prove the turn ended, so the previous behaviour is unchanged and a genuinely
+    #     active long-running shell is never demoted.
+    if _STATE_ACTIVE_RUN_RE.search(region) and not _TURN_DONE_RE.search(region):
         return "working"
     # 1b) a live shell command running in the pane is work in progress (shell-
     #     running), NOT idle and NOT an external block.

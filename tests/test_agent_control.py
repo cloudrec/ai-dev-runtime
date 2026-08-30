@@ -1033,3 +1033,89 @@ def test_a_readable_inventory_is_marked_reachable(monkeypatch):
     import core.agent_control as ac
     monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, "", ""))
     assert ac.agent_list()["control_unreachable"] is False
+
+
+# ── 2026-08-30: a BACKGROUND shell masked a finished FOREGROUND turn ─────────
+# capacity-blockchain:0.0 finished its stage, printed "Stopped here as instructed", and
+# sat at an empty `❯` prompt with `pane_current_command=claude`. A `pytest` it had
+# launched through the Bash tool kept Claude Code's "· 1 shell" footer marker alive, and
+# that marker lived in `_STATE_ACTIVE_RUN_RE`, so the pane read `working` forever. Every
+# downstream consumer was blinded — including the quiescence rule, whose entire job is to
+# notice a stop like this one.
+
+ACAP_TURN_DONE_BG_SHELL = (
+    "  I'll report the suite verdict when it\n"
+    "  finishes.\n"
+    "✻ Brewed for 39s · done 6:59 PM · 1 shell still\n"
+    "  running\n"
+    "──────────\n"
+    "❯ \n"
+    "──────────\n"
+    "  ⏵⏵ auto mode on · 1 shell · ← 3 agents")
+
+ACAP_TURN_LIVE_BG_SHELL = (
+    "✻ Noodling… · 1 shell still running\n"
+    "  ⏵⏵ auto mode on · 1 shell")
+
+
+def test_a_finished_turn_is_not_working_just_because_a_background_shell_runs():
+    """The live capacity-blockchain case."""
+    import core.agent_control as ac
+    assert ac.classify_state(True, True, ACAP_TURN_DONE_BG_SHELL) != "working"
+
+
+def test_a_live_turn_with_a_background_shell_is_still_working():
+    """No regression: without a completion stamp the turn is not provably finished, so
+    the footer marker keeps its old meaning."""
+    import core.agent_control as ac
+    assert ac.classify_state(True, True, ACAP_TURN_LIVE_BG_SHELL) == "working"
+
+
+def test_foreground_activity_always_wins_over_a_done_stamp():
+    """A `done` stamp from an EARLIER turn must never demote a turn that is live now."""
+    import core.agent_control as ac
+    stale_done_then_live = (
+        "✻ Brewed for 39s · done 6:59 PM · 1 shell still running\n"
+        "✻ Pondering… (8s · esc to interrupt)")
+    assert ac.classify_state(True, True, stale_done_then_live) == "working"
+
+
+def test_the_shared_active_predicate_is_unchanged_for_its_other_consumers():
+    """`_STATE_ACTIVE_RUN_RE` is imported by context_budget, commander_autopilot, the
+    continuation watchdog and the state estimator, which each want the broader "something
+    is running here" meaning. The refinement belongs to classify_state alone."""
+    import core.agent_control as ac
+    region = ac.live_status_region(ACAP_TURN_DONE_BG_SHELL)
+    assert ac._STATE_ACTIVE_RUN_RE.search(region), "shared predicate must still match"
+    assert not ac._FOREGROUND_ACTIVE_RE.search(region), "foreground twin must not"
+
+
+def test_the_foreground_twin_cannot_drift_from_the_shared_pattern():
+    """It is BUILT from the shared pattern, so a marker added there is added here too —
+    the two cannot silently diverge."""
+    import core.agent_control as ac
+    for live in ("esc to interrupt", "✻ Wibbling… (thinking)",
+                 "✻ Working… (8s ·", "waiting for 2 background agents",
+                 "compacting", "↑ 12.4k tokens"):
+        assert ac._FOREGROUND_ACTIVE_RE.search(live), live
+    assert not ac._FOREGROUND_ACTIVE_RE.search("· 1 shell")
+
+
+def test_a_genuine_long_running_shell_session_is_not_demoted():
+    """A monitoring session with no completion stamp keeps reading as active work."""
+    import core.agent_control as ac
+    assert ac.classify_state(True, True, "✻ watching… · 2 shells") == "working"
+    assert ac.classify_state(True, True, "some output", shell_running=True) == "shell_running"
+
+
+def test_the_word_done_in_prose_is_not_a_completion_stamp():
+    """Isolates the stamp's strictness. Agents say "done" constantly while still working
+    ("done with step 3, continuing"). Only Claude Code's own `· done H:MM` footer marks
+    the TURN as finished; matching bare prose would demote live agents fleet-wide."""
+    import core.agent_control as ac
+    prose_done_live_turn = (
+        "  I'm done with step 3 and moving on.\n"
+        "✻ Noodling… · 1 shell still running")
+    assert not ac._TURN_DONE_RE.search(prose_done_live_turn)
+    assert ac.classify_state(True, True, prose_done_live_turn) == "working"
+    assert ac._TURN_DONE_RE.search("✻ Brewed for 39s · done 6:59 PM · 1 shell")
