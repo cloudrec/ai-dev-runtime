@@ -3241,3 +3241,104 @@ type, letting an exception escape the hook, printing to stdout, and four on the
 closed-loop resolution.
 
 Local commits only; no remote push, per instruction.
+
+---
+
+# Part 15 — the native peer mechanism, and a noise defect it exposed
+
+## The peer layer exists and works
+
+`ListAgents` from the supervisor session shows **all ten tmux workers as addressable
+native peers**, with live status and their tmux pane:
+
+```
+cp-canary-v2-88 [46dbb9]           idle   tmux cp-canary:@175.%175
+seo-13 [7407c7]                    idle   tmux mess-postsignup-cleanup-sonnet-v4:@188.%188
+gaika-extension-72 [f9f762]        idle   tmux gaika-opus:@198.%198
+auction-2d [83d542]                shell  tmux diamond-auction:@155.%155
+… 10 peers, plus this supervisor session ai-dev-runtime-e7 [1fc40d]
+```
+
+That listing also supplies the **session ↔ tmux target join** the Python side never had.
+It is now recorded in `native_peer` so a daemon that cannot call session tools can still
+resolve a peer name to a target.
+
+**The native continuation hop is proven.** A single `SendMessage` to
+`cp-canary-v2-88` carrying the ordinary safe step, with `notify_when_idle: true`,
+delivered the continuation AND armed a one-shot idle subscription — no tmux paste,
+no ChatGPT, no polling.
+
+## An architectural fact that constrains the design
+
+`ListAgents`, `SendMessage` and `notify_when_idle` are **session tools, not APIs**. The
+`owner-os-wake-companion` daemon is a Python process and cannot call them. So there are
+two continuation transports, and they are not interchangeable:
+
+| Transport | Who can drive it | Status |
+| --- | --- | --- |
+| `agent_control.agent_send` (tmux paste) | the Python supervisor, on a timer or hook trigger | **running in production**, two closed loops proven |
+| `SendMessage` peer hop | a live Claude supervisor SESSION | **mechanism proven**, needs a persistent session to hold it |
+
+A "persistent Supervisor-Claude" therefore means a dedicated long-lived Claude session,
+not a daemon. This session acted as one to prove the hop; it is not yet a standing
+service, and that is the honest remaining gap.
+
+## Owner-gate routing, proven on real events
+
+Native needs-input signals reach the owner path while the supervisor refuses to answer
+them:
+
+```
+ev 15712 cp-canary-v2          -> wake, route owner-os   | supervisor: not_a_turn_boundary
+ev 15708 ai-dev-runtime        -> wake, route owner-os   | supervisor: not_a_turn_boundary
+ev 15693 arbitrage2-fable-audit-> wake, route owner-os   | supervisor: not_a_turn_boundary
+ev 15688 capacity (ACAP)       -> wake, route owner-os   | supervisor: not_a_turn_boundary
+```
+
+Note `capacity`: a **deny-listed** project still woke the owner. The denylist stops
+CONTINUATION, never NOTIFICATION — a gated agent is still watched, it is simply never
+auto-continued. Unmapped projects fell back to `owner-os` with audit, as documented.
+
+## The defect the measurement exposed
+
+An hour after the hooks went live: **18 of 19** native `agent_waiting_input` events were
+`notification_type=idle_prompt`, and **11 of those became delivered owner wakes** —
+roughly a dozen interruptions an hour whose entire content was "an agent is idle".
+Exactly one event was a genuine `agent_needs_input`.
+
+`idle_prompt` fires whenever a pane SITS at the prompt; `agent_needs_input` fires when the
+agent is ASKING. Mapping the first to an actionable wake was wrong — the same trap as
+`Stop` firing every turn, in another costume, and I walked into it a second time.
+
+`idle_prompt` is now the routine turn-boundary record: still useful, because idleness is
+exactly what the supervisor acts on and an agent that never ends a turn may emit this when
+it emits no `Stop` — but never a doorbell. `agent_needs_input` is untouched and still
+wakes. Measured after the fix: 4 hook events, **all routine, zero new wake-capable events
+from idle**.
+
+## Auto-registration, and a denylist that had to be fixed
+
+Registration is automatic and subtractive — every agent except deny-listed projects, each
+row durable and attributed. Live:
+
+```
+registered:  arbitrage2-fable · cp-canary · gaika-opus · mess-opus · mess-postsignup-…-v4
+denied:      capacity (ACAP C1/C2) · auction (value-bearing) · payment-orchestrator/payorch
+             · email (sends mail) · xmrig · ai-dev-runtime (the supervisor's own session)
+```
+
+A defect found live minutes after deploying it: `owner-os-wake-policy-opus` — the
+supervisor's OWN session — had been registered by the earlier build, and adding
+`ai-dev-runtime` to the denylist did not revoke it. A supervisor that answers its own turn
+boundaries loops on itself. The denylist is now evaluated on READ and denied rows are
+purged every pass; verified gone.
+
+## State
+
+Commits (local only, no push): `05b51cd`, `56aa69d`, `446c10e`.
+Gates: 486, 339, 162 passed. Mutations killed this stage: eleven.
+
+Still open, named honestly: a standing Supervisor-Claude session that holds
+`notify_when_idle` subscriptions across restarts, and `/goal` auto-submission, which stays
+gated off because widening the fail-closed allowlist is a safety decision and not an
+implementation detail.
