@@ -86,13 +86,36 @@ def _tmux(args: list) -> tuple:
         return 1, "", str(e)
 
 
+class TmuxControlUnreachable(RuntimeError):
+    """The tmux control plane could not be reached, so NOTHING about panes is known."""
+
+
+def control_probe() -> dict:
+    """Reachability + integrity of the tmux control plane. FAIL CLOSED: if the probe
+    itself cannot run, that is not permission to assume the plane is fine."""
+    try:
+        from core import tmux_control
+        return tmux_control.probe()
+    except Exception as e:  # noqa: BLE001
+        return {"healthy": False, "reachable": False,
+                "reason": f"probe_failed:{type(e).__name__}", "detail": str(e)[:160]}
+
+
 def panes() -> list:
-    rc, out, _ = _tmux(["list-panes", "-a", "-F",
+    rc, out, err = _tmux(["list-panes", "-a", "-F",
                         "#{session_name}:#{window_index}.#{pane_index}\t#{pane_dead}\t"
                         "#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}"])
     rows = []
     if rc != 0:
-        return rows
+        # An empty list used to be returned for BOTH "tmux says there are no panes" and
+        # "tmux could not be asked". Those are opposite facts, and every caller here
+        # reads the empty one as evidence: pane_state() reports the target dead,
+        # live_claude_for_cwd() reports no duplicate, and recover() would then create a
+        # session on a host where the real one is alive but unreachable. That is not
+        # hypothetical — 2026-08-30, /tmp/tmux-0 deleted under a live server, a client
+        # started a second server and duplicated a live agent. Unknown now raises.
+        raise TmuxControlUnreachable(
+            f"tmux list-panes failed (rc={rc}): {(err or '').strip()[:160]}")
     for line in out.splitlines():
         parts = line.split("\t")
         if len(parts) >= 5:
@@ -294,7 +317,7 @@ def verify_recovered(target: str, cwd: str) -> dict:
 
 def recover(target: str, *, registry: Optional[dict] = None, conn=None,
             run_fn=None, sleep=time.sleep, now: Optional[float] = None,
-            explicit: bool = False) -> dict:
+            explicit: bool = False, probe_fn=None) -> dict:
     """Revive one registered dead session. Every refusal is explained and logged.
 
     `explicit=True` is an owner/MCP-initiated resume: it still requires a real project
@@ -305,134 +328,159 @@ def recover(target: str, *, registry: Optional[dict] = None, conn=None,
     own = conn is None
     conn = conn or _db()
     try:
-        reg = registry if registry is not None else load_registry()
-        entry = (reg.get("sessions") or {}).get(target)
-        if not entry:
-            _log(conn, target, "refuse", False, "not_registered")
-            return {"recovered": False, "reason": "not_registered"}
-        if not entry.get("enabled"):
-            _log(conn, target, "refuse", False, "disabled_in_registry")
-            return {"recovered": False, "reason": "disabled_in_registry"}
-        q = is_quarantined(target, conn=conn)
-        if q:
-            return {"recovered": False, "reason": "quarantined", "since": q["since"]}
-
-        # ── WHERE: the governor's project dir wins over the recovery registry ──
-        # Resolved before anything else, because every later proof (duplicate detection,
-        # the tmux -c, the verification) is only as good as this path.
-        loc = authoritative_cwd(target, entry)
-        cwd = loc["cwd"]
-        if loc["diverged"]:
-            _log(conn, target, "note", True, "registry_cwd_diverged_from_project_config",
-                 {"governed": loc["governed"], "registry": loc["registry"]})
-        if not cwd:
-            _log(conn, target, "refuse", False, "no_project_dir", loc)
-            return {"recovered": False, "reason": "no_project_dir", "cwd_resolution": loc}
-        if not os.path.isdir(cwd):
-            # FAIL CLOSED. `tmux new-session -c <missing>` does NOT fail — it returns rc=0
-            # and silently starts the pane in the server's default directory, which is
-            # /root. That is how a MESS session came up in /root on a stale conversation
-            # and sat on the trust prompt. A path we cannot stand in is not a path we start
-            # a session in.
-            _log(conn, target, "refuse", False, "project_dir_missing", loc)
-            return {"recovered": False, "reason": "project_dir_missing",
-                    "cwd_resolution": loc, "owner_blocker": True}
-
-        p = pane_state(target)
-        if not p.get("missing") and not p.get("dead"):
-            _log(conn, target, "skip", True, "already_alive")
-            return {"recovered": False, "reason": "already_alive"}
-
-
-        tail = _capture(target, 30)
-        if deliberate_stop(target, tail):
-            _log(conn, target, "refuse", False, "deliberate_stop")
-            return {"recovered": False, "reason": "deliberate_stop"}
-
-        # DUPLICATE PROOF — never a second live Claude for the same project.
-        dups = live_claude_for_cwd(cwd, exclude_target=target)
-        if dups:
-            _log(conn, target, "refuse", False, "live_claude_exists_for_cwd",
-                 {"panes": [d["target"] for d in dups]})
-            return {"recovered": False, "reason": "live_claude_exists_for_cwd",
-                    "panes": [d["target"] for d in dups]}
-
-        limits = reg.get("limits") or {}
-        window = float(limits.get("window_secs") or 21600)
-        cap = int(limits.get("max_recoveries_per_target") or 3)
-        used = recent_recoveries(target, window, conn=conn)
-        if used >= cap:
-            conn.execute("INSERT OR REPLACE INTO session_quarantine VALUES (?,?,?)",
-                         (target, _now_iso(),
-                          f"crash loop: {used} recoveries within {int(window)}s"))
-            conn.commit()
-            _log(conn, target, "quarantine", False, "crash_loop_cap_reached",
-                 {"used": used, "cap": cap})
-            return {"recovered": False, "reason": "quarantined_crash_loop",
-                    "used": used, "cap": cap, "owner_blocker": True}
-
-        # ── WHY: a dead pane is not a reason; open work is ──
-        # Last gate before acting, deliberately: the refusals above are stronger statements
-        # about this target (the owner stopped it, a live pane already serves this project,
-        # it is crash-looping) and each deserves to be the reported reason. `explicit` is
-        # the owner/MCP resume path — the owner asking IS the reason — and skips only this
-        # check, never the project-directory proof above.
-        if not explicit:
-            work = has_authoritative_work(target)
-            if not work["open"]:
-                _log(conn, target, "refuse", False, f"no_open_work:{work['reason']}", work)
-                return {"recovered": False, "reason": "no_open_work",
-                        "detail": work,
-                        "note": "recovery restores interrupted work; it does not reopen "
-                                "work that finished"}
-
-        # exponential backoff on repeated attempts within the window
-        base = float(limits.get("backoff_base_secs") or 60)
-        if used:
-            sleep(min(base * (2 ** (used - 1)), 900))
-
-        session = entry.get("session") or target.split(":")[0]
-        conv = entry.get("conversation_id") or ""
-        shape = entry.get("resume_shape") or "claude --resume {conversation_id}"
-        cmd = shape.format(conversation_id=conv, cwd=cwd)
-        run = run_fn or (lambda a: _tmux(a))
-
-        # Revive the EXACT pane. respawn-pane reuses the existing window; only if the
-        # whole session is gone do we recreate it under the same name.
-        if p.get("missing"):
-            rc, _, err = run(["new-session", "-d", "-s", session, "-c", cwd, cmd])
-            how = "new-session"
-        else:
-            rc, _, err = run(["respawn-pane", "-k", "-t", target, "-c", cwd, cmd])
-            how = "respawn-pane"
-        if rc != 0:
-            _log(conn, target, "revive", False, f"tmux_failed:{how}", {"err": err[:200]})
-            return {"recovered": False, "reason": f"tmux_failed:{how}", "error": err[:200]}
-
-        sleep(6)
-        choice = choose_summary_if_offered(target)
-        if choice.get("offered"):
-            sleep(4)
-
-        v = verify_recovered(target, cwd)
-        torn_down = False
-        if not v["ok"] and not v["checks"].get("cwd_matches", True):
-            # We started this pane and it came up in the wrong directory. Leaving it is how
-            # a "failed" recovery still produced a live Claude sitting in /root on a stale
-            # conversation, which the next discovery pass then recorded as a real agent.
-            # A recovery that cannot prove itself cleans up after itself.
-            run(["kill-session", "-t", session])
-            torn_down = True
-        _log(conn, target, "revive", bool(v["ok"]), "verified" if v["ok"] else "verify_failed",
-             {"how": how, "checks": v["checks"], "summary_choice": choice, "pid": v.get("pid"),
-              "torn_down": torn_down, "cwd_resolution": loc})
-        return {"recovered": bool(v["ok"]), "reason": "verified" if v["ok"] else "verify_failed",
-                "how": how, "verify": v, "summary_choice": choice,
-                "conversation_id": conv, "torn_down": torn_down,
-                "note": "recovery restores the session only; it authorises no new work"}
+        return _recover_inner(target, registry=registry, conn=conn, run_fn=run_fn,
+                              sleep=sleep, now=now, explicit=explicit, probe_fn=probe_fn)
+    except TmuxControlUnreachable as e:
+        # The plane went down mid-flight, between the precondition and a later read.
+        # Same rule: refuse, explain, change nothing.
+        _log(conn, target, "refuse", False, "tmux_control_unreachable", {"error": str(e)[:200]})
+        return {"recovered": False, "reason": "tmux_control_unreachable",
+                "detail": str(e)[:200]}
     finally:
         if own:
             conn.close()
+
+
+def _recover_inner(target: str, *, registry, conn, run_fn, sleep, now, explicit,
+                   probe_fn) -> dict:
+    reg = registry if registry is not None else load_registry()
+    entry = (reg.get("sessions") or {}).get(target)
+    if not entry:
+        _log(conn, target, "refuse", False, "not_registered")
+        return {"recovered": False, "reason": "not_registered"}
+    if not entry.get("enabled"):
+        _log(conn, target, "refuse", False, "disabled_in_registry")
+        return {"recovered": False, "reason": "disabled_in_registry"}
+    q = is_quarantined(target, conn=conn)
+    if q:
+        return {"recovered": False, "reason": "quarantined", "since": q["since"]}
+
+    # FAIL CLOSED on a control plane that is unreachable OR split. Every proof this
+    # function relies on — "the pane is dead", "no other live Claude holds this cwd"
+    # — is read through tmux, so a plane we cannot fully see turns each of them into
+    # a false yes. A SPLIT plane (two servers bound to the same socket path) is just
+    # as blinding: the duplicate this function must never create may already exist on
+    # the server we cannot reach. Refusing costs a delayed recovery; proceeding costs
+    # a second live agent on the same project.
+    ctl = (probe_fn or control_probe)()
+    if not ctl.get("healthy"):
+        _log(conn, target, "refuse", False, "tmux_control_not_healthy", ctl)
+        return {"recovered": False, "reason": "tmux_control_not_healthy",
+                "control": ctl, "owner_blocker": bool(ctl.get("split_brain"))}
+
+    # ── WHERE: the governor's project dir wins over the recovery registry ──
+    # Resolved before anything else, because every later proof (duplicate detection,
+    # the tmux -c, the verification) is only as good as this path.
+    loc = authoritative_cwd(target, entry)
+    cwd = loc["cwd"]
+    if loc["diverged"]:
+        _log(conn, target, "note", True, "registry_cwd_diverged_from_project_config",
+             {"governed": loc["governed"], "registry": loc["registry"]})
+    if not cwd:
+        _log(conn, target, "refuse", False, "no_project_dir", loc)
+        return {"recovered": False, "reason": "no_project_dir", "cwd_resolution": loc}
+    if not os.path.isdir(cwd):
+        # FAIL CLOSED. `tmux new-session -c <missing>` does NOT fail — it returns rc=0
+        # and silently starts the pane in the server's default directory, which is
+        # /root. That is how a MESS session came up in /root on a stale conversation
+        # and sat on the trust prompt. A path we cannot stand in is not a path we start
+        # a session in.
+        _log(conn, target, "refuse", False, "project_dir_missing", loc)
+        return {"recovered": False, "reason": "project_dir_missing",
+                "cwd_resolution": loc, "owner_blocker": True}
+
+    p = pane_state(target)
+    if not p.get("missing") and not p.get("dead"):
+        _log(conn, target, "skip", True, "already_alive")
+        return {"recovered": False, "reason": "already_alive"}
+
+
+    tail = _capture(target, 30)
+    if deliberate_stop(target, tail):
+        _log(conn, target, "refuse", False, "deliberate_stop")
+        return {"recovered": False, "reason": "deliberate_stop"}
+
+    # DUPLICATE PROOF — never a second live Claude for the same project.
+    dups = live_claude_for_cwd(cwd, exclude_target=target)
+    if dups:
+        _log(conn, target, "refuse", False, "live_claude_exists_for_cwd",
+             {"panes": [d["target"] for d in dups]})
+        return {"recovered": False, "reason": "live_claude_exists_for_cwd",
+                "panes": [d["target"] for d in dups]}
+
+    limits = reg.get("limits") or {}
+    window = float(limits.get("window_secs") or 21600)
+    cap = int(limits.get("max_recoveries_per_target") or 3)
+    used = recent_recoveries(target, window, conn=conn)
+    if used >= cap:
+        conn.execute("INSERT OR REPLACE INTO session_quarantine VALUES (?,?,?)",
+                     (target, _now_iso(),
+                      f"crash loop: {used} recoveries within {int(window)}s"))
+        conn.commit()
+        _log(conn, target, "quarantine", False, "crash_loop_cap_reached",
+             {"used": used, "cap": cap})
+        return {"recovered": False, "reason": "quarantined_crash_loop",
+                "used": used, "cap": cap, "owner_blocker": True}
+
+    # ── WHY: a dead pane is not a reason; open work is ──
+    # Last gate before acting, deliberately: the refusals above are stronger statements
+    # about this target (the owner stopped it, a live pane already serves this project,
+    # it is crash-looping) and each deserves to be the reported reason. `explicit` is
+    # the owner/MCP resume path — the owner asking IS the reason — and skips only this
+    # check, never the project-directory proof above.
+    if not explicit:
+        work = has_authoritative_work(target)
+        if not work["open"]:
+            _log(conn, target, "refuse", False, f"no_open_work:{work['reason']}", work)
+            return {"recovered": False, "reason": "no_open_work",
+                    "detail": work,
+                    "note": "recovery restores interrupted work; it does not reopen "
+                            "work that finished"}
+
+    # exponential backoff on repeated attempts within the window
+    base = float(limits.get("backoff_base_secs") or 60)
+    if used:
+        sleep(min(base * (2 ** (used - 1)), 900))
+
+    session = entry.get("session") or target.split(":")[0]
+    conv = entry.get("conversation_id") or ""
+    shape = entry.get("resume_shape") or "claude --resume {conversation_id}"
+    cmd = shape.format(conversation_id=conv, cwd=cwd)
+    run = run_fn or (lambda a: _tmux(a))
+
+    # Revive the EXACT pane. respawn-pane reuses the existing window; only if the
+    # whole session is gone do we recreate it under the same name.
+    if p.get("missing"):
+        rc, _, err = run(["new-session", "-d", "-s", session, "-c", cwd, cmd])
+        how = "new-session"
+    else:
+        rc, _, err = run(["respawn-pane", "-k", "-t", target, "-c", cwd, cmd])
+        how = "respawn-pane"
+    if rc != 0:
+        _log(conn, target, "revive", False, f"tmux_failed:{how}", {"err": err[:200]})
+        return {"recovered": False, "reason": f"tmux_failed:{how}", "error": err[:200]}
+
+    sleep(6)
+    choice = choose_summary_if_offered(target)
+    if choice.get("offered"):
+        sleep(4)
+
+    v = verify_recovered(target, cwd)
+    torn_down = False
+    if not v["ok"] and not v["checks"].get("cwd_matches", True):
+        # We started this pane and it came up in the wrong directory. Leaving it is how
+        # a "failed" recovery still produced a live Claude sitting in /root on a stale
+        # conversation, which the next discovery pass then recorded as a real agent.
+        # A recovery that cannot prove itself cleans up after itself.
+        run(["kill-session", "-t", session])
+        torn_down = True
+    _log(conn, target, "revive", bool(v["ok"]), "verified" if v["ok"] else "verify_failed",
+         {"how": how, "checks": v["checks"], "summary_choice": choice, "pid": v.get("pid"),
+          "torn_down": torn_down, "cwd_resolution": loc})
+    return {"recovered": bool(v["ok"]), "reason": "verified" if v["ok"] else "verify_failed",
+            "how": how, "verify": v, "summary_choice": choice,
+            "conversation_id": conv, "torn_down": torn_down,
+            "note": "recovery restores the session only; it authorises no new work"}
 
 
 def status(conn=None) -> dict:
@@ -440,13 +488,29 @@ def status(conn=None) -> dict:
     conn = conn or _db()
     try:
         reg = load_registry()
-        out = {"registered": sorted((reg.get("sessions") or {}).keys()), "targets": {}}
+        out = {"registered": sorted((reg.get("sessions") or {}).keys()), "targets": {},
+               "control_unreachable": False}
+        # Read the plane ONCE, and state it when it cannot be read. `alive: False` and
+        # `alive: None` are different claims: the first says the pane is gone, the second
+        # says we could not look. Reporting the first when the second is true is what let
+        # a 100-minute control blackout read as a healthy fleet on 2026-08-30.
+        live, control_error = None, None
+        try:
+            live = {row["target"]: row for row in panes()}
+        except TmuxControlUnreachable as e:
+            control_error = str(e)[:200]
+            out["control_unreachable"] = True
+            out["control_error"] = control_error
         for t in out["registered"]:
             entry = reg["sessions"][t]
-            p = pane_state(t)
+            if control_error is None:
+                p = live.get(t) or {"missing": True, "dead": True}
+                alive = (not p.get("missing")) and (not p.get("dead"))
+            else:
+                alive = None
             out["targets"][t] = {
                 "enabled": bool(entry.get("enabled")),
-                "alive": (not p.get("missing")) and (not p.get("dead")),
+                "alive": alive,
                 "quarantined": bool(is_quarantined(t, conn=conn)),
                 "recoveries_6h": recent_recoveries(t, 21600, conn=conn),
             }

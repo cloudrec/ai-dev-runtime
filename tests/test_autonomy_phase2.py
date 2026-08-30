@@ -18,6 +18,18 @@ import pytest
 
 from core import project_state as ps
 from core import session_recovery as sr
+
+
+@pytest.fixture(autouse=True)
+def _reachable_control_plane(monkeypatch):
+    """recover() now refuses outright when the tmux control plane is unreachable or
+    split (see core/tmux_control.py — a blind plane turns "the pane is dead" and "no
+    duplicate exists" into false yeses). These tests exercise the decisions ABOVE that
+    gate, so they declare a healthy plane; the gate itself is tested directly in
+    test_tmux_control.py and by the refusal tests below."""
+    monkeypatch.setattr(sr, "control_probe",
+                        lambda: {"healthy": True, "reachable": True, "reason": "ok"})
+
 from core import commander_autopilot as ap
 
 

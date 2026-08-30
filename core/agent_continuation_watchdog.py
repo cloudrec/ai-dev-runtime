@@ -262,9 +262,25 @@ def health(load_config: Optional[Callable] = None,
             eligible_live, unmanaged_live = [], []
         if live_error:
             base["live_inventory_error"] = live_error
+            base["control_plane_reachable"] = False
+        elif live is not None:
+            base["control_plane_reachable"] = True
 
+        # FAIL CLOSED, and checked FIRST — before any verdict that silently assumes the
+        # inventory is real. 2026-08-30: the tmux control socket was deleted underneath a
+        # live server, every inventory read raised for 100 minutes, and this function
+        # recorded the exception as a field and then reported `ok` anyway (the original
+        # comment, "health never depends on tmux", was true of the CODE and false of the
+        # CLAIM: a coverage verdict is a statement about live agents). Health that cannot
+        # see the fleet does not get to call it healthy. UNKNOWN is not ok.
+        if live_error:
+            base["status"] = "unreachable"
+            base["warning"] = (
+                f"tmux_control_unreachable: the live agent inventory could not be read "
+                f"({live_error}) — coverage is UNKNOWN, not ok. An inventory that failed "
+                f"to load is not an empty fleet.")
         # Misconfiguration: enabled but nothing it is allowed to act on.
-        if ENABLED and len(elig) == 0:
+        elif ENABLED and len(elig) == 0:
             base["status"] = "warning"
             base["warning"] = "no_eligible_sessions: watchdog enabled but no managed-auto " \
                               "session is configured — it can never act (misconfiguration)"
@@ -1001,7 +1017,13 @@ async def run_loop() -> None:
         try:
             def _live():
                 from core import agent_control
-                return {a.get("target") for a in agent_control.agent_list().get("agents", [])
+                inv = agent_control.agent_list()
+                if inv.get("control_unreachable"):
+                    # Raise rather than hand health() a blind empty set: an inventory
+                    # taken while tmux control is down is not evidence of anything.
+                    raise RuntimeError(f"tmux control unreachable: "
+                                       f"{inv.get('control_reason') or 'unknown'}")
+                return {a.get("target") for a in inv.get("agents", [])
                         if a.get("is_agent") and a.get("target")}
             h = await asyncio.to_thread(lambda: health(live_sessions=_live))
             coverage = h.get("coverage")

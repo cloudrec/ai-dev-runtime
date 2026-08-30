@@ -414,6 +414,13 @@ def test_zero_configured_still_reports_the_original_misconfiguration(monkeypatch
 
 
 def test_a_broken_tmux_inventory_never_breaks_health(monkeypatch):
+    """It must not RAISE — and it must not claim ok either.
+
+    2026-08-30: the tmux control socket was deleted underneath a live server, every
+    inventory read raised for 100 minutes, and this function recorded the exception as a
+    field and reported `ok` anyway. Not breaking is the requirement; calling an
+    unreadable fleet healthy was the defect.
+    """
     from core import agent_continuation_watchdog as cw
 
     def boom():
@@ -421,8 +428,19 @@ def test_a_broken_tmux_inventory_never_breaks_health(monkeypatch):
     monkeypatch.setattr(cw, "eligible_sessions", lambda _lc: {"cp-canary"})
     monkeypatch.setattr(cw, "ENABLED", True)
     h = cw.health(load_config=lambda: {}, live_sessions=boom)
-    assert h["status"] == "ok"
+    assert h["status"] == "unreachable"
+    assert h["status"] != "ok"
     assert "live_inventory_error" in h
+    assert h["control_plane_reachable"] is False
+    assert "UNKNOWN" in h["warning"]
+
+
+def test_health_reports_the_plane_reachable_when_the_inventory_loads(monkeypatch):
+    from core import agent_continuation_watchdog as cw
+    monkeypatch.setattr(cw, "eligible_sessions", lambda _lc: {"cp-canary"})
+    monkeypatch.setattr(cw, "ENABLED", True)
+    h = cw.health(load_config=lambda: {}, live_sessions=lambda: {"cp-canary:0.0"})
+    assert h["status"] == "ok" and h["control_plane_reachable"] is True
 
 
 def test_without_an_injected_inventory_health_stays_hermetic(monkeypatch):

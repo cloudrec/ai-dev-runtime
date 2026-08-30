@@ -1244,8 +1244,18 @@ def agent_list() -> dict:
     rc, out, err = _tmux(["list-panes", "-a", "-F", _PANE_FORMAT])
     if rc != 0:
         if "no server running" in (err or "").lower():
+            # An inventory we could not read is UNKNOWN, not empty. This branch used to
+            # return a plain empty-but-successful inventory, and all twenty callers —
+            # discovery, the stall doctor, the supervisor, the continuation watchdog —
+            # read that as "the fleet is fine, it is just empty". On 2026-08-30 the
+            # control socket was deleted underneath a live server and managed-agent
+            # health stayed green for 100 minutes on exactly that reading. The rows are
+            # still empty (callers that only want agents keep working) but the condition
+            # is now stated, so a caller that must not act on a blind inventory can see
+            # it. See core/tmux_control.py for the incident and the guard.
             audit("agent_list", "-", agents=0, note="no tmux server")
-            return {"agents": [], "sessions": [], "duplicates": [], "tmux_running": False}
+            return {"agents": [], "sessions": [], "duplicates": [], "tmux_running": False,
+                    "control_unreachable": True, "control_reason": "no_tmux_server"}
         raise AgentControlError(f"tmux list-panes failed: {err.strip()[:200]}")
 
     agents = []
@@ -1309,6 +1319,7 @@ def agent_list() -> dict:
         "sessions": sorted({a["session"] for a in agents}),
         "duplicates": duplicates,
         "tmux_running": True,
+        "control_unreachable": False,
     }
 
 

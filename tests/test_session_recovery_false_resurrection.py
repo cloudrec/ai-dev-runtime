@@ -23,6 +23,18 @@ import pytest
 
 from core import session_recovery as sr
 
+
+@pytest.fixture(autouse=True)
+def _reachable_control_plane(monkeypatch):
+    """recover() now refuses outright when the tmux control plane is unreachable or
+    split (see core/tmux_control.py — a blind plane turns "the pane is dead" and "no
+    duplicate exists" into false yeses). These tests exercise the decisions ABOVE that
+    gate, so they declare a healthy plane; the gate itself is tested directly in
+    test_tmux_control.py and by the refusal tests below."""
+    monkeypatch.setattr(sr, "control_probe",
+                        lambda: {"healthy": True, "reachable": True, "reason": "ok"})
+
+
 MESS = "mess-qa-automation:0.0"
 STALE_CONV = "406eab3c-66f4-4a35-b1cf-4a0f657480fc"
 
@@ -356,3 +368,80 @@ def test_the_release_is_audited_like_every_other_recovery_decision():
                     "ORDER BY rowid DESC LIMIT 1", (_CANARY,)).fetchone()
     c.close()
     assert row and row[0] == "release_quarantine" and row[1] == 1
+
+
+# ── 2026-08-30: a BLIND control plane must refuse, not invent ────────────────
+# `/tmp/tmux-0` was deleted by a generic 48h /tmp cleaner (a unix socket's mtime is
+# stamped at bind() and never moves, so an 18-day-old server socket looks idle forever).
+# The server survived and attached clients kept working; every new connect() failed.
+# `panes()` returned [] for that, which is the same value it returns for "there are no
+# panes" — so pane_state() called the target dead and live_claude_for_cwd() called the
+# project free. A client that hit the same wall started a SECOND tmux server and
+# launched a duplicate Claude on a project that already had a live one.
+
+def test_panes_raises_instead_of_reporting_an_empty_fleet_it_could_not_read(monkeypatch):
+    monkeypatch.setattr(sr, "_tmux", lambda a: (
+        1, "", "error connecting to /tmp/tmux-0/default (No such file or directory)"))
+    with pytest.raises(sr.TmuxControlUnreachable):
+        sr.panes()
+
+
+def test_panes_still_returns_empty_when_tmux_genuinely_reports_no_panes(monkeypatch):
+    monkeypatch.setattr(sr, "_tmux", lambda a: (0, "", ""))
+    assert sr.panes() == []
+
+
+def test_recovery_refuses_while_the_control_plane_is_unreachable(monkeypatch, tmp_path):
+    """The refusal that would have prevented the duplicate agent."""
+    monkeypatch.setattr(sr, "control_probe", lambda: {
+        "healthy": False, "reachable": False, "reason": "socket_missing"})
+    reg = {"sessions": {MESS: {"target": MESS, "enabled": True,
+                               "cwd": str(tmp_path)}}, "limits": {}}
+    r = sr.recover(MESS, registry=reg)
+    assert r["recovered"] is False
+    assert r["reason"] == "tmux_control_not_healthy"
+
+
+def test_recovery_refuses_a_split_control_plane_as_an_owner_blocker(monkeypatch, tmp_path):
+    """Two servers on one socket path: the duplicate this function must never create may
+    already exist on the server it cannot reach."""
+    monkeypatch.setattr(sr, "control_probe", lambda: {
+        "healthy": False, "reachable": True, "split_brain": True, "reason": "split_brain"})
+    reg = {"sessions": {MESS: {"target": MESS, "enabled": True,
+                               "cwd": str(tmp_path)}}, "limits": {}}
+    r = sr.recover(MESS, registry=reg)
+    assert r["recovered"] is False and r["reason"] == "tmux_control_not_healthy"
+    assert r["owner_blocker"] is True
+
+
+def test_recovery_turns_a_mid_flight_control_loss_into_a_refusal_not_a_crash(monkeypatch, tmp_path):
+    """The plane can go down between the precondition and a later pane read."""
+    monkeypatch.setattr(sr, "control_probe", lambda: {"healthy": True, "reachable": True})
+    monkeypatch.setattr(sr, "pane_state", lambda t: (_ for _ in ()).throw(
+        sr.TmuxControlUnreachable("tmux list-panes failed (rc=1): error connecting")))
+    reg = {"sessions": {MESS: {"target": MESS, "enabled": True,
+                               "cwd": str(tmp_path)}}, "limits": {}}
+    r = sr.recover(MESS, registry=reg)
+    assert r["recovered"] is False and r["reason"] == "tmux_control_unreachable"
+
+
+def test_status_reports_alive_unknown_not_dead_when_it_cannot_look(monkeypatch, tmp_path):
+    """`alive: False` says the pane is gone; `alive: None` says we could not look.
+    Reporting the first when the second is true is how a blackout reads as a fleet."""
+    monkeypatch.setattr(sr, "load_registry", lambda *a, **k: {
+        "sessions": {MESS: {"target": MESS, "enabled": True}}, "limits": {}})
+    monkeypatch.setattr(sr, "panes", lambda: (_ for _ in ()).throw(
+        sr.TmuxControlUnreachable("error connecting")))
+    st = sr.status()
+    assert st["control_unreachable"] is True
+    assert st["targets"][MESS]["alive"] is None
+
+
+def test_status_reports_real_liveness_when_the_plane_answers(monkeypatch):
+    monkeypatch.setattr(sr, "load_registry", lambda *a, **k: {
+        "sessions": {MESS: {"target": MESS, "enabled": True}}, "limits": {}})
+    monkeypatch.setattr(sr, "panes", lambda: [
+        {"target": MESS, "dead": False, "pid": "1", "cwd": "/opt/mess", "cmd": "claude"}])
+    st = sr.status()
+    assert st["control_unreachable"] is False
+    assert st["targets"][MESS]["alive"] is True

@@ -501,6 +501,19 @@ async def agents_direct_lifecycle_metrics(_: bool = Depends(_auth)):
     return {"enabled": _dal.ENABLED, "metrics": _dal.metrics()}
 
 
+@router.get("/agents/tmux-control/health")
+async def agents_tmux_control_health(_: bool = Depends(_auth)):
+    """Reachability and integrity of the tmux control plane Owner OS drives agents
+    through. Read-only, and GREEN only on a proven client round-trip.
+
+    `status` is `ok` only when a real tmux round-trip succeeded AND exactly one server is
+    bound to the socket path. `unreachable` means managed-agent state is UNKNOWN — not
+    empty, not healthy. `split_brain` means two servers claim the path and agents on the
+    orphaned one are invisible to Owner OS entirely."""
+    from core import tmux_control as _tc
+    return _tc.health()
+
+
 @router.get("/agents/continuation-watchdog/health")
 async def agents_continuation_watchdog_health(_: bool = Depends(_auth)):
     """Continuation-watchdog health + last action (last run, agents checked,
@@ -515,7 +528,13 @@ async def agents_continuation_watchdog_health(_: bool = Depends(_auth)):
     from core import agent_continuation_watchdog as _cw
 
     def _live():
-        return {a.get("target") for a in agent_control.agent_list().get("agents", [])
+        inv = agent_control.agent_list()
+        if inv.get("control_unreachable"):
+            # Never hand health() a blind empty set: it would compute coverage against a
+            # fleet it could not see and call the result ok.
+            raise RuntimeError(f"tmux control unreachable: "
+                               f"{inv.get('control_reason') or 'unknown'}")
+        return {a.get("target") for a in inv.get("agents", [])
                 if a.get("is_agent") and a.get("target")}
 
     return _cw.health(live_sessions=_live)

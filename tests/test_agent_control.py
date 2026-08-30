@@ -1013,3 +1013,23 @@ def test_monitor_signal_never_overrides_a_real_external_block():
     blocked = MONITOR_AT_REST.replace("  [CAVEMAN]\n",
                                       "  Blocked: vendor key required to continue\n")
     assert ac.classify_state(True, True, blocked, pending_input="") == "externally_blocked"
+
+
+def test_an_unreadable_inventory_states_that_it_is_unreadable(monkeypatch):
+    """2026-08-30: this branch returned a plain empty-but-successful inventory, and all
+    twenty callers read it as "the fleet is fine, it is just empty". The rows stay empty
+    — callers that only want agents keep working — but the condition is now stated, so a
+    caller that must not act on a blind inventory can see it."""
+    import core.agent_control as ac
+    monkeypatch.setattr(ac, "_tmux",
+                        lambda a, stdin=None: (1, "", "no server running on /tmp/tmux-0/default"))
+    r = ac.agent_list()
+    assert r["tmux_running"] is False
+    assert r["control_unreachable"] is True
+    assert r["control_reason"] == "no_tmux_server"
+
+
+def test_a_readable_inventory_is_marked_reachable(monkeypatch):
+    import core.agent_control as ac
+    monkeypatch.setattr(ac, "_tmux", lambda a, stdin=None: (0, "", ""))
+    assert ac.agent_list()["control_unreachable"] is False

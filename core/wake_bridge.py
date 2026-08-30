@@ -98,6 +98,11 @@ WAKE_EVENT_TYPES = frozenset({
     "agent_dead", "agent_process_failed", "agent_crash_loop", "session_quarantined",
     "governor_blocker", "stage_blocked_external", "task_failed", "action_blocked",
     "notification_dead_letter", "notification_channel_down", "notifications_red",
+    # the control plane itself is down or split (2026-08-30: the tmux control socket was
+    # deleted under a live server; managed-agent control was gone for 100 minutes and
+    # nothing could wake anyone about it, because losing the ability to SEE agents was
+    # not itself an event type). Emitted deduped per class per 30 min by core.tmux_control.
+    "agent_control_plane_unreachable", "agent_control_plane_split",
     # an owner-directed task reaching its end
     "task_completed", "work_stopped_incomplete",
     # closed-loop wake watchdog (task 211): a delivered wake produced no observed
@@ -113,6 +118,9 @@ ROUTINE_EVENT_TYPES = frozenset({
     "work_report_published", "owner_gate_answered", "blocker_resolved",
     "context_rotated", "false_idle_corrected", "new_agent_discovered",
     "verified_record_contradicted",
+    # the control plane came back (self-healed by the guard). Durable, never a wake:
+    # the outage already woke the owner, and the recovery is the good news.
+    "agent_control_plane_recovered",
     # runtime job lifecycle chatter: durable history, never a wake on its own —
     # the terminal states that matter arrive as task_failed / action_blocked /
     # owner_decision_required / task_completed and wake through those.
@@ -701,7 +709,11 @@ _WORKER_WATCHED_FILES = {
     # loop live there — and tools/wake_companion.py is its own entrypoint. A fix
     # to either changed how wakes are delivered while raising no skew at all,
     # which is exactly the failure this mechanism exists to catch.
+    # tmux_control.py joins the list for the same reason: the companion now runs the
+    # control-plane guard first in every tick, so a fix to the probe or the repair is a
+    # fix to how the companion sees the fleet at all.
     "wake_companion": ("wake_bridge.py", "wake_routes.py", "closed_loop_wake.py",
+                       "tmux_control.py",
                        os.path.join("..", "tools", "cdp_composer.py"),
                        os.path.join("..", "tools", "wake_companion.py")),
     "agent_orchestrator": ("agent_control.py", "agent_orchestrator.py",

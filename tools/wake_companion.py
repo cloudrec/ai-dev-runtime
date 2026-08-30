@@ -24,6 +24,10 @@ POLL_SECS = int(os.getenv("COMPANION_POLL_SECS", "20"))
 # Inventory the ChatGPT tabs every N ticks (default ~5 minutes at 20s polls).
 DISCOVERY_EVERY_TICKS = int(os.getenv("COMPANION_DISCOVERY_TICKS", "15"))
 CDP_LIST_URL = os.getenv("COMPANION_CDP_LIST_URL", "http://127.0.0.1:9222/json/list")
+# The control-plane guard runs BEFORE the agent watch, every tick: if the tmux socket has
+# been lost, the repair happens in time for this same tick's inventory instead of a
+# blackout that lasts until a human notices (2026-08-30: 100 minutes).
+CONTROL_GUARD_ENABLED = os.getenv("COMPANION_CONTROL_GUARD", "1") not in ("0", "false", "no")
 
 
 def discover_chats() -> dict:
@@ -203,6 +207,27 @@ def watch_runtime() -> dict:
     return r
 
 
+def watch_control_plane() -> dict:
+    """Probe the tmux control plane, repair a deleted socket, and make either outcome
+    durable.
+
+    This runs first in the tick because everything after it — the agent watch, the stall
+    doctor, the closed-loop watch — reads the fleet THROUGH tmux. On 2026-08-30 that
+    transport was gone for 100 minutes and the only trace was this process's stdout:
+    no event, no wake, and a managed-agent health surface still reporting ok.
+    """
+    from core import tmux_control as tc
+    r = tc.guard()
+    st = r.get("probe") or {}
+    if not st.get("healthy"):
+        rep = r.get("repair") or {}
+        print(f"control-plane: {st.get('reason')} socket={st.get('socket_path')} "
+              f"listeners={st.get('listeners')} pids={st.get('listener_pids')} "
+              f"repair={rep.get('reason') or 'not_attempted'} "
+              f"event={r.get('event_id')}", flush=True)
+    return r
+
+
 def main() -> None:
     from core import wake_bridge as wb
     # Announce this process and the code it started with, so a deploy that
@@ -216,6 +241,11 @@ def main() -> None:
     while True:
         try:
             tick(wb)
+            if CONTROL_GUARD_ENABLED:
+                try:
+                    watch_control_plane()
+                except Exception as e:  # noqa: BLE001 — the guard never breaks the loop
+                    print(f"control-plane guard error: {str(e)[:160]}", flush=True)
             if AGENT_WATCH_ENABLED:
                 try:
                     watch_agents()
