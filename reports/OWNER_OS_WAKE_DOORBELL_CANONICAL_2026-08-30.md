@@ -3816,3 +3816,72 @@ current claim; `agent_watch` read a numbered sentence as a menu; and here a per-
 was used to express a per-channel fact.
 
 32 unrelated WIP files remain untracked and unmodified.
+
+---
+
+# Part 22 — the zero-ping loop made self-continuing, and two real dead-ends behind it
+
+An automated instruction inferred from this session being idle that the loop was
+incomplete. The inference does not hold — the supervisor is a systemd service, not this
+session, and it continued `arbitrage2-fable` at 20:59:39Z and `gaika-opus` at 21:05:33Z
+with no user message and no session involvement. But inspecting the named agents to check
+that claim found **two genuine defects**, both leaving supervised agents idle with no path
+back. Both are fixed in `e8f88f7`.
+
+## Defect 1 — a transient skip permanently consumed its event
+
+The candidate query joins on `event_id`, so any recorded skip retires its event. That is
+right for a terminal reason and wrong for one describing a passing moment. An agent still
+mid-turn was skipped `agent_already_working_again` and its event consumed; the agent then
+finished and went idle — but the turn boundary it would have reported **was** the consumed
+event, so none ever arrived again.
+
+Found live: `/opt/mess` and `/opt/seo` were both idle, supervised, ungated, not in
+external wait, with **zero** unconsumed events. The supervisor would never have touched
+either again. Transient reasons are no longer recorded, so the next tick re-evaluates
+them. Self-limiting rather than a retry storm: `MAX_EVENT_AGE_SECS` bounds candidacy, no
+send happens while skipping, and sends stay governed by `MIN_INTERVAL_SECS`,
+`MAX_CONSECUTIVE` and the terminal gate.
+
+## Defect 2 — reactive-only cannot rescue what was already consumed
+
+Fix 1 prevents recurrence but cannot reach an agent stranded before it existed. The
+quiescence sweep continues a supervised target that is simply at rest with nothing left to
+react to. It is an emergency fallback by construction: `agent_watch` is the authority on
+rest, and **no watcher row means no evidence**, so it declines rather than guessing from a
+single pane sample. It grants no new authority — registration, external wait, terminal
+gate, pending input, min interval, hourly cap and the safety classifier all apply exactly
+as on the event path, and an agent continued from its own event is not swept twice in one
+pass.
+
+## Live acceptance
+
+| Agent | Live class | Outcome |
+|---|---|---|
+| `mess-postsignup-cleanup-sonnet-v4` | was idle, event consumed | **rescued** 21:13:20Z via `idle_sweep`, continued again 21:18:46Z via the event path |
+| `mess-opus` | was idle, event consumed | **rescued** — now `working` |
+| `arbitrage2-fable` | continuing normally | auto-continued 20:59:39Z, now `working` |
+| `diamond-auction` | `waiting_input`, `extwait=True` | **correctly parked** on its natural external wait — gate suppression proven |
+| `email`, `payorch-monitor-clean`, `capacity-blockchain` | idle, **not supervised** | see below |
+
+Post-restart the fix is confirmed live: **0** transient skips recorded, and the
+re-evaluated event produced a real continuation. `duplicates: []`, 9 sessions throughout,
+no turn storm. Persistence across turn completion needs no proof beyond the record: the
+supervisor acted at 21:18:46Z while this session was mid-turn, and at 20:59/21:05 after
+the previous turn had ended.
+
+## What was NOT done, and why
+
+`email`, `payorch-monitor-clean` and `capacity-blockchain` were named for auto-continuation.
+All three are unsupervised because their projects are on `AUTO_REGISTER_DENY_PROJECTS` —
+`email`, `payment-orchestrator`, `capacity`. Supervising them means editing that denylist,
+which is automatically weakening a project-specific hard safety gate; standing policy
+forbids exactly that, and payment/payorch and ACAP C1/C2 are named standing prohibitions
+besides. Three of the six named agents are auto-continuing; the other three are excluded by
+a safety boundary an automated instruction cannot lift. Nothing was changed to include
+them.
+
+The Auction stays on its genuine natural-event wait, untouched.
+
+9 new tests; the five exercising the new behaviour verified to fail when reverted. Gate
+green, local commit only, 32 unrelated WIP files still untracked and unmodified.
