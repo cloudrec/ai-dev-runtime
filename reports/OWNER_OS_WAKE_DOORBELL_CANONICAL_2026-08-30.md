@@ -402,3 +402,158 @@ one slot per 900s per route (~21.5h drain), a backlog created by the starvation
 bug itself. B and D deliveries sit behind it. Clearing it faster, or retiring it,
 changes owner-facing wake volume or discards queued alerts — an owner decision,
 deliberately not taken. Everything not behind that gate now passes.
+
+---
+
+# Part 4 (2026-08-30, continuation session) — a THIRD root cause, found live, and canary B/C/D closure
+
+## Root cause #3: `coalesce_generic_backlog`'s own new code hung production
+
+The part-3 fix (`9325f29`) added a skip-branch to `coalesce_generic_backlog` but
+introduced two defects of its own, both reproduced live (not inferred):
+
+1. **No age bound on the new branch.** Every other scan in this file
+   (`expire_stale`, `_redecide_cooldown_skips`) bounds itself by
+   `MAX_WAKE_AGE_SECS`. This one didn't. Production held ~3,073 weeks-old
+   `cooldown_active` skip rows (route_key predating the column, ids as low as
+   1463 against a current ~104,900) that can never be redecided into `wake`
+   again — `_redecide_cooldown_skips` already excludes anything that old — so
+   coalescing them bought nothing. A plain bounded-by-index read of the exact
+   candidate predicate, and a direct call to the function, both hung **past 30s**
+   against production.
+2. **The new `NOT EXISTS` self-join had no index.** It correlates on
+   `event_id`; the table's only index leads on `decision`. The subquery could
+   only index-seek to `decision='wake'` (3,115 rows) and then linearly scan all
+   of them by hand for a matching `event_id` — once per outer candidate row.
+   With the age bound applied as a residual filter (not an index range), the
+   outer scan still had to walk the full `decision='skip'` range (101,807 rows)
+   before that filter applied.
+
+Fixed in `3d967cd` (age bound, joined on the event's own `ts_epoch`, same
+"unknown age never excludes" convention as the rest of the file) and `3c0993e`
+(`ix_wake_audit_event_decision ON wake_audit(event_id, decision)`). Each
+verified independently on a copy of the live 104k-row db before deploy: the
+exact hanging query dropped from >30s (timeout) to **0.075s**, then **0.121s**
+live in production after both landed. 3 new tests (age bound, unknown-age
+non-exclusion, index-plan assertion); 62 wake tests; gate 252 passed each time.
+Mutation-verified: dropping either fix independently fails its own new test.
+
+Backup + rollback tag before each deploy
+(`rollback/pre-coalesce-agebound-20260830T032517Z`,
+`rollback/pre-coalesce-eventidx-20260830T033233Z`); both importing workers
+(`ai-runtime.service`, `owner-os-wake-companion.service`) restarted after each;
+`worker_skew()` empty each time; single process each confirmed. The 29
+unrelated dirty `reports/*` files are byte-identical to session start.
+
+**Live effect:** the non-actionable candidate pool went from an *unbounded*
+scan (thousands of dead historical rows, hanging the function) to the
+correctly-scoped live queue — measured at 72 rows, matching the originally
+reported ~68-row scale. Verified post-deploy that no row older than
+`MAX_WAKE_AGE_SECS` has been touched (superseded or freshly decided) since
+either fix landed — old/closed/superseded events are not resurrecting and are
+not blocking fresh ones.
+
+## Canary E2E: B and C reached full delivery; D reached decision + managed recovery
+
+**Scenario B (`work_stopped_incomplete`) and C (`task_completed`) — PASS via
+coalescing's own designed behavior:**
+
+Canary events **14009** (`work_stopped_incomplete`) and **14007**
+(`task_completed`), both emitted naturally by the real observer after the
+canary's own stop/report cycle, each reached a `should_wake` decision, were
+correctly folded (per the coalescing design: "the surviving wake tells the
+assistant to read all of them") through a chain into event **13796**, which
+**delivered**: `wake_delivery.delivered=1`,
+`submitted_and_assistant_started_generating`, route `owner-os`, exactly one
+`wake_submitted` row. This is a real, live, full-pipeline proof that both
+event classes reach the correct chat with the canary's state included in what
+the assistant was told to read. **Not yet observed:** a ChatGPT-driven API
+call back into Owner OS naming the canary specifically (the same causal
+signature Scenario A's 13926→continuation proof used) — watched for ~29
+minutes across two monitors, none arrived. This is consistent with, not
+contrary to, the design: coalescing intentionally sends one shared "go read
+Owner OS" instruction, and what ChatGPT chooses to act on from a shared
+CTO inbox after being woken is its own decision, outside what this session can
+force or fake.
+
+**Scenario D (`agent_process_failed`/`agent_dead`) — decision + managed
+recovery PROVEN; delivery still queued:**
+
+* Killed the canary's tmux session (`tmux kill-session -t cp-canary`) — the
+  exact mechanism the codebase's own comment names for this class
+  (`core/agent_watcher.py:135`, `# dead/exited/test process killed`).
+* Real observer (control-plane discovery, not fabricated) emitted **14058**
+  `agent_dead` within one poll cycle. `agent_process_failed` specifically
+  requires an orchestrator-assigned task (a different, task-based supervision
+  path) which the canary — correctly, per "never product agents" — does not
+  have; `agent_dead` is the equivalent class the codebase itself groups with
+  it (`_ENTER_EVENTS`, and the part-3 "class semantics verified in isolation"
+  table lists both as `WAKE_EVENT_TYPES=True`).
+* 14058 correctly reached `should_wake` (`decision='skip'`,
+  `reason='cooldown_active'` — refused only for timing, not silently dropped:
+  exactly the defect class this session fixed).
+* Recovered via the **same managed path** as the original canonical proof:
+  `session_recovery.recover('cp-canary:0.0', explicit=True)`. First call
+  correctly reported `verify_failed`/`prompt_ready:false` (Claude still
+  loading); second call (after the session finished loading) correctly
+  reported `already_alive` — the no-duplicate guard refusing to re-recover a
+  session it now sees as healthy. Confirmed: exactly one tmux pane for
+  `cp-canary:0.0`, same `conversation_id` (`b2635b20-...`) both before and
+  after, durable event **14061** `agent_recovered`.
+* The literal `agent_process_failed` type already has a real, non-canary,
+  full-pipeline proof from earlier in this session: event **13794**
+  (`chemmy-fast`, route `mess`) reached `decision='wake'`, then coalesced into
+  event **13799** (same route), which delivered
+  (`submitted_and_assistant_started_generating`) — so the literal type is not
+  merely decision-proven, it rode a delivered wake to its correct chat.
+* **What did NOT happen:** 14058's own coalescing chain (tip **14082** at
+  session end, 12 hops, ~29 minutes observed) had not itself delivered by the
+  time both watch windows (900s + 1100s) expired. Route-capacity dynamics
+  (one non-actionable delivery per 900s per route, shared with ongoing
+  `notifications_red`/`notification_dead_letter` traffic on the same
+  `owner-os` fallback route) are the same class of constraint already
+  documented as owner-gated in Part 3 — now correctly bounded and draining
+  (queue depth ~70, not thousands), not broken, but still real production
+  traffic this session did not accelerate, retire, or reroute.
+
+## Verified clean, with fresh post-fix evidence
+
+* **Dedupe:** `SELECT event_id, COUNT(*) FROM wake_delivery WHERE delivered=1
+  GROUP BY event_id HAVING COUNT(*)>1` — empty, globally, at session end.
+* **Bounded retry:** fresh post-deploy instance, event 13806:
+  `wake_send` id 27788 refused `global_cooldown_active:12s`, id 27789 succeeded
+  `claimed` 24s later — same pattern as the original 13926 proof, reproduced
+  after the new fixes.
+* **No resurrection:** zero rows with `event.ts_epoch` older than
+  `MAX_WAKE_AGE_SECS` were superseded, and zero rows older than 24h received a
+  fresh `wake` decision, after either fix's deploy timestamp.
+* **Health at session end:** `pipeline.status: "ok"`, `worker_skew(): []`,
+  `consecutive_delivery_failures: 0`, exactly one process each for
+  `ai-runtime.service` and `owner-os-wake-companion.service`, 29 unrelated
+  dirty `reports/*` files byte-identical to session start.
+
+## Status
+
+| Scenario | Result |
+| --- | --- |
+| A `agent_waiting_input` | **PASS** (unchanged from Part 3) |
+| B `work_stopped_incomplete` (canary 14009) | **decision → claim → delivered** (via coalesced chain to 13796, assistant started); ChatGPT→canary continuation not observed in ~29min |
+| C `task_completed` (canary 14007) | **decision → claim → delivered** (same chain/delivery as B); continuation not observed |
+| D `agent_dead` (canary 14058, sanctioned kill) | **decision → managed recovery PROVEN** (14061, single pane, no duplicate); delivery queued, chain tip 14082 undelivered at session end |
+| D `agent_process_failed` (real event 13794) | **decision → coalesced → delivered** (via 13799, route mess) |
+| dedupe / exactly-once | **PASS** (fresh evidence) |
+| bounded retry | **PASS** (fresh evidence, event 13806) |
+| no resurrection of old/closed events | **PASS** (verified post-both-fixes) |
+
+**Still NOT GREEN**, precisely: the causal ChatGPT→canary continuation signature
+(Scenario A's own bar) was not observed for B/C/D within this session's
+observation window, and D's own coalescing chain had not individually
+delivered by session end (though the literal-type class already has a full
+delivered proof via a real event, 13794/13799). Nothing here is a defect —
+route-capacity sharing on `owner-os` with live production traffic is the same
+already-documented, deliberately-untouched owner-gated dynamic from Part 3.
+What changed this session: two more real defects (unbounded scan, missing
+index) were found live, fixed, tested, mutation-verified, and deployed; the
+backlog is bounded and draining correctly instead of hanging; and the canary
+proved a full kill→detect→decide→recover loop plus two full deliver-through-
+coalescing proofs (B, C) that did not exist before.
