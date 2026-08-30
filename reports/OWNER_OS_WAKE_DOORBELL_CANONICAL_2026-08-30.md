@@ -1401,3 +1401,61 @@ window, waiting its route's 900 s lane.
 backend") and `a6f4c391` ("Recreate lost live tmux socket") are still
 `waiting_approval` and are now redundant. Until they are approved, cancelled or
 otherwise retired, 14912's watch may emit one further escalation.
+
+### Reconciliation of the 15331 wake, and the cohort behind these escalations
+
+A wake for 15331 (`wake_loop_no_progress`, `runtimejob:a6f4c391`) was received and
+reconciled READ-ONLY against this document and commit `359f600`. Nothing was
+approved, cancelled or otherwise changed; `config/approved_gates.yaml` was not
+touched.
+
+**Everything recorded above still holds, verified against live state:**
+
+| Claim | Live check |
+| --- | --- |
+| 14833's watch terminal | `rewoken=1 (15248)`, `escalated=1 (15330)` — unchanged |
+| 14912's watch has one escalation left | `rewoken=1 (15331)`, `escalated=0` — unchanged |
+| Both jobs still parked | `cd01ad71` and `a6f4c391` both `waiting_approval`, `updated_at` unchanged since creation |
+| 15331 itself travelled the loop cleanly | audit 111372 `skip/actionable_cooldown_active` → 111376 `wake` (bounded retry), delivered 14:50:04Z, `wake_submitted`=1, **acknowledged=1** |
+
+The wake that reported "no progress" was itself decided, claimed after one
+cooldown refusal, delivered, submitted exactly once and retired. A loop that does
+that is not the loop that is stuck.
+
+**The cohort — why more of these will arrive, and what they are not.** Five
+runtime jobs have produced wake-loop escalations. Four were auto-created during
+or immediately after the socket outage and all propose the SAME repair:
+
+| Job | Created | Goal | Status |
+| --- | --- | --- | --- |
+| `cd01ad71` | 11:47:10Z | Restore Owner OS tmux backend | `waiting_approval` |
+| `8ee3aa76` | 12:07:22Z | Recover tmux managed agents | `waiting_approval` |
+| `a6f4c391` | 12:29:36Z | Recreate lost live tmux socket | `waiting_approval` |
+| `35337a2c` | 13:23:27Z | Opus tmux control-plane recovery | `waiting_approval` |
+| `5e1bcdc8` | 13:26:10Z | Host XMRig forensic triage | `waiting_approval` |
+
+The first four are **obsolete**: the socket was restored at 13:25Z, the cause is
+root-caused above, and a recurrence is now bounded to one companion tick by the
+deployed guard. The fifth is unrelated work, explicitly out of this session's
+scope, and was not touched.
+
+**This must not be read as an unrepaired control plane.** At the time of writing
+`tmux_control.health()` is `ok` with one listener and no split, `agent_list()`
+returns 10 agents with `control_unreachable: false`, and every managed session is
+present. The escalations are the closed-loop watchdog correctly observing that
+five parked jobs have made no progress — because nobody has answered them, which
+is precisely what `owner_decision_required` means.
+
+**Volume is bounded.** Three runtimejob watches remain open (`a6f4c391`,
+`35337a2c`, `5e1bcdc8`); each can emit at most one further escalation before its
+watch goes terminal. There are 26 open pane watches, which behave as they always
+have. 17 jobs sit in `waiting_approval` in total.
+
+**No safe non-gated work remains open on this thread.** The exact owner-gated
+next decision: **retire or approve the four redundant tmux-repair jobs**
+(`cd01ad71`, `8ee3aa76`, `a6f4c391`, `35337a2c`). Cancelling them ends their
+watches and stops the remaining escalations; approving any of them would run a
+HIGH_RISK repair for a fault that no longer exists. `5e1bcdc8` is a separate
+decision on unrelated work. Job approval is gated through
+`config/approved_gates.yaml` — a static file requiring filesystem/git access,
+never reachable from an API-supplied value — so none of this was done here.
