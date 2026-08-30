@@ -4197,3 +4197,48 @@ does not need, so those rows keep emitting the wrong project until they age out.
 During this work the untracked count briefly read 33. It was a transient artefact of the
 concurrently running test suite; the set is again exactly the 32 baseline files and every
 checksum verifies.
+
+---
+
+# Part 28 — event 15773: no new defect, and the exact gate that remains
+
+15773 (`notification_dead_letter`, critical, `owner_action_required=1`, 20:11:50Z) is
+notification 3182 — a Telegram send for event 15766 (`work_stopped_incomplete`,
+`ai-dev-runtime`) that exhausted 5 attempts. Three questions settled by evidence.
+
+**Is it the project/route conflation just fixed in `a5b930e`? No.** That defect lives in
+`closed_loop_wake`, where the companion passed a route key into a field named `project_id`
+for `wake_loop_*` alarms. This is the notifier, a different component. The event row's own
+`project_id` is **empty**, and the `owner-os` in the wake trigger is
+`wake_routes.FALLBACK_ROUTE` — `normalize_key(project_id) or FALLBACK_ROUTE` — which is the
+correct, deliberate route for an event with no project. Its `wake_audit` rows show exactly
+that: `route_key='owner-os'`, decision `wake`. Correct behaviour, not a mislabel.
+
+**Is it a new defect? No.** Its `dedup_key` is `deadletter:3182` — the per-notification-id
+key whose ineffectiveness was diagnosed and fixed in `c403ca0` (Part 21). 15773 predates
+that commit. The underlying delivery failure is the known Telegram gate from Part 17,
+unchanged and still current: `telegram send failed: Bad Request: chat not found`, channel
+`owner_push` `state=unhealthy`, last updated 23:13:12Z.
+
+**So nothing was changed.** No remediation applies that is not already committed.
+
+## What the numbers say about the residual
+
+Since `c403ca0` was committed at ~21:0x UTC: **66 dead-letter events under 66 distinct
+dedup keys**, the most recent at 23:13:02Z, all still keyed `deadletter:<notification_id>`.
+That is the committed fix demonstrably **not live** — it collapses these to one alarm per
+channel per window only after a restart.
+
+## The exact remaining owner gate
+
+One operation, unchanged since Part 17: supply a correct `TELEGRAM_CHAT_ID` (or re-add the
+bot to the intended chat and `/start` it). The token is valid — an invalid one returns 401,
+not "chat not found". No code change is pending for it, and it was not touched here.
+
+Two things follow from that gate and are worth stating together, because they compound:
+every owner-facing event still reaches the owner only through the ChatGPT bridge, and the
+five wake-policy fixes committed today (`c403ca0`, `a9ff86e`, `66fe932`, `01f53c7`,
+`a5b930e`) are all inert until an approved restart.
+
+Nothing restarted, no credential, external account, payment path, secret or production
+integration touched. 32 unrelated WIP files untracked and byte-identical.
