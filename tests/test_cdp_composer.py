@@ -358,3 +358,87 @@ def test_the_turn_check_counts_nodes_and_never_reads_them(wired):
     cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
     for e in s.exprs:
         assert "data-message-author-role" not in e or ".length" in e, e
+
+
+# ── 2026-08-30: a focus-trapping dialog blocked every wake for 3.5 hours ─────
+# A stray Radix popover ([role=dialog][data-state=open]) held activeElement on three
+# route tabs at once. focus() on the composer was reverted the instant it was called, so
+# every delivery failed as the generic `composer_not_focused` and nothing said why.
+
+class _FakeSession:
+    """Minimal _Session stand-in: a page with an optional dialog focus trap."""
+
+    def __init__(self, *, trapped: bool, escapes_to_release: int = 1,
+                 focusable: bool = True):
+        self.trapped = trapped
+        self.escapes_to_release = escapes_to_release
+        self.focusable = focusable
+        self.escapes = 0
+        self.clicks = []
+        self._focused = False
+
+    def call(self, method, params=None):
+        params = params or {}
+        if method == "Input.dispatchKeyEvent":
+            if params.get("key") == "Escape" and params.get("type") == "keyUp":
+                self.escapes += 1
+                if self.escapes >= self.escapes_to_release:
+                    self.trapped = False
+            return {}
+        if method == "Runtime.evaluate":
+            expr = params.get("expression", "")
+            if ".focus()" in expr:
+                self._focused = self.focusable and not self.trapped
+            if ".click()" in expr:
+                self.clicks.append(expr)
+            return {}
+        return {}
+
+    def boolean(self, expression):
+        if "role=dialog" in expression:
+            return self.trapped
+        if "document.activeElement ===" in expression:
+            return self._focused
+        return None
+
+
+def test_focus_succeeds_without_a_dialog_and_presses_nothing():
+    from tools import cdp_composer as cc
+    s = _FakeSession(trapped=False)
+    assert cc.focus_composer(s, sleep=lambda x: None) is True
+    assert s.escapes == 0
+
+
+def test_a_focus_trapping_dialog_is_dismissed_with_escape_only():
+    """Escape, never a click: a click could ACTIVATE one of the dialog's controls, and
+    this code has no idea what they do."""
+    from tools import cdp_composer as cc
+    s = _FakeSession(trapped=True)
+    assert cc.focus_composer(s, sleep=lambda x: None) is True
+    assert s.escapes == 1
+    assert s.clicks == []
+
+
+def test_a_trap_that_will_not_release_is_reported_not_fought():
+    from tools import cdp_composer as cc
+    s = _FakeSession(trapped=True, escapes_to_release=99)
+    assert cc.focus_composer(s, attempts=3, sleep=lambda x: None) is not True
+    assert s.escapes == 3          # bounded — no unbounded loop against a stuck page
+    assert cc.dialog_traps_focus(s) is True
+
+
+def test_a_focus_failure_with_no_dialog_is_not_retried_as_one():
+    """Not every focus failure is a trap. Retrying a page that simply will not focus the
+    composer just repeats the same answer."""
+    from tools import cdp_composer as cc
+    s = _FakeSession(trapped=False, focusable=False)
+    assert cc.focus_composer(s, attempts=3, sleep=lambda x: None) is not True
+    assert s.escapes == 0
+
+
+def test_a_trapped_page_is_reported_as_trapped_not_as_a_bare_focus_failure():
+    """The 3.5-hour blackout looked identical to every other focus failure in the log."""
+    from tools import cdp_composer as cc
+    assert cc.focus_failure_reason(_FakeSession(trapped=True)) == \
+        "composer_focus_trapped_by_dialog"
+    assert cc.focus_failure_reason(_FakeSession(trapped=False)) == "composer_not_focused"

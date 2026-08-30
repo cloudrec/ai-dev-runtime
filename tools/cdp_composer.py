@@ -223,6 +223,67 @@ class _Session:
             pass
 
 
+# A dialog that CONTAINS activeElement is a focus trap: focus() on the composer is
+# reverted the moment it is called, so the phrase can never be typed. Radix popovers —
+# ChatGPT's own menus and pickers — are exactly this, and one left open on a route tab
+# silently blocks every wake to that chat until someone notices in a browser.
+_DIALOG_TRAPS_FOCUS_JS = (
+    "(function(){var d=document.querySelectorAll('[role=dialog]');"
+    "for(var i=0;i<d.length;i++){if(d[i].contains(document.activeElement))return true;}"
+    "return false;})()")
+
+
+def dialog_traps_focus(s) -> Optional[bool]:
+    return s.boolean(_DIALOG_TRAPS_FOCUS_JS)
+
+
+def dismiss_focus_trap(s) -> None:
+    """Close a focus-trapping dialog the way a keyboard user would: Escape, nothing else.
+
+    Deliberately never clicks anything inside the dialog — a click could ACTIVATE one of
+    its controls, and this code has no idea what they do. Escape is the one gesture every
+    dialog implements as "close, change nothing". It is also strictly smaller than what
+    this module already does on this page: type a phrase and press send.
+    """
+    for ev in ("rawKeyDown", "keyUp"):
+        s.call("Input.dispatchKeyEvent", {"type": ev, "key": "Escape", "code": "Escape",
+                                          "windowsVirtualKeyCode": 27,
+                                          "nativeVirtualKeyCode": 27})
+
+
+def focus_failure_reason(s) -> str:
+    """Name WHY the composer could not be focused. A trapped page and a page that simply
+    will not focus need different answers from whoever reads the delivery log."""
+    return ("composer_focus_trapped_by_dialog" if dialog_traps_focus(s) is True
+            else "composer_not_focused")
+
+
+def focus_composer(s, attempts: int = 3, sleep=None) -> Optional[bool]:
+    """Focus the composer, dismissing a focus-trapping dialog if one is in the way.
+
+    Bounded: a trap that survives `attempts` Escapes is reported, not fought. The caller
+    turns that into a named failure reason rather than a retry loop against a page that
+    is not going to yield.
+    """
+    import time as _t
+    sleep = sleep or _t.sleep
+    for i in range(max(1, attempts)):
+        s.call("Runtime.evaluate",
+               {"expression": f"document.querySelector({COMPOSER_SEL!r}).focus()"})
+        focused = s.boolean(
+            f"document.activeElement === document.querySelector({COMPOSER_SEL!r})")
+        if focused is True:
+            return True
+        if dialog_traps_focus(s) is not True:
+            # Not a trap — retrying the same call would only repeat the same answer.
+            return focused
+        dismiss_focus_trap(s)
+        if i + 1 < max(1, attempts):
+            sleep(0.3)
+    return s.boolean(
+        f"document.activeElement === document.querySelector({COMPOSER_SEL!r})")
+
+
 def _record_delivery(source: str, event_id: Optional[int], res: dict,
                      conversation: str = "", route_key: str = "") -> dict:
     """Persist the outcome of an attempt — the failures above all, since those are the ones
@@ -430,12 +491,14 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         asst_id_before = s.last_attr(ASSISTANT_TURN_SEL, "data-message-id")
         # Focus by element identity, then CONFIRM focus. A focus call that silently fails is
         # exactly how the phrase went nowhere before.
-        s.call("Runtime.evaluate",
-               {"expression": f"document.querySelector({COMPOSER_SEL!r}).focus()"})
-        focused = s.boolean(
-            f"document.activeElement === document.querySelector({COMPOSER_SEL!r})")
+        focused = focus_composer(s)
         if focused is not True:
-            return {"ok": False, "reason": "composer_not_focused"}
+            # Name the cause instead of collapsing it. 2026-08-30, 12:19 -> 16:0x: every
+            # wake delivery failed as the generic `composer_not_focused` while the real
+            # state was a stray Radix popover (`[role=dialog][data-state=open]`) holding
+            # activeElement in its focus trap on three route tabs at once. Three and a
+            # half hours of undeliverable wakes read as one undifferentiated failure.
+            return {"ok": False, "reason": focus_failure_reason(s)}
 
         # The ONLY string ever sent into the page.
         s.call("Input.insertText", {"text": phrase})
