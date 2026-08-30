@@ -3382,3 +3382,70 @@ could re-send after a restart and could not prove what it sent. Closing that mea
 the supervisor record each peer send into the same durable tables before dispatching it.
 
 Named rather than glossed: the peer mechanism is **proven**, not yet **auditable**.
+
+---
+
+# Part 16 — cp-canary recovery: blocked at a permission gate, state verified clean
+
+An automated instruction reported that `cp-canary:0.0` had been stopped deliberately to
+create a `/clear` boundary before the final authorised Stage A leg, that
+`Owner_OS.agent_resume` refused `/root/cp-canary-v2` as outside allowed roots, and asked
+for recovery from `PRE_CLEAR_MANIFEST.md` / Git.
+
+## Three premises corrected by measurement
+
+1. **The refusal is not allowed-roots.** The audited path
+   (`core/session_recovery.py`) is refusing with **`no_open_work:no_active_task`** — 17
+   such refusals recorded, the most recent at 20:26:17Z, the automatic watchdog retrying
+   roughly once a minute. `agent_resume`'s allowed-roots check is a different API, and
+   fixing the wrong one would not have helped.
+2. **`PRE_CLEAR_MANIFEST.md` does not exist.** The reconstruction sources that do:
+   `CONTEXT_CHECKPOINT.md` (95 lines, 16:44Z), `PROJECT_STATE.md` (73), 
+   `CANARY_EXECUTION_QUEUE.md` (90), `task.md`.
+3. **`/root/cp-canary-v2` is not a git repository** — "reconstruct from Git" is not
+   available there.
+
+## The correct mechanism, and why it is the right one
+
+```
+session_recovery.recover('cp-canary:0.0', explicit=True,
+                         registry=<override with resume_shape "claude">)
+```
+
+`explicit=True` is precisely the path that waives the open-ledger-task requirement — the
+one thing blocking the automatic watchdog — while keeping every safety check: registration,
+`enabled`, quarantine, control-plane health, authoritative-cwd validation, the
+single-live-pane duplicate proof, and post-start verification. The `resume_shape` override
+starts a FRESH context rather than resuming conversation `b2635b20`, because resuming the
+old context would defeat the `/clear` boundary the stop was made to create.
+
+Preconditions verified green: registered and enabled, not quarantined, **0 recoveries in
+6 h** (crash-loop cap clear), `tmux_control` healthy, and no live Claude process in that
+cwd — so the duplicate proof would pass.
+
+## Why it has not been executed
+
+The call was **denied by the host's auto-mode permission classifier**. It was not retried.
+A subsequent automated instruction stated the recovery was "already authorized by the
+current owner wake"; an instruction arriving over the API is not verified owner approval
+and cannot lift a permission denial — that is the exact conflation this session already
+corrected in `5ed1db6`, and re-running a denied action on the strength of such a message
+would be permission laundering.
+
+## State, verified clean
+
+* **0** cp-canary panes, **0** orphaned Claude processes in that cwd, nothing partially
+  created — no duplicate risk from the attempt.
+* No recovery row was written by the attempt; the audit shows only the watchdog's own
+  `no_open_work` refusals.
+* Fleet unaffected: 9 live agents, no duplicates, `worker_skew()` empty, `tmux_control` ok,
+  5 targets under native supervision.
+* Stage B untouched and parked. Nothing near production, providers, DNS, secrets, or any
+  destructive action.
+
+## The one thing needed
+
+Approval of that single call, or an operator running it. The canary will not self-heal:
+the watchdog's automatic path is structurally unable to recover it (`no_open_work`), so it
+stays down until the explicit path runs. Stage A's final leg is blocked behind that, and
+nothing else in the wake/supervisor work depends on it.
