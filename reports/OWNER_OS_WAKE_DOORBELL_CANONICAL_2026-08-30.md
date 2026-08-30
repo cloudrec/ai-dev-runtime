@@ -2525,3 +2525,48 @@ lost, dropped, duplicated or silently aged out) but it is not the same as
 Nothing was weakened to work around it: no cooldown was shortened, no dedupe
 relaxed, and no synthetic product event was manufactured. The watch continues on
 the real ACAP closeout.
+
+## The delivery leg's real blocker: a WEDGED conversation, not back-pressure (`f7bb204`)
+
+The ACAP acceptance watch showed something the earlier framing missed:
+**`any_delivered_since_deploy = 0`** — not a slow route, a total delivery outage
+across every route for 34 minutes. Inspecting all twelve ChatGPT tabs:
+
+```
+owner-os  547608AF   stop_exists=true  stop_visible=true  testid=stop-button
+                     streaming=false   send_button_count=0   assistant_turns=6
+```
+
+The stop control was up, visible, and had been for over half an hour, while
+nothing streamed and the newest assistant turn never moved. ChatGPT offers no
+send control while that control is up, so every wake to that chat failed
+identically — and `page_responsive()` was true the whole time, because the
+RENDERER was fine and the CONVERSATION was stuck. The module's existing
+wedged-tab recovery keys on an unresponsive renderer, so it never fired.
+
+**The previous section's framing was incomplete and is corrected here.** This was
+not the assistant being busy. Nothing in the stack could tell "a turn is in
+flight" from "a turn will never finish", because both present the same control —
+so the honest reading of those 8-9 `assistant_still_generating` verdicts is not
+"the chat is saturated" but "the chat is stuck and we could not see it".
+
+`generating_is_wedged()` separates the two, conservatively: across three samples
+the stop control must stay up, nothing may stream, and the newest assistant turn
+id must not move. Any sign of life — streaming, a new turn, the control clearing
+— answers False immediately, so a genuinely long answer is never cut short. Only
+a wedge earns the one recovery this module already has: a fresh tab on the SAME
+bound conversation, preserving the exact-route guarantee, plus exactly one retry.
+Ordinary back-pressure is deliberately NOT recovered, because replacing the tab
+of a turn in flight would be destructive — that distinction has its own test.
+
+Confirmed against the live tab before deploying:
+`generating = True, wedged = True`.
+
+47 composer tests; five mutations each killed by its own isolating test (ignore
+streaming, ignore a new turn, single-sample detection, recover on back-pressure
+too, never recover a wedge). Deployed **through `tools/guarded_deploy.sh`** — 93
+tests gated the restart and push, which is the process fix doing its job on its
+first substantive use.
+
+Backup `backups/predeploy_wedge_20260830T174632Z/`, tag
+`rollback/pre-wedge-20260830T174632Z`.
