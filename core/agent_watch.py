@@ -208,7 +208,22 @@ QUIESCENT_SECS = int(os.getenv("AGENT_WATCH_QUIESCENT_SECS", "300"))
 _PROMPT_STATES = frozenset({"waiting_owner", "waiting_input", "idle", "unknown", ""})
 # A numbered choice menu — "1. <option> ... 2. <option>" — whatever the option wording.
 # Event 4088 was a five-option strategy menu with none of the yes/no vocabulary.
-_MENU_RE = re.compile(r"\b1\.\s+\S.{0,300}?\b2\.\s+\S")
+#
+# LINE-ANCHORED, and read from the line-preserving view. The old pattern searched
+# space-joined text for "1. ... 2. ..." within 300 characters, so an agent writing an
+# ORDINARY NUMBERED SENTENCE — "corrected by measurement: 1. the refusal is X, not Y.
+# 2. the manifest does not exist." — was classified as a decision menu and woke the owner
+# at severity high. Event 15817 was exactly that: this supervisor's own turn summary,
+# raised as a prompt needing an owner response when no prompt existed (agent_status
+# showed pending=None throughout).
+#
+# A real CLI menu always renders one option per line, optionally behind the selection
+# caret. Prose numbering runs inside a sentence. That is the whole difference, and it is
+# the same reason `_bottom_lines_text` exists for crash matching: some shapes are only
+# distinguishable by occupying their own line.
+_MENU_RE = re.compile(
+    r"^[ \t]*(?:❯[ \t]*)?1\.[ \t]+\S[\s\S]{0,400}?^[ \t]*(?:❯[ \t]*)?2\.[ \t]+\S",
+    re.MULTILINE)
 # POSITIVE final evidence. Completion is never inferred from mere quietness: idle after
 # work with no finish statement stays un-announced (event 4086 was "idle" from UI
 # metadata while an internal task list sat half-open).
@@ -334,7 +349,7 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
     if st == "waiting_owner":
         return {"cls": "owner_prompt", "reason": "inventory_waiting_owner"}
     if st in _PROMPT_STATES and (_OWNER_PROMPT_RE.search(region)
-                                 or _MENU_RE.search(region)):
+                                 or _MENU_RE.search(_bottom_lines_text(tail))):
         return {"cls": "owner_prompt", "reason": "decision_prompt_at_bottom"}
     if _BLOCKER_RE.search(region):
         return {"cls": "blocker", "reason": "paused_waiting_text_at_bottom"}

@@ -935,3 +935,43 @@ def test_a_new_question_on_a_parked_pane_still_wakes():
           emit, now=1100.0)
     asked = [c for c in emit.calls if c["type"] == "agent_prompt_needs_response"]
     assert len(asked) == 1, "a real question still wakes"
+
+
+# ── a numbered SENTENCE is not a decision menu (event 15817) ──────────────────────────
+# `_MENU_RE` searched space-joined text for "1. ... 2. ..." within 300 chars, so an agent
+# writing an ordinary numbered summary was classified owner_prompt and woke the owner at
+# severity high. 15817 was this supervisor's own turn summary; agent_status showed
+# pending=None throughout, so there was never a prompt to answer.
+
+_PROSE_15817 = (
+    "Three premises corrected by measurement (now in report): 1. Refusal is "
+    "no_open_work:no_active_task, not allowed-roots - allowed-roots belongs to "
+    "agent_resume, different API. 2. PRE_CLEAR_MANIFEST.md does not exist.\n"
+)
+
+_REAL_MENU = "Do you want to proceed?\n\u276f 1. Yes\n  2. No, keep the gate closed\n"
+_REAL_MENU_NO_YESNO = (
+    "Which strategy should I use?\n"
+    "  1. Rebuild the index from scratch\n"
+    "  2. Patch the existing rows\n"
+    "  3. Leave it and report\n"
+)
+
+
+def test_numbered_prose_is_not_a_menu():
+    assert aw._MENU_RE.search(aw._bottom_lines_text(_PROSE_15817)) is None
+
+
+def test_real_menu_still_matches():
+    assert aw._MENU_RE.search(aw._bottom_lines_text(_REAL_MENU)) is not None
+
+
+def test_option_menu_without_yes_no_vocabulary_still_matches():
+    """Event 4088's shape: a real choice menu with none of the yes/no words."""
+    assert aw._MENU_RE.search(aw._bottom_lines_text(_REAL_MENU_NO_YESNO)) is not None
+
+
+def test_menu_read_from_line_preserving_view():
+    """Space-joining the region is what destroyed the line anchor in the first place."""
+    assert aw._MENU_RE.search(aw._bottom_region(_REAL_MENU)) is None
+    assert aw._MENU_RE.search(aw._bottom_lines_text(_REAL_MENU)) is not None
