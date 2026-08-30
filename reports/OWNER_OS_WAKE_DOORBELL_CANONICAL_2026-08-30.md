@@ -1551,3 +1551,65 @@ dedupe duplicates: 0
 ```
 
 The original fault remains absent. Nothing was approved, cancelled or run.
+
+### Wakes 15363 / 15364 — the redundant-cohort escalation stream is now exhausted
+
+**15363** `wake_loop_stalled` (`runtimejob:a6f4c391`, critical, 14:59:33Z) and
+**15364** `wake_loop_stalled` (`runtimejob:35337a2c`, critical, 15:02:21Z) are the
+second and final escalations predicted above. Both watches are now terminal, so
+**all four redundant tmux-repair watches have completed their bounded lifecycle**:
+
+| Job | Watch | Re-woken | Escalated | State |
+| --- | --- | --- | --- | --- |
+| `cd01ad71` | 14833 | 15248 | **15330** | terminal |
+| `8ee3aa76` | 14844 | 15252 | **15335** | terminal |
+| `a6f4c391` | 14912 | 15331 | **15363** | terminal |
+| `35337a2c` | 14988 | 15336 | **15364** | terminal |
+
+**No further wake-loop escalations will come from this cohort.** Verified
+structurally, not assumed: `register_delivery()` never registers a
+`loop_watchdog`-class delivery, so the escalation events themselves start no new
+watch — a query for watches keyed on 15248/15252/15330/15331/15335/15336/15363/
+15364 returns **0**. Exactly **one** open runtimejob watch remains, `5e1bcdc8`
+(the unrelated XMRig triage job, `rewoken=1` via 15348, `escalated=0`), which can
+emit at most one more.
+
+The watch table's own health, for context — the escalation path is the rare case,
+not the norm:
+
+```
+resolved:runtime_job_terminal   25     (jobs that finished; watch retired silently)
+resolved:event_marked_invalid    6
+escalated (terminal)             6
+open                             1
+```
+
+**a6f4c391 status: still redundant, still stalled, unchanged.** All five jobs
+remain `waiting_approval` with `updated_at` identical to their creation
+timestamps — nothing has moved them. 15363 was itself decided, delivered
+15:03:07Z (`submitted_and_assistant_started_generating`) and acknowledged;
+15364 is decided and queued behind the `owner-os` cooldown.
+
+**Fault-absence re-verification (read-only), at 15363/15364 time:**
+
+```
+tmux_control: ok | listeners 1 | split False       server pid 302442 (original)
+agent_list  : 10 agents | duplicates [] | control_unreachable False
+recovery    : control_unreachable False            skew []
+sessions    : 10        agent_control_plane_* events ever: 0
+tmux connect errors since the restore: 0
+```
+
+Also observed: **15365** `notification_dead_letter` (critical) — the pre-existing
+Telegram `owner_push` gate from Part 1 (2,565 dead-lettered for the life of the
+database), unchanged and unrelated to this work.
+
+**Safe work completed here:** read-only inspection and this record. Nothing
+approved, cancelled, retired or run; `config/approved_gates.yaml` untouched.
+
+**Owner decision still required (unchanged, now lower-urgency):** retire or
+approve `cd01ad71`, `8ee3aa76`, `a6f4c391`, `35337a2c`. Their escalation stream
+has ended on its own, so the cost of leaving them parked is now only that four
+obsolete HIGH_RISK proposals sit in `waiting_approval`; approving any of them
+would run a repair for a fault verified absent above. `5e1bcdc8` is a separate
+decision on unrelated work.
