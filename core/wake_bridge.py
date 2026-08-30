@@ -1439,11 +1439,31 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
     conn, own = _conn(conn)
     try:
         conn.execute(_SUBMIT_SCHEMA)
+        # Include rows still sitting at decision='skip' for a cooldown, not only
+        # those that already reached 'wake'.
+        #
+        # The `wake`-only filter was the whole reason a backlog could exist at all.
+        # A generic wake refused by the non-actionable floor never becomes a `wake`
+        # row, so coalescing never saw it: 68 identical `notification_dead_letter`
+        # skips (one persistent Telegram outage, no agent) queued as 68 separate
+        # candidates, each re-decided by `_redecide_cooldown_skips` and each taking
+        # its own 900s slot — ~21.5h of lane time carrying one instruction, while
+        # fresh events (a canary's `work_stopped_incomplete`, an
+        # `agent_process_failed`) waited behind them.
+        #
+        # The docstring's own argument applies unchanged to a skip: the phrase is
+        # fixed and carries no event content, so N queued copies for one chat are N
+        # copies of one identical instruction. Folding them raises no wake
+        # frequency — it removes redundant candidates. The newest per route
+        # survives and still says "go read Owner OS", and the CTO inbox keeps every
+        # event regardless. Superseded rows are retired, never deleted.
         rows = conn.execute(
             "SELECT a.id, a.event_id, COALESCE(a.project_id,''), "
             "COALESCE(a.route_key,''), COALESCE(a.agent_id,'') FROM wake_audit a "
-            "WHERE a.decision='wake' "
+            "WHERE (a.decision='wake' OR (a.decision='skip' AND a.reason='cooldown_active')) "
             "AND a.acknowledged=0 AND a.superseded_by IS NULL AND COALESCE(a.actionable,0)=0 "
+            "AND NOT EXISTS (SELECT 1 FROM wake_audit w WHERE w.event_id=a.event_id "
+            "                AND w.decision='wake' AND w.id<>a.id) "
             "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
             "ORDER BY a.id ASC").fetchall()
         groups: dict = {}

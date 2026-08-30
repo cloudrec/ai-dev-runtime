@@ -666,3 +666,72 @@ def test_the_non_actionable_decision_floor_still_applies_in_its_own_lane():
     assert _wake(1, severity="critical", now=t)["wake"] is True
     soon = wb.should_wake(event_id=2, severity="critical", now=t + 60)
     assert soon["wake"] is False and soon["reason"] == "cooldown_active"
+
+
+# ── redundant generic SKIPS must coalesce too, not just wakes ────────────────
+# coalesce_generic_backlog only folded rows already at decision='wake'. A generic
+# wake refused by the non-actionable floor never becomes a `wake` row, so
+# coalescing never saw it. Live 2026-08-30: 68 identical notification_dead_letter
+# skips — one persistent Telegram outage, no agent — queued as 68 separate
+# candidates, each re-decided and each taking its own 900s slot: ~21.5h of lane
+# time carrying one instruction, while a canary's work_stopped_incomplete and an
+# agent_process_failed waited behind them.
+
+def _skip_row(event_id, route="owner-os", reason="cooldown_active"):
+    """A generic wake refused by the floor — the shape that never coalesced.
+
+    Uses wb's own connection so the schema/migrations exist; a raw sqlite3
+    connection hits `no such table: wake_audit` on a fresh temp db.
+    """
+    conn, own = wb._conn(None)
+    try:
+        conn.execute("INSERT INTO wake_audit (ts,at,event_id,decision,reason,actionable,"
+                     "route_key,acknowledged) VALUES (?,?,?,'skip',?,0,?,0)",
+                     (1000.0 + event_id, "2026-08-30T00:00:00+00:00", event_id, reason, route))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def test_redundant_generic_skips_are_coalesced_into_the_newest():
+    for e in (501, 502, 503):
+        _skip_row(e)
+    r = wb.coalesce_generic_backlog(now=2000.0)
+    assert r["superseded"] == 2, r
+    assert set(r["superseded_event_ids"]) == {501, 502}, r
+    assert 503 in r["kept_event_ids"], "the NEWEST must survive and carry the instruction"
+
+
+def test_coalescing_is_per_route_never_global():
+    """Folding across routes would silently drop a chat's only doorbell ring."""
+    _skip_row(601, route="owner-os")
+    _skip_row(602, route="mess")
+    r = wb.coalesce_generic_backlog(now=2000.0)
+    assert r["superseded"] == 0, "different chats must never absorb each other"
+
+
+def test_a_superseded_skip_is_retired_not_deleted():
+    import os, sqlite3
+    for e in (701, 702):
+        _skip_row(e)
+    wb.coalesce_generic_backlog(now=2000.0)
+    conn, own = wb._conn(None)
+    try:
+        row = conn.execute("SELECT superseded_by, superseded_reason FROM wake_audit "
+                           "WHERE event_id=701").fetchone()
+        prov = conn.execute("SELECT COUNT(*) FROM wake_coalesce_audit "
+                            "WHERE event_id=701").fetchone()[0]
+    finally:
+        if own:
+            conn.close()
+    assert row and row[0] is not None and "coalesced" in (row[1] or "")
+    assert prov == 1, "an append-only provenance row must name what absorbed it"
+
+
+def test_actionable_rows_are_never_coalesced():
+    """Each actionable wake is a distinct blocked pane, not a duplicate instruction."""
+    _wake(801, severity="high", event_type="agent_waiting_input", now=1000.0)
+    _wake(802, severity="high", event_type="agent_waiting_input", now=1000.0 + 61)
+    r = wb.coalesce_generic_backlog(now=2000.0)
+    assert 801 not in r["superseded_event_ids"] and 802 not in r["superseded_event_ids"]
