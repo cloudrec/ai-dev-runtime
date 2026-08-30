@@ -316,6 +316,11 @@ def _migrate(conn) -> None:
     for name, decl in _AUDIT_COLUMNS:
         if name not in have:
             conn.execute(f"ALTER TABLE wake_audit ADD COLUMN {name} {decl}")
+    # Created after the columns exist — `actionable` is itself a migrated column,
+    # so indexing it before the ALTER would fail on a pre-existing database.
+    # See _migrate_send for the measurements motivating this.
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_wake_audit_lookback "
+                 "ON wake_audit (decision, actionable, id)")
 
 
 def _conn(conn=None):
@@ -1505,6 +1510,15 @@ def _migrate_send(conn) -> None:
         conn.execute("ALTER TABLE wake_send ADD COLUMN actionable INTEGER DEFAULT 0")
     if "route_key" not in have:
         conn.execute("ALTER TABLE wake_send ADD COLUMN route_key TEXT")
+    # Both cooldown lookbacks are `... WHERE allowed=1 AND actionable=? AND <route>
+    # ORDER BY id DESC LIMIT 1`. Unindexed they SCAN: cheap while a recent row
+    # matches and the scan stops early, but a route with no prior send of that
+    # class walks the whole table. Measured on the live db 2026-08-30 —
+    # wake_audit 104k rows: 0.021ms when a recent row matched, 23ms when none did.
+    # Append-only tables, so this only gets worse. Indexes are additive and
+    # destroy nothing; retention is a separate, owner-gated question.
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_wake_send_lookback "
+                 "ON wake_send (allowed, actionable, route_key, id)")
 
 
 def claim_send(source: str, event_id: Optional[int] = None, conn=None,
