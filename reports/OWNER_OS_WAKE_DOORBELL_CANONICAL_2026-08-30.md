@@ -2570,3 +2570,65 @@ first substantive use.
 
 Backup `backups/predeploy_wedge_20260830T174632Z/`, tag
 `rollback/pre-wedge-20260830T174632Z`.
+
+## STOP: a concrete unavoidable external gate — the host is thrashing
+
+The wedge fix deployed, and the very next attempt returned `renderer_unresponsive`
+with the CDP endpoint itself unreachable. That is not the tab and not the
+pipeline. Measured on the host at 17:50Z:
+
+```
+load average          25.11, 21.00, 15.10       (18 runnable, 5 blocked)
+memory                11 GB total · 9 used · 0 free · 1 GB available
+swap                  20467 MB used of 20479 MB  = 100%
+swap traffic          si 3432 / so 12064 pages per second — continuous thrashing
+chrome                61 processes, 2.15 GB      (CDP port still LISTENing, no answers)
+claude                10 processes, 2.32 GB
+postgres 1.68 GB · fastnetmon 1.51 GB · celery 1.00 GB
+```
+
+Swap is fully consumed and the machine is paging continuously. Chrome cannot
+answer `/json/version`, so no wake can be delivered through it, and the wedged
+conversation found earlier is very likely the same exhaustion seen from inside
+the browser — a renderer that could not finish its turn.
+
+**This is where the work stops, and it is an external gate, not a technical
+failure of the wake loop.** Every stage this session built is verifiably working
+up to the browser boundary: detection, decision, lane, claim, back-pressure and
+wedge diagnosis all produced correct, evidenced results minutes before the host
+became unreachable. Nothing in the pipeline can deliver into a browser that the
+kernel cannot schedule.
+
+**Deliberately not done**, because each would be a destructive action on other
+projects or on the owner's authenticated session, and none of them is this
+session's to take:
+
+* killing or restarting Chrome (61 processes, an authenticated ChatGPT session),
+* killing any of the 10 running `claude` agents — they belong to other projects,
+* stopping `fastnetmon`, `celery`, `postgres` or Docker workloads,
+* anything touching the XMRig, Telegram, payment, C1/C2 or host-cleanup gates.
+
+This session's own watchers were stopped rather than left polling a thrashing
+host, since they were adding load to the problem they were measuring.
+
+**The owner decision this needs:** free memory on the host — which processes may
+be stopped, or whether the box needs more RAM/swap. Until then the delivery leg
+of the ACAP acceptance cannot be exercised by anyone, and no code change would
+alter that.
+
+## Technical verdict at the stopping point
+
+| Leg | Verdict |
+| --- | --- |
+| Structural stop detection (the ACAP miss) | **PROVEN** — 15458, 15460, 15473 from a pane previously pinned `working` by a background shell |
+| Lifecycle fast-lane decision | **PROVEN** — audits 112170 / 112195, `actionable=1`, promoted from `actionable_cooldown_active` skips |
+| Bounded claim | **PROVEN** — 60 s floor honoured; lifecycle wakes drained at 78–94 s against 900 s before |
+| Safe back-pressure, no draft, no latch | **PROVEN** — repeated `assistant_still_generating` verdicts, events left pending |
+| Wedged-conversation detection | **PROVEN live** (`generating = True, wedged = True`) and deployed with recovery |
+| Delivery → ack → ChatGPT reread → continuation | **BLOCKED by the host gate above** |
+| Red-gate deploys | **CLOSED** — `tools/guarded_deploy.sh`, 9 tests, 4 mutations, and every deploy since has gone through it |
+
+Six defects were found and fixed against real production panes today, each
+backup-first, each mutation-verified, none weakening a cooldown, dedupe,
+exactly-once or suppression rule, and no synthetic product event was ever used to
+stand in for a real one.
