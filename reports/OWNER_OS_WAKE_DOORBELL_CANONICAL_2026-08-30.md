@@ -2972,3 +2972,158 @@ each will fire again the moment its pane actually changes.
 Delivery continues normally: 11 delivered / 6 refused in the same fifteen
 minutes, the refusals being the back-pressure and wedge verdicts doing their job.
 `worker_skew()` empty, `tmux_control` ok, no split.
+
+---
+
+# Part 13 — native Claude Code lifecycle: hooks become the primary signal
+
+## Why
+
+Owner OS learned that an agent stopped by SCRAPING its tmux pane and classifying
+the text. Most of this session was spent repairing exactly that: prose that
+matched no detector (ACAP), a background shell masking a finished turn, an
+inventory flicker re-announcing an unchanged pane (Auction), report prose read as
+a live prompt. Claude Code knows every one of those facts precisely. A hook is
+ground truth; a scraped pane is an inference.
+
+## Capability verification FIRST, before any change
+
+Installed build **2.1.251** (native, commit 37534ac). Verified present in this
+exact binary rather than assumed from documentation:
+
+```
+hooks   Stop · StopFailure · SubagentStop · TaskCompleted · TeammateIdle ·
+        Notification · SessionStart · UserPromptSubmit · SessionEnd · PreCompact
+other   notify_when_idle · SendMessage · ListAgents · session_crons ·
+        background_tasks · last_assistant_message · agent_needs_input ·
+        agent_completed · idle_prompt
+```
+
+Payload contracts were read out of the build's own schema, not guessed —
+e.g. `Stop{stop_hook_active, last_assistant_message?, session_crons}`,
+`Notification{message, title?, notification_type}`,
+`TaskCompleted{task_id, task_subject, task_description?, teammate_name?}`.
+
+## The bridge (`hooks/owneros_hook.py`)
+
+| Native signal | Owner OS class | Wakes? |
+| --- | --- | --- |
+| `Stop`, `SubagentStop`, `TeammateIdle` | `agent_turn_stopped`, `agent_subagent_stopped` | **never** — routine by name |
+| `Notification(agent_needs_input\|idle_prompt)` | `agent_waiting_input` | yes, fast lane |
+| `Notification(agent_completed)`, `TaskCompleted` | `task_completed` | yes, fast lane |
+| `StopFailure` | `agent_process_failed` | yes, fast lane |
+
+**`Stop` fires at the end of EVERY turn**, not when an agent finally goes idle.
+Mapping it to a wake would page the owner after every reply, so both turn classes
+are in `ROUTINE_EVENT_TYPES` and `is_significant` refuses them a wake by name.
+No new wake class is invented — the three that do wake are classes Owner OS
+already routes and rate-limits.
+
+**Workers never carry a ChatGPT URL.** The hook reports project (from cwd) and
+session identity only; routing stays central, and an unmapped project fails
+closed to the documented `owner-os` fallback with an explicit `unmapped_route:`
+audit.
+
+**Observation may never break the observed session:** every path exits 0, writes
+nothing to stdout, and swallows every exception.
+
+## Live evidence
+
+**Hooks HOT-LOAD into already-running sessions — no restart is needed.** Within
+three minutes of the settings change, twelve events arrived from **five distinct
+live sessions**, including `agent_waiting_input` from real `Notification` hooks.
+That settles requirement (6): no product turn has to be interrupted and no live
+Claude session has to be restarted to migrate.
+
+End-to-end, after the env fix below:
+
+```
+Notification hook -> event 15559 agent_waiting_input (project gaika-extension)
+                  -> wake_audit 112971  wake / actionable_waiting_transition  actionable=1
+                  -> route gaika-extension -> chat 6a90487a-…  (that project's own chat)
+```
+
+No tmux scraping anywhere in that path. The verification event was synthetic, so
+it was retired through the audited `agent_alert_invalid` overlay and **never
+reached a chat**.
+
+**A defect the first live run exposed:** a hook runs as a bare process with none
+of the service environment, so the wake bridge read `WAKE_BRIDGE_ENABLED` as
+unset, decided it was disabled, and recorded two real `agent_waiting_input`
+events with **no wake decision**. The event log was right and the doorbell never
+rang. Fixed by loading `configs/.env` in the hook, filling only keys not already
+set so an explicit environment still wins.
+
+**Volume, measured rather than hoped:** 12 events in 9 minutes across 5 sessions,
+of which 8 were turn records that correctly produced no wake at all.
+
+## Route inventory (requirement 7) — nothing rebound
+
+| Agent | Project | Route | Resolution |
+| --- | --- | --- | --- |
+| `diamond-auction:0.0` | auction | **auction** | explicit |
+| `email:0.0` | email | **email** | explicit |
+| `gaika-opus:0.0` | gaika-extension | **gaika-extension** | explicit |
+| `mess-opus:0.0` | mess | **mess** | explicit |
+| `payorch-monitor-clean:0.0` | payment-orchestrator | payment-orchestrator | explicit — but bound to the **owner-os chat** |
+| `arbitrage2-fable:0.0` | arbitrage2-fable-audit | owner-os | `unmapped_route:` fallback + audit |
+| `capacity-blockchain:0.0` | capacity | owner-os | `unmapped_route:` fallback + audit |
+| `cp-canary:0.0` | cp-canary-v2 | owner-os | `unmapped_route:` fallback + audit |
+| `mess-postsignup-cleanup-sonnet-v4:0.0` | seo | owner-os | `unmapped_route:` fallback + audit |
+| `owner-os-wake-policy-opus:0.0` | ai-dev-runtime | owner-os | `unmapped_route:` fallback + audit |
+
+Four projects reach their own chat; five fail closed to the fallback WITH audit,
+which is the documented behaviour for an unbound project. **Nothing was rebound.**
+One item is flagged for owner attention rather than changed:
+`payment-orchestrator` is an *explicit* binding whose conversation is the
+owner-os chat (bound by auto-discovery on 2026-08-19) — that may be deliberate,
+and evidence does not say it is wrong.
+
+## The Auction case (event 15519) — intentional waits are not stalls
+
+`wake_loop_no_progress` escalated `diamond-auction:0.0` while it was deliberately
+parked on a read-only monitor for a natural auction close. `_progress_since`
+counts NEW EVENTS, and an agent waiting correctly emits none.
+
+The distinction is not readable from the sentence — this session already proved
+prose an unreliable discriminator twice. Claude Code states it structurally
+instead: a session that stopped with `background_tasks` running or
+`session_crons` armed is waiting BY DESIGN, and the `Stop` hook records exactly
+those fields. `closed_loop_wake` now resolves such a watch **silently** as
+`intentional_external_wait` — the same non-emitting path as `runtime_job_terminal`.
+
+Fail-safe preserved: with no structured record (older Claude, hooks disabled, a
+session predating install) the old behaviour stands unchanged. Unproven means NOT
+resolved, never the reverse. A genuinely stalled agent that stopped with nothing
+armed still escalates, and the evidence expires after a bounded lookback.
+
+## Safety, backups and rollback
+
+* Global settings backed up before any edit:
+  `backups/claude_settings_20260830T185532Z/settings.json`
+  (sha256 verified identical at the time of copy).
+* Registration is **additive**: each event appends its own matcher group, the
+  caveman plugin's `SessionStart`/`UserPromptSubmit` groups were asserted intact
+  afterwards, and every pre-existing top-level key was checked to survive.
+  `claude doctor` clean after the change.
+* Rollback: restore that settings.json (removes all Owner OS hooks instantly —
+  no session restart needed, since registration hot-loads), and
+  `git checkout rollback/pre-native-20260830T190613Z -- core/ hooks/`.
+  The fallback tmux/quiescence watcher was never disabled, so removing the hooks
+  returns the system to exactly the path it used all session.
+* Local commits only, no remote push, per instruction.
+
+Tests: 15 hook + 32 closed-loop, 186 in the deploy gate. Eight mutations killed
+by their own tests — mapping `Stop` to a wake, waking on every notification type,
+letting an exception escape, printing to stdout, resolving a watch with no
+record, dropping the staleness bound, treating any stop as intentional, and
+removing the intentional-wait resolution.
+
+## Not yet done, and named rather than implied
+
+The supervisor half is designed but not built: a persistent Supervisor-Claude
+holding `notify_when_idle` subscriptions and continuing workers over
+`SendMessage`, `/goal` for verified multi-turn task loops, auto-registration at
+agent creation, and a latency/overhead comparison against the current path.
+Today's change makes the SIGNAL native and correct; the CONTINUATION still
+travels the existing ChatGPT route, which is proven and unchanged.
