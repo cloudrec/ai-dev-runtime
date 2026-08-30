@@ -516,19 +516,33 @@ recovery PROVEN; delivery still queued:**
   chain's endpoint — verified by re-tracing `14058` immediately after and
   getting the same tip. This closes decision → claim → delivery → assistant-
   started for the canary's `agent_dead` event, end to end, through the
-  coalescing design's intended path. **Still not observed** (checked again at
-  this point): any `deliveries` row targeting `cp-canary*` since session
-  start — zero. The causal ChatGPT→canary continuation call (Scenario A's own
-  bar) has not occurred within the observation window so far. Route-capacity
-  dynamics (one non-actionable delivery per 900s per route, shared with
-  ongoing `notifications_red`/`notification_dead_letter` traffic on the same
-  `owner-os` fallback route) are the same class of constraint already
-  documented as owner-gated in Part 3 — now correctly bounded and draining
-  (queue depth ~70, not thousands), not broken, but still real production
-  traffic this session did not accelerate, retire, or reroute. Whether
-  ChatGPT chooses to act on the canary specifically, from a shared "go read
-  Owner OS" instruction covering many events, is its own decision and cannot
-  be forced or simulated from this side.
+  coalescing design's intended path.
+
+  **Final result (full ~90-minute watch across two consecutive monitors,
+  ending 2026-08-30 ~07:04Z):** 14082 remained the chain's permanent, stable,
+  delivered tip throughout — reverified identically at the end of the full
+  1-hour extension. **Zero `deliveries` rows targeting `cp-canary*` appeared
+  in the entire window.** The causal ChatGPT→canary continuation call
+  (Scenario A's own bar) did not occur. This is the final, honest negative
+  result for that specific leg — not a timeout artifact.
+
+  An unrelated external restart of `owner-os-wake-companion.service` occurred
+  at `2026-08-30T06:22:13+02:00` during the watch (`Result=success`,
+  `NRestarts=0` — a clean stop/start, not initiated by this session; no
+  `systemctl` call was made by this session during the hour). Verified it
+  caused no disruption: deliveries continued seamlessly immediately before
+  (06:11:34) and after (06:24:24) the restart, D's proven chain/tip was
+  unchanged, `worker_skew()` empty, pipeline `status: "ok"` throughout.
+
+  Route-capacity dynamics (one non-actionable delivery per 900s per route,
+  shared with ongoing `notifications_red`/`notification_dead_letter` traffic
+  on the same `owner-os` fallback route) are the same class of constraint
+  already documented as owner-gated in Part 3 — now correctly bounded and
+  draining (queue depth ~70, not thousands), not broken, but still real
+  production traffic this session did not accelerate, retire, or reroute.
+  Whether ChatGPT chooses to act on the canary specifically, from a shared
+  "go read Owner OS" instruction covering many events in a live CTO inbox, is
+  its own decision and cannot be forced or simulated from this side.
 
 ## Verified clean, with fresh post-fix evidence
 
@@ -559,15 +573,29 @@ recovery PROVEN; delivery still queued:**
 | bounded retry | **PASS** (fresh evidence, event 13806) |
 | no resurrection of old/closed events | **PASS** (verified post-both-fixes) |
 
-**Still NOT GREEN**, precisely: the causal ChatGPT→canary continuation signature
-(Scenario A's own bar) was not observed for B/C/D within this session's
-observation window, and D's own coalescing chain had not individually
-delivered by session end (though the literal-type class already has a full
-delivered proof via a real event, 13794/13799). Nothing here is a defect —
-route-capacity sharing on `owner-os` with live production traffic is the same
-already-documented, deliberately-untouched owner-gated dynamic from Part 3.
-What changed this session: two more real defects (unbounded scan, missing
-index) were found live, fixed, tested, mutation-verified, and deployed; the
-backlog is bounded and draining correctly instead of hanging; and the canary
-proved a full kill→detect→decide→recover loop plus two full deliver-through-
-coalescing proofs (B, C) that did not exist before.
+**Still NOT GREEN**, precisely and finally (after a full ~90-minute continued
+watch, ending ~07:04Z): B, C, and D each now have a complete, verified
+decision → claim → delivery → assistant-started proof (B/C via 13796; D via
+14082, plus D's managed recovery loop and the literal-type proof via
+13794/13799). What did **not** occur, in ~90 minutes of live observation, is
+the causal ChatGPT→canary continuation call — zero `deliveries` rows targeted
+`cp-canary*` in that window. That is the one leg this report cannot mark
+GREEN, and it is reported as a genuine negative result, not a timeout
+artifact. Nothing here is a defect — route-capacity sharing on `owner-os`
+with live production traffic is the same already-documented, deliberately-
+untouched owner-gated dynamic from Part 3, and whether ChatGPT chooses to act
+on the canary from a shared inbox is outside what this session can force.
+
+What changed this session: a third real defect (in addition to the two from
+Part 2/3) was found live, fixed, tested, mutation-verified, and deployed —
+`coalesce_generic_backlog`'s own new code had no age bound and no index for
+its self-join, both reproduced as 30s+ hangs against production. The backlog
+is now bounded and draining correctly (queue depth ~70, matching the
+originally-reported ~68) instead of hanging. The canary proved a full
+kill→detect→decide→recover loop (agent_dead 14058 → agent_recovered 14061,
+no duplicate) plus two full deliver-through-coalescing proofs (B: 14009→13796,
+C: 14007→13796) and its own process-death class reaching full delivery
+(D: 14058→14082) — none of which existed before this session. Production is
+healthy: pipeline `ok`, `worker_skew()` empty, dedupe/bounded-retry/no-
+resurrection all hold with fresh evidence, and an unrelated external service
+restart mid-watch caused no disruption.
