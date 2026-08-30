@@ -735,3 +735,30 @@ def test_actionable_rows_are_never_coalesced():
     _wake(802, severity="high", event_type="agent_waiting_input", now=1000.0 + 61)
     r = wb.coalesce_generic_backlog(now=2000.0)
     assert 801 not in r["superseded_event_ids"] and 802 not in r["superseded_event_ids"]
+
+
+def test_skips_older_than_max_wake_age_are_never_coalesce_candidates():
+    """Past MAX_WAKE_AGE_SECS a skip can never be redecided into `wake` again
+    (`_redecide_cooldown_skips` already excludes it), so it can never become a live
+    delivery candidate either way. Without this bound the candidate query re-resolves
+    every historical `cooldown_active` skip ever written, forever, on every tick — a
+    direct production hang reproduced live against 3000+ weeks-old rows."""
+    now = 10_000_000.0
+    old_ts = now - wb.MAX_WAKE_AGE_SECS - 1
+    _insert_event(901, ts_epoch=old_ts, type="notification_dead_letter")
+    _insert_event(902, ts_epoch=old_ts, type="notification_dead_letter")
+    for e in (901, 902):
+        _skip_row(e)
+    r = wb.coalesce_generic_backlog(now=now)
+    assert r["superseded"] == 0, "an event that can never be redecided must never be touched"
+    assert 901 not in r["kept_event_ids"] and 902 not in r["kept_event_ids"]
+
+
+def test_skip_with_unknown_event_age_is_still_a_candidate():
+    """No matching `event` row means age is UNKNOWN, not old — same convention as
+    `expire_stale`/`_redecide_cooldown_skips`: unknown never blocks a fold."""
+    for e in (911, 912):
+        _skip_row(e)
+    r = wb.coalesce_generic_backlog(now=2000.0)
+    assert r["superseded"] == 1
+    assert 912 in r["kept_event_ids"]

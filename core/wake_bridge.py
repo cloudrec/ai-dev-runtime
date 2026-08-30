@@ -1457,15 +1457,31 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
         # frequency — it removes redundant candidates. The newest per route
         # survives and still says "go read Owner OS", and the CTO inbox keeps every
         # event regardless. Superseded rows are retired, never deleted.
+        #
+        # The skip branch is bounded to the SAME `MAX_WAKE_AGE_SECS` ceiling
+        # `_redecide_cooldown_skips` already uses for its own event-age check: past
+        # that ceiling a skip can never be redecided into `wake` again (that
+        # function excludes it), so it can never become a live delivery candidate
+        # either way — coalescing it buys nothing. Without this bound the query
+        # re-resolves every historical `cooldown_active` skip ever written (3000+
+        # weeks-old rows, most with no stored route_key, each needing a fresh
+        # `wake_routes.resolve()` call) on EVERY tick forever, since most never
+        # share a route with another row and so never collapse away. Found live:
+        # a plain read of this exact predicate, and a direct call to this
+        # function, both hung past 30s against the production db. Unknown age
+        # (no matching event row) is never a reason to exclude — same convention
+        # as `expire_stale`/`_redecide_cooldown_skips`.
         rows = conn.execute(
             "SELECT a.id, a.event_id, COALESCE(a.project_id,''), "
             "COALESCE(a.route_key,''), COALESCE(a.agent_id,'') FROM wake_audit a "
-            "WHERE (a.decision='wake' OR (a.decision='skip' AND a.reason='cooldown_active')) "
+            "LEFT JOIN event e ON e.id = a.event_id "
+            "WHERE (a.decision='wake' OR (a.decision='skip' AND a.reason='cooldown_active' "
+            "       AND (e.ts_epoch IS NULL OR e.ts_epoch > ?))) "
             "AND a.acknowledged=0 AND a.superseded_by IS NULL AND COALESCE(a.actionable,0)=0 "
             "AND NOT EXISTS (SELECT 1 FROM wake_audit w WHERE w.event_id=a.event_id "
             "                AND w.decision='wake' AND w.id<>a.id) "
             "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
-            "ORDER BY a.id ASC").fetchall()
+            "ORDER BY a.id ASC", (now - MAX_WAKE_AGE_SECS,)).fetchall()
         groups: dict = {}
         for aid, eid, project, stored_route, agent_ref in rows:
             # Group by the RESOLVED route, not the raw project key. Two sessions of
