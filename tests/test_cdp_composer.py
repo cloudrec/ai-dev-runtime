@@ -579,3 +579,100 @@ def test_an_unanswerable_probe_does_not_block_delivery(wired):
     r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
     assert r["ok"] is True and r["reason"] == "submitted_and_assistant_started_generating"
     assert s.inserted == ["PHRASE"]
+
+
+# ── 2026-08-30: a WEDGED conversation blocks a route forever ─────────────────
+class _WedgeSession(_FakeSession):
+    """Stop control up, nothing streaming, assistant turn frozen — the live owner-os
+    shape: the RENDERER answers fine, the CONVERSATION is stuck."""
+
+    def __init__(self, *, streaming=False, turn_ids=None, **kw):
+        super().__init__(trapped=False, **kw)
+        self.streaming = streaming
+        self.turn_ids = list(turn_ids or ["m1", "m1", "m1"])
+
+    def boolean(self, expression):
+        if "stop-button" in expression:
+            return True
+        if "result-streaming" in expression:
+            return self.streaming
+        return super().boolean(expression)
+
+    def last_attr(self, selector, attr):
+        return self.turn_ids.pop(0) if self.turn_ids else "m1"
+
+
+def test_a_stuck_stop_control_with_no_streaming_is_wedged():
+    from tools import cdp_composer as cc
+    assert cc.generating_is_wedged(_WedgeSession(), sleep=lambda s: None) is True
+
+
+def test_streaming_tokens_are_never_called_wedged():
+    """A genuinely long answer must never be cut short."""
+    from tools import cdp_composer as cc
+    assert cc.generating_is_wedged(_WedgeSession(streaming=True),
+                                   sleep=lambda s: None) is False
+
+
+def test_a_new_assistant_turn_proves_it_is_not_wedged():
+    from tools import cdp_composer as cc
+    s = _WedgeSession(turn_ids=["m1", "m2", "m3"])
+    assert cc.generating_is_wedged(s, sleep=lambda s_: None) is False
+
+
+def test_the_stop_control_clearing_proves_it_is_not_wedged():
+    from tools import cdp_composer as cc
+
+    class _Clears(_WedgeSession):
+        def __init__(self):
+            super().__init__()
+            self._n = 0
+
+        def boolean(self, expression):
+            if "stop-button" in expression:
+                self._n += 1
+                return self._n < 2
+            return super().boolean(expression)
+
+    assert cc.generating_is_wedged(_Clears(), sleep=lambda s_: None) is False
+
+
+def test_every_sample_must_agree_before_declaring_a_wedge():
+    """One quiet moment mid-answer is not a wedge."""
+    from tools import cdp_composer as cc
+
+    class _Blip(_WedgeSession):
+        def __init__(self):
+            super().__init__()
+            self._n = 0
+
+        def boolean(self, expression):
+            if "result-streaming" in expression:
+                self._n += 1
+                return self._n >= 2      # quiet on the first sample, streaming after
+            return super().boolean(expression)
+
+    assert cc.generating_is_wedged(_Blip(), sleep=lambda s_: None) is False
+
+
+def test_ordinary_back_pressure_never_replaces_the_tab(wired, monkeypatch):
+    """Recovery is destructive to a turn in flight. Only a WEDGE — which never resolves —
+    earns it; back-pressure resolves itself and must be left alone."""
+    calls = []
+    monkeypatch.setattr(cdp, "recover_wedged_tab", lambda t, u: calls.append(u) or t)
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.generating = True                      # generating, and NOT wedged
+    monkeypatch.setattr(cdp, "generating_is_wedged", lambda *a, **k: False)
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["reason"] == "assistant_still_generating"
+    assert calls == [], "a live turn must never have its tab replaced"
+
+
+def test_a_wedged_conversation_does_earn_one_tab_recovery(wired, monkeypatch):
+    calls = []
+    monkeypatch.setattr(cdp, "recover_wedged_tab", lambda t, u: calls.append(u) or t)
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.generating = True
+    monkeypatch.setattr(cdp, "generating_is_wedged", lambda *a, **k: True)
+    cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert calls == ["https://chatgpt.com/c/a"], "a wedge must be recovered exactly once"

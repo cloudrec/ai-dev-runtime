@@ -310,11 +310,49 @@ def ack_click_decision(names: list) -> str:
 # was simply describing the wrong thing, and an operator reading the log would look for a
 # broken composer instead of ordinary back-pressure.
 _STOP_BUTTON_SEL = "button[data-testid='stop-button'], button[aria-label*='Stop']"
+# Tokens actually arriving. Distinct from STREAMING_SEL / _STOP_BUTTON_SEL, which are the
+# stop CONTROL: the control being up says a turn was started, this says one is still
+# producing. The difference between them is exactly what distinguishes back-pressure from
+# a wedged conversation.
+STREAMING_CONTENT_SEL = ".result-streaming, [data-message-streaming='true']"
 
 
 def assistant_is_generating(s) -> Optional[bool]:
     """Is a turn being generated right now? None when the page cannot answer."""
     return s.boolean(f"!!document.querySelector({_STOP_BUTTON_SEL!r})")
+
+
+def generating_is_wedged(s, samples: int = 3, interval: float = 2.0, sleep=None) -> bool:
+    """A stop control that is present while NOTHING is happening.
+
+    ChatGPT shows the stop control for the whole of a turn, and the composer offers no
+    send control while it does — so a conversation whose turn never finishes blocks every
+    future delivery to that chat, permanently and silently. 2026-08-30: the owner-os tab
+    sat with `data-testid=stop-button` visible, `.result-streaming` absent and the newest
+    assistant turn frozen, for over half an hour; `page_responsive()` was true throughout
+    (the RENDERER was fine — the CONVERSATION was stuck), so the existing wedged-tab
+    recovery never triggered and not one wake could be delivered.
+
+    Bounded and conservative: every sample must agree, across `samples * interval`
+    seconds, that the stop control is up, nothing is streaming and the newest assistant
+    turn id has not moved. Any sign of life — streaming, a new turn, the stop control
+    clearing — answers False immediately, so a genuinely long answer is never cut short.
+    """
+    import time as _t
+    sleep = sleep or _t.sleep
+    last_id = None
+    for i in range(max(1, samples)):
+        if i:
+            sleep(interval)
+        if s.boolean(f"!!document.querySelector({_STOP_BUTTON_SEL!r})") is not True:
+            return False                      # the turn ended: not wedged
+        if s.boolean(f"!!document.querySelector({STREAMING_CONTENT_SEL!r})") is True:
+            return False                      # tokens are arriving: genuinely working
+        now_id = s.last_attr(ASSISTANT_TURN_SEL, "data-message-id")
+        if last_id is not None and now_id != last_id:
+            return False                      # a new turn landed: genuinely working
+        last_id = now_id
+    return True
 
 
 def dialog_title(s) -> str:
@@ -483,8 +521,19 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
 
     # The claim is spent from here on, so every outcome past this line is a delivery attempt
     # and is recorded as one — success and failure alike.
-    return _record_delivery(source, event_id, _attempt(conversation_url, phrase,
-                                                       source=source, event_id=event_id),
+    res = _attempt(conversation_url, phrase, source=source, event_id=event_id)
+    # A WEDGED conversation never clears on its own: the stop control stays up, no send
+    # control is offered, and every future wake to this chat fails identically. That is a
+    # permanent route outage, so it earns the one recovery this module already has —
+    # replacing the tab on the SAME bound conversation, which keeps the exact-route
+    # guarantee — and exactly one retry. Ordinary back-pressure is NOT recovered: a turn
+    # genuinely in flight resolves itself and interrupting it would be destructive.
+    if res.get("reason") == "assistant_generating_wedged":
+        target = find_target(conversation_url)
+        if target and recover_wedged_tab(target, conversation_url):
+            res = _attempt(conversation_url, phrase, source=source, event_id=event_id)
+            res["after_wedge_recovery"] = True
+    return _record_delivery(source, event_id, res,
                             conversation=conversation_url, route_key=route_key)
 
 
@@ -620,6 +669,11 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # brings it around again once the assistant is free. Fail-open — if the page cannot
         # answer the question (None), the previous path runs unchanged.
         if assistant_is_generating(s) is True:
+            # Two different worlds behind one appearance. A turn genuinely in flight is
+            # back-pressure and resolves itself; a stop control that is up while nothing
+            # streams never resolves, and blocks the route forever.
+            if generating_is_wedged(s):
+                return {"ok": False, "reason": "assistant_generating_wedged"}
             return {"ok": False, "reason": "assistant_still_generating"}
 
         # The ONLY string ever sent into the page.
