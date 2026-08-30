@@ -2949,3 +2949,26 @@ the fix at **18:36:28Z** — the repeat predates the fix going live by 45 second
 and is therefore pre-fix, not a failure of it. The repeats ran on a roughly
 one-hour cadence (16:25 → 17:35 → 18:35), so a watch is running past that
 interval to confirm the absence of a fourth.
+
+## Live verification: the repeat is suppressed, genuine stops are not
+
+The fix went live at 18:36:28Z. Within three minutes, two GENUINELY new stops
+were announced normally:
+
+```
+18:36:43  15500  work_stopped_incomplete  cp-canary:0.0
+18:39:18  15503  work_stopped_incomplete  payorch-monitor-clean:0.0  (digest 6a4dc9dd0b)
+```
+
+— while `diamond-auction:0.0`, unchanged for 8465 s, emitted **nothing**. That is
+the exact discrimination the fix was written for: a new fact is announced, an
+unchanged pane is not.
+
+Notifications stay correctly ARMED across the fleet for parked panes
+(`diamond-auction` quiescent, `email` quiescent, `payorch-monitor-clean`
+quiescent, several `owner_prompt`), so none of them has been silently disarmed —
+each will fire again the moment its pane actually changes.
+
+Delivery continues normally: 11 delivered / 6 refused in the same fifteen
+minutes, the refusals being the back-pressure and wedge verdicts doing their job.
+`worker_skew()` empty, `tmux_control` ok, no split.
