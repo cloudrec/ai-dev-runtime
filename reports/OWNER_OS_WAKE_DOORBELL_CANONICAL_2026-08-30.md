@@ -573,18 +573,19 @@ recovery PROVEN; delivery still queued:**
 | bounded retry | **PASS** (fresh evidence, event 13806) |
 | no resurrection of old/closed events | **PASS** (verified post-both-fixes) |
 
-**Still NOT GREEN**, precisely and finally (after a full ~90-minute continued
-watch, ending ~07:04Z): B, C, and D each now have a complete, verified
-decision → claim → delivery → assistant-started proof (B/C via 13796; D via
-14082, plus D's managed recovery loop and the literal-type proof via
-13794/13799). What did **not** occur, in ~90 minutes of live observation, is
-the causal ChatGPT→canary continuation call — zero `deliveries` rows targeted
-`cp-canary*` in that window. That is the one leg this report cannot mark
-GREEN, and it is reported as a genuine negative result, not a timeout
-artifact. Nothing here is a defect — route-capacity sharing on `owner-os`
-with live production traffic is the same already-documented, deliberately-
-untouched owner-gated dynamic from Part 3, and whether ChatGPT chooses to act
-on the canary from a shared inbox is outside what this session can force.
+## GREEN — owner sign-off (2026-08-30, ~07:1xZ)
+
+B, C, and D each have a complete, verified decision → claim → delivery →
+assistant-started proof (B/C via 13796; D via 14082, plus D's managed
+recovery loop and the literal-type proof via 13794/13799). The one leg not
+directly observed in ~90 minutes of live watching — a causal ChatGPT→canary
+continuation call (zero `deliveries` rows targeted `cp-canary*` in that
+window) — is an accepted, owner-signed-off gap, not a defect: it depends on
+ChatGPT's own choice from a shared "go read Owner OS" inbox, not on anything
+this pipeline controls, and route-capacity sharing on `owner-os` with live
+production traffic is the same already-documented dynamic from Part 3.
+Marked **GREEN** by explicit owner instruction given current live health and
+the completed B/C/D proof; watching stopped.
 
 What changed this session: a third real defect (in addition to the two from
 Part 2/3) was found live, fixed, tested, mutation-verified, and deployed —
