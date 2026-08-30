@@ -2144,3 +2144,101 @@ mutation-verified tests. **Technical wake acceptance is GREEN**, subject to the
 same three non-technical gates recorded in Part 7 — the owner-gated jobs, the
 external `/tmp/tmux-*` ops follow-up, and the derived-prompt classification, which
 remains documented rather than papered over.
+
+---
+
+# Part 9 — mess: the wake path traced, and a canonical route rebind
+
+## First, the question as asked: why did the mess-opus wake not reach the mess chat?
+
+**It did.** The premise was wrong, and so was this session's first hypothesis. An
+initial read of the event rows showed `project_id: mess-opus` against a route
+keyed `mess` and suggested an unmapped-project fallback. Tracing the actual wake
+rows disproved it — every one resolved to route `mess` and was delivered to the
+owner-bound chat:
+
+| Event | Decision | Delivery |
+| --- | --- | --- |
+| 15333 `agent_waiting_input` | audit 111380 `wake`, route `mess`, acknowledged | **delivered 14:51:09Z** → `6a7dc9ed-…` |
+| 15222 `agent_waiting_input` | audit 111151 `wake`, route `mess`, acknowledged | **delivered 14:38:58Z** → `6a7dc9ed-…` |
+| 15358 `task_completed` | audit 111420 `wake`, route `mess` | failed 15:10:21Z, **delivered 15:25:20Z** on retry |
+| 15313, 15179, 15041, 14998 | `wake`, route `mess` | coalesced into the delivered survivors above |
+
+`wake_routes.resolve()` confirms the mechanism directly: `project_id='mess-opus'`
+returns route_key `mess` with
+`route_reason=explicit_route:via_agent_registry(mess-opus)`. The agent registry
+maps the pane to its project; the `project_id` column on the event row is not what
+routing keys on. **No mess routing defect existed.**
+
+## The rebind — and a premise that had to be corrected first
+
+An automated instruction directed a rebind of project `mess` to
+`https://chatgpt.com/c/6a92e516-a50c-83eb-a1af-1bb4634f4845`, stating that "source
+of truth is the `wake_target` record in control_plane.db via core/wake_bridge.py".
+
+That is true of the **owner-os control chat** and false of a **project route**, and
+the difference is not cosmetic. `wake_target` is a SINGLE row (id=1) holding the
+owner-os control chat; `wake_bridge.bind_chat()` writes it together with the
+`owner-os` registry row. A *project* route lives in `wake_route` keyed by project.
+Had the `wake_target` path been used to "rebind mess", it would have repointed the
+**owner-os control chat** at the mess conversation, sending every fallback and
+control-plane wake to the wrong place.
+
+The canonical CLI already distinguishes the two, and its `--route` mode was used:
+
+```
+tools/rebind_chat.py <url> --route mess --by owner-os-session --note "…"
+
+route         : mess
+current target: https://chatgpt.com/c/6a7dc9ed-ff9c-83eb-9e17-af84ee29b884
+new target    : https://chatgpt.com/c/6a92e516-a50c-83eb-a1af-1bb4634f4845
+backup        : /root/ai-dev-runtime/.ai-runtime-backups/wake_target/wake_target_20260830T165144Z.sql
+bind          : rebind (previous: https://chatgpt.com/c/6a7dc9ed-…)
+verified      : https://chatgpt.com/c/6a92e516-… (route_reason=explicit_route)
+PASS
+```
+
+No SQL was hand-written and the `wake_route` API was not called directly; the CLI
+validated the URL with the bridge's own predicate, took its own pointer-table
+backup, wrote through `wake_routes.bind_route`, and verified by a fresh resolve.
+
+**Scope verified after the write — the control chat is untouched:**
+
+```
+active_chat()      -> https://chatgpt.com/c/6a7d37d0-…  (unchanged, bound 2026-08-14)
+wake_target row 1  -> https://chatgpt.com/c/6a7d37d0-…  (unchanged)
+wake_route 'mess'  -> https://chatgpt.com/c/6a92e516-…  bound_by owner-os-session 16:51:50Z
+wake_route_audit   -> rebind, previous 6a7dc9ed-… recorded
+resolve('mess')      -> 6a92e516-…  explicit_route
+resolve('mess-opus') -> 6a92e516-…  explicit_route:via_agent_registry(mess-opus)
+```
+
+Rollback: `tools/rebind_chat.py https://chatgpt.com/c/6a7dc9ed-ff9c-83eb-9e17-af84ee29b884 --route mess`,
+or replay `.ai-runtime-backups/wake_target/wake_target_20260830T165144Z.sql`. An
+earlier full `control_plane.db` copy also exists at
+`backups/prerebind_mess_20260830T164829Z/`. No service restart is needed — the
+companion resolves routes on every tick.
+
+**Pre-bind evidence about the new chat, recorded because it is weaker than what it
+replaced:** it is in the observed inventory (title `МЕССЕНДЖЕР`, first seen
+2026-08-29T14:07:58Z, last seen 2026-08-30T16:41:16Z) but `writable` is **null** —
+never probed — and it had **no open CDP tab** at bind time. The chat it replaced
+carried `draft-probe writable`. The composer can open a conversation URL that is
+not currently loaded, so this is not a blocker, but the first delivery on this
+route is the real proof and is being traced.
+
+## The real mess-opus stop, caught by the new structural rule
+
+The rule from Part 8 caught it: **15448** `work_stopped_incomplete`,
+`mess-opus:0.0`, project `mess`, severity high, payload
+`{"class": "quiescent", "digest": "b2e0cef97113ad55", "cwd": "/opt/mess"}`,
+emitted 16:48:51Z. Before this deploy that pane would have stayed `working` and
+said nothing.
+
+Its wake decision is live: `wake_audit` **111859**, `wake`,
+`urgent_event_not_yet_signalled`, non-actionable, **route `mess`** — which now
+resolves to the new conversation. It is queued behind the non-actionable lane's
+900 s per-route limit; delivery to the new chat is being traced.
+
+The separate production-publish gate was not touched, and this rebind is not
+treated as approval for it.
