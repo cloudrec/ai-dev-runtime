@@ -370,7 +370,7 @@ def resolve_target(cwd: str, agents: list) -> Optional[str]:
 
 
 def open_gate(target: str, *, reason: str, conn=None, now: Optional[float] = None,
-              emit_fn: Optional[Callable] = None) -> dict:
+              emit_fn: Optional[Callable] = None, owner_facing: bool = True) -> dict:
     """Record the terminal state ONCE and emit one owner-facing event.
 
     Idempotent by construction: the row is the latch. A second call while the gate stands
@@ -391,7 +391,9 @@ def open_gate(target: str, *, reason: str, conn=None, now: Optional[float] = Non
             from core.control_plane import cto
             emit_fn = cto.emit
         res = emit_fn("native_supervisor", "agent_continuation_exhausted",
-                      agent_id=target, severity="high", owner_action_required=True,
+                      agent_id=target,
+                      severity="high" if owner_facing else "info",
+                      owner_action_required=bool(owner_facing),
                       payload={"target": target, "reason": reason,
                                "gate_ttl_secs": GATE_TTL_SECS,
                                "automated_continuation": "stopped"},
@@ -412,6 +414,55 @@ def open_gate(target: str, *, reason: str, conn=None, now: Optional[float] = Non
     finally:
         if own:
             conn.close()
+
+
+# How far back a recorded intentional-wait skip still speaks for a target.
+GATE_WAIT_LOOKBACK_SECS = int(os.getenv("NATIVE_SUPERVISOR_GATE_WAIT_LOOKBACK_SECS", "3600"))
+
+
+def gate_exemption(conn, target: str, cwd: str = "", now: Optional[float] = None) -> str:
+    """Is there an innocent explanation for reaching the continuation cap?
+
+    The gate's claim is "six automated continuations each produced another turn boundary,
+    so this is not converging". That claim is only sound if the agent had something to
+    converge ON and was not deliberately waiting. Two ways it can be false:
+
+    * The agent is in an intentional external wait. `native_supervision` records that skip
+      under the payload CWD, because `decide()` runs before `resolve_target()`, while the
+      cap and the gate key on the resolved tmux target. So a target could be recognised as
+      waiting-by-design fourteen times and still be escalated as stalled — the same
+      namespace split as the `session:`/tmux one in Part 23, in a third place. Both forms
+      are therefore checked.
+
+    * The agent has no assigned task. Continuation was never going to converge on work that
+      was never given. Sending should still STOP — poking an agent with nothing to do is
+      the spin the cap exists to end — but calling that an owner-attention failure is
+      wrong, so the gate opens without waking anyone.
+
+    Returns "" when the cap really does mean what the gate says.
+    """
+    now = now if now is not None else now_ts()
+    names = [n for n in (target, cwd, (cwd or "").rstrip("/")) if n]
+    for n in names:
+        if in_external_wait(n, conn=conn, now=now):
+            return "intentional_external_wait"
+    try:
+        marks = ",".join("?" * len(names))
+        row = conn.execute(
+            f"SELECT 1 FROM native_supervision WHERE target IN ({marks}) "
+            "AND reason='intentional_external_wait' AND ts_epoch > ? LIMIT 1",
+            (*names, now - GATE_WAIT_LOOKBACK_SECS)).fetchone()
+        if row:
+            return "recent_intentional_external_wait"
+    except Exception:  # noqa: BLE001 — unknown never means "suppress the alarm"
+        return ""
+    try:
+        from core import os_task_queue as q
+        if q.active_task(target, conn=conn) is None:
+            return "no_assigned_task"
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 def in_gate(target: str, *, conn=None, now: Optional[float] = None) -> bool:
@@ -627,8 +678,16 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                 # Not converging: MAX_CONSECUTIVE automated continuations in the hour each
                 # produced another turn boundary. Record the terminal state ONCE, tell the
                 # owner ONCE, and stop sending — rather than skipping silently forever.
+                exempt = gate_exemption(conn, target, payload.get("cwd", ""), now)
+                if exempt == "intentional_external_wait" or \
+                        exempt == "recent_intentional_external_wait":
+                    # Waiting by design is not a stall. No gate, no alarm.
+                    _record(conn, eid, target, "skip", f"cap_reached_but_{exempt}", True)
+                    skipped.append({"event_id": eid, "target": target,
+                                    "why": f"cap_reached_but_{exempt}"})
+                    continue
                 g = open_gate(target, reason="continuation_cap_reached_without_progress",
-                              conn=conn, now=now)
+                              conn=conn, now=now, owner_facing=not exempt)
                 _record(conn, eid, target, "gate", "continuation_cap_reached_without_progress",
                         True, {"gate_opened": g.get("opened"),
                                "gate_event_id": g.get("event_id")})

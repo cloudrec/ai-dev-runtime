@@ -544,3 +544,69 @@ def test_an_agent_in_the_supervisors_own_cwd_is_never_registered(monkeypatch):
     own = os.path.dirname(os.path.dirname(os.path.abspath(ns.__file__)))
     ns.auto_register([_agent(target="owner-os-self:0.0", cwd=own)], conn=conn)
     assert "owner-os-self:0.0" not in ns.registered_targets(conn=conn)
+
+
+# ── the continuation cap must mean what the gate says it means (event 16047) ──────────
+# The gate claims "six continuations each produced another turn boundary, so this is not
+# converging". Live, it fired on two agents where that claim was false: arbitrage2-fable
+# had an armed monitor and was awaiting a FINAL, and the seo worker had no assigned task
+# and was simply holding.
+
+def _sup_row(conn, target, reason, ts):
+    conn.execute("INSERT INTO native_supervision (event_id,ts,ts_epoch,target,action,"
+                 "reason,ok,detail) VALUES (?,?,?,?,?,?,1,'{}')",
+                 (0, "t", ts, target, "skip", reason))
+    conn.commit()
+
+
+def test_an_intentional_wait_recorded_under_the_cwd_still_exempts_the_target():
+    """The namespace split: decide() records the skip under the payload cwd, while the
+    cap and the gate key on the resolved tmux target."""
+    conn, _ = ns._conn()
+    now = time.time()
+    _sup_row(conn, "/opt/arbitrage2-fable-audit", "intentional_external_wait", now - 60)
+    assert ns.gate_exemption(conn, "arbitrage2-fable:0.0",
+                             "/opt/arbitrage2-fable-audit", now) == \
+        "recent_intentional_external_wait"
+
+
+def test_a_live_external_wait_declaration_exempts_in_either_namespace():
+    conn, _ = ns._conn()
+    now = time.time()
+    ns.mark_external_wait("/opt/proj", reason="armed monitor", conn=conn)
+    assert ns.gate_exemption(conn, "proj:0.0", "/opt/proj", now) == "intentional_external_wait"
+
+
+def test_a_stale_wait_record_does_not_exempt_forever():
+    conn, _ = ns._conn()
+    now = time.time()
+    _sup_row(conn, "/opt/old", "intentional_external_wait",
+             now - ns.GATE_WAIT_LOOKBACK_SECS - 60)
+    assert ns.gate_exemption(conn, "old:0.0", "/opt/old", now) != \
+        "recent_intentional_external_wait"
+
+
+def test_no_assigned_task_opens_the_gate_but_wakes_nobody():
+    """Sending must still stop — that is the spin the cap exists to end — but an agent
+    with nothing assigned was never failing to converge."""
+    conn, _ = ns._conn()
+    seen = []
+
+    def emit(source, etype, **kw):
+        seen.append((kw.get("severity"), kw.get("owner_action_required")))
+        return {"event_id": 7}
+
+    g = ns.open_gate("x:0.0", reason="cap", conn=conn, now=1000.0, emit_fn=emit,
+                     owner_facing=False)
+    assert g["opened"] is True
+    assert ns.in_gate("x:0.0", conn=conn, now=1000.0) is True     # sends still stop
+    assert seen == [("info", False)]                              # nobody is woken
+
+
+def test_a_genuine_stall_still_wakes_the_owner():
+    conn, _ = ns._conn()
+    seen = []
+    ns.open_gate("y:0.0", reason="cap", conn=conn, now=1000.0,
+                 emit_fn=lambda s, e, **kw: seen.append(
+                     (kw.get("severity"), kw.get("owner_action_required"))) or {"event_id": 8})
+    assert seen == [("high", True)]
