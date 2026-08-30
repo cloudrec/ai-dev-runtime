@@ -631,3 +631,234 @@ def test_two_agents_route_to_their_own_projects_without_cross_talk():
     _scan(agents, {"a1:0.0": BLOCKER_TAIL, "a2:0.0": PROMPT_TAIL}, emit)
     routed = {c["agent_id"]: c["project_id"] for c in emit.calls}
     assert routed == {"a1:0.0": "gaika-drop", "a2:0.0": "mess"}
+
+
+# ── 2026-08-30: the SILENT STOP. A pane can be structurally idle yet stay `working`
+# ── forever because its final prose matches no detector.
+#
+# Live: a canary finished its step and stopped to ask, wording it "Not proceeding past
+# this question." No finish vocabulary, no prompt vocabulary, no menu, no blocker
+# phrase — so classify held it `working` (`no_positive_finish_evidence`) and NOTHING was
+# ever emitted for a pane the inventory itself called idle. The fix is structural, never
+# linguistic: the inventory must already say at-rest AND the bottom region must have been
+# unchanged for QUIESCENT_SECS. Loosening the regexes instead would manufacture false
+# completions and false prompts fleet-wide, which is the worse failure.
+
+CANARY_SILENT_STOP = """I appended the dated line to the report.
+It is inside /root/cp-canary-v2 only and needs no scope change. But it's your call.
+Not proceeding past this question."""
+
+LONG_SHELL_TAIL = """[watch] tick 41221 ok
+[watch] tick 41222 ok
+[watch] tick 41223 ok"""
+
+
+# (a) the exact phrasing that just failed
+def test_a_silent_stop_becomes_quiescent_once_it_is_structurally_at_rest():
+    fresh = aw.classify(CANARY_SILENT_STOP, state="idle", prev_cls="working")
+    assert fresh["cls"] == "working", "a pane that just went quiet is not yet a stop"
+
+    settled = aw.classify(CANARY_SILENT_STOP, state="idle", prev_cls="working",
+                          quiet_secs=aw.QUIESCENT_SECS + 1)
+    assert settled["cls"] == "quiescent"
+    assert "at_rest_unchanged_for" in settled["reason"]
+
+
+def test_a_quiescence_never_claims_completion():
+    """`completed` asserts the agent SAID it finished. Quietness must never fabricate
+    that — the honest verdict is that work stopped without proving it finished."""
+    c = aw.classify(CANARY_SILENT_STOP, state="idle", prev_cls="working",
+                    quiet_secs=aw.QUIESCENT_SECS * 10)
+    assert c["cls"] != "completed"
+    assert aw._EVENT_FOR["quiescent"][0] == "work_stopped_incomplete"
+    assert aw._EVENT_FOR["quiescent"][0] != "task_completed"
+
+
+def test_a_dwell_is_required_no_stop_is_declared_on_a_pause_between_turns():
+    for q in (0.0, 1.0, aw.QUIESCENT_SECS - 1):
+        assert aw.classify(CANARY_SILENT_STOP, state="idle", prev_cls="working",
+                           quiet_secs=q)["cls"] == "working"
+
+
+# (b) a genuine menu is untouched
+def test_b_a_real_numbered_menu_is_still_owner_prompt_at_any_dwell():
+    for q in (0.0, aw.QUIESCENT_SECS * 5):
+        assert aw.classify(PROMPT_TAIL, state="idle", prev_cls="working",
+                           quiet_secs=q)["cls"] == "owner_prompt"
+        assert aw.classify(CHEMMY_MENU_REST, state="waiting_owner", prev_cls="working",
+                           quiet_secs=q)["cls"] == "owner_prompt"
+
+
+def test_b_a_blocker_phrase_is_still_a_blocker_at_any_dwell():
+    for q in (0.0, aw.QUIESCENT_SECS * 5):
+        assert aw.classify(BLOCKER_TAIL, state="idle", prev_cls="working",
+                           quiet_secs=q)["cls"] == "blocker"
+
+
+# (c) long-running shells and monitors keep working
+def test_c_a_long_running_shell_never_becomes_quiescent():
+    """`shell_running` is an ACTIVE inventory state: a monitor whose output happens to be
+    unchanged is still doing its job. This is why the rule keys on the inventory's
+    structural verdict and not on quietness alone."""
+    c = aw.classify(LONG_SHELL_TAIL, state="shell_running", prev_cls="working",
+                    quiet_secs=aw.QUIESCENT_SECS * 100)
+    assert c["cls"] == "working" and c["reason"] == "inventory_state_shell_running"
+
+
+def test_c_an_actively_working_pane_never_becomes_quiescent():
+    c = aw.classify(WORKING_TAIL, state="working", prev_cls="working",
+                    quiet_secs=aw.QUIESCENT_SECS * 100)
+    assert c["cls"] == "working"
+
+
+# (d) the scan emits the right event for a settled idle pane
+def test_d_a_settled_idle_pane_emits_work_stopped_incomplete():
+    emit = _Emit()
+    t = "cp-canary:0.0"
+    # first sweep: working, and the digest clock starts
+    _scan([_agent(t, "/root/cp-canary-v2", state="working")], {t: WORKING_TAIL},
+          emit, now=1000.0)
+    # it goes quiet, unchanged, and only LATER does that become a stop
+    _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: CANARY_SILENT_STOP},
+          emit, now=1010.0)
+    assert not [c for c in emit.calls if c["type"] == "work_stopped_incomplete"], \
+        "must not fire while the pane has only just gone quiet"
+
+    r = _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: CANARY_SILENT_STOP},
+              emit, now=1010.0 + aw.QUIESCENT_SECS + 5)
+    stops = [c for c in emit.calls if c["type"] == "work_stopped_incomplete"]
+    assert len(stops) == 1, r
+    assert stops[0]["severity"] == "high"
+    assert stops[0].get("owner_action_required") is False
+
+
+def test_d_a_stated_finish_still_completes_rather_than_going_quiescent():
+    """The completion path is untouched: a pane that SAYS it finished still completes."""
+    emit = _Emit()
+    t = "gaika-ext-audit:0.0"
+    _scan([_agent(t, state="working")], {t: WORKING_TAIL}, emit, now=1000.0)
+    _scan([_agent(t, state="idle")], {t: IDLE_TAIL}, emit,
+          now=1000.0 + aw.QUIESCENT_SECS * 3)
+    assert [c["type"] for c in emit.calls] == ["task_completed"]
+
+
+# (e) dedupe holds — a stop does not become a wake loop
+def test_e_a_settled_stop_emits_once_not_every_sweep():
+    emit = _Emit()
+    t = "cp-canary:0.0"
+    _scan([_agent(t, "/root/cp-canary-v2", state="working")], {t: WORKING_TAIL},
+          emit, now=1000.0)
+    base = 1010.0
+    _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: CANARY_SILENT_STOP},
+          emit, now=base)
+    for i in range(1, 8):
+        _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: CANARY_SILENT_STOP},
+              emit, now=base + aw.QUIESCENT_SECS + 5 + i * 20)
+    stops = [c for c in emit.calls if c["type"] == "work_stopped_incomplete"]
+    assert len(stops) == 1, f"one stop, not one per sweep: {len(stops)}"
+
+
+def test_e_resuming_work_rearms_so_a_later_stop_is_a_fresh_event():
+    emit = _Emit()
+    t = "cp-canary:0.0"
+    _scan([_agent(t, "/root/cp-canary-v2", state="working")], {t: WORKING_TAIL},
+          emit, now=1000.0)
+    _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: CANARY_SILENT_STOP},
+          emit, now=1010.0)
+    _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: CANARY_SILENT_STOP},
+          emit, now=1010.0 + aw.QUIESCENT_SECS + 5)
+    # back to work, then it stops again later with different closing text
+    _scan([_agent(t, "/root/cp-canary-v2", state="working")], {t: WORKING_TAIL},
+          emit, now=2000.0)
+    again = CANARY_SILENT_STOP + "\nA second question, same shape."
+    _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: again}, emit, now=2010.0)
+    _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: again}, emit,
+          now=2010.0 + aw.QUIESCENT_SECS + 5)
+    stops = [c for c in emit.calls if c["type"] == "work_stopped_incomplete"]
+    assert len(stops) == 2, "a genuinely new stop after real work is a new event"
+
+
+_WORDS = ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot")
+
+
+def test_e_the_digest_clock_restarts_when_the_pane_text_changes():
+    """Changing output must reset the dwell, or a slowly-producing pane would be called
+    stopped while it is plainly still emitting."""
+    emit = _Emit()
+    t = "cp-canary:0.0"
+    _scan([_agent(t, "/root/cp-canary-v2", state="working")], {t: WORKING_TAIL},
+          emit, now=1000.0)
+    for i, w in enumerate(_WORDS):
+        tail = CANARY_SILENT_STOP + f"\nstill emitting {w}"
+        _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: tail}, emit,
+              now=1010.0 + i * (aw.QUIESCENT_SECS - 1))
+    assert not [c for c in emit.calls if c["type"] == "work_stopped_incomplete"]
+
+
+def test_e_digit_only_churn_is_deliberately_NOT_a_change():
+    """Pins an interaction that is easy to misread as a bug.
+
+    `digest_of` strips volatile digits on purpose — spinners and token counters must not
+    each look like a new event. A consequence is that a pane whose ONLY change is a
+    ticking number reads as unchanged, so the dwell keeps accumulating and a settled
+    stop is still reported. That is correct here: a pane genuinely producing work is
+    `working` or `shell_running` in the inventory and never reaches this rule at all;
+    reaching it means the inventory already called the pane at rest, and a bare counter
+    moving on an at-rest pane is cosmetic. Pinned so the behaviour is a decision rather
+    than an accident."""
+    emit = _Emit()
+    t = "cp-canary:0.0"
+    _scan([_agent(t, "/root/cp-canary-v2", state="working")], {t: WORKING_TAIL},
+          emit, now=1000.0)
+    for i in range(6):
+        tail = CANARY_SILENT_STOP + f"\nstill emitting line {i}"
+        _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: tail}, emit,
+              now=1010.0 + i * (aw.QUIESCENT_SECS - 1))
+    stops = [c for c in emit.calls if c["type"] == "work_stopped_incomplete"]
+    assert len(stops) == 1
+
+
+def test_e_the_dwell_accumulates_from_the_first_quiet_sweep_not_the_previous_one():
+    """`digest_since` must SURVIVE unchanged sweeps.
+
+    Isolates a mistake that ordinary fixtures miss: if the stamp were rewritten every
+    sweep (as `ts` is), the measured quiet time would only ever be the gap between two
+    consecutive sweeps. With a 20s companion poll that is always far below the
+    threshold, so a pane could sit stopped forever and never once qualify.
+    """
+    emit = _Emit()
+    t = "cp-canary:0.0"
+    _scan([_agent(t, "/root/cp-canary-v2", state="working")], {t: WORKING_TAIL},
+          emit, now=1000.0)
+    step = aw.QUIESCENT_SECS / 3.0            # each gap alone is far below the threshold
+    for i in range(1, 6):
+        _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: CANARY_SILENT_STOP},
+              emit, now=1000.0 + i * step)
+    stops = [c for c in emit.calls if c["type"] == "work_stopped_incomplete"]
+    assert len(stops) == 1, "accumulated quiet time must cross the threshold"
+
+
+def test_e_changing_text_resets_the_dwell_even_across_long_gaps():
+    """Isolates the reset itself: with gaps LONGER than the threshold, a pane whose text
+    changes every sweep must still never be called stopped."""
+    emit = _Emit()
+    t = "cp-canary:0.0"
+    _scan([_agent(t, "/root/cp-canary-v2", state="working")], {t: WORKING_TAIL},
+          emit, now=1000.0)
+    for i, w in enumerate(_WORDS):
+        tail = CANARY_SILENT_STOP + f"\nstill emitting {w}"
+        _scan([_agent(t, "/root/cp-canary-v2", state="idle")], {t: tail}, emit,
+              now=1000.0 + (i + 1) * (aw.QUIESCENT_SECS + 60))
+    assert not [c for c in emit.calls if c["type"] == "work_stopped_incomplete"]
+
+
+def test_c_an_unrecognised_inventory_state_is_never_called_stopped():
+    """Forward-compatibility guard on the structural gate.
+
+    `_QUIESCENT_STATES` is an ALLOWLIST, not the complement of the active states. A state
+    this classifier has never heard of — a future 'compacting', 'rewinding', 'queued' —
+    is not evidence of rest, and quiet time must not turn it into one.
+    """
+    c = aw.classify(CANARY_SILENT_STOP, state="compacting", prev_cls="working",
+                    quiet_secs=aw.QUIESCENT_SECS * 100)
+    assert c["cls"] == "working"

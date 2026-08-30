@@ -95,7 +95,12 @@ CREATE TABLE IF NOT EXISTS agent_watch_suppress (
 )
 """
 
-_STATE_COLUMNS = (("miss_count", "INTEGER DEFAULT 0"),)
+_STATE_COLUMNS = (("miss_count", "INTEGER DEFAULT 0"),
+                  # When the CURRENT digest was first seen. `ts` is overwritten on
+                  # every sweep, so it measures "last looked at", not "how long this
+                  # pane has been unchanged" — and the second is the only thing that
+                  # can tell a pause between turns from a pane that has stopped.
+                  ("digest_since", "REAL"))
 
 
 def _migrate_state(conn) -> None:
@@ -188,6 +193,17 @@ _CONTINUATION_RE = re.compile(
     r"|\bif you\b|\bunless\b|\bwas stopped\b)", re.IGNORECASE)
 # Inventory states that mean ACTIVE — text may never override these into waiting/done.
 _ACTIVE_STATES = frozenset({"working", "shell_running"})
+# STRUCTURAL rest, as decided by the inventory (core.agent_control), never by prose:
+# `idle`/`waiting_input`/`unknown` mean no active-execution evidence, no running shell and
+# no freshly-written transcript. `working`/`shell_running` are excluded above and can
+# therefore never reach the quiescence rule — a long-running shell or monitor stays
+# working no matter how long its output is unchanged. `waiting_owner` is excluded because
+# it is already classified `owner_prompt` earlier.
+_QUIESCENT_STATES = frozenset({"idle", "waiting_input", "unknown", ""})
+# How long a structurally-at-rest pane must sit with an UNCHANGED bottom region before
+# quietness is treated as a stop. Long enough that an ordinary pause between turns never
+# trips it; short enough that a silent stop is not indefinite.
+QUIESCENT_SECS = int(os.getenv("AGENT_WATCH_QUIESCENT_SECS", "300"))
 # Inventory states in which a decision menu is credible.
 _PROMPT_STATES = frozenset({"waiting_owner", "waiting_input", "idle", "unknown", ""})
 # A numbered choice menu — "1. <option> ... 2. <option>" — whatever the option wording.
@@ -282,7 +298,7 @@ def excerpt_of(tail: str, limit: int = 300, cls: str = "") -> str:
 
 
 def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool = True,
-             prev_cls: str = "") -> dict:
+             prev_cls: str = "", quiet_secs: float = 0.0) -> dict:
     """(inventory state, current bottom region) -> one class.
 
     The structured `agent_list` state is trusted FIRST: an agent the inventory calls
@@ -329,8 +345,25 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
         final = _WS.sub(" ", " ".join(_meaningful_lines(tail)[-3:]))
         if _CONTINUATION_RE.search(region) or not _FINISH_RE.search(final):
             # Came to rest, but either its own words say the work continues, or its
-            # closing lines never SAID it finished. Stay "working" so a real, stated
-            # finish later is still a fresh transition — quietness alone never completes.
+            # closing lines never SAID it finished. Quietness alone never COMPLETES —
+            # that rule stands, and `completed` is still unreachable from here.
+            #
+            # But it must not mean "working forever" either. 2026-08-30, live: a canary
+            # finished its step and stopped to ask a question worded "Not proceeding past
+            # this question." — no finish vocabulary, no prompt vocabulary, no menu, no
+            # blocker phrase. It matched none of the four detectors, so this branch held
+            # it `working` and NOTHING was ever emitted for a pane that was structurally
+            # idle. A stop that no phrase happens to describe is exactly the silent class
+            # this whole wake loop exists to catch.
+            #
+            # The fail-safe is STRUCTURAL, never linguistic: the inventory (which reads
+            # active-execution evidence, running shells and transcript writes, not prose)
+            # must already call the pane at rest, AND its bottom region must have been
+            # unchanged for QUIESCENT_SECS. Then the honest verdict is that work STOPPED
+            # without proving it finished — `work_stopped_incomplete`, not `completed`.
+            if st in _QUIESCENT_STATES and quiet_secs >= QUIESCENT_SECS:
+                return {"cls": "quiescent",
+                        "reason": f"at_rest_unchanged_for_{int(quiet_secs)}s"}
             return {"cls": "working", "reason": "no_positive_finish_evidence"}
         if _TOOL_COMPLETION_RE.search(final):
             # The finish vocabulary belongs to a command/monitor/subprocess notice
@@ -369,6 +402,10 @@ _EVENT_FOR = {
     "owner_prompt": ("agent_prompt_needs_response", "high", True),
     "blocker": ("agent_waiting_input", "high", True),
     "completed": ("task_completed", "info", False),
+    # A pane that stopped without ever saying so. Deliberately NOT task_completed: no
+    # finish was stated, so claiming one would be a fabrication. Non-actionable severity
+    # — it is news, not necessarily a request.
+    "quiescent": ("work_stopped_incomplete", "high", False),
     "crashed": ("agent_process_failed", "critical", True),
 }
 
@@ -451,19 +488,35 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 skipped.append({"target": target, "why": "unreadable"})
                 continue
             row = conn.execute(
-                "SELECT cls,digest,notified_cls,notified_digest,notified_ts "
+                "SELECT cls,digest,notified_cls,notified_digest,notified_ts,digest_since "
                 "FROM agent_watch_state WHERE target=?", (target,)).fetchone()
             prev_cls = row[0] if row else ""
+            # How long this pane has looked EXACTLY like this. The digest is computed
+            # below from the same bottom region classify reads, so comparing against the
+            # stored one answers "has anything changed since we last looked".
+            prev_digest = row[1] if row else ""
+            prev_since = float(row[5]) if row and row[5] is not None else None
+            dg_now = digest_of(_bottom_region(tail)) if a.get("alive") else "gone"
+            quiet_secs = (now - prev_since) if (prev_since is not None
+                                                and prev_digest == dg_now) else 0.0
             c = classify(tail, state=a.get("state", ""), alive=bool(a.get("alive")),
-                         is_agent=bool(a.get("is_agent")), prev_cls=prev_cls)
+                         is_agent=bool(a.get("is_agent")), prev_cls=prev_cls,
+                         quiet_secs=quiet_secs)
             cls = c["cls"]
-            dg = digest_of(_bottom_region(tail)) if cls != "crashed" else "gone"
+            dg = dg_now if cls != "crashed" else "gone"
+            # An unchanged digest KEEPS its original first-seen stamp; any change restarts
+            # the clock. Overwriting it every sweep (as `ts` is) would make every pane look
+            # permanently fresh and the quiescence rule could never fire.
+            digest_since = prev_since if (prev_since is not None
+                                          and prev_digest == dg) else now
             # Persist the observation first — the record of what IS outlives any
             # decision about whether to announce it.
             conn.execute(
-                "INSERT INTO agent_watch_state (target,cls,digest,at,ts) VALUES (?,?,?,?,?) "
+                "INSERT INTO agent_watch_state (target,cls,digest,at,ts,digest_since) "
+                "VALUES (?,?,?,?,?,?) "
                 "ON CONFLICT(target) DO UPDATE SET cls=excluded.cls, digest=excluded.digest,"
-                "at=excluded.at, ts=excluded.ts", (target, cls, dg, now_iso(), now))
+                "at=excluded.at, ts=excluded.ts, digest_since=excluded.digest_since",
+                (target, cls, dg, now_iso(), now, digest_since))
             # RESUME RE-ARMS. An agent that went back to work has consumed whatever it was
             # asked; if the very same prompt appears again later, that is a new event, not
             # a duplicate of the old one.
