@@ -3885,3 +3885,68 @@ The Auction stays on its genuine natural-event wait, untouched.
 
 9 new tests; the five exercising the new behaviour verified to fail when reverted. Gate
 green, local commit only, 32 unrelated WIP files still untracked and unmodified.
+
+---
+
+# Part 23 — event 15923: a wake chasing a dead session, and the namespace split behind it
+
+## Not explained by Part 22 — a different component, and a real defect
+
+15923 (`wake_loop_stalled`, critical, `owner_action_required=1`) comes from
+`closed_loop_wake`, not the native supervisor. Chain:
+
+| Time (UTC) | |
+|---|---|
+| 19:55:43 | 15712 `agent_waiting_input`, `claude_hook`, cwd `/root/cp-canary-v2`, target `session:b2635b20-8de` |
+| 20:20:35 | cp-canary killed by control-plane `agent_stop` (Part 18) |
+| 20:47:20 | that wake **delivered** — to an agent that no longer existed |
+| 21:03:06 | re-woken (15881), no progress |
+| 21:18:49 | escalated critical (15923) |
+
+**Root cause.** Hook-sourced wakes are addressed `session:<conversation id>`;
+`agent_watch_state` is keyed by tmux target. The two namespaces never meet, so *none* of
+the pane-based resolutions — `pane_alive_and_working`, `agent_parked_completed`,
+`intentional_external_wait` — can ever fire for a hook wake. When the session behind one
+is gone, `_progress_since` can never see progress, and the watch re-wakes and escalates
+with no possible end. This is exactly the argument already written down for `runtimejob:`
+targets, in a second namespace nobody had checked.
+
+The `idle_prompt` mapping was checked and is not at fault: 15712 was emitted at 19:55:43Z,
+four minutes before `446c10e` demoted `idle_prompt` to routine. It is history, not a live
+defect.
+
+## Fixed in two steps, because the first was wrong
+
+`3344b03` added `_session_target_gone`, fail-closed toward keeping the alarm: an unknown
+cwd, an unreadable inventory or any still-present pane all decline to claim the session is
+gone, and resolution additionally requires a terminal `agent_dead`/`agent_process_failed`
+so the owner is still told once before this goes quiet.
+
+**It did not fire on the real case.** The terminal check matched
+`agent_id = <watch target>` — but the death is recorded as `agent_id=cp-canary:0.0`,
+`project_id=cp-canary-v2`, while the watch target is `session:b2635b20-8de`. Matching on
+the session form could never hit: the fix reproduced the very namespace split it existed
+to bridge, and the tests passed only because the helper inserted the terminal event in the
+convenient shape rather than the real one. Caught by checking the live rows instead of
+trusting green tests.
+
+`a6114e4` matches the terminal event on the project derived from the shared cwd, bounded
+to a terminal event no older than the watched wake so a crash from last week cannot retire
+a watch opened today. The test helper now records the death the way `agent_watch` really
+does.
+
+## Live acceptance
+
+```
+15668  resolved=1  target_session_no_longer_present
+15629  resolved=1  target_session_no_longer_present
+15712  escalated=1 (unchanged — already terminal before the fix)
+```
+
+Confirmed in the companion log at 23:31:16 local. Zero new events for that session since
+15923. `deregister_resolved` deliberately does not touch `escalated=1` rows, so the one
+that already spoke stays as the record that it did. 9 sessions, 32 WIP files untracked and
+unmodified, no remote push.
+
+Fifth defect of the same family: a key or namespace that answers a different question than
+the one being asked.
