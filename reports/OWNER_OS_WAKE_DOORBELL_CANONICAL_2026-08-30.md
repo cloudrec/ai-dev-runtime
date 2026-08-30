@@ -2699,3 +2699,53 @@ path needs a guard so it does not open a replacement tab when the *browser
 endpoint itself* is degraded, rather than the single tab — otherwise recovery
 will keep amplifying any future host-pressure episode. That fix was not made in
 this turn because the instruction scoped it to a read-only re-check.
+
+## The amplification loop is closed (`dca772a`)
+
+The feedback loop identified in the previous section is fixed at its source.
+
+**What it was.** `page_responsive()` answers about ONE renderer. Under host
+exhaustion it is false for every tab, because the browser is starving rather than
+any single page being wedged — and `recover_wedged_tab()` treats that identically
+to the 4214 hung-renderer case it was written for. So every delivery attempt
+opened a replacement tab, failed to verify it inside its window, left the old one
+open, and added another renderer to the exhaustion that caused the failure.
+Measured: 1 owner-os tab and 61 chrome processes became 41 pages — 25 of them
+bare `chatgpt.com` roots — and 68 processes in eight minutes.
+
+**The distinction the code now makes.** `browser_degraded()` asks about the
+BROWSER, on three signals, any one sufficient:
+
+* the browser-level endpoint does not answer at all;
+* it answers but slowly — a healthy Chrome lists tabs in milliseconds, and
+  seconds means it is starving (`CDP_SLOW_SECS`, default 2.0);
+* it already holds more pages than this host should ever need
+  (`CDP_MAX_PAGES`, default 12), which is itself the signature of replacement
+  tabs accumulating.
+
+Only real `page` targets count; background and service workers are not tabs.
+
+**Where the guard lives.** Inside `recover_wedged_tab()` — the single choke point
+for creating a tab — so no caller can bypass it and a refusal means no tab is
+created, not one created and discarded. The `page_responsive` call site
+additionally reports `browser_degraded:<reason>` so the log names which thing is
+unwell instead of blaming the renderer.
+
+**What is deliberately preserved.** One wedged renderer on a healthy browser is
+still replaced, exactly as before — that is the incident this recovery exists
+for, and it has its own test asserting `/json/new` is still called.
+
+Live at the moment of deploy: `{"degraded": true, "reason": "too_many_pages:42"}`
+— the guard correctly recognises the condition it was written for.
+
+54 composer tests, 100 across the delivery suites. Five mutations, each killed by
+its own isolating test: no guard, guard everything, no page cap, no slow-endpoint
+signal, and counting workers as pages. Deployed through
+`tools/guarded_deploy.sh`; backup `backups/predeploy_browserguard_20260830T181323Z/`,
+tag `rollback/pre-browserguard-20260830T181323Z`.
+
+**This does not free memory and does not claim to.** It stops the delivery path
+from making the shortage worse, and it makes the real condition legible in the
+delivery log. The host gate recorded above — roughly 3–4 GB of RSS to be freed,
+and the 25 orphaned root tabs that may be closed — is unchanged and remains an
+owner decision. Nothing was killed, closed, restarted or reconfigured.
