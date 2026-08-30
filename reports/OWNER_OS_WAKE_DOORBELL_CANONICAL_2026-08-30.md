@@ -4033,3 +4033,72 @@ The evidence answers the underlying worry directly: nine real continuations land
 this pane was idle. Its idleness blocks nothing.
 
 3 new tests, two mutation-verified. 32 WIP files untracked and unmodified, no remote push.
+
+---
+
+# Part 25 — events 16047 / 16068: the cap did not mean what the gate said
+
+## The two live gates were both false alarms, for different reasons
+
+`arbitrage2-fable:0.0` had an armed monitor and was awaiting a FINAL. Its
+`intentional_external_wait` skips are recorded under the payload **cwd**
+(`/opt/arbitrage2-fable-audit`, 14 times) because `decide()` runs before
+`resolve_target()`, while the cap counter and the gate key on the resolved **tmux target**.
+The agent was recognised as waiting-by-design fourteen times and escalated as stalled
+anyway — the same namespace split as the `session:`/tmux one in Part 23, in a third place.
+
+`mess-postsignup-cleanup-sonnet-v4:0.0` had no assigned task and was simply holding.
+Continuation was never going to converge on work that was never given.
+
+`66fe932` adds `gate_exemption()`: both namespaces are checked for a live or recently
+recorded external wait, then the assigned-task check. An intentional wait skips with no gate
+and no alarm. No assigned task still **opens** the gate — poking an agent with nothing to do
+is exactly the spin the cap exists to end — but emits at `info` with
+`owner_action_required=False`, so nobody is woken. A genuine stall wakes the owner exactly
+as before.
+
+Deliberately **not** gated on having a task: `active_task` is `None` for every agent on this
+host, since the `os_task` queue is only used by cp-canary. Requiring one would disable
+continuation fleet-wide. This changes the alarm, never the anti-spin.
+
+Dry-run against the two real gated agents returns `recent_intentional_external_wait` and
+`no_assigned_task` — matching, independently, what a read-only inspection of the two panes
+had reported.
+
+## Event 16068 is a DIFFERENT path, and this fix does not cover it
+
+16068 (`wake_loop_no_progress`) comes from `closed_loop_wake`, not the supervisor gate. Its
+chain: 16042 (`agent_prompt_needs_response`, project `seo`) → wake delivered 21:58:34Z →
+the agent stays idle because it has nothing assigned → no progress → escalation at
+22:14:40Z. Earlier watches for this agent resolved `pane_alive_and_working`; this one could
+not, because `idle` is deliberately excluded from resolution as genuinely ambiguous.
+
+**Why the alarm says `project=owner-os` for an agent in `/opt/seo`** —
+`tools/wake_companion.py:122`:
+
+```python
+closed_loop_wake.register_delivery(..., project_id=p.get("route_key", ""))
+```
+
+The watchdog stores the **route key** — which ChatGPT chat the wake was delivered to — in a
+field named `project_id`, discarding the agent's real project, which event 16042 carries.
+A one-line cause. **Not changed here**: altering an emitted event field with no ability to
+restart or verify live is not a blind edit worth making.
+
+The `no_assigned_task` exemption was **deliberately not ported** into `closed_loop_wake`.
+With `active_task` empty for every agent, exempting on it inside the watchdog would suppress
+genuine stalls fleet-wide and gut the watchdog. Wrong trade.
+
+16042's own classification is not re-derivable: the stored excerpt is truncated, the full
+bottom region was not retained, and against the current classifier that text matches none of
+the menu, prompt or blocker patterns. Recorded as unexplained rather than guessed at.
+
+## Verification
+
+Focused + relevant modules 159 passed. **Whole repository: 2 811 passed, exit 0, 13 m 33 s**
+(one pre-existing `tarfile` DeprecationWarning, unrelated). 5 new tests, 4 verified to fail
+with the change reverted.
+
+**Not live.** No service restart, so `66fe932` takes effect at the next approved restart;
+16068-class events continue until then. Local commits only, nothing pushed. 32 unrelated WIP
+files untracked and byte-identical.
