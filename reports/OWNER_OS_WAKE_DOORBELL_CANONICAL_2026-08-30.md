@@ -3127,3 +3127,117 @@ holding `notify_when_idle` subscriptions and continuing workers over
 agent creation, and a latency/overhead comparison against the current path.
 Today's change makes the SIGNAL native and correct; the CONTINUATION still
 travels the existing ChatGPT route, which is proven and unchanged.
+
+---
+
+# Part 14 — the supervisor half: agents continue without ChatGPT, proven live
+
+## Two closed loops, on two different projects, with no browser in the path
+
+```
+cp-canary:0.0                          (canary)
+  Stop hook -> event 15662 agent_turn_stopped
+            -> supervisor re-read live state -> continued the SAME agent
+            -> delivered=true duplicate=false agent_created=false
+            -> panes before 1, after 1        latency 43.9s
+
+mess-postsignup-cleanup-sonnet-v4:0.0  (real project, /opt/seo)
+  Stop hook -> event 15664 agent_turn_stopped (cwd /opt/seo)
+            -> continued the SAME agent, delivery key nativesup:15664
+            -> delivered=true duplicate=false agent_created=false
+            -> panes before 1, after 1        latency 17.9s
+```
+
+Both deliveries carry `actor=native_supervisor` — **no `api:bearer`, so ChatGPT
+was not in either path.** The decision immediately after the canary continuation
+was `min_interval_not_elapsed`: the per-target floor engaging in production,
+exactly as its test demands.
+
+## Latency and overhead, measured rather than asserted
+
+| Path | n | mean | median |
+| --- | --- | --- | --- |
+| **Native supervisor** (hook -> continuation) | 2 | **30.9 s** | — |
+| ChatGPT wake path (event -> delivered wake) | 32 | 2691 s | 752 s |
+
+Roughly **24× faster on the median** and far better on the tail, because the
+native path has no rate-limited lane, no browser, and no assistant occupancy in
+front of it. Overhead per hook invocation: **0.13 s wall, 20 MB peak RSS** — one
+short-lived process per turn boundary.
+
+## What the supervisor actually did, in production
+
+```
+skip / intentional_external_wait               17
+skip / agent_already_working_again             14
+skip / not_a_turn_boundary:agent_waiting_input  8
+skip / not_in_rollout_allowlist                 6
+continue / continued_same_agent                 2
+skip / min_interval_not_elapsed                 1
+```
+
+**48 decisions, 2 actions.** Every refusal is durable and reasoned. The largest
+class is `intentional_external_wait` — agents parked with a monitor armed, which
+the old path would have escalated as stalls.
+
+## Roll-out state (requirement 7)
+
+Allowlist in `configs/.env`, so a target is supervised because it is **named**,
+never because it appeared:
+
+```
+NATIVE_SUPERVISOR_TARGETS=cp-canary:0.0,mess-postsignup-cleanup-sonnet-v4:0.0,gaika-opus:0.0
+```
+
+Deliberately excluded, and why: `capacity-blockchain` (ACAP C1/C2 gates),
+`diamond-auction` (value-bearing gates), `payorch-monitor-clean` (payment),
+`email` (sends mail). Those keep the existing path and their gates untouched.
+
+No live session was restarted to enable any of this — hooks hot-load, which is
+what made a fleet-wide signal layer safe to turn on mid-flight.
+
+## The Auction escalations (15519, 15567), closed
+
+`intentional_external_wait` is now durable structured state, from either source:
+
+* **proven** — the Stop hook's own `background_tasks` / `session_crons`, which is
+  how `/opt/arbitrage2-fable-audit` resolves (17 decisions above);
+* **declared** — for the gap that measurement exposed: an agent already parked
+  when hooks installed emits nothing until it next moves, and
+  `/opt/diamond/auction` was the ONLY live session with no native records at all.
+  A declaration records who and why, **expires** (6 h default), and suppresses
+  only no-progress escalation.
+
+`agent_process_failed`, `agent_dead` and `agent_waiting_input` remain wake-capable
+for that target throughout — this is not a mute button. Verified live:
+`_resolution_reason(diamond-auction) -> intentional_external_wait`.
+
+## Fallback, unchanged
+
+The tmux/quiescence watchdog, the wedge and back-pressure guards, the composer
+path and every wake lane are untouched and still running. If a hook never fires —
+an older build, a crash, hooks disabled, control-plane loss — the system behaves
+exactly as it did all session. The native layer is strictly additive.
+
+## Backups and rollback
+
+* Global Claude settings: `backups/claude_settings_20260830T185532Z/settings.json`
+  (hash-verified). Restoring it removes every Owner OS hook instantly, no restart
+  needed.
+* Control plane + settings before the supervisor deploy:
+  `backups/predeploy_supervisor_20260830T191946Z/`.
+* Tags: `rollback/pre-native-…`, `rollback/pre-supervisor-…`.
+* Disable without any rollback: `NATIVE_SUPERVISOR_ENABLED=0`, or empty the
+  allowlist, or `COMPANION_NATIVE_SUPERVISOR=0`.
+
+## Tests
+
+21 supervisor + 15 hook + 32 closed-loop; **360 in the deploy gate**. Sixteen
+mutations killed by their own tests across this stage — acting on a working
+agent, typing over staged input, ignoring the allowlist, resolving an ambiguous
+cwd, dropping the floor, ignoring the safety classifier, continuing on questions,
+a wait that never expires, mapping `Stop` to a wake, waking on every notification
+type, letting an exception escape the hook, printing to stdout, and four on the
+closed-loop resolution.
+
+Local commits only; no remote push, per instruction.
