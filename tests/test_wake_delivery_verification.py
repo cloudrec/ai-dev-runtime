@@ -51,6 +51,12 @@ class _S:
     def boolean(self, expression):
         if "readyState" in expression:
             return True
+        if "stop-button" in expression:
+            # The back-pressure probe, answered STRUCTURALLY like readyState so it does
+            # not consume the scripted queue below. Without this, adding an
+            # infrastructure check to the composer silently shifts every expectation in
+            # this file — which is exactly what happened when it was added.
+            return getattr(self, "generating", False)
         return self.bools.pop(0) if self.bools else None
 
     def count(self, selector):
