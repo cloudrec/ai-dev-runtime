@@ -3950,3 +3950,86 @@ unmodified, no remote push.
 
 Fifth defect of the same family: a key or namespace that answers a different question than
 the one being asked.
+
+---
+
+# Part 24 — capacity-blockchain was NOT a zero-ping continuation; the real proof is elsewhere
+
+## The claim checked, and refused
+
+An automated instruction asked whether `capacity-blockchain` moved idle→working via
+native/control-plane continuation, to be recorded as the first zero-ping proof. **It did
+not, and recording it as such would have been false.**
+
+Every `native_supervision` row for that target is `skip: not_in_rollout_allowlist`. Its
+transitions came from external API sends, and the attribution says so plainly:
+
+```
+capacity-safe-reversible-closeout-20260830-2339   actor=api:bearer  172.20.0.6 ua=python-httpx/0.27.0
+capacity-15921-submit-reconcile-20260830-2331     actor=api:bearer  172.20.0.6 ua=python-httpx/0.27.0
+capacity-event15841-continue-readonly-offhost-*   actor=api:bearer  172.20.0.6 ua=python-httpx/0.27.0
+```
+
+Those are hand-keyed sends over the same automated Owner OS API channel these instructions
+arrive on — the opposite of a zero-ping continuation. The `api:*` tagging added in
+`5ed1db6` is what made the distinction visible; this is that guard doing its job.
+
+## The real proof, which already exists
+
+Between 21:21:26Z and 21:37:50Z — entirely after the previous turn ended, with no user or
+ChatGPT message — the supervisor continued **three real non-canary agents nine times**:
+
+| Target | Continuations | Attribution |
+|---|---|---|
+| `arbitrage2-fable:0.0` | 4 | `actor=native_supervisor`, `source=claude_hook`, keys `nativesup:<event_id>` |
+| `mess-postsignup-cleanup-sonnet-v4:0.0` | 3 | same |
+| `gaika-opus:0.0` | 2 | same |
+
+Latency across 24 event-path continuations: **mean 40.2 s**, min 4.4 s, max 161.3 s.
+
+## Requirement 4 fired in production for the first time
+
+Part 18 recorded the terminal gate as built and tested but not yet observed. It has now
+fired, twice, correctly:
+
+```
+15954  21:28:35Z  mess-postsignup-cleanup-sonnet-v4:0.0  agent_continuation_exhausted  high  oar=1
+15986  21:39:57Z  arbitrage2-fable:0.0                   agent_continuation_exhausted  high  oar=1
+```
+
+Exactly one event per target, gate rows open with a 6 h TTL, and a durable
+`continuation_gate_open` skip confirming sends are suppressed rather than repeated. Six
+automated continuations each produced another turn boundary, so the supervisor stopped and
+said so once — no spin, no spam.
+
+## Fleet classification
+
+| Agent | Class |
+|---|---|
+| `capacity-blockchain`, `mess-opus`, `owner-os-wake-policy-opus` | active — nothing to do |
+| `diamond-auction` | genuine gate — external wait, parked (quiet 19 338 s) |
+| `arbitrage2-fable`, `mess-postsignup-cleanup-sonnet-v4` | **terminal gate** — exhausted, awaiting owner attention, deliberately not continued |
+| `gaika-opus` | unfinished safe — continues on its next turn boundary |
+| `email`, `payorch-monitor-clean` | excluded — denylisted, safety boundary |
+
+`duplicates: []` throughout.
+
+## Why this pane can safely stay idle — now enforced structurally
+
+This pane is `owner-os-wake-policy-opus:0.0`, project `ai-dev-runtime`, and it is excluded
+deliberately. Supervising it means the supervisor answering its own turn boundaries and
+driving the very session that edits, tests and deploys the supervisor. A defect in the
+supervisor would then auto-drive its own further modification with nobody in the loop, and
+this is also the pane holding classifier-gated work, which an automated "continue with the
+next safe step" would repeatedly re-attempt.
+
+The rationale was already written down — but the entry enforcing it sat inside the
+env-overridable `NATIVE_SUPERVISOR_DENY_PROJECTS` string, which made the one entry that can
+never be removed the easiest to remove by accident. `c01a493` derives `SELF_PROJECT` from
+where the module actually lives and unions it in after the env is read: configuration can
+still widen the denylist, and can no longer narrow it past the supervisor's own project.
+
+The evidence answers the underlying worry directly: nine real continuations landed while
+this pane was idle. Its idleness blocks nothing.
+
+3 new tests, two mutation-verified. 32 WIP files untracked and unmodified, no remote push.
