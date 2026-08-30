@@ -4102,3 +4102,53 @@ with the change reverted.
 **Not live.** No service restart, so `66fe932` takes effect at the next approved restart;
 16068-class events continue until then. Local commits only, nothing pushed. 32 unrelated WIP
 files untracked and byte-identical.
+
+---
+
+# Part 26 — event 16102: a prompt wake escalated over a retracted premise
+
+16102 (`wake_loop_stalled`, critical) is the escalation of the same watch that produced
+16068 — both from event 16042 — exactly as Part 25 said would happen.
+
+**Not stale attribution.** The session is alive and correctly identified: target matches,
+cwd `/opt/seo`, `pending=None`, `pending_kind=None`. The `project=owner-os` label is the
+separate `register_delivery` route-key mislabel already recorded in Part 25, and it is not
+the cause. This is a false stall from a **retracted premise**.
+
+The premise of `agent_prompt_needs_response` is that a question is on screen right now.
+That pane had no prompt, no pending input and no assigned task, and `agent_watch` had long
+since reclassified it away from `owner_prompt`. The watchdog re-woke it at 22:14:40Z and
+escalated to critical at 22:29:57Z over a question nobody was asking.
+
+`01f53c7` retires a watch when its ORIGINAL event asserted a live prompt and `agent_watch`
+no longer classifies the pane as prompting.
+
+Deliberately narrow, because the comment beside it already refuses the general claim that
+idle means done — and that refusal still stands. This resolves only prompt-class wakes, and
+only on the narrower fact that the specific asserted prompt is absent. Still
+`owner_prompt` → keeps escalating. `blocker` → keeps escalating. `crashed` → keeps
+escalating. A `work_stopped_incomplete` watch is **not** resolved by the pane going idle.
+No `agent_watch` row → nothing claimed.
+
+**Evidence it does not suppress genuine stalls fleet-wide:** a dry-run over all eight open
+watches resolves exactly one — 16042, the one that produced these events — and leaves the
+other seven (`gaika-opus`, two `session:*`, four `cp-canary`) untouched. In production it
+would have fired at the 16068 stage, so 16102 would never have been emitted.
+
+## Verification
+
+| | |
+|---|---|
+| Changed | `core/closed_loop_wake.py`, `tests/test_closed_loop_wake.py` |
+| Focused | `test_closed_loop_wake.py` 41 passed; 4-module gate green |
+| Whole repository | **2 816 passed, exit 0, 12 m 11 s** — 2 811 before, plus the 5 new tests |
+| Mutation | the resolve test verified to fail with the change reverted |
+| Heads | local `01f53c7`, base/remote `2c8e8b1`, 32 ahead / 0 behind |
+| Worktree | clean; 32 unrelated WIP files untracked and byte-identical |
+
+**Residual risks.** Not live — no restart, so nothing changes until an approved one, and the
+16042 watch stays `escalated=1` (`deregister_resolved` only touches `escalated=0` rows), so
+it will not retroactively resolve. The route-key mislabel stands, untouched by design. And
+the narrowing rests on `agent_watch` being right about the current class: a pane it
+misclassified as `idle` while genuinely prompting would now resolve instead of escalate —
+bounded to prompt-class wakes only.
