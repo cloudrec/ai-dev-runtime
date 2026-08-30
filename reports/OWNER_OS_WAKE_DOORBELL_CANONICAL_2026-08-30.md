@@ -1294,3 +1294,52 @@ No schema, config, credential or routing change to unwind. Never
 Not marking GREEN as a formal acceptance claim — that determination belongs to
 whoever has actual authority to accept it, on the evidence above, not to this
 report.
+
+## Closeout (Part 6)
+
+An automated instruction was received to stop the temporary watch, change no
+runtime policy or services, and summarise. The watch was stopped; nothing else
+was touched.
+
+Final live state — `pipeline.status: stuck` cites exactly one route:
+`pending_wake_stuck:auction:3305s`.
+
+**Remaining pending wakes at closeout** (all decided, routed and queued — none
+lost, none suppressed):
+
+| Route | Event | Type | Lane | oar |
+| --- | --- | --- | --- | --- |
+| `auction` | 15005 | `agent_recovered` | non-actionable | 0 |
+| `email` | 15006 | `agent_recovered` | non-actionable | 0 |
+| `payment-orchestrator` | 15010 | `agent_recovered` | non-actionable | 0 |
+| `mess` | 15308 | `work_stopped_incomplete` | non-actionable | 1 |
+| `email` | 15197 | `agent_waiting_input` | actionable | 1 |
+| `gaika-extension` | 15298 | `agent_waiting_input` | actionable | 1 |
+| `mess` | 15333 | `agent_waiting_input` | actionable | 1 |
+| `owner-os` | 15330 | `wake_loop_stalled` (`runtimejob:cd01ad71`, orig 14833) | actionable | 1 |
+| `owner-os` | 15331 | `wake_loop_no_progress` (`runtimejob:a6f4c391`, orig 14912) | actionable | 1 |
+| `owner-os` | 15332, 15334 | `agent_waiting_input` | actionable | 1 |
+
+The three `agent_recovered` rows all date from 13:24:55Z — during the socket
+blackout — and are non-actionable, so each waits its route's 900 s lane. 15330
+and 15331 are the closed-loop watchdog correctly reporting that two runtime jobs
+woken during the backlog drain showed no progress inside the 900 s SLO; they are
+new owner-facing alerts, not a regression of this work.
+
+Three delivery failures in the closing 30 minutes were all
+`cdp_error:WebSocketTimeoutException` — the pre-existing transient class (37 over
+the prior three days, per Part 3), absorbed by the retry path; 24 deliveries
+succeeded in the same window.
+
+**Owner-gated follow-ups, deliberately not taken:**
+
+1. **Non-actionable lane capacity.** One wake per 900 s per route is unchanged.
+   Draining the remaining backlog faster, or retiring it, changes owner-facing wake
+   volume or discards queued alerts. Same gate as Part 3.
+2. **`/root/cleanup_disk_pass2.sh`.** Not modified — it is an owner's file
+   outside this repo. Adding `/tmp/tmux-*` beside `/tmp/claude-0` in its
+   exclusion list would remove the cause; the guard already bounds a recurrence
+   to one companion tick.
+3. **Telegram `owner_push`** (`Bad Request: chat not found`) and the unread
+   `cto_inbox` remain exactly as Part 1 left them. The wake path does not depend
+   on either.
