@@ -121,6 +121,11 @@ ROUTINE_EVENT_TYPES = frozenset({
     # the control plane came back (self-healed by the guard). Durable, never a wake:
     # the outage already woke the owner, and the recovery is the good news.
     "agent_control_plane_recovered",
+    # Native Claude Code lifecycle records (2026-08-30). The `Stop` hook fires at the END
+    # OF EVERY TURN, not when an agent finally goes idle, so these are structure for the
+    # supervisor to read — never a doorbell. Routing them here means `is_significant`
+    # refuses them a wake BY NAME, so no rate limit or lane has to absorb turn chatter.
+    "agent_turn_stopped", "agent_subagent_stopped",
     # runtime job lifecycle chatter: durable history, never a wake on its own —
     # the terminal states that matter arrive as task_failed / action_blocked /
     # owner_decision_required / task_completed and wake through those.

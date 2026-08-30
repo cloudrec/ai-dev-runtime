@@ -17,6 +17,7 @@ the event log) and adds its own small, restart-safe table.
 """
 from __future__ import annotations
 
+import json
 import os
 from typing import Callable, Optional
 
@@ -108,6 +109,48 @@ def _runtime_job_terminal(target: str) -> bool:
         return False
 
 
+# An INTENTIONAL external wait, proven structurally rather than read out of prose.
+#
+# 2026-08-30, diamond-auction:0.0: the agent finished its stage, armed a read-only monitor
+# for a natural auction close, and said so — "if a natural auction close occurs, it
+# auto-anchors and I'll be notified... Idle on the watch." Nothing was stuck. But
+# `_progress_since` counts NEW EVENTS, and an agent waiting correctly emits none, so the
+# watchdog re-woke it and then escalated `wake_loop_no_progress` (15519) at the owner.
+#
+# The distinction cannot be read from the sentence — that is the trap this session already
+# proved twice (a stop whose wording matched no detector, and report prose classified as a
+# live prompt). Claude Code states it structurally instead: a session that stopped with
+# `background_tasks` still running or `session_crons` armed is waiting BY DESIGN, and the
+# lifecycle hook records exactly those fields. An armed monitor is the difference between
+# "waiting" and "stuck", and it is a fact, not an interpretation.
+_INTENTIONAL_WAIT_LOOKBACK_SECS = int(
+    os.getenv("WAKE_INTENTIONAL_WAIT_LOOKBACK_SECS", "7200"))
+
+
+def _armed_external_wait(conn, target: str, now: float) -> bool:
+    """Did this agent last stop with a monitor still armed?
+
+    Reads the durable `agent_turn_stopped` record the native Stop hook writes. Absent that
+    record — an older Claude, hooks disabled, a session started before install — this
+    returns False and the watchdog behaves exactly as it did before, which is the required
+    fallback: unproven means NOT resolved, never the reverse.
+    """
+    try:
+        row = conn.execute(
+            "SELECT payload FROM event WHERE agent_id=? AND type='agent_turn_stopped' "
+            "AND ts_epoch > ? ORDER BY id DESC LIMIT 1",
+            (target, now - _INTENTIONAL_WAIT_LOOKBACK_SECS)).fetchone()
+    except Exception:  # noqa: BLE001 — a missing column or table never resolves a watch
+        return False
+    if not row or not row[0]:
+        return False
+    try:
+        p = json.loads(row[0])
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(p.get("background_tasks")) or bool(p.get("session_crons"))
+
+
 def _resolution_reason(conn, *, event_id: int, target: str) -> Optional[str]:
     """Has the condition THIS watch exists for already resolved? Three independent
     signals, any one of which is sufficient:
@@ -141,6 +184,11 @@ def _resolution_reason(conn, *, event_id: int, target: str) -> Optional[str]:
         if _runtime_job_terminal(target):
             return "runtime_job_terminal"
         return None
+    # A pane that parked with its own monitor armed is waiting, not stalled. Checked with
+    # the other silent-resolution signals, so it deregisters the watch without emitting —
+    # the owner is not told a second time about a state they already know is intentional.
+    if _armed_external_wait(conn, target, now_ts()):
+        return "intentional_external_wait"
     try:
         row = conn.execute(
             "SELECT cls FROM agent_watch_state WHERE target=?", (target,)).fetchone()

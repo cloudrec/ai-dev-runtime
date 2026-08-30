@@ -774,3 +774,87 @@ def test_state_change_away_from_parked_resets_suppression(conn):
     r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
     assert [e["event_id"] for e in r["rewoken"]] == [315]
     assert emit.calls[-1]["type"] == "wake_loop_no_progress"
+
+
+# ── 2026-08-30: an INTENTIONAL external wait is not a stall ──────────────────
+# diamond-auction:0.0 finished its stage, armed a read-only monitor for a natural auction
+# close and said so — "if a natural auction close occurs, it auto-anchors and I'll be
+# notified... Idle on the watch." Nothing was stuck. But `_progress_since` counts NEW
+# EVENTS and a correctly-waiting agent emits none, so the watchdog re-woke it and then
+# escalated wake_loop_no_progress (15519) at the owner.
+#
+# The distinction is not readable from the sentence. Claude Code states it structurally:
+# a session that stopped with background_tasks running or session_crons armed is waiting
+# BY DESIGN, and the native Stop hook records exactly those fields.
+
+def _turn_stopped(conn, target, payload, ts=None):
+    """`_resolution_reason` reads the clock itself, so the record must be dated in REAL
+    time to be inside its lookback — dating it 1000.0 made the row invisible and the first
+    version of these tests failed for that reason, not for a defect in the rule."""
+    import json as _j
+    import time as _t
+    ts = _t.time() if ts is None else ts
+    conn.execute(
+        "INSERT INTO event (ts,ts_epoch,source,type,agent_id,severity,payload) "
+        "VALUES (?,?,?,?,?,?,?)",
+        ("t", ts, "claude_hook", "agent_turn_stopped", target, "info", _j.dumps(payload)))
+    conn.commit()
+
+
+def test_an_armed_background_task_marks_the_wait_intentional(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    t = "diamond-auction:0.0"
+    _turn_stopped(conn, t, {"background_tasks": [{"id": "watch1", "status": "running"}]})
+    assert clw._armed_external_wait(conn, t, __import__("time").time()) is True
+    assert clw._resolution_reason(conn, event_id=1, target=t) == "intentional_external_wait"
+
+
+def test_an_armed_session_cron_also_marks_it_intentional(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    t = "diamond-auction:0.0"
+    _turn_stopped(conn, t, {"session_crons": [{"schedule": "*/10 * * * *"}]})
+    assert clw._resolution_reason(conn, event_id=1, target=t) == "intentional_external_wait"
+
+
+def test_a_stop_with_NO_monitor_armed_still_escalates(tmp_path, monkeypatch):
+    """The whole point of the watchdog is preserved: a genuinely stalled agent, which
+    stopped with nothing armed, must still be re-woken and escalated."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    t = "some-agent:0.0"
+    _turn_stopped(conn, t, {"last_assistant_message": "stopping here", "background_tasks": []})
+    assert clw._armed_external_wait(conn, t, __import__("time").time()) is False
+    assert clw._resolution_reason(conn, event_id=1, target=t) is None
+
+
+def test_no_structured_record_falls_back_to_the_old_behaviour(tmp_path, monkeypatch):
+    """FAIL-SAFE: an older Claude, hooks disabled, or a session started before install
+    leaves no record. Unproven must mean NOT resolved — never the reverse."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    assert clw._armed_external_wait(conn, "never-seen:0.0", __import__("time").time()) is False
+    assert clw._resolution_reason(conn, event_id=1, target="never-seen:0.0") is None
+
+
+def test_a_stale_armed_record_does_not_resolve_forever(tmp_path, monkeypatch):
+    """The evidence expires. A monitor armed days ago says nothing about now."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    t = "diamond-auction:0.0"
+    import time as _t
+    base = _t.time() - clw._INTENTIONAL_WAIT_LOOKBACK_SECS - 600
+    _turn_stopped(conn, t, {"background_tasks": [{"id": "old"}]}, ts=base)
+    now = _t.time()
+    assert clw._armed_external_wait(conn, t, now) is False
