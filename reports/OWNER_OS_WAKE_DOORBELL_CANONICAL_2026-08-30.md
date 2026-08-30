@@ -2360,3 +2360,38 @@ Gate: **795 passed**, 0 failed.
 * Rollback tag: `rollback/pre-lane-fg-20260830T170749Z` → `b9a7fd2`.
 * Both importing workers restarted together: `Result=success`, `NRestarts=0`,
   `worker_skew()` empty.
+
+## Live proof on the ACAP case
+
+The deploy landed at 17:07:49Z. **Seven seconds later**, at 17:07:56Z,
+`capacity-blockchain:0.0` emitted event **15458**:
+
+```
+work_stopped_incomplete  capacity-blockchain:0.0  severity high  oar=0
+payload: {"class": "quiescent", "digest": "e4c5fb8f8a05baf1", "cwd": "/opt/capacity"}
+```
+
+Its dwell had been accumulating since 17:00; the only thing that had been missing
+was the ability to see the pane as at rest. `agent_status` moved `working → idle`
+the moment the mask lifted.
+
+**The lane changed too, which is the other half of the fix.** `wake_audit`
+**112016** records the decision with **`actionable=1`** on a
+`work_stopped_incomplete` — before this deploy that column would have been `0`
+and the event would have faced the 900 s floor. Its current state is
+`skip / actionable_cooldown_active`: it is waiting out the **60 s** fast floor,
+not fifteen minutes.
+
+**Everything the instruction required held:**
+
+| Requirement | Evidence |
+| --- | --- |
+| Exactly one appropriate stop | **1** `work_stopped_incomplete` for ACAP since the deploy; watch row `cls=idle`, `notified_cls=quiescent` — dedupe armed, report-once |
+| B2–B5 / C1 / C2 remain closed | **0** deliveries to `capacity-blockchain*` since the deploy — nothing was sent to that agent, no work was triggered |
+| Background shells not killed blindly | the `pytest` (pid 72600) it had launched is still running, untouched |
+| No regression on genuine long-running shells | a live turn with a background shell still classifies `working`; only an explicit `· done H:MM` stamp demotes it |
+
+One measurement error of this session's own is recorded rather than hidden: the
+first ACAP watcher took its baseline as `MAX(event.id)` at arm time, which was
+15458 itself — the very event it was waiting for — so it reported `stops=0` while
+the event already existed. The watcher was wrong, not the system.
