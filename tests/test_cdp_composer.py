@@ -676,3 +676,86 @@ def test_a_wedged_conversation_does_earn_one_tab_recovery(wired, monkeypatch):
     monkeypatch.setattr(cdp, "generating_is_wedged", lambda *a, **k: True)
     cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
     assert calls == ["https://chatgpt.com/c/a"], "a wedge must be recovered exactly once"
+
+
+# ── 2026-08-30: recovery must not amplify a starving browser ─────────────────
+# The host ran out of memory and swap; page_responsive() was false for EVERY tab because
+# the whole browser was starved. recover_wedged_tab fired on every delivery attempt,
+# opened a replacement it could not verify, and left the old one — 1 owner-os tab and 61
+# chrome processes became 41 pages (25 bare roots) and 68 processes in eight minutes.
+# Each failed delivery was adding renderers to the exhaustion that caused it.
+
+def _pages(n, kind="page"):
+    return [{"type": kind, "id": f"t{i}", "url": "https://chatgpt.com/"} for i in range(n)]
+
+
+def test_an_unreachable_browser_endpoint_is_degraded():
+    from tools import cdp_composer as cc
+
+    def boom():
+        raise OSError("connection refused")
+
+    d = cc.browser_degraded(list_fn=boom)
+    assert d["degraded"] is True and d["reason"].startswith("endpoint_unreachable")
+
+
+def test_a_slow_browser_endpoint_is_degraded():
+    """A healthy Chrome lists tabs in milliseconds; seconds means it is starving."""
+    from tools import cdp_composer as cc
+    ticks = iter([0.0, 5.0])
+    d = cc.browser_degraded(list_fn=lambda: _pages(3), clock=lambda: next(ticks))
+    assert d["degraded"] is True and d["reason"].startswith("endpoint_slow")
+
+
+def test_too_many_pages_is_degraded():
+    """The signature of replacement tabs accumulating — the live state was 41."""
+    from tools import cdp_composer as cc
+    ticks = iter([0.0, 0.01])
+    d = cc.browser_degraded(list_fn=lambda: _pages(41), clock=lambda: next(ticks))
+    assert d["degraded"] is True and d["reason"] == "too_many_pages:41"
+
+
+def test_a_healthy_browser_is_not_degraded():
+    from tools import cdp_composer as cc
+    ticks = iter([0.0, 0.01])
+    d = cc.browser_degraded(list_fn=lambda: _pages(4), clock=lambda: next(ticks))
+    assert d["degraded"] is False and d["pages"] == 4
+
+
+def test_only_real_pages_count_not_workers_or_service_workers():
+    from tools import cdp_composer as cc
+    ticks = iter([0.0, 0.01])
+    mixed = _pages(3) + _pages(30, kind="service_worker")
+    d = cc.browser_degraded(list_fn=lambda: mixed, clock=lambda: next(ticks))
+    assert d["degraded"] is False, "background workers are not tabs"
+
+
+def test_a_degraded_browser_opens_NO_replacement_tab(monkeypatch):
+    """The whole point: refusing must mean no tab is created, not a tab created and
+    discarded."""
+    from tools import cdp_composer as cc
+    opened = []
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": True,
+                                                                 "reason": "too_many_pages:41"})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET": opened.append(path) or {})
+    assert cc.recover_wedged_tab({"id": "old"}, "https://chatgpt.com/c/a") is None
+    assert opened == [], "a starving browser must not be handed another tab to open"
+
+
+def test_a_healthy_browser_still_gets_its_replacement_tab(monkeypatch):
+    """No regression on the 4214 incident this recovery exists for: ONE wedged renderer
+    on a healthy browser is still replaced."""
+    from tools import cdp_composer as cc
+    opened = []
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+
+    def fake_http(path, method="GET"):
+        opened.append(path)
+        return {"id": "fresh"}
+
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc, "find_target", lambda url: {"id": "fresh"})
+    monkeypatch.setattr(cc, "page_responsive", lambda t, timeout=8.0: True)
+    monkeypatch.setattr(cc.time, "sleep", lambda s: None)
+    assert cc.recover_wedged_tab({"id": "old"}, "https://chatgpt.com/c/a") is not None
+    assert any("/json/new" in p for p in opened)

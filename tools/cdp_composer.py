@@ -63,6 +63,48 @@ def _http(path: str, method: str = "GET"):
         return json.loads(body) if body.strip() else {}
 
 
+# BROWSER-level health, as distinct from one tab's renderer. The difference decides
+# whether replacing a tab helps or hurts.
+#
+# 2026-08-30: the host ran out of memory and swap (100% of 20 GB, load 29, continuous
+# paging). `page_responsive()` was false for every tab, because the whole browser was
+# starved — so `recover_wedged_tab()` fired on every delivery attempt, opened a
+# replacement it could not verify inside its window, and left the old tab open. Chrome
+# went from 1 owner-os tab and 61 processes to 41 pages (25 of them bare chatgpt.com
+# roots) and 68 processes in eight minutes. Each failed delivery was adding renderers to
+# the exhaustion that caused the failure.
+#
+# Replacing a tab is right when ONE renderer is wedged and the browser is healthy — the
+# 4214 incident this recovery was written for. It is destructive when the browser itself
+# is degraded, so that case must refuse instead.
+BROWSER_MAX_PAGES = int(os.getenv("CDP_MAX_PAGES", "12"))
+BROWSER_SLOW_SECS = float(os.getenv("CDP_SLOW_SECS", "2.0"))
+
+
+def browser_degraded(list_fn=None, clock=None) -> dict:
+    """Is the BROWSER in trouble, rather than a single page?
+
+    Three signals, any one sufficient: the browser-level endpoint does not answer at all;
+    it answers but slowly (a healthy Chrome lists tabs in milliseconds); or it is already
+    holding more pages than this host should ever need, which is itself the signature of
+    replacement tabs accumulating.
+    """
+    clock = clock or time.monotonic
+    t0 = clock()
+    try:
+        pages = (list_fn or (lambda: _http("/json/list")))()
+    except Exception as e:  # noqa: BLE001
+        return {"degraded": True, "reason": f"endpoint_unreachable:{type(e).__name__}"}
+    elapsed = clock() - t0
+    n = sum(1 for p in pages if isinstance(p, dict) and p.get("type") == "page") \
+        if isinstance(pages, list) else -1
+    if elapsed > BROWSER_SLOW_SECS:
+        return {"degraded": True, "reason": f"endpoint_slow:{elapsed:.1f}s", "pages": n}
+    if n > BROWSER_MAX_PAGES:
+        return {"degraded": True, "reason": f"too_many_pages:{n}", "pages": n}
+    return {"degraded": False, "reason": "ok", "pages": n, "elapsed": elapsed}
+
+
 def page_responsive(target: dict, timeout: float = 8.0) -> bool:
     """Can this page's renderer answer a trivial evaluate at all?
 
@@ -93,8 +135,16 @@ def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict
     process and keep working when a renderer hangs — which is exactly when the CDP
     session channel does not. The new tab opens directly on the bound URL, so the
     exact-route guarantee is untouched; the wedged tab is closed only AFTER the
-    replacement exists, so a failed recovery cannot leave us with no ChatGPT tab at all."""
+    replacement exists, so a failed recovery cannot leave us with no ChatGPT tab at all.
+
+    REFUSES when the BROWSER is degraded rather than this one tab: opening a replacement
+    then is not recovery, it is another renderer added to whatever is already starving the
+    browser. This is the single choke point for creating tabs, so the guard lives here and
+    no caller can bypass it."""
     import time
+    d = browser_degraded()
+    if d.get("degraded"):
+        return None
     try:
         try:
             fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}",
@@ -619,6 +669,11 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
     # guaranteed timeout, and replace the tab at browser level (the 4214 incident: 113
     # identical WebSocketTimeouts against one hung page).
     if not page_responsive(target):
+        # Name WHICH thing is unwell. A starving browser and a single wedged renderer look
+        # identical from one tab, and only the second is worth replacing a tab over.
+        d = browser_degraded()
+        if d.get("degraded"):
+            return {"ok": False, "reason": f"browser_degraded:{d.get('reason')}"}
         target = recover_wedged_tab(target, conversation_url)
         if not target:
             return {"ok": False, "reason": "renderer_unresponsive"}
