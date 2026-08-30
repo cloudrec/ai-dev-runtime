@@ -3754,3 +3754,65 @@ not exist) was being counted as a second, different blob. The figure is withdraw
 Durable fix: stage report changes by explicit path, never by directory. The recurrence
 happened precisely because `68f7e9f` restored the state without removing the habit that
 caused it.
+
+---
+
+# Part 21 — event 15483: the known Telegram gate, and the real defect underneath it
+
+## The event itself is the known gate — recorded, not re-opened
+
+15483 (`notification_dead_letter`, critical, `owner_action_required=1`) is notification
+3100, channel `telegram`, 5 attempts exhausted, carrying an `agentwatch:...:quiescent`
+dedup key. It is the **already-known Telegram `owner_push` failure** from Part 17, not a
+new one:
+
+* Every dead letter ever recorded — 3 204 of them — is that one channel (3 202 labelled
+  `telegram`, 2 `owner_push`, the same sender under both names), all at exactly 5 attempts.
+* The only failure cause the control plane retains is
+  `telegram send failed: Bad Request: chat not found`, still current at 21:00:24Z.
+
+Evidentiary limit, stated rather than glossed: the `notification` table has no per-attempt
+error column, so cause identity is established from the channel-level error plus the
+uniformity of the population, not proven row by row. No credential, chat id, gate or
+routing was touched, and no new remediation thread is opened — the fix remains the single
+owner-only operation named in Part 17.
+
+Checked and clear: dead-letter events create **no** notifications of their own
+(0 of 3 204), so there is no amplification loop. `push=False` is doing its job.
+
+## The defect underneath: the alarm never deduped
+
+Reconciling it exposed a genuine, non-gated code defect.
+
+```python
+dedup_key=f"deadletter:{n['id']}"     # a notification id is unique by construction
+```
+
+`append_event` suppresses a repeat only when the same key recurs inside the window. Keyed
+on the notification id, the key is different every time by definition, so the 900 s window
+could never match and **the dedup was structurally incapable of collapsing anything**:
+937 events under 937 distinct keys in 24 hours, every one `critical` with
+`owner_action_required=1`, for a single unchanging cause. That is the largest event type on
+this host, and it is why `notification_dead_letter` reads as the loudest signal in the
+inbox while meaning one thing.
+
+Fixed in `c403ca0`: keyed by **channel**, with an explicit
+`NOTIFIER_DEAD_LETTER_DEDUP_SECS` window. A dead letter means *this channel is not
+delivering* — one standing fact, not one fact per message.
+
+Nothing is lost, and the tests say so rather than the commit message: every dead-lettered
+message is still marked individually in the `notification` table, which stays the
+per-message ledger, and a second channel still raises its own alarm, so a genuinely new
+failure is not hidden behind the old one. 3 tests; the collapse test verified to fail with
+the fix reverted (4 events instead of 1).
+
+**Not live.** The engine that drains the outbox runs inside `ai-runtime.service`, whose
+restart is owner-gated. The fix is committed and takes effect at the next approved restart;
+until then the event rate is unchanged. Nothing was restarted to force it.
+
+This is the fourth defect of one shape today: a key, a regex or a scan that answers a
+different question than the one being asked. `work_evidence` read narrated history as a
+current claim; `agent_watch` read a numbered sentence as a menu; and here a per-message key
+was used to express a per-channel fact.
+
+32 unrelated WIP files remain untracked and unmodified.
