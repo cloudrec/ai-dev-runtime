@@ -2455,3 +2455,73 @@ latency is the assistant's own response time.
    `readyState`, and the suites are green (184 passed). Deploying on a red gate
    was still wrong, and the chaining that allowed it is the actual process defect
    — recorded rather than quietly corrected.
+
+---
+
+# Part 11 — the process defect closed, and what the ACAP acceptance is waiting on
+
+## The red-gate deploy cannot recur (`c7d9a67`)
+
+Part 10 recorded a commit deployed while eight tests were red, because the gate,
+the backup, the commit and the service restart were chained into one shell
+command and nothing in that chain stops on a non-zero exit.
+
+`tools/guarded_deploy.sh --gate CMD --deploy CMD` now runs the deploy ONLY on a
+clean gate exit, and distinguishes the three outcomes that matter: **1** gate red
+and the deploy refused *and said so*, **3** deploy failed after a green gate,
+**0** success.
+
+Two hazards surfaced while writing it, and both are pinned by their own tests —
+the guard's first two versions were themselves broken:
+
+* an `if` condition is exempt from errexit, so a failing gate must be CAPTURED
+  there rather than allowed to kill the guard before it can refuse anything;
+* `eval` runs in the CURRENT shell, so a gate that itself calls `exit` — a
+  wrapper script, a `set -e` runner, the literal `exit 1` — terminated the guard
+  and returned the gate's own status. That *looks* like a refusal while skipping
+  the refusal entirely and leaving no message. Gate and deploy now run in
+  subshells.
+
+9 tests; four mutations each killed by its own test (deploy-regardless-of-gate,
+no gate subshell, a failed deploy reported as success, `--dry-run` deploying
+anyway). Its first real use was gating its own push:
+
+```
+== GATE ==   82 passed
+== GATE EXIT: 0 ==
+== DEPLOY (gate passed) ==   pushed c7d9a67
+== DEPLOY EXIT: 0 ==
+```
+
+## ACAP acceptance: three legs proven, delivery waiting on a saturated chat
+
+Against the REAL `capacity-blockchain:0.0` closeout, not a synthetic event:
+
+| Leg | Status |
+| --- | --- |
+| Structural stop detection | **PROVEN** — 15458 (17:07:56Z) and 15460 (17:18:04Z), both `class: quiescent`, emitted from a pane that had been pinned at `working` by a background `pytest` |
+| Lifecycle fast-lane decision | **PROVEN** — `wake_audit` 112170 and 112195, `wake / actionable_waiting_transition`, **`actionable=1`**. Both began as `skip / actionable_cooldown_active` and were promoted by the redecide sweep, so the whole fast path — skip, redecide, wake — is exercised |
+| Bounded claim | **PROVEN** — the lane's own 60 s floor applied and released; owner-os lifecycle wakes are draining at 78–94 s gaps against one per 900 s before |
+| Safe back-pressure | **PROVEN** — 8 consecutive `assistant_still_generating` verdicts in 10 minutes, no typed draft, no latch, events still pending |
+| Successful delivery | **WAITING** — see below |
+| Exactly-once / ack | pending on delivery |
+| ChatGPT re-reads and continues or leaves at a gate | pending on delivery |
+
+**What delivery is waiting on, stated precisely.** The bound owner-os chat's
+assistant has been generating continuously. A wake cannot be typed into a chat
+that is mid-answer: ChatGPT replaces the send control with a stop control, so
+there is nothing to click and Enter is ignored. Every attempt is therefore
+refused safely and retried.
+
+This is worth naming as a systemic property rather than a transient: **raising
+wake throughput does not raise delivery throughput past the assistant's own
+occupancy.** Each delivered wake makes the assistant generate; while it generates
+nothing else can be delivered; when it finishes, the next queued wake goes in and
+it generates again. The fast lane converts a 900 s scheduling delay into a queue
+against the chat's real capacity — which is a strictly better failure (nothing is
+lost, dropped, duplicated or silently aged out) but it is not the same as
+"delivered promptly", and this report will not claim it is.
+
+Nothing was weakened to work around it: no cooldown was shortened, no dedupe
+relaxed, and no synthetic product event was manufactured. The watch continues on
+the real ACAP closeout.
