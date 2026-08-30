@@ -858,3 +858,53 @@ def test_a_stale_armed_record_does_not_resolve_forever(tmp_path, monkeypatch):
     _turn_stopped(conn, t, {"background_tasks": [{"id": "old"}]}, ts=base)
     now = _t.time()
     assert clw._armed_external_wait(conn, t, now) is False
+
+
+# ── a wake addressed to a session that is gone can never resolve itself (event 15923) ──
+# Hook wakes are addressed `session:<conversation id>`, a namespace absent from
+# agent_watch_state, so none of the pane-based resolutions can fire for one. cp-canary was
+# killed at 20:20:35Z; its wake was delivered at 20:47:20Z to an agent that no longer
+# existed, re-woken at 21:03 and escalated critical at 21:18:49Z with no possible end.
+
+def _hook_wake(conn, event_id=9100, cwd="/root/cp-canary-v2",
+               target="session:b2635b20-8de", terminal=True):
+    import json as _j
+    conn.execute("INSERT INTO event (id,ts,ts_epoch,source,type,agent_id,severity,payload) "
+                 "VALUES (?,?,?,?,?,?,?,?)",
+                 (event_id, "t", 1000.0, "claude_hook", "agent_waiting_input", target,
+                  "high", _j.dumps({"cwd": cwd, "session_id": "b2635b20"})))
+    if terminal:
+        conn.execute("INSERT INTO event (ts,ts_epoch,source,type,agent_id,severity,payload) "
+                     "VALUES (?,?,?,?,?,?,?)",
+                     ("t", 1001.0, "agent_watch", "agent_dead", target, "high", "{}"))
+    conn.commit()
+    clw.register_delivery(event_id=event_id, target=target, project_id="owner-os",
+                          conn=conn, now=1000.0)
+
+
+def test_a_gone_session_resolves_instead_of_escalating_forever():
+    conn, _ = clw._conn()
+    _hook_wake(conn)
+    out = clw.deregister_resolved(conn=conn, now=2000.0, agents=[])
+    assert out and out[0]["reason"] == "target_session_no_longer_present"
+
+
+def test_a_live_session_still_escalates_exactly_as_before():
+    """Fail-closed: a pane still present keeps its watch, however quiet it is."""
+    conn, _ = clw._conn()
+    _hook_wake(conn)
+    live = [{"target": "cp-canary:0.0", "claude_cwd": "/root/cp-canary-v2", "alive": True}]
+    assert clw.deregister_resolved(conn=conn, now=2000.0, agents=live) == []
+
+
+def test_a_gone_session_with_no_terminal_event_keeps_waking():
+    """The owner must have been told once, by agent_dead, before this goes quiet."""
+    conn, _ = clw._conn()
+    _hook_wake(conn, event_id=9101, target="session:never-declared-dead", terminal=False)
+    assert clw.deregister_resolved(conn=conn, now=2000.0, agents=[]) == []
+
+
+def test_an_unknown_cwd_makes_no_claim():
+    conn, _ = clw._conn()
+    _hook_wake(conn, event_id=9102, cwd="", target="session:no-cwd")
+    assert clw.deregister_resolved(conn=conn, now=2000.0, agents=[]) == []

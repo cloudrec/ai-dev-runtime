@@ -80,6 +80,51 @@ _RUNTIME_JOB_TERMINAL_STATUSES = frozenset({
 })
 _RUNTIME_JOB_TARGET_PREFIX = "runtimejob:"
 
+# Hook-sourced wakes are addressed `session:<conversation id>`, a namespace that never
+# appears in `agent_watch_state` (which is keyed by tmux target). So NONE of the
+# pane-based resolutions below can ever fire for one, and if the session behind it is gone
+# the watch chases progress that can never arrive — exactly the runtimejob argument, in a
+# second namespace. Event 15923: cp-canary was killed at 20:20:35Z, its wake was delivered
+# at 20:47:20Z to an agent that no longer existed, re-woken at 21:03 and escalated
+# critical at 21:18:49Z, with no possible end.
+_SESSION_TARGET_PREFIX = "session:"
+
+
+def _session_target_gone(conn, event_id: int, target: str, agents=None) -> bool:
+    """Is the session behind this watch provably gone?
+
+    Fail-closed in the direction that keeps waking: unknown cwd, unreadable inventory or
+    a still-present pane all return False, so a live agent's genuine stall escalates
+    exactly as before. Resolution needs BOTH no live agent in the session's own working
+    directory AND a terminal event already recorded for it, so the owner has still been
+    told once — by `agent_dead` / `agent_process_failed` — before this goes quiet.
+    """
+    try:
+        row = conn.execute("SELECT payload FROM event WHERE id=?", (event_id,)).fetchone()
+        cwd = (json.loads(row[0]) or {}).get("cwd", "") if row and row[0] else ""
+    except Exception:  # noqa: BLE001
+        return False
+    if not cwd:
+        return False
+    if agents is None:
+        try:
+            from core import agent_control as ac
+            agents = ac.agent_list().get("agents", [])
+        except Exception:  # noqa: BLE001 — no inventory, no claim
+            return False
+    live = [a for a in (agents or [])
+            if (a.get("claude_cwd") or a.get("cwd") or "").rstrip("/") == cwd.rstrip("/")
+            and a.get("alive")]
+    if live:
+        return False
+    try:
+        term = conn.execute(
+            "SELECT 1 FROM event WHERE agent_id=? AND type IN "
+            "('agent_dead','agent_process_failed') LIMIT 1", (target,)).fetchone()
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(term)
+
 
 def _runtime_job_terminal(target: str) -> bool:
     """Is the job behind this `runtimejob:<8-hex-prefix>` target ALREADY terminal?
@@ -158,7 +203,8 @@ def _armed_external_wait(conn, target: str, now: float) -> bool:
     return bool(p.get("background_tasks")) or bool(p.get("session_crons"))
 
 
-def _resolution_reason(conn, *, event_id: int, target: str) -> Optional[str]:
+def _resolution_reason(conn, *, event_id: int, target: str,
+                       agents=None) -> Optional[str]:
     """Has the condition THIS watch exists for already resolved? Three independent
     signals, any one of which is sufficient:
 
@@ -191,6 +237,9 @@ def _resolution_reason(conn, *, event_id: int, target: str) -> Optional[str]:
         if _runtime_job_terminal(target):
             return "runtime_job_terminal"
         return None
+    if target.startswith(_SESSION_TARGET_PREFIX) and _session_target_gone(
+            conn, event_id, target, agents=agents):
+        return "target_session_no_longer_present"
     # A pane that parked with its own monitor armed is waiting, not stalled. Checked with
     # the other silent-resolution signals, so it deregisters the watch without emitting —
     # the owner is not told a second time about a state they already know is intentional.
@@ -221,7 +270,7 @@ def _resolution_reason(conn, *, event_id: int, target: str) -> Optional[str]:
     return None
 
 
-def deregister_resolved(*, conn=None, now: Optional[float] = None) -> list:
+def deregister_resolved(*, conn=None, now: Optional[float] = None, agents=None) -> list:
     """Proactively retire every OPEN watch whose underlying condition already
     resolved — SILENTLY: `resolved=1` is set, nothing is emitted. Distinct from
     `escalated`, which is a terminal state reached BY emitting; this is the state
@@ -235,7 +284,8 @@ def deregister_resolved(*, conn=None, now: Optional[float] = None) -> list:
             "WHERE escalated=0 AND COALESCE(resolved,0)=0").fetchall()
         deregistered = []
         for event_id, target in rows:
-            reason = _resolution_reason(conn, event_id=event_id, target=target or "")
+            reason = _resolution_reason(conn, event_id=event_id, target=target or "",
+                                        agents=agents)
             if not reason:
                 continue
             conn.execute(
