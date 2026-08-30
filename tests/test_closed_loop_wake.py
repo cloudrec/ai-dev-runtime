@@ -874,9 +874,13 @@ def _hook_wake(conn, event_id=9100, cwd="/root/cp-canary-v2",
                  (event_id, "t", 1000.0, "claude_hook", "agent_waiting_input", target,
                   "high", _j.dumps({"cwd": cwd, "session_id": "b2635b20"})))
     if terminal:
-        conn.execute("INSERT INTO event (ts,ts_epoch,source,type,agent_id,severity,payload) "
-                     "VALUES (?,?,?,?,?,?,?)",
-                     ("t", 1001.0, "agent_watch", "agent_dead", target, "high", "{}"))
+        # recorded in the TMUX namespace, as agent_watch really records it — the mismatch
+        # this resolution has to bridge
+        conn.execute("INSERT INTO event "
+                     "(ts,ts_epoch,source,type,agent_id,project_id,severity,payload) "
+                     "VALUES (?,?,?,?,?,?,?,?)",
+                     ("t", 1001.0, "agent_watch", "agent_dead", "cp-canary:0.0",
+                      cwd.rstrip("/").rsplit("/", 1)[-1], "high", "{}"))
     conn.commit()
     clw.register_delivery(event_id=event_id, target=target, project_id="owner-os",
                           conn=conn, now=1000.0)
