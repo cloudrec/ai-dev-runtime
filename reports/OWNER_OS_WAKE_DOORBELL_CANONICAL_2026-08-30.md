@@ -4152,3 +4152,48 @@ it will not retroactively resolve. The route-key mislabel stands, untouched by d
 the narrowing rests on `agent_watch` being right about the current class: a pane it
 misclassified as `idle` while genuinely prompting would now resolve instead of escalate —
 bounded to prompt-class wakes only.
+
+---
+
+# Part 27 — the project/route conflation, closed at its origin
+
+Parts 25 and 26 recorded this as a known open defect: owner-facing watchdog alarms about an
+agent in `/opt/seo` were filed under project `owner-os`. Now closed in `a5b930e`.
+
+**Traced to the origin rather than patched at the symptom.** `wake_bridge.pending_wake()`
+holds `project_id` as a local and passes it to `compose_phrase` — but never returned it. The
+companion therefore had only `route_key` to hand and passed it as `project_id`;
+`register_delivery` stored that, and `slo_scan` re-emitted it. One missing return field
+became a wrong project on every SLO alarm.
+
+Fixed along the whole path, so the two facts stop sharing a field anywhere:
+
+* `pending_wake` returns `project_id` (where the wake came FROM) alongside `route_key`
+  (where it goes TO);
+* `register_delivery` accepts `route_key` and stores it in its own migrated column;
+* `slo_scan` files `wake_loop_no_progress` and `wake_loop_stalled` under the real project,
+  carrying `route_key` in the payload as routing context;
+* `wake_companion` forwards both.
+
+5 tests using the real event and route shapes (`project_id="seo"`, `route_key="owner-os"`,
+target `mess-postsignup-cleanup-sonnet-v4:0.0`), including a regression asserting the
+original substitution cannot return, and one for a live-DB row written before the
+`route_key` column existed. Mutation-checked in three parts: reverting `wake_bridge`,
+`closed_loop_wake` or the companion each fails its own test and only that one.
+
+| | |
+|---|---|
+| Files | `core/wake_bridge.py`, `core/closed_loop_wake.py`, `tools/wake_companion.py`, `tests/test_closed_loop_wake.py` |
+| Focused | 46 passed; 5-module gate 268 passed |
+| Whole repository | **2 821 passed, exit 0, 12 m 33 s** — 2 816 before, plus the 5 new tests |
+| Heads | local `a5b930e`, base/remote `2c8e8b1`, 34 ahead / 0 behind |
+| Worktree | clean; 32 WIP files untracked, all md5-verified byte-identical |
+
+**Residual.** Not live — no restart, so this and the four fixes before it take effect only at
+the next approved restart. Watch rows written earlier keep the route key in `project_id` and
+are deliberately not back-filled: rewriting live watch history is a data mutation this fix
+does not need, so those rows keep emitting the wrong project until they age out.
+
+During this work the untracked count briefly read 33. It was a transient artefact of the
+concurrently running test suite; the set is again exactly the 32 baseline files and every
+checksum verifies.
