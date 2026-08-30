@@ -1037,6 +1037,31 @@ PRESERVED (byte-identical session list incl. creation timestamp): True
 The throwaway server was then killed and its socket directory removed;
 production's own plane was never made unreachable at any point.
 
+### Fail-closed proof, in the deployed code, on all four surfaces
+
+Run against the real modules with `TMUX` unset and `TMUX_TMPDIR` pointed at an
+empty directory, so every surface is asked about a control plane that genuinely
+is not there. Production's own plane was never made unreachable:
+
+```
+tmux_control.health()   status=unreachable  reason=socket_missing  healthy=false
+                        "…managed-agent health is UNKNOWN, not ok. An inventory
+                         that failed to load is not an empty fleet."
+agent_control.agent_list()      raises AgentControlError (fail closed)
+agent_continuation_watchdog.health()
+                        status=unreachable   control_plane_reachable=false
+                        "tmux_control_unreachable: the live agent inventory could
+                         not be read … coverage is UNKNOWN, not ok"
+session_recovery.recover('cp-canary:0.0')
+                        recovered=false  reason=tmux_control_not_healthy
+session_recovery.status()
+                        control_unreachable=true   cp-canary alive=None  (not False)
+```
+
+Before this deploy the third line read `status: ok` and the fourth would have
+proceeded to `tmux new-session`. Immediately afterwards, against the real socket:
+`tmux_control ok`, 10 sessions, unchanged.
+
 ## A second live defect, found while verifying wake health: 3.5 hours of undeliverable wakes
 
 `pipeline_health()` reported `stuck` with `consecutive_delivery_failures`, and
