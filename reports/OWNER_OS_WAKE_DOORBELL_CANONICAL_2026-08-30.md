@@ -600,3 +600,12 @@ C: 14007→13796) and its own process-death class reaching full delivery
 healthy: pipeline `ok`, `worker_skew()` empty, dedupe/bounded-retry/no-
 resurrection all hold with fresh evidence, and an unrelated external service
 restart mid-watch caused no disruption.
+
+## Closeout
+
+No monitoring active. Final check: `pipeline.status: "ok"`, `worker_skew(): []`,
+`consecutive_delivery_failures: 0`, one process each for
+`owner-os-wake-companion.service` and `ai-runtime.service` (both
+`Result=success`, `NRestarts=0`), 29 unrelated `reports/*` WIP files
+byte-identical to session start. GREEN stands. No further production changes
+made or pending.
