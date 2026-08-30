@@ -1498,7 +1498,7 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
         # eligible to try again.
         rows = conn.execute(
             "SELECT a.id, a.event_id, COALESCE(a.project_id,''), "
-            "COALESCE(a.route_key,''), COALESCE(a.agent_id,'') FROM wake_audit a "
+            "COALESCE(a.route_key,''), COALESCE(a.agent_id,''), a.decision FROM wake_audit a "
             "LEFT JOIN event e ON e.id = a.event_id "
             "WHERE (a.decision='wake' OR (a.decision='skip' AND a.reason='cooldown_active')) "
             "AND (e.ts_epoch IS NULL OR e.ts_epoch > ?) "
@@ -1508,7 +1508,7 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
             "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
             "ORDER BY a.id ASC", (now - MAX_WAKE_AGE_SECS,)).fetchall()
         groups: dict = {}
-        for aid, eid, project, stored_route, agent_ref in rows:
+        for aid, eid, project, stored_route, agent_ref, decision in rows:
             # Group by the RESOLVED route, not the raw project key. Two sessions of
             # one project (payorch-live-buttons, payorch-monitor-clean) resolve to a
             # single chat, so grouping on the raw key would leave them unfolded and
@@ -1525,16 +1525,29 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
                         "route_key") or wake_routes.route_key_for_event(project)
                 except Exception:  # noqa: BLE001 - grouping must never break the drain
                     key = wake_routes.route_key_for_event(project)
-            groups.setdefault(key, []).append((aid, eid))
+            groups.setdefault(key, []).append((aid, eid, decision))
         superseded, kept = [], []
         reason = "coalesced_into_newest_generic_wake"
         for key, members in groups.items():
             if len(members) < 2:
                 kept.append(int(members[0][1]))
                 continue
-            keep_audit_id, keep_event_id = int(members[-1][0]), int(members[-1][1])
+            # A `wake`-decision member must never be superseded by a `skip` one, even
+            # a newer one — that would demote an already-decided, claim-ready wake
+            # back to pending, discarding its wake status and forcing it through the
+            # WHOLE decision-gate cooldown again. Reproduced live 2026-08-30: a wake
+            # row sat unclaimed only briefly before a fresher `skip` row (a routine
+            # duplicate on the same busy route) coalesced OVER it, repeatedly, in a
+            # cycle that could run indefinitely on a route with continuous traffic.
+            # Restrict "kept" to the wake-decision members when any exist; only pick
+            # from skip-decision members when the whole group is still undecided.
+            wake_members = [m for m in members if m[2] == "wake"]
+            pool = wake_members or members
+            keep_audit_id, keep_event_id = int(pool[-1][0]), int(pool[-1][1])
             kept.append(keep_event_id)
-            for aid, eid in members[:-1]:
+            for aid, eid, _decision in members:
+                if aid == keep_audit_id:
+                    continue
                 conn.execute("UPDATE wake_audit SET superseded_by=?, superseded_at=?, "
                              "superseded_reason=? WHERE id=?",
                              (keep_audit_id, now_iso(), reason, int(aid)))

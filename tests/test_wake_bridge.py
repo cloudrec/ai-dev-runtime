@@ -830,3 +830,29 @@ def test_an_already_too_old_wake_row_is_excluded_even_as_the_only_candidate():
     r = wb.coalesce_generic_backlog(now=now)
     assert 941 not in r["kept_event_ids"]
     assert 941 not in r["superseded_event_ids"]
+
+
+def test_a_wake_decision_is_never_superseded_by_a_fresher_skip():
+    """A `wake`-decision row is already claim-ready. Folding it into a fresher
+    `skip` row demotes it back to pending, discarding its wake status and forcing
+    it through the whole decision-gate cooldown again — reproduced live 2026-08-30
+    as an indefinite oscillation on a busy route (a canary work_stopped_incomplete
+    event kept reaching `wake` and immediately being coalesced back under a newer,
+    still-undecided `skip` duplicate, over and over, never once reaching a claim)."""
+    _wake_row(951, ts=100.0)                    # wake decided FIRST (lower audit id)
+    _skip_row(952)                               # a routine duplicate decided LATER
+    r = wb.coalesce_generic_backlog(now=2000.0)
+    assert r["kept_event_id"] == 951, (
+        "the already-decided wake must remain kept even though the skip row is newer")
+    assert 952 in r["superseded_event_ids"]
+    assert 951 not in r["superseded_event_ids"]
+
+
+def test_the_newest_wake_still_wins_among_multiple_wake_rows():
+    """Unchanged behaviour when every candidate is already decided: newest wake
+    still wins, same as before this fix."""
+    _wake_row(961, ts=100.0)
+    _wake_row(962, ts=200.0)
+    r = wb.coalesce_generic_backlog(now=2000.0)
+    assert r["kept_event_id"] == 962
+    assert 961 in r["superseded_event_ids"]
