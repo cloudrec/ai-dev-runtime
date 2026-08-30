@@ -3678,3 +3678,55 @@ the supervisor sends through `agent_control.agent_send`, and all 8 continuations
 * `agent_stop` still has no paired restart obligation. Nothing here changed that.
 * Telegram is still dead (Part 17), so `agent_continuation_exhausted` — like every
   owner-facing event — can only reach the owner through the ChatGPT bridge.
+
+---
+
+# Part 19 — event 15817 reconciled: a numbered sentence read as a decision menu
+
+15817 (`agent_prompt_needs_response`, severity high, `owner_action_required=1`) is **not
+owner approval and not a gate**. Reconciled read-only against live state first:
+`agent_status` for `owner-os-wake-policy-opus:0.0` reports `state=working`,
+`pending=None`, `pending_kind=None`. No prompt existed then or now, so nothing was
+answered and no gate was approached.
+
+The event was `agent_watch` reading **this supervisor's own pane**. Its excerpt is the
+Part 16 turn summary — including the premise (`PRE_CLEAR_MANIFEST.md does not exist`) that
+the same turn had already corrected. Acting on it would have re-injected a stale, wrong
+fact as if it were an instruction.
+
+## Root cause, fixed in `a9ff86e`
+
+```python
+_MENU_RE = re.compile(r"\b1\.\s+\S.{0,300}?\b2\.\s+\S")   # searched space-joined text
+```
+
+Applied to `_bottom_region`, which space-joins lines. So an ordinary numbered sentence —
+"corrected by measurement: 1. the refusal is X, not Y. 2. the manifest does not exist." —
+matched as a decision menu and woke the owner at high severity. Any agent writing a
+numbered summary triggers it.
+
+A real CLI menu renders one option per line, optionally behind the `❯` caret; prose
+numbering runs inside a sentence. The pattern is now line-anchored and reads
+`_bottom_lines_text` — the line-preserving view this module already keeps for crash
+matching, added for the same reason: some shapes are only distinguishable by occupying
+their own line. The yes/no vocabulary path and `inventory_waiting_owner` are untouched, so
+nothing that woke for those stops waking.
+
+Verified: the real 15817 prose no longer matches; a Yes/No menu still matches; and the
+event 4088 shape — a five-option strategy menu with none of the yes/no vocabulary — still
+matches. 4 tests, each verified to fail with the fix reverted.
+
+**Blast radius deliberately not quantified.** A count over stored events would have been
+easy to publish and wrong: excerpts are whitespace-normalised before storage, so the
+newlines that decide this question are already gone. An earlier draft of this analysis did
+compute such a number; it is withdrawn rather than reported.
+
+This is the third defect of one family found today — `work_evidence` markers, the
+`intentional_external_wait` prose match, and now this. Prose regex over a pane or a report
+answers a different question than the one being asked, and the answer is structure:
+line anchors, declared status, native lifecycle state.
+
+## State after deploy
+Companion restarted cleanly, 9 sessions unchanged, no duplicates, 29 unrelated WIP files
+untouched. No owner gate crossed: `approved_gates.yaml`, Telegram credentials, ACAP C1/C2,
+XMRig, `/etc/systemd/system` and the HIGH_RISK jobs were all left alone.
