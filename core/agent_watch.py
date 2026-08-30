@@ -517,10 +517,25 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 "ON CONFLICT(target) DO UPDATE SET cls=excluded.cls, digest=excluded.digest,"
                 "at=excluded.at, ts=excluded.ts, digest_since=excluded.digest_since",
                 (target, cls, dg, now_iso(), now, digest_since))
-            # RESUME RE-ARMS. An agent that went back to work has consumed whatever it was
-            # asked; if the very same prompt appears again later, that is a new event, not
-            # a duplicate of the old one.
-            if cls == "working" and row and row[2]:
+            # RESUME RE-ARMS — but only on evidence of actual PROGRESS. An agent that went
+            # back to work has consumed whatever it was asked, so the same prompt later is
+            # a new event rather than a duplicate. The trap is that `working` can come from
+            # the INVENTORY alone (`st in _ACTIVE_STATES`), which flickers with a background
+            # shell or the "· N shell" footer while the pane's own output never moves.
+            #
+            # 2026-08-30, diamond-auction:0.0: the agent finished its stage and parked on a
+            # read-only watch, saying "Remaining items are the unchanged external owner
+            # gates. Idle on the watch." Its bottom region was byte-identical for over two
+            # hours — digest f74cac57f157a547 throughout — yet the inventory flickered to
+            # `working`, that cleared the notification, and the SAME unchanged pane emitted
+            # a second `work_stopped_incomplete` 70 minutes after the first. The stop itself
+            # was real and worth saying once; saying it again about an unchanged pane is a
+            # false wake.
+            #
+            # The digest IS the progress evidence: if the bottom region has not moved since
+            # we notified, the agent has produced nothing new and the notification stays
+            # armed. A genuine resume changes what is on screen, so it re-arms as before.
+            if cls == "working" and row and row[2] and dg != row[3]:
                 # task 211 owner_intervention metric: a resume with no proof the wake for
                 # THIS notification was ever delivered by the companion means a human
                 # typed into the pane directly — conservative, best-effort, never fatal

@@ -862,3 +862,76 @@ def test_c_an_unrecognised_inventory_state_is_never_called_stopped():
     c = aw.classify(CANARY_SILENT_STOP, state="compacting", prev_cls="working",
                     quiet_secs=aw.QUIESCENT_SECS * 100)
     assert c["cls"] == "working"
+
+
+# ── 2026-08-30: a parked agent must not be re-announced ─────────────────────
+# diamond-auction:0.0 finished its stage and parked on a read-only watch, saying
+# "Remaining items are the unchanged external owner gates. Idle on the watch." Its bottom
+# region was byte-identical for over two hours, yet the inventory flickered to `working`
+# (a background shell / the "· N shell" footer), that cleared the notification, and the
+# same unchanged pane emitted a second work_stopped_incomplete 70 minutes later.
+
+AUCTION_PARKED = """No further non-gated verification is warranted (path
+fully validated across staging 7Q-7U and live 7V).
+Remaining items are the unchanged external owner gates.
+Idle on the watch."""
+
+
+def test_an_inventory_flicker_does_not_re_announce_an_unchanged_pane():
+    """The exact Auction shape: stop, flicker to working with NO new output, stop again."""
+    emit = _Emit()
+    t = "diamond-auction:0.0"
+    _scan([_agent(t, "/opt/diamond/auction", state="working")], {t: WORKING_TAIL},
+          emit, now=1000.0)
+    _scan([_agent(t, "/opt/diamond/auction", state="idle")], {t: AUCTION_PARKED},
+          emit, now=1010.0)
+    _scan([_agent(t, "/opt/diamond/auction", state="idle")], {t: AUCTION_PARKED},
+          emit, now=1010.0 + aw.QUIESCENT_SECS + 5)
+    first = [c for c in emit.calls if c["type"] == "work_stopped_incomplete"]
+    assert len(first) == 1, "the stop itself is real and is said once"
+
+    # the inventory flickers to working while the pane text does NOT move
+    for i in range(3):
+        _scan([_agent(t, "/opt/diamond/auction", state="shell_running")],
+              {t: AUCTION_PARKED}, emit, now=2000.0 + i * 30)
+        _scan([_agent(t, "/opt/diamond/auction", state="idle")], {t: AUCTION_PARKED},
+              emit, now=2000.0 + i * 30 + aw.QUIESCENT_SECS + 5)
+    again = [c for c in emit.calls if c["type"] == "work_stopped_incomplete"]
+    assert len(again) == 1, f"an unchanged pane must not be re-announced: {len(again)}"
+
+
+def test_real_progress_still_re_arms_so_a_later_stop_is_a_fresh_event():
+    """No regression: when the agent actually produces new output, the next stop is a
+    genuinely new event and must be announced."""
+    emit = _Emit()
+    t = "diamond-auction:0.0"
+    _scan([_agent(t, "/opt/diamond/auction", state="working")], {t: WORKING_TAIL},
+          emit, now=1000.0)
+    _scan([_agent(t, "/opt/diamond/auction", state="idle")], {t: AUCTION_PARKED},
+          emit, now=1010.0)
+    _scan([_agent(t, "/opt/diamond/auction", state="idle")], {t: AUCTION_PARKED},
+          emit, now=1010.0 + aw.QUIESCENT_SECS + 5)
+    # it genuinely works again — the pane text MOVES — then stops on something new
+    # Deliberately NOT finish vocabulary: "finished" would classify `completed` and emit
+    # task_completed, which is a different (and also correct) path. This test is about the
+    # re-arm, so the second stop must be the same class as the first.
+    moved = AUCTION_PARKED + "\nPicked the next gate up; still on the same watch."
+    _scan([_agent(t, "/opt/diamond/auction", state="working")], {t: moved}, emit, now=3000.0)
+    _scan([_agent(t, "/opt/diamond/auction", state="idle")], {t: moved}, emit, now=3010.0)
+    _scan([_agent(t, "/opt/diamond/auction", state="idle")], {t: moved},
+          emit, now=3010.0 + aw.QUIESCENT_SECS + 5)
+    stops = [c for c in emit.calls if c["type"] == "work_stopped_incomplete"]
+    assert len(stops) == 2, "real progress then a new stop IS a new event"
+
+
+def test_a_new_question_on_a_parked_pane_still_wakes():
+    """Suppressing the repeat must not suppress a genuinely new prompt: a different
+    digest is a different fact, whatever the class."""
+    emit = _Emit()
+    t = "diamond-auction:0.0"
+    _scan([_agent(t, "/opt/diamond/auction", state="working")], {t: WORKING_TAIL},
+          emit, now=1000.0)
+    _scan([_agent(t, "/opt/diamond/auction", state="waiting_owner")], {t: PROMPT_TAIL},
+          emit, now=1100.0)
+    asked = [c for c in emit.calls if c["type"] == "agent_prompt_needs_response"]
+    assert len(asked) == 1, "a real question still wakes"
