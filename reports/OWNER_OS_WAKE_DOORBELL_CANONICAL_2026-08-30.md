@@ -178,7 +178,7 @@ Observed live by the production path: `agent_list()` -> `is_agent: True`,
 `agent_recovered` (severity high) emitted by the observer; control-plane registry
 records `lifecycle_state: recovered`.
 
-## Scenario A — `agent_waiting_input`: **PASS through assistant-start**
+## Scenario A — `agent_waiting_input`: **FULL PASS (continuation proven)**
 
 Work delivered through the production actuation path
 (`agent_control.agent_send`, idempotency key `p0-canary-A-waiting-input`,
@@ -205,10 +205,23 @@ with an explicit `unmapped_route` reason. No URL was guessed and no binding was
 created; the canonical rebind flow was not needed because the fallback is the
 intended behaviour for an unbound project.
 
+### A — continuation leg PROVEN
+
+| Leg | Evidence |
+| --- | --- |
+| Continuation delivery | `deliveries` idempotency key **`cp-canary-13926-continue-safe-20260830-0414`** -> `cp-canary:0.0`, `agent_send`, `delivered=true submitted=true queued=false duplicate=false pane_changed=true`, 02:14:33Z |
+| Latency | **75s** after the wake landed (02:13:18 -> 02:14:33) |
+| Who | `delivery_attribution`: `actor=api:bearer`, `source=172.20.0.6 ua=python-httpx/0.27.0` — the awakened ChatGPT side calling the Owner OS API, i.e. it re-read live state rather than trusting the wake payload |
+| Causality | the idempotency key **carries the wake event id 13926**. That is what makes this causal rather than coincidental — the same standard the 2026-08-27 report used for event 9997 |
+| Same agent, no duplicate | exactly **one** `cp-canary` tmux pane; `agent_created: false`; canary returned `waiting_input` -> `working` and emitted **13927** `work_report_published` |
+
+**A is a complete closed loop:** real stop -> observer event -> decision -> claim
+(with a bounded cooldown retry) -> correct bound chat -> exactly-one submission ->
+assistant started -> ChatGPT re-read Owner OS -> same canary continued, no
+duplicate.
+
 ## NOT YET PROVEN
 
-* A's **continuation leg** — that the awakened ChatGPT turn re-reads Owner OS and
-  resumes this same canary — is not yet evidenced.
 * Scenarios **B** (`work_stopped_incomplete`), **C** (completion), **D**
   (`agent_process_failed`) not yet run.
 * Dedupe negative proof (no repeated wake after resolution) not yet run.
