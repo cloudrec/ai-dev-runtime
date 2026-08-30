@@ -321,6 +321,15 @@ def _migrate(conn) -> None:
     # See _migrate_send for the measurements motivating this.
     conn.execute("CREATE INDEX IF NOT EXISTS ix_wake_audit_lookback "
                  "ON wake_audit (decision, actionable, id)")
+    # coalesce_generic_backlog's `NOT EXISTS (... WHERE w.event_id=a.event_id ...)`
+    # self-join has no usable index without this: `ix_wake_audit_lookback` leads on
+    # `decision`, so that correlated subquery can only index-seek to decision='wake'
+    # and then linearly scan every such row (thousands, growing forever) checking
+    # event_id by hand, once per OUTER candidate row. Measured live 2026-08-30: a
+    # read-only run of the exact query hung past 30s against a 104k-row table with
+    # no event_id index at all.
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_wake_audit_event_decision "
+                 "ON wake_audit (event_id, decision)")
 
 
 def _conn(conn=None):

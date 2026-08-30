@@ -762,3 +762,24 @@ def test_skip_with_unknown_event_age_is_still_a_candidate():
     r = wb.coalesce_generic_backlog(now=2000.0)
     assert r["superseded"] == 1
     assert 912 in r["kept_event_ids"]
+
+
+def test_the_event_id_self_join_is_indexed_not_a_linear_scan():
+    """coalesce_generic_backlog's `NOT EXISTS (... w.event_id=a.event_id ...)` self-join
+    has no usable index without ix_wake_audit_event_decision: the only other index on
+    wake_audit leads on `decision`, so that correlated subquery could only index-seek to
+    decision='wake' and then scan every such row by hand checking event_id — O(candidates
+    x wake-rows), reproduced live as a 30s+ hang against the production table."""
+    import os, sqlite3
+    _wake(921, now=1000.0)
+    _skip_row(922)
+    assert "ix_wake_audit_event_decision" in _indexes("wake_audit")
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    try:
+        plan = " ".join(str(r[-1]) for r in c.execute(
+            "EXPLAIN QUERY PLAN SELECT 1 FROM wake_audit a WHERE NOT EXISTS "
+            "(SELECT 1 FROM wake_audit w WHERE w.event_id=a.event_id AND w.decision='wake' "
+            "AND w.id<>a.id)"))
+    finally:
+        c.close()
+    assert "ix_wake_audit_event_decision" in plan, plan
