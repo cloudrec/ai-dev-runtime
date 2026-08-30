@@ -2749,3 +2749,61 @@ from making the shortage worse, and it makes the real condition legible in the
 delivery log. The host gate recorded above — roughly 3–4 GB of RSS to be freed,
 and the 25 orphaned root tabs that may be closed — is unchanged and remains an
 owner decision. Nothing was killed, closed, restarted or reconfigured.
+
+## Host recovered, and the lifecycle fast lane is PROVEN end to end on a real event
+
+The host came back on its own between 18:14 and 18:22 — Chrome shed renderers
+(68 → 21 processes) and the pressure eased without anything being killed by this
+session:
+
+```
+                   17:58Z              18:22Z
+available RAM      1879 MB             3315 MB
+swap               20479/20479 100%    13100/20479  64%
+CDP /json/version  HTTP 200 in 2.707s  HTTP 200 in 0.0019s
+chrome processes   68                  21
+```
+
+Delivery resumed immediately, and the first event through was a lifecycle
+terminal — **event 15393, `agent_dead`, `arbitrage2-audit:0.0`** — which carries
+its own before/after on a single event:
+
+| Leg | Evidence |
+| --- | --- |
+| Pre-fix decision | `wake_audit` **111562** — `skip / cooldown_active`, **`actionable=0`**: the generic 900 s lane |
+| Post-fix decision | `wake_audit` **112065** — `wake / actionable_waiting_transition`, **`actionable=1`**, route `owner-os` |
+| Bounded claim | `wake_send` 29177 `claimed_actionable` 18:21:04 → 29178 refused `actionable_cooldown_active:50s` → 29179 `claimed_actionable` 18:22:20 |
+| Delivery | **18:22:34Z**, `delivered=1`, `submitted_and_assistant_started_generating`, chat `6a7d37d0-…` |
+| Exactly-once | `wake_submitted` = **1**, despite two allowed claims — the bounded retry, not a duplicate |
+| Retire | `wake_audit.acknowledged = 1` |
+
+The same event visibly moved from `actionable=0` to `actionable=1` across the
+deploy. That is the latency fix demonstrated on real production traffic rather
+than argued from a table.
+
+**ACAP's own three stops — 15458, 15460, 15473 — all hold fast-lane `wake`
+decisions (`actionable=1`)** and are queued behind on the same route. Their
+detection, lane and claim legs are proven; their individual deliveries follow the
+lane's ordinary cycle.
+
+**The browser guard is holding under the recovery:** pages 3 → 4, chrome
+processes 21 → 22 over the same window. No runaway, no replacement-tab
+accumulation, and no `renderer_unresponsive` since it deployed.
+
+### Fail-fast on a degraded browser (`25180d6`)
+
+One more refinement went in while the host was still bad: `_attempt` now asks the
+browser-level question BEFORE opening a session. Previously the renderer probe
+passed, the session hung, and the attempt recorded
+`cdp_error:WebSocketTimeoutException` after burning tens of seconds of a
+thrashing machine — true, but blaming the socket for a shortage of memory.
+Fail-open: only a measurably degraded browser is refused, with a test asserting
+the composer is still reached when it is fine.
+
+That change also hung the test suite outright on first run, because every test
+exercising `_attempt` began making a real HTTP call to the live CDP port. The
+fixture now stubs `browser_degraded` structurally, exactly as it already stubs
+`page_responsive`. **That is the fourth time this session a fixture answered an
+infrastructure probe from a scripted queue or the live system**; each instance is
+recorded rather than quietly patched, because the pattern keeps producing either
+false greens or, here, a hang.
