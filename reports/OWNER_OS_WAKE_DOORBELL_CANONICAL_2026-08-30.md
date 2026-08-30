@@ -1459,3 +1459,52 @@ HIGH_RISK repair for a fault that no longer exists. `5e1bcdc8` is a separate
 decision on unrelated work. Job approval is gated through
 `config/approved_gates.yaml` — a static file requiring filesystem/git access,
 never reachable from an API-supplied value — so none of this was done here.
+
+### Wakes 15335 / 15336 — same cohort, and the fault is verified still absent
+
+Two further wakes were received: **15335** `wake_loop_stalled`
+(`runtimejob:8ee3aa76`) and **15336** `wake_loop_no_progress`
+(`runtimejob:35337a2c`). Both are the redundant tmux-repair watches already
+identified in the cohort above. Nothing was approved, cancelled or run; only
+read-only verification was performed.
+
+**Both wakes travelled the loop cleanly** — again demonstrating the loop is not
+what is stuck:
+
+| Event | Decision | Delivery | Exactly-once |
+| --- | --- | --- | --- |
+| 15335 | audit 111383 `skip/actionable_cooldown_active` → 111396 `wake`, route `owner-os`, **acknowledged** | 14:55:14Z `submitted_and_assistant_started_generating` | `wake_submitted`=1 |
+| 15336 | audit 111384 `skip/actionable_cooldown_active` → 111405 `wake`, route `owner-os`, **acknowledged** | 14:56:19Z `submitted_and_assistant_started_generating` | `wake_submitted`=1 |
+
+Watch state: `8ee3aa76` is now **terminal** (`rewoken=1 (15252)`,
+`escalated=1 (15335)`); `35337a2c` has `rewoken=1 (15336)`, `escalated=0`, so one
+further escalation remains possible for it.
+
+**Read-only verification that the original fault remains absent:**
+
+| Check | Result |
+| --- | --- |
+| Control socket | `/tmp/tmux-0/default` present, mode 660, born 15:25:07 (the restore) |
+| Server identity | pid **302442**, started 2026-08-12 — the ORIGINAL server, never restarted, so no session was ever recreated |
+| Listeners on the path | **1** listening socket (plus 7 ordinary client connections) — no orphan, no split |
+| `tmux_control.health()` | `ok`, `socket_exists: true`, `split_brain: false` |
+| `agent_list()` | 10 agents, `duplicates: []`, `control_unreachable: false` |
+| `session_recovery.status()` | `control_unreachable: false`, zero targets with `alive: None` |
+| tmux sessions | 10 |
+| `agent_control_plane_*` events | **0 ever emitted** — the plane has not gone unhealthy once since the guard was deployed |
+| `tmux_control_audit` (last 2 h) | 2 rows, both `repair_refused / already_reachable` from this session's own probes — no repair has been needed |
+| tmux connect errors since 13:25Z restore | **0** |
+
+The fault is absent and has not recurred. Note for the record: the socket's mtime
+is now 15:25:07 today, so it becomes eligible for the same 48h-idle `/tmp` reaper
+again from 2026-09-01 — at which point the deployed guard bounds the outage to a
+single companion tick rather than 100 minutes.
+
+**Gate unchanged.** No safe non-gated work remains on this thread. The exact
+owner-gated decision is still: retire (cancel) or approve the four redundant
+tmux-repair jobs `cd01ad71`, `8ee3aa76`, `a6f4c391`, `35337a2c`. Cancelling ends
+their watches and stops the remaining escalations (at most one each, from
+`35337a2c` and `a6f4c391`); approving would run a HIGH_RISK repair for a fault
+that is verified absent above. `5e1bcdc8` (XMRig triage) is unrelated work and a
+separate decision. Approval is gated through `config/approved_gates.yaml`, which
+is not reachable from any API-supplied value.
