@@ -975,3 +975,20 @@ def test_menu_read_from_line_preserving_view():
     """Space-joining the region is what destroyed the line anchor in the first place."""
     assert aw._MENU_RE.search(aw._bottom_region(_REAL_MENU)) is None
     assert aw._MENU_RE.search(aw._bottom_lines_text(_REAL_MENU)) is not None
+
+
+# ── a disputed classification must be re-derivable from its own event ─────────────────
+# Events 15817, 16042 and 16177 were all `owner_prompt` on panes showing no pending prompt.
+# The stored payload recorded neither the inventory state nor which branch fired, so the
+# cause could not be established afterwards and any fix would have been a guess.
+
+def test_the_event_records_the_inventory_state_and_the_reason():
+    emit = _Emit()
+    t = "gaika-ext-audit:0.0"
+    _scan([_agent(t, state="working")], {t: WORKING_TAIL}, emit)
+    r = _scan([_agent(t, state="waiting_input")], {t: CHEMMY_MENU_REST}, emit, now=1100.0)
+    assert [e["class"] for e in r["emitted"]] == ["owner_prompt"]
+    p = emit.calls[-1]["payload"]
+    assert p["state"] == "waiting_input"
+    assert p["class_reason"]                       # says which branch fired
+    assert p["target"] == t and p["class"] == "owner_prompt"

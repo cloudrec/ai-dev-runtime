@@ -4242,3 +4242,67 @@ five wake-policy fixes committed today (`c403ca0`, `a9ff86e`, `66fe932`, `01f53c
 
 Nothing restarted, no credential, external account, payment path, secret or production
 integration touched. 32 unrelated WIP files untracked and byte-identical.
+
+---
+
+# Part 29 — event 16177: a fix attempted, measured against real data, and withdrawn
+
+16177 is another `agent_prompt_needs_response` on this supervisor's own pane, from its own
+written summary — the third after 15817 and 16042. Part 19 line-anchored `_MENU_RE`, which
+stopped an inline numbered *sentence* reading as a menu. A markdown numbered **list** still
+reads as one: its items sit at line starts exactly like menu options.
+
+## The attempt, and why it was withdrawn
+
+Measured against the false positives, real menu options looked short (3–30 characters) and
+the prose items long (61–112), so a length guard seemed to separate them cleanly. It did
+not. `CHEMMY_MENU_REST` — a **real captured menu** from event 4088 — carries
+`"Give me a disjoint scope I can own end-to-end"` at 44 characters, and a 40-character
+threshold broke its pre-existing test.
+
+That failure is the useful result. The remaining gap between a real 44 and a prose 61 is
+two samples wide, and fitting a classifier to it would silence genuine owner prompts — much
+worse than the noise it removes. The change was reverted in full and its tests removed; the
+module is back at 68 passing.
+
+The structurally better fix is visible: restrict the *menu* branch to inventory states
+`waiting_owner`/`waiting_input`, since `_PROMPT_STATES` currently also admits `idle`,
+`unknown` and `""`. Both real-menu tests already use waiting states, so they would hold.
+**It was not made**, because the stored payloads do not record what the inventory reported,
+so there is no way to show the three false positives were `idle` — and this is the second
+narrowing attempt in one turn. Guessing twice is worse than waiting once.
+
+## What was done instead: make the next one diagnosable
+
+The agent_watch event payload now records the **inventory state** and the **class reason**,
+the two facts that would have settled this immediately. Events 15817, 16042 and 16177 were
+all `owner_prompt` on panes showing no pending prompt, and their payloads could say neither
+which branch fired nor what the inventory had reported.
+
+Additive, no behaviour change, one new test, mutation-verified.
+
+| | |
+|---|---|
+| Files | `core/agent_watch.py`, `tests/test_agent_watch.py` |
+| Focused | 69 passed (68 before, plus the new one) |
+| Mutation | reverting the payload change fails the new test with `KeyError: 'state'` |
+| Not changed | `_MENU_RE`, `_PROMPT_STATES`, and every classification path |
+
+## The remaining gate is the restart, and nothing else
+
+Deploy skew confirms it directly: `worker_skew()` reports `wake_companion` running code
+**4 427 s older** than the tree. Six wake-policy fixes are committed and inert:
+
+| Commit | Activates on restart |
+|---|---|
+| `c403ca0` | one dead-letter alarm per channel instead of one per message |
+| `a9ff86e` | a numbered sentence no longer reads as a decision menu |
+| `66fe932` | the continuation cap stops firing on intentional waits and unassigned agents |
+| `01f53c7` | a prompt wake stops escalating once the prompt is gone |
+| `a5b930e` | SLO alarms filed under the source project, route kept separate |
+| this one | inventory state and class reason recorded on every agent_watch event |
+
+No other safe non-restart work remains. Every other open item needs an owner: a correct
+`TELEGRAM_CHAT_ID`, the restart itself, cp-canary recovery (classifier-blocked), the ACAP C2
+write. Nothing was restarted; no credential, secret, external account, payment path or
+production integration was touched. 32 unrelated WIP files untracked and byte-identical.

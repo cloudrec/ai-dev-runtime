@@ -604,6 +604,15 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 "agent_watch", etype, project_id=project, agent_id=target,
                 severity=severity, owner_action_required=oar,
                 payload={"target": target, "class": cls, "digest": dg,
+                         # The INVENTORY state and the reason the class was chosen. Without
+                         # these, a disputed classification cannot be re-derived after the
+                         # fact: events 15817, 16042 and 16177 were all `owner_prompt` on
+                         # panes that showed no pending prompt, and the stored payload could
+                         # not say which branch fired or what the inventory had reported, so
+                         # the fix could only be guessed at. Recording them costs two fields
+                         # and makes the next one diagnosable.
+                         "state": a.get("state", ""),
+                         "class_reason": c.get("reason", ""),
                          "cwd": a.get("claude_cwd") or a.get("cwd") or "",
                          "project": project or "(unmapped -> owner-os)",
                          "excerpt": ex},
