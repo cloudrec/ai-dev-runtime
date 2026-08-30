@@ -3449,3 +3449,119 @@ Approval of that single call, or an operator running it. The canary will not sel
 the watchdog's automatic path is structurally unable to recover it (`no_open_work`), so it
 stays down until the explicit path runs. Stage A's final leg is blocked behind that, and
 nothing else in the wake/supervisor work depends on it.
+
+---
+
+# Part 17 — pipeline verification, a dead owner channel, and the ACAP C2 determination
+
+Read-only verification pass. cp-canary left unchanged, as an automated instruction directed.
+
+## 17.1 Wake/supervisor invariants — all hold
+
+| Invariant | Measured |
+|---|---|
+| Lifecycle fast lane | exactly `work_stopped_incomplete`, `task_completed`, `agent_process_failed`, `agent_dead` |
+| `notification_dead_letter` / `notifications_red` fast? | **no** — `actionable=0`, generic lane, as required |
+| Turn chatter fast? | no — `agent_turn_stopped`, `agent_subagent_stopped` routine, refused a wake BY NAME |
+| Cooldown lanes | actionable 60 s / generic 900 s, each scoped separately |
+| `worker_skew()` | empty |
+| `tmux_control` | ok, not split |
+| Live agents / duplicates | 9 / none |
+| Supervised targets | 5, denylist honoured on read |
+
+24 h decision traffic: 8 633 skip / 671 wake. Refusals are dominated by
+`routine_event_type` (5 804) and `cooldown_active` (1 911), with 833
+`already_woke_for_this_event` — dedupe and the two lanes are doing the work, not the
+rate limiter. Actionable events wake at 529/640 (83 %); non-actionable at 142/8 664
+(1.6 %). The lane separation is behaving exactly as designed.
+
+**One clarification worth recording**: `agent_control_plane_unreachable` / `_split` are in
+`WAKE_EVENT_TYPES` but NOT in the fast lane, so they wake on the 900 s floor. That is
+correct — `core/tmux_control.py` already dedupes them per class per 30 min, so a faster
+floor would buy nothing — but the two sets are easy to confuse when reading the module.
+
+## 17.2 Wake delivery is ~50 % and self-recovering
+
+24 h: 438 delivered, 435 failed. Failures: `composer_not_focused` 237,
+`composer_did_not_clear_after_send` 52, `assistant_generating_wedged` 47,
+`cdp_error:WebSocketTimeoutException` 43, `assistant_still_generating` 40,
+`renderer_unresponsive` 10, `composer_focus_trapped_by_dialog` 4.
+
+Hourly, this is not a flat rate — it is two degraded windows. 09:00–13:00 collapsed
+(hour 13: 0 delivered / 50 failed) and 16:00–17:00 again. Hours 21–23 run 19/1, 19/1,
+23/3. **The browser degraded and recovered without intervention**; the guards absorbed it
+and retried rather than burning the queue. Events 15708/15712/15719/15754 are still
+cycling on `assistant_generating_wedged` — retrying correctly, not stuck silently.
+
+## 17.3 FINDING: the Telegram owner channel has never once delivered
+
+| Channel | delivered | dead_letter | failed | pending |
+|---|---|---|---|---|
+| `telegram` | **0** | 3 190 | 1 | 1 |
+| `owner_push` | 4 rows, last **2026-08-03** | | | |
+
+Not a recent outage. Across the entire lifetime of the table — first dead letter
+`2026-08-03T02:00:09Z`, most recent `2026-08-30T20:27:25Z`, 27 days, ~30/hour — Telegram
+has produced **zero** successful deliveries. Every notification exhausts 5 attempts and
+dead-letters.
+
+Root cause is recorded verbatim in the `channel` table and is unambiguous:
+
+```
+owner_push  state=unhealthy  healthy=0  last_ok_at=(empty)
+last_error = "telegram send failed: Bad Request: chat not found"
+```
+
+Both credentials are present (`TELEGRAM_BOT_TOKEN` 46 chars, `TELEGRAM_CHAT_ID` 10 chars;
+values not read). "chat not found" is not an auth failure — an invalid token returns 401
+Unauthorized. The token works; **the chat id does not address a chat this bot can post
+to.** The usual causes are a bot removed from the target chat, or a group upgraded to a
+supergroup, which changes the id from `-NNNNNNNNN` to `-100NNNNNNNNN`. A 10-character id
+is consistent with the pre-migration form.
+
+**Consequence, stated plainly:** the ChatGPT wake bridge is not one owner channel among
+several — it is the **only** one. `same_chat_wake` is unconfigured and `scheduled_chatgpt`
+is disabled. Every repair in Parts 1–16 was work on a single point of failure with no
+redundancy behind it, and the 711 dead-letter events per day are the sound of the backup
+path failing, not noise.
+
+Not fixed here: the chat id is a credential value, and standing typed instruction is not
+to touch Telegram credentials. The minimal owner-only operation is to supply a correct
+`TELEGRAM_CHAT_ID` (or re-add the bot to the intended chat and `/start` it). The
+notification code needs no change — `detect_capabilities()` is already evidence-scoped and
+has been honestly reporting `unhealthy` this whole time.
+
+## 17.4 ACAP C2 `/etc/systemd/system` hardening — determination: NOT delegable
+
+An automated instruction asked to resolve this "through an approved control-plane path
+only" and to determine whether standing delegation of reversible technical operations
+suffices. It does not, for three independently sufficient reasons.
+
+1. **No such path exists.** `config/approved_gates.yaml` is the only sanctioned
+   auto-answer registry. It holds 9 gates across four scopes
+   (`mess_local_test`, `arb_paper`, `payment_standby`, `owner_os_selftest`) and contains
+   **zero** entries matching ACAP, capacity, systemd, or any `/etc/` path.
+2. **The registry is entirely expired.** Every gate carries `expires_at` of
+   2026-08-03 or 2026-08-11; today is 2026-08-30. `core/approved_gates.py:119` marks
+   expired entries and refuses them, so the registry currently approves **nothing at all**.
+   That is a fail-closed degradation, not a hazard — but it means there is no live
+   mechanism to extend.
+3. **`service_ops_policy.py` is not a substitute.** It is a verb allowlist over
+   `systemctl`/compose (`build`, `up`, `create`, `restart` permitted; `stop`, `disable`,
+   `mask`, `kill` forbidden). It governs *operating* units. It grants no file write into
+   `/etc/systemd/system`, and reading it as authority for one would be exactly the
+   automatic weakening of a project-specific hard safety gate that standing policy forbids.
+
+Standing delegation covers reversible technical decisions; a privileged write into
+`/etc/systemd/system` is a host-level change to boot behaviour, outside any project repo,
+and ACAP C1/C2 is a named standing prohibition. Delegation does not reach it.
+
+**Exact minimal owner-only operation** — one of:
+
+* Owner performs the single hardening write and `systemctl daemon-reload` directly; or
+* Owner adds one narrowly scoped, unexpired entry to `config/approved_gates.yaml` binding
+  the exact ACAP target to the exact command shape. Editing that file is itself owner-only
+  under standing instruction, so this cannot bootstrap itself.
+
+Nothing was attempted, and the classifier was not bypassed or worked around. ACAP's
+independent read-only preflight of `safeguard-demo-vps` is untouched by anything here.
