@@ -2879,3 +2879,73 @@ recorded alongside them rather than quietly corrected.
 whoever has authority to accept it, on the evidence above. The technical legs are
 proven; the remaining items are the host memory gate and the owner-gated jobs,
 both unchanged and both recorded.
+
+---
+
+# Part 12 — event 15471: the stop was real, the REPEAT was the false wake (`b70c597`)
+
+An automated instruction asked whether classifying `diamond-auction:0.0` as
+`work_stopped_incomplete` was a false lifecycle wake, given the pane is
+deliberately parked on a read-only natural-close monitor and explicitly requests
+no response.
+
+**Answer, split in two, because the honest answer is not one or the other:**
+
+* **The first announcement was correct.** The agent had genuinely stopped. Its
+  own words — "Remaining items are the unchanged external owner gates. Idle on
+  the watch." — are a stop, and `work_stopped_incomplete` claims exactly that and
+  no more (it deliberately does not claim completion). Telling the owner once
+  that a managed agent has parked is the behaviour this whole work exists to
+  provide, and suppressing it would recreate the original defect.
+* **The repeats were false.** The pane's bottom region was byte-identical for
+  over two hours — digest `f74cac57f157a547` throughout, confirmed live — and it
+  announced itself **three** times: 16:25:04, 17:35:38, 18:35:43. Nothing about
+  the agent changed between them. That is a false wake, and it was mine: the
+  quiescence rule from Part 8 made these panes reachable, and the re-arm rule let
+  them repeat.
+
+## Root cause
+
+`RESUME RE-ARMS` cleared `notified_cls`/`notified_digest` on any `working`
+classification. But `working` can come from the INVENTORY alone
+(`st in _ACTIVE_STATES`) — which flickers with a background shell or the
+`· N shell` footer — while the agent's own output never moves. Live confirmation
+on the Auction pane: inventory reported `waiting_input` at one moment and
+`working` earlier, with the digest unchanged the entire time.
+
+So a flicker re-armed the notification, and the same unchanged pane was announced
+again on the next settle.
+
+## The fix, and what it deliberately does not touch
+
+The digest IS the progress evidence. Re-arming now requires
+`dg != notified_digest`: if the bottom region has not moved since we notified,
+the agent has produced nothing new and the notification stays armed.
+
+| Case | Behaviour |
+| --- | --- |
+| Unchanged pane, inventory flickers to `working` | **suppressed** — the false repeat |
+| Genuine work, pane text moves, then stops again | **still announced** — the digest moved |
+| A NEW question on a parked pane | **still wakes** — a different digest is a different fact; `owner_prompt`/`blocker` also keep their own digest sensitivity and hourly reminder |
+| The FIRST announcement of any stop | **untouched** |
+
+Measured scope before fixing: fleet-wide the defect was **one agent and one
+digest, twice** — not a storm, and not assumed.
+
+64 agent-watch tests, 286 across the sweep suites. Three mutations, each killed
+by its own test: re-arm on any `working` (the original bug), never re-arm (which
+would suppress genuine new stops), and re-arming on digest equality (inverted).
+Deployed through `tools/guarded_deploy.sh`; backup
+`backups/predeploy_rearm_20260830T183540Z/`, tag
+`rollback/pre-rearm-20260830T183540Z`.
+
+**Auction was not touched and no activity was manufactured.** Every observation
+above is a read of its pane and of the control plane.
+
+## Timing note, so the evidence is not misread
+
+A third repeat (**15498**) fired at **18:35:43.869Z**. The workers restarted with
+the fix at **18:36:28Z** — the repeat predates the fix going live by 45 seconds
+and is therefore pre-fix, not a failure of it. The repeats ran on a roughly
+one-hour cadence (16:25 → 17:35 → 18:35), so a watch is running past that
+interval to confirm the absence of a fourth.
