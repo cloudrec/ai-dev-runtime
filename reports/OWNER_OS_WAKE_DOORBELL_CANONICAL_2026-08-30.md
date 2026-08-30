@@ -3342,3 +3342,43 @@ Still open, named honestly: a standing Supervisor-Claude session that holds
 `notify_when_idle` subscriptions across restarts, and `/goal` auto-submission, which stays
 gated off because widening the fail-closed allowlist is a safety decision and not an
 implementation detail.
+
+## The native peer loop, closed and measured
+
+```
+~19:52Z  supervisor session -> SendMessage("cp-canary-v2-88", safe step, notify_when_idle)
+ 19:56Z  canary finished the turn: "Note #1117 appended. Log 1121 lines.
+          Handled the peer request as a routine lease within existing scope"
+ 19:56Z  [Cross-session idle notice] delivered to the supervisor — one-shot, no polling
+          cp-canary panes: 1 before, 1 after
+```
+
+End to end in roughly four minutes: continuation sent natively, work done, worker idle,
+supervisor notified natively. **No tmux paste, no pane scraping, no ChatGPT, and no
+polling anywhere in that loop.**
+
+**The receiver enforced the permission boundary itself**, which is the property that
+makes this safe to use as a normal hop. Its own log:
+
+> "This is a **third** delivery class now on record — cross-session peer message,
+> alongside typed owner messages and automated Owner OS API instructions. Logged as a
+> teammate request, explicitly *not* owner sign-off and not approval for anything
+> pending."
+
+That is the correct reading, and it was reached by the worker, not asserted by the sender.
+
+### A real gap this proof exposed
+
+The peer hop **does not pass through `agent_control.agent_send`**, so it writes no row in
+`deliveries` and no `delivery_attribution`. Ordering the window shows it plainly: three
+`api:bearer` rows appear, and the peer message that actually produced note #1117 appears
+nowhere.
+
+So the peer transport currently has **no Owner OS idempotency record and no audit trail**
+— the two properties requirement 6 asks for, and which the tmux transport has had all
+along. Nothing was lost here (the worker logged it itself, and the idle notice is
+evidence), but a supervisor sending peer messages at fleet scale without a durable record
+could re-send after a restart and could not prove what it sent. Closing that means having
+the supervisor record each peer send into the same durable tables before dispatching it.
+
+Named rather than glossed: the peer mechanism is **proven**, not yet **auditable**.
