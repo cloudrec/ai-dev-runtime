@@ -28,6 +28,10 @@ CDP_LIST_URL = os.getenv("COMPANION_CDP_LIST_URL", "http://127.0.0.1:9222/json/l
 # been lost, the repair happens in time for this same tick's inventory instead of a
 # blackout that lasts until a human notices (2026-08-30: 100 minutes).
 CONTROL_GUARD_ENABLED = os.getenv("COMPANION_CONTROL_GUARD", "1") not in ("0", "false", "no")
+# The NATIVE supervisor: continue managed agents from Claude Code's own lifecycle hooks
+# instead of from a scraped pane. Runs alongside the tmux watchers, which stay as the
+# fallback for crashes, silent failures and any case where a hook never fires.
+NATIVE_SUPERVISOR_ENABLED = os.getenv("COMPANION_NATIVE_SUPERVISOR", "1") not in ("0", "false", "no")
 
 
 def discover_chats() -> dict:
@@ -228,6 +232,23 @@ def watch_control_plane() -> dict:
     return r
 
 
+def supervise_native() -> dict:
+    """Continue agents from native lifecycle events. ChatGPT is not in this path.
+
+    Everything it may do is bounded inside `native_supervisor.scan`: an allowlisted
+    target, resolved to exactly one live pane, still at rest, with nothing staged in its
+    composer, past its own floor, and only the fail-closed safe step. Anything else is a
+    durable refusal.
+    """
+    from core import native_supervisor as ns
+    r = ns.scan()
+    for a in r.get("acted", []):
+        print(f"native-supervisor: continued {a['target']} from event {a['event_id']} "
+              f"(key {a['idempotency_key']}, agent_created={a.get('agent_created')})",
+              flush=True)
+    return r
+
+
 def main() -> None:
     from core import wake_bridge as wb
     # Announce this process and the code it started with, so a deploy that
@@ -246,6 +267,11 @@ def main() -> None:
                     watch_control_plane()
                 except Exception as e:  # noqa: BLE001 — the guard never breaks the loop
                     print(f"control-plane guard error: {str(e)[:160]}", flush=True)
+            if NATIVE_SUPERVISOR_ENABLED:
+                try:
+                    supervise_native()
+                except Exception as e:  # noqa: BLE001 — never breaks the tick
+                    print(f"native-supervisor error: {str(e)[:160]}", flush=True)
             if AGENT_WATCH_ENABLED:
                 try:
                     watch_agents()

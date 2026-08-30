@@ -762,7 +762,7 @@ _WORKER_WATCHED_FILES = {
     # control-plane guard first in every tick, so a fix to the probe or the repair is a
     # fix to how the companion sees the fleet at all.
     "wake_companion": ("wake_bridge.py", "wake_routes.py", "closed_loop_wake.py",
-                       "tmux_control.py", "agent_watch.py",
+                       "tmux_control.py", "agent_watch.py", "native_supervisor.py",
                        os.path.join("..", "tools", "cdp_composer.py"),
                        os.path.join("..", "tools", "wake_companion.py")),
     "agent_orchestrator": ("agent_control.py", "agent_orchestrator.py",

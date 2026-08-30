@@ -143,7 +143,14 @@ def _armed_external_wait(conn, target: str, now: float) -> bool:
     except Exception:  # noqa: BLE001 — a missing column or table never resolves a watch
         return False
     if not row or not row[0]:
-        return False
+        # No native record yet — an agent that was already parked when hooks were
+        # installed emits nothing until it next moves. A DECLARED wait covers exactly that
+        # gap, and is bounded and audited so it cannot silence anything indefinitely.
+        try:
+            from core import native_supervisor as _ns
+            return _ns.in_external_wait(target, conn=conn, now=now)
+        except Exception:  # noqa: BLE001 — unknown never means "resolved"
+            return False
     try:
         p = json.loads(row[0])
     except Exception:  # noqa: BLE001
