@@ -631,3 +631,38 @@ def test_creating_the_index_is_idempotent():
     wb.claim_send("companion", event_id=1, actionable=False, now=1000.0)
     wb.claim_send("companion", event_id=2, actionable=False, now=1000.0 + wb.COOLDOWN_SECS + 1)
     assert "ix_wake_send_lookback" in _indexes("wake_send")
+
+
+# ── the DECISION gate must not be starved either ─────────────────────────────
+# There are two cooldown gates: should_wake (decision) and claim_send (send).
+# Fixing only claim_send was not enough — an event skipped at the decision gate
+# never becomes a `wake` row at all, so it can never reach a claim, and
+# _redecide_cooldown_skips re-runs the same query and gets the same skip.
+#
+# Found live during the P0 acceptance canaries: event 13946
+# (work_stopped_incomplete on cp-canary) sat in skip/cooldown_active indefinitely
+# while the owner-os route's last NON-actionable claim was 2230s old — far outside
+# its own 900s window — because actionable wakes kept resetting it.
+
+def test_actionable_decisions_do_not_starve_the_non_actionable_decision_gate():
+    t = 1000.0
+    first = _wake(1, severity="critical", now=t)          # non-actionable, decided wake
+    assert first["wake"] is True
+
+    # a stream of actionable decisions well inside the non-actionable window
+    for i in range(8):
+        _wake(100 + i, severity="high", event_type="agent_waiting_input",
+              now=t + 60 * (i + 1))
+
+    later = wb.should_wake(event_id=2, severity="critical",
+                           now=t + wb.COOLDOWN_SECS + 1)
+    assert later["wake"] is True, (
+        f"non-actionable decision starved by actionable traffic: {later}")
+
+
+def test_the_non_actionable_decision_floor_still_applies_in_its_own_lane():
+    """The fix must not remove the floor, only stop the wrong lane resetting it."""
+    t = 3000.0
+    assert _wake(1, severity="critical", now=t)["wake"] is True
+    soon = wb.should_wake(event_id=2, severity="critical", now=t + 60)
+    assert soon["wake"] is False and soon["reason"] == "cooldown_active"

@@ -407,8 +407,21 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
                     "conversation": target["conversation"],
                     "route_key": target["route_key"],
                     "route_reason": target["route_reason"]}
+        # Scope to NON-actionable wakes, mirroring the actionable branch above. This
+        # was unscoped, so every actionable wake decision reset the non-actionable
+        # floor — the same asymmetry that was fixed in `claim_send`, but at the
+        # DECISION gate rather than the send gate. Fixing only the send gate was not
+        # enough: an event skipped here never becomes a `wake` row at all, and
+        # `_redecide_cooldown_skips` re-runs this same query and gets the same skip,
+        # so it can never reach the claim.
+        #
+        # Found during the P0 acceptance canaries: event 13946
+        # (`work_stopped_incomplete`, cp-canary) sat in `skip/cooldown_active`
+        # indefinitely while the owner-os route's last NON-actionable claim was
+        # 2230s old — far outside its own 900s window.
         last = conn.execute(
-            f"SELECT ts FROM wake_audit WHERE decision='wake' AND {_ROUTE_MATCH} "
+            f"SELECT ts FROM wake_audit WHERE decision='wake' "
+            f"AND COALESCE(actionable,0)=0 AND {_ROUTE_MATCH} "
             "ORDER BY id DESC LIMIT 1", _route_params(target["route_key"])).fetchone()
         if last and (now - float(last[0] or 0)) < COOLDOWN_SECS:
             wait = int(COOLDOWN_SECS - (now - float(last[0])))
