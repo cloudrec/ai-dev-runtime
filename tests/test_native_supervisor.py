@@ -6,6 +6,7 @@ tests pin what the supervisor may do, and far more importantly what it may NOT.
 """
 from __future__ import annotations
 
+import os
 import time
 
 import pytest
@@ -509,3 +510,37 @@ def test_sweep_does_not_double_send_with_the_event_path(monkeypatch):
     calls = []
     _scan(conn, [_agent()], calls)
     assert len(calls) == 1
+
+
+# ── the supervisor must never be able to drive its own session ────────────────────────
+# The self-reference entry used to live inside the env-overridable denylist, which made
+# the one entry that can never be removed the easiest to remove by accident: setting
+# NATIVE_SUPERVISOR_DENY_PROJECTS for an unrelated reason dropped it silently.
+
+def test_self_project_is_derived_from_where_the_code_lives():
+    """Not a string someone can get wrong or forget to update."""
+    import core.native_supervisor as mod
+    expected = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(mod.__file__))))
+    assert ns.SELF_PROJECT == expected
+    assert ns.SELF_PROJECT in ns.AUTO_REGISTER_DENY_PROJECTS
+
+
+def test_an_env_override_cannot_drop_the_self_reference_guard(monkeypatch):
+    monkeypatch.setenv("NATIVE_SUPERVISOR_DENY_PROJECTS", "something-unrelated")
+    import importlib
+    import core.native_supervisor as mod
+    reloaded = importlib.reload(mod)
+    try:
+        assert "something-unrelated" in reloaded.AUTO_REGISTER_DENY_PROJECTS   # widening works
+        assert reloaded.SELF_PROJECT in reloaded.AUTO_REGISTER_DENY_PROJECTS   # and cannot narrow
+    finally:
+        monkeypatch.delenv("NATIVE_SUPERVISOR_DENY_PROJECTS", raising=False)
+        importlib.reload(mod)
+
+
+def test_an_agent_in_the_supervisors_own_cwd_is_never_registered(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "")
+    conn, _ = ns._conn()
+    own = os.path.dirname(os.path.dirname(os.path.abspath(ns.__file__)))
+    ns.auto_register([_agent(target="owner-os-self:0.0", cwd=own)], conn=conn)
+    assert "owner-os-self:0.0" not in ns.registered_targets(conn=conn)

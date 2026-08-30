@@ -226,15 +226,23 @@ def _conn(conn=None):
 # without a manual edit; this list exists so that convenience can never reach a project
 # whose gates are expensive to get wrong. A denylist beats discovery, always — an agent is
 # excluded because of what its project DOES, not because nobody got round to listing it.
+# The supervisor's own project, derived from where this file actually lives rather than
+# named in a string. Supervising it would mean the supervisor answering its own turn
+# boundaries and driving the very session that edits, tests and deploys the supervisor —
+# so this entry must survive ANY configuration. Keeping it in the env-overridable list
+# below made the one entry that can never be removed the easiest one to remove by
+# accident: setting NATIVE_SUPERVISOR_DENY_PROJECTS for an unrelated reason silently
+# dropped the self-reference guard along with everything else.
+SELF_PROJECT = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Value-bearing and irreversible-risk projects. Env may WIDEN this; it can never narrow it
+# past SELF_PROJECT. ACAP C1/C2 · Auction value gates · payment · outbound mail · miner
+# triage.
 AUTO_REGISTER_DENY_PROJECTS = {
     p.strip() for p in os.getenv(
         "NATIVE_SUPERVISOR_DENY_PROJECTS",
-        # ACAP C1/C2 · Auction value-bearing gates · payment · outbound mail · miner
-        # triage · and ai-dev-runtime, because the supervisor must never drive its own
-        # session: it would answer its own turn boundaries and loop on itself.
-        "capacity,auction,payment-orchestrator,payorch,email,xmrig,"
-        "ai-dev-runtime").split(",") if p.strip()
-}
+        "capacity,auction,payment-orchestrator,payorch,email,xmrig").split(",") if p.strip()
+} | {SELF_PROJECT}
 AUTO_REGISTER = os.getenv("NATIVE_SUPERVISOR_AUTO_REGISTER", "1") not in ("0", "false", "no")
 
 _REG_SCHEMA = """
