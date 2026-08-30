@@ -506,15 +506,29 @@ recovery PROVEN; delivery still queued:**
   event **13799** (same route), which delivered
   (`submitted_and_assistant_started_generating`) — so the literal type is not
   merely decision-proven, it rode a delivered wake to its correct chat.
-* **What did NOT happen:** 14058's own coalescing chain (tip **14082** at
-  session end, 12 hops, ~29 minutes observed) had not itself delivered by the
-  time both watch windows (900s + 1100s) expired. Route-capacity dynamics
-  (one non-actionable delivery per 900s per route, shared with ongoing
-  `notifications_red`/`notification_dead_letter` traffic on the same
+* **Update (continued observation, ~1h later):** 14058's coalescing chain
+  reached its permanent tip at event **14082** (`notifications_red`, the
+  route's newest survivor), which **delivered**: `wake_delivery.delivered=1`,
+  `submitted_and_assistant_started_generating`, route `owner-os`, at
+  `2026-08-30T04:08:30Z`. Exactly-once confirmed: 1 `wake_submitted` row, 1
+  `delivered=1` row for 14082. Once an event has a `wake_submitted` row it is
+  excluded from future coalescing candidacy, so 14082 is permanently the
+  chain's endpoint — verified by re-tracing `14058` immediately after and
+  getting the same tip. This closes decision → claim → delivery → assistant-
+  started for the canary's `agent_dead` event, end to end, through the
+  coalescing design's intended path. **Still not observed** (checked again at
+  this point): any `deliveries` row targeting `cp-canary*` since session
+  start — zero. The causal ChatGPT→canary continuation call (Scenario A's own
+  bar) has not occurred within the observation window so far. Route-capacity
+  dynamics (one non-actionable delivery per 900s per route, shared with
+  ongoing `notifications_red`/`notification_dead_letter` traffic on the same
   `owner-os` fallback route) are the same class of constraint already
   documented as owner-gated in Part 3 — now correctly bounded and draining
   (queue depth ~70, not thousands), not broken, but still real production
-  traffic this session did not accelerate, retire, or reroute.
+  traffic this session did not accelerate, retire, or reroute. Whether
+  ChatGPT chooses to act on the canary specifically, from a shared "go read
+  Owner OS" instruction covering many events, is its own decision and cannot
+  be forced or simulated from this side.
 
 ## Verified clean, with fresh post-fix evidence
 
@@ -539,7 +553,7 @@ recovery PROVEN; delivery still queued:**
 | A `agent_waiting_input` | **PASS** (unchanged from Part 3) |
 | B `work_stopped_incomplete` (canary 14009) | **decision → claim → delivered** (via coalesced chain to 13796, assistant started); ChatGPT→canary continuation not observed in ~29min |
 | C `task_completed` (canary 14007) | **decision → claim → delivered** (same chain/delivery as B); continuation not observed |
-| D `agent_dead` (canary 14058, sanctioned kill) | **decision → managed recovery PROVEN** (14061, single pane, no duplicate); delivery queued, chain tip 14082 undelivered at session end |
+| D `agent_dead` (canary 14058, sanctioned kill) | **decision → claim → delivered → assistant-started PROVEN** (chain tip 14082, delivered 04:08:30Z, exactly-once) + **managed recovery PROVEN** (14061, single pane, no duplicate); ChatGPT→canary continuation call not observed |
 | D `agent_process_failed` (real event 13794) | **decision → coalesced → delivered** (via 13799, route mess) |
 | dedupe / exactly-once | **PASS** (fresh evidence) |
 | bounded retry | **PASS** (fresh evidence, event 13806) |
