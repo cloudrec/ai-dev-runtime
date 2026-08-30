@@ -310,9 +310,12 @@ def test_every_registered_project_dir_exists(real_project_config):
 # broken brake, and it is what blocked the P0 wake acceptance canaries.
 
 _CANARY = "cp-canary:0.0"
-_CANARY_REG = {"sessions": [{"target": _CANARY, "session": "cp-canary",
-                             "cwd": "/tmp/cp-canary", "conversation_id": "c1",
-                             "enabled": True}]}
+# load_registry() yields {"sessions": {target: entry}} — keyed by target. The
+# first version of this fixture used a LIST, which made the guard vacuously
+# permissive and would have passed against broken code.
+_CANARY_REG = {"sessions": {_CANARY: {"target": _CANARY, "session": "cp-canary",
+                                      "cwd": "/tmp/cp-canary",
+                                      "conversation_id": "c1", "enabled": True}}}
 
 
 def _quarantine(target, reason="crash loop: 3 recoveries within 21600s"):

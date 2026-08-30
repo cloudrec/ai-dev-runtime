@@ -152,8 +152,10 @@ def release_quarantine(target: str, *, reason: str = "", registry: Optional[dict
     * historical audit rows are never touched — this removes the live quarantine
       latch only.
     """
+    # load_registry() returns {"sessions": {target: entry}} — a dict keyed by
+    # target, not a list. Getting this wrong silently accepted every target.
     reg = registry if registry is not None else load_registry()
-    entries = {e.get("target"): e for e in (reg.get("sessions") or [])}
+    entries = reg.get("sessions") or {}
     own = conn is None
     conn = conn or _db()
     try:
