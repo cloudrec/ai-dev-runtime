@@ -1508,3 +1508,46 @@ their watches and stops the remaining escalations (at most one each, from
 that is verified absent above. `5e1bcdc8` (XMRig triage) is unrelated work and a
 separate decision. Approval is gated through `config/approved_gates.yaml`, which
 is not reachable from any API-supplied value.
+
+### Wake 15334 — this session's own pane, and a live re-verification of the Part 5 attribution fix
+
+**15334** `agent_waiting_input`, `owner-os-wake-policy-opus:0.0`, severity high,
+`owner_action_required=1`, 14:46:15Z. This is the Part 5 mechanism observed again:
+this session's own pane is itself a managed agent, so when it goes idle waiting it
+emits a real event and wakes the loop like any other agent.
+
+| Leg | Evidence |
+| --- | --- |
+| Decision | audit 111381 `skip/actionable_cooldown_active` → 111390 `wake`, route `owner-os`, **acknowledged** |
+| Delivery | first attempt 14:53:38Z failed `renderer_unresponsive`; **retried and delivered 14:59:23Z** `submitted_and_assistant_started_generating` |
+| Exactly-once | `wake_submitted` = 1 (despite two attempts — the retry is bounded, not a duplicate) |
+| Continuation | `deliveries` key **`owner-os-wake-15334-20260830-1659`** → same target, `actor=api:bearer`, `172.20.0.6 ua=python-httpx`, 14:59:54Z |
+| Gap | **31 s** after the wake |
+
+That is another complete same-target causal continuation — the key carries event
+15334 — on a real non-canary agent, and it additionally exercises the bounded
+retry across a `renderer_unresponsive` failure.
+
+**Attribution fix `5ed1db6` re-verified live.** A first pass looked for the
+`[AUTOMATED …]` marker inside `deliveries.result.delivery_evidence` for this
+pane's recent rows and found none, which would suggest a regression. It is not
+one: `delivery_evidence` captures the pane TAIL after delivery, and the marker is
+prefixed to the top of the pasted block, above that window. `_tag_if_automated()`
+and `_AUTOMATED_ORIGIN_TAG` are intact in `core/agent_control.py`, and the
+marker's effect is directly observable — every automated instruction received in
+this session's channel arrives carrying that exact prefix. The fix works; the
+absent-from-tail reading was a measurement artefact, recorded here so it is not
+mistaken for a regression later.
+
+**Fault-absence re-verification (read-only), at 15334 time:**
+
+```
+tmux_control: ok | listeners 1 | split False | socket_exists True
+agent_list  : 10 agents | duplicates [] | control_unreachable False
+recovery    : control_unreachable False        skew: []
+server pid  : 302442 (original, 2026-08-12)    sessions: 10
+agent_control_plane_* events ever: 0           tmux connect errors since restore: 0
+dedupe duplicates: 0
+```
+
+The original fault remains absent. Nothing was approved, cancelled or run.
