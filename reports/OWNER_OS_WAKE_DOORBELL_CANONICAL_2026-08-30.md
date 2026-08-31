@@ -4468,3 +4468,47 @@ working again — and a fresh cap is then reached. Recorded as pending rather th
 | Owner WIP | 32 untracked, `md5sum -c` exit 0, file set identical |
 | Rollback | `/root/owner-os-backups/wake-policy-activation-20260831T000432Z` intact |
 | Services | companion active on new code, `worker_skew()` clear; `ai-runtime` untouched |
+
+---
+
+# Part 33 — the residual investigation found a real defect: two doors, one exemption
+
+Part 32 left one claim unproven: whether the `no_assigned_task` → `owner_facing=False`
+branch actually suppresses the alarm. Chasing that proof found a defect instead.
+
+**What the evidence showed.** At 00:39:19Z — after activation — `arbitrage2-fable:0.0`
+opened a genuinely NEW gate episode via the idle sweep: `{"gate_opened": true}`, meaning
+`open_gate` did not return early. Its earlier gate had been cleared when the agent was
+observed working again (`gaika-opus` cleared the same way at 00:04:25Z, so `clear_gate` is
+live too). No `agent_continuation_exhausted` was emitted.
+
+That looked like the proof. It is not. **The idle-sweep branch never passed `owner_facing`
+at all**, so it defaulted to `True` and asked for an owner-facing alarm. The only reason
+nobody was woken is the emit-level dedup: event 15986 for that same target was still inside
+the 6 h `nativesup:gate:<target>` window.
+
+So the sweep was the louder of two doors into the same room. The event path had been taught
+to stay quiet for an agent with no assigned task; the sweep had not, and a dedup window was
+all that stood between it and the exact false alarm `66fe932` set out to remove. Once that
+window expired it would have fired.
+
+Fixed: the sweep now computes `gate_exemption` from the agent's own cwd, skips entirely on an
+intentional wait, and passes `owner_facing=not exempt` like the event path. Its record also
+carries `gate_event_id` and `exempt`, which the event path already had and the sweep did not.
+
+**A test of mine was vacuous and was rewritten.** The first version asserted the resulting
+severity through a stubbed `open_gate` that derived it from `kw.get("owner_facing")` — absent
+on the buggy path, which is falsy, so it produced `("info", False)` either way and passed
+with the fix reverted. The rewrite asserts the kwarg is *explicitly present and False*,
+because relying on the default is precisely what the bug was. Both sweep tests now fail when
+the code is reverted.
+
+| | |
+|---|---|
+| Files | `core/native_supervisor.py`, `tests/test_native_supervisor.py` |
+| Focused | 57 passed |
+| Mutation | both new tests fail with the change reverted; verified after the rewrite, not before |
+| Residual from Part 32 | still open — the alarm-suppression branch has not been exercised live, and the dedup window continues to mask it until ~03:39Z |
+
+32 owner-WIP files verified byte-identical again (`md5sum -c` pass, set unchanged). The
+untracked count read 33 briefly during a concurrent test run and returned to 32, as before.

@@ -610,3 +610,43 @@ def test_a_genuine_stall_still_wakes_the_owner():
                  emit_fn=lambda s, e, **kw: seen.append(
                      (kw.get("severity"), kw.get("owner_action_required"))) or {"event_id": 8})
     assert seen == [("high", True)]
+
+
+# ── both doors into the gate must apply the same exemption ───────────────────────────
+# The idle sweep defaulted to owner_facing=True, so an agent with no assigned task would
+# wake the owner there even though the event path had just been taught not to. Only the
+# emit-level 6h dedup hid it: arbitrage2-fable opened a sweep gate at 00:39:19Z with
+# gate_opened=true and stayed silent solely because event 15986 was still in the window.
+
+def test_the_idle_sweep_gate_applies_the_same_exemption(monkeypatch):
+    """It must pass owner_facing EXPLICITLY. Relying on the default is what the bug was,
+    and a test that only checks the resulting severity passes either way."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    monkeypatch.setattr(ns, "MAX_CONSECUTIVE", 0)          # cap already reached
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", ns.IDLE_SWEEP_QUIET_SECS + 60)
+    seen = []
+
+    def fake_gate(t, **kw):
+        seen.append(kw)
+        return {"opened": True, "event_id": 55}
+
+    monkeypatch.setattr(ns, "open_gate", fake_gate)
+    calls = []
+    _scan(conn, [_agent()], calls)
+    assert calls == []                                     # no send at the cap
+    assert len(seen) == 1
+    assert "owner_facing" in seen[0], "the sweep must not fall back to the default"
+    assert seen[0]["owner_facing"] is False                # no assigned task -> silent
+
+
+def test_the_idle_sweep_skips_entirely_on_an_intentional_wait(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    monkeypatch.setattr(ns, "MAX_CONSECUTIVE", 0)
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", ns.IDLE_SWEEP_QUIET_SECS + 60)
+    ns.mark_external_wait("/root/cp-canary-v2", reason="armed monitor", conn=conn)
+    opened = []
+    monkeypatch.setattr(ns, "open_gate", lambda t, **kw: opened.append(t) or {"opened": True})
+    _scan(conn, [_agent()], [])
+    assert opened == []                                    # no gate at all

@@ -740,11 +740,25 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                 if (now - last) < max(MIN_INTERVAL_SECS, IDLE_SWEEP_QUIET_SECS):
                     continue
                 if n_hour >= MAX_CONSECUTIVE:
+                    # Same exemption as the event path. Without this the sweep was the
+                    # louder of the two doors into the same room: it defaulted to
+                    # owner_facing=True, so an agent with no assigned task would wake the
+                    # owner here even though the event path had just been taught not to.
+                    # Only the emit-level 6h dedup was hiding it (arbitrage2-fable,
+                    # gate_opened=true at 00:39:19Z, silent solely because event 15986 was
+                    # still inside the window).
+                    exempt = gate_exemption(conn, target, a.get("claude_cwd")
+                                            or a.get("cwd") or "", now)
+                    if exempt in ("intentional_external_wait",
+                                  "recent_intentional_external_wait"):
+                        _record(conn, 0, target, "skip", f"cap_reached_but_{exempt}", True)
+                        continue
                     g = open_gate(target, reason="idle_sweep_cap_reached_without_progress",
-                                  conn=conn, now=now)
+                                  conn=conn, now=now, owner_facing=not exempt)
                     _record(conn, 0, target, "gate",
                             "idle_sweep_cap_reached_without_progress", True,
-                            {"gate_opened": g.get("opened")})
+                            {"gate_opened": g.get("opened"),
+                             "gate_event_id": g.get("event_id"), "exempt": exempt})
                     continue
                 if not safe_fn(step_text):
                     _record(conn, 0, target, "refuse", "step_failed_safety_classifier", False)
