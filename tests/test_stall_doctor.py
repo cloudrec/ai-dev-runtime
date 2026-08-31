@@ -598,3 +598,39 @@ def test_prune_skipped_when_live_agent_list_is_empty(conn):
     assert r["pruned"] == []
     assert conn.execute("SELECT 1 FROM stall_doctor_state WHERE target=?",
                         (t,)).fetchone()
+
+
+# ── the doctor must honour a declared external wait, like every other path ────────────
+# Event 16836: diamond-auction sat in a declared natural-event wait, and the stall doctor
+# still raised agent_waiting_input at oar=1. The native supervisor had honoured that
+# declaration since the Auction case; this path never consulted it, so two paths disagreed
+# about the same declared state.
+
+def test_a_declared_external_wait_is_skipped(monkeypatch, tmp_path):
+    from core import native_supervisor as ns
+    monkeypatch.setattr(ns, "in_external_wait", lambda t, **k: t == "diamond-auction:0.0")
+    assert sd.in_declared_external_wait("diamond-auction:0.0") is True
+    assert sd.in_declared_external_wait("some-other:0.0") is False
+
+
+def test_an_unavailable_lookup_does_not_suppress(monkeypatch):
+    """Fail-open toward the normal behaviour — unknown never means 'stay quiet'."""
+    from core import native_supervisor as ns
+
+    def boom(*a, **k):
+        raise RuntimeError("table missing")
+
+    monkeypatch.setattr(ns, "in_external_wait", boom)
+    assert sd.in_declared_external_wait("anything:0.0") is False
+
+
+def test_scan_skips_a_target_under_a_live_declaration(monkeypatch):
+    from core import native_supervisor as ns
+    monkeypatch.setattr(ns, "in_external_wait", lambda t, **k: t == "parked:0.0")
+    calls = []
+    r = sd.scan(agents=[{"target": "parked:0.0", "claude_cwd": "/opt/x", "is_agent": True,
+                         "alive": True, "state": "idle"}],
+                read_fn=lambda t: calls.append(t) or "waiting for the close",
+                pending_fn=lambda t, tail, cwd: "")
+    assert calls == [], "a parked pane is not even read"
+    assert any(s.get("why") == "intentional_external_wait" for s in r["skipped"])

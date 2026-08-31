@@ -314,6 +314,26 @@ def resume_target(target: str, conn=None) -> bool:
             conn.close()
 
 
+def in_declared_external_wait(target: str, *, conn=None) -> bool:
+    """Is this target under a LIVE external-wait declaration?
+
+    Delegates to `native_supervisor`, deliberately rather than re-reading the table, so the
+    two paths cannot drift apart on what "declared" means. Fail-open toward doing the normal
+    thing: if the lookup is unavailable, the doctor behaves exactly as before.
+
+    An EXPIRED declaration is absent by design, and that is a real limit worth naming: a wait
+    on an unbounded natural event outlives its own TTL, after which nothing here suppresses
+    the blocker. That is what happened in event 16836 — the declaration lapsed at 01:24:02Z
+    while the auction close it was waiting for had not occurred — and it is a policy question
+    about TTL semantics, not something this check can decide.
+    """
+    try:
+        from core import native_supervisor as _ns
+        return bool(_ns.in_external_wait(target, conn=conn))
+    except Exception:  # noqa: BLE001 — unknown never means "suppress"
+        return False
+
+
 def is_paused(target: str, conn=None) -> bool:
     conn, own = _conn(conn)
     try:
@@ -419,6 +439,14 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 continue
             if is_paused(target, conn=conn):
                 skipped.append({"target": target, "why": "paused"})
+                continue
+            if in_declared_external_wait(target, conn=conn):
+                # A pane parked on a declared external wait is waiting BY DESIGN. The
+                # native supervisor has honoured that since the Auction case; this path
+                # never consulted it, so the two disagreed about the same declared state
+                # and the doctor could still raise a blocker for an agent everyone else
+                # had agreed was parked (event 16836, diamond-auction).
+                skipped.append({"target": target, "why": "intentional_external_wait"})
                 continue
             cwd = a.get("claude_cwd") or a.get("cwd") or ""
             try:
