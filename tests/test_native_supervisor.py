@@ -891,3 +891,88 @@ def test_validation_reports_and_never_repairs(monkeypatch):
     monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {"capacity"})
     ns.validate_config()
     assert ns.AUTO_REGISTER_DENY_PROJECTS == {"capacity"}, "validate_config must not mutate"
+
+
+# ── cold-start / policy-change reconciliation ─────────────────────────────────────────
+# A purely reactive loop cannot reach a pane that parked BEFORE it became eligible: its
+# turn boundary was consumed, or never observed, so no new lifecycle event will arrive. The
+# idle sweep is the reconciliation pass for exactly that, and these pin its contract, which
+# nothing covered: after a policy change makes an already-parked pane eligible, it must be
+# continued ONCE — same worker, no storm — and a genuine external wait must survive.
+
+def test_a_pane_parked_before_it_became_eligible_is_reconciled(monkeypatch):
+    """The cold-start case: no hook event exists for this target at all."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "")            # not allow-listed...
+    conn, _ = ns._conn()
+    agent = _agent(target="late-joiner:0.0", cwd="/opt/latejoiner")
+    _watch_state(conn, "late-joiner:0.0", ns.IDLE_SWEEP_QUIET_SECS + 600)
+    ns.auto_register([agent], conn=conn)                   # ...but discovery registers it
+    assert ns.is_supervised("late-joiner:0.0", conn=conn)
+    calls = []
+    r = _scan(conn, [agent], calls)                        # no hook event anywhere
+    assert len(calls) == 1, "the parked pane must be reached without a lifecycle event"
+    assert r["acted"][0]["via"] == "idle_sweep"
+
+
+def test_reconciliation_is_idempotent_and_does_not_storm(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", ns.IDLE_SWEEP_QUIET_SECS + 600)
+    calls = []
+    for _ in range(5):                                     # five consecutive ticks
+        _scan(conn, [_agent()], calls)
+    assert len(calls) == 1, f"one continuation per quiet window, got {len(calls)}"
+
+
+def test_reconciliation_never_overrides_a_genuine_external_wait(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", ns.IDLE_SWEEP_QUIET_SECS + 600)
+    ns.mark_external_wait("cp-canary:0.0", reason="armed monitor", conn=conn)
+    calls = []
+    _scan(conn, [_agent()], calls)
+    assert calls == [], "a declared wait outranks reconciliation"
+
+
+def test_reconciliation_still_refuses_a_value_bearing_project(monkeypatch):
+    """Cold-start must not become a way around the denylist."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    conn, _ = ns._conn()
+    agent = _agent(target="capacity-blockchain:0.0", cwd="/opt/capacity")
+    _watch_state(conn, "capacity-blockchain:0.0", ns.IDLE_SWEEP_QUIET_SECS + 600)
+    ns.auto_register([agent], conn=conn)
+    calls = []
+    _scan(conn, [agent], calls)
+    assert calls == [], "reconciliation is not a denylist bypass"
+
+
+def test_a_wildcard_rollout_is_not_a_denylist_bypass(monkeypatch):
+    """The hole: `is_supervised` returned True on the wildcard branch before ever reaching
+    the registry filter, so NATIVE_SUPERVISOR_TARGETS=* made every value-bearing project
+    continuable. Checked on both the direct call and through auto-registration."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    conn, _ = ns._conn()
+    for target, project in (("capacity-blockchain:0.0", "capacity"),
+                            ("diamond-auction:0.0", "auction"),
+                            ("payorch-monitor-clean:0.0", "payment-orchestrator"),
+                            ("email:0.0", "email")):
+        assert ns.is_supervised(target, conn=conn, project=project) is False, target
+    assert ns.is_supervised("mess-opus:0.0", conn=conn, project="mess") is True
+
+
+def test_an_explicit_allowlist_entry_is_not_a_bypass_either(monkeypatch):
+    """Naming a denylisted target directly must not beat the denylist."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "capacity-blockchain:0.0")
+    conn, _ = ns._conn()
+    assert ns.is_supervised("capacity-blockchain:0.0", conn=conn, project="capacity") is False
+
+
+def test_without_a_project_the_registry_still_decides(monkeypatch):
+    """A caller that cannot supply the project must not accidentally widen access."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    conn, _ = ns._conn()
+    conn.execute(ns._REG_SCHEMA)
+    conn.execute("INSERT INTO native_supervised_target(target,project,cwd) VALUES(?,?,?)",
+                 ("capacity-blockchain:0.0", "capacity", "/opt/capacity"))
+    conn.commit()
+    assert ns.is_supervised("capacity-blockchain:0.0", conn=conn) is False

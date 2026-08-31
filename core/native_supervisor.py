@@ -296,6 +296,18 @@ def auto_register(agents: list, *, conn=None, now: Optional[float] = None,
             conn.close()
 
 
+def _project_for_target(target: str, *, conn=None) -> str:
+    """The registered project for a target, or "" when it has never been registered."""
+    conn, own = _conn(conn)
+    try:
+        row = conn.execute("SELECT COALESCE(project,'') FROM native_supervised_target "
+                           "WHERE target=?", (target,)).fetchone()
+        return (row[0] or "") if row else ""
+    finally:
+        if own:
+            conn.close()
+
+
 def registered_targets(conn=None) -> set:
     """Registered AND not deny-listed.
 
@@ -417,13 +429,33 @@ def send_block_reason(target: str, project: str = "", *, conn=None) -> str:
     return "not_registered"
 
 
-def is_supervised(target: str, *, conn=None) -> bool:
+def is_supervised(target: str, *, conn=None, project: str = "") -> bool:
     """Supervised if explicitly allow-listed OR auto-registered. Either way it is a
-    positive record — nothing is supervised merely by existing."""
+    positive record — nothing is supervised merely by existing.
+
+    The denylist is checked FIRST, before either positive path. `registered_targets` has
+    filtered it on read since the self-reference incident, but the allow-list and wildcard
+    branches returned True before ever reaching that filter — so
+    `NATIVE_SUPERVISOR_TARGETS="*"`, an ordinary-looking rollout setting, silently made
+    `capacity`, `auction`, `payment-orchestrator` and `email` continuable. A test written to
+    assert the opposite is what found it. A rollout switch must never be a denylist bypass.
+
+    `project` is supplied by callers that know it (both scan paths do). Without it a
+    registered target is still resolved through the registry, which carries its project.
+    """
     if not target:
+        return False
+    if project and project in AUTO_REGISTER_DENY_PROJECTS:
         return False
     a = allowed_targets()
     if "*" in a or target in a:
+        if not project:
+            # No project supplied: fall back to the registry, which filters the denylist.
+            try:
+                if _project_for_target(target, conn=conn) in AUTO_REGISTER_DENY_PROJECTS:
+                    return False
+            except Exception:  # noqa: BLE001 — unknown is never "supervised"
+                return False
         return True
     try:
         return target in registered_targets(conn=conn)
@@ -723,7 +755,8 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                         "target_unresolved_or_ambiguous", True)
                 skipped.append({"event_id": eid, "why": "target_unresolved_or_ambiguous"})
                 continue
-            if not is_supervised(target, conn=conn):
+            if not is_supervised(target, conn=conn,
+                                 project=_project_of({"claude_cwd": payload.get("cwd", "")})):
                 why = send_block_reason(
                     target, _project_of({"claude_cwd": payload.get("cwd", "")}), conn=conn)
                 _record(conn, eid, target, "skip", why, True)
@@ -818,7 +851,7 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                     continue
                 if (a.get("state") or "") not in _AT_REST or a.get("pending"):
                     continue
-                if not is_supervised(target, conn=conn):
+                if not is_supervised(target, conn=conn, project=_project_of(a)):
                     continue
                 if in_external_wait(target, conn=conn, now=now) or in_gate(
                         target, conn=conn, now=now):
