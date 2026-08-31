@@ -4965,3 +4965,50 @@ conversation, or the owner decides to change that agent's provenance policy. The
 progress, because it was correctly not acted on.
 
 No code changed. HEAD `955474d`, worktree clean, 32 owner-WIP byte-identical.
+
+---
+
+# HANDOFF STATUS — 2026-08-31 05:30 UTC (supersedes the 04:15 UTC block)
+
+The 04:15 block listed `4cf8ab2` and `0d9674b` as inert pending a companion restart. That
+restart happened at 05:13:35Z, so those two lines are now wrong. The earlier block stays as
+history.
+
+**Activation (2026-08-31 05:13:35Z).** Backup first —
+`/root/owner-os-backups/supervisor-activation-20260831T051141Z`, both DBs via online
+`.backup`, five sources, HEAD `75ff568`, prior PID, 9-pane inventory. Gate **248 passed**,
+exit 0, with the restart wired to fire only on green. `owner-os-wake-companion.service`
+PID 1792587 → 2980127. After: `worker_skew()` **clear**, 9 agents, `duplicates: []`,
+`tmux_control: ok`, pane set identical to the pre-restart record. No classifier bypassed.
+
+**Live: seven of nine.** `a9ff86e`, `66fe932`, `01f53c7`, `a5b930e`, `ad0aab6`, and now
+`4cf8ab2` and `0d9674b`.
+
+**Zero-ping continuation, observed after activation.** Six `continued_same_agent` actions
+through 05:26:37Z, keyed `nativesup:<event_id>` with `actor=native_supervisor`,
+`source=claude_hook` — distinguishable in the audit from the one `api:bearer` relay in the
+same window. They landed while this pane was idle, which is the "supervisor keeps working
+when the Claude pane stops" property, observed rather than asserted. Alongside them:
+`intentional_external_wait` ×4 and `not_in_rollout_allowlist` ×3 — genuine gates and
+denylisted projects still parked — `continuation_gate_open` ×2, no duplicates, no storm.
+
+**Two markers live but NOT yet exercised, and not claimed as confirmed.** `4cf8ab2` shows
+itself as a sweep gate row carrying `exempt` and `gate_event_id`; `0d9674b` shows itself as a
+gate alarm carrying a non-empty `project_id`. Counts since activation: **0** sweep gates and
+**0** project-bearing alarms. Both need a NEW gate episode, and the two open gates
+(`mess-postsignup-cleanup-sonnet-v4` until 10:52:31Z, `gaika-opus` until 09:48:17Z) latch that
+until they clear. Proven by test and mutation check, not yet by production event.
+
+**Remaining, all owner-gated.** `c403ca0` needs `ai-runtime.service` — the shared Owner OS
+API other projects call; deliberately excluded here because Telegram is non-critical to
+supervisor continuation. A correct `TELEGRAM_CHAT_ID` or a `/start` from the intended chat is
+the only thing that makes an owner notification arrive; no delivery has ever been proven
+(`last_ok_at` and `last_proof` both empty). cp-canary recovery stays behind the auto-mode
+classifier. ACAP C2 has no sanctioned path. Push has no authorization and cannot be scoped —
+one commit publishes all 50.
+
+**Not done, and why.** The `orchestrator_goal` record was not rewritten: id=1 is the older
+"SEO Growth OS" goal completed 2026-08-08, not a supervisor-rollout record. No
+`os_task_queue` record was created either — `enqueue` writes a task file into an agent's cwd
+and queues text for automated delivery, so creating one to satisfy a status display would
+inject work into a real agent on an automated instruction.
