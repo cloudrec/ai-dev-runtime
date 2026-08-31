@@ -5227,3 +5227,44 @@ The only marker still unexercised is `4cf8ab2`'s — an idle-sweep row carrying 
 gate so far has come through the event path. Owner gates unchanged: `ai-runtime` restart for
 `c403ca0`, `TELEGRAM_CHAT_ID`, cp-canary recovery, ACAP C2, push. The external-wait TTL
 question from Part 43 remains an owner policy choice.
+
+---
+
+# Part 45 — event 16597, and the idle-sweep marker exercised deterministically
+
+## 16597: the same Telegram gate, already documented
+
+Notification **3376**, channel `telegram`, `dead_letter` after 5/5 attempts (03:16:29Z →
+03:19:52Z), key `agentwatch:mess-postsignup-cleanup-sonnet-v4:0.0:quiescent:…`, carrying event
+**16592** (`work_stopped_incomplete`, project `seo`). Cause unchanged: `chat not found`.
+Ninth member of an identical series already covered by Parts 21, 28, 35, 39 and 44 — resolved
+in the sense that the diagnosis is complete and the remedy is an owner credential, not
+currently actionable here. No new entry was warranted for it beyond this line.
+
+## The `4cf8ab2` marker — from unexercised to proven
+
+Every gate on this host since activation has come through the **event path**; a query for
+`idle_sweep%` in `native_supervision` returns **nothing, ever**. So the sweep marker was live
+but had never run, and the existing sweep test stubs `open_gate`, which means it never wrote
+the journal row that constitutes the marker.
+
+`test_the_idle_sweep_gate_writes_its_marker_fields` drives the real path — real `open_gate`,
+real `_record`, no hook event so only the sweep can act — and asserts the row itself:
+
+```
+reason  = idle_sweep_cap_reached_without_progress
+detail  = {"gate_opened": true, "gate_event_id": 3131, "exempt": "no_assigned_task"}
+emitted = ("agent_continuation_exhausted", "info", False)
+```
+
+A companion test asserts the event path produces `continuation_cap_reached_without_progress`
+with **no** `exempt` key, so the two paths stay distinguishable — `exempt` is precisely what
+dates the sweep fix in a live journal.
+
+**Mutation-checked against the real thing:** reverting `4cf8ab2`'s sweep branch — dropping
+`owner_facing=not exempt` and the two detail fields — fails both sweep tests with
+`KeyError: 'gate_event_id'`. So the assertions bind to the fix, not to incidental structure.
+
+69 passed. This closes the last outstanding verification item that did not require an owner
+gate: the marker is now proven deterministically, and production observation of it remains
+merely a matter of an idle sweep eventually firing.

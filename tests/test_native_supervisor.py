@@ -6,6 +6,7 @@ tests pin what the supervisor may do, and far more importantly what it may NOT.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 
@@ -788,3 +789,55 @@ def test_the_block_still_blocks(monkeypatch):
     ns.auto_register([_agent(target="capacity-blockchain:0.0", cwd="/opt/capacity")],
                      conn=conn)
     assert "capacity-blockchain:0.0" not in ns.registered_targets(conn=conn)
+
+
+# ── the idle-sweep gate marker, exercised end to end ──────────────────────────────────
+# `4cf8ab2` shows itself in production as a native_supervision row from the SWEEP carrying
+# `exempt` and `gate_event_id`. No idle_sweep gate has fired on this host since activation
+# (every gate so far came through the event path), so the marker was live but unexercised.
+# The earlier sweep test stubs `open_gate` and therefore never writes that row. This drives
+# the real path: real open_gate, real _record, and asserts the journal row itself.
+
+def test_the_idle_sweep_gate_writes_its_marker_fields(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    monkeypatch.setattr(ns, "MAX_CONSECUTIVE", 0)          # cap already reached
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", ns.IDLE_SWEEP_QUIET_SECS + 60)
+    emitted = []
+    import core.control_plane.cto as _cto
+    monkeypatch.setattr(_cto, "emit",
+                        lambda s, e, **kw: emitted.append(
+                            (e, kw.get("severity"), kw.get("owner_action_required")))
+                        or {"event_id": 3131})
+    calls = []
+    _scan(conn, [_agent()], calls)                          # no hook event: sweep only
+    assert calls == [], "no send once the cap is reached"
+
+    row = conn.execute(
+        "SELECT reason, detail FROM native_supervision WHERE target=? AND action='gate' "
+        "ORDER BY rowid DESC LIMIT 1", ("cp-canary:0.0",)).fetchone()
+    assert row is not None, "the sweep must journal its gate"
+    assert row[0] == "idle_sweep_cap_reached_without_progress"
+    detail = json.loads(row[1])
+    assert detail["gate_opened"] is True
+    assert detail["gate_event_id"] == 3131                  # marker: event path had it, sweep did not
+    assert detail["exempt"] == "no_assigned_task"           # marker: only the sweep records this
+    # and the alarm stayed silent, because there was no task to converge on
+    assert emitted == [("agent_continuation_exhausted", "info", False)]
+
+
+def test_the_sweep_marker_is_absent_on_the_event_path(monkeypatch):
+    """The two paths must stay distinguishable: `exempt` is what dates the sweep fix."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    monkeypatch.setattr(ns, "MAX_CONSECUTIVE", 0)
+    monkeypatch.setattr(ns, "IDLE_SWEEP_ENABLED", False)
+    conn, _ = ns._conn()
+    _hook_event(conn)
+    import core.control_plane.cto as _cto
+    monkeypatch.setattr(_cto, "emit", lambda s, e, **kw: {"event_id": 77})
+    _scan(conn, [_agent()], [])
+    row = conn.execute(
+        "SELECT reason, detail FROM native_supervision WHERE action='gate' "
+        "ORDER BY rowid DESC LIMIT 1").fetchone()
+    assert row[0] == "continuation_cap_reached_without_progress"
+    assert "exempt" not in json.loads(row[1])
