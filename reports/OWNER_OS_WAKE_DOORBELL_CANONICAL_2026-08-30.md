@@ -5268,3 +5268,46 @@ dates the sweep fix in a live journal.
 69 passed. This closes the last outstanding verification item that did not require an owner
 gate: the marker is now proven deterministically, and production observation of it remains
 merely a matter of an idle sweep eventually firing.
+
+---
+
+# Part 46 — the idle sweep is firing in production; its gate branch still is not
+
+I have said several times that no idle sweep had ever fired. That is no longer true, and the
+correction matters because the two halves of `4cf8ab2` are now in different states.
+
+**The sweep's CONTINUATION path is live and working.** Five deliveries between 06:36:27Z and
+07:14:55Z carry `source=idle_sweep` and keys of the form
+`nativesup:idle:<target>:<time-bucket>`:
+
+```
+nativesup:idle:mess-opus:0.0:5960534         mess-opus:0.0         07:14:55
+nativesup:idle:mess-opus:0.0:5960533         mess-opus:0.0         07:09:35
+nativesup:idle:mess-opus:0.0:5960532         mess-opus:0.0         07:04:18
+nativesup:idle:mess-opus:0.0:5960531         mess-opus:0.0         06:58:30
+nativesup:idle:arbitrage2-fable:0.0:5960527  arbitrage2-fable:0.0  06:36:27
+```
+
+Attribution in the last hour: `native_supervisor/claude_hook` **9**, `native_supervisor/
+idle_sweep` **4**. The event path remains primary and the sweep is doing exactly what it was
+built for — reaching agents whose turn boundary was already consumed.
+
+**The sweep's GATE branch has still never fired.** A query for `idle_sweep_cap_reached_
+without_progress`, or for any `detail` containing `exempt`, returns nothing. That branch needs
+the sweep to hit `MAX_CONSECUTIVE`, which has not happened. So the `exempt` marker remains
+proven only by the mutation-checked test added in `6bfa933`, and I am not claiming otherwise.
+
+Stating both halves separately, because "the sweep fired" would have implied more than the
+evidence supports.
+
+## Scope note
+
+The zero-ping property continues to hold on permitted projects: continuations of `mess-opus`
+and `arbitrage2-fable` through 07:51:38Z, all `actor=native_supervisor`, distinguishable in
+the audit from 18 `api:bearer` relays in the same hour.
+
+It cannot be demonstrated on the three named projects, and that is a scope consequence rather
+than a missing capability: `owner-os-wake-policy-opus` is blocked
+`supervisor_self_reference`, `capacity-blockchain` and `diamond-auction` are blocked
+`value_bearing_send_blocked`, and Auction still reports **zero** hook events in 24 h, so it
+has no lifecycle signal to route in the first place.
