@@ -841,3 +841,53 @@ def test_the_sweep_marker_is_absent_on_the_event_path(monkeypatch):
         "ORDER BY rowid DESC LIMIT 1").fetchone()
     assert row[0] == "continuation_cap_reached_without_progress"
     assert "exempt" not in json.loads(row[1])
+
+
+# ── the config that holds the gates up must itself be checked ─────────────────────────
+# The denylist is the only thing between an automated continuation and a pane whose agent
+# holds mutation authority, and it is assembled from an env var. A typo there fails SILENTLY
+# by producing a shorter denylist — opening a gate nobody decided to open. Nothing checked
+# that until this.
+
+def test_the_shipped_config_is_coherent():
+    r = ns.validate_config()
+    assert r["ok"] is True, r["problems"]
+    assert ns.SELF_PROJECT in r["checked"]["deny_projects"]
+
+
+def test_a_shortened_denylist_is_a_problem(monkeypatch):
+    """The failure mode that has no other alarm: a typo drops a value-bearing project."""
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {ns.SELF_PROJECT, "capacity"})
+    r = ns.validate_config()
+    assert r["ok"] is False
+    joined = " ".join(r["problems"])
+    assert "auction" in joined and "payorch" in joined
+
+
+def test_losing_the_self_reference_guard_is_a_problem(monkeypatch):
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS",
+                        {"capacity", "auction", "payment-orchestrator", "payorch", "xmrig"})
+    r = ns.validate_config()
+    assert r["ok"] is False
+    assert any("SELF_PROJECT" in p for p in r["problems"])
+
+
+def test_a_disabled_rate_guard_is_a_problem(monkeypatch):
+    monkeypatch.setattr(ns, "MIN_INTERVAL_SECS", 0)
+    r = ns.validate_config()
+    assert r["ok"] is False
+    assert any("MIN_INTERVAL_SECS" in p for p in r["problems"])
+
+
+def test_goal_autosubmit_on_is_a_problem(monkeypatch):
+    monkeypatch.setattr(ns, "GOAL_AUTOSUBMIT", True)
+    r = ns.validate_config()
+    assert r["ok"] is False
+    assert any("GOAL_AUTOSUBMIT" in p for p in r["problems"])
+
+
+def test_validation_reports_and_never_repairs(monkeypatch):
+    """A config this important is corrected deliberately, not patched by what it governs."""
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {"capacity"})
+    ns.validate_config()
+    assert ns.AUTO_REGISTER_DENY_PROJECTS == {"capacity"}, "validate_config must not mutate"

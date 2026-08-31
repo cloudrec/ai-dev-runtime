@@ -339,6 +339,58 @@ def allowed_targets() -> set:
     return {"*"} if raw == "*" else {t.strip() for t in raw.split(",") if t.strip()}
 
 
+def validate_config() -> dict:
+    """Is the supervisor's configuration coherent, and are the gates actually standing?
+
+    The denylist is the only thing between an automated continuation and a pane whose agent
+    holds mutation authority, and it is assembled from an environment variable. A typo there
+    does not fail loudly — it silently produces a SHORTER denylist, which opens a gate nobody
+    decided to open. Nothing checked that until now.
+
+    Returns {"ok": bool, "problems": [...], "checked": {...}}. Problems are stated, never
+    repaired: a config this important should be corrected deliberately, not patched at
+    import time by the thing it governs.
+    """
+    problems, checked = [], {}
+
+    checked["self_project"] = SELF_PROJECT
+    if not SELF_PROJECT:
+        problems.append("SELF_PROJECT is empty — the recursion guard cannot hold")
+    elif SELF_PROJECT not in AUTO_REGISTER_DENY_PROJECTS:
+        problems.append(
+            f"SELF_PROJECT {SELF_PROJECT!r} is missing from the denylist — the supervisor "
+            "could drive the session that deploys it")
+
+    checked["deny_projects"] = sorted(AUTO_REGISTER_DENY_PROJECTS)
+    # The value-bearing set is not merely a default: losing any of it silently widens who
+    # may be typed into. Named explicitly so a shortened env is a PROBLEM, not a surprise.
+    for required in ("capacity", "auction", "payment-orchestrator", "payorch", "xmrig"):
+        if required not in AUTO_REGISTER_DENY_PROJECTS:
+            problems.append(f"value-bearing project {required!r} is not denylisted")
+
+    for name, value, low in (("MIN_INTERVAL_SECS", MIN_INTERVAL_SECS, 1),
+                             ("MAX_CONSECUTIVE", MAX_CONSECUTIVE, 1),
+                             ("MAX_EVENT_AGE_SECS", MAX_EVENT_AGE_SECS, 1),
+                             ("GATE_TTL_SECS", GATE_TTL_SECS, 1),
+                             ("IDLE_SWEEP_QUIET_SECS", IDLE_SWEEP_QUIET_SECS, 1)):
+        checked[name] = value
+        if value < low:
+            problems.append(f"{name}={value} disables a rate guard (must be >= {low})")
+
+    checked["goal_autosubmit"] = GOAL_AUTOSUBMIT
+    if GOAL_AUTOSUBMIT:
+        problems.append("GOAL_AUTOSUBMIT is on — a /goal line changes behaviour for many "
+                        "turns and is not on the safe-continuation allowlist")
+
+    checked["targets_raw"] = _TARGETS_RAW
+    if _TARGETS_RAW.strip() == "*":
+        # A wildcard rollout is legitimate; it must still not reach a denylisted project,
+        # which auto_register enforces. Recorded so the combination is visible.
+        checked["wildcard_rollout"] = True
+
+    return {"ok": not problems, "problems": problems, "checked": checked}
+
+
 def send_block_reason(target: str, project: str = "", *, conn=None) -> str:
     """WHY a target may not be sent to — the two reasons are not the same thing.
 

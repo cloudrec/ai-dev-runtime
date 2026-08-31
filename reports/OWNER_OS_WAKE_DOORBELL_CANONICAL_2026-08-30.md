@@ -5311,3 +5311,57 @@ than a missing capability: `owner-os-wake-policy-opus` is blocked
 `supervisor_self_reference`, `capacity-blockchain` and `diamond-auction` are blocked
 `value_bearing_send_blocked`, and Auction still reports **zero** hook events in 24 h, so it
 has no lifecycle signal to route in the first place.
+
+---
+
+# Part 47 — pre-gate prerequisites: two real gaps closed
+
+Audited each named prerequisite against what already exists, and built only what was
+genuinely missing. Hook wiring (8 events), duplicate/storm guards (`MIN_INTERVAL_SECS`,
+`MAX_CONSECUTIVE`, idempotency keys, terminal gate), the proof harness
+(`verify_gate_suppression.py`) and the activation plan (Part 34) were already in place and
+were not rebuilt. Two things were not.
+
+## Gap 1 — nothing validated the config that holds the gates up
+
+The denylist is the only thing between an automated continuation and a pane whose agent holds
+mutation authority, and it is assembled from an environment variable. A typo there **does not
+fail loudly** — it produces a *shorter* denylist, silently opening a gate nobody decided to
+open. Nothing checked that.
+
+`validate_config()` now does, and reports rather than repairs — a config this important should
+be corrected deliberately, not patched at import time by the thing it governs. It checks that
+`SELF_PROJECT` is non-empty and present in the denylist, that every value-bearing project
+(`capacity`, `auction`, `payment-orchestrator`, `payorch`, `xmrig`) is still listed, that no
+rate guard has been zeroed, and that `GOAL_AUTOSUBMIT` is off.
+
+Shipped config reads `ok: True` with an empty problem list. 6 tests; the four that exercise
+failure modes all pass when `validate_config` is stubbed to always-ok, so they bind to the
+logic rather than its shape.
+
+## Gap 2 — rollback had never been rehearsed
+
+Four backups exist and every activation has cited one, but no restore had ever been
+attempted. "Rollback available" was an assertion, not a verified fact — exactly the kind of
+claim this report has tried to avoid elsewhere.
+
+Rehearsed against `supervisor-activation-20260831T051141Z`, without disturbing live state:
+
+| Check | Result |
+|---|---|
+| Backup DB integrity | `PRAGMA integrity_check` → **ok** |
+| Backup is a real earlier point | 16 766 events vs 17 093 live — a coherent older snapshot |
+| Source restorable and valid | `native_supervisor.py` copied out and parses |
+| Recorded HEAD resolves | `75ff568a` present in history, so `git checkout <sha> -- <file>` works |
+| Contents | both DBs, five sources, HEAD, prior PID, pane inventory, supervision row count |
+
+Rollback is now a checked property rather than a stated one.
+
+## Owner-OS-self lifecycle proof — the observable half
+
+For `ai-dev-runtime` the chain **event → supervisor receives → decides → journals** is
+demonstrable and demonstrated: 120 `claude_hook` events in 24 h, each resolved and recorded
+with an explicit reason. The remaining half — supervisor sends to this pane — is blocked by
+`supervisor_self_reference`, deliberately and structurally, because the supervisor would be
+driving the session that edits and deploys it. That half is not pending work; it is a
+property.
