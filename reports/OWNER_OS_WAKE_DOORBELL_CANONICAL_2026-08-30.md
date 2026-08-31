@@ -4586,3 +4586,58 @@ control number: 9 events under 9 distinct keys.
 **Rollback either way:** `/root/owner-os-backups/wake-policy-activation-20260831T000432Z`
 holds both DBs and all six sources; `git checkout <prior> -- <file>` plus a restart reverts
 any single fix.
+
+---
+
+# Part 35 — event 16045, and a gate alarm that could not be routed
+
+## 16045: the known Telegram gate, carrying a message that was itself a false alarm
+
+Notification **3240**, channel `telegram`, `dead_letter` after 5 attempts (21:56:05Z →
+21:59:25Z), no receipt, notification key `nativesup:gate:mess-postsignup-cleanup-sonnet-v4:0.0`.
+Root cause unchanged: `Bad Request: chat not found`.
+
+Worth noting what it was carrying: event **15954** — one of the four false
+`agent_continuation_exhausted` alarms that `66fe932` was written to prevent. Two independent
+defects stacked on one message: an alarm that should never have been raised, sent down a
+channel that has never delivered.
+
+## The defect found: gate alarms carry no project
+
+All four `agent_continuation_exhausted` events raised on 2026-08-30 have an **EMPTY**
+`project_id`. `open_gate` set `agent_id` and nothing else, so the alarm cannot route to the
+project's own chat and lands project-less in the inbox — falling back to `owner-os` like any
+unmapped event. Same family as `a5b930e`: identity present upstream, dropped on the way out.
+
+Fixed narrowly: `open_gate` takes an optional `project_id` and, when not given, falls back to
+the `native_supervised_target` registration record, so a caller that does not know the
+project still produces a routable event. An unregistered target still emits — it only loses
+the routing hint, never the alarm.
+
+3 tests, all verified to fail with the change reverted. Focused module: 62 passed.
+
+## `agent.commander.agent_externally_blocked` — undetermined, and I will not guess
+
+Commander event 3815, `capacity-blockchain:0.0`, 23:05:06Z, transition
+`idle → externally_blocked`.
+
+The visible evidence argues against a genuine blocker: it reads *"Stopping cleanly. ✽
+Crunched for 11m 48s · done 1:04 AM ✔ Update installed · Restart to update"* — a clean
+finish plus a Claude Code updater banner, with no external dependency named anywhere. The
+pane is `working` again now.
+
+But the classification cannot be reproduced from what was stored. Re-running
+`agent_control._STATE_EXTERNAL_RE` — which looks for verification keys, vendor waits, quota
+and rate limits — against the recorded evidence returns **no match**. The stored `evidence`
+is a truncated snippet rather than the 500-character tail the classifier actually read, so
+the input that produced the decision is gone.
+
+So: **most likely a misclassification, not a genuine external block — but not provable, and
+not claimed as either.** Two things follow, both recorded rather than acted on:
+
+* The commander event has the same observability gap `ad0aab6` closed for `agent_watch`: it
+  records the transition but not which rule fired or what tail was matched. Adding that would
+  make the next one decidable.
+* `agent_control.py` and `agent_orchestrator.py` are the commander path, not the wake-policy
+  scope authorised here, and the agent involved is ACAP. Changing either needs its own
+  authorisation; nothing was touched.

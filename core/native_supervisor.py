@@ -370,7 +370,8 @@ def resolve_target(cwd: str, agents: list) -> Optional[str]:
 
 
 def open_gate(target: str, *, reason: str, conn=None, now: Optional[float] = None,
-              emit_fn: Optional[Callable] = None, owner_facing: bool = True) -> dict:
+              emit_fn: Optional[Callable] = None, owner_facing: bool = True,
+              project_id: str = "") -> dict:
     """Record the terminal state ONCE and emit one owner-facing event.
 
     Idempotent by construction: the row is the latch. A second call while the gate stands
@@ -390,8 +391,19 @@ def open_gate(target: str, *, reason: str, conn=None, now: Optional[float] = Non
         if emit_fn is None:
             from core.control_plane import cto
             emit_fn = cto.emit
+        # Without a project the alarm cannot route to the project's own chat and lands
+        # project-less in the inbox: all four gate events raised on 2026-08-30 carried an
+        # EMPTY project_id. Falls back to the registration record, so a caller that does
+        # not know the project still produces a routable event.
+        if not project_id:
+            try:
+                r = conn.execute("SELECT project FROM native_supervised_target "
+                                 "WHERE target=?", (target,)).fetchone()
+                project_id = (r[0] or "") if r else ""
+            except Exception:  # noqa: BLE001
+                project_id = ""
         res = emit_fn("native_supervisor", "agent_continuation_exhausted",
-                      agent_id=target,
+                      agent_id=target, project_id=project_id,
                       severity="high" if owner_facing else "info",
                       owner_action_required=bool(owner_facing),
                       payload={"target": target, "reason": reason,

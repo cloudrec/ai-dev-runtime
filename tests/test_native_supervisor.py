@@ -701,3 +701,40 @@ def test_end_to_end_a_genuine_stall_still_wakes_the_owner(monkeypatch):
                         or {"event_id": 7})
     _scan(conn, [_agent()], [])
     assert emitted == [("high", True)]
+
+
+# ── a gate alarm must name its project, or it cannot be routed ────────────────────────
+# All four agent_continuation_exhausted events raised on 2026-08-30 carried an EMPTY
+# project_id, so they could not route to the project's own chat and landed project-less.
+
+def test_the_gate_alarm_carries_the_project(tmp_path):
+    conn = _gate_conn(tmp_path)
+    conn.execute(ns._REG_SCHEMA)
+    conn.execute("INSERT INTO native_supervised_target(target,project,cwd) VALUES(?,?,?)",
+                 ("seo-worker:0.0", "seo", "/opt/seo"))
+    conn.commit()
+    seen = []
+    ns.open_gate("seo-worker:0.0", reason="cap", conn=conn, now=1000.0,
+                 emit_fn=lambda s, e, **kw: seen.append(kw.get("project_id")) or {"event_id": 1})
+    assert seen == ["seo"]
+
+
+def test_an_explicit_project_wins_over_the_registry(tmp_path):
+    conn = _gate_conn(tmp_path)
+    conn.execute(ns._REG_SCHEMA)
+    conn.execute("INSERT INTO native_supervised_target(target,project,cwd) VALUES(?,?,?)",
+                 ("x:0.0", "from-registry", "/opt/x"))
+    conn.commit()
+    seen = []
+    ns.open_gate("x:0.0", reason="cap", conn=conn, now=1000.0, project_id="explicit",
+                 emit_fn=lambda s, e, **kw: seen.append(kw.get("project_id")) or {"event_id": 1})
+    assert seen == ["explicit"]
+
+
+def test_an_unregistered_target_still_emits(tmp_path):
+    """No registry row must not break the alarm — it only loses the routing hint."""
+    conn = _gate_conn(tmp_path)
+    seen = []
+    ns.open_gate("unknown:0.0", reason="cap", conn=conn, now=1000.0,
+                 emit_fn=lambda s, e, **kw: seen.append(kw.get("project_id")) or {"event_id": 1})
+    assert seen == [""]
