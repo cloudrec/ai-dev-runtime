@@ -5012,3 +5012,56 @@ one commit publishes all 50.
 `os_task_queue` record was created either — `enqueue` writes a task file into an agent's cwd
 and queues text for automated delivery, so creating one to satisfy a status display would
 inject work into a real agent on an automated instruction.
+
+---
+
+# Part 41 — native-primitive redesign: verified, partly already built, and blocked on its own targets
+
+An automated instruction asked to redesign the zero-ping loop around native agent-team
+primitives for exactly three projects: `owner-os-wake-policy-opus`, `capacity-blockchain`,
+`diamond-auction`. Verified against the install rather than the doc claims.
+
+## What is verified true
+
+Claude Code **2.1.251** — above the 2.1.32 floor for agent teams. All seven lifecycle hooks
+the instruction names are **already wired** in `~/.claude/settings.json`: `Stop`,
+`StopFailure`, `SubagentStop`, `TaskCompleted`, `TeammateIdle`, `Notification`,
+`UserPromptSubmit`, plus `SessionStart`. They have been the primary signal since `d1a0328`
+and `0689ce3`, feeding durable Owner OS events consumed by `core/native_supervisor.py`, with
+routing and audit in `deliveries` + `delivery_attribution` and tmux/quiescence demoted to the
+fallback it now is. The architecture the instruction describes is, in its durable half,
+already the normal path and live.
+
+**A correction to an earlier claim in this session.** Peer messaging was previously described
+here as unavailable to the supervisor. `ListAgents` shows nine addressable peer sessions, so
+`SendMessage` between sessions is real. The accurate limitation is narrower and matters more:
+these are **session tools, not service APIs**. `owner-os-wake-companion.service` is a systemd
+Python process; it cannot call `SendMessage`. Making agent-team messaging the primary path
+would therefore make continuation depend on this pane being alive and taking turns — the
+exact dependency the zero-ping design exists to remove, and the opposite of the
+"supervisor keeps working after the Claude pane goes idle" property already demonstrated.
+Hooks → events → control plane has no such dependency, which is why it is the durable path.
+
+## Why the redesign cannot be built on the three named targets
+
+| Target | Project | Denied by |
+|---|---|---|
+| `owner-os-wake-policy-opus:0.0` | `ai-dev-runtime` | `SELF_PROJECT`, derived from the module's own location and **non-overridable** (`c01a493`) |
+| `capacity-blockchain:0.0` | `capacity` | value-bearing denylist — ACAP, standing prohibition on C1/C2 |
+| `diamond-auction:0.0` | `auction` | value-bearing denylist — Auction value gates, standing prohibition |
+
+`is_supervised()` returns **False** for all three. Making them the normal path requires
+removing them from the denylist, which is precisely the automatic weakening of
+project-specific hard safety gates that standing policy forbids — and that the same
+instruction also requires ("Preserve current project hard gates"). The two requirements are
+mutually exclusive, and the gates win.
+
+The self-reference entry additionally cannot be satisfied on its own terms: a supervisor
+driving the session that edits, tests and deploys the supervisor would answer its own turn
+boundaries, which is why that guard was made structural rather than configurable.
+
+## What was done
+
+Nothing was changed. No denylist edit, no messages sent to ACAP or Auction sessions, no code
+written for a path that could not be exercised on any permitted target. The verification
+above is recorded so the next attempt starts from measured facts rather than the doc summary.
