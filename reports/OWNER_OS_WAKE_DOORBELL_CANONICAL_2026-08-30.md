@@ -4770,3 +4770,59 @@ contradicted). Already proven deterministically in `9e8c439`.
 **Open question with a known answer-shape.** Whether the `agent_watch` menu branch may be
 restricted to waiting states (Part 37). Needs one datum: a genuine menu observed with its
 inventory state. `ad0aab6` now records it; none has appeared on any agent but this one.
+
+---
+
+# Part 38 — the live proof arrived, and event 16652 needs no fix
+
+## Gate suppression CONFIRMED in production
+
+Event **16613**, 03:32:21Z, `mess-postsignup-cleanup-sonnet-v4:0.0`,
+`agent_continuation_exhausted` at **`severity=info`, `owner_action_required=0`** — emitted
+after that target's 6 h dedup window expired at 03:28:35Z, so the dedup can no longer explain
+the silence. `tools/verify_gate_suppression.py` returns `status=confirmed`, exit 0.
+
+The contrast is the evidence:
+
+| Event | Time | Severity | oar |
+|---|---|---|---|
+| 15954 · 15986 · 16016 · 16099 | 21:28–22:28Z, pre-fix | `high` | **1** |
+| **16613** | 03:32:21Z, post-fix, post-expiry | **`info`** | **0** |
+
+Same code path, same class of agent, opposite owner-facing outcome. `66fe932` does what it
+claimed: the gate still opens so sends stop, and nobody is woken for an agent that had no
+task to converge on. Part 32 withheld this claim; Part 34 proved it deterministically and
+recorded it as time-blocked. It is now proven in production as well, and the withheld claim
+can be closed.
+
+## Event 16652 — expected, no code change warranted
+
+`wake_loop_stalled`, critical, on this supervisor's own pane. Original event **16595** was
+`work_stopped_incomplete`, `class=quiescent`, `state=idle`,
+`at_rest_unchanged_for_346s`; the wake was delivered 03:25:42Z, re-woken 03:41:08Z (16627),
+escalated 03:57:17Z.
+
+**The escalation is factually correct.** Between delivery and escalation the only event
+recorded for this target was 16627 — the watchdog's own re-wake, which `_progress_since`
+deliberately excludes so an episode can still escalate. Zero genuine activity in 31 minutes.
+The pane really did nothing, because it had reported that only owner gates remain and was
+told to stay idle. The watchdog reported the truth.
+
+**Why no fix.** The tempting change is to exempt a quiescent-sourced wake, or to port
+`no_assigned_task` into `closed_loop_wake`. Part 25 already examined and rejected the latter:
+`active_task` is `None` for **every** agent on this host, so exempting on it inside the
+watchdog would suppress genuine stalls fleet-wide and gut the thing. That reasoning is
+unchanged. Deciding it differently now, on a first occurrence — one `wake_loop_no_progress`
+and one `wake_loop_stalled`, both today — would repeat the over-narrowing already withdrawn
+twice in this session.
+
+Incidental confirmations in the same evidence: the payload carries `route_key: owner-os`
+separately from `project_id: ai-dev-runtime`, which is `a5b930e` live; and `01f53c7`
+correctly does **not** apply, because the original is `work_stopped_incomplete` rather than a
+prompt wake, and that type is deliberately excluded from prompt-premise resolution.
+
+## Status
+
+Six of nine wake-policy fixes are live and now all six are evidenced in production. `4cf8ab2`
+and `0d9674b` remain inert behind a companion restart, `c403ca0` behind an `ai-runtime`
+restart. No non-gated work remains.
