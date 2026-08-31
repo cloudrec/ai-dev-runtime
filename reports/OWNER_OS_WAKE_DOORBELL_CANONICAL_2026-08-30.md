@@ -4826,3 +4826,48 @@ prompt wake, and that type is deliberately excluded from prompt-premise resoluti
 Six of nine wake-policy fixes are live and now all six are evidenced in production. `4cf8ab2`
 and `0d9674b` remain inert behind a companion restart, `c403ca0` behind an `ai-runtime`
 restart. No non-gated work remains.
+
+---
+
+# HANDOFF STATUS — 2026-08-31 04:15 UTC (supersedes the 02:42 UTC block)
+
+The 02:42 block is now wrong in three specifics and is left in place as history rather than
+edited: it records HEAD `e8b79c1` and 45 commits ahead, and it lists the gate-suppression
+proof as time-gated with an earliest observable time. All three have moved.
+
+**Repository.** HEAD `dbb4d59` on `ai-runtime/220-windows-bridge`, worktree clean, **47
+ahead** of `origin`, 0 behind. 32 owner-WIP report files untracked and md5-verified
+byte-identical to their state at session start. Whole repository suite green: **2 829 passed,
+exit 0**. Focused suites across every module the nine commits touch: **274 passed**.
+
+**The time gate is closed.** `tools/verify_gate_suppression.py` returns `status=confirmed`,
+exit 0. Event **16613** (03:32:21Z) is `agent_continuation_exhausted` at `severity=info`,
+`owner_action_required=0`, emitted after its target's dedup window expired at 03:28:35Z — so
+the dedup can no longer account for the silence. The four pre-fix events on the same path
+were all `high`/`oar=1`. Nothing about this claim is now pending.
+
+**Live and evidenced in production:** `a9ff86e`, `66fe932`, `01f53c7`, `a5b930e`, `ad0aab6`.
+
+**Committed and inert, with the exact restart that activates each:**
+
+| Commit | Activates on |
+|---|---|
+| `4cf8ab2` idle sweep applies the same gate exemption | `owner-os-wake-companion.service` |
+| `0d9674b` gate alarm carries its project | `owner-os-wake-companion.service` |
+| `c403ca0` one dead-letter alarm per channel | `ai-runtime.service` |
+
+`worker_skew()` measures the companion running code 3 306 s older than the tree.
+`notifier.py` is referenced by the companion zero times — it runs in the control-plane engine
+inside the API daemon, which is why its restart is the separate one.
+
+**Telegram is a data fault, not a code fault** — established read-only: both values are
+present in `configs/.env`, the unit loads that file, and `chat not found` is Telegram's own
+`description` returned after a well-formed, authenticated request. A bad token would return
+401; an empty id would return "chat_id is empty". The id is positive, i.e. a private user
+chat rather than a group, and that error on a positive id is the signature of a bot never
+`/start`ed by that user. Value not read or recorded anywhere.
+
+**Open question, unchanged:** whether the `agent_watch` menu branch may be narrowed to
+waiting states (Part 37). It needs one datum — a genuine menu observed together with its
+inventory state. `ad0aab6` records that field now; none has appeared on any agent but this
+one.
