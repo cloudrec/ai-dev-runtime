@@ -5065,3 +5065,64 @@ boundaries, which is why that guard was made structural rather than configurable
 Nothing was changed. No denylist edit, no messages sent to ACAP or Auction sessions, no code
 written for a path that could not be exercised on any permitted target. The verification
 above is recorded so the next attempt starts from measured facts rather than the doc summary.
+
+---
+
+# Part 42 — the policy split shipped, and two pending markers confirmed in production
+
+## `0d9674b` confirmed live
+
+Part 31 and the 05:30 handoff recorded that the gate alarm carrying its project was proven by
+test but not yet by production event. It is now:
+
+| Event | Time | project_id | severity | oar |
+|---|---|---|---|---|
+| 16823 | 05:40:04Z | **`gaika-extension`** | `info` | 0 |
+| 16806 | 05:30:22Z | **`mess`** | `info` | 0 |
+| 16613 | 03:32:21Z | `(EMPTY)` — pre-fix | `info` | 0 |
+| 15954 · 15986 · 16016 · 16099 | 21:28–22:28Z | `(EMPTY)` — pre-fix | `high` | 1 |
+
+Two alarms now name their real project instead of falling back to the `owner-os` route. The
+contrast against the pre-fix rows is the evidence.
+
+`66fe932` also strengthened from one sample to three: `verify_gate_suppression.py` reports
+`3 post-expiry gate event(s), all info/oar=0`, exit 0. Every gate opened since — 05:30:22Z
+and 05:40:04Z, both `gate_opened: true`, so `open_gate` genuinely ran rather than returning
+early — stopped sends without waking anyone.
+
+**Still not observed:** the `4cf8ab2` marker. Its signature is a row from the *idle sweep*
+carrying `exempt`; the three gates above all came through the **event path**
+(`continuation_cap_reached_without_progress`), which records `gate_opened` and
+`gate_event_id` but not `exempt`. The sweep has not opened a gate since activation. Live but
+unexercised, and not claimed otherwise.
+
+## The policy split — shipped and activated
+
+`27b09b6` replaces one misleading journal label with three accurate ones:
+`value_bearing_send_blocked`, `supervisor_self_reference`, `not_registered`. Activated
+backup-first behind a 253-passed gate; companion PID 2980127 → 3086835, skew clear, 9 agents,
+no duplicates, tmux ok.
+
+The premise that prompted it was corrected by measurement rather than accepted: lifecycle
+observation is **already** unconditional — 112 hook events from `ai-dev-runtime` and 28 from
+`capacity` in a day, and a genuine gate routes through the owner-facing wake path, which
+never consults the denylist. The denylist governs only whether the supervisor may type into a
+pane. That narrower fact is what the vocabulary now records.
+
+The new labels have not yet appeared in the live journal: no denylisted target has resolved a
+hook event since activation. Proven by five mutation-verified tests, not yet by production
+row.
+
+## What stays blocked, and why that is not a conflation
+
+Sends to ACAP and Auction remain blocked. The distinction between supervision authority and
+mutation authority is real, and is implemented where it holds — but it does not carry to
+sends: the supervisor does not mutate value itself, it types into a pane whose agent **holds**
+mutation authority. Nudging a deliberately parked value-bearing agent is a decision with
+consequences and stays an owner decision. A test asserts that even a wildcard rollout
+(`_TARGETS_RAW="*"`) cannot auto-register a denylisted project, so naming the reason did not
+soften the block.
+
+**Auction cannot be assessed at all:** `/opt/diamond/auction` has **zero** hook events in 24 h
+against 25 for capacity and 108 for ai-dev-runtime. Lifecycle signalling is not observable
+there, so no acceptance claim about it would be founded.
