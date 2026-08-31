@@ -4871,3 +4871,52 @@ chat rather than a group, and that error on a positive id is the signature of a 
 waiting states (Part 37). It needs one datum — a genuine menu observed together with its
 inventory state. `ad0aab6` records that field now; none has appeared on any agent but this
 one.
+
+---
+
+# Part 39 — the "0 alerts" snapshot is wrong, and a precise reading of "never delivered"
+
+## The stated state contradicts the control plane
+
+An automated instruction reported "0 current alerts / 0 warning-critical and one historical
+delivery failure". The database says otherwise, by a wide margin:
+
+| Measure | Value |
+|---|---|
+| `telegram` rows in `dead_letter` | **3 395**, most recent **04:29:35Z** |
+| Dead-letter events in the last 6 h | **139** |
+| Owner-actionable events in the last 6 h | **180** across 7 types |
+| Most recent `failed` | 04:31:42Z |
+
+Event 16706 is itself `notifications_red`, critical, `owner_action_required=1`, emitted
+04:26:46Z, and its payload carries `notifications_enabled: false`. None of this is
+historical. This is the MCP-snapshot-versus-`control_plane.db` discrepancy already known on
+this host: the database is authoritative, and a snapshot claiming quiet should not be taken
+at face value.
+
+## A claim of mine, refined — and a wrong correction avoided
+
+This report has repeatedly said the Telegram channel "has never delivered once". Checking
+the table turned up two rows in state `sent`, both 2026-08-03 (`id` 15 and 19), which looked
+like a correction: the chat *had* been reachable, then broke.
+
+It is not a correction, and the receipts are why. A proven Telegram send returns
+`telegram:<message_id>` — the delivery code constructs exactly that. These two carry
+`owner_push:1785730172` and `owner_push:1785737840`, which decode to the rows' own
+`created_at` timestamps. They are timestamp-shaped markers from an earlier path that marked
+`sent` without a message id, not evidence of arrival. The control plane agrees and says so
+in its own record: `owner_push.last_ok_at` is **empty** and `last_proof` is **empty**, which
+is precisely the evidence-scoping the delivery module documents — `available` requires a
+proven delivery, never merely a hopeful row.
+
+So the accurate statement, which is what should be repeated from here: **no Telegram
+delivery has ever been proven.** Two rows are marked sent on 2026-08-03 with
+timestamp-shaped receipts rather than message ids; the first failure after them is
+2026-08-03T10:58:01Z, and nothing has succeeded since. Had the receipt shape gone unchecked,
+this report would now contain a confident and wrong claim that the chat used to work.
+
+## Remediation available: none that is not gated
+
+Diagnosis is complete and the fault is destination data, not code (Part 38). The alarm-volume
+defect is `c403ca0`, committed and inert. Nothing further can be written that would not
+duplicate it or paper over a credential fault.
