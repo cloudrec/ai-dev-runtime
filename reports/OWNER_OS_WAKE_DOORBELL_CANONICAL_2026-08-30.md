@@ -4416,3 +4416,55 @@ touched, and continuation is unaffected by it throughout.
 **Push remains refused.** No authorization exists; the canonical record says "local commits
 only, no remote push" in three places, and the branch cannot be scoped — publishing one of
 today's commits publishes all 38.
+
+---
+
+# Part 32 — post-activation verification, including one claim withheld
+
+Read-only verification ~30 minutes after activation. No code changed: nothing was found that
+needed changing.
+
+## No over-suppression — checked, not assumed
+
+The named risk of `01f53c7` was silencing a live agent. It did not: all **11**
+`prompt_no_longer_present` resolutions in the window belong to **four dead sessions** —
+`payorch-sonnet-fixes:0.0`, `payorch-patroni-repair-clean:0.0`, `owner-os-server-alerts:0.0`,
+`igameng-build:0.0` — none of which appear among the nine live panes. Stale watches for
+sessions that no longer exist, exactly the intended target.
+
+The watchdog is also demonstrably **not** silenced: `wake_loop_no_progress` and
+`wake_loop_stalled` each fired once after activation (00:18:16Z, 00:13:07Z). Escalation
+still works.
+
+Supervision in the same hour: 10 `continued_same_agent`, 4 `intentional_external_wait`,
+18 `not_in_rollout_allowlist`, 1 `continuation_gate_open`.
+
+## What `66fe932` has actually proven, and what it has not
+
+**Proven live:** the exemption's *skip* branch fired three times —
+`cap_reached_but_recent_intentional_external_wait`. That reason string did not exist before
+today, so those three skips are unambiguously the new code declining to gate an agent that is
+waiting by design.
+
+**NOT proven live, and the distinction matters:** the `no_assigned_task` →
+`owner_facing=False` branch. Zero `agent_continuation_exhausted` events since activation
+looks like proof, but it is not. All four targets already carried gates opened **before**
+activation — `mess-postsignup-cleanup-sonnet-v4` 21:28:35Z, `arbitrage2-fable` 21:39:57Z,
+`gaika-opus` 21:51:07Z, `mess-opus` 22:28:44Z, all `high`/`oar=1`, the very false alarms that
+motivated the fix. `open_gate` returns `opened=False` while a gate stands, so the latch alone
+fully explains the silence. The post-activation `gate` rows in `native_supervision` are that
+early return being recorded.
+
+So the silence is consistent with the fix but does not demonstrate it. The branch becomes
+observable when a gate clears — by TTL at ~05:28–06:28Z, or sooner if an agent is seen
+working again — and a fresh cap is then reached. Recorded as pending rather than claimed.
+
+## State
+
+| | |
+|---|---|
+| HEAD | `f155a23` (this part adds one docs commit) |
+| Worktree | clean |
+| Owner WIP | 32 untracked, `md5sum -c` exit 0, file set identical |
+| Rollback | `/root/owner-os-backups/wake-policy-activation-20260831T000432Z` intact |
+| Services | companion active on new code, `worker_skew()` clear; `ai-runtime` untouched |
