@@ -169,7 +169,9 @@ def test_a_deny_listed_agent_is_never_touched(monkeypatch):
     calls = []
     r = _scan(conn, [_agent(target="diamond-auction:0.0", cwd="/opt/diamond/auction")], calls)
     assert calls == [], "a deny-listed project must never be continued"
-    assert r["skipped"][0]["why"] == "not_in_rollout_allowlist"
+    # reason vocabulary split so the journal distinguishes a deliberate value-bearing
+    # exclusion from a project nobody registered; the block itself is unchanged
+    assert r["skipped"][0]["why"] == "value_bearing_send_blocked"
 
 
 def test_the_supervisor_never_drives_its_own_session():
@@ -738,3 +740,51 @@ def test_an_unregistered_target_still_emits(tmp_path):
     ns.open_gate("unknown:0.0", reason="cap", conn=conn, now=1000.0,
                  emit_fn=lambda s, e, **kw: seen.append(kw.get("project_id")) or {"event_id": 1})
     assert seen == [""]
+
+
+# ── supervision authority and mutation authority are not the same thing ───────────────
+# Lifecycle OBSERVATION is unconditional: hook events from every project are recorded
+# durably, and a genuine gate routes through the owner-facing wake path regardless. The
+# denylist governs only whether the supervisor may TYPE INTO a pane. The journal used to
+# say `not_in_rollout_allowlist` for both a deliberately excluded value-bearing project and
+# a project nobody had registered — different situations, different remedies.
+
+def test_a_value_bearing_project_says_so():
+    assert ns.send_block_reason("capacity-blockchain:0.0", "capacity") == \
+        "value_bearing_send_blocked"
+    assert ns.send_block_reason("diamond-auction:0.0", "auction") == \
+        "value_bearing_send_blocked"
+
+
+def test_the_supervisors_own_project_is_a_distinct_reason():
+    """Structural recursion guard, not a value judgement — it must not read the same."""
+    assert ns.send_block_reason("owner-os:0.0", ns.SELF_PROJECT) == \
+        "supervisor_self_reference"
+
+
+def test_an_unregistered_project_is_merely_unregistered():
+    assert ns.send_block_reason("brand-new:0.0", "brandnew") == "not_registered"
+    assert ns.send_block_reason("brand-new:0.0", "") == "not_registered"
+
+
+def test_the_scan_journal_records_the_specific_reason(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "")
+    conn, _ = ns._conn()
+    _hook_event(conn, cwd="/opt/capacity")
+    calls = []
+    r = _scan(conn, [_agent(target="capacity-blockchain:0.0", cwd="/opt/capacity")], calls)
+    assert calls == [], "a value-bearing project is never typed into"
+    assert r["skipped"][0]["why"] == "value_bearing_send_blocked"
+    assert r["skipped"][0]["lifecycle_observed"] is True
+    row = conn.execute("SELECT reason FROM native_supervision WHERE target=? "
+                       "ORDER BY rowid DESC LIMIT 1", ("capacity-blockchain:0.0",)).fetchone()
+    assert row[0] == "value_bearing_send_blocked"
+
+
+def test_the_block_still_blocks(monkeypatch):
+    """Naming the reason must not soften it."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")      # even a wildcard rollout
+    conn, _ = ns._conn()
+    ns.auto_register([_agent(target="capacity-blockchain:0.0", cwd="/opt/capacity")],
+                     conn=conn)
+    assert "capacity-blockchain:0.0" not in ns.registered_targets(conn=conn)

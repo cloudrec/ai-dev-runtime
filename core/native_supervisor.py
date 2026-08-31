@@ -339,6 +339,32 @@ def allowed_targets() -> set:
     return {"*"} if raw == "*" else {t.strip() for t in raw.split(",") if t.strip()}
 
 
+def send_block_reason(target: str, project: str = "", *, conn=None) -> str:
+    """WHY a target may not be sent to — the two reasons are not the same thing.
+
+    Lifecycle OBSERVATION is already unconditional: hook events from every project are
+    recorded durably (112 from ai-dev-runtime and 28 from capacity in a single day), and a
+    genuine gate still routes through the owner-facing wake path, which does not consult
+    this. What the denylist governs is narrower — whether the supervisor may TYPE INTO a
+    pane. Conflating the two made the journal say `not_in_rollout_allowlist` for a
+    value-bearing project that is deliberately excluded and for a project nobody has
+    registered yet, which are different situations with different remedies.
+
+      value_bearing_send_blocked — ACAP, Auction, payment, mail, miner triage. Deliberate
+        and owner-only to change. Supervision authority is not mutation authority, but the
+        supervisor types into a pane whose agent HOLDS mutation authority, so the block
+        stays until an owner decides otherwise.
+      supervisor_self_reference — the supervisor's own project. Structural, derived from
+        the module's location, and not a value judgement: it would answer its own turn
+        boundaries and drive the session that edits it.
+      not_registered — simply never registered. Auto-registration fixes this by itself.
+    """
+    if project and project in AUTO_REGISTER_DENY_PROJECTS:
+        return ("supervisor_self_reference" if project == SELF_PROJECT
+                else "value_bearing_send_blocked")
+    return "not_registered"
+
+
 def is_supervised(target: str, *, conn=None) -> bool:
     """Supervised if explicitly allow-listed OR auto-registered. Either way it is a
     positive record — nothing is supervised merely by existing."""
@@ -646,9 +672,11 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                 skipped.append({"event_id": eid, "why": "target_unresolved_or_ambiguous"})
                 continue
             if not is_supervised(target, conn=conn):
-                _record(conn, eid, target, "skip", "not_in_rollout_allowlist", True)
-                skipped.append({"event_id": eid, "target": target,
-                                "why": "not_in_rollout_allowlist"})
+                why = send_block_reason(
+                    target, _project_of({"claude_cwd": payload.get("cwd", "")}), conn=conn)
+                _record(conn, eid, target, "skip", why, True)
+                skipped.append({"event_id": eid, "target": target, "why": why,
+                                "lifecycle_observed": True})
                 continue
             # The pane must still be at rest RIGHT NOW — the event describes a moment that
             # has already passed, and re-reading live state is the point.
