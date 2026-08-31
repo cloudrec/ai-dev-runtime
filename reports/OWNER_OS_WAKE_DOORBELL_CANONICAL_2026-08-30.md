@@ -5126,3 +5126,51 @@ soften the block.
 **Auction cannot be assessed at all:** `/opt/diamond/auction` has **zero** hook events in 24 h
 against 25 for capacity and 108 for ai-dev-runtime. Lifecycle signalling is not observable
 there, so no acceptance claim about it would be founded.
+
+---
+
+# Part 43 — event 16836: two paths disagreeing about one declared state
+
+`stall_doctor` raised `agent_waiting_input` at `owner_action_required=1` for
+`diamond-auction:0.0`, an agent everything else had agreed was parked.
+
+**Root cause, and it is not where it looked.** The event came from `stall_doctor` — not
+`agent_watch`, not the native supervisor. A grep for external waits in that module returned
+**zero** references. The native supervisor has honoured declared waits since the Auction case;
+the doctor never consulted them, so two paths held different views of the same declared state
+and the doctor could raise a blocker over one of them.
+
+Fixed in `d625698`: `in_declared_external_wait()` delegates to `native_supervisor` rather than
+re-reading the table, so the two cannot drift on what "declared" means, and fails open toward
+the previous behaviour when the lookup is unavailable — unknown never means stay quiet. A
+parked pane is now not even read. 3 tests, all failing when reverted. Activated backup-first
+behind a **282-passed** gate; companion PID 3086835 → 3132688, skew clear, 9 agents, no
+duplicates.
+
+**What this does NOT fix, and the distinction matters.** It would not have prevented 16836.
+That declaration had already **expired at 01:24:02Z** on its 6 h TTL, while the auction close
+it was waiting for had not happened, and an expired declaration is absent by design
+(`native_supervisor` says so in its own docstring). So the fix closes a genuine inconsistency
+that would bite whenever a declaration is live, and leaves the actual cause of 16836 open.
+
+**The open question, stated as a policy choice rather than decided.** A wait on an *unbounded
+natural event* outlives any fixed TTL. `EXTERNAL_WAIT_DEFAULT_TTL_SECS` is 6 h, so such a wait
+is guaranteed to produce a false blocker later — not because anything malfunctioned, but
+because the declaration's lifetime and the watched condition's lifetime are unrelated.
+Options are to re-declare periodically, to allow a TTL-less declaration bounded by an explicit
+clear, or to accept the re-raise as a deliberate "is this still true?" prompt. Each trades
+silence against staleness differently. Not decided here, and the wait was **not** re-declared
+on Auction's behalf: doing so would suppress owner-facing alarms about a value-bearing project
+on an automated instruction.
+
+## Observer registration — already true, and measured
+
+The request for a lifecycle-only observer class for denylisted projects was checked rather
+than built. Observation is **already unconditional**: 108 `claude_hook` events from
+`ai-dev-runtime` and 25 from `capacity` in a day, all durable and feeding the audit bus, and
+genuine gates route through the owner-facing wake path, which never consults the denylist.
+`27b09b6` gave that distinction a name in the journal. What remains blocked is only *typing
+into* a value-bearing pane — an owner decision, not a conflation.
+
+**Auction cannot be instrumented at all:** zero hook events in 24 h, session state `shell`,
+started a day ago. Nothing to observe there yet, so no acceptance claim about it is founded.
