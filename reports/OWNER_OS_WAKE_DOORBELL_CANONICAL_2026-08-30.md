@@ -4512,3 +4512,77 @@ the code is reverted.
 
 32 owner-WIP files verified byte-identical again (`md5sum -c` pass, set unchanged). The
 untracked count read 33 briefly during a concurrent test run and returned to 32, as before.
+
+---
+
+# Part 34 — the masked branch proven deterministically; the post-restart checklist
+
+## The Part 32 residual is now proven at code level
+
+Live observation could not settle it: every candidate target already had an
+`agent_continuation_exhausted` inside the 6 h `nativesup:gate:<target>` dedup window, so
+silence in production was consistent with the fix *and* with the mask. The confound is
+structural, not a matter of waiting harder.
+
+An isolated database has no prior gate event, which removes the confound entirely.
+`test_end_to_end_no_assigned_task_gates_silently` drives the real `scan()` with the cap
+reached, the idle sweep disabled to isolate the event path, and **the real `open_gate`** —
+only the emit sink is captured. It asserts exactly one `agent_continuation_exhausted` at
+`severity=info`, `owner_action_required=False`, and that `in_gate` is nonetheless true, so
+sends genuinely stop. A control test drives the same path with `gate_exemption` returning
+nothing and asserts `("high", True)`.
+
+Two-way mutation check, both confirmed:
+
+| Mutation | Result |
+|---|---|
+| drop `owner_facing=not exempt` from the event path | emits `high` — test fails |
+| make `gate_exemption` never return `no_assigned_task` | emits `high` — two tests fail |
+
+So the suppression is caused by the exemption computation feeding the `owner_facing` kwarg,
+not by anything incidental. **Still time-blocked:** live production confirmation, until the
+dedup windows expire — 03:28:35Z (`mess-postsignup-cleanup-sonnet-v4`), 03:39:57Z
+(`arbitrage2-fable`), 03:51:07Z (`gaika-opus`), 04:28:44Z (`mess-opus`). Recorded as
+time-blocked rather than claimed.
+
+## What is live now, and what is not
+
+The companion restarted 02:07:17 local and runs the five Part 31 fixes.
+`worker_skew()` reports it **2 836 s behind** again, because `4cf8ab2` landed after it
+started.
+
+| Fix | Live? | Needs |
+|---|---|---|
+| `a9ff86e` numbered sentence is not a menu | **yes** | — |
+| `66fe932` cap exemption, event path | **yes** | — |
+| `01f53c7` prompt wake stops escalating | **yes** | — |
+| `a5b930e` project and route separated | **yes** | — |
+| `ad0aab6` state/class_reason recorded | **yes** | — |
+| `4cf8ab2` idle sweep applies the same exemption | no | companion restart |
+| `c403ca0` one dead-letter alarm per channel | no | **`ai-runtime` restart (owner gate)** |
+
+## Post-restart validation checklist — prepared, not executed
+
+**Before:** capture `worker_skew()`, `MainPID`, pane inventory, and current counts of
+`agent_continuation_exhausted` and `notification_dead_letter` distinct dedup keys. Back up
+both DBs with `sqlite3 .backup`.
+
+**Gate:** `guarded_deploy.sh` with `test_native_supervisor.py test_closed_loop_wake.py
+test_agent_watch.py test_wake_bridge.py test_control_plane_notifier.py` — restart only on
+exit 0.
+
+**After a companion restart, for `4cf8ab2`:**
+1. `worker_skew()` returns clear;
+2. `MainPID` changed, service `active`, pane set identical, `duplicates: []`;
+3. a sweep gate row appears carrying `exempt` and `gate_event_id` — fields the old sweep
+   never recorded, so their presence alone dates the code;
+4. any sweep gate on a no-task agent emits `severity=info`, `owner_action_required=0`;
+5. `cap_reached_but_*` skips still appear, and continuations still occur.
+
+**After an `ai-runtime` restart, for `c403ca0`:** dead-letter events collapse to **one
+distinct `deadletter:<channel>` key per window** instead of one per notification id. Today's
+control number: 9 events under 9 distinct keys.
+
+**Rollback either way:** `/root/owner-os-backups/wake-policy-activation-20260831T000432Z`
+holds both DBs and all six sources; `git checkout <prior> -- <file>` plus a restart reverts
+any single fix.

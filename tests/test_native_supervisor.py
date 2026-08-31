@@ -650,3 +650,54 @@ def test_the_idle_sweep_skips_entirely_on_an_intentional_wait(monkeypatch):
     monkeypatch.setattr(ns, "open_gate", lambda t, **kw: opened.append(t) or {"opened": True})
     _scan(conn, [_agent()], [])
     assert opened == []                                    # no gate at all
+
+
+# ── deterministic proof of the suppression branch, without the dedup confound ─────────
+# Live, this branch is masked: every candidate target already had a gate event inside the
+# 6h `nativesup:gate:<target>` dedup window, so silence in production proves nothing. An
+# isolated DB has no prior gate event, so the emit is unambiguous. `open_gate` is REAL
+# here — only the emit sink is captured — so this exercises the whole wiring from the cap
+# check through gate_exemption to the severity actually requested.
+
+def test_end_to_end_no_assigned_task_gates_silently(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    monkeypatch.setattr(ns, "MAX_CONSECUTIVE", 0)          # cap reached on the first look
+    monkeypatch.setattr(ns, "IDLE_SWEEP_ENABLED", False)   # isolate the EVENT path
+    conn, _ = ns._conn()
+    _hook_event(conn)
+    emitted = []
+
+    def emit(source, etype, **kw):
+        emitted.append({"type": etype, "severity": kw.get("severity"),
+                        "oar": kw.get("owner_action_required")})
+        return {"event_id": 4242}
+
+    monkeypatch.setattr(ns, "_conn", ns._conn)             # unchanged; explicit for clarity
+    import core.control_plane.cto as _cto
+    monkeypatch.setattr(_cto, "emit", emit)
+    calls = []
+    _scan(conn, [_agent()], calls)
+    assert calls == [], "no send once the cap is reached"
+    assert len(emitted) == 1, f"exactly one gate event, got {emitted}"
+    assert emitted[0]["type"] == "agent_continuation_exhausted"
+    assert emitted[0]["severity"] == "info"
+    assert emitted[0]["oar"] is False                      # gate opens, nobody is woken
+    assert ns.in_gate("cp-canary:0.0", conn=conn) is True   # and sends really do stop
+
+
+def test_end_to_end_a_genuine_stall_still_wakes_the_owner(monkeypatch):
+    """The control: same path, but with work to converge on, must stay owner-facing."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    monkeypatch.setattr(ns, "MAX_CONSECUTIVE", 0)
+    monkeypatch.setattr(ns, "IDLE_SWEEP_ENABLED", False)
+    monkeypatch.setattr(ns, "gate_exemption", lambda *a, **k: "")   # nothing innocent
+    conn, _ = ns._conn()
+    _hook_event(conn)
+    emitted = []
+    import core.control_plane.cto as _cto
+    monkeypatch.setattr(_cto, "emit",
+                        lambda s, e, **kw: emitted.append(
+                            (kw.get("severity"), kw.get("owner_action_required")))
+                        or {"event_id": 7})
+    _scan(conn, [_agent()], [])
+    assert emitted == [("high", True)]
