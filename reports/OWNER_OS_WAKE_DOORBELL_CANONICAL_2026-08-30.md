@@ -4716,3 +4716,57 @@ idea is dead and the menu branch must stay as it is.
 
 Until then the cost is bounded and measured: two false prompts in roughly two hours, both on
 the supervisor's own pane, which is denylisted from supervision. Recorded, not fixed.
+
+---
+
+# HANDOFF STATUS — 2026-08-31 02:42 UTC
+
+**Repository.** HEAD `e8b79c1` on `ai-runtime/220-windows-bridge`, worktree clean, 45 ahead
+of `origin` and 0 behind. 32 owner-WIP report files untracked and md5-verified byte-identical
+to their state at session start. Whole repository suite green: 2 829 passed, exit 0.
+
+**Wake-policy fixes — nine commits, all tested and mutation-checked.**
+
+| Commit | What it fixes | Live? |
+|---|---|---|
+| `a9ff86e` | a numbered sentence is not a decision menu | yes |
+| `66fe932` | continuation cap exempts intentional waits and unassigned agents | yes |
+| `01f53c7` | a prompt wake stops escalating once the prompt is gone | yes |
+| `a5b930e` | source project and delivery route stop sharing one field | yes |
+| `ad0aab6` | inventory state and class reason recorded on every event | yes |
+| `4cf8ab2` | the idle sweep applies the same gate exemption | **no** — companion restart |
+| `0d9674b` | a gate alarm carries its project, so it can be routed | **no** — companion restart |
+| `c403ca0` | one dead-letter alarm per channel, not per message | **no** — `ai-runtime` restart |
+| `9e8c439`, `671a7a3` | deterministic proof + read-only checker for the suppression branch | n/a |
+
+**Owner-gated, exactly.**
+
+*Restart `owner-os-wake-companion.service`* activates `4cf8ab2` and `0d9674b`. Sanctioned
+verb, backup and green-gate discipline already established; not performed because the current
+instructions exclude restarts.
+
+*Restart `ai-runtime.service`* is the only route for `c403ca0`. It is the shared Owner OS API
+other projects call, and project memory records its restart as owner-gated.
+
+*Set a correct `TELEGRAM_CHAT_ID`* — the channel has delivered **zero** notifications in 28
+days (`Bad Request: chat not found`; the token is valid, a bad one returns 401). Every
+owner-facing event reaches the owner only through the ChatGPT bridge, which has no
+redundancy behind it.
+
+*cp-canary recovery* is refused by the host auto-mode classifier, not by code. It will not
+self-heal: the watchdog's automatic path refuses with `no_open_work:no_active_task`.
+
+*ACAP C2 `/etc/systemd/system` write* has no sanctioned control-plane path — `approved_gates`
+has no matching entry and every gate in it expired 2026-08-11.
+
+*Push* has no authorization on record, and cannot be scoped: publishing any one of today's
+commits publishes all 45.
+
+**Time-gated, not owner-gated.** Live confirmation that the gate-suppression branch stays
+silent for an unassigned agent. Earliest observable **03:28:35 UTC**; run
+`python3 tools/verify_gate_suppression.py` (read-only; 0 confirmed, 2 not yet, 3
+contradicted). Already proven deterministically in `9e8c439`.
+
+**Open question with a known answer-shape.** Whether the `agent_watch` menu branch may be
+restricted to waiting states (Part 37). Needs one datum: a genuine menu observed with its
+inventory state. `ad0aab6` now records it; none has appeared on any agent but this one.
