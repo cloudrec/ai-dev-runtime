@@ -4641,3 +4641,35 @@ not claimed as either.** Two things follow, both recorded rather than acted on:
 * `agent_control.py` and `agent_orchestrator.py` are the commander path, not the wake-policy
   scope authorised here, and the agent involved is ACAP. Changing either needs its own
   authorisation; nothing was touched.
+
+---
+
+# Part 36 — a checker for the one claim production could not settle
+
+The gate-suppression branch of `66fe932` is provable in isolation (`9e8c439`) but not in
+production until a 6 h dedup window expires. `tools/verify_gate_suppression.py` encodes the
+predicate so it is evaluated the same way whenever it is run, rather than re-derived by hand
+each time.
+
+Read-only by construction: the database is opened `mode=ro` through a URI, and a run was
+confirmed to leave `control_plane.db` byte-identical. Exit codes are 0 confirmed, 2 not yet
+observable, **3 contradicted** — a post-expiry gate event that still woke the owner must read
+as a failure, never as green.
+
+The evidence rule is the point. An `agent_continuation_exhausted` counts only if it was
+emitted at or after **its own target's** window expiry; anything earlier could have been
+silenced by the dedup rather than by the fix, which is exactly the confusion Part 32 fell
+into. Expiry is per target, so one agent's expired window cannot vouch for another's.
+
+Two arithmetic traps met during this investigation are documented in the module and avoided
+in it: `event.ts` is ISO with a `T` separator and mis-sorts against `datetime('now')`, so
+`ts_epoch` is used; and `strftime('%s','now')` returns TEXT while SQLite orders every numeric
+below every string, so the comparison is cast. Both produced confidently wrong answers today —
+a 10× dead-letter "spike" that was not real, and an "EXPIRED" window that had 117 minutes left.
+
+**The checker's own first version was wrong too**, and its tests caught it: expiries were
+keyed off the latest gate event per target rather than the first, so the deadline moved
+forward with every new event and nothing could ever qualify. Fixed to take the first.
+
+5 tests; reverting the evidence filter fails three of them. Current production reading:
+`status=masked`, earliest observable **03:28:35 UTC**.
