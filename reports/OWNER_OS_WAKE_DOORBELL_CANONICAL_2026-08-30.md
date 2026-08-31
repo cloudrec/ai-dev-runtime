@@ -4673,3 +4673,46 @@ forward with every new event and nothing could ever qualify. Fixed to take the f
 
 5 tests; reverting the evidence filter fails three of them. Current production reading:
 `status=masked`, earliest observable **03:28:35 UTC**.
+
+---
+
+# Part 37 — the evidence Part 29 lacked has arrived, and it is still not enough
+
+Part 29 proposed restricting the menu branch of `agent_watch` to inventory states
+`waiting_owner`/`waiting_input`, and explicitly did **not** make the change because the
+stored payloads could not show what the inventory had reported. `ad0aab6` closed that gap,
+and the first samples are in:
+
+| Event | State | Branch | Excerpt |
+|---|---|---|---|
+| 16300 | `idle` | `decision_prompt_at_bottom` | "no push. Genuine owner gates remaining: 1. systemctl…" |
+| 16310 | `idle` | `decision_prompt_at_bottom` | "diagnosable. Genuine owner gates — untouched, none c…" |
+| 16279 | `idle` | `paused_waiting_text_at_bottom` | (blocker branch, not the menu branch) |
+
+So the first half is now **proven rather than suspected**: the menu branch does fire on panes
+the inventory calls `idle`, and both instances are this supervisor's own numbered prose,
+raised as `agent_prompt_needs_response` with `owner_action_required=1`.
+
+**The change still is not justified, and here is the missing half.** Restricting the branch
+to waiting states is only safe if a genuine CLI menu always presents with a waiting state.
+Nothing in the data says it does. Worse, the mechanism argues against it:
+`agent_control._STATE_WAIT_OWNER_RE` recognises `(y/n)`, "do you want", "shall i",
+"proceed?", "which option", "choose an option" — and the event 4088 shape ("What should I do
+next?" followed by unnumbered-vocabulary options) matches **none** of them. A real
+five-option menu could therefore sit on an `idle` pane, and the proposed narrowing would
+silence exactly the case the menu branch exists to catch.
+
+The other two prompt paths do not cover that gap either: `_OWNER_PROMPT_RE` needs the yes/no
+vocabulary the 4088 shape lacks, and `_BLOCKER_RE` needs paused/waiting wording.
+
+**Decision: no classifier change.** Part 29 withdrew a length heuristic after it broke a real
+captured menu; narrowing on state now, with the misfire half proven and the safety half
+unmeasured, would repeat that mistake with better evidence for the wrong side of it.
+
+**The one datum still needed:** a genuine menu observed together with its inventory state.
+`ad0aab6` records exactly that field, so the next real menu on any agent settles it — if it
+carries a waiting state, the narrowing is safe and worth making; if it carries `idle`, the
+idea is dead and the menu branch must stay as it is.
+
+Until then the cost is bounded and measured: two false prompts in roughly two hours, both on
+the supervisor's own pane, which is denylisted from supervision. Recorded, not fixed.
