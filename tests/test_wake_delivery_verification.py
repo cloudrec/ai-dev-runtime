@@ -35,11 +35,20 @@ def _iso(tmp_path, monkeypatch):
     yield
 
 
+# The stop-button selector, read from the module so the fake cannot drift from it.
+_STOP_BUTTON_SEL_TXT = getattr(cdp, "_STOP_BUTTON_SEL", "stop-button")
+
+
 class _S:
     """Fake CDP session. `turns` are the successive user-turn counts the page reports."""
 
     def __init__(self, bools, turns):
-        self.bools = list(bools)
+        # `bools` is kept in the signature so every call site reads unchanged, but it is
+        # no longer a queue: the four historical positions were always focus, composer
+        # non-empty, send enabled, composer cleared, and all twelve callers pass True for
+        # each. They become named flags that the predicates below read.
+        b = list(bools) + [True] * 4
+        self.focused, self.nonempty, self.send_enabled, self.cleared = b[0], b[1], b[2], b[3]
         self.turns = list(turns)
         self.inserted = []
 
@@ -49,15 +58,37 @@ class _S:
         return {}
 
     def boolean(self, expression):
-        if "readyState" in expression:
+        """Answer by WHAT IS ASKED, never by call order.
+
+        This used to be `self.bools.pop(0)`, a positional queue. Every one of the twelve
+        call sites passes the same `[True, True, True, True]`, so the queue encoded no
+        per-test variation whatsoever — only a dependency on how many probes the composer
+        happens to make, and in what order. Adding or reordering a probe therefore broke
+        tests that had nothing to do with the change, and running this file alone versus
+        after its neighbours gave different results: 8 failures in isolation, none in one
+        particular six-file combination. The stop-button probe already carried a comment
+        describing exactly this trap; the rest of the queue had the same flaw.
+
+        Keyed on the expression instead, the fake cannot desynchronise.
+        """
+        e = expression or ""
+        if "readyState" in e:
             return True
-        if "stop-button" in expression:
-            # The back-pressure probe, answered STRUCTURALLY like readyState so it does
-            # not consume the scripted queue below. Without this, adding an
-            # infrastructure check to the composer silently shifts every expectation in
-            # this file — which is exactly what happened when it was added.
+        if _STOP_BUTTON_SEL_TXT in e:
             return getattr(self, "generating", False)
-        return self.bools.pop(0) if self.bools else None
+        if cdp.STREAMING_CONTENT_SEL in e:
+            return getattr(self, "streaming", False)
+        if "activeElement" in e:
+            return self.focused
+        if "textContent.length === 0" in e or "length === 0" in e:
+            return self.cleared
+        if "textContent.length > 0" in e or "length > 0" in e:
+            return self.nonempty
+        if "aria-disabled" in e or cdp.SEND_SEL in e:
+            return self.send_enabled
+        if "dialog" in e.lower():
+            return getattr(self, "dialog_trap", False)
+        return None
 
     def count(self, selector):
         if selector == cdp.USER_TURN_SEL:
@@ -71,8 +102,16 @@ class _S:
         pass
 
 
-def _wire(monkeypatch, *, bools, turns):
+def _wire(monkeypatch, *, bools, turns, degraded=None):
     s = _S(bools, turns)
+    # THE fix for this file's flakiness. `browser_degraded()` asks the REAL browser how
+    # many tabs it holds, so these tests silently depended on the live Chromium having at
+    # most CDP_MAX_PAGES (12) pages. When it reached 13 they all began failing with
+    # `browser_degraded:too_many_pages:13`, before the fake session was ever consulted —
+    # which is why the file passed earlier in the day and failed later with no code change
+    # between. A unit test must not depend on how many tabs a browser happens to have.
+    monkeypatch.setattr(cdp, "browser_degraded",
+                        lambda *a, **k: degraded or {"degraded": False})
     monkeypatch.setattr(cdp, "page_responsive", lambda t, timeout=8.0: True)
     monkeypatch.setattr(cdp, "find_target", lambda url: {"webSocketDebuggerUrl": "ws://x"})
     monkeypatch.setattr(cdp, "_Session", lambda ws: s)
