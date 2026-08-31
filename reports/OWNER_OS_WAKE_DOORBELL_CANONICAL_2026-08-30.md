@@ -4351,3 +4351,68 @@ the tree.
 
 No safe non-restart work remains. Nothing was restarted; no credential, secret, external
 account, payment path or production integration was touched.
+
+---
+
+# Part 31 — activation: five fixes live and proven on real agents, one still gated
+
+Activated through the sanctioned mechanism only — `guarded_deploy.sh` with a green hard-stop
+gate, backup first, and a `restart` verb that `service_ops_policy` permits and this session
+had already used six times. No classifier bypassed, no blocked path mutated.
+
+| Step | Result |
+|---|---|
+| Backup | `/root/owner-os-backups/wake-policy-activation-20260831T000432Z` — both DBs via online `.backup`, all six sources, HEAD `e5f7cd2`, prior PID, 9-pane inventory |
+| Gate | **274 passed**, six modules, exit 0 |
+| Restart | `owner-os-wake-companion.service`, PID 1237646 → 1792587 |
+| Health | active; `worker_skew()` **CLEAR** (was 4 427 s behind) |
+| Fleet | 9 agents, `duplicates: []`, `tmux_control: ok`, pane set **identical** to the pre-restart record |
+
+## Proof on real agents
+
+**`ad0aab6` — observability.** Events 16275 and 16279 carry `state` and `class_reason`,
+absent from every prior event. 16275 reads `state=idle`,
+`class_reason=at_rest_unchanged_for_322s`; 16279 reads `paused_waiting_text_at_bottom` —
+which immediately settles that it came from the blocker branch, not the menu branch. That is
+exactly the question Part 29 could not answer about 15817/16042/16177.
+
+**`66fe932` — the cap.** Four continuations after the restart with no user or ChatGPT input:
+`arbitrage2-fable` at 00:01:48 and 00:15:05, `gaika-opus` at 00:04:46 and 00:16:59, all
+`continued_same_agent`. `arbitrage2-fable` is the agent that had been falsely terminal-gated;
+it is continuing again, and `gate_exemption` now stops its intentional waits re-gating it.
+
+**Genuine gates stayed parked**, in the same window: `intentional_external_wait` ×4 — armed
+monitors correctly skipped rather than escalated — and `not_in_rollout_allowlist` ×3, the
+denylisted value-bearing projects untouched.
+
+**`01f53c7` — prompt premise.** Live, and it retired a backlog nobody had noticed: watches
+5555, 5559, 5561, 5562 and 5566 for `payorch-sonnet-fixes:0.0` — event ids from weeks ago —
+all resolved `prompt_no_longer_present` at 00:07:20. Those had been open indefinitely,
+unable to resolve because no pane-based signal could ever apply to them.
+
+**`a5b930e` — project and route separated.** New watches store both distinctly:
+`gaika-opus:0.0` → project `gaika-opus`, route `gaika-extension`;
+`owner-os-wake-policy-opus:0.0` → project `ai-dev-runtime`, route `owner-os`. Under the old
+code both fields would have read the route. Event 16273 (`wake_loop_stalled`) is filed under
+project **`mess`** — the agent's real project. Its `route_key` is empty because that watch
+row predates the column, which is the expected behaviour for pre-existing rows.
+
+## The sixth fix is genuinely blocked, and the blocker is isolated
+
+`c403ca0` is inert and measurably so: three dead letters since the restart, under **three
+distinct** `deadletter:<notification_id>` keys — the pre-fix per-message form. It lives in
+`core/control_plane/notifier.py`, which the companion **never imports** (`grep` count 0). It
+runs in the control-plane engine inside `ai-runtime.service`, whose process started
+21:07:17Z, before the file was written at 23:02:48 local.
+
+**Exact sanctioned owner-only operation:** `systemctl restart ai-runtime.service`. It
+activates `c403ca0` and nothing else. Not performed here: that daemon is the shared Owner OS
+API other projects call, so restarting it is not this project's service to bounce, and
+project memory records its restart as owner-gated.
+
+Telegram remains degraded by design — `unhealthy`, still dead-lettering, no credential
+touched, and continuation is unaffected by it throughout.
+
+**Push remains refused.** No authorization exists; the canonical record says "local commits
+only, no remote push" in three places, and the branch cannot be scoped — publishing one of
+today's commits publishes all 38.
