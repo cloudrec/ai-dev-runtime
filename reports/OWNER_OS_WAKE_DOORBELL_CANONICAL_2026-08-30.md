@@ -5174,3 +5174,56 @@ into* a value-bearing pane — an owner decision, not a conflation.
 
 **Auction cannot be instrumented at all:** zero hook events in 24 h, session state `shell`,
 started a day ago. Nothing to observe there yet, so no acceptance claim about it is founded.
+
+---
+
+# Part 44 — verified all-clear on the three properties, and `27b09b6` confirmed live
+
+Verification pass over the instrumentable projects. Auction treated as non-instrumentable
+(zero hook events, `shell` session) and not forced. No code change was warranted; none made.
+
+## 1. Native hook events are durably ingested — 8 of 9 live panes
+
+650 `claude_hook` events across 12 working directories in 24 h:
+`arbitrage2-fable-audit` 143 · `ai-dev-runtime` 120 · `payment-orchestrator` 95 · `seo` 83 ·
+`gaika-extension` 69 · `mess` 53 · `cp-canary-v2` 41 · `capacity` 28 · `email` 10, plus three
+minor paths. Every live pane except `/opt/diamond/auction` is ingesting.
+
+## 2. Genuine owner gates route independent of the denylist — measured, not assumed
+
+Denylisted projects raised **67** owner-actionable events in 24 h and **47 woke**:
+
+| Project | Waking event types |
+|---|---|
+| `email` | `agent_waiting_input` 12/15, `agent_prompt_needs_response` 7/8, `wake_loop_no_progress` 6/6, `wake_loop_stalled` 6/6 |
+| `capacity` | `agent_waiting_input` 6/11, `agent_prompt_needs_response` 1/1 |
+| `payment-orchestrator` | `wake_loop_no_progress` 5/5, `agent_waiting_input` 2/3 |
+| `auction` | `agent_waiting_input` 1/1, `wake_loop_no_progress` 1/1, `wake_loop_stalled` 1/1 |
+
+Auction is the sharpest case: denylisted **and** without hooks, its gates still route — through
+the tmux/quiescence fallback into the owner-facing wake path, which never consults the
+denylist. That is the separation working end to end.
+
+**Every non-woken event has a documented reason**, checked individually rather than assumed:
+`cooldown_active`, `actionable_cooldown_active`, `already_woke_for_this_event`. No silent
+drops, no missing audit rows. Rate limiting and dedupe, not suppression.
+
+## 3. Value-bearing sends stay blocked — zero, ever
+
+`native_supervisor` deliveries to `capacity-blockchain:0.0`, `diamond-auction:0.0`,
+`payorch-monitor-clean:0.0` and `email:0.0`, across the whole `deliveries` table joined to
+`delivery_attribution`: **0**. Not "none recently" — none at all.
+
+## `27b09b6` confirmed live
+
+Part 42 recorded the new block-reason vocabulary as test-proven but not yet in the live
+journal. It is now: **5** `value_bearing_send_blocked` rows for `payorch-monitor-clean:0.0`,
+against the 88 historical `not_in_rollout_allowlist` rows that preceded the split. The journal
+now says *why* a target is not typed into.
+
+## Remaining
+
+The only marker still unexercised is `4cf8ab2`'s — an idle-sweep row carrying `exempt`; every
+gate so far has come through the event path. Owner gates unchanged: `ai-runtime` restart for
+`c403ca0`, `TELEGRAM_CHAT_ID`, cp-canary recovery, ACAP C2, push. The external-wait TTL
+question from Part 43 remains an owner policy choice.
