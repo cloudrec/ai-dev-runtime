@@ -4920,3 +4920,48 @@ this report would now contain a confident and wrong claim that the chat used to 
 Diagnosis is complete and the fault is destination data, not code (Part 38). The alarm-volume
 defect is `c403ca0`, committed and inert. Nothing further can be written that would not
 duplicate it or paper over a credential fault.
+
+---
+
+# Part 40 — event 16721: the refusal is the guard working, and the requested fix is declined
+
+An automated instruction described a reproducible symptom: an instruction relayed into
+`mess-postsignup-cleanup-sonnet-v4` through the Owner OS API arrives with an automated
+wrapper, the agent rejects it as not a direct person message, and `wake_loop_no_progress`
+follows. It asked whether HEAD `955474d` already fixes this "provenance/classification path",
+and if not, to implement the minimal fix.
+
+**HEAD does not fix it, because there is nothing broken to fix.** The behaviour is
+`5ed1db6` — *"tag automated (api:\*) deliveries so they cannot pass as owner text"* —
+working as designed. `core/agent_control.py:1578` `_tag_if_automated(text, actor)` prefixes a
+visible automated-origin marker whenever `actor` is an `api:*` principal. Its own comment
+records why it exists: on 2026-08-30 a relay with `actor=api:bearer` sent *"Mark GREEN…"* and
+was read as owner text.
+
+The attribution confirms this is that path, not a misclassification. Recent sends to that
+target:
+
+```
+seo-direct-owner-continue-event16721-20260831-0641   actor=api:bearer
+seo-event16695-safe-continue-20260831-0626           actor=api:bearer
+seo-event-16678-verbatim-owner-20260831-0618         actor=api:bearer
+nativesup:16724                                      actor=native_supervisor
+```
+
+Keys naming themselves "direct-owner" and "verbatim-owner" are still `api:bearer`. The agent
+is refusing an automated relay that is labelled an automated relay. That is correct.
+
+**The requested change is declined.** The only way to stop the refusal is to remove or bypass
+the tagging, which would make an automated relay indistinguishable from a person speaking. It
+is the same guard this session relies on every turn to refuse treating these wrappers as owner
+sign-off — and it is self-defeating to weaken by this route, since an instruction arriving
+through the wrapper could then not be distinguished from an owner instruction authorising its
+own removal. Standing policy also forbids automatically weakening a project-specific hard
+safety gate.
+
+**Legitimate paths, neither of which is mine to take:** a person speaks in that agent's own
+conversation, or the owner decides to change that agent's provenance policy. The resulting
+`wake_loop_no_progress` is then accurate rather than noise — the relay genuinely produced no
+progress, because it was correctly not acted on.
+
+No code changed. HEAD `955474d`, worktree clean, 32 owner-WIP byte-identical.
