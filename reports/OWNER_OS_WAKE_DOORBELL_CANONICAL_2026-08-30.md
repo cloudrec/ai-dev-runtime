@@ -5634,3 +5634,129 @@ Two owner decisions stand:
    `code_change` job in this repository will be rolled back unvalidated — now
    saying so accurately, which is the whole of what Part 50 buys without a
    restart.
+
+---
+
+# Part 51 — the critical lane was 95% false, and the rest would not say why
+
+Part 50 ended with two owner gates and no more safe code work in sight. Asking a
+different question — not "what is broken" but "what is this system actually
+telling its owner" — found that almost nothing in its most severe lane was true.
+
+## The measurement
+
+24 hours of events, by type and severity:
+
+```
+  835  agent_turn_stopped                     info
+  310  notification_dead_letter               critical
+  191  work_stopped_incomplete                high
+  138  agent_process_failed                   critical
+   ...
+   61  wake_loop_no_progress                  high
+   43  notifications_red                      critical
+   34  wake_loop_stalled                      critical
+```
+
+Two classes carry the critical lane. Both were examined; both were wrong, in
+different ways.
+
+## 1 — the provider usage limit had a second door
+
+Of 138 `agent_process_failed` criticals, **134 arrived via `claude_hook`, and 131
+of those carried the Part 49 banner** — `"You've hit your weekly limit …"`. The
+remaining three were real (`Prompt is too long`, two `Connection lost
+mid-response`).
+
+**95% of the system's most severe alert class described agents that were alive,
+had not crashed, had not completed, and needed nothing from an owner.**
+
+Part 49 fixed the pane-scraping path. `hooks/owneros_hook.py` never read the
+message at all:
+
+```python
+if ev == "StopFailure":
+    # The turn ended in an error the session could not recover from.
+    return ("agent_process_failed", "critical", True)
+```
+
+Unconditional. And this is the *louder* door: the pane path fires once per pane
+per digest, while the hook fires per turn against a 15-minute dedup window — so
+five sessions sitting against a weekly limit produced a steady critical every few
+minutes for sixteen hours. Fixing only the scraped path in Part 49 left the
+larger half running, which is why the ledger looked unchanged afterwards.
+
+`_is_provider_limit()` reuses `agent_watch._PROVIDER_LIMIT_RE` rather than
+copying it — one vocabulary, so a reworded banner is taught to both doors at
+once — and checks `last_assistant_message`, `message` and `error_details`,
+because which field carries the text is the runtime's choice. It fails **closed**:
+if the shared vocabulary cannot be imported, the StopFailure keeps its critical
+mapping, because losing a real crash costs strictly more than repeating a false
+alarm this already narrows.
+
+Downstream, it also retires alarms built on top of the false ones: 6 of 34
+`wake_loop_stalled` and 14 of 61 `wake_loop_no_progress` in the same window trace
+back to a quota-banner critical that should never have been wake-capable.
+
+## 2 — a dead letter that would not say why
+
+The other 310 criticals are one fact repeated: Telegram is not delivering. Their
+entire payload:
+
+```json
+{"notification_id": 4184, "channel": "telegram", "attempts": 5,
+ "dedup_key": "doctor:email:0.0:LOST_CONTINUATION:39160b69b74f88b2"}
+```
+
+`owner_action_required=True`, and nothing an owner could act on. The reason was
+never missing — only dropped. `deliver()` computes a real per-tier rejection on
+every attempt and returns it in `attempts[].detail`, but the dead-letter branch
+fires on a *later* drain, once the row crosses max_attempts, by which time that
+value is gone. The cause sat one table away the whole time:
+
+```
+channel.last_error = "telegram send failed: Bad Request: chat not found"
+```
+
+A chat id the bot cannot post to — extracted from the HTTPError body by an
+earlier fix precisely so it would be diagnosable, then never carried anywhere an
+owner reads. The dead letter now carries `reasons` per tier and names the cause
+in `action_taken`, read once per drain. It stays best-effort in both directions:
+an alarm that fails because its own explanation failed to load is strictly worse
+than an unexplained alarm.
+
+**The Telegram misconfiguration itself is not touched** — `configs/.env`, beside
+`RUNTIME_TOKEN`, owner-gated. What changes is that the ledger now names the one
+thing to fix instead of repeating that something is wrong.
+
+## The suite-duration question, answered and closed
+
+Part 50 left the validation cap as an owner decision. Before accepting that, the
+suite was profiled to see whether the 600 s cap could be met instead of raised:
+
+| | |
+|---|---|
+| Total | 682 s, 2 892 tests |
+| Slowest 45 tests | ~205 s combined |
+| Everything else | ~477 s across 2 847 tests, ~0.17 s each |
+
+There is no small set of pathological tests to fix — the cost is broad and
+structural, roughly one sqlite-backed setup per test. Two slow outliers exist
+(45 s, 36 s) but removing both would not close a 100 s gap that keeps growing.
+`pytest-xdist` is not installed, and installing it is itself an environment
+change. **Raising `RUNTIME_TEST_TIMEOUT` remains the right answer, and remains an
+owner decision.** The question is now closed rather than open.
+
+## State
+
+| | |
+|---|---|
+| Commits | `99b6c2f`, `7fee855` on `ai-runtime/220-windows-bridge` |
+| Gate | **2 904 passed**, exit 0 |
+| Guard tests | 8 + 4; each verified failing with its fix reverted |
+| Expected effect | ~131 fewer false criticals/day, ~20 fewer derived wake-loop alarms/day, and the remaining 310 gain a cause |
+
+Both fixes are committed and **inert** — the hook runs from the checkout, so it
+takes effect for sessions started after it lands, and the notifier runs inside
+`ai-runtime.service`, which has not been restarted. The two owner gates from
+Part 50 stand unchanged, and a third is now named: the Telegram chat id.
