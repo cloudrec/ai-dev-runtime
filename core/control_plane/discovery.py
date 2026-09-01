@@ -126,6 +126,34 @@ def discover(inventory: Optional[dict] = None, *, config: Optional[dict] = None,
             if match and match["target"] != target and match["target"] not in live_targets:
                 renamed_from = match["target"]
                 api.set_lifecycle(match["target"], DEAD)   # old target retired (renamed)
+                # The watcher tracks panes by tmux target, so the old name is about to
+                # stop appearing in its inventory — and absence is how it recognises a
+                # crash. Retiring the watch state here is the only moment anything knows
+                # the difference between "renamed" and "died".
+                #
+                # But the match above is NOT strong enough to silence a crash alarm on.
+                # `conv` comes from the CWD, not the pane, so every agent working in the
+                # same directory carries the same conversation id: a pane that genuinely
+                # died and a DIFFERENT pane that replaced it in that directory are
+                # indistinguishable by conversation alone. A rename moves a label and
+                # keeps the process, so process continuity is the evidence that separates
+                # them, and the pid is already in both records. Without pid equality the
+                # registry still reconciles exactly as before — one row, no duplicate —
+                # and the watcher is left to reach its own verdict, because the cheap way
+                # to stop a false crash alarm is to stop reporting crashes.
+                same_process = False
+                try:
+                    same_process = bool(a.get("pid")) and \
+                        int(match.get("pid") or 0) == int(a.get("pid"))
+                except (TypeError, ValueError):
+                    same_process = False
+                if same_process:
+                    try:
+                        from core import agent_watch as _aw
+                        _aw.retire(renamed_from, reason=f"renamed to {target}",
+                                   by="discovery")
+                    except Exception:  # noqa: BLE001 — must not break the sweep
+                        pass
 
         reg = api.register_agent(target, session=session, cwd=cwd, pid=a.get("pid"),
                                  command=a.get("command"), conversation_id=conv or "")

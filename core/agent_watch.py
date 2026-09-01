@@ -80,6 +80,42 @@ def is_suppressed(target: str, conn=None, now: Optional[float] = None) -> bool:
         if own:
             conn.close()
 
+
+# A rename is not a death. `core.control_plane.discovery` reconciles a renamed pane by
+# conversation_id and retires the OLD target — but this module tracks panes by tmux
+# target alone, so the old name simply stopped appearing in the inventory and the
+# vanish path published `agent_process_failed` (critical, owner action required) for a
+# process that was alive under its new name. Event 18172 declared
+# `owner-os-wake-policy-opus:0.0` crashed 18 seconds after event 18170 recorded that
+# exact target as `renamed_from` of a live agent. Discovery already knows; it just had
+# no way to say so. This is that way.
+def retire(target: str, *, reason: str, by: str = "control_plane", conn=None,
+           now: Optional[float] = None) -> dict:
+    """Forget a target that no longer exists UNDER THIS NAME (renamed, not died).
+
+    Drops the watch state, so the vanish path has nothing to miss and cannot conclude a
+    crash from the absence; drops any suppression row, which is meaningless for a name
+    nothing will answer to again; and retires crash alerts already published for it,
+    because they are false in exactly the way a recovered pane's are.
+    """
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        target = (target or "").strip()
+        if not target:
+            return {"ok": False, "target": target, "reason": "empty target"}
+        retired = _retire_crash_alerts(conn, target, now,
+                                       f"target retired: {reason}")
+        conn.execute("DELETE FROM agent_watch_state WHERE target=?", (target,))
+        conn.execute("DELETE FROM agent_watch_suppress WHERE target=?", (target,))
+        conn.commit()
+        return {"ok": True, "target": target, "by": by, "reason": reason[:200],
+                "retired_events": retired}
+    finally:
+        if own:
+            conn.close()
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS agent_watch_state (
     target TEXT PRIMARY KEY,
@@ -709,6 +745,16 @@ def _reconcile_recovered_crash(conn, target: str, now: float) -> list:
     un-invalidated agent_process_failed event for this target invalid (audited
     overlay, event rows untouched) and acknowledges their pending wakes so a
     recovered process cannot keep paging as dead."""
+    return _retire_crash_alerts(
+        conn, target, now,
+        f"process observed alive at {now_iso()} — transient/recovered, "
+        "not a current crash")
+
+
+def _retire_crash_alerts(conn, target: str, now: float, reason: str) -> list:
+    """Mark this target's outstanding `agent_process_failed` events invalid and
+    acknowledge their pending wakes. The event rows are never touched — this is a
+    labelled overlay, so the audit trail keeps every mistake."""
     retired = []
     try:
         rows = conn.execute(
@@ -717,9 +763,7 @@ def _reconcile_recovered_crash(conn, target: str, now: float) -> list:
             "AND e.type='agent_process_failed' AND e.agent_id=? "
             "AND i.event_id IS NULL ORDER BY e.id DESC LIMIT 5", (target,)).fetchall()
         for (eid,) in rows:
-            mark_invalid(eid, reason=f"process observed alive at {now_iso()} — "
-                                     "transient/recovered, not a current crash",
-                         by="agent_watch", conn=conn, now=now)
+            mark_invalid(eid, reason=reason, by="agent_watch", conn=conn, now=now)
             try:
                 from core import wake_bridge
                 wake_bridge.acknowledge(eid, conn=conn, now=now)
