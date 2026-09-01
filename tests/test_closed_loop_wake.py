@@ -1038,3 +1038,127 @@ def test_the_companion_passes_project_and_route_separately():
     assert 'project_id=p.get("project_id"' in call
     assert 'route_key=p.get("route_key"' in call
     assert 'project_id=p.get("route_key"' not in call     # the original defect
+
+
+# ── one agent, two names (2026-09-01) ───────────────────────────────────────
+# 34 `wake_loop_stalled` criticals in 24 h, and every one of their deliveries had
+# already recorded `submitted_and_assistant_started_generating` — the wake landed
+# and the assistant began generating. The watchdog escalated anyway.
+#
+# `agent_watch` files events under the tmux target (`gaika-opus:0.0`); the native
+# hooks file theirs under `session:<conversation[:12]>`, because a hook knows its
+# session and not the tmux world. Both are the same agent. `_progress_since`
+# counted only one name, so it could not see `agent_turn_stopped` — at 835 events
+# a day the most abundant proof of life in the system. A session-form target was
+# worse off still: `agent_watch_state` is keyed by tmux target, so it has no row
+# there at all and `pane_alive_and_working` could never resolve it.
+#
+# This module already names the defect for `runtimejob:` targets — "a job has no
+# pane, so `_progress_since` can NEVER see progress for one; every runtimejob
+# watch is a guaranteed future false positive". A plain agent had it too.
+
+CONV = "cc43ebcf-6474-428f-a3e5-c034ba244e85"
+PANE = "gaika-opus:0.0"
+ALIAS = "session:cc43ebcf-647"
+
+
+def _register_agent(conn, target=PANE, conv=CONV, cwd="/opt/gaika-extension"):
+    from core.control_plane import api
+    api.register_agent(target, session=target.split(":")[0], cwd=cwd,
+                       conversation_id=conv, conn=conn)
+
+
+def _emit_calls():
+    calls = []
+
+    def emit(source, etype, **kw):
+        calls.append(etype)
+        return {"event_id": 9000 + len(calls)}
+    return calls, emit
+
+
+def test_the_two_names_resolve_to_each_other(conn):
+    _register_agent(conn)
+    assert ALIAS in clw._identities(conn, PANE)
+    assert PANE in clw._identities(conn, ALIAS)
+
+
+def test_a_target_always_lists_itself_first(conn):
+    """Best-effort by construction: never fewer identities than before."""
+    assert clw._identities(conn, "unknown:0.0")[0] == "unknown:0.0"
+    assert clw._identities(conn, "runtimejob:abc")[0] == "runtimejob:abc"
+    assert clw._identities(conn, "")[0] == ""
+
+
+def test_hook_progress_under_the_session_name_suppresses_the_rewake(conn):
+    """The exact false positive: the agent is working and saying so every turn,
+    under the only name a hook can know."""
+    _register_agent(conn)
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=71, target=PANE, project_id="gaika-extension",
+                          conn=conn, now=NOW)
+    cto.emit("claude_hook", "agent_turn_stopped", agent_id=ALIAS,
+             project_id="gaika-extension", conn=conn)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r["rewoken"] and calls == []
+
+
+def test_pane_progress_reaches_a_watch_registered_on_the_session_name(conn):
+    """The same blindness in the other direction."""
+    _register_agent(conn)
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=72, target=ALIAS, project_id="gaika-extension",
+                          conn=conn, now=NOW)
+    cto.emit("agent_watch", "agent_state", agent_id=PANE,
+             project_id="gaika-extension", conn=conn)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r["rewoken"] and calls == []
+
+
+def test_a_session_watch_resolves_on_the_panes_working_class(conn):
+    """`agent_watch_state` is keyed by tmux target, so a session-form watch could
+    never be resolved by `pane_alive_and_working` before this."""
+    _register_agent(conn)
+    aw._conn(conn)                       # ensure agent_watch's own schema exists
+    conn.execute("INSERT OR REPLACE INTO agent_watch_state (target, cls) VALUES (?,?)",
+                 (PANE, "working"))
+    conn.commit()
+    assert clw._resolution_reason(conn, event_id=73, target=ALIAS) == \
+        "pane_alive_and_working"
+
+
+def test_a_genuinely_silent_agent_still_escalates(conn):
+    """The cheap way to end false stalls is to stop reporting stalls. Nothing
+    happens under EITHER name here, and the escalation must survive."""
+    _register_agent(conn)
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=74, target=PANE, project_id="gaika-extension",
+                          conn=conn, now=NOW)
+    clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    clw.slo_scan(conn=conn, now=NOW + 2 * clw.WAKE_LOOP_SLO_SECS + 60, emit_fn=emit)
+    assert calls == ["wake_loop_no_progress", "wake_loop_stalled"]
+
+
+def test_another_agents_activity_is_still_not_progress(conn):
+    """Widening the identity set must not widen it to the whole fleet."""
+    _register_agent(conn)
+    _register_agent(conn, target="mess-opus:0.0", conv="90df737f-85c7-40e1-0000-000000000000",
+                    cwd="/opt/mess")
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=75, target=PANE, project_id="gaika-extension",
+                          conn=conn, now=NOW)
+    cto.emit("claude_hook", "agent_turn_stopped", agent_id="session:90df737f-85c",
+             project_id="mess", conn=conn)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert [e["event_id"] for e in r["rewoken"]] == [75]
+
+
+def test_an_unreadable_registry_never_claims_resolution():
+    """Unknown must never mean resolved: a lookup that raises yields the target
+    alone, which is exactly the behaviour that existed before aliases."""
+    class Broken:
+        def execute(self, *a, **kw):
+            raise RuntimeError("registry unreadable")
+
+    assert clw._identities(Broken(), PANE) == (PANE,)
+    assert clw._watch_state_cls(Broken(), PANE) == ""

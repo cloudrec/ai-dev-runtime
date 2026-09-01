@@ -226,6 +226,62 @@ def _armed_external_wait(conn, target: str, now: float) -> bool:
     return bool(p.get("background_tasks")) or bool(p.get("session_crons"))
 
 
+def _identities(conn, target: str) -> tuple:
+    """Every agent_id the SAME agent's events are recorded under.
+
+    One agent speaks with two names here. `agent_watch` writes events under the tmux
+    target (`gaika-opus:0.0`); the native hooks write theirs under
+    `session:<conversation[:12]>`, because a hook knows its session and not the tmux
+    world. Both are that agent, and a watch registered under one name was blind to
+    everything it did under the other — including `agent_turn_stopped`, the most
+    abundant proof of life in the system at 835 events a day.
+
+    This is the same defect this module already names for `runtimejob:` targets: an
+    identity whose activity `_progress_since` structurally cannot see is a guaranteed
+    future false positive. It was simply not noticed that a plain agent has the problem
+    too, in both directions — a session-form target additionally has no
+    `agent_watch_state` row at all, so `pane_alive_and_working` could never resolve it.
+
+    Returns the target plus any alias, target first. Best-effort: on any failure the
+    caller gets exactly today's behaviour, never fewer identities than it had.
+    """
+    out = [target]
+    try:
+        if target.startswith(_SESSION_TARGET_PREFIX):
+            prefix = target[len(_SESSION_TARGET_PREFIX):]
+            if prefix:
+                for (t,) in conn.execute(
+                        "SELECT target FROM agent WHERE substr(conversation_id,1,?)=? "
+                        "AND target NOT LIKE 'session:%' ORDER BY updated_at DESC LIMIT 2",
+                        (len(prefix), prefix)).fetchall():
+                    if t and t not in out:
+                        out.append(t)
+        elif not target.startswith(_RUNTIME_JOB_TARGET_PREFIX):
+            row = conn.execute("SELECT conversation_id FROM agent WHERE target=?",
+                               (target,)).fetchone()
+            conv = (row[0] if row else "") or ""
+            if conv:
+                alias = _SESSION_TARGET_PREFIX + conv[:12]
+                if alias not in out:
+                    out.append(alias)
+    except Exception:  # noqa: BLE001 — an unknown alias never means "resolved"
+        pass
+    return tuple(out)
+
+
+def _watch_state_cls(conn, target: str) -> str:
+    """agent_watch's current class for this agent, under whichever name it is filed."""
+    for ident in _identities(conn, target):
+        try:
+            row = conn.execute("SELECT cls FROM agent_watch_state WHERE target=?",
+                               (ident,)).fetchone()
+        except Exception:  # noqa: BLE001
+            return ""
+        if row and row[0]:
+            return row[0]
+    return ""
+
+
 def _resolution_reason(conn, *, event_id: int, target: str,
                        agents=None) -> Optional[str]:
     """Has the condition THIS watch exists for already resolved? Three independent
@@ -269,9 +325,8 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     if _armed_external_wait(conn, target, now_ts()):
         return "intentional_external_wait"
     try:
-        row = conn.execute(
-            "SELECT cls FROM agent_watch_state WHERE target=?", (target,)).fetchone()
-        if row and row[0] == "working":
+        cls = _watch_state_cls(conn, target)
+        if cls == "working":
             return "pane_alive_and_working"
         # task 221 (events 10268/10284, mess/chemmy-fast): an agent that finished its
         # authorized scope and is explicitly at rest (agent_watch's "completed" class —
@@ -286,7 +341,7 @@ def _resolution_reason(conn, *, event_id: int, target: str,
         # away from "completed", so this check stops applying on its own — no separate
         # reset logic is needed, and a NEW event for the same target starts its own
         # fresh watch regardless.
-        if row and row[0] == "completed":
+        if cls == "completed":
             return "agent_parked_completed"
         # The premise of a prompt wake is that a question is on screen. When agent_watch
         # has since reclassified the pane away from `owner_prompt`/`blocker`, that premise
@@ -300,7 +355,7 @@ def _resolution_reason(conn, *, event_id: int, target: str,
         # genuinely waiting agent still classifies `owner_prompt`/`blocker` and keeps
         # escalating; crash, failure and stop watches are untouched; and with no
         # agent_watch row at all nothing is claimed.
-        if row and row[0] in _NOT_PROMPTING_CLASSES:
+        if cls and cls in _NOT_PROMPTING_CLASSES:
             try:
                 ev = conn.execute("SELECT type FROM event WHERE id=?",
                                   (event_id,)).fetchone()
@@ -387,10 +442,11 @@ def _progress_since(conn, target: str, since_ts: float) -> bool:
     The watchdog's OWN bookkeeping events (source='closed_loop_wake' — the re-wake and
     the escalation it emits) are excluded: otherwise the re-wake's own event row would
     read as "progress" on the very next scan and the episode could never escalate."""
+    idents = _identities(conn, target)
     row = conn.execute(
-        "SELECT COUNT(*) FROM event WHERE agent_id=? AND ts_epoch > ? "
-        "AND source != 'closed_loop_wake'",
-        (target, since_ts)).fetchone()
+        "SELECT COUNT(*) FROM event WHERE agent_id IN (%s) AND ts_epoch > ? "
+        "AND source != 'closed_loop_wake'" % ",".join("?" * len(idents)),
+        (*idents, since_ts)).fetchone()
     return bool(row and row[0])
 
 
