@@ -5856,3 +5856,108 @@ named rather than guessed at.
 Committed and inert, like everything since Part 49 — the watchdog runs inside the
 wake companion, which has not been restarted. The three owner gates stand:
 restart the two services, raise `RUNTIME_TEST_TIMEOUT`, fix the Telegram chat id.
+
+---
+
+# Part 53 — a job on an owner gate is waiting, not stalled
+
+Part 52 retired 12 of 73 escalations and named what it had not explained: 61
+watches with no event under either name in their window. Rather than leave that
+as a guess, the residue was broken down by target kind.
+
+```
+still unexplained: 62
+by target kind: [('pane', 45), ('session', 9), ('runtimejob', 8)]
+```
+
+The `runtimejob` group is the one that should not exist at all. This module
+already resolves a runtime job whose status is terminal — the check exists
+precisely because "a job has no pane, so `_progress_since` can NEVER see progress
+for one". Eight had escaped it.
+
+## What they were doing
+
+```
+runtimejob:cd01ad71   status=waiting_approval   finished=None
+runtimejob:8ee3aa76   status=waiting_approval   finished=None
+runtimejob:a6f4c391   status=waiting_approval   finished=None
+runtimejob:35337a2c   status=waiting_approval   finished=None
+runtimejob:5e1bcdc8   status=waiting_approval   finished=None
+runtimejob:ede89203   status=waiting_approval   finished=None
+```
+
+Six of eight were parked on an **owner gate**. Checked at escalation time rather
+than merely now — each had its `owner_decision_required` event before the
+escalation and no terminal event in between — so this is what they were doing
+when the alarm fired, not what they drifted into afterwards. (The remaining two
+are the 2026-08-15 pair that predates the terminal check itself.)
+
+So: `runtime_events` announced the decision properly, once, as
+`owner_decision_required`. The job sat exactly where it must until a human acted.
+`_progress_since` saw nothing move — correctly, because nothing was moving — and
+the watchdog escalated `wake_loop_stalled`, **critical**, telling the owner a
+second and louder time about a decision already sitting in their queue. Re-waking
+cannot help. The only thing that ends the state is the owner.
+
+## The rule was already written down, in another file
+
+`core/runtime_watchdog.py`, module docstring:
+
+> `waiting_approval` is NEVER a stall: it is a true owner decision, announced
+> once by the lifecycle bridge (runtime_events), not re-announced here.
+
+And this module's own `intentional_external_wait` comment, about panes:
+
+> the owner is not told a second time about a state they already know is
+> intentional
+
+The rule existed twice. The closed-loop watchdog was simply not a party to
+either. That is the recurring shape of this whole sequence — Parts 50 through 53
+are all one half of the system knowing something the other half acts against.
+
+## The fix
+
+`waiting_approval` resolves the watch as `runtime_job_awaiting_owner`,
+deliberately **not** folded into the terminal set: the job is not finished, and
+conflating the two would let a parked job read as a completed one. It is
+self-limiting exactly as `agent_parked_completed` is — when the owner approves,
+the status leaves the set, and the next event for that job opens its own fresh
+watch.
+
+The set holds exactly one status. `runtime_events.EVENT_FOR_STATUS` is the
+authority on what both wakes and then parks; `draft` and `superseded` never wake
+at all, so they can never open a watch and are not listed on speculation. The
+test pins that reasoning against the mapping itself rather than restating the
+literal, so adding a future parking status to the bridge fails the test loudly
+instead of quietly regrowing this bug.
+
+## Combined effect, and what still is not explained
+
+| | |
+|---|---|
+| Escalations on record | 74 |
+| Retired by `8aba07f` (identity) | 12 |
+| Retired by `3d8d4bf` (owner gate) | 6 |
+| **Combined distinct** | **18 (24%)** |
+
+The remaining 56 are pane and session targets with no activity under any name.
+Their current `agent_watch_state` classes split 20 `crashed`, 14 `idle`, 11
+`working`, 9 with no row. `crashed` is a real failure and must keep waking;
+`idle` is deliberately excluded as ambiguous, a line drawn earlier and not
+revisited here. The `working` group should now resolve through
+`pane_alive_and_working`, which Part 52 taught to read either name.
+
+What remains genuinely open is the same weakness Part 52 named and this part does
+not repair: **"an event was recorded" is a poor proxy for "the agent is making
+progress"**, and a single turn that runs half an hour emits nothing while it
+works. Fixing that means finding a positive liveness signal rather than
+subtracting more exceptions, and it is not attempted on a guess.
+
+| | |
+|---|---|
+| Commit | `3d8d4bf` on `ai-runtime/220-windows-bridge` |
+| Gate | **2 917 passed**, exit 0 |
+| Guard tests | 5; 4 verified failing with the fix reverted |
+
+Committed and inert. The three owner gates are unchanged: restart the two
+services, raise `RUNTIME_TEST_TIMEOUT`, fix the Telegram chat id.
