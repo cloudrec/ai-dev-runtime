@@ -1119,3 +1119,25 @@ def test_the_word_done_in_prose_is_not_a_completion_stamp():
     assert not ac._TURN_DONE_RE.search(prose_done_live_turn)
     assert ac.classify_state(True, True, prose_done_live_turn) == "working"
     assert ac._TURN_DONE_RE.search("✻ Brewed for 39s · done 6:59 PM · 1 shell")
+
+
+# ── the external-blocked vocabulary must match the banner the CLI actually prints ─────
+# `quota exceeded` and `rate limited` were already listed but never matched the real
+# wording, so a quota stop was not recognised as externally blocked at all.
+
+def test_the_real_provider_limit_banner_is_externally_blocked():
+    txt = ("You’ve hit your weekly limit · resets 7pm (Europe/Berlin) "
+           "/usage-credits to finish what you’re working on")
+    assert ac._STATE_EXTERNAL_RE.search(txt) is not None
+
+
+def test_provider_limit_variants_are_recognised():
+    for v in ("You’ve hit your weekly limit", "usage limit reached",
+              "You’ve hit your 5-hour limit", "weekly limit exceeded",
+              "quota exceeded", "rate limited"):
+        assert ac._STATE_EXTERNAL_RE.search(v) is not None, v
+
+
+def test_a_warning_short_of_exhaustion_is_not_external():
+    """Approaching a limit is not hitting it; a working agent must not be parked."""
+    assert ac._STATE_EXTERNAL_RE.search("approaching your weekly limit") is None

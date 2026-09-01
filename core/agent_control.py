@@ -964,6 +964,18 @@ _MONITOR_FOOTER_TAIL = 400
 _STATE_EXTERNAL_RE = re.compile(
     r"(verification key|awaiting vendor|vendor key|input[_ ]required|"
     r"api key required|credentials? required|quota exceeded|rate.?limit(ed|ing)?\b|"
+    # Provider usage limits, as the CLI actually words them. "quota exceeded" and
+    # "rate limited" were already here but never matched the real banner:
+    # "You've hit your weekly limit · resets 7pm (Europe/Berlin) /usage-credits to
+    # finish what you're working on". Events 17630/17631/17634 are the live proof —
+    # the same text produced agent_process_failed once and task_completed twice,
+    # because nothing recognised it as an external wait and the phrase "finish what
+    # you're working on" reads as a completion. Waiting for a provider window to
+    # reset is the definition of externally blocked: no owner action helps, and the
+    # agent is neither dead nor done. The apostrophe is a Unicode right single quote
+    # in the real banner, so both forms are matched.
+    r"hit your (?:weekly|daily|monthly|5.hour|usage) limit|"
+    r"(?:weekly|usage) limit (?:reached|exceeded)|/usage.credits|"
     r"429 too many|externally blocked|blocked on (an? )?external)", re.I)
 # Claude is asking the owner a question (not the owner's own queued input line).
 _STATE_WAIT_OWNER_RE = re.compile(

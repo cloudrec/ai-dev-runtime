@@ -119,6 +119,17 @@ _OWNER_PROMPT_RE = re.compile(
     r"|❯?\s*1\.\s*yes[\s\S]{0,200}?\bno\b"
     r"|разрешить\?|продолжить\?|подтверд)", re.IGNORECASE)
 # Work explicitly at rest, waiting for someone: paused / awaiting instructions / blocked.
+# A PROVIDER usage window is exhausted. This is neither a failure nor a finish: the
+# agent is alive, did not crash, did not complete, and no owner action helps — the window
+# resets on its own. It needed its own class because the banner carries finish vocabulary
+# ("…to finish what you're working on"), so `_FINISH_RE` matched it and the same text was
+# published as `task_completed` twice (events 17631, 17634) and as `agent_process_failed`
+# once (17630). Placed ABOVE the finish branch so exhaustion outranks a false ending.
+_PROVIDER_LIMIT_RE = re.compile(
+    r"(hit your (?:weekly|daily|monthly|5.hour|usage) limit"
+    r"|(?:weekly|usage) limit (?:reached|exceeded)"
+    r"|/usage.credits)", re.IGNORECASE)
+
 _BLOCKER_RE = re.compile(
     r"(waiting for (instructions|input|migration|owner|your|approval|confirmation)"
     r"|awaiting (instructions|input|approval|confirmation)"
@@ -351,6 +362,10 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
     if st in _PROMPT_STATES and (_OWNER_PROMPT_RE.search(region)
                                  or _MENU_RE.search(_bottom_lines_text(tail))):
         return {"cls": "owner_prompt", "reason": "decision_prompt_at_bottom"}
+    if _PROVIDER_LIMIT_RE.search(region):
+        # Outranks both the blocker and the finish branches: the owner cannot unblock a
+        # provider window, so this must not wake anyone, and it certainly is not a finish.
+        return {"cls": "provider_limit", "reason": "provider_usage_window_exhausted"}
     if _BLOCKER_RE.search(region):
         return {"cls": "blocker", "reason": "paused_waiting_text_at_bottom"}
     if prev_cls == "working":
@@ -422,6 +437,11 @@ _EVENT_FOR = {
     # — it is news, not necessarily a request.
     "quiescent": ("work_stopped_incomplete", "high", False),
     "crashed": ("agent_process_failed", "critical", True),
+    # Waiting on a provider window to reset. Recorded durably so the pause is visible,
+    # but NOT owner-actionable: there is nothing an owner can do, and waking them for a
+    # quota reset is noise. Never task_completed (no work finished) and never
+    # agent_process_failed (nothing failed).
+    "provider_limit": ("agent_externally_blocked", "info", False),
 }
 
 

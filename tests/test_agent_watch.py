@@ -992,3 +992,54 @@ def test_the_event_records_the_inventory_state_and_the_reason():
     assert p["state"] == "waiting_input"
     assert p["class_reason"]                       # says which branch fired
     assert p["target"] == t and p["class"] == "owner_prompt"
+
+
+# ── a provider usage window is neither a failure nor a finish (17630/17631/17634) ─────
+# The real banner is "You've hit your weekly limit · resets 7pm (Europe/Berlin)
+# /usage-credits to finish what you're working on". It contains finish vocabulary, so
+# _FINISH_RE matched and the SAME text was published as task_completed twice and as
+# agent_process_failed once. The agent was alive, had not crashed, had not completed, and
+# no owner action could help — the window resets on its own.
+
+_QUOTA = ("You’ve hit your weekly limit · resets 7pm (Europe/Berlin) "
+          "/usage-credits to finish what you’re working on")
+
+
+def test_a_provider_limit_is_not_a_completion():
+    out = aw.classify(_QUOTA, state="idle", prev_cls="working")
+    assert out["cls"] == "provider_limit"
+    assert out["cls"] != "completed"
+    assert aw._EVENT_FOR[out["cls"]][0] == "agent_externally_blocked"
+
+
+def test_a_provider_limit_is_not_a_failure():
+    out = aw.classify(_QUOTA, state="idle", prev_cls="working")
+    etype, severity, oar = aw._EVENT_FOR[out["cls"]]
+    assert etype != "agent_process_failed"
+    assert oar is False, "an owner cannot unblock a provider window"
+    assert severity == "info"
+
+
+def test_the_finish_vocabulary_alone_would_still_have_completed():
+    """Pins WHY the class is needed: the banner really does read as a finish."""
+    assert aw._FINISH_RE.search(_QUOTA) is not None
+
+
+def test_provider_limit_outranks_the_blocker_branch():
+    mixed = _QUOTA + "\nwaiting for input"
+    assert aw.classify(mixed, state="idle", prev_cls="working")["cls"] == "provider_limit"
+
+
+def test_a_genuine_completion_is_unaffected():
+    out = aw.classify("All tests pass. Done.", state="idle", prev_cls="working")
+    assert out["cls"] != "provider_limit"
+
+
+def test_a_genuine_crash_is_unaffected():
+    out = aw.classify("Killed", state="idle", alive=False, prev_cls="working")
+    assert out["cls"] != "provider_limit"
+
+
+def test_approaching_a_limit_is_not_exhaustion():
+    """A warning is not a stop — it must not park a working agent."""
+    assert aw._PROVIDER_LIMIT_RE.search("approaching your weekly limit") is None
