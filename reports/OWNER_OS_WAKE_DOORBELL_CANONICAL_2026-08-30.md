@@ -5961,3 +5961,137 @@ subtracting more exceptions, and it is not attempted on a guess.
 
 Committed and inert. The three owner gates are unchanged: restart the two
 services, raise `RUNTIME_TEST_TIMEOUT`, fix the Telegram chat id.
+
+---
+
+# Part 54 — event 18090 reconciled, and the guard that was being fed
+
+An automated instruction was received asking for a read-only inspection of the
+`notification_dead_letter` / wake-delivery path, and for event 18090 to be
+reconciled against a reported "zero delivery_failed / current_alerts".
+
+## Event 18090 is correct and current
+
+```
+id 18090  2026-09-01T17:44:28Z  notifier/notification_dead_letter  severity=critical
+payload {"notification_id": 4134, "channel": "telegram", "attempts": 5, ...}
+dedup_key deadletter:telegram
+action_taken "dead-lettered after max attempts — delivery channel unhealthy"
+```
+
+Every authoritative local read agrees with it:
+
+| Read | Result |
+|---|---|
+| `notifications_status()` | **red** — "telegram send failed: Bad Request: chat not found" |
+| `channel.last_error` (owner_push) | same string |
+| `notification_failure_report()` | total 4 211, **active 17** in the last hour, newest 217 s old |
+| `notification_history_report()` | `dead_letter: 4211`, `sent: 2`, 21 059 cumulative attempts |
+
+Its `action_taken` still carries the old generic wording rather than the cause,
+which is expected: `7fee855` is committed and inert, like everything since
+Part 49.
+
+## Where a "zero" reading comes from
+
+Neither `delivery_failed` nor `current_alerts` exists anywhere in this codebase,
+so the zero is not a local field disagreeing — it is an external surface scoped
+differently. Two mechanisms produce exactly that reading, and both are working as
+designed:
+
+* **`state='failed'` is empty by construction.** The live split is
+  `dead_letter: 4211, sent: 2, failed: 1`. `failed` is a transient state on the
+  way to dead-lettering; anything counting it sees ~0 while 4 211 durable
+  failures sit one state along. Local diagnostics count `dead_letter` and are
+  correct.
+* **`/control-plane/wake/alerts` is agent-scoped.** It is documented "Agent-derived
+  owner alerts (source=agent_watch)" and `recent_alerts()` filters exactly that,
+  so a `notifier`-sourced dead letter can never appear there. Confirmed: 200 rows
+  returned, zero of type `notification_dead_letter`. The endpoint that answers
+  this question is `/control-plane/notifications/status`, and it reports red.
+
+**No defect, and no contradiction.** 18090 stands. This matches the standing note
+that an MCP snapshot is not `control_plane.db`, and that `notifications_status()`
+is the read to trust.
+
+## A dedup claim from Part 51, corrected
+
+Part 51 cited 310 dead-letter criticals in 24 h. Split at the 04:34:29Z restart
+of `ai-runtime.service`, those are two different code versions:
+
+| Window | Events | Distinct dedup keys |
+|---|---|---|
+| Before the restart | 256 | **256** (`deadletter:3295`, `…3296`, …) |
+| After the restart | 58 | **1** (`deadletter:telegram`) |
+
+The channel-keyed dedup is live and working — 3.7 events/h against a 900 s window
+that permits 4. The current rate is ~89/day, not 310. Part 51's "not one of them
+recorded a cause" stands; its volume figure conflated the two regimes and is
+corrected here.
+
+## The wake-delivery path: a guard being fed
+
+Read-only, the delivery outcomes tell a blunter story than the notification side:
+
+```
+1098  browser_degraded:too_many_pages:15
+ 502  submitted_and_assistant_started_generating
+ 191  assistant_generating_wedged
+  79  assistant_still_generating
+  74  browser_degraded:too_many_pages:13
+  21  browser_degraded:too_many_pages:14
+```
+
+**1 193 of 1 985 attempts — 60% — were refused because the browser held too many
+pages.** The live inventory: 12 pages, **seven of them bare `chatgpt.com` roots**
+against five real conversations.
+
+The guard is right, and was written deliberately after the 2026-08-30 OOM
+incident. But nothing was bringing the count down, and one branch was pushing it
+up. When a replacement tab never became usable, `recover_wedged_tab` returned
+`None` and left it open:
+
+```python
+for _ in range(15):
+    ...
+    if t and t.get("id") == fresh.get("id") and page_responsive(t):
+        break
+else:
+    return None          # `fresh` is open, and now invisible
+```
+
+An unverified tab matches no conversation, so `find_target` can never see it
+again — while it still counts toward the budget. Every failed recovery
+permanently spent one slot of the exact budget whose exhaustion causes the next
+failure. The 2026-08-30 fix stopped tabs being opened *while degraded*, which
+prevents amplification during an incident but never reclaims what an ordinary
+failed recovery leaks.
+
+The failure path now closes `fresh` — the id Chrome just returned, which cannot
+be a bound conversation or any pre-existing tab. The OLD tab is still left alone,
+so the standing promise is unchanged: a failed recovery cannot leave us with no
+ChatGPT tab at all. It now ends with exactly the tabs it started with.
+
+| | |
+|---|---|
+| Commit | `404496b` on `ai-runtime/220-windows-bridge` |
+| Gate | **2 923 passed**, exit 0 |
+| Guard tests | 6; 3 verified failing with the fix reverted |
+
+## Ledger — what is blocked, and on whom
+
+This **stops the accumulation. It does not clear the seven roots already open**,
+and it is inert until the companion runs new code. Closing live tabs is a
+mutation of the companion browser and was not performed.
+
+Standing owner gates, unchanged and none crossed:
+
+1. **Restart `owner-os-wake-companion.service` and `ai-runtime.service`** — every
+   fix from Part 49 onward is committed and inert.
+2. **Raise `RUNTIME_TEST_TIMEOUT`** past the suite's real duration (~640 s vs a
+   600 s cap); lives in `configs/.env` beside `RUNTIME_TOKEN`.
+3. **Fix the Telegram chat id** — `Bad Request: chat not found` is the single
+   cause behind all 4 211 dead letters.
+4. **Clear the orphaned browser tabs** (new): seven bare `chatgpt.com` roots hold
+   the page budget at the guard threshold, so wake delivery stays ~60% refused
+   until they are closed, even with `404496b` live.
