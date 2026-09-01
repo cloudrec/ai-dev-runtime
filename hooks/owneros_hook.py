@@ -64,6 +64,32 @@ def _load_runtime_env() -> None:
     except Exception:  # noqa: BLE001 — a missing env file must not break the session
         pass
 
+def _is_provider_limit(payload: dict) -> bool:
+    """Does this failure say only that a provider window ran out?
+
+    The vocabulary is deliberately NOT duplicated here: it lives in
+    `core.agent_watch`, which already owns the provider-limit class, so a banner
+    reworded upstream is taught to both doors at once.
+
+    Fails CLOSED. If the classifier cannot be consulted for any reason, the caller
+    keeps the critical mapping — an unreadable message must never be the thing that
+    turns a real crash silent. Losing a crash costs strictly more than repeating a
+    false alarm this fix already narrows.
+    """
+    try:
+        from core.agent_watch import _PROVIDER_LIMIT_RE
+        parts = [str(payload.get("last_assistant_message") or ""),
+                 str(payload.get("message") or "")]
+        details = payload.get("error_details")
+        if details:
+            parts.append(details if isinstance(details, str)
+                         else json.dumps(details, sort_keys=True))
+        text = " ".join(p for p in parts if p)
+        return bool(text.strip()) and bool(_PROVIDER_LIMIT_RE.search(text))
+    except Exception:  # noqa: BLE001 — see "fails CLOSED" above
+        return False
+
+
 # Event mapping. LEFT: what Claude Code tells us. RIGHT: the Owner OS class that already
 # has routing, a lane and a rate limit. Nothing invents a new wake class.
 #
@@ -78,6 +104,17 @@ def _map(ev: str, payload: dict):
     if ev == "SubagentStop":
         return ("agent_subagent_stopped", _ROUTINE, False)
     if ev == "StopFailure":
+        # A provider usage window is exhausted. Part 49 gave this its own class after
+        # the pane-scraping path read the same banner as BOTH a crash and a finish —
+        # but it fixed only that path. The banner arrives here too, as a StopFailure,
+        # and this door mapped every StopFailure to a critical owner-actionable crash
+        # without ever reading the message. Measured over 24 h: 131 of 138
+        # `agent_process_failed` criticals carried it. That is 95% of the most severe
+        # alert class in the system describing agents that were alive, had not
+        # crashed, had not completed, and needed nothing from an owner — the window
+        # resets on its own.
+        if _is_provider_limit(payload):
+            return ("agent_externally_blocked", "info", False)
         # The turn ended in an error the session could not recover from.
         return ("agent_process_failed", "critical", True)
     if ev == "TaskCompleted":

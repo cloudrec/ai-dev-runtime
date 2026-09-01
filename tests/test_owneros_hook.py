@@ -227,3 +227,90 @@ def test_the_trigger_never_blocks_or_raises(monkeypatch):
     import subprocess as _sp
     monkeypatch.setattr(_sp, "Popen", _boom)
     mod._trigger_supervisor()   # must not raise
+
+
+# ── the second door for a provider usage limit (2026-09-01) ─────────────────
+# Part 49 gave an exhausted provider window its own class, because the pane-tail
+# path read the banner as BOTH a crash and a finish. It fixed one door. The same
+# banner also arrives here, as a StopFailure, and this mapping never read the
+# message: every StopFailure became a critical, owner-actionable crash.
+#
+# Measured over 24 h on this host: 131 of 138 `agent_process_failed` criticals
+# carried the banner — 95% of the most severe alert class in the system,
+# describing agents that were alive, had not crashed, had not completed, and
+# needed nothing from an owner.
+
+BANNER = ("You've hit your weekly limit · resets 7pm (Europe/Berlin) "
+          "/usage-credits to finish what you're working on")
+
+
+def test_the_live_banner_is_not_a_crash():
+    etype, sev, oar = _map("StopFailure", last_assistant_message=BANNER)
+    assert etype == "agent_externally_blocked"
+    assert sev == "info" and oar is False
+
+
+def test_the_banner_does_not_wake_the_owner():
+    """The whole point: nobody can act on a quota reset, so it must not ring."""
+    etype, _, oar = _map("StopFailure", last_assistant_message=BANNER)
+    assert oar is False
+    from core import wake_bridge as wb
+    assert etype not in wb.WAKE_EVENT_TYPES
+
+
+def test_a_real_stop_failure_is_still_a_critical_crash():
+    """The cheap way to end false crash alarms is to stop reporting crashes."""
+    etype, sev, oar = _map("StopFailure", error_details={"code": 500},
+                           last_assistant_message="API Error: Connection lost mid-response.")
+    assert etype == "agent_process_failed" and sev == "critical" and oar is True
+
+
+def test_a_stop_failure_with_no_message_at_all_stays_critical():
+    etype, sev, oar = _map("StopFailure", error_details={"code": 500})
+    assert etype == "agent_process_failed" and sev == "critical" and oar is True
+
+
+def test_the_banner_is_recognised_in_error_details_too():
+    """Which field carries the text is the runtime's choice, not ours."""
+    etype, _, oar = _map("StopFailure", error_details={"message": BANNER})
+    assert etype == "agent_externally_blocked" and oar is False
+
+
+def test_a_warning_that_the_limit_is_APPROACHING_is_not_exhaustion():
+    """Part 49 drew this line deliberately: a working agent must never be parked
+    by a warning."""
+    etype, sev, _ = _map("StopFailure",
+                         last_assistant_message="You are approaching your weekly limit")
+    assert etype == "agent_process_failed" and sev == "critical"
+
+
+def test_the_classifier_fails_closed(monkeypatch):
+    """If the shared vocabulary cannot be consulted, a StopFailure stays critical.
+    Losing a real crash costs strictly more than repeating a false alarm."""
+    import builtins
+    from hooks import owneros_hook as h
+    real_import = builtins.__import__
+
+    def boom(name, *a, **kw):
+        if name == "core.agent_watch":
+            raise ImportError("no vocabulary today")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", boom)
+    assert h._is_provider_limit({"last_assistant_message": BANNER}) is False
+    assert h._map("StopFailure", {"last_assistant_message": BANNER})[0] == "agent_process_failed"
+
+
+def test_both_doors_agree_on_the_same_banner():
+    """One vocabulary, deliberately not duplicated: the pane path and the hook path
+    must never disagree about the same text."""
+    from core import agent_watch as aw
+    from hooks import owneros_hook as h
+    # state="idle": the pane has STOPPED and the banner is why. An active state
+    # deliberately outranks tail text in classify(), so a working agent is never
+    # parked by scrollback.
+    assert aw.classify(alive=True, is_agent=True, state="idle",
+                       tail=BANNER)["cls"] == "provider_limit"
+    assert h._is_provider_limit({"last_assistant_message": BANNER}) is True
+    assert aw._EVENT_FOR["provider_limit"][0] == \
+        h._map("StopFailure", {"last_assistant_message": BANNER})[0]
