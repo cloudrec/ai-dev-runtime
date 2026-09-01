@@ -6599,3 +6599,76 @@ the others, for a reason that is a routing decision rather than a defect.
 
 Both remaining items are owner decisions about a credential and a routing choice.
 Neither is a code defect.
+
+---
+
+# Part 60 — soak check on the deployed set
+
+Roughly a dozen behavioural changes went live inside one hour (Parts 57-59), so
+this is the deliberate look back at what they actually did, measured from the
+companion restart at 23:16:59Z.
+
+| Signal | Before this session | Since the restarts |
+|---|---|---|
+| `agent_process_failed` (critical) | 131 per 6 h, 95% a quota banner | **0** |
+| All criticals | continuous | **1** — a Telegram dead letter, and it predates the fix below |
+| `browser_degraded:too_many_pages` | 1 193 of 1 985 attempts in 24 h | 18, all **before** the tab cleanup; **0** after |
+| Successful deliveries | 502 in 24 h against 1 483 failures | 6, with 1 transient `cdp_error` |
+| `worker_skew()` | two workers, up to 48 918 s | `[]` |
+| Open wake watches | 49, some 107 h old | 0 |
+
+## The per-chat claim is recording what it scoped on
+
+```
+34 of 34 claims since the restart: scoped to chat
+```
+
+Every claim now carries the conversation it was judged against (`b160887`), so
+the cooldown that protects one chat is measured per chat rather than per route
+key. No claim fell back to the route scope, which is the expected result now that
+the companion always names the conversation.
+
+## One fix is deployed but NOT yet exercised — stated rather than claimed
+
+The single critical since the restart is `notification_dead_letter` 18817 at
+23:23:00Z, and it still carries the old wording:
+
+```
+action_taken: dead-lettered after max attempts — delivery channel unhealthy
+```
+
+That is not a failure of `7fee855`. `ai-runtime` restarted at 23:23:50Z — fifty
+seconds *after* that event — so it was emitted by the previous process. No dead
+letter has been produced since, so the new path has had nothing to run on.
+
+Rather than wait for one and rather than claim it works, the path was exercised
+directly against the live channel table:
+
+```
+_failure_reasons() ->
+  same_chat_wake: no inbound trigger configured
+  owner_push:     telegram send failed: Bad Request: chat not found
+
+next dead letter's action_taken ->
+  dead-lettered after max attempts — same_chat_wake: no inbound trigger configured;
+  owner_push: telegram send failed: Bad Request: chat not found
+```
+
+So the next one will name the one thing to fix. Until it fires, that is a verified
+code path and not a verified event.
+
+## Backlog
+
+Four wakes remain pending, oldest 1 765 s on `owner-os`. The 9 229 s `seo` item
+noted in Part 59 has drained. This is the queue that built while every delivery
+was refused, and it is clearing at the pace the per-chat cooldown allows.
+
+## Gates
+
+1-3. ~~Companion restart~~ · ~~`ai-runtime` restart~~ · ~~browser tabs~~ — done
+4. **Raise `RUNTIME_TEST_TIMEOUT`** (~640 s suite against a 600 s cap)
+5. **Fix the Telegram chat id** — the only remaining `red_reason`
+6. **Decide the three route keys bound to one conversation**
+
+No further non-gated code defect is visible. `observability_summary()` agrees:
+its only red reason is the notification failures that item 5 causes.
