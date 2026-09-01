@@ -63,12 +63,19 @@ def sessions(*, now: Optional[float] = None, refresh: bool = False) -> list:
     if not ENABLED:
         return []
     now = now if now is not None else time.monotonic()
-    if not refresh and _cache["rows"] and (now - _cache["ts"]) < TTL_SECS:
+    # Freshness gates the cache, NOT truthiness. Keying on "we have rows" meant an
+    # EMPTY answer was never cached, so a host with no sessions — or a binary that
+    # has started failing, which is exactly when this must stay cheap — paid a
+    # subprocess call on every single lookup. Measured: five lookups, five calls,
+    # and 49 watch evaluations took 27 s instead of milliseconds.
+    if not refresh and _cache["ts"] and (now - _cache["ts"]) < TTL_SECS:
         return _cache["rows"]
     try:
         rows = [r for r in _list_raw() if isinstance(r, dict)]
     except Exception:  # noqa: BLE001 — an unreadable listing is never evidence
-        return _cache["rows"] if (now - _cache["ts"]) < TTL_SECS else []
+        # A failure does not refresh the clock: the next call may still retry, but a
+        # STALE-BUT-FRESH-ENOUGH answer is preferred to none while it does.
+        return _cache["rows"] if (_cache["ts"] and (now - _cache["ts"]) < TTL_SECS) else []
     _cache["ts"], _cache["rows"] = now, rows
     return rows
 
@@ -77,19 +84,70 @@ def reset_cache() -> None:
     _cache["ts"], _cache["rows"] = 0.0, []
 
 
+#: How far up a process tree to look for the pane that owns a session. A pane that
+#: runs `claude` directly needs 0 hops; one where the operator typed `claude` into an
+#: already-open shell needs 1. A small bound keeps a pathological /proc from turning
+#: a lookup into a walk to init.
+_MAX_ANCESTRY_HOPS = int(os.getenv("OWNEROS_NATIVE_ANCESTRY_HOPS", "4"))
+
+
+def _ppid_of(pid: int) -> int:
+    """Parent of this pid, or 0. Reads /proc directly — no subprocess, no shell.
+
+    The comm field can contain spaces and parentheses, so the ppid is taken from
+    after the LAST ')' rather than by splitting the whole line.
+    """
+    try:
+        with open(f"/proc/{int(pid)}/stat", "r", encoding="utf-8", errors="replace") as fh:
+            data = fh.read()
+        return int(data[data.rindex(")") + 1:].split()[1])
+    except Exception:  # noqa: BLE001 — an unreadable process is simply not an ancestor
+        return 0
+
+
+def _is_descendant_of(child_pid, ancestor_pid: int) -> bool:
+    try:
+        cur = int(child_pid)
+    except (TypeError, ValueError):
+        return False
+    for _ in range(_MAX_ANCESTRY_HOPS):
+        cur = _ppid_of(cur)
+        if not cur or cur == 1:
+            return False
+        if cur == ancestor_pid:
+            return True
+    return False
+
+
 def by_pid(pid, *, now: Optional[float] = None) -> Optional[dict]:
+    """The session running as this pid — or as a CHILD of it.
+
+    Owner OS records the tmux PANE's pid; the runtime records the `claude` process
+    itself. They are the same number only when the pane runs `claude` directly. Where
+    the operator typed `claude` into an already-open shell, the pane is `-bash` and
+    `claude` is its child: measured on this host, 8 of 10 agents matched directly and
+    2 did not (`email:0.0` pane 1692437 -> claude 1695585, `hostsecure:0.0` pane
+    3260897 -> claude 3262329). Those two silently lost every native answer.
+
+    The direct match is tried first and costs nothing; the ancestry walk runs only
+    when it fails, and only for as many sessions as are listed.
+    """
     try:
         want = int(pid)
     except (TypeError, ValueError):
         return None
     if not want:
         return None
-    for r in sessions(now=now):
+    rows = sessions(now=now)
+    for r in rows:
         try:
             if int(r.get("pid") or 0) == want:
                 return r
         except (TypeError, ValueError):
             continue
+    for r in rows:
+        if r.get("pid") and _is_descendant_of(r.get("pid"), want):
+            return r
     return None
 
 

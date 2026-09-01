@@ -314,3 +314,41 @@ def test_both_doors_agree_on_the_same_banner():
     assert h._is_provider_limit({"last_assistant_message": BANNER}) is True
     assert aw._EVENT_FOR["provider_limit"][0] == \
         h._map("StopFailure", {"last_assistant_message": BANNER})[0]
+
+
+# ── the fallback branches that have never fired (2026-09-01) ───────────────
+# The native-first audit measured which hooks actually arrive on this host over
+# 24 h: `Stop` 639, `Notification` 303 (every one of them `idle_prompt`),
+# `StopFailure` 136, `SubagentStop` 124. `TaskCompleted` and `TeammateIdle` are
+# registered and fired ZERO times, as did the `agent_needs_input` and
+# `agent_completed` notification subtypes.
+#
+# The audit's conclusion was to KEEP them: they cost nothing per event that never
+# arrives, and deleting them would trade a real fallback — for a host that does
+# use teammates or tasks — for no gain. What they lacked was proof they are
+# correct if they ever do fire, which is what a fallback is for. `TaskCompleted`
+# was already covered; `TeammateIdle` was not, so a branch nobody exercises could
+# have rotted unnoticed.
+
+def test_a_teammate_going_idle_is_a_record_not_a_doorbell():
+    """Never fires here. If it ever does, it must not page the owner — `TeammateIdle`
+    is the same every-turn trap as `Stop` and `idle_prompt` in a third costume."""
+    etype, severity, oar = _map("TeammateIdle", teammate_name="reviewer")
+    assert etype == "agent_turn_stopped"
+    assert oar is False and severity == "info"
+    from core import wake_bridge as wb
+    assert etype not in wb.WAKE_EVENT_TYPES
+    assert etype in wb.ROUTINE_EVENT_TYPES
+
+
+def test_the_never_seen_branches_still_map_to_known_classes():
+    """A fallback that emits a class the wake bridge has never heard of would be
+    recorded and then silently ignored."""
+    from core import wake_bridge as wb
+    known = set(wb.WAKE_EVENT_TYPES) | set(wb.ROUTINE_EVENT_TYPES)
+    for ev, payload in (("TaskCompleted", {"task_id": "t", "task_subject": "s"}),
+                        ("TeammateIdle", {"teammate_name": "reviewer"}),
+                        ("Notification", {"notification_type": "agent_needs_input"}),
+                        ("Notification", {"notification_type": "agent_completed"})):
+        etype, _sev, _oar = _map(ev, **payload)
+        assert etype in known, f"{ev}/{payload} maps to an unknown class {etype}"
