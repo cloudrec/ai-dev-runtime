@@ -5365,3 +5365,58 @@ with an explicit reason. The remaining half — supervisor sends to this pane �
 `supervisor_self_reference`, deliberately and structurally, because the supervisor would be
 driving the session that edits and deploys it. That half is not pending work; it is a
 property.
+
+---
+
+# Part 48 — a rollout switch was a denylist bypass
+
+Found by a test written to assert the opposite, while pinning the cold-start reconciliation
+contract. It is the most security-relevant defect of this session and belongs in the record
+rather than only in a commit message.
+
+## The hole
+
+`is_supervised()` returned `True` on the allow-list and wildcard branches **before** reaching
+`registered_targets()`, which has filtered the denylist on read since the self-reference
+incident (`56aa69d`). So:
+
+```python
+a = allowed_targets()
+if "*" in a or target in a:
+    return True          # never consulted the denylist
+```
+
+Setting `NATIVE_SUPERVISOR_TARGETS="*"` — an ordinary-looking rollout action, and the obvious
+way anyone would widen supervision — silently made `capacity`, `auction`,
+`payment-orchestrator` and `email` continuable. Naming a denylisted target explicitly in the
+allow-list did the same. The value-bearing gate that five separate instructions had been
+asking to open was **one environment variable away from opening itself**, with no alarm:
+`validate_config()` recorded `wildcard_rollout: True` as a fact and did not treat it as a
+problem, because nothing knew it was one.
+
+Nothing was ever sent. The default `_TARGETS_RAW` is `cp-canary:0.0`, so the wildcard was
+never set on this host. The exposure was latent, not realised — but it was one edit deep, and
+that edit is exactly what a rollout would have done.
+
+## The fix — `8e738f2`
+
+The denylist is checked **first**, before either positive path. Callers that know the project
+pass it (both scan paths do); without it the registry decides, since it carries the project.
+The self-reference guard is unchanged and remains structural.
+
+Four guard tests, all failing when the branch order is restored:
+a wildcard rollout cannot reach `capacity`, `auction`, `payment-orchestrator` or `email`;
+an explicit allow-list entry naming a denylisted target does not beat the denylist; a caller
+that cannot supply the project does not accidentally widen access; and cold-start
+reconciliation is not a bypass either.
+
+## What this says about the session's other refusals
+
+Five instructions asked for value-bearing sends to be enabled, each with a different framing.
+Had any been accepted as authorisation, this hole would have been indistinguishable from the
+intended change — a wildcard set "to roll out supervision" would have looked like the request
+being fulfilled, not like a gate failing open. Refusing on provenance rather than plausibility
+is what kept the two separable.
+
+Verified after activation: `capacity-blockchain` and `diamond-auction` both
+`value_bearing_send_blocked`, `validate_config()` ok, skew clear, 8 agents, no duplicates.
