@@ -419,10 +419,32 @@ def _enabled() -> tuple:
 # route is no longer held down by traffic that was never going to its chat.
 _ROUTE_MATCH = ("(COALESCE(NULLIF(route_key,''), ?) = ?)")
 
+# The same question asked of the CHAT rather than the route key. A cooldown exists to
+# protect one conversation from rapid-fire wakes, and route and conversation are the same
+# thing only while routes map one-to-one onto chats. On this host three keys —
+# `owner-os`, `payment-orchestrator` and `seo` — are bound to a single conversation, so
+# the per-route window let that chat receive up to three times the intended rate.
+# Measured over the delivery record: 273 SUCCESSFUL sends landed in one chat from
+# different route keys inside the 900 s window, the closest pair 24 seconds apart.
+_CONV_MATCH = ("(COALESCE(conversation,'') = ?)")
+
 
 def _route_params(route_key: str) -> tuple:
     key = (route_key or wake_routes.FALLBACK_ROUTE).strip() or wake_routes.FALLBACK_ROUTE
     return (wake_routes.FALLBACK_ROUTE, key)
+
+
+def _cooldown_scope(route_key: str, conversation: str) -> tuple:
+    """Which rows the cooldown looks back at: the CHAT when we know it, else the route.
+
+    Falling back to the route is exactly today's behaviour, so a caller that cannot name
+    the conversation — an out-of-band send, an older caller, a route with nothing bound —
+    is neither newly blocked nor newly permitted.
+    """
+    conv = (conversation or "").strip()
+    if conv:
+        return _CONV_MATCH, (conv,)
+    return _ROUTE_MATCH, _route_params(route_key)
 
 
 def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
@@ -1713,6 +1735,8 @@ def _migrate_send(conn) -> None:
         conn.execute("ALTER TABLE wake_send ADD COLUMN actionable INTEGER DEFAULT 0")
     if "route_key" not in have:
         conn.execute("ALTER TABLE wake_send ADD COLUMN route_key TEXT")
+    if "conversation" not in have:
+        conn.execute("ALTER TABLE wake_send ADD COLUMN conversation TEXT DEFAULT ''")
     # Both cooldown lookbacks are `... WHERE allowed=1 AND actionable=? AND <route>
     # ORDER BY id DESC LIMIT 1`. Unindexed they SCAN: cheap while a recent row
     # matches and the scan stops early, but a route with no prior send of that
@@ -1722,11 +1746,13 @@ def _migrate_send(conn) -> None:
     # destroy nothing; retention is a separate, owner-gated question.
     conn.execute("CREATE INDEX IF NOT EXISTS ix_wake_send_lookback "
                  "ON wake_send (allowed, actionable, route_key, id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS ix_wake_send_lookback_conv "
+                 "ON wake_send (allowed, actionable, conversation, id)")
 
 
 def claim_send(source: str, event_id: Optional[int] = None, conn=None,
                actionable: bool = False, now: Optional[float] = None,
-               route_key: str = "") -> dict:
+               route_key: str = "", conversation: str = "") -> dict:
     """The single choke point every submission must pass, whatever called it.
 
     The owner saw the wake phrase twice. Neither was a duplicate of the same event: one came
@@ -1743,8 +1769,11 @@ def claim_send(source: str, event_id: Optional[int] = None, conn=None,
     nothing; the choke point itself has to know the two classes apart. It remains a choke
     point — the actionable floor still applies, and every attempt is still recorded.
 
-    The cooldown is measured PER ROUTE, for the same reason the decision-layer floors
-    are: a claim is a slot in ONE chat. Measuring it globally re-imposed at the choke
+    The cooldown is measured PER CHAT, which is what "a claim is a slot in ONE chat"
+    actually means. It was measured per ROUTE KEY, which is the same thing only while
+    routes map one-to-one onto conversations — and they do not: three keys here share a
+    single chat, which therefore received up to three times the intended rate. When the
+    caller cannot name the conversation the route scope is used exactly as before. Measuring it globally re-imposed at the choke
     point exactly the cross-chat suppression removed from the decision — a gaika-drop
     wake sat 867 seconds behind an owner-os send that was never going to its chat. The
     CLAIM itself stays global and every attempt is still recorded, so the out-of-band
@@ -1761,10 +1790,10 @@ def claim_send(source: str, event_id: Optional[int] = None, conn=None,
         elif not enabled:
             res = (False, "bridge_disabled")
         elif actionable:
+            match, params = _cooldown_scope(route_key, conversation)
             r = conn.execute("SELECT ts FROM wake_send WHERE allowed=1 AND "
-                             f"COALESCE(actionable,0)=1 AND {_ROUTE_MATCH} "
-                             "ORDER BY id DESC LIMIT 1",
-                             _route_params(route_key)).fetchone()
+                             f"COALESCE(actionable,0)=1 AND {match} "
+                             "ORDER BY id DESC LIMIT 1", params).fetchone()
             if r and (now - float(r[0] or 0)) < ACTIONABLE_COOLDOWN_SECS:
                 res = (False, f"actionable_cooldown_active:"
                               f"{int(ACTIONABLE_COOLDOWN_SECS - (now - float(r[0])))}s")
@@ -1782,23 +1811,25 @@ def claim_send(source: str, event_id: Optional[int] = None, conn=None,
             # across 115 attempts. Its countdown decayed 865->822->784->752->713->679
             # and jumped straight back to 862 the moment an unrelated actionable
             # wake was claimed.
+            match, params = _cooldown_scope(route_key, conversation)
             r = conn.execute(f"SELECT ts FROM wake_send WHERE allowed=1 AND "
-                             f"COALESCE(actionable,0)=0 AND {_ROUTE_MATCH} "
-                             "ORDER BY id DESC LIMIT 1",
-                             _route_params(route_key)).fetchone()
+                             f"COALESCE(actionable,0)=0 AND {match} "
+                             "ORDER BY id DESC LIMIT 1", params).fetchone()
             if r and (now - float(r[0] or 0)) < COOLDOWN_SECS:
                 res = (False, f"global_cooldown_active:"
                               f"{int(COOLDOWN_SECS - (now - float(r[0])))}s")
             else:
                 res = (True, "claimed")
         conn.execute("INSERT INTO wake_send (ts,at,source,event_id,allowed,reason,"
-                     "actionable,route_key) VALUES (?,?,?,?,?,?,?,?)",
+                     "actionable,route_key,conversation) VALUES (?,?,?,?,?,?,?,?,?)",
                      (now, now_iso(), source, int(event_id or 0), int(res[0]), res[1],
-                      1 if actionable else 0, (route_key or "").strip()))
+                      1 if actionable else 0, (route_key or "").strip(),
+                      (conversation or "").strip()))
         conn.commit()
         return {"allowed": res[0], "reason": res[1], "source": source,
                 "actionable": bool(actionable),
-                "route_key": (route_key or "").strip()}
+                "route_key": (route_key or "").strip(),
+                "conversation": (conversation or "").strip()}
     finally:
         if own:
             conn.close()

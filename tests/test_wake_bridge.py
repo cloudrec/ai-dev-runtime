@@ -856,3 +856,87 @@ def test_the_newest_wake_still_wins_among_multiple_wake_rows():
     r = wb.coalesce_generic_backlog(now=2000.0)
     assert r["kept_event_id"] == 962
     assert 961 in r["superseded_event_ids"]
+
+
+# ── a claim is a slot in ONE CHAT, not in one route key (2026-09-01) ────────
+# `claim_send`'s own docstring says "a claim is a slot in ONE chat", and its
+# caller's comment says "The claim is for a slot in THIS conversation, so it
+# carries the route". Route and conversation are the same thing only while routes
+# map one-to-one onto chats. On this host they do not: `owner-os`,
+# `payment-orchestrator` and `seo` are all bound to one conversation, so that chat
+# was claimable once per route per window — three times the intended rate.
+#
+# Measured on the delivery record: 273 SUCCESSFUL sends landed in a single chat
+# from different route keys inside the 900 s window, the closest pair 24 seconds
+# apart. That is precisely what the floor exists to prevent.
+
+NOW = 1000.0
+CHAT_A = "https://chatgpt.com/c/6a7d37d0-02dc-83ed-9ef4-d26156937c57"
+CHAT_B = "https://chatgpt.com/c/6a90487a-fddc-83eb-9545-7f1ad2dc958d"
+
+
+def test_two_routes_sharing_one_chat_share_its_cooldown():
+    """The exact live shape: different route keys, same conversation."""
+    first = wb.claim_send("companion", event_id=1, route_key="owner-os",
+                                   conversation=CHAT_A, now=NOW)
+    assert first["allowed"] is True
+
+    second = wb.claim_send("companion", event_id=2,
+                                    route_key="payment-orchestrator",
+                                    conversation=CHAT_A, now=NOW + 24)
+    assert second["allowed"] is False
+    assert second["reason"].startswith("global_cooldown_active")
+
+
+def test_a_different_chat_is_not_blocked_by_it():
+    """Cross-chat suppression is the bug this floor was already fixed for once —
+    narrowing to the chat must not widen back into it."""
+    wb.claim_send("companion", event_id=1, route_key="owner-os",
+                           conversation=CHAT_A, now=NOW)
+    other = wb.claim_send("companion", event_id=2, route_key="gaika-extension",
+                                   conversation=CHAT_B, now=NOW + 24)
+    assert other["allowed"] is True
+
+
+def test_the_same_chat_is_claimable_again_after_the_window():
+    wb.claim_send("companion", event_id=1, route_key="owner-os",
+                           conversation=CHAT_A, now=NOW)
+    later = wb.claim_send("companion", event_id=2, route_key="seo",
+                                   conversation=CHAT_A,
+                                   now=NOW + wb.COOLDOWN_SECS + 1)
+    assert later["allowed"] is True
+
+
+def test_the_actionable_floor_is_per_chat_too():
+    wb.claim_send("companion", event_id=1, route_key="owner-os",
+                           actionable=True, conversation=CHAT_A, now=NOW)
+    same = wb.claim_send("companion", event_id=2, route_key="seo",
+                                  actionable=True, conversation=CHAT_A,
+                                  now=NOW + 5)
+    assert same["allowed"] is False
+    assert same["reason"].startswith("actionable_cooldown_active")
+
+
+def test_a_caller_that_names_no_chat_keeps_the_route_scope():
+    """Out-of-band callers, older callers and unbound routes must be neither newly
+    blocked nor newly permitted — the fallback is exactly today's behaviour."""
+    wb.claim_send("operator", event_id=1, route_key="owner-os",
+                           now=NOW)
+    same_route = wb.claim_send("operator", event_id=2, route_key="owner-os",
+                                        now=NOW + 24)
+    assert same_route["allowed"] is False
+    other_route = wb.claim_send("operator", event_id=3, route_key="mess",
+                                         now=NOW + 24)
+    assert other_route["allowed"] is True
+
+
+def test_the_claim_row_records_the_chat_it_was_for():
+    """Every attempt is recorded, allowed or not — now with the scope it was judged in."""
+    out = wb.claim_send("companion", event_id=7, route_key="seo",
+                                 conversation=CHAT_A, now=NOW)
+    assert out["conversation"] == CHAT_A
+    import os, sqlite3
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    row = c.execute("SELECT conversation, route_key FROM wake_send "
+                    "WHERE event_id=7").fetchone()
+    assert row[0] == CHAT_A and row[1] == "seo", "the route still travels for the audit"

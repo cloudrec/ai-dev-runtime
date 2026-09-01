@@ -585,9 +585,13 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
             import sys as _sys
             _sys.path.insert(0, "/root/ai-dev-runtime")
             from core import wake_bridge as _wb
-            # The claim is for a slot in THIS conversation, so it carries the route.
+            # The claim is for a slot in THIS conversation, so it carries the
+            # conversation. It used to carry only the route key, which is the same
+            # thing only while routes map one-to-one onto chats — and three keys here
+            # share one chat, so that chat was claimable three times per window. The
+            # route still travels for the audit row and for the fallback scope.
             c = _wb.claim_send(source, event_id=event_id, actionable=actionable,
-                               route_key=route_key)
+                               route_key=route_key, conversation=conversation_url)
             if not c.get("allowed"):
                 return {"ok": False, "reason": f"not_claimed:{c.get('reason')}"}
         except Exception as e:  # noqa: BLE001
