@@ -5420,3 +5420,51 @@ is what kept the two separable.
 
 Verified after activation: `capacity-blockchain` and `diamond-auction` both
 `value_bearing_send_blocked`, `validate_config()` ok, skew clear, 8 agents, no duplicates.
+
+---
+
+# Part 49 — a provider usage limit is neither a failure nor a finish
+
+Runtime job 265 ("Fix wake policy for quota exhaustion") was reconciled before any code was
+written: genuinely **not done**, and no out-of-band work existed. No commit mentioned quota,
+and the external-blocked vocabulary listed `quota exceeded` and `rate limited` but never
+matched the banner the CLI actually prints.
+
+## Reproduced first
+
+The live text is *"You've hit your weekly limit · resets 7pm (Europe/Berlin) /usage-credits
+to finish what you're working on"*. Against it:
+
+```
+_STATE_EXTERNAL_RE : False     ← not recognised as externally blocked
+_FINISH_RE         : True      ← reads as a completion
+```
+
+That one pair explains all three events on a single pane: `task_completed` twice (17631,
+17634) and `agent_process_failed` once (17630), from the same banner. The phrase *"finish
+what you're working on"* is what trips the finish path. The agent was alive, had not
+crashed, had not completed, and no owner action helps — the window resets on its own.
+
+## The fix — `0edc0e8`
+
+`core/agent_control.py`: the external-blocked pattern now matches the real wording,
+including the Unicode right single quote and the 5-hour / daily / monthly variants.
+
+`core/agent_watch.py`: a new `provider_limit` class placed **above** both the blocker and
+the finish branches, mapped to `agent_externally_blocked` at `info` severity with
+`owner_action_required=False` — durable, so the pause is visible in the ledger; silent,
+because waking an owner for a quota reset is noise they cannot act on.
+
+Deliberately narrow: *"approaching your weekly limit"* is a warning rather than exhaustion
+and still classifies normally, so a working agent is never parked by it. A genuine
+completion and a genuine crash are both unaffected, each pinned by its own test.
+
+10 tests; five fail with the change reverted. Gate: **388 passed**, exit 0.
+
+## Not live, and the ledger shows why that matters
+
+`worker_skew()` reports the companion running code **46 953 s** older than the tree — it
+started 06:35:20 local, and this fix landed at 19:37. One further false `task_completed` was
+published on this pane at 14:06:35Z, after the diagnosis but before any activation. The fix
+is committed and inert; a companion restart is what would stop the next one, and that is an
+owner decision.
