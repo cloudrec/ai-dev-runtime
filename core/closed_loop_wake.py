@@ -300,6 +300,43 @@ def _identities(conn, target: str) -> tuple:
     return tuple(out)
 
 
+def _natively_working(conn, target: str) -> bool:
+    """Is the runtime itself reporting this agent as working right now?
+
+    POSITIVE evidence, which is the thing `_progress_since` never had. It counts
+    events, and an agent in the middle of a long turn emits none while it works —
+    indistinguishable from a pane that died. Both `8aba07f` and `3d8d4bf` subtract
+    exceptions from that proxy; this replaces it for the one case it was worst at.
+
+    `claude agents --json` reports `busy` per session. The target may be either of
+    the two names an agent goes by, so both are tried: a `session:<id>` target asks
+    by (truncated) session id, a tmux target asks by the pid the registry holds.
+
+    Fail-open in the only direction that matters: absence of an answer is NOT
+    evidence of death, so this can only ever RESOLVE a watch, never escalate one.
+    """
+    try:
+        from core import native_sessions
+        if target.startswith(_SESSION_TARGET_PREFIX):
+            sid = target[len(_SESSION_TARGET_PREFIX):]
+            if sid and native_sessions.is_working(sid):
+                return True
+        for ident in _identities(conn, target):
+            if ident.startswith(_SESSION_TARGET_PREFIX):
+                sid = ident[len(_SESSION_TARGET_PREFIX):]
+                if sid and native_sessions.is_working(sid):
+                    return True
+                continue
+            row = conn.execute("SELECT pid FROM agent WHERE target=?",
+                               (ident,)).fetchone()
+            pid = row[0] if row else None
+            if pid and native_sessions.is_working(pid=pid):
+                return True
+    except Exception:  # noqa: BLE001 — unknown never means "resolved", and never raises
+        return False
+    return False
+
+
 def _watch_state_cls(conn, target: str) -> str:
     """agent_watch's current class for this agent, under whichever name it is filed."""
     for ident in _identities(conn, target):
@@ -358,6 +395,12 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     # the owner is not told a second time about a state they already know is intentional.
     if _armed_external_wait(conn, target, now_ts()):
         return "intentional_external_wait"
+    # Asked BEFORE the scraped class, because it is the same question answered by
+    # the runtime instead of by inference. A pane mid-turn reports `busy` here while
+    # emitting no events at all, which is exactly the state that produced the
+    # escalations Part 53 could not account for.
+    if _natively_working(conn, target):
+        return "runtime_reports_agent_working"
     try:
         cls = _watch_state_cls(conn, target)
         if cls == "working":

@@ -77,12 +77,42 @@ def _load_config() -> dict:
 
 
 def _conversation_id(cwd: str) -> Optional[str]:
+    """FALLBACK identity: the newest conversation in this directory.
+
+    A per-DIRECTORY answer to a per-PANE question. Two agents in one cwd get the
+    same id, which is why a pane that had genuinely died could be reconciled as the
+    `renamed_from` of the pane that replaced it (event 18172), and why the wake
+    watchdog had to widen an identity set (`8aba07f`) instead of simply knowing it.
+    Kept only for the case where the runtime cannot tell us — see `_identity_of`.
+    """
     try:
         from core import agent_control as ac
         ev = ac.conversation_evidence(cwd) or {}
         return (ev.get("latest") or {}).get("conversation_id")
     except Exception:  # noqa: BLE001
         return None
+
+
+def _identity_of(agent: dict, cwd: str, conversation_fn) -> Optional[str]:
+    """Who this pane IS, preferring the runtime's own answer over our inference.
+
+    `claude agents --json` reports a `sessionId` per PID, which is the fact the cwd
+    heuristic below was approximating. Asking the process that owns the session
+    removes the whole class of directory-collision bugs rather than compensating for
+    them downstream.
+
+    Falls back to the cwd guess whenever the native view has no opinion — no binary,
+    a timeout, a pane it does not list — so behaviour without it is exactly what it
+    was.
+    """
+    try:
+        from core import native_sessions
+        sid = native_sessions.session_id_for_pid(agent.get("pid"))
+        if sid:
+            return sid
+    except Exception:  # noqa: BLE001 — the native view never breaks discovery
+        pass
+    return conversation_fn(cwd) if cwd else None
 
 
 def discover(inventory: Optional[dict] = None, *, config: Optional[dict] = None,
@@ -115,7 +145,7 @@ def discover(inventory: Optional[dict] = None, *, config: Optional[dict] = None,
         target = a["target"]
         session = a.get("session") or target.split(":", 1)[0]
         cwd = a.get("claude_cwd") or a.get("cwd") or ""
-        conv = conversation_fn(cwd) if cwd else None
+        conv = _identity_of(a, cwd, conversation_fn)
         prior = api.get_agent(target)
 
         # rename / move / restart reconciliation: a record with this conversation but a

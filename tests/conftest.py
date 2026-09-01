@@ -38,3 +38,12 @@ os.environ["AGENT_CONTROL_DB"] = os.path.join(_TEST_DB_DIR, "agent_control_test.
 # Job worktrees likewise: a test-run executor must never materialize worktrees
 # under the live /var/lib/ai-runtime tree.
 os.environ["RUNTIME_WORKTREE_ROOT"] = os.path.join(_TEST_DB_DIR, "worktrees")
+
+# Same rule again, for the runtime's own view of its sessions. `claude agents --json`
+# reports the REAL sessions running on this host, so a test that consults it is reading
+# live machine state as fixture data: whether a suite passes would depend on what the
+# operator happens to be running. Observed exactly that — three closed-loop tests using
+# a real conversation id resolved against a genuinely `busy` live pane and inverted their
+# own assertions. Hard off, like the databases above; the tests that cover the native
+# path enable it explicitly and inject their own listing.
+os.environ["OWNEROS_NATIVE_SESSIONS"] = "0"
