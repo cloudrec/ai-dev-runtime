@@ -128,6 +128,18 @@ def page_responsive(target: dict, timeout: float = 8.0) -> bool:
         return False
 
 
+def _close_target(target_id: str) -> bool:
+    """Close one tab by id, best-effort. A tab that will not close is worse to fight
+    than to leave, so a failure here is swallowed exactly as the old-tab close is."""
+    if not target_id:
+        return False
+    try:
+        _http(f"/json/close/{target_id}")
+        return True
+    except Exception:  # noqa: BLE001 — a zombie tab is worse to fight than to leave
+        return False
+
+
 def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict]:
     """Replace a wedged renderer with a fresh tab on the SAME bound conversation.
 
@@ -159,12 +171,24 @@ def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict
             if t and t.get("id") == fresh.get("id") and page_responsive(t):
                 break
         else:
+            # The replacement never became usable. It is still OPEN, and leaving it is
+            # how the condition the guard above refuses on gets built in the first
+            # place: an unverified tab matches no conversation, so `find_target` can
+            # never see it again, but it still counts toward BROWSER_MAX_PAGES. Live
+            # state on 2026-09-01 was 12 pages, SEVEN of them bare chatgpt.com roots,
+            # with 1 193 of 1 985 delivery attempts in 24 h refused
+            # `browser_degraded:too_many_pages`. The guard was doing its job; it was
+            # being fed by this branch.
+            #
+            # Closing only `fresh` — the id Chrome just returned to us — cannot touch a
+            # bound conversation or any pre-existing tab, and it leaves the OLD tab
+            # untouched, so the promise above holds: a failed recovery still cannot
+            # leave us with no ChatGPT tab at all. It ends with exactly the tabs it
+            # started with.
+            _close_target(fresh["id"])
             return None
         if old_target.get("id") and old_target["id"] != fresh["id"]:
-            try:
-                _http(f"/json/close/{old_target['id']}")
-            except Exception:  # noqa: BLE001 — a zombie tab is worse to fight than to leave
-                pass
+            _close_target(old_target["id"])
         return find_target(conversation_url)
     except Exception:  # noqa: BLE001
         return None

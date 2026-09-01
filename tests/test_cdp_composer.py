@@ -798,3 +798,91 @@ def test_a_healthy_browser_still_reaches_the_composer(wired, monkeypatch):
     s = wired({"n": 1}, bools=[True, True, True, True])
     r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
     assert r["ok"] is True and s.inserted == ["PHRASE"]
+
+
+# ── the branch that fed the guard (2026-09-01) ──────────────────────────────
+# `browser_degraded` refuses delivery above BROWSER_MAX_PAGES, and it was refusing
+# constantly: 1 193 of 1 985 wake-delivery attempts in 24 h ended
+# `browser_degraded:too_many_pages`, with the live browser holding 12 pages of
+# which SEVEN were bare chatgpt.com roots.
+#
+# The guard was right. It was being fed. When a replacement tab never became
+# usable, `recover_wedged_tab` returned None and left it OPEN — and an unverified
+# tab matches no conversation, so `find_target` can never see it again while it
+# still counts toward the page budget. Every failed recovery permanently spent
+# one slot of the very budget whose exhaustion caused the next failure.
+
+def _recover_with(monkeypatch, *, verified, old_id="old"):
+    from tools import cdp_composer as cc
+    calls = []
+
+    def fake_http(path, method="GET"):
+        calls.append(path)
+        return {"id": "fresh"} if "/json/new" in path else {}
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc, "find_target", lambda url: {"id": "fresh"})
+    monkeypatch.setattr(cc, "page_responsive", lambda t, timeout=8.0: verified)
+    monkeypatch.setattr(cc.time, "sleep", lambda s: None)
+    out = cc.recover_wedged_tab({"id": old_id}, "https://chatgpt.com/c/a")
+    return out, calls
+
+
+def test_an_unverified_replacement_tab_is_closed_not_leaked(monkeypatch):
+    """The exact leak: opened, never usable, never closed."""
+    out, calls = _recover_with(monkeypatch, verified=False)
+    assert out is None
+    assert "/json/close/fresh" in calls, "the tab it opened must not be left behind"
+
+
+def test_a_failed_recovery_leaves_the_old_tab_alone(monkeypatch):
+    """The module's standing promise: a failed recovery cannot leave us with no
+    ChatGPT tab at all. It must end with exactly the tabs it started with."""
+    out, calls = _recover_with(monkeypatch, verified=False)
+    assert out is None
+    assert "/json/close/old" not in calls
+    assert len([c for c in calls if "/json/close/" in c]) == 1
+
+
+def test_a_successful_recovery_keeps_the_new_tab_and_closes_the_old(monkeypatch):
+    """No regression on the 4214 incident: the replacement is the point."""
+    out, calls = _recover_with(monkeypatch, verified=True)
+    assert out is not None
+    assert "/json/close/old" in calls
+    assert "/json/close/fresh" not in calls, "the replacement must survive"
+
+
+def test_nothing_is_closed_when_no_tab_was_ever_opened(monkeypatch):
+    """A browser refused at the guard opens nothing, so it must close nothing."""
+    from tools import cdp_composer as cc
+    calls = []
+    monkeypatch.setattr(cc, "browser_degraded",
+                        lambda *a, **k: {"degraded": True, "reason": "too_many_pages:41"})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET": calls.append(path) or {})
+    assert cc.recover_wedged_tab({"id": "old"}, "https://chatgpt.com/c/a") is None
+    assert calls == []
+
+
+def test_a_new_tab_with_no_id_closes_nothing(monkeypatch):
+    """Chrome answered but gave us no handle — there is nothing safe to close."""
+    from tools import cdp_composer as cc
+    calls = []
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http",
+                        lambda path, method="GET": calls.append(path) or {})
+    assert cc.recover_wedged_tab({"id": "old"}, "https://chatgpt.com/c/a") is None
+    assert not [c for c in calls if "/json/close/" in c]
+
+
+def test_a_close_that_fails_never_raises(monkeypatch):
+    """A zombie tab is worse to fight than to leave — the same rule the old-tab
+    close already followed."""
+    from tools import cdp_composer as cc
+
+    def boom(path, method="GET"):
+        raise OSError("browser gone")
+
+    monkeypatch.setattr(cc, "_http", boom)
+    assert cc._close_target("x") is False
+    assert cc._close_target("") is False
