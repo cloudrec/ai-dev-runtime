@@ -6208,3 +6208,138 @@ A fifth is now visible and is deliberately **not** acted on: three route keys ar
 bound to one conversation. That is why one wedged chat took out three projects,
 and unbinding or rebinding a route is an owner decision about where their wakes
 land, not a defect to fix in code.
+
+---
+
+# Part 56 — native-first, and the end of the watch backlog
+
+An automated instruction directed that no Owner OS mechanism be extended where the
+installed Claude Code provides the capability natively, and that an audit precede
+further code changes. The audit is `reports/OWNER_OS_NATIVE_FIRST_AUDIT_2026-09-01.md`;
+its four recommended steps were then implemented, and two further defects surfaced
+while verifying them.
+
+## What the audit found, and what it refused to conclude
+
+Claude Code `2.1.257`. Of the six lifecycle hooks Owner OS maps, only four ever
+fire here — `Stop` 639, `Notification` 303 (every one `idle_prompt`),
+`StopFailure` 136, `SubagentStop` 124 in 24 h. `TaskCompleted` and `TeammateIdle`
+fired zero times, as did the `agent_needs_input` and `agent_completed` subtypes.
+
+That inverted the attractive conclusion. Turn boundaries and crashes are already
+fully native (1 065 and 136 events against 0 and 4 scraped), but all three
+ACTIONABLE classes an owner is woken for — waiting-input, completion,
+stopped-incomplete — had **zero** native events and 325 scraped ones. The pane
+inference is not redundant there; it is the only producer, and deleting it would
+delete the signal.
+
+What did generalise was `claude agents --json`, which reports `sessionId`, `pid`
+and a `status` of busy/idle/blocked per session.
+
+## Steps 1 and 2 — `0087a68`
+
+`core/native_sessions.py` reads that listing: cached, bounded, and fail-open in
+the only direction that matters — no binary, a timeout, malformed JSON or an
+unlisted session all yield "no opinion", never "not alive". It can only ever
+RESOLVE a watch, never escalate one.
+
+**Identity.** `discovery` had asked which conversation was newest in a CWD: a
+per-directory answer to a per-pane question, and the direct cause of event 18172
+being labelled a rename. Identity now comes from the pid that owns the session.
+
+**Liveness.** Part 53 closed by naming what was missing — "a positive liveness
+signal rather than subtracting more exceptions". `status: busy` is that signal,
+consulted before the scraped class.
+
+It also exposed a test-integrity problem worth recording: three closed-loop tests
+used a REAL conversation id, so they resolved against a genuinely busy live pane
+and inverted their own assertions. The suite was reading live machine state as
+fixture data. `conftest` now hard-disables the native view exactly as it already
+does for the live databases.
+
+## Steps 3 and 4 — `c4d5af8`
+
+Owner OS records the tmux PANE's pid; the runtime records the `claude` process.
+They coincide only when the pane runs `claude` directly:
+
+```
+1692437 -bash          <- email:0.0 as Owner OS sees it
+ └─ 1695585 claude     <- the session the runtime reports
+```
+
+8 of 10 matched; the 2 that did not lost every native answer. A bounded ancestry
+walk fixed it — 10 of 10 now resolve. Step 4 kept `TaskCompleted` / `TeammateIdle`
+as the audit recommended, and pinned `TeammateIdle`, which had no coverage at all,
+so a fallback nobody exercises cannot rot unseen.
+
+A real defect surfaced during that verification: `sessions()` gated its cache on
+HAVING ROWS rather than on freshness, so an EMPTY answer was never cached and
+every lookup re-ran the subprocess — precisely when the binary is failing and it
+most needs to stay cheap.
+
+## The watch backlog, closed — `92ca240`, `c95a5e1`
+
+Two remaining classes of immortal row:
+
+**No target.** Fourteen rows carried an empty target, which `slo_scan` skips by
+name, so they could never resolve, progress or escalate. Every one had the answer
+on its own event: `agent_id` IS the target. `register_delivery` now reads it from
+the event and REFUSES to create a row when even that is blank.
+
+**Success was not a terminal state.** `slo_scan` treated observed progress as a
+reason to skip a row for one pass, never as the state a watch reaches by
+succeeding. 26 open watches for a single session, `_progress_since` true for every
+one, the oldest 107 hours old — unable to fire, unable to close.
+`progress_observed` is now a resolution reason, checked last because it is the
+weakest claim, and unable to suppress an escalation that requires its absence.
+
+Result, verified read-only: **all 49 open watches now resolve** — 27
+`progress_observed`, 13 `watch_has_no_target`, 7 `runtime_reports_agent_working`,
+2 `prompt_no_longer_present`. None remains open. None of those retirements emits.
+
+## An alarm that could not clear — `0dfa5b7`
+
+`actuation_scope_report`, the actuator's strongest safety check, asked the whole
+`cp_action` ledger with no time bound. `arbitrage2-opus:0.0` and
+`mess-qa-automation:0.0` were actuated by `autopilot_next_step` between
+2026-08-04 and 08-07 — 333 rows, all submitted and verified — and the ledger has
+recorded nothing since. The report read red for 25 days, and could not distinguish
+a live escape from a month-old one.
+
+The breach set is unchanged and still asked of the whole ledger; it never shrinks,
+and the summary keeps it on `actuation_scope_breach_ever`. Only the colour moved:
+red in-window, **amber** for historical-only, never green while a breach is on
+record. Unknown time fails SAFE — an undated row counts as active, so a breach
+cannot downgrade itself by writing a bad timestamp.
+
+## Verified end state
+
+`observability_summary()` now reports:
+
+```
+red_reasons : ['active_failures=16']
+red    notifications / notification_history   Telegram
+red    runtime_jobs                           3 active failures
+amber  actuation_scope                        historical, 25 days old
+green  consistency, restart_consistency, registry_health, loop_liveness,
+       cto_cursor, resource_leases, log_growth
+```
+
+Every remaining non-green signal was checked to its cause:
+
+| Signal | Cause | Disposition |
+|---|---|---|
+| notifications ×2 | `Bad Request: chat not found` | **owner gate** — Telegram chat id |
+| runtime_jobs (2 of 3) | `pytest timed out after 600 seconds` | **owner gate** — `RUNTIME_TEST_TIMEOUT` |
+| runtime_jobs (1 of 3) | real collection errors in `backend/tests/` | **out of scope** — `/opt/seo` |
+| actuation_scope | breach of 2026-08-04..07 | correctly classified historical |
+
+**Only genuine owner gates and one out-of-scope project remain.** The gates are
+unchanged and none was crossed: restart the two services, raise
+`RUNTIME_TEST_TIMEOUT`, fix the Telegram chat id, clear the orphaned browser tabs,
+and decide the three route keys bound to one conversation.
+
+Everything from Part 49 onward is committed and inert until a restart, with one
+exception worth repeating because it was previously reported wrongly: `99b6c2f`
+runs from the checkout on every hook invocation and took effect immediately —
+131 quota-banner criticals per 6 h before, zero after.
