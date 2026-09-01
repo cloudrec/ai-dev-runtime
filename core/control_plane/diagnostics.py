@@ -483,12 +483,30 @@ def _read_canary_allowlist(dropin_path: str = None) -> set:
 
 
 def actuation_scope_report(*, now: Optional[float] = None, conn=None, allowlist: set = None,
-                           dropin_path: str = None,
+                           dropin_path: str = None, active_window_secs: float = 86400.0,
                            synthetic_prefixes=("canary-synthetic",)) -> dict:
-    """Verify the actuator never broadened beyond the canary: every target that appears in the
-    durable `cp_action` ledger must be on the canary allowlist (or a known synthetic test
-    target). Any REAL non-canary agent that was actuated is a scope BREACH → red. Read-only —
-    the strongest safety check while the actuator is armed."""
+    """Verify the actuator never broadened beyond the canary: every target in the durable
+    `cp_action` ledger must be on the canary allowlist (or a known synthetic test target).
+    Read-only — the strongest safety check while the actuator is armed.
+
+    The breach set is asked of the WHOLE ledger and never shrinks: once the actuator has
+    escaped its allowlist that is a permanent fact, and hiding it later would be the one
+    change this check must never make.
+
+    But `red` is asked of NOW. The query was unbounded in time, so a single historical
+    breach pinned this report red forever: on this host `arbitrage2-opus:0.0` and
+    `mess-qa-automation:0.0` were actuated by `autopilot_next_step` between 2026-08-04 and
+    2026-08-07, the ledger has recorded nothing at all in the 26 days since, and the
+    report still read red. An alarm in that state cannot distinguish "the actuator is
+    escaping right now" from "it did, last month" — which is precisely how a real breach
+    would arrive unnoticed, wearing the same colour the dashboard has shown all along.
+
+    So: `red` when a breach is INSIDE the window, `amber` when the only breaches are
+    historical. Deliberately never `green` while a breach is on record — the actuator did
+    once escape, and that must not read as clean — and the same active/historical split
+    `notification_failure_report` already uses.
+    """
+    now = now if now is not None else time.time()
     allow = set(allowlist) if allowlist is not None else _read_canary_allowlist(dropin_path)
     own = conn is None
     if conn is None:
@@ -496,22 +514,43 @@ def actuation_scope_report(*, now: Optional[float] = None, conn=None, allowlist:
         conn = connect()
         init_db(conn)
     try:
-        actuated = {r[0] for r in conn.execute(
-            "SELECT DISTINCT target FROM cp_action").fetchall()}
+        rows = conn.execute("SELECT target, created_at FROM cp_action").fetchall()
     finally:
         if own:
             conn.close()
+    actuated = {r[0] for r in rows}
     synthetic = {t for t in actuated if any(t.startswith(p) for p in synthetic_prefixes)}
     unexpected = actuated - allow - synthetic
+    when = _split([r[1] for r in rows if r[0] in unexpected], now, active_window_secs)
+    # An undated or unparseable breach row counts as ACTIVE. Unknown time must fail
+    # safe here: treating "we cannot tell when this happened" as historical would let a
+    # breach downgrade itself by writing a bad timestamp, which is the one direction a
+    # safety check may never move.
+    def _in_window(stamp) -> bool:
+        e = _epoch(stamp)
+        return True if e is None else (now - e) < active_window_secs
+
+    active = {r[0] for r in rows if r[0] in unexpected and _in_window(r[1])}
+    if not unexpected:
+        status, note = "green", "actuation confined to the canary allowlist (+ synthetic tests)"
+    elif active:
+        status, note = "red", "SCOPE BREACH — a non-canary agent was actuated"
+    else:
+        status, note = "amber", ("scope breach on record but none in window — historical, "
+                                 "not a live escape")
     return {
         "metric": "actuation_scope",
         "canary_allowlist": sorted(allow),
         "actuated_targets": sorted(actuated),
         "synthetic_test_targets": sorted(synthetic),
         "unexpected_actuated": sorted(unexpected),
-        "status": "red" if unexpected else "green",
-        "note": ("SCOPE BREACH — a non-canary agent was actuated" if unexpected
-                 else "actuation confined to the canary allowlist (+ synthetic tests)"),
+        "unexpected_active": sorted(active),
+        "breach_newest_at": when["newest_at"],
+        "breach_newest_age_secs": when["newest_age_secs"],
+        "active_window_secs": active_window_secs,
+        "classification": when["classification"],
+        "status": status,
+        "note": note,
     }
 
 
@@ -800,8 +839,11 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         red_reasons.append("same_chat_drain_stalled")
     if cto["stale_consumers"]:
         red_reasons.append(f"stale_cto_cursors={cto['stale_consumers']}")
-    if scope["unexpected_actuated"]:
-        red_reasons.append(f"actuation_scope_breach={scope['unexpected_actuated']}")
+    # Only a breach IN THE WINDOW makes the summary unhealthy. A historical one stays
+    # visible on its own key below, because it must never disappear — but a permanently
+    # unhealthy summary is one nobody can read a new fault out of.
+    if scope["unexpected_active"]:
+        red_reasons.append(f"actuation_scope_breach={scope['unexpected_active']}")
     if not consistency["consistent"]:
         red_reasons.append("consistency_violation")
     if not restartc["restart_safe"]:
@@ -822,7 +864,9 @@ def observability_summary(*, now: Optional[float] = None) -> dict:
         "loop_liveness": loops,
         "stalled_loops": loops["stalled_loops"],
         "actuation_scope": scope,
-        "actuation_scope_breach": bool(scope["unexpected_actuated"]),
+        "actuation_scope_breach": bool(scope["unexpected_active"]),
+        # The permanent record, independent of the window: the actuator escaped once.
+        "actuation_scope_breach_ever": bool(scope["unexpected_actuated"]),
         "consistency": consistency,
         "consistent": consistency["consistent"],
         "restart_consistency": restartc,

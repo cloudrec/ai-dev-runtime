@@ -371,10 +371,14 @@ def test_summary_red_when_a_loop_is_stalled(tmp_path, monkeypatch):
 
 
 # ── actuation scope integrity (never broadened beyond the canary) ────────────
-def _cp_action(target):
+def _cp_action(target, created_at=None):
+    """`created_at` matters now: the scope report asks WHEN a breach happened, so a
+    fixture without a timestamp is a fixture without a claim about liveness."""
+    from datetime import datetime, timezone
+    at = created_at if created_at is not None else datetime.now(timezone.utc).isoformat()
     c = _conn()
-    c.execute("INSERT OR REPLACE INTO cp_action(idkey,target,verified) VALUES(?,?,1)",
-              (f"{target}|k", target))
+    c.execute("INSERT OR REPLACE INTO cp_action(idkey,target,verified,created_at) "
+              "VALUES(?,?,1,?)", (f"{target}|k", target, at))
     c.commit(); c.close()
 
 
@@ -751,3 +755,74 @@ def test_summary_log_growth_is_advisory_not_red(tmp_path, monkeypatch):
     s = diag.observability_summary(now=NOW)
     assert s["log_retention_advise"] is True and s["log_total_rows"] >= 12
     assert s["status"] == "green" and s["red_reasons"] == []   # growth never flips red
+
+
+# ── a scope breach must say WHEN (2026-09-02) ──────────────────────────────
+# `actuation_scope_report` asked the whole `cp_action` ledger with no time bound,
+# so one historical breach pinned it red forever. Live: `arbitrage2-opus:0.0` and
+# `mess-qa-automation:0.0` were actuated by `autopilot_next_step` between
+# 2026-08-04 and 2026-08-07, the ledger recorded nothing at all in the 26 days
+# since, and the report still read red. An alarm in that state cannot tell "the
+# actuator is escaping right now" from "it did last month" — which is exactly how
+# a real breach arrives unnoticed, wearing the colour the dashboard always shows.
+
+def _iso_ago(secs, base=None):
+    """ISO timestamp `secs` before a reference point. Defaults to real now for the
+    report's own default clock; pass `base=NOW` when the caller under test is given
+    the fixed `NOW`, or the offset is measured against the wrong clock entirely."""
+    from datetime import datetime, timedelta, timezone
+    ref = (datetime.fromtimestamp(base, timezone.utc) if base is not None
+           else datetime.now(timezone.utc))
+    return (ref - timedelta(seconds=secs)).isoformat()
+
+
+def test_a_breach_inside_the_window_is_still_red():
+    _cp_action("cp-canary:0.0")
+    _cp_action("arbitrage2-opus:0.0", created_at=_iso_ago(60))
+    r = diag.actuation_scope_report(allowlist={"cp-canary:0.0"})
+    assert r["status"] == "red"
+    assert r["unexpected_active"] == ["arbitrage2-opus:0.0"]
+
+
+def test_a_breach_only_in_history_is_amber_never_green():
+    """The actuator did once escape. That must not read as clean — but it must also
+    stop claiming the escape is happening now."""
+    _cp_action("cp-canary:0.0")
+    _cp_action("arbitrage2-opus:0.0", created_at=_iso_ago(26 * 86400))
+    r = diag.actuation_scope_report(allowlist={"cp-canary:0.0"})
+    assert r["status"] == "amber"
+    assert r["unexpected_active"] == []
+    assert r["unexpected_actuated"] == ["arbitrage2-opus:0.0"], "the record never shrinks"
+    assert r["classification"] == "historical"
+
+
+def test_an_undated_breach_counts_as_active():
+    """Unknown time fails SAFE. Treating "we cannot tell when" as historical would let
+    a breach downgrade itself by writing a bad timestamp."""
+    _cp_action("cp-canary:0.0")
+    c = _conn()
+    c.execute("INSERT OR REPLACE INTO cp_action(idkey,target,verified,created_at) "
+              "VALUES(?,?,1,NULL)", ("undated|k", "arbitrage2-opus:0.0"))
+    c.commit(); c.close()
+    r = diag.actuation_scope_report(allowlist={"cp-canary:0.0"})
+    assert r["status"] == "red" and r["unexpected_active"] == ["arbitrage2-opus:0.0"]
+
+
+def test_a_clean_ledger_is_still_green():
+    _cp_action("cp-canary:0.0")
+    r = diag.actuation_scope_report(allowlist={"cp-canary:0.0"})
+    assert r["status"] == "green" and r["unexpected_actuated"] == []
+
+
+def test_the_summary_stays_healthy_for_a_historical_breach_but_still_records_it(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("RUNTIME_JOBS_DB", str(tmp_path / "empty.db"))
+    sqlite3.connect(str(tmp_path / "empty.db")).execute(
+        "CREATE TABLE jobs(id TEXT,status TEXT,created_at TEXT,updated_at TEXT,finished_at TEXT)")
+    _agent_row("cp:0.0", NOW - 5, "managed")
+    _loop_markers(cw_ts=NOW - 5, orch_ts=NOW - 5, dal_ts=NOW - 5, sup_ts=NOW - 5)
+    _cp_action("some-real-agent:0.0", created_at=_iso_ago(26 * 86400, base=NOW))
+    s = diag.observability_summary(now=NOW)
+    assert s["actuation_scope_breach"] is False, "not a LIVE escape"
+    assert s["actuation_scope_breach_ever"] is True, "and it never disappears"
+    assert not [r for r in s["red_reasons"] if "actuation_scope" in r]
