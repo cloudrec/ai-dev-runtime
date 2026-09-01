@@ -6516,3 +6516,86 @@ red_reasons : ['active_failures=21']
 Items 3-6 are owner decisions about credentials, configuration, a browser and a
 routing choice. None is a code defect, and none can be closed from inside the
 repository.
+
+---
+
+# Part 59 — the tabs, and the pipeline actually delivering
+
+The owner authorised clearing the companion browser's accumulated tabs. This was
+the dominant blocker: the wake pipeline had been correct and deployed since
+Part 57 and idle behind a page budget it could not reclaim on its own.
+
+## Classified before anything was closed
+
+```
+total pages: 25 | bare roots: 21 | conversations: 4 | other: 0
+
+CONVERSATIONS (kept, never touched)
+  BOUND ROUTE  .../c/6a7d37d0-…  ПЛАТЁЖКА
+  BOUND ROUTE  .../c/6a9151c4-…  HostSecure
+  BOUND ROUTE  .../c/6a15459a-…  EMAIL SYSTEM
+  BOUND ROUTE  .../c/6a90487a-…  GAIKA Agent Watch
+```
+
+All four conversation tabs were bound routes; all 21 candidates were bare
+`chatgpt.com` roots with no conversation loaded — the exact accumulation signature
+`cdp_composer` describes, and nothing in progress on any of them. The full
+inventory was snapshotted to the deploy backup first.
+
+The closer refuses on two conditions rather than trusting the snapshot: it aborts
+entirely if no non-root tab would remain, and it **re-reads each tab immediately
+before closing it**, skipping any id that is no longer a bare root. A tab that
+became a conversation between listing and closing is never closed on stale
+evidence.
+
+Result: **21 closed, 0 failed, 4 remain** — the four bound conversations,
+untouched.
+
+## The pipeline started delivering within one tick
+
+Last refusal at 01:27:02, cleanup at ~01:27:35, and then:
+
+```
+01:28:22  delivered wake for event 18798 [route gaika-extension] … submitted_and_assistant_started_generating
+01:29:11  delivered wake for event 18570 [route email]           … submitted_and_assistant_started_generating
+```
+
+Two wakes delivered, **zero** `too_many_pages` since, zero delivery failures,
+zero new criticals. Before the cleanup, 1 193 of 1 985 attempts in 24 h had been
+refused on this guard.
+
+| Check | Result |
+|---|---|
+| Pages now | **4**, of which **0 bare roots** — no regrowth |
+| `worker_skew()` | `[]` |
+| Deliveries since cleanup | 2, both successful |
+| `consecutive_delivery_failures` | 0 |
+| New criticals | 0 |
+
+The page count holding at 4 with no new roots is the first live evidence that
+`404496b` works: under the old code every failed recovery left one behind, which
+is how 7 roots became 21 in a single afternoon.
+
+## What is still draining, and one caveat
+
+Four wakes remain pending, the oldest 9 229 s (2.5 h) on the `seo` route — a
+backlog accumulated while every delivery was refused. That should drain on its
+own, paced by the per-chat cooldown, and is not a fault.
+
+It is worth naming that the `seo` route is one of the three keys bound to the
+single `ПЛАТЁЖКА` conversation (gate 6, still open), and that conversation is the
+one Part 55 found wedged 187 times. So the seo backlog may drain more slowly than
+the others, for a reason that is a routing decision rather than a defect.
+
+## Gates
+
+1. ~~Restart the companion~~ — done (Part 57)
+2. ~~Restart `ai-runtime`~~ — done (Part 58)
+3. ~~Clear the orphaned browser tabs~~ — **done**, above
+4. **Raise `RUNTIME_TEST_TIMEOUT`** past the suite's real duration (~640 s vs 600)
+5. **Fix the Telegram chat id** — `Bad Request: chat not found`; the only remaining
+   `red_reason`, and the cause of every dead letter
+6. **Decide the three route keys bound to one conversation**
+
+Both remaining items are owner decisions about a credential and a routing choice.
+Neither is a code defect.
