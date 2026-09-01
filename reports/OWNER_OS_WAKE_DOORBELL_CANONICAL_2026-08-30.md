@@ -5760,3 +5760,99 @@ Both fixes are committed and **inert** — the hook runs from the checkout, so i
 takes effect for sessions started after it lands, and the notifier runs inside
 `ai-runtime.service`, which has not been restarted. The two owner gates from
 Part 50 stand unchanged, and a third is now named: the Telegram chat id.
+
+---
+
+# Part 52 — one agent, two names
+
+Part 51 cleared the false criticals it could account for and left the wake-loop
+alarms unexplained: 34 `wake_loop_stalled` (critical) and 61
+`wake_loop_no_progress` (high) in 24 h, of which only 6 and 14 traced back to a
+quota banner. The rest were assumed to be the dead Telegram channel or ordinary
+browser backpressure. They were neither.
+
+## The delivery records contradict the alarm
+
+Every stalled watch, joined to its delivery row:
+
+```
+ 13  ('submitted_and_assistant_started_generating', 'owner-os')
+  5  ('submitted_and_assistant_started_generating', 'payment-orchestrator')
+  4  ('submitted_and_assistant_started_generating', 'gaika-extension')
+  4  ('submitted_and_assistant_started_generating', 'seo')
+  ...
+```
+
+**All 34.** Not one failed to deliver. The wake landed, the assistant started
+generating, and the watchdog escalated to critical anyway. Whatever
+`wake_loop_stalled` was measuring, it was not delivery.
+
+## An agent speaks under two names
+
+`agent_watch` files events under the tmux target — `gaika-opus:0.0`. The native
+hooks file theirs under `session:<conversation[:12]>`, because a hook knows its
+own session and nothing about tmux. Both are the same agent.
+
+`_progress_since` counted one name:
+
+```python
+"SELECT COUNT(*) FROM event WHERE agent_id=? AND ts_epoch > ? ..."
+```
+
+So a watch registered on the pane could not see `agent_turn_stopped` — at 835
+events a day the single most abundant proof of life in the system. And a watch
+registered on the session name was worse off still: `agent_watch_state` is keyed
+by tmux target, so a session-form target has no row there at all, and
+`pane_alive_and_working` could never resolve it however plainly the pane was
+working.
+
+The module already spells this defect out — for a different target type:
+
+> the target is a runtime job (`runtimejob:<id>`) that has since reached a
+> terminal status — a job has no pane, so `_progress_since` can NEVER see
+> progress for one; every runtimejob watch is a guaranteed future false positive
+> unless resolution is checked directly against the jobs store
+
+The argument generalises to any identity whose activity is filed under a name the
+watch is not looking at. A plain agent qualified, in both directions, and nobody
+had noticed.
+
+## The fix, and what it is worth
+
+`_identities()` resolves the pair through the agent registry; `_progress_since`
+and the `agent_watch_state` lookup consult all of them. Best-effort by
+construction — any failure yields the target alone, exactly today's behaviour, so
+it can never see *fewer* identities than before.
+
+Measured against all 73 escalations on record, evaluated at the moment each
+decision was actually taken:
+
+| | |
+|---|---|
+| Progress visible **before** the fix | **0** of 73 |
+| Progress visible **after** the fix | **12** of 73 |
+| First-stage re-wakes also suppressed | 4 |
+
+The zero is the check that the measurement is honest: an escalation with visible
+progress could not have happened, because `_progress_since` would have suppressed
+it. The method reproduces that exactly, then finds 12 more.
+
+**It does not explain the other 61, and this is not claimed to.** Those had no
+event under either name inside their window — consistent with a single long turn
+that emits nothing until it ends. Using "an event was recorded" as the proxy for
+"the agent is making progress" is weak in a way this fix does not repair; a turn
+that runs 30 minutes looks identical to a pane that died. That is left open and
+named rather than guessed at.
+
+## State
+
+| | |
+|---|---|
+| Commit | `8aba07f` on `ai-runtime/220-windows-bridge` |
+| Gate | **2 912 passed**, exit 0 |
+| Guard tests | 8; 6 verified failing with the fix reverted |
+| Pinned both ways | a genuinely silent agent still escalates; another agent's activity is still not progress |
+
+Committed and inert, like everything since Part 49 — the watchdog runs inside the
+wake companion, which has not been restarted. The three owner gates stand:
+restart the two services, raise `RUNTIME_TEST_TIMEOUT`, fix the Telegram chat id.
