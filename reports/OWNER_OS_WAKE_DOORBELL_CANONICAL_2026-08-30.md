@@ -6749,3 +6749,75 @@ repair attempted.
 5. **Fix the Telegram chat id** — `Bad Request: chat not found`; still the only
    `red_reason`, and the cause of every dead letter
 6. **Decide the three route keys bound to one conversation**
+
+---
+
+# Part 62 — bounding a bug class, and sharpening the last gate
+
+Two small pieces of work that need no gate: finishing the question Part 56 opened
+by fixing one alarm that could not clear, and making the remaining Telegram gate
+precise enough to act on.
+
+## The alarm-that-cannot-clear class, swept
+
+`actuation_scope_report` was red for 25 days over a breach from 2026-08-04 because
+it queried the whole ledger with no time bound. That is a class of defect, not an
+incident, so every report surface was checked for the same shape rather than
+assuming it was unique:
+
+| Report | Verdict |
+|---|---|
+| `actuation_scope`, `notification_failure`, `notification_history`, `runtime_job_failure` | use `_split` — active vs historical |
+| `commander_delivery`, `cto_cursor`, `lease`, `log_growth`, `loop_liveness`, `owner_gate`, `registry_health`, `restart_consistency`, `runtime_blockers` | windowed |
+| `closed_loop_wake` | unbounded **and correct** |
+| `consistency` | unbounded **and correct** |
+
+The two unbounded survivors were examined rather than flagged. `closed_loop_wake`
+returns a hardcoded `"status": "green"` — it is a lifetime-counters surface and
+never an alarm, so a window would be meaningless. `consistency` checks
+INVARIANTS: a notification sitting in an unknown state is wrong *now*, whenever it
+got there, so a present-tense fact needs no window. It reports green with zero
+violations.
+
+**Result: one instance, already fixed.** The class is closed rather than left as
+an open suspicion, which is the point of sweeping it.
+
+## The Telegram gate is narrower than "fix the chat id"
+
+The standing description of gate 5 has been "fix the Telegram chat id". The
+stored evidence supports a sharper reading, reached without using the credential
+for anything:
+
+```
+channel.last_error = "telegram send failed: Bad Request: chat not found"
+TELEGRAM_BOT_TOKEN  set
+TELEGRAM_CHAT_ID    set, 9 digits, positive
+```
+
+`Bad Request` is HTTP **400**. An invalid, revoked or malformed bot token returns
+**401 Unauthorized**, not a 400 about a chat. So Telegram authenticated the bot
+and then rejected the destination: **the token is valid; the problem is the
+chat.**
+
+A positive 9-digit id is a private user chat, and for those "chat not found" most
+commonly means the user has never started a conversation with the bot — Telegram
+refuses to let a bot message a user who has not initiated contact.
+
+So the id may well be correct and the fix may not be an edit at all: opening that
+bot in Telegram and pressing **Start** would be enough. That is worth knowing
+before anyone goes looking for a wrong number, and it is checkable in seconds by
+the one person who can see the chat.
+
+No API call was made to confirm this. Verifying the token by calling `getMe`
+would mean using the credential outward, which is not something to do unasked when
+the existing error text already distinguishes the two cases.
+
+## Gates
+
+1-4. ~~companion restart~~ · ~~`ai-runtime` restart~~ · ~~browser tabs~~ ·
+   ~~`RUNTIME_TEST_TIMEOUT`~~ — done
+5. **Telegram delivery** — token valid, destination rejected; most likely the bot
+   has never been started by that chat. Still the only `red_reason`.
+6. **Decide the three route keys bound to one conversation** — not currently
+   harmful (Part 60 measured all three getting through), but it is why one wedged
+   chat took out three projects in Part 55.
