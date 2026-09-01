@@ -351,7 +351,7 @@ def _watch_state_cls(conn, target: str) -> str:
 
 
 def _resolution_reason(conn, *, event_id: int, target: str,
-                       agents=None) -> Optional[str]:
+                       agents=None, delivered_ts: Optional[float] = None) -> Optional[str]:
     """Has the condition THIS watch exists for already resolved? Three independent
     signals, any one of which is sufficient:
 
@@ -446,6 +446,20 @@ def _resolution_reason(conn, *, event_id: int, target: str,
                 return "prompt_no_longer_present"
     except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
         pass
+    # The watch's own question, answered: did this delivered wake produce movement?
+    # `slo_scan` treated progress as a reason to SKIP the row for one pass and never
+    # as the state it reaches by succeeding, so a watch whose wake plainly worked
+    # stayed open forever — re-evaluated on every scan, for as long as the row lived.
+    # Observed: 26 open watches for one session, every one of them with progress
+    # recorded, the oldest 107 hours old. They can never fire (progress measured from
+    # delivery only ever accumulates) and never close: inert, but immortal.
+    #
+    # Checked LAST, because it is the weakest claim — it says only that something
+    # happened afterwards — so any structural reason above still wins the audit trail.
+    # It can never suppress a due escalation: escalation requires the absence of
+    # exactly what this asserts.
+    if delivered_ts is not None and target and _progress_since(conn, target, delivered_ts):
+        return "progress_observed"
     return None
 
 
@@ -459,12 +473,12 @@ def deregister_resolved(*, conn=None, now: Optional[float] = None, agents=None) 
     conn, own = _conn(conn)
     try:
         rows = conn.execute(
-            "SELECT event_id, target FROM wake_loop_watch "
+            "SELECT event_id, target, delivered_ts FROM wake_loop_watch "
             "WHERE escalated=0 AND COALESCE(resolved,0)=0").fetchall()
         deregistered = []
-        for event_id, target in rows:
+        for event_id, target, delivered_ts in rows:
             reason = _resolution_reason(conn, event_id=event_id, target=target or "",
-                                        agents=agents)
+                                        agents=agents, delivered_ts=delivered_ts)
             if not reason:
                 continue
             conn.execute(

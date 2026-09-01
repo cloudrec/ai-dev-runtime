@@ -1304,3 +1304,74 @@ def test_rows_written_before_the_guard_are_retired_not_left_open(conn):
     assert 4863 in [d["event_id"] for d in r["deregistered"]]
     assert not r["rewoken"] and not r["escalated"]
     assert emit.calls == [], "retiring an orphan must not wake anyone"
+
+
+# ── a wake that worked is FINISHED (2026-09-02) ────────────────────────────
+# `slo_scan` treated observed progress as a reason to skip the row for one pass,
+# never as the state a watch reaches by SUCCEEDING. So a watch whose wake plainly
+# worked stayed open forever, re-evaluated on every scan for the life of the row.
+# Observed live: 26 open watches for a single session, every one with progress
+# recorded, the oldest 107 hours old. They can never fire — progress measured from
+# delivery only ever accumulates — and never close. Inert, but immortal.
+
+def test_a_watch_whose_wake_produced_progress_is_retired(conn):
+    clw.register_delivery(event_id=800, target="mess:0.0", project_id="mess",
+                          conn=conn, now=NOW)
+    cto.emit("agent_watch", "agent_state", agent_id="mess:0.0", project_id="mess",
+             conn=conn)
+    assert clw._resolution_reason(conn, event_id=800, target="mess:0.0",
+                                  delivered_ts=NOW) == "progress_observed"
+
+    emit = _Emit()
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert [d["event_id"] for d in r["deregistered"]] == [800]
+    assert r["deregistered"][0]["reason"] == "progress_observed"
+    assert emit.calls == [], "retiring a successful watch must not wake anyone"
+
+
+def test_it_does_not_reopen_on_a_later_scan(conn):
+    """The point of a terminal state: the row stops being work."""
+    clw.register_delivery(event_id=801, target="mess:0.0", project_id="mess",
+                          conn=conn, now=NOW)
+    cto.emit("agent_watch", "agent_state", agent_id="mess:0.0", project_id="mess",
+             conn=conn)
+    emit = _Emit()
+    clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    r2 = clw.slo_scan(conn=conn, now=NOW + 9 * clw.WAKE_LOOP_SLO_SECS, emit_fn=emit)
+    assert r2["deregistered"] == [] and not r2["rewoken"] and not r2["escalated"]
+
+
+def test_silence_after_delivery_still_escalates(conn):
+    """Retiring on progress must not become retiring on everything: escalation
+    requires the ABSENCE of exactly what `progress_observed` asserts."""
+    clw.register_delivery(event_id=802, target="quiet:0.0", project_id="mess",
+                          conn=conn, now=NOW)
+    emit = _Emit()
+    clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    clw.slo_scan(conn=conn, now=NOW + 2 * clw.WAKE_LOOP_SLO_SECS + 60, emit_fn=emit)
+    assert [c["type"] for c in emit.calls] == ["wake_loop_no_progress",
+                                               "wake_loop_stalled"]
+
+
+def test_a_structural_reason_still_wins_the_audit_trail(conn):
+    """`progress_observed` is the weakest claim — it says only that something
+    happened afterwards — so it is checked last."""
+    aw._conn(conn)
+    conn.execute("INSERT OR REPLACE INTO agent_watch_state (target, cls) VALUES (?,?)",
+                 ("mess:0.0", "working"))
+    conn.commit()
+    clw.register_delivery(event_id=803, target="mess:0.0", project_id="mess",
+                          conn=conn, now=NOW)
+    cto.emit("agent_watch", "agent_state", agent_id="mess:0.0", project_id="mess",
+             conn=conn)
+    assert clw._resolution_reason(conn, event_id=803, target="mess:0.0",
+                                  delivered_ts=NOW) == "pane_alive_and_working"
+
+
+def test_a_caller_that_omits_delivered_ts_gets_the_old_behaviour(conn):
+    """Progress is only claimed when the caller supplies the delivery time."""
+    clw.register_delivery(event_id=804, target="mess:0.0", project_id="mess",
+                          conn=conn, now=NOW)
+    cto.emit("agent_watch", "agent_state", agent_id="mess:0.0", project_id="mess",
+             conn=conn)
+    assert clw._resolution_reason(conn, event_id=804, target="mess:0.0") is None
