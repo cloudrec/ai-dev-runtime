@@ -83,6 +83,27 @@ def _conn(conn=None):
 _RUNTIME_JOB_TERMINAL_STATUSES = frozenset({
     "completed", "failed", "cancelled", "rolled_back", "blocked", "fallback_plan_only",
 })
+
+# A job parked on an OWNER GATE is waiting, not stalled — the job-shaped twin of the
+# `intentional_external_wait` rule below. `runtime_watchdog` already states it outright:
+# "`waiting_approval` is NEVER a stall: it is a true owner decision, announced once by
+# the lifecycle bridge (runtime_events), not re-announced here." This module never
+# learned it. So `runtime_events` announced the decision properly as
+# `owner_decision_required` (high), the job then sat in `waiting_approval` exactly as it
+# must until a human acts, `_progress_since` saw nothing move, and the watchdog
+# escalated `wake_loop_stalled` — CRITICAL — telling the owner a second and louder time
+# about a decision already sitting in their queue. Re-waking cannot help: the only thing
+# that ends this state is the owner.
+#
+# Deliberately NOT folded into the terminal set. The job is not finished, and this
+# resolution is self-limiting in the same way `agent_parked_completed` is: when the
+# owner approves, the status leaves this set and the next event for the job opens its
+# own fresh watch.
+# Exactly the status that wakes AND parks: `runtime_events.EVENT_FOR_STATUS` maps
+# `waiting_approval` to `owner_decision_required`, and nothing else in that table both
+# raises a wake and then waits on a human. `draft`/`superseded` never wake at all, so
+# they can never open a watch and are deliberately not listed on speculation.
+_RUNTIME_JOB_OWNER_GATE_STATUSES = frozenset({"waiting_approval"})
 _RUNTIME_JOB_TARGET_PREFIX = "runtimejob:"
 
 # Hook-sourced wakes are addressed `session:<conversation id>`, a namespace that never
@@ -159,9 +180,19 @@ def _runtime_job_terminal(target: str) -> bool:
     job_store's own configured DB path (so it follows RUNTIME_DB in tests exactly the
     way job_store itself does); any failure to read reads as "not confirmed terminal"
     — a job store this module cannot see must never be treated as resolved."""
+    return _runtime_job_status(target) in _RUNTIME_JOB_TERMINAL_STATUSES
+
+
+def _runtime_job_status(target: str) -> str:
+    """This job's current status, or "" when it cannot be read.
+
+    An unreadable job store yields "", which matches no status set, so every caller
+    falls through to "not resolved" — a store this module cannot see must never be
+    treated as resolved.
+    """
     prefix = target[len(_RUNTIME_JOB_TARGET_PREFIX):]
     if not prefix:
-        return False
+        return ""
     try:
         import sqlite3
         from core import job_store
@@ -172,9 +203,9 @@ def _runtime_job_terminal(target: str) -> bool:
                 (prefix + "%",)).fetchone()
         finally:
             jconn.close()
-        return bool(row) and row[0] in _RUNTIME_JOB_TERMINAL_STATUSES
+        return (row[0] if row else "") or ""
     except Exception:  # noqa: BLE001 — never let a job-store read block resolution
-        return False
+        return ""
 
 
 # An INTENTIONAL external wait, proven structurally rather than read out of prose.
@@ -313,8 +344,11 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     if not target:
         return None
     if target.startswith(_RUNTIME_JOB_TARGET_PREFIX):
-        if _runtime_job_terminal(target):
+        status = _runtime_job_status(target)
+        if status in _RUNTIME_JOB_TERMINAL_STATUSES:
             return "runtime_job_terminal"
+        if status in _RUNTIME_JOB_OWNER_GATE_STATUSES:
+            return "runtime_job_awaiting_owner"
         return None
     if target.startswith(_SESSION_TARGET_PREFIX) and _session_target_gone(
             conn, event_id, target, agents=agents):

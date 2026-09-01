@@ -1162,3 +1162,83 @@ def test_an_unreadable_registry_never_claims_resolution():
 
     assert clw._identities(Broken(), PANE) == (PANE,)
     assert clw._watch_state_cls(Broken(), PANE) == ""
+
+
+# ── a job on an owner gate is waiting, not stalled (2026-09-01) ─────────────
+# 6 of the 8 escalated `runtimejob:` watches on record were sitting in
+# `waiting_approval`. `runtime_events` had already announced that properly as
+# `owner_decision_required` (high); the job then sat exactly where it must until a
+# human acted; `_progress_since` saw nothing move; and this watchdog escalated
+# `wake_loop_stalled` — CRITICAL — telling the owner a second and louder time
+# about a decision already sitting in their queue. Re-waking cannot help, because
+# the only thing that ends the state is the owner.
+#
+# `runtime_watchdog` states the rule outright in its own module docstring —
+# "`waiting_approval` is NEVER a stall: it is a true owner decision, announced
+# once by the lifecycle bridge (runtime_events), not re-announced here" — and this
+# module simply never learned it.
+
+def _job_at(monkeypatch, tmp_path, status, name="gate.db"):
+    monkeypatch.setenv("RUNTIME_DB", str(tmp_path / name))
+    from core import job_store
+    monkeypatch.setattr(job_store, "_DB", str(tmp_path / name))
+    job_store.init_db()
+    job = job_store.create_job(goal="needs a human", instructions="x",
+                               project_path="/root/ai-dev-runtime")
+    job_store.update_job(job["id"], status=status)
+    return f"runtimejob:{job['id'][:8]}"
+
+
+def test_a_job_awaiting_approval_is_resolved_not_escalated(conn, monkeypatch, tmp_path):
+    target = _job_at(monkeypatch, tmp_path, "waiting_approval")
+    emit = _Emit()
+    clw.register_delivery(event_id=310, target=target, project_id="owner-os",
+                          event_type="owner_decision_required", conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r["rewoken"] and not r["escalated"]
+    assert r["deregistered"][0]["reason"] == "runtime_job_awaiting_owner"
+    assert emit.calls == [], "the owner must not be told a second time"
+
+
+def test_awaiting_owner_is_not_reported_as_terminal(conn, monkeypatch, tmp_path):
+    """The job is not finished, and conflating the two would let a parked job be
+    read as a completed one."""
+    target = _job_at(monkeypatch, tmp_path, "waiting_approval", name="gate2.db")
+    assert clw._runtime_job_terminal(target) is False
+    assert clw._resolution_reason(conn, event_id=311, target=target) == \
+        "runtime_job_awaiting_owner"
+
+
+def test_an_executing_job_still_escalates(conn, monkeypatch, tmp_path):
+    """The fix must resolve only owner-gated jobs, never every runtimejob watch."""
+    from core.control_plane.store import now_ts
+    target = _job_at(monkeypatch, tmp_path, "editing", name="gate3.db")
+    t0 = now_ts()
+    emit = _Emit()
+    clw.register_delivery(event_id=312, target=target, project_id="owner-os",
+                          event_type="owner_decision_required", conn=conn, now=t0)
+    r = clw.slo_scan(conn=conn, now=t0 + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r["deregistered"]
+    assert [e["event_id"] for e in r["rewoken"]] == [312]
+
+
+def test_an_unreadable_job_store_resolves_nothing(conn, monkeypatch):
+    """A store this module cannot see must never be treated as resolved."""
+    from core import job_store
+    monkeypatch.setattr(job_store, "_DB", "/nonexistent/dir/jobs.db")
+    assert clw._runtime_job_status("runtimejob:deadbeef") == ""
+    assert clw._runtime_job_terminal("runtimejob:deadbeef") is False
+    assert clw._resolution_reason(conn, event_id=313,
+                                  target="runtimejob:deadbeef") is None
+
+
+def test_only_the_status_that_both_wakes_and_parks_is_gated():
+    """`draft`/`superseded` never wake, so they can never open a watch — they are
+    deliberately not in the set, rather than added on speculation."""
+    from core import runtime_events as re_
+    assert clw._RUNTIME_JOB_OWNER_GATE_STATUSES == {"waiting_approval"}
+    ev, _sev, oar = re_.EVENT_FOR_STATUS["waiting_approval"]
+    assert ev == "owner_decision_required" and oar is True
+    assert "draft" not in re_.EVENT_FOR_STATUS
+    assert not (clw._RUNTIME_JOB_OWNER_GATE_STATUSES
+                & clw._RUNTIME_JOB_TERMINAL_STATUSES)
