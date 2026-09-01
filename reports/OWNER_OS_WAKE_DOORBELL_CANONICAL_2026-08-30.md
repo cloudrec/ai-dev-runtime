@@ -6095,3 +6095,116 @@ Standing owner gates, unchanged and none crossed:
 4. **Clear the orphaned browser tabs** (new): seven bare `chatgpt.com` roots hold
    the page budget at the guard threshold, so wake delivery stays ~60% refused
    until they are closed, even with `404496b` live.
+
+---
+
+# Part 55 — a claim is a slot in one chat, not in one route key
+
+Continuing down the wake-delivery reasons after Part 54, the second-largest
+failure was `assistant_generating_wedged` at 191 in 24 h. Following it did not
+end where it looked like it would.
+
+## 187 of 191 wedges are one conversation
+
+```
+=== assistant_generating_wedged by route, 24h ===
+ 106  owner-os
+  53  seo
+  28  payment-orchestrator
+   4  gaika-extension
+
+=== by conversation ===
+ 187  https://chatgpt.com/c/6a7d37d0-02dc-83ed-9ef4-d26156937c57
+   4  https://chatgpt.com/c/6a90487a-fddc-83eb-9545-7f1ad2dc958d
+```
+
+Three route keys, one chat. The registry confirms it: `owner-os`,
+`payment-orchestrator` and `seo` are all bound to
+`6a7d37d0-02dc-83ed-9ef4-d26156937c57`. So a single wedged conversation was
+failing the wakes of three projects — and rebinding a route is an owner action,
+so that stayed untouched.
+
+The wedge itself also has no route out at present: `recover_wedged_tab` is the
+designated recovery, and it refuses while the browser is degraded — which it is,
+on the page budget from Part 54. Two findings feeding each other, neither
+fixable by mutating the live browser.
+
+## What the shared chat actually broke
+
+`claim_send` is documented as the choke point, and its docstring is explicit:
+
+> The cooldown is measured PER ROUTE, for the same reason the decision-layer
+> floors are: **a claim is a slot in ONE chat.**
+
+Its caller agrees, in the same words:
+
+> The claim is for a slot in THIS conversation, so it carries the route.
+
+Both sentences describe the chat. The code keyed on the route. Those coincide
+only while routes map one-to-one onto conversations — and three keys here share
+one, so that chat was claimable once *per route* per window, at three times the
+intended rate.
+
+This was measured, not inferred:
+
+| | |
+|---|---|
+| Claims granted into one chat inside its 900 s window, different routes, 7 days | **907** |
+| Of those, **successful** sends the owner actually received | **273** |
+| Closest pair | **24 seconds apart** |
+
+Rapid-fire wakes in a single conversation are exactly what the floor exists to
+prevent, and it had been open for as long as any two keys have shared a chat.
+
+## The fix
+
+The cooldown scopes to the conversation when the caller names it, and the
+companion names it. A caller that cannot — an out-of-band send, an older caller,
+a route with nothing bound — keeps the route scope exactly as before, so nothing
+is newly blocked or newly permitted by omission. The route key still travels and
+is still recorded, so an audit row says both what was claimed and which scope
+judged it.
+
+Narrowing to the chat deliberately does **not** widen back into cross-chat
+suppression — the bug this floor was already fixed for once, when a gaika-drop
+wake sat 867 s behind an owner-os send that was never going to its chat. A wake
+to a different conversation is unaffected, and a test pins that.
+
+## Migration, rehearsed rather than asserted
+
+`wake_send` gains a `conversation` column and a matching lookback index, both
+additive. Against a copy of the live database:
+
+| | |
+|---|---|
+| Rows | 33 922 |
+| Migration + index build | 59 ms |
+| `integrity_check` | ok |
+| Rows preserved | yes |
+| New lookback, worst case | 1.2 ms (same order as the route lookback beside it) |
+
+Stated plainly because it is a real if minor consequence: every existing row has
+an empty conversation, so on first run each chat's window starts fresh — at most
+one extra send per chat, once, self-correcting on the next claim.
+
+| | |
+|---|---|
+| Commit | `b160887` on `ai-runtime/220-windows-bridge` |
+| Gate | **2 929 passed**, exit 0 |
+| Guard tests | 6; 5 verified failing with the fix reverted |
+
+## Ledger
+
+Committed and inert. The owner gates are unchanged, and Part 54's fourth still
+stands; nothing here crossed any of them:
+
+1. **Restart the two services** — everything from Part 49 onward is inert.
+2. **Raise `RUNTIME_TEST_TIMEOUT`** past the suite's real duration.
+3. **Fix the Telegram chat id** — the single cause of 4 211 dead letters.
+4. **Clear the orphaned browser tabs** — seven bare roots hold the page budget at
+   the guard threshold; this also blocks the one recovery a wedged chat has.
+
+A fifth is now visible and is deliberately **not** acted on: three route keys are
+bound to one conversation. That is why one wedged chat took out three projects,
+and unbinding or rebinding a route is an owner decision about where their wakes
+land, not a defect to fix in code.
