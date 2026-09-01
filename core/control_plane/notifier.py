@@ -21,16 +21,59 @@ MAX_ATTEMPTS = 5
 DEAD_LETTER_DEDUP_SECS = int(os.getenv("NOTIFIER_DEAD_LETTER_DEDUP_SECS", "900"))
 
 
+# The proactive tiers `delivery.deliver` walks, in its order. Named here because the
+# dead-letter alarm has to be able to say WHY, and the reason is per-tier.
+_TIERS = ("same_chat_wake", "owner_push")
+
+
+def _failure_reasons(conn=None) -> dict:
+    """Why each proactive tier is not delivering, from the stored channel evidence.
+
+    `deliver()` computes a real reason per tier on every attempt and returns it in
+    `attempts[].detail`, but the dead-letter branch fires on a LATER drain, when that
+    return value is long gone — so the alarm carried none of it. Measured: 311 critical
+    dead letters in 24 h whose entire payload was an id, a channel name, an attempt
+    count and a dedup key, while the cause sat one table away the whole time
+    ("Bad Request: chat not found" — a chat id the bot cannot post to).
+
+    Read from `channel.last_error`, which delivery already maintains as the durable
+    record of the last real rejection. Best-effort by construction: an alarm that
+    cannot be raised because its explanation failed to load is strictly worse than an
+    unexplained alarm.
+    """
+    out = {}
+    for tier in _TIERS:
+        try:
+            row = api.get_channel(tier, conn=conn) or {}
+        except Exception:  # noqa: BLE001 — never block the alarm on its own annotation
+            continue
+        err = (row.get("last_error") or "").strip()
+        if err:
+            out[tier] = err[:300]
+    return out
+
+
 def drain(*, max_attempts: int = MAX_ATTEMPTS, conn=None) -> dict:
     sent = failed = dead = 0
+    # Read once per drain, not once per dead letter: the channel state cannot change
+    # inside a pass, and a backlog is exactly when this runs over many rows at once.
+    reasons = None
     for n in api.pending_notifications(conn=conn):
         if n["attempts"] >= max_attempts:
             api.mark_notification(n["id"], "dead_letter", conn=conn)
+            if reasons is None:
+                reasons = _failure_reasons(conn=conn)
+            # The one line an owner actually reads. "delivery channel unhealthy" names
+            # the symptom they already knew about from the severity; the rejection text
+            # is the part that says what to change.
+            why = "; ".join(f"{t}: {r}" for t, r in reasons.items())
             emit("notifier", "notification_dead_letter", severity="critical",
                  owner_action_required=True,
                  payload={"notification_id": n["id"], "channel": n["channel"],
-                          "attempts": n["attempts"], "dedup_key": n["dedup_key"]},
-                 action_taken="dead-lettered after max attempts — delivery channel unhealthy",
+                          "attempts": n["attempts"], "dedup_key": n["dedup_key"],
+                          "reasons": reasons},
+                 action_taken=("dead-lettered after max attempts — "
+                               + (why or "delivery channel unhealthy"))[:400],
                  # Keyed by CHANNEL, not by notification id. An id is unique by
                  # construction, so the old key deduped nothing: a channel that has been
                  # down for weeks minted a fresh critical owner_action_required event for

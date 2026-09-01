@@ -83,3 +83,65 @@ def test_a_different_channel_still_gets_its_own_alarm():
         notifier.drain(max_attempts=5)
     channels = {e.get("payload", {}).get("channel") for e in _dead_letter_events()}
     assert channels == {"owner_push", "some_other_channel"}
+
+
+# ── a dead letter must say WHY (2026-09-01) ──────────────────────────────────
+# 311 critical dead letters in 24 h whose entire payload was an id, a channel
+# name, an attempt count and a dedup key. The cause sat one table away the whole
+# time — `channel.last_error` read "telegram send failed: Bad Request: chat not
+# found", a chat id the bot cannot post to. `deliver()` computes that reason on
+# every attempt and returns it in `attempts[].detail`, but the dead-letter branch
+# fires on a LATER drain, when that return value is long gone.
+
+CHAT_NOT_FOUND = "telegram send failed: Bad Request: chat not found"
+
+
+def _drain_to_dead_letter(max_attempts=5):
+    cp.enqueue_notification(channel="owner_push", dedup_key="why")
+    for _ in range(max_attempts + 1):
+        notifier.drain(max_attempts=max_attempts)
+    return [e for e in cto.cto_brief_since("t")["events"]
+            if e["type"] == "notification_dead_letter"]
+
+
+def test_a_dead_letter_carries_the_rejection_that_caused_it(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "y")
+    monkeypatch.setattr(delivery, "_send_owner_push",
+                        lambda m: (False, None, CHAT_NOT_FOUND))
+    delivery.refresh_channel_health()
+
+    evs = _drain_to_dead_letter()
+    assert evs, "no dead letter raised"
+    assert evs[0]["payload"]["reasons"]["owner_push"] == CHAT_NOT_FOUND
+
+
+def test_the_summary_line_names_the_cause(monkeypatch):
+    """`action_taken` is what the notifications surface shows, and "delivery
+    channel unhealthy" only restates the severity."""
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "y")
+    monkeypatch.setattr(delivery, "_send_owner_push",
+                        lambda m: (False, None, CHAT_NOT_FOUND))
+    delivery.refresh_channel_health()
+
+    evs = _drain_to_dead_letter()
+    assert "chat not found" in (evs[0].get("action_taken") or "")
+
+
+def test_an_unexplained_failure_still_dead_letters(monkeypatch):
+    """Best-effort by construction: an alarm that cannot be raised because its
+    explanation failed to load is strictly worse than an unexplained alarm."""
+    monkeypatch.setattr(notifier, "_failure_reasons", lambda conn=None: {})
+    delivery.refresh_channel_health()
+    evs = _drain_to_dead_letter()
+    assert evs, "the alarm must survive having no reason to give"
+    assert evs[0]["severity"] == "critical"
+    assert "delivery channel unhealthy" in (evs[0].get("action_taken") or "")
+
+
+def test_reading_the_reason_never_breaks_the_alarm(monkeypatch):
+    def boom(*a, **kw):
+        raise RuntimeError("channel table unreadable")
+    monkeypatch.setattr(notifier.api, "get_channel", boom)
+    assert notifier._failure_reasons() == {}
