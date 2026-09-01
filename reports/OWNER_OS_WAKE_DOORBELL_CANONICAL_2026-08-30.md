@@ -6343,3 +6343,84 @@ Everything from Part 49 onward is committed and inert until a restart, with one
 exception worth repeating because it was previously reported wrongly: `99b6c2f`
 runs from the checkout on every hook invocation and took effect immediately —
 131 quota-banner criticals per 6 h before, zero after.
+
+---
+
+# Part 57 — the companion restart
+
+The owner authorised restarting the wake companion, staged separately from
+`ai-runtime` as offered. Everything from Parts 50-56 that lives in the companion
+is now live; `ai-runtime` was deliberately left alone and still runs the code it
+started with on 2026-09-01 04:34Z.
+
+## Before
+
+| | |
+|---|---|
+| HEAD | `7c983f9`, tracked tree clean |
+| Companion | PID 3291988, started 19:51:00 CEST on `65c9c0c`-era code |
+| Skew | wake_companion 17 252 s behind; agent_orchestrator 48 918 s behind |
+| Backup | `backups/predeploy_companion_20260901T231557Z/` — both DBs, `integrity_check` ok |
+| Rollback | `ROLLBACK.md` in that directory; tag `rollback/pre-companion-restart-20260901T231557Z` |
+
+The rollback plan names the cheapest option first and it is not a code change:
+`systemctl stop owner-os-wake-companion`. The bridge is an accelerator by
+construction — with it stopped, events still land durably in the CTO inbox and
+autonomy is unaffected. Restoring the previously-running code is
+`git checkout 65c9c0c` + restart, which preserves the branch and every commit.
+
+## After — verified, not assumed
+
+| Check | Result |
+|---|---|
+| Service | active/running, PID 901395, clean start |
+| Errors in journal | **none** — no traceback, no exception, no failure line |
+| Skew | **wake_companion GONE from the skew list**; only agent_orchestrator remains, as expected |
+| `code_fingerprint` | recorded (`774bf58d…`) — the content-based skew check is live and knows what it loaded |
+| Heartbeat | `last_seen` advanced 23:16:59 → 23:18:05, no longer frozen at boot (`88582aa`) |
+| `wake_send.conversation` | column + index present; the per-chat cooldown migration applied cleanly to 34 156 live rows |
+| Open watches | **49 → 0** |
+| New criticals since restart | **0** |
+| Fleet | 10 live agents, 13 native sessions, no duplicates |
+
+The watch backlog retired itself silently and in the log, exactly as designed:
+
+```
+closed-loop-watch: deregistered session:d3555e35-b20 for event 17976 — progress_observed
+closed-loop-watch: deregistered mess-postsignup-cleanup-sonnet-v4:0.0 for event 18389 — progress_observed
+```
+
+34 `progress_observed`, 13 `watch_has_no_target`, 2 `prompt_no_longer_present`.
+No wake was emitted for any of them.
+
+## The gate this restart could not open, now quantified
+
+Delivery is still refused on the first tick and every tick since:
+
+```
+not delivered for event 18570; stays pending (browser_degraded:too_many_pages:25)
+```
+
+The companion browser holds **25 pages, 21 of them bare `chatgpt.com` roots**,
+against a `BROWSER_MAX_PAGES` of 12. It was 12 pages / 7 roots when Part 54
+measured it this afternoon; the leak kept running until this restart, because the
+fix for it (`404496b`) only became live now.
+
+So `404496b` stops the accumulation from here. It cannot reclaim the 21 roots
+already open, and while they hold the budget **every wake delivery stays refused**
+— which also blocks the single recovery a wedged conversation has, since
+`recover_wedged_tab` refuses while the browser is degraded.
+
+Clearing those tabs is a mutation of the companion browser and remains an owner
+decision. It is now the dominant blocker: the wake pipeline is correct, deployed
+and idle behind it.
+
+## Standing gates after this restart
+
+1. ~~Restart the companion~~ — **done**, verified above.
+2. **Restart `ai-runtime`** — still carries the Part 49 `agent_control.py` fix and
+   the job-executor timeout classification, 48 918 s stale.
+3. **Raise `RUNTIME_TEST_TIMEOUT`** past the suite's real duration.
+4. **Fix the Telegram chat id** — the only remaining `red_reason`.
+5. **Clear the orphaned browser tabs** — now the dominant blocker.
+6. **Decide the three route keys bound to one conversation.**
