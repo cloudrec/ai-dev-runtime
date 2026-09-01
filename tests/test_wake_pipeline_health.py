@@ -258,8 +258,19 @@ def test_a_failing_health_call_never_kills_the_loop(monkeypatch):
 # the gaika-drop chat while the stale companion delivered it to owner-os and
 # logged `[route owner-os]`. Same database, two versions of the truth.
 
+_REAL_FP = wake_bridge._module_fingerprint
+
+
+def _deployed(monkeypatch, value="deployed"):
+    """Stand in for new bytes on disk: whatever the worker recorded when it
+    loaded its code, the files no longer hash to it."""
+    monkeypatch.setattr(wake_bridge, "_module_fingerprint",
+                        lambda w="wake_companion": value)
+
+
 def test_a_worker_started_before_the_current_code_is_flagged(conn, monkeypatch):
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    _deployed(monkeypatch)                       # the bytes changed after it started
     monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 60)
     skew = wake_bridge.worker_skew(conn=conn, now=NOW)
     assert len(skew) == 1
@@ -275,6 +286,7 @@ def test_a_worker_restarted_after_the_deploy_is_clean(conn, monkeypatch):
 
 def test_skew_makes_the_pipeline_report_stuck(conn, monkeypatch):
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    _deployed(monkeypatch)
     monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 60)
     h = wake_bridge.pipeline_health(conn=conn, now=NOW)
     assert h["status"] == "stuck"
@@ -284,6 +296,7 @@ def test_skew_makes_the_pipeline_report_stuck(conn, monkeypatch):
 def test_a_heartbeat_from_the_same_process_keeps_the_original_start_time(conn, monkeypatch):
     """A busy stale worker must not be able to clear its own alarm."""
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    _deployed(monkeypatch)
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 5)
     monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 60)
     assert len(wake_bridge.worker_skew(conn=conn, now=NOW)) == 1
@@ -296,6 +309,7 @@ def test_a_restart_under_a_new_pid_clears_the_alarm(conn, monkeypatch):
     because the heartbeat path preserved the old start time."""
     monkeypatch.setattr(wake_bridge.os, "getpid", lambda: 1111)
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    _deployed(monkeypatch)                       # a deploy lands under it
     monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 600)
     assert len(wake_bridge.worker_skew(conn=conn, now=NOW)) == 1     # stale
 
@@ -326,6 +340,10 @@ def test_a_worker_is_judged_only_against_its_own_watched_files(conn, monkeypatch
                          lambda p: mtimes[os.path.basename(p)])
     wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 300)
     wake_bridge.register_worker("agent_orchestrator", conn=conn, now=NOW - 300)
+    # only the orchestrator's file set actually changed
+    monkeypatch.setattr(wake_bridge, "_module_fingerprint",
+                        lambda w="wake_companion": "deployed"
+                        if w == "agent_orchestrator" else _REAL_FP(w))
     skew = wake_bridge.worker_skew(conn=conn, now=NOW)
     assert [w["worker"] for w in skew] == ["agent_orchestrator"]
 
@@ -336,6 +354,79 @@ def test_agent_orchestrator_watched_files_include_agent_control(monkeypatch):
     mechanism silently stops catching the class of bug it was built for."""
     assert "agent_control.py" in wake_bridge._WORKER_WATCHED_FILES["agent_orchestrator"]
     assert "agent_orchestrator.py" in wake_bridge._WORKER_WATCHED_FILES["agent_orchestrator"]
+
+
+# ── an mtime is not a deploy (2026-09-01) ──────────────────────────────────
+# A detached HEAD was fast-forwarded back onto its own branch. The checkout
+# passed through the branch's older commit and returned to the same one, so
+# every watched file was rewritten with IDENTICAL bytes and a fresh mtime. The
+# companion had started 19 minutes earlier on exactly those bytes and was
+# reported as running code 1 136 s stale — a restart recommendation for a
+# process that was already current. This module had paid for trusting an mtime
+# once before: a /tmp reaper judged the busiest socket on the host idle, because
+# a socket's mtime is frozen at bind().
+
+def test_rewriting_the_same_bytes_is_not_a_deploy(conn, monkeypatch):
+    """The exact false positive: mtime moves, content does not."""
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 1282)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 146)
+    assert wake_bridge.worker_skew(conn=conn, now=NOW) == []
+
+
+def test_a_real_deploy_under_a_bumped_mtime_is_still_caught(conn, monkeypatch):
+    """The fix must not buy silence by ignoring mtime's question entirely."""
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 1282)
+    _deployed(monkeypatch)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 146)
+    assert [w["worker"] for w in wake_bridge.worker_skew(conn=conn, now=NOW)] \
+        == ["wake_companion"]
+
+
+def test_a_row_written_before_this_column_keeps_the_old_verdict(conn, monkeypatch):
+    """A worker registered by the previous build has no fingerprint. Treating
+    the absence as proof of freshness would silently disarm the alarm across
+    exactly the upgrade that introduced it."""
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    conn.execute("UPDATE wake_worker SET code_fingerprint=NULL")
+    conn.commit()
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 60)
+    assert len(wake_bridge.worker_skew(conn=conn, now=NOW)) == 1
+
+
+def test_a_heartbeat_does_not_relabel_the_code_the_worker_loaded(conn, monkeypatch):
+    """Same reason started_ts is frozen on a heartbeat: a stale worker must not
+    be able to clear its own alarm merely by staying alive across the deploy."""
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    _deployed(monkeypatch)
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 5)
+    row = conn.execute("SELECT code_fingerprint FROM wake_worker").fetchone()
+    assert row[0] != "deployed"
+
+
+def test_the_fingerprint_covers_every_watched_file(tmp_path, monkeypatch):
+    """A hash over only the first file would miss the very case event 11073 was
+    about: the changed file was not the module doing the hashing."""
+    monkeypatch.setattr(wake_bridge, "_WORKER_WATCHED_FILES",
+                        {"wake_companion": ("wake_bridge.py", "agent_control.py")})
+    before = wake_bridge._module_fingerprint("wake_companion")
+    monkeypatch.setattr(wake_bridge, "_WORKER_WATCHED_FILES",
+                        {"wake_companion": ("wake_bridge.py", "agent_watch.py")})
+    assert wake_bridge._module_fingerprint("wake_companion") != before
+
+
+def test_a_missing_watched_file_is_a_change_not_a_crash(monkeypatch):
+    monkeypatch.setattr(wake_bridge, "_WORKER_WATCHED_FILES",
+                        {"wake_companion": ("wake_bridge.py",)})
+    present = wake_bridge._module_fingerprint("wake_companion")
+    monkeypatch.setattr(wake_bridge, "_WORKER_WATCHED_FILES",
+                        {"wake_companion": ("no_such_module.py",)})
+    absent = wake_bridge._module_fingerprint("wake_companion")
+    assert absent and absent != present
+
+
+def test_no_registered_worker_reports_no_skew_after_migration(conn):
+    assert wake_bridge.worker_skew(conn=conn, now=NOW) == []
+
 
 
 # ── a cooldown is not a stall ──────────────────────────────────────────────

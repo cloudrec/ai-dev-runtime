@@ -23,6 +23,7 @@ event and the Telegram tier still carries the urgent ones.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from typing import Optional
@@ -748,6 +749,12 @@ CREATE TABLE IF NOT EXISTS wake_worker (
 """
 
 
+def _migrate_worker(conn) -> None:
+    have = {r[1] for r in conn.execute("PRAGMA table_info(wake_worker)")}
+    if "code_fingerprint" not in have:
+        conn.execute("ALTER TABLE wake_worker ADD COLUMN code_fingerprint TEXT")
+
+
 # Which source files matter varies by worker - the wake companion cares about
 # its own delivery code, the agent orchestrator cares about the classifier it
 # imports (this is how event 11073 happened: agent_control.py got four fixes
@@ -786,15 +793,41 @@ def _module_mtime(worker: str = "wake_companion") -> float:
     return newest
 
 
+def _module_fingerprint(worker: str = "wake_companion") -> str:
+    """What this worker's code IS, not when it was last touched.
+
+    An mtime answers "was this file written to", which is not the question. A
+    branch reattach that ends on the same commit rewrites every file it passes
+    through and changes nothing: on 2026-09-01 a detached HEAD was fast-forwarded
+    back onto its own branch and the companion — which had started 19 minutes
+    earlier on exactly these bytes — was reported as running stale code. This
+    module has already paid for trusting an mtime once, when a /tmp reaper judged
+    the busiest socket on the host idle because a socket's mtime is frozen at
+    bind(). Hashing the bytes costs a few hundred microseconds and cannot lie.
+    """
+    h = hashlib.sha256()
+    here = os.path.dirname(os.path.abspath(__file__))
+    for rel in _WORKER_WATCHED_FILES.get(worker, _WORKER_WATCHED_FILES["wake_companion"]):
+        h.update(rel.encode())
+        try:
+            with open(os.path.join(here, rel), "rb") as fh:
+                h.update(fh.read())
+        except OSError:
+            h.update(b"\0missing")
+    return h.hexdigest()
+
+
 def register_worker(worker: str, conn=None, now: Optional[float] = None) -> dict:
     """A deliverer announces itself. Called on start and refreshed as it runs."""
     now = now if now is not None else now_ts()
     conn, own = _c(conn)
     try:
         conn.execute(_WORKER_SCHEMA)
+        _migrate_worker(conn)
         row = conn.execute("SELECT started_ts, pid FROM wake_worker WHERE worker=?",
                            (worker,)).fetchone()
         pid = os.getpid()
+        fp = _module_fingerprint(worker)
         if row and int(row[1] or 0) == pid:
             # Same process: a heartbeat. It must NOT move started_ts, or a busy
             # stale worker would keep clearing its own alarm.
@@ -806,13 +839,15 @@ def register_worker(worker: str, conn=None, now: Optional[float] = None) -> dict
             # alarm could never clear, and an alarm that cannot clear is worse
             # than no alarm: it trains everyone to ignore it.
             conn.execute("UPDATE wake_worker SET pid=?, started_ts=?, started_at=?, "
-                         "last_seen_ts=?, last_seen_at=? WHERE worker=?",
-                         (pid, now, now_iso(), now, now_iso(), worker))
+                         "last_seen_ts=?, last_seen_at=?, code_fingerprint=? "
+                         "WHERE worker=?",
+                         (pid, now, now_iso(), now, now_iso(), fp, worker))
             row = None
         else:
             conn.execute("INSERT INTO wake_worker (worker,pid,started_ts,started_at,"
-                         "last_seen_ts,last_seen_at) VALUES (?,?,?,?,?,?)",
-                         (worker, os.getpid(), now, now_iso(), now, now_iso()))
+                         "last_seen_ts,last_seen_at,code_fingerprint) "
+                         "VALUES (?,?,?,?,?,?,?)",
+                         (worker, os.getpid(), now, now_iso(), now, now_iso(), fp))
         conn.commit()
         return {"worker": worker, "started_ts": (row[0] if row else now)}
     finally:
@@ -826,15 +861,27 @@ def worker_skew(conn=None, now: Optional[float] = None) -> list:
     conn, own = _c(conn)
     try:
         conn.execute(_WORKER_SCHEMA)
+        _migrate_worker(conn)
         out = []
-        for worker, started, last_seen in conn.execute(
-                "SELECT worker, started_ts, last_seen_ts FROM wake_worker"):
+        for worker, started, last_seen, fp in conn.execute(
+                "SELECT worker, started_ts, last_seen_ts, code_fingerprint "
+                "FROM wake_worker"):
             code_mtime = _module_mtime(worker)
-            if started and code_mtime > float(started):
-                out.append({"worker": worker,
-                            "started_at_age_secs": int(now - float(started)),
-                            "code_newer_by_secs": int(code_mtime - float(started)),
-                            "last_seen_age_secs": int(now - float(last_seen or 0))})
+            if not (started and code_mtime > float(started)):
+                continue
+            # An mtime later than the start is a QUESTION, not a verdict. If the
+            # worker recorded what its code hashed to when it loaded it, and the
+            # files still hash to that, nothing was deployed - the bytes were
+            # rewritten identically (a same-commit checkout, a touch, a restored
+            # backup) and there is nothing to restart for. A row with no
+            # fingerprint predates this column, so it keeps the old mtime verdict
+            # rather than being silently declared clean.
+            if fp and fp == _module_fingerprint(worker):
+                continue
+            out.append({"worker": worker,
+                        "started_at_age_secs": int(now - float(started)),
+                        "code_newer_by_secs": int(code_mtime - float(started)),
+                        "last_seen_age_secs": int(now - float(last_seen or 0))})
         return out
     finally:
         if own:
