@@ -6424,3 +6424,95 @@ and idle behind it.
 4. **Fix the Telegram chat id** — the only remaining `red_reason`.
 5. **Clear the orphaned browser tabs** — now the dominant blocker.
 6. **Decide the three route keys bound to one conversation.**
+
+---
+
+# Part 58 — the ai-runtime restart, and an empty skew list
+
+The owner authorised the second half of the staged restart. `ai-runtime.service`
+now runs the current tree, and for the first time in this sequence
+`worker_skew()` returns `[]`.
+
+## Pre-flight, before touching anything
+
+This service owns runtime jobs, so the question that mattered was not "is the code
+newer" but "is anything mid-flight that a restart would strand". The repository
+answers that itself:
+
+```
+restart_consistency: restart_safe=true, green
+  orphaned_notifications: []      abandoned_inflight_actions: []
+  cursors_ahead_of_log:   []      supervisor_heartbeat_age: 17 s
+in-flight jobs: 0
+API /health before: HTTP 200
+```
+
+Every job in the store was terminal or `waiting_approval` — the latter parked on
+an owner gate, not executing. Nothing was interrupted.
+
+| | |
+|---|---|
+| Service before | PID 85808, started 2026-09-01 06:34:29 CEST |
+| Skew before | agent_orchestrator 48 918 s behind |
+| Backup | `backups/predeploy_airuntime_20260901T232310Z/` — all three DBs, `integrity_check` ok |
+| Rollback | `ROLLBACK.md` there; tag `rollback/pre-airuntime-restart-20260901T232310Z` |
+
+The rollback note records what the restart actually changes in behaviour, so the
+decision to revert would not have to be reconstructed later: `agent_control`
+recognising a provider usage limit as externally-blocked rather than a crash or a
+finish (Part 49), and `job_executor` no longer reporting a validation TIMEOUT as
+"tests failed" or spending planner repair attempts on a clock (`33d85dc`).
+Neither loosens a gate; both are reclassifications that make a recorded reason
+match what happened. This restart applied no schema migration of its own.
+
+## After
+
+| Check | Result |
+|---|---|
+| Service | active/running, PID 934537 |
+| API | `/health` HTTP 200 before and after |
+| Journal | no error, traceback or exception |
+| Jobs | 136 before, 136 after; **0 in-flight**, nothing stranded |
+| New criticals | **0** |
+| `restart_safe` / `consistent` | true / true |
+
+## The skew list is empty
+
+```
+worker_skew() -> []
+
+wake_companion      pid 901395  fp 774bf58dae8c  last_seen advancing
+agent_orchestrator  pid 934537  fp 5f66d118b3e1  registered on start
+```
+
+Both workers now carry a recorded `code_fingerprint`, so from here the skew alarm
+compares the bytes a process actually loaded against the bytes on disk. The
+mechanism that spent this session reporting drift — and, on 2026-09-01, reporting
+it falsely after a no-op branch reattach — now has a baseline for both halves of
+the fleet and nothing to report.
+
+Every fix from Part 49 through Part 56 is live.
+
+## What remains
+
+`observability_summary()` red_reasons is a single entry, and it is a gate:
+
+```
+red_reasons : ['active_failures=21']
+```
+
+1. ~~Restart the companion~~ — done, Part 57.
+2. ~~Restart `ai-runtime`~~ — **done**, above.
+3. **Raise `RUNTIME_TEST_TIMEOUT`** past the suite's real duration (~640 s vs 600).
+   Until then every `code_change` job here is rolled back unvalidated — now
+   saying so accurately rather than claiming its tests failed.
+4. **Fix the Telegram chat id** — `Bad Request: chat not found`, the only
+   remaining red reason and the cause of every dead letter.
+5. **Clear the orphaned browser tabs** — 25 pages, 21 bare roots against a limit
+   of 12. The dominant blocker: the wake pipeline is correct and deployed, and
+   every delivery is still refused behind it.
+6. **Decide the three route keys bound to one conversation.**
+
+Items 3-6 are owner decisions about credentials, configuration, a browser and a
+routing choice. None is a code defect, and none can be closed from inside the
+repository.
