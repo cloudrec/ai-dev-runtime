@@ -6672,3 +6672,80 @@ was refused, and it is clearing at the pace the per-chat cooldown allows.
 
 No further non-gated code defect is visible. `observability_summary()` agrees:
 its only red reason is the notification failures that item 5 causes.
+
+---
+
+# Part 61 — RUNTIME_TEST_TIMEOUT raised to 1800
+
+The owner authorised raising the validation cap. This closes the gate Part 50
+opened: the repository's own suite had outgrown the timeout that validates every
+`code_change` job against it, so those jobs were being rolled back unvalidated —
+and, until `33d85dc`, reported as though their tests had failed.
+
+## Both consumers wanted the same thing
+
+`RUNTIME_TEST_TIMEOUT` is read in two places with different defaults —
+`job_executor` (600) and `deliver` (180) — so raising it had to be checked
+against both rather than just the one that prompted it. They run the same
+command: `deliver._DEFAULT_TESTS` is `["python3 -m pytest -q"]`, the full suite,
+and that module's own comment already records it as "measured 742-1171s against a
+600s cap". Both paths were failing for the same reason, so a single raise fixes
+both and creates no conflicting side effect.
+
+## The edit
+
+`configs/.env` is gitignored, mode 600, and holds `RUNTIME_TOKEN`. It was changed
+without reading or printing anything but the one line:
+
+| | |
+|---|---|
+| Backup | `backups/predeploy_testtimeout_20260901T233717Z/env.snapshot`, mode 600 in a 700 directory |
+| Change | `RUNTIME_TEST_TIMEOUT=600` → `1800` |
+| Occurrences of that key | exactly 1, verified before editing |
+| Lines | 66 → 66 |
+| Mode | 600 → 600 |
+| Lines differing | exactly one |
+
+## Applied, because the value is inert without a restart
+
+The unit carries `EnvironmentFile=/root/ai-dev-runtime/configs/.env`, read at
+start, and the running process still held 600 after the edit. Raising the value
+without applying it would have delivered a change that does nothing, so the
+restart was treated as part of the requested work rather than a separate
+decision — the same restart the owner authorised earlier, with the same
+pre-flight repeated rather than assumed:
+
+```
+restart_safe: True    in-flight jobs: 0    /health: 200 before and after
+```
+
+| Check | Result |
+|---|---|
+| Service | active, PID 1002688 |
+| Live env | `RUNTIME_TEST_TIMEOUT=1800` |
+| As the code reads it | `job_executor._TEST_TIMEOUT = 1800`, `deliver._TEST_TIMEOUT = 1800` |
+| Journal | no error, traceback or exception |
+| Jobs | 136 before, 136 after |
+| New criticals | 0 |
+| `worker_skew()` | `[]` |
+
+## What this does and does not guarantee
+
+1 800 s against a suite measured between 640 s and 1 171 s is real headroom, not
+unlimited. The suite grows — it has gained roughly 90 tests during this session
+alone — and a repository that outgrows 1 800 s would recreate exactly this
+condition.
+
+What has changed is that the next occurrence will be legible. Before `33d85dc` a
+cap breach was recorded as "tests failed after repair attempts", sending a reader
+after a defect nobody had observed, and spending planner repair attempts on a
+clock. It is now reported as the suite not finishing, with the cap named, and no
+repair attempted.
+
+## Gates
+
+1-4. ~~companion restart~~ · ~~`ai-runtime` restart~~ · ~~browser tabs~~ ·
+   ~~`RUNTIME_TEST_TIMEOUT`~~ — done
+5. **Fix the Telegram chat id** — `Bad Request: chat not found`; still the only
+   `red_reason`, and the cause of every dead letter
+6. **Decide the three route keys bound to one conversation**
