@@ -169,3 +169,60 @@ def test_timed_out_step_reaps_its_grandchildren(tmp_path, monkeypatch):
         except Exception:
             pass
         pytest.fail(f"grandchild {gc_pid} survived the step timeout — process group not reaped")
+
+
+# ── a clock is not a defect (2026-09-01) ────────────────────────────────────
+# Job ed184800 ("Fix wake policy for quota exhaustion") is recorded as `failed`
+# with the error "tests failed after repair attempts". No test failed. Its stored
+# validation blob reads:
+#
+#   "Command '['python3', '-m', 'pytest', '-q']' timed out after 600 seconds"
+#
+# This repo's suite takes ~650 s against a RUNTIME_TEST_TIMEOUT of 600, so the
+# condition is permanent, not a fluke — and a timeout was indistinguishable from
+# a genuine failure in the outcome, the error text and the repair loop alike.
+# The repair loop is the expensive half: it hands the planner "timed out after
+# 600 seconds" as the failure to fix, then re-runs the same suite for another
+# full cap, multiplying the cost of a job while learning nothing.
+
+def _timeout_tests(monkeypatch, tmp_path, secs=1):
+    monkeypatch.setattr(job_executor, "_TEST_TIMEOUT", secs)
+    return job_executor._run_tests(str(tmp_path), ["sleep 30"])
+
+
+def test_a_timed_out_suite_is_recorded_as_a_timeout_not_a_failing_test(tmp_path, monkeypatch):
+    res = _timeout_tests(monkeypatch, tmp_path)
+    assert res["ok"] is False
+    assert res["timed_out"] is True
+    assert res["results"][0]["timed_out"] is True
+    assert "timed out" in res["results"][0]["output"]
+
+
+def test_a_genuinely_failing_test_is_not_labelled_a_timeout(tmp_path, monkeypatch):
+    """The distinction has to cut both ways or it is just a second name for
+    failure."""
+    monkeypatch.setattr(job_executor, "_TEST_TIMEOUT", 30)
+    res = job_executor._run_tests(str(tmp_path), ["false"])
+    assert res["ok"] is False
+    assert res["timed_out"] is False
+    assert res["results"][0]["timed_out"] is False
+
+
+def test_a_passing_suite_reports_no_timeout(tmp_path, monkeypatch):
+    monkeypatch.setattr(job_executor, "_TEST_TIMEOUT", 30)
+    res = job_executor._run_tests(str(tmp_path), ["true"])
+    assert res["ok"] is True and res["timed_out"] is False
+
+
+def test_the_repair_loop_is_not_entered_for_a_timeout():
+    """Pinned at the source, since the loop needs a live job to exercise: the
+    while-condition must exclude a timed-out run, exactly as it already excludes
+    a known-broken planner."""
+    import inspect
+    src = inspect.getsource(job_executor.run_job) \
+        if hasattr(job_executor, "run_job") else inspect.getsource(job_executor)
+    cond = [ln for ln in src.splitlines() if "attempt < _MAX_REPAIRS" in ln]
+    assert cond, "repair loop condition not found"
+    window = src[src.index(cond[0]): src.index(cond[0]) + 400]
+    assert 'tests.get("timed_out")' in window, \
+        "the repair loop must skip a timed-out validation run"

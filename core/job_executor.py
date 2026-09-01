@@ -266,11 +266,13 @@ def _run_tests(project_path: str, commands: list[str]) -> dict:
     exactly like a real `&&` would, without ever invoking an actual shell."""
     results = []
     ok = True
+    timed_out = False
     for cmd in commands[:5]:
         steps = [s.strip() for s in cmd.split("&&") if s.strip()]
         if not steps:
             continue
         step_ok = True
+        step_timed_out = False
         output = ""
         try:
             for step in steps:
@@ -279,12 +281,21 @@ def _run_tests(project_path: str, commands: list[str]) -> dict:
                 if not passed:
                     step_ok = False
                     break
+        except subprocess.TimeoutExpired as e:
+            # A suite that ran out of clock did not report anything about the
+            # change. Recorded separately from a failing test because the two
+            # justify opposite responses, and only one of them is evidence.
+            step_ok = False
+            step_timed_out = True
+            timed_out = True
+            output += str(e)[:400]
         except Exception as e:  # noqa: BLE001
             step_ok = False
             output += str(e)[:400]
-        results.append({"cmd": cmd, "passed": step_ok, "output": output[-1500:]})
+        results.append({"cmd": cmd, "passed": step_ok, "timed_out": step_timed_out,
+                        "output": output[-1500:]})
         ok = ok and step_ok
-    return {"ok": ok, "results": results}
+    return {"ok": ok, "timed_out": timed_out, "results": results}
 
 
 def _remove_created_paths(project_path: str, changed: list) -> list[str]:
@@ -783,11 +794,25 @@ def _run_work_stages(job_id: str, job: dict, pp: str, work_pp: str, plan: dict,
         tests = {"ok": True, "results": [], "skipped_repo_suite": True}
     else:
         tests = _run_tests(work_pp, plan.get("test_commands") or [])
+        if tests.get("timed_out"):
+            job_store.append_log(
+                job_id, "warn",
+                f"validation suite did not finish within RUNTIME_TEST_TIMEOUT "
+                f"({_TEST_TIMEOUT}s) — not a test failure, and not repairable by a "
+                f"planner; no repair attempt will be made")
         attempt = 0
         # When a fallback plan is in use the provider planner is known-broken —
         # re-invoking it for a repair attempt would just fail/time out again, so skip
         # the planner-based repair loop entirely (never retry a broken planner).
-        while not tests["ok"] and attempt < _MAX_REPAIRS and not fallback_used:
+        #
+        # A timeout is skipped for the same reason and a stronger one: nothing was
+        # learned about the change, so there is no failure to describe to a planner.
+        # Feeding it "Command '[...]' timed out after N seconds" asks it to fix a
+        # clock, and each attempt re-runs the same suite for the same duration — the
+        # cost of a job multiplies while the evidence stays at zero. This suite takes
+        # ~650 s against a 600 s cap, so the condition is live, not hypothetical.
+        while not tests["ok"] and attempt < _MAX_REPAIRS and not fallback_used \
+                and not tests.get("timed_out"):
             attempt += 1
             job_store.append_log(job_id, "warn", f"tests failed — repair attempt {attempt}")
             # Real escalation ladder: a sonnet plan whose tests fail escalates the
@@ -824,10 +849,24 @@ def _run_work_stages(job_id: str, job: dict, pp: str, work_pp: str, plan: dict,
         job_store.update_job(job_id, tests=tests, validation={
             "ok": tests["ok"], "validation_kind": job_kinds.validation_kind_for(kind),
             "repo_suite_used": True,
+            "timed_out": bool(tests.get("timed_out")),
             "results": [{"check": f"repo suite: {r.get('cmd')}", "passed": bool(r.get("passed")),
+                         "timed_out": bool(r.get("timed_out")),
                          "detail": (r.get("output") or "")[-500:]} for r in tests.get("results", [])],
         })
         if not tests["ok"] and (plan.get("test_commands")):
+            # Rolled back either way — an unvalidated change must not land — but the
+            # reason is not interchangeable. "tests failed" is a claim about the
+            # change; a timeout is a statement about the harness, and reporting one
+            # as the other sends whoever reads it looking for a defect that was
+            # never observed.
+            if tests.get("timed_out"):
+                _rollback("validation suite did not finish")
+                _finish(job_id, "failed", outcome=job_kinds.FAILED,
+                        error=f"validation suite did not finish within "
+                              f"RUNTIME_TEST_TIMEOUT ({_TEST_TIMEOUT}s); the change was "
+                              f"rolled back UNVALIDATED — no test reported a failure")
+                return
             _rollback("tests failed")
             _finish(job_id, "failed", outcome=job_kinds.FAILED,
                     error="tests failed after repair attempts")
