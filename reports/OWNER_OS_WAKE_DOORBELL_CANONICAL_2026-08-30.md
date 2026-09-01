@@ -5468,3 +5468,169 @@ started 06:35:20 local, and this fix landed at 19:37. One further false `task_co
 published on this pane at 14:06:35Z, after the diagnosis but before any activation. The fix
 is committed and inert; a companion restart is what would stop the next one, and that is an
 owner decision.
+
+---
+
+# Part 50 — four things that were true and reported as something else
+
+A session that resumed on an inherited claim and, checking it, found the claim
+correct and the instruments around it wrong. Every defect below is the same
+shape: the system observed something real and published a different thing. None
+was found by looking for it; each surfaced while verifying the state of the one
+before.
+
+## The inherited claim, verified
+
+The prior session reported reattaching a detached `HEAD` to
+`ai-runtime/220-windows-bridge` as a pure fast-forward before its Claude API
+stalled. Confirmed: `HEAD == ai-runtime/220-windows-bridge == 65c9c0c`, working
+tree clean, and the reflog dates the reattach precisely —
+
+```
+65c9c0c HEAD@{2026-09-01 20:09:58 +0200}: merge 65c9c0c: Fast-forward
+6bfa933 HEAD@{2026-09-01 20:09:57 +0200}: checkout: moving from 65c9c0ca… to ai-runtime/220-windows-bridge
+```
+
+One second apart, ending where it started. That second is where the next defect
+came from.
+
+## 1 — a rename is not a death, and a replacement is not a rename
+
+Event 18172 declared `owner-os-wake-policy-opus:0.0` **CRASHED** — critical,
+owner action required — 18 seconds after event 18170 recorded that exact target
+as the `renamed_from` of a live agent in the same cwd. Two halves of the system
+reached opposite conclusions about the same pane inside one control-loop tick.
+
+`control_plane.discovery` reconciles a rename by conversation id and retires the
+old registry row. `agent_watch` tracks panes by tmux target alone, so the old
+name simply stopped appearing in its inventory — and two consecutive absences is
+exactly how it recognises a crash. Discovery held the only evidence that could
+separate the two, at the only moment it existed, and had no way to say it.
+
+`agent_watch.retire()` is that way: drop the watch state so the vanish path has
+nothing to miss, drop a suppression row no name will answer to again, and
+retract crash alerts already published — the watcher can reach the vanish branch
+*before* discovery reconciles, which is the live ordering that produced 18172.
+Retraction goes through `mark_invalid`, so the event row is never touched.
+
+**Then the fix was nearly wrong in the more expensive direction.** Discovery's
+rename verdict is weaker than it looks: `_conversation_id(cwd)` reads the newest
+conversation for a *directory*, not for a pane, so every agent working in the
+same cwd carries the same id — a pane that genuinely died and a different pane
+that replaced it are indistinguishable by conversation alone. Coupling a crash
+alarm to that verdict would have silenced real crashes across the whole fleet.
+
+Event 18172 is that case, not the clean one. The old target held pid **3501868**;
+the pane that "renamed" it held pid **3394205** — an *older* pid, so not the same
+process. A rename moves a label and keeps the process, so process continuity is
+the evidence, and both records already carried it. Registry reconciliation is
+unchanged; only the retirement of the alarm now requires the stronger proof, and
+a missing pid proves nothing.
+
+**Event 18172 therefore stands.** The process it named really had stopped. The
+alarm was right and the `renamed_from` label was wrong — the opposite of the
+first reading, and the reason the fix ships with the alarm intact.
+
+## 2 — deploy skew must judge the code, not the clock
+
+`worker_skew()` compared a worker's start time against the newest mtime across
+the files it runs. That reattach above rewrote every watched file with identical
+bytes and a fresh mtime, and the alarm reported the companion — started 19
+minutes earlier on exactly those bytes — as running code **1 136 s stale**. A
+restart recommendation, for a current process, raised during the handoff whose
+whole purpose was deciding what needed restarting.
+
+This module has paid for trusting an mtime once already, from the other
+direction: a `/tmp` reaper judged the busiest socket on the host idle, because a
+socket's mtime is frozen at `bind()` (Part 27).
+
+`register_worker` now records a sha256 over the bytes of every watched file — the
+code the worker actually loaded — on start and restart, never on a heartbeat, for
+the same reason `started_ts` is frozen there. `worker_skew()` keeps mtime as the
+cheap first question and lets content give the verdict. Conservative twice over:
+a row predating the column keeps the old verdict, because reading absence as
+proof of freshness would disarm the alarm across the very upgrade that added it;
+and an mtime that has not moved is still not skew, so the hash is computed only
+when the clock raises the question.
+
+## 3 — the heartbeat that was never sent
+
+Reading the skew output for defect 2 surfaced a third: `last_seen_age_secs: 3263`
+for a companion whose journal showed it delivering a wake twenty seconds earlier.
+The orchestrator read 19 s on the same sweep.
+
+`register_worker` is documented as "called on start and refreshed as it runs",
+and its same-pid branch exists solely to service that refresh. The orchestrator
+calls it inside its loop. The companion called it **once, above** the loop — so
+`last_seen_ts`, the column whose entire job is "this process is still running",
+was written at boot and never again. Every reading taken from it since the
+companion started was wrong by the process's whole uptime.
+
+The call moves inside the loop. It cannot launder a stale worker: the heartbeat
+branch moves neither `started_ts` nor the recorded fingerprint. Pinned by AST as
+well as behaviour, because the defect was *position*, not absence — a single call
+above the loop registers the worker and reads as correct at a glance, which is
+how it survived.
+
+## 4 — a validation timeout is not a failing test
+
+Runtime job `ed184800` ("Fix wake policy for quota exhaustion", the job behind
+Part 49) is recorded as `failed`, error **"tests failed after repair attempts"**.
+No test failed. Its own stored validation blob says:
+
+```
+Command '['python3', '-m', 'pytest', '-q']' timed out after 600 seconds
+```
+
+The suite here takes **~650 s** (2 892 tests) against a `RUNTIME_TEST_TIMEOUT` of
+**600**. This is not a fluke that caught one job — it is the current, permanent
+outcome of validating *any* `code_change` job in this repository, recorded each
+time as a defect in the change that nobody observed.
+
+Three places treated the clock as evidence. `_run_tests` folded `TimeoutExpired`
+into the same handler as a failing command, so nothing downstream could tell them
+apart. The repair loop then spent itself on it — handing the planner "timed out
+after 600 seconds" as the failure to fix, asking a model to repair a clock, and
+re-running the same suite for another full cap per attempt, multiplying the cost
+of a job while the evidence stayed at zero. Then the job died claiming its tests
+had failed.
+
+Now `timed_out` is recorded per step and per run; the repair loop skips a
+timed-out run for the same reason it already skips a known-broken planner, and a
+stronger one — there is no failure to describe; and the terminal error states
+that the suite did not finish and the change was rolled back **UNVALIDATED**.
+
+The rollback is deliberately unchanged: an unvalidated change must not land, so
+the job still fails and still reverts. What changes is that it stops reporting a
+defect nobody saw. Part 49 drew this distinction for a provider usage limit; this
+is the same one, one layer down.
+
+## What is fixed and inert, and what needs an owner
+
+| | |
+|---|---|
+| Commits | `ddbfdd9`, `652c3da`, `88582aa`, `33d85dc` on `ai-runtime/220-windows-bridge` |
+| Gate | **2 892 passed**, exit 0 (full suite, after each commit) |
+| Guard tests | 12 + 7 + 2 + 4; each verified failing with its fix reverted |
+| Backup | `backups/predeploy_skew_content_20260901T183234Z/` — `integrity_check ok`, 18 227 events, pre-migration schema captured |
+| Live migration | `wake_worker.code_fingerprint` added, additive; legacy rows NULL, old verdict preserved as designed |
+| Fleet | 9 live agents, no duplicates, `validate_config()` ok, denylist intact, `targets_raw` still `cp-canary:0.0` |
+
+**All four fixes are committed and inert.** `WorkingDirectory` is the checkout,
+so a restart is what activates code, and a restart is an owner gate. Both workers
+are now *genuinely* stale — the companion because these commits changed
+`wake_bridge.py` and `agent_watch.py`, which it watches; `agent_orchestrator`
+because Part 49's `agent_control.py` fix landed at 19:42 and `ai-runtime.service`
+has run since 06:34. That is 51 000 s of drift, and the skew alarm reporting it
+is now correct rather than merely loud.
+
+Two owner decisions stand:
+
+1. **Restart `owner-os-wake-companion.service` and `ai-runtime.service`** to
+   activate Parts 49 and 50. Backup and rollback point are in place above.
+2. **Raise `RUNTIME_TEST_TIMEOUT`** past the suite's real duration. Deliberately
+   not done here: it lives in `configs/.env`, untracked and holding
+   `RUNTIME_TOKEN`, and needs a restart to take effect. Until it moves, every
+   `code_change` job in this repository will be rolled back unvalidated — now
+   saying so accurately, which is the whole of what Part 50 buys without a
+   restart.
