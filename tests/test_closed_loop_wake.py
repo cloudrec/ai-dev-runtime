@@ -1242,3 +1242,65 @@ def test_only_the_status_that_both_wakes_and_parks_is_gated():
     assert "draft" not in re_.EVENT_FOR_STATUS
     assert not (clw._RUNTIME_JOB_OWNER_GATE_STATUSES
                 & clw._RUNTIME_JOB_TERMINAL_STATUSES)
+
+
+# ── a watch is ABOUT an agent (2026-09-02) ─────────────────────────────────
+# Fourteen live rows carried an empty target. `slo_scan` skips those by name, so
+# each could never resolve, never progress and never escalate: a row that lives
+# forever and means nothing. Every one of them had the answer on its own event the
+# whole time — `agent_id` IS the target (`runtimejob:bea93aec`,
+# `capacity-blockchain:0.0`, `agent_waiting_input` panes). The caller did not pass
+# it and nothing looked.
+
+def test_a_missing_target_is_taken_from_the_event(conn):
+    cto.emit("agent_watch", "agent_waiting_input", agent_id="capacity-blockchain:0.0",
+             project_id="capacity", conn=conn)
+    eid = conn.execute("SELECT MAX(id) FROM event").fetchone()[0]
+    clw.register_delivery(event_id=eid, project_id="capacity", conn=conn, now=NOW)
+    row = conn.execute("SELECT target FROM wake_loop_watch WHERE event_id=?",
+                       (eid,)).fetchone()
+    assert row and row[0] == "capacity-blockchain:0.0"
+
+
+def test_an_explicit_target_still_wins(conn):
+    cto.emit("agent_watch", "agent_waiting_input", agent_id="from-event:0.0",
+             project_id="p", conn=conn)
+    eid = conn.execute("SELECT MAX(id) FROM event").fetchone()[0]
+    clw.register_delivery(event_id=eid, target="explicit:0.0", project_id="p",
+                          conn=conn, now=NOW)
+    row = conn.execute("SELECT target FROM wake_loop_watch WHERE event_id=?",
+                       (eid,)).fetchone()
+    assert row[0] == "explicit:0.0"
+
+
+def test_a_watch_with_no_nameable_subject_is_not_created(conn):
+    """Refusing is the honest outcome — a tracking row for an unnameable subject is
+    not tracking."""
+    clw.register_delivery(event_id=987654, project_id="p", conn=conn, now=NOW)
+    assert conn.execute("SELECT COUNT(*) FROM wake_loop_watch WHERE event_id=987654"
+                        ).fetchone()[0] == 0
+
+
+def test_an_event_whose_agent_id_is_blank_creates_nothing(conn):
+    cto.emit("controller", "owner_decision_required", project_id="owner-os", conn=conn)
+    eid = conn.execute("SELECT MAX(id) FROM event").fetchone()[0]
+    clw.register_delivery(event_id=eid, project_id="owner-os", conn=conn, now=NOW)
+    assert conn.execute("SELECT COUNT(*) FROM wake_loop_watch WHERE event_id=?",
+                        (eid,)).fetchone()[0] == 0
+
+
+def test_rows_written_before_the_guard_are_retired_not_left_open(conn):
+    """The fourteen already on disk. Retiring beats leaving a permanent row that a
+    future backfill of `target` would silently re-animate into a weeks-late wake."""
+    clw._conn(conn)                     # ensure the watch schema exists
+    conn.execute("INSERT INTO wake_loop_watch (event_id,target,project_id,route_key,"
+                 "delivered_ts,delivered_at) VALUES (?,?,?,?,?,?)",
+                 (4863, "", "owner-os", "", NOW, "then"))
+    conn.commit()
+    assert clw._resolution_reason(conn, event_id=4863, target="") == "watch_has_no_target"
+
+    emit = _Emit()
+    r = clw.slo_scan(conn=conn, now=NOW + 3 * clw.WAKE_LOOP_SLO_SECS, emit_fn=emit)
+    assert 4863 in [d["event_id"] for d in r["deregistered"]]
+    assert not r["rewoken"] and not r["escalated"]
+    assert emit.calls == [], "retiring an orphan must not wake anyone"

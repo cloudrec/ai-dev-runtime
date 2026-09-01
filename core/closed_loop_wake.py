@@ -379,7 +379,11 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
         pass
     if not target:
-        return None
+        # Written before `register_delivery` refused to create these. It can never
+        # resolve on its own terms and `slo_scan` skips it by name, so it would sit
+        # open forever. Retire it rather than leave a permanent row that any future
+        # backfill of `target` would silently re-animate into a weeks-late wake.
+        return "watch_has_no_target"
     if target.startswith(_RUNTIME_JOB_TARGET_PREFIX):
         status = _runtime_job_status(target)
         if status in _RUNTIME_JOB_TERMINAL_STATUSES:
@@ -477,6 +481,22 @@ def deregister_resolved(*, conn=None, now: Optional[float] = None, agents=None) 
 
 
 # ── SLO watchdog ─────────────────────────────────────────────────────────────
+def _target_from_event(conn, event_id: int) -> str:
+    """The agent this event is about, straight off the event row.
+
+    `agent_id` is the same string the watch calls `target` — the pane address, the
+    `session:<id>` alias or the `runtimejob:<prefix>` handle, whichever the emitter
+    used. Reading it here means a caller that forgets to pass the target no longer
+    silently creates an untrackable watch.
+    """
+    try:
+        row = conn.execute("SELECT agent_id FROM event WHERE id=?",
+                           (int(event_id),)).fetchone()
+    except Exception:  # noqa: BLE001 — a missing event is simply no target
+        return ""
+    return ((row[0] if row else "") or "").strip()
+
+
 def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
                       event_type: str = "", route_key: str = "", conn=None,
                       now: Optional[float] = None) -> None:
@@ -499,10 +519,23 @@ def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
     try:
         if wb.trigger_class_for(event_type) == wb.TRIGGER_CLASS_LOOP_WATCHDOG:
             return
+        # A watch is ABOUT an agent. Without one it can never resolve, never
+        # progress and never escalate — `slo_scan` skips it by name — so it is a row
+        # that lives forever and means nothing. Fourteen such rows exist here, and
+        # every one of them had the answer on its own event all along: `agent_id` IS
+        # the target (`runtimejob:bea93aec`, `capacity-blockchain:0.0`, ...). The
+        # caller simply did not pass it, and nothing looked.
+        target = (target or "").strip()
+        if not target:
+            target = _target_from_event(conn, event_id)
+        if not target:
+            # Still nothing to watch. Refusing is the honest outcome: a tracking row
+            # for an unnameable subject is not tracking.
+            return
         conn.execute(
             "INSERT OR IGNORE INTO wake_loop_watch (event_id,target,project_id,route_key,"
             "delivered_ts,delivered_at) VALUES (?,?,?,?,?,?)",
-            (int(event_id), target or "", project_id or "", route_key or "",
+            (int(event_id), target, project_id or "", route_key or "",
              now, now_iso()))
         conn.commit()
     finally:
