@@ -623,3 +623,44 @@ def test_the_orchestrator_watch_list_is_unchanged():
     watched = _watched("agent_orchestrator")
     for name in ("agent_control.py", "agent_orchestrator.py", "waiting_transitions.py"):
         assert any(p.endswith(name) for p in watched), (name, watched)
+
+
+# ── the heartbeat that was never sent (2026-09-01) ─────────────────────────
+# `register_worker` is documented as "called on start and refreshed as it runs",
+# and `agent_orchestrator` does exactly that — inside its loop. The wake
+# companion called it ONCE, before its loop, so `last_seen_ts` stayed frozen at
+# boot for the life of the process: it read 3 263 s stale for a companion that
+# had delivered a wake twenty seconds earlier. A liveness column written only
+# once is not a liveness column.
+
+def test_a_heartbeat_advances_last_seen(conn, monkeypatch):
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 3600)
+    wake_bridge.register_worker("wake_companion", conn=conn, now=NOW - 5)
+    _deployed(monkeypatch)
+    monkeypatch.setattr(wake_bridge, "_module_mtime", lambda w=None: NOW - 60)
+    skew = wake_bridge.worker_skew(conn=conn, now=NOW)
+    assert skew[0]["last_seen_age_secs"] == 5          # heartbeat landed
+    assert skew[0]["started_at_age_secs"] == 3600      # start time did not move
+
+
+def test_the_companion_heartbeats_inside_its_loop():
+    """The defect was structural, not behavioural: the call sat above `while`.
+    Pinning the position is the only way this stays fixed, since a single call
+    before the loop still registers the worker and looks correct."""
+    import ast
+    import pathlib
+    src = pathlib.Path(__file__).resolve().parents[1] / "tools" / "wake_companion.py"
+    tree = ast.parse(src.read_text())
+    main = next(n for n in ast.walk(tree)
+                if isinstance(n, ast.FunctionDef) and n.name == "main")
+    loops = [n for n in ast.walk(main) if isinstance(n, ast.While)]
+    assert loops, "companion main has no loop"
+
+    def registers(node):
+        return any(isinstance(c, ast.Call)
+                   and isinstance(c.func, ast.Attribute)
+                   and c.func.attr == "register_worker"
+                   for c in ast.walk(node))
+
+    assert any(registers(w) for w in loops), \
+        "register_worker must be called inside the companion loop, not only before it"

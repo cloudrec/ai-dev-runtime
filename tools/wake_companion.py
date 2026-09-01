@@ -253,15 +253,28 @@ def supervise_native() -> dict:
 
 def main() -> None:
     from core import wake_bridge as wb
-    # Announce this process and the code it started with, so a deploy that
-    # restarts the API but not this companion is DETECTABLE instead of silently
-    # delivering to the wrong chat with stale routing logic.
-    try:
-        wb.register_worker("wake_companion")
-    except Exception as e:  # noqa: BLE001
-        print(f"worker registration failed: {str(e)[:120]}", flush=True)
     n = 0
     while True:
+        # Announce this process and the code it started with, so a deploy that
+        # restarts the API but not this companion is DETECTABLE instead of
+        # silently delivering to the wrong chat with stale routing logic.
+        #
+        # INSIDE the loop, as the orchestrator already does it. Called once
+        # before the loop, this recorded a start time and then never spoke
+        # again: `last_seen_ts` — the column whose whole job is "this process is
+        # still running" — stayed frozen at boot for the life of the companion,
+        # reading 3 263 s stale for a process that had delivered a wake twenty
+        # seconds earlier. A liveness field that is only ever written once is
+        # not a liveness field.
+        #
+        # This CANNOT clear a skew alarm: the same-pid branch is a pure
+        # heartbeat that moves neither `started_ts` nor the recorded code
+        # fingerprint, precisely so that a busy stale worker cannot vouch for
+        # itself by staying alive.
+        try:
+            wb.register_worker("wake_companion")
+        except Exception as e:  # noqa: BLE001
+            print(f"worker registration failed: {str(e)[:120]}", flush=True)
         try:
             tick(wb)
             if CONTROL_GUARD_ENABLED:
