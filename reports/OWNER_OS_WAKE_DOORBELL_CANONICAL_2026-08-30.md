@@ -8522,3 +8522,72 @@ refuses to guess, and a pane-only target with no session identity is unaffected.
 The hook going quiet at 09:52:57 is the trigger for this incident and is NOT explained
 here. This part makes the watchdog robust to it; it does not say why the hook stopped.
 That is a separate question and stays open.
+
+## Part 78 correction — the hook never went quiet, and the escalation was right
+
+Part 78 asserted that this session's hook stopped emitting while the agent kept
+working, and that `_transcript_advanced()` would have prevented events 21178 and
+21272. **Both claims are false.** Investigating the "why did the hook go quiet"
+question they left open is what disproved them.
+
+The hook did not fail. The session was genuinely idle.
+
+```
+last transcript entry before the gap   09:52:58
+first transcript entry after the gap   10:33:37
+transcript entries in between          0
+```
+
+The `agent_turn_stopped` gap of 09:53:00 -> 10:42:34 exactly matches a 41-minute gap
+in the transcript itself. There were no turns to report. The hook fired correctly for
+every turn that happened, which is the honest answer to the question Part 78 left
+open: **expected quiescence, not a hook process exit, registration loss, session
+rollover, supervisor fault, or permission problem.**
+
+That makes the watchdog's verdict correct on its own terms. The wake was delivered at
+09:59:19 into a session that did not move again until 10:33:37, so at both scans there
+genuinely had been no progress for the full SLO window.
+
+## The verification that misled me
+
+Part 78 cites `_transcript_advanced` returning True for the delivery window. It does -
+*when run at 10:37*, by which time the transcript had advanced. At the scans that
+actually fired it would have returned False:
+
+```
+re-wake  10:15:42   newest transcript entry 09:52:49   -> False
+escalate 10:32:46   newest transcript entry 09:52:49   -> False
+```
+
+The measurement asked "has this advanced by now" and the question was "had it advanced
+at scan time". A live check run after the fact answers a different question than the
+one the incident asks, and this is the second time in this session that a
+green-looking measurement described a state other than the one under investigation.
+
+## What stands, and what does not
+
+The code stands. `_progress_since` depending on a single instrumented oracle is a real
+blind spot, `_transcript_advanced` is fail-closed, it costs one `stat`, and the
+regression coverage and the conftest isolation it forced are all worth keeping. But it
+is now a **defensive** improvement with no observed incident behind it, and Part 78
+must not be read as evidence that the hook drops events. It does not.
+
+What does NOT stand is the diagnosis. The original report was closer to right than the
+rebuttal in Part 78: the agent was idle because it was parked at an owner gate having
+correctly reported that no safe work remained, and being parked at a gate is not
+stalling. Part 78 dismissed that framing on the grounds that `quiescent` is the honest
+verdict for a pane that stopped without proving it finished. That argument is still
+sound for a genuine mid-work silent stop, and it does not cover this case, where the
+agent had finished everything it was permitted to do and said so.
+
+## The real question, left open and NOT fixed here
+
+There is no durable signal that distinguishes "idle, waiting on a human" from "idle,
+stuck". `_armed_external_wait` covers a pane that armed its own monitor;
+`runtime_job_awaiting_owner` covers the job-shaped twin; `agent_parked_completed`
+covers an agent that proved it finished. A pane idle at an owner gate with no
+`owner_gate` row of its own falls through all three.
+
+Closing that gap means either recording a gate for the pane or teaching the watchdog to
+read one, and both are actuation-scope changes. Not attempted under a diagnostic
+instruction, and recorded here as the genuine open item rather than fixed quietly.
