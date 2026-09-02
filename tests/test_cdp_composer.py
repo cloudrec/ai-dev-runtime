@@ -973,3 +973,72 @@ def test_every_tab_creation_path_is_guarded():
     for name in creators:
         body = inspect.getsource(getattr(cc, name))
         assert "browser_degraded" in body, f"{name} creates tabs without the guard"
+
+
+# ── a failed close must not hand back the wedged tab (2026-09-02) ───────────
+# `_close_target` swallows failures on purpose — "a zombie tab is worse to fight
+# than to leave". But the success path then did `return find_target(...)`, which
+# walks the page list and returns the FIRST url match. With the old tab still open
+# because its close failed, that match could be the OLD wedged renderer: a
+# "successful" recovery handed back the very tab it had just replaced, and the
+# caller typed into the wedged one.
+#
+# Observed indirectly as three tabs open on a single conversation while that
+# conversation was wedging repeatedly.
+
+def _recover(monkeypatch, *, close_ok, old_still_matches_first):  # noqa: D401
+    from tools import cdp_composer as cc
+    closed = []
+
+    def fake_close(tid):
+        closed.append(tid)
+        return close_ok
+
+    # The verification loop must see `fresh`; only AFTER it breaks does the old
+    # tab win a re-scan, which is the exact ordering hazard. `verified` flips once
+    # the loop has done its job.
+    state = {"verified": False}
+
+    def fake_find(url):
+        if state["verified"] and old_still_matches_first:
+            return {"id": "old", "url": url}      # a re-scan would grab the wedged tab
+        return {"id": "fresh", "url": url}
+
+    def fake_responsive(t, timeout=8.0):
+        state["verified"] = True
+        return True
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", lambda p, method="GET":
+                        {"id": "fresh"} if "/json/new" in p else {})
+    monkeypatch.setattr(cc, "_close_target", fake_close)
+    monkeypatch.setattr(cc, "find_target", fake_find)
+    monkeypatch.setattr(cc, "page_responsive", fake_responsive)
+    monkeypatch.setattr(cc.time, "sleep", lambda s: None)
+    out = cc.recover_wedged_tab({"id": "old"}, "https://chatgpt.com/c/a")
+    return out, closed
+
+
+def test_a_successful_recovery_returns_the_verified_tab(monkeypatch):
+    """Not a re-scan: the loop already proved which tab is fresh and answering."""
+    out, closed = _recover(monkeypatch, close_ok=True, old_still_matches_first=False)
+    assert out == {"id": "fresh", "url": "https://chatgpt.com/c/a"}
+    assert "old" in closed
+
+
+def test_a_failed_close_still_returns_the_fresh_tab_not_the_old_one(monkeypatch):
+    """The defect: with the close failing, a re-scan could return the wedged tab."""
+    out, closed = _recover(monkeypatch, close_ok=False, old_still_matches_first=True)
+    assert out["id"] == "fresh", "recovery must never hand back the tab it replaced"
+
+
+def test_a_failed_close_is_retried_exactly_once(monkeypatch):
+    """One retry covers a renderer that needs a moment; it must not become a loop
+    that fights a zombie tab, which this module explicitly refuses to do."""
+    out, closed = _recover(monkeypatch, close_ok=False, old_still_matches_first=False)
+    assert closed.count("old") == 2, "expected one close plus exactly one retry"
+
+
+def test_a_close_that_succeeds_is_not_retried(monkeypatch):
+    out, closed = _recover(monkeypatch, close_ok=True, old_still_matches_first=False)
+    assert closed.count("old") == 1

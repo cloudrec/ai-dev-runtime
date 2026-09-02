@@ -188,8 +188,22 @@ def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict
             _close_target(fresh["id"])
             return None
         if old_target.get("id") and old_target["id"] != fresh["id"]:
-            _close_target(old_target["id"])
-        return find_target(conversation_url)
+            # One retry, then stop. `_close_target` swallows failures on purpose —
+            # "a zombie tab is worse to fight than to leave" — but a single retry
+            # costs nothing and covers the ordinary case of a wedged renderer that
+            # needs a moment before the browser will drop it.
+            if not _close_target(old_target["id"]):
+                _close_target(old_target["id"])
+        # Return the tab we VERIFIED, never a re-scan.
+        #
+        # This used to `return find_target(conversation_url)`, which walks the page
+        # list and returns the FIRST url match. When the close above failed, the old
+        # wedged tab was still open and still matched, so a "successful" recovery
+        # could hand back the very renderer it had just replaced — and the caller
+        # would then type into the wedged one. The loop above already proved `t` is
+        # the fresh tab and that it answers, so `t` is the only correct answer here,
+        # whether or not the old tab could be closed.
+        return t
     except Exception:  # noqa: BLE001
         return None
 
