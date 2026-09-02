@@ -351,6 +351,28 @@ def allowed_targets() -> set:
     return {"*"} if raw == "*" else {t.strip() for t in raw.split(",") if t.strip()}
 
 
+#: Every environment variable the checks in `validate_config` depend on. Listed rather
+#: than discovered, so adding a new gate to this module without adding it here is a
+#: visible omission instead of a silent hole.
+_CONFIG_ENV_VARS = (
+    "NATIVE_SUPERVISOR_TARGETS",
+    "NATIVE_SUPERVISOR_DENY_PROJECTS",
+    "NATIVE_SUPERVISOR_GOAL_AUTOSUBMIT",
+    "NATIVE_SUPERVISOR_ENABLED",
+    "NATIVE_SUPERVISOR_AUTO_REGISTER",
+    "NATIVE_SUPERVISOR_IDLE_SWEEP",
+    "NATIVE_SUPERVISOR_MIN_INTERVAL_SECS",
+    "NATIVE_SUPERVISOR_MAX_CONSECUTIVE",
+    "NATIVE_SUPERVISOR_MAX_AGE_SECS",
+    "NATIVE_SUPERVISOR_GATE_TTL_SECS",
+    "NATIVE_SUPERVISOR_IDLE_SWEEP_QUIET_SECS",
+    "NATIVE_SUPERVISOR_EXTERNAL_WAIT_TTL_SECS",
+    "NATIVE_SUPERVISOR_GATE_WAIT_LOOKBACK_SECS",
+)
+# SELF_PROJECT is deliberately absent: it is derived from this file's path, not from
+# the environment, so it cannot diverge between a shell and the service.
+
+
 def validate_config() -> dict:
     """Is the supervisor's configuration coherent, and are the gates actually standing?
 
@@ -404,7 +426,7 @@ def validate_config() -> dict:
     #
     # Every value above was captured from the environment at import. Run inside the
     # service that is the config in force; run from a shell it is a set of defaults,
-    # and the function says nothing about the difference. That is not hypothetical:
+    # and the function said nothing about the difference. That is not hypothetical:
     # invoked from a shell on 2026-09-01 this reported `targets_raw: "cp-canary:0.0"`
     # and was quoted as evidence that supervision was confined to the canary, while
     # both live services were running three targets from the unit's EnvironmentFile.
@@ -413,20 +435,34 @@ def validate_config() -> dict:
     # force is worse than no validator, for the same reason the scope check that read
     # the wrong drop-in was: it answers the question with false comfort. So compare,
     # and say so. Never repaired here — the same rule as every other problem above.
+    #
+    # Checked for EVERY variable the config above depends on, not just the targets.
+    # The dangerous ones are the gate flags: someone setting
+    # NATIVE_SUPERVISOR_GOAL_AUTOSUBMIT=1 or shortening NATIVE_SUPERVISOR_DENY_PROJECTS
+    # in the unit would otherwise get a clean bill of health from a shell run, while
+    # the service ran with the gate open — and the denylist is the whole subject of
+    # the wildcard-rollout defect this function was written after.
+    #
+    # Comparison is on the RAW environment string rather than the parsed value, so it
+    # works uniformly for lists, flags and numbers without re-implementing any of the
+    # parsing above.
+    _checked_env = {}
     try:
         from core.control_plane.diagnostics import effective_service_env
-        effective = effective_service_env("NATIVE_SUPERVISOR_TARGETS",
-                                          default=_TARGETS_RAW)
-    except Exception:  # noqa: BLE001 — unable to compare is not a problem to invent
-        effective = None
-    if effective is not None:
-        checked["targets_effective"] = effective
-        if effective.strip() != _TARGETS_RAW.strip():
+        for _var in _CONFIG_ENV_VARS:
+            _mine = os.environ.get(_var)
+            _eff = effective_service_env(_var, default=None)
+            if _eff is None or (_mine or "").strip() == _eff.strip():
+                continue
+            _checked_env[_var] = {"in_process": _mine, "effective": _eff}
             problems.append(
-                f"config mismatch: this process was validated with "
-                f"NATIVE_SUPERVISOR_TARGETS={_TARGETS_RAW!r}, but the service runs "
-                f"{effective!r} — validate inside the service, or trust the effective "
-                f"value, not this one")
+                f"config mismatch on {_var}: this process sees {_mine!r} but the "
+                f"service runs {_eff!r} — validate inside the service, or trust the "
+                f"effective value, not this one")
+    except Exception:  # noqa: BLE001 — unable to compare is not a problem to invent
+        _checked_env = {}
+    if _checked_env:
+        checked["config_mismatch"] = _checked_env
 
     return {"ok": not problems, "problems": problems, "checked": checked}
 

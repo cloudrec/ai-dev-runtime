@@ -985,24 +985,56 @@ def test_without_a_project_the_registry_still_decides(monkeypatch):
 # shell on 2026-09-01 it reported `targets_raw: "cp-canary:0.0"` and was quoted as
 # evidence that supervision was confined to the canary, while both live services
 # were running three targets from the unit's EnvironmentFile.
+#
+# The check covers EVERY variable the config depends on, not just the targets. The
+# dangerous ones are the gate flags: GOAL_AUTOSUBMIT set in the unit, or a
+# shortened DENY_PROJECTS, would otherwise get a clean bill of health from a shell
+# run while the service ran with the gate open.
 
-def test_a_config_mismatch_is_reported_as_a_problem(monkeypatch):
+def _effective(monkeypatch, mapping):
     from core.control_plane import diagnostics as diag
-    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
     monkeypatch.setattr(diag, "effective_service_env",
-                        lambda name, **kw: "cp-canary:0.0,other:0.0")
+                        lambda name, default=None, **kw: mapping.get(name, default))
+
+
+def test_a_targets_mismatch_is_reported(monkeypatch):
+    monkeypatch.delenv("NATIVE_SUPERVISOR_TARGETS", raising=False)
+    _effective(monkeypatch, {"NATIVE_SUPERVISOR_TARGETS": "cp-canary:0.0,other:0.0"})
     r = ns.validate_config()
     assert r["ok"] is False
-    assert any("config mismatch" in p for p in r["problems"])
-    assert r["checked"]["targets_raw"] == "cp-canary:0.0"
-    assert r["checked"]["targets_effective"] == "cp-canary:0.0,other:0.0"
+    assert any("config mismatch on NATIVE_SUPERVISOR_TARGETS" in p for p in r["problems"])
+    assert r["checked"]["config_mismatch"]["NATIVE_SUPERVISOR_TARGETS"]["effective"] \
+        == "cp-canary:0.0,other:0.0"
+
+
+def test_a_goal_autosubmit_mismatch_is_reported(monkeypatch):
+    """The most dangerous flag this function asserts on. A shell run reads the
+    default (off) and would have called that fine."""
+    monkeypatch.delenv("NATIVE_SUPERVISOR_GOAL_AUTOSUBMIT", raising=False)
+    _effective(monkeypatch, {"NATIVE_SUPERVISOR_GOAL_AUTOSUBMIT": "1"})
+    r = ns.validate_config()
+    assert r["ok"] is False
+    assert any("NATIVE_SUPERVISOR_GOAL_AUTOSUBMIT" in p for p in r["problems"])
+
+
+def test_a_shortened_denylist_in_the_unit_is_reported(monkeypatch):
+    """The denylist is the whole subject of the wildcard-rollout defect this
+    function was written after."""
+    monkeypatch.delenv("NATIVE_SUPERVISOR_DENY_PROJECTS", raising=False)
+    _effective(monkeypatch, {"NATIVE_SUPERVISOR_DENY_PROJECTS": "capacity"})
+    r = ns.validate_config()
+    assert any("NATIVE_SUPERVISOR_DENY_PROJECTS" in p for p in r["problems"])
 
 
 def test_no_mismatch_is_reported_when_they_agree(monkeypatch):
     """Run inside the service the two are the same, and nothing is invented."""
-    from core.control_plane import diagnostics as diag
-    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
-    monkeypatch.setattr(diag, "effective_service_env", lambda name, **kw: "cp-canary:0.0")
+    monkeypatch.setenv("NATIVE_SUPERVISOR_TARGETS", "cp-canary:0.0")
+    _effective(monkeypatch, {"NATIVE_SUPERVISOR_TARGETS": "cp-canary:0.0"})
+    assert not any("config mismatch" in p for p in ns.validate_config()["problems"])
+
+
+def test_a_variable_set_nowhere_is_not_a_mismatch(monkeypatch):
+    _effective(monkeypatch, {})
     assert not any("config mismatch" in p for p in ns.validate_config()["problems"])
 
 
@@ -1015,4 +1047,15 @@ def test_an_unreadable_effective_config_invents_no_problem(monkeypatch):
     monkeypatch.setattr(diag, "effective_service_env", boom)
     r = ns.validate_config()
     assert not any("config mismatch" in p for p in r["problems"])
-    assert "targets_effective" not in r["checked"]
+    assert "config_mismatch" not in r["checked"]
+
+
+def test_every_env_var_this_module_reads_is_listed(monkeypatch):
+    """Adding a new gate without listing it here would be a silent hole: the new
+    variable could diverge between shell and service with nothing to notice."""
+    import re
+    src = open("core/native_supervisor.py").read()
+    used = set(re.findall(r"os\.getenv\(\s*\"(NATIVE_SUPERVISOR_[A-Z_]+)\"", src))
+    assert used, "regex found no env vars — the guard itself is broken"
+    assert used <= set(ns._CONFIG_ENV_VARS), \
+        "unlisted: %s" % sorted(used - set(ns._CONFIG_ENV_VARS))
