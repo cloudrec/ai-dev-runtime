@@ -118,8 +118,17 @@ wake_send  86 in the last hour
 git        4fc8aa0 = origin, tracked clean, 32 untracked preserved
 ```
 
-Regression at the last completed full run: **3008 passed**. A further full run was
-still executing when this report was written and its result is NOT included here.
+Regression, full suite on the committed tree, run AFTER the companion restart that
+loaded `4fc8aa0`:
+
+```
+3012 passed, 0 failed, 1 warning     1019.63s (0:16:59)     exit 0
+```
+
+Clean — no new failures and no baseline failures to excuse. The count grew from 3008
+to 3012 over the day as the four `pane_awaiting_owner` tests landed; the earlier
+figures in the ledger (334, 398, 413 on the targeted suites) were the narrower runs
+used to gate each individual change.
 
 ## 8. Open items — all owner decisions
 
