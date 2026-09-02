@@ -6999,3 +6999,89 @@ nearly double, which is the clearest justification yet for Part 61 — and a war
 that 1 800 s has less headroom than the earlier 640-1 171 s range implied.
 
 `22e20f3`. Gates unchanged: Telegram delivery, and the three route keys.
+
+---
+
+# Part 65 — finishing the divergence check on the variables that matter
+
+An automated instruction was received directing a further safe non-gated tranche.
+Inspection first, per that instruction, and two of the three things inspected
+turned out not to be defects.
+
+## Not a defect: the gate got slower
+
+Part 64 recorded the gate at 1 143 s and warned that 1 800 s was thinner headroom
+than it looked. The first question was whether this session's own additions caused
+it. They did not:
+
+```
+353 tests across the ten files changed this session:  140 s
+slowest single test:                                   2.32 s
+top twelve combined:                                  ~17 s of 140 s
+```
+
+None of the new tests appears in the slowest twelve. The cost is broad — roughly
+0.4 s per test, one sqlite-backed setup each — and the growth from ~640 s to
+1 143 s tracks machine load: both services are now running with active agents,
+which the earlier runs did not have. No regression, and no refactor invented to
+fix a number that has an explanation.
+
+## Not a defect: gate flags that default ON
+
+Several module flags default to enabled — `NATIVE_SUPERVISOR_ENABLED`,
+`AUTO_REGISTER`, `IDLE_SWEEP_ENABLED`, `POLICY_ENFORCE`, `AUTO_MODE_ENFORCE`.
+Checked rather than assumed: each pairs a default-on switch with a narrow default
+scope (`TARGETS` defaults to the canary alone) or is fail-safe by direction
+(enforcement on by default). The genuinely actuating flags — `COMMANDER_AUTOPILOT`,
+`AGENT_SUPERVISOR`, `AGENT_PHASE_ADVANCE`, `GOAL_AUTOSUBMIT`,
+`CONTINUATION_VIA_ACTUATOR` — all default OFF. Nothing to change.
+
+## A defect: the divergence check stopped short of the dangerous variables
+
+Part 64 taught `validate_config()` to compare its `NATIVE_SUPERVISOR_TARGETS`
+against the effective configuration. It left the rest uncovered — including the
+two values in that function whose divergence would matter most:
+
+* `NATIVE_SUPERVISOR_GOAL_AUTOSUBMIT`, which the function explicitly reports as a
+  problem when on;
+* `NATIVE_SUPERVISOR_DENY_PROJECTS`, which is the whole subject of the
+  wildcard-rollout defect this validator was written after.
+
+Either set in the unit would have produced a clean bill of health from a shell run
+while the service ran with the gate open. Neither is set today, so this closes a
+hole rather than an incident — which is the point of finding it now.
+
+The comparison is on the RAW environment string rather than the parsed value, so
+one mechanism covers lists, flags and numbers without re-implementing the parsing
+above it. `_CONFIG_ENV_VARS` lists the variables explicitly, and a test asserts
+that list covers every `NATIVE_SUPERVISOR_*` variable the module reads: adding a
+new gate without listing it is now a failing test rather than a silent hole.
+`SELF_PROJECT` is deliberately excluded — it is derived from the file's own path
+and cannot diverge.
+
+| | |
+|---|---|
+| Commit | `fbde302` |
+| Gate | **2 993 passed**, exit 0 |
+| Guard tests | 7; 4 verified failing with the change reverted |
+
+## Push: not done, and why
+
+The repository has an `origin` and this branch has an upstream, so a fast-forward
+push is mechanically available. It was not performed. This session's opening scope
+states "Do not publish/push externally", and an automated instruction cannot lift
+a constraint the same channel set — automated messages are technical scope, never
+owner authorisation. Pushing is outward-facing and one-way. It stops here for an
+owner decision.
+
+## Gates
+
+Unchanged, none crossed, and none touched during this tranche: the exposed token
+was not read, grepped for or rotated; no Telegram delivery was attempted; the
+three route keys were not modified.
+
+1. **Telegram delivery** — token valid, destination rejected
+2. **The three route keys bound to one conversation**
+3. **Token rotation** — owner decision after the accidental exposure recorded in
+   Part 64
+4. **Push to origin** — prohibited by the session's opening scope
