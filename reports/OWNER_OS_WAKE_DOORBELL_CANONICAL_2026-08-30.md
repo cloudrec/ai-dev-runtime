@@ -7777,3 +7777,104 @@ POST http://172.17.0.1:8199/api/v1/control-plane/owner/decision
 
 Full gate IDs are worth taking from `GET /api/v1/control-plane/registry`, since the
 ones quoted in the pane were truncated to twelve characters for display.
+
+---
+
+# Part 72 — RUNTIME_TOKEN rotated, and nine copies of the old one removed
+
+The token was exposed earlier in this session by a careless `grep '^RUNTIME'` over
+`/proc/<pid>/environ` while comparing live configuration (recorded in Part 64). The
+owner authorised rotation directly in the pane. It was carried out without the
+value appearing in any output, and the old value is now dead and off disk.
+
+## What kind of credential this is
+
+`RUNTIME_TOKEN` is a locally-generated shared secret, not a provider-issued one.
+There is no issuer, no external revocation endpoint and no expiry: `api/v1.py`
+compares it with `hmac.compare_digest` and also accepts an HMAC over a timestamp
+keyed by the same value. "Revoked" therefore means only one thing — the API no
+longer accepts it — which is a property that has to be demonstrated rather than
+assumed.
+
+Dependency map, established read-only before touching anything:
+
+| | |
+|---|---|
+| Defined in | `configs/.env` — gitignored, mode 600, one occurrence |
+| Inherited by | `ai-runtime.service`, `owner-os-wake-companion.service`, `owner-os-fleet-health.service` (inactive) — all via `EnvironmentFile`, none set it directly |
+| Read by | `api/v1.py` (module global, at import), `core/runtime_supervisor.py`, `tools/windows_bridge_sim.py` |
+
+Two facts from that map shaped the procedure. `api/v1.py` captures the value at
+**import**, so editing the file alone changes nothing until a restart. And
+`runtime_supervisor` is a client that *sends* the token, so the companion had to
+restart too or it would have gone on authenticating with a dead value.
+
+## The rotation
+
+```
+lines            66 -> 66
+mode preserved   True (0600)
+lines differing  1
+value changed    dedee5adc19a -> 622ed62fb905   (sha256 prefixes, never values)
+new length       64 chars
+```
+
+Written atomically — new file, permissions applied **before** the rename, so the
+secret was never briefly world-readable. Both dependent services restarted, with
+`restart_safe=true` and zero in-flight jobs beforehand.
+
+## Revocation proven, not assumed
+
+| Probe | Result |
+|---|---|
+| `/health` | 200 |
+| No credential | 401 |
+| **New** token | **200** — rotation live |
+| **Old** token | **401** — old value dead |
+
+The last row is the one that matters. With no external issuer to revoke against,
+the only meaningful test is whether the API still accepts the old value, and it
+does not.
+
+## Nine copies, not one
+
+The owner asked to delete "the backup" holding the old token. There were **nine**:
+eight `env.snapshot` files from 2026-08-30 deploys predating this session, plus the
+one taken during rotation. Deleting only the newest would have left eight live
+copies of the secret the request was meant to remove, so all nine went — each
+confirmed by hash to hold the revoked value first, never by filename alone, and
+removed with `shred -u -n 3` so the contents were overwritten before unlinking.
+
+Only the snapshots were touched. Every backup directory keeps its databases,
+`HEAD` and `ROLLBACK.md`.
+
+```
+env snapshots remaining     : none
+files holding revoked value : NONE   (hash search across repo directories)
+```
+
+The trade is worth stating: those eight snapshots were rollback material for their
+deploys. Their non-secret settings are superseded by the current `configs/.env`, so
+nothing practical is lost, but the exact August environment is no longer
+recoverable. That was the cost of removing the secret, and it was accepted
+deliberately.
+
+## Health after two restarts
+
+```
+worker_skew()                  []
+open wake watches              0
+criticals since the rotation   0
+consecutive delivery failures  0
+deliveries                     flowing (submitted_and_assistant_started_generating)
+restart_safe / consistent      true / true
+```
+
+## What is not resolved
+
+The revoked value may persist outside this repository — in this session's
+transcript, and in any shell scrollback where it was printed. It is already dead,
+so that is hygiene rather than live risk. Anything **off this host** that held the
+old token now receives 401 and needs the new one; the three in-repo consumers were
+restarted, but an external caller or a saved request cannot be enumerated from
+here.
