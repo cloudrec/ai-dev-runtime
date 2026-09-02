@@ -103,8 +103,21 @@ post-change: 3000 passed, 0 failed. Detail in Part 74 of the canonical ledger.
 ## Genuine owner gates
 
 * **Telegram** — 400 `chat not found`, not 401, so the token authenticates and the
-  chat is rejected. Positive 9-digit id = a private chat. One action: open the bot
-  and press Start.
+  chat is rejected. `getMe` returns ok, which is the proof: the bot is live and the
+  credential is fine, and it is the chat that refuses. Positive 10-char id = a
+  private chat, and Telegram will not accept `sendMessage` into a private chat that
+  has never opened a conversation with the bot.
+
+  The bot is **@ezzetasecurity_bot** — https://t.me/ezzetasecurity_bot. One action:
+  open that link and press Start. No config edit, no token change, no restart. If it
+  still 400s afterwards, the stored chat id belongs to a different account than the
+  one that pressed Start — a routing question, and a separate gate.
+
+  NOT required for autonomous operation. It is one of two notification tiers
+  (`same_chat_wake`, `owner_push`) and neither is in the wake path: `wake_bridge.py`,
+  `closed_loop_wake.py` and `wake_companion.py` contain zero references to telegram.
+  Wakes run on the CDP → ChatGPT pane path — 1899 `wake_send` in 24 h. What is lost
+  while it is shut is the out-of-band ping, not the loop.
 * **`canary_agent_selection`** — the single open gate; answering could widen
   actuation scope.
 * **Three shared route keys** — `owner-os`, `payment-orchestrator`, `seo` all bound
