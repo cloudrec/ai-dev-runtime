@@ -8091,8 +8091,18 @@ with no reason text at all all remain `("agent_process_failed", "critical", True
 Narrowing a false alarm must not cost a real crash, and the empty payload is the
 sharpest version of that — no reason is the most dangerous input, and it stays critical.
 
-`tests/test_owneros_hook.py` 35 passed. Broader run over the hook, agent_watch,
-wake_bridge, closed_loop_wake and native_supervisor suites: see the session record.
+```
+tests/test_owneros_hook.py                                 35 passed
+hook + agent_watch + wake_bridge + closed_loop_wake
+  + native_supervisor                                     334 passed  (190.79s)
+full suite, post-change                                  3000 passed  (1039.86s)
+```
+
+The full run is clean: 3000 passed, nothing failed, no baseline failures to excuse.
+An earlier full run was started before this change landed and was stopped rather than
+reported — it had collected against the pre-change tree, so its number would have
+described code that no longer exists. The 3000 above is a fresh run on the committed
+tree.
 
 ## What this does not claim
 

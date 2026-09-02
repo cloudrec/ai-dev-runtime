@@ -97,8 +97,8 @@ recoverable condition (a provider window) and treated a full context as a crash.
 deliberately NOT merged, because `_classify()` reads the provider regex and would
 have labelled a full context `provider_usage_window_exhausted`. Five tests, two of
 which fail when the call site is reverted; the control case pins that a real
-traceback, a non-zero exit, and an empty payload all stay critical. Detail in
-Part 74 of the canonical ledger.
+traceback, a non-zero exit, and an empty payload all stay critical. Full suite
+post-change: 3000 passed, 0 failed. Detail in Part 74 of the canonical ledger.
 
 ## Genuine owner gates
 
