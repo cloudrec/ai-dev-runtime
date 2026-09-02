@@ -7625,3 +7625,55 @@ it and in audit event **19348** (`push=False`, so nothing was woken).
 queue now shows only obligations whose subject still exists. Nothing was answered
 on the owner's behalf, and the two decisions that carry real semantic weight are
 untouched and still waiting.
+
+## Part 70 addendum — the 12 reconciled, and the cause left standing
+
+An automated instruction was received asking that the remaining obligations be
+reconciled against live state before further work. Every one of the 12 checks out.
+
+| Kind | Count | Subject state | Verdict |
+|---|---:|---|---|
+| `classify_scope` | 9 | all **LIVE**, all `observe_only` | genuine open obligations |
+| `canary_agent_selection` | 1 | `(canary-selection)` — not an agent target | correctly preserved as ambiguous |
+| `unverified_owner_decision` | 1 | `arbitrage2-opus:0.0`, registry `dead` | stale by criterion, excluded by instruction |
+| `governor_cross_project_work_refused` | 1 | `mess-qa-automation:0.0`, registry `dead` | stale by criterion, excluded by instruction |
+
+No preserved gate was wrongly kept and none has since gone stale except the two
+deliberately excluded. `owner_gate_report()` now reports **status green** with
+**8** SLA breaches, against 136 before the cleanup.
+
+## What the cleanup made visible
+
+Nine agents are running in `observe_only` with an unanswered scope question:
+`email`, `capacity-blockchain`, `diamond-auction`, `gaika-opus`,
+`payorch-cp-ip-fix`, `hostsecure`, `owner-os-opus-clean`, `arbitrage-resume`,
+`mess-opus-next`. That is a real backlog and it was previously buried under 128
+gates about panes that no longer existed. Surfacing it is the point of the
+exercise; answering it is an owner decision and none was touched.
+
+## The cause is untreated, deliberately
+
+The cleanup addressed a symptom. `control_plane.discovery` opens one
+`classify_scope` gate per unknown-scope agent by design, and **nothing retires it
+when that agent dies**, so the queue refills. Measured rate of new
+`classify_scope` gates:
+
+```
+2026-09-02   1     2026-08-30  16
+2026-09-01   3     2026-08-28   6
+2026-08-31   2     2026-08-18  10
+```
+
+One to three a day in the ordinary case, with bursts of ten to sixteen when a
+group of agents is created. At that rate the 128 recur within weeks.
+
+The obvious fix — auto-retire a gate when its subject dies — is **not** proposed
+lightly, because it is precisely what `api.close_gates()` forbids: "owner-DECISION
+gates are never auto-closed; those require a verified owner_decision". A scope
+gate is an owner decision. Teaching the system to close them on its own would
+weaken a rule this codebase set deliberately, so it is not something to slip in as
+maintenance. It needs an owner's design decision about what "the subject no longer
+exists" should mean for a question the owner never answered.
+
+Recorded with the rate so the decision can be made on evidence rather than
+rediscovered the next time the queue fills.
