@@ -328,6 +328,27 @@ def consider_auto_bind(conversation: str, *, title: str = "", conn=None,
             return {"bound": False, "reason": "ambiguous_project_markers",
                     "candidates": matches}
         key = matches[0]
+        # The conversation side of the same guarantee. Everything below protects the
+        # ROUTE — a healthy binding is never replaced — and nothing protected the
+        # CONVERSATION, so auto-discovery could pile a second and third project onto a
+        # chat that already belonged to another one. It did: `owner-os`,
+        # `payment-orchestrator` and `seo` all ended up on the one chat now titled
+        # ПЛАТЁЖКА, which is 3 route keys sharing 1 doorbell out of 12 keys over 10
+        # chats. Wakes for all three landed in one conversation and the other two
+        # projects' chats were never rung, which is what an owner sees as "the loop
+        # stopped, I have to poke it myself".
+        #
+        # Refuse, rather than rebind: moving a pointer is an owner decision about where
+        # their messages land, and this function's whole license is deterministic
+        # evidence. A title is mutable — the `seo` binding was made when this chat's
+        # title still named seo, and the title changed afterwards — so a claim can be
+        # true at bind time and false later. Refusing is the fail-closed half of that;
+        # unwinding what a past rename left behind is not auto-discovery's call.
+        for other in wake_routes.list_routes(conn=conn):
+            if (other.get("conversation") or "").strip().rstrip("/") == url \
+                    and other.get("route_key") != key:
+                return {"bound": False, "reason": "conversation_already_bound_to_other_route",
+                        "route_key": key, "held_by": other.get("route_key")}
         existing = wake_routes.get_route(key, conn=conn)
         continuation = False
         if existing:

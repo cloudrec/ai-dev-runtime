@@ -8256,3 +8256,86 @@ Unchanged and singular. The Telegram Start gate is now the ENTIRE critical lane:
 4 x `notification_dead_letter` + 1 x `notifications_red` per hour, nothing else in
 it. One owner action closes it — open the bot, press Start. Until then every wake
 that cannot reach the owner ends here, and the count keeps climbing.
+
+---
+
+# Part 77 — the loop works, and rings the wrong doorbell
+
+The symptom was that the owner still pokes ChatGPT project chats with "проверь",
+which reads like a broken autonomy loop. It is not broken. Every stage runs; the
+last one delivers to the wrong conversation.
+
+## The path, stage by stage
+
+```
+claims, 24h        1058 allowed   (cooldown refusals are 7-35s, not a blocker)
+delivery, 24h      every route shows delivered == watches, no gap
+resolution         94-97% per route, 24 escalations total
+fail-closed        none observed - nothing recorded-but-unactuated
+```
+
+So detection, claim, delivery and resolution are all healthy. The defect is in
+route -> conversation.
+
+## Three keys, one doorbell
+
+```
+owner-os              -> 6a7d37d0...  "ПЛАТЁЖКА"   deploy-2026-08-14, legacy migration
+payment-orchestrator  -> 6a7d37d0...  "ПЛАТЁЖКА"   auto-discovery 2026-08-19
+seo                   -> 6a7d37d0...  "ПЛАТЁЖКА"   auto-discovery 2026-09-01
+```
+
+12 route keys over 10 conversations. In 24 h those three delivered **291 watches into
+one chat** (owner-os 148, seo 75, payment 68). Owner OS's own wakes land in the
+payment chat, so the conversation the owner opens expecting Owner OS has had nothing
+delivered to it, and they type "проверь".
+
+The manual poking is itself in the data. Live, unbound conversations include
+"Проверка событий Owner OS" x4, "Проверь события Owner OS" x2, "Проверка новых
+событий" x3 - nine chats that exist because the bound one never rang - alongside
+"Resume SEO agent" (which matches the `seo` marker) and "Payment Orchestrator",
+both unbound.
+
+## The missing half of a guard
+
+`consider_auto_bind()` protects the ROUTE. Its docstring is explicit: "A healthy
+existing binding is never replaced, however new the chat." Nothing protected the
+CONVERSATION, so discovery could stack a second and third project onto a chat that
+already belonged to another one - which is exactly what happened twice.
+
+Fixed by refusing a chat already held by a different route key, recording `held_by`.
+It changes no existing destination and narrows what auto-discovery may do rather than
+widening it.
+
+## A title is mutable, and that is the deeper cause
+
+`match_projects("ПЛАТЁЖКА")` returns **only** `payment-orchestrator`. It has never
+matched `seo`. The registry row for that chat nonetheless reads
+`inferred_route: seo, evidence: "title marker match: seo"` - self-contradictory,
+because the binding was made when the chat carried a different title and the title
+changed afterwards. Auto-discovery binds on evidence that can go stale silently, and
+nothing re-checks it.
+
+Refusing new collisions is the fail-closed half. Unwinding what a past rename left
+behind is deliberately NOT done here: moving a pointer decides where an owner's
+messages land, and that is theirs.
+
+## Evidence
+
+3 tests; 2 fail when the guard is removed, verified by removing it. They pin the
+collision refusal, that a key may still re-assert its OWN chat, and that the
+continuation path - which exists so a project whose chat died can follow the owner to
+a new one - cannot follow them into a chat another project is using.
+
+## The owner decision, exactly
+
+| key | now | candidate | consequence |
+|---|---|---|---|
+| `owner-os` | ПЛАТЁЖКА | one of the "Проверка событий Owner OS" chats, or a fresh named one | Owner OS wakes stop landing in the payment chat |
+| `seo` | ПЛАТЁЖКА | `Resume SEO agent` (`...7-1e4c64cc7431`, matches the marker) | SEO wakes reach the SEO chat |
+| `payment-orchestrator` | ПЛАТЁЖКА | keep - the title genuinely names it | none |
+
+Keeping all three in one chat is a legitimate choice; then the fix is only that no
+fourth project joins by accident. The one input that cannot be guessed is which
+conversation `owner-os` should ring: the nine candidates are near-identical in title,
+and picking would be a guess about where the owner actually reads.

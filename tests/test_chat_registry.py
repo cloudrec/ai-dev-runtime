@@ -109,6 +109,48 @@ def test_a_substring_is_not_a_marker():
     assert r["bound"] is False and r["reason"] == "no_project_marker_in_title"
 
 
+def test_a_chat_that_already_belongs_to_another_project_is_refused():
+    """The conversation side of the same guarantee.
+
+    Everything else here protects the ROUTE. Nothing protected the CONVERSATION, so
+    discovery could pile a second project onto a chat that already belonged to one.
+    It did, in production: owner-os, payment-orchestrator and seo all landed on the
+    single chat now titled ПЛАТЁЖКА, so three projects shared one doorbell and two of
+    them were never rung.
+    """
+    _seed_project("mess"); _seed_project("seo")
+    wr.bind_route("mess", MESS)
+    r = cr.consider_auto_bind(MESS, title="seo roadmap")
+    assert r["bound"] is False
+    assert r["reason"] == "conversation_already_bound_to_other_route"
+    assert r["held_by"] == "mess"
+    assert wr.get_route("seo") is None, "seo must not have been bound"
+    assert wr.get_route("mess")["conversation"] == MESS, "mess must keep its chat"
+
+
+def test_the_holder_may_still_rebind_to_its_own_chat():
+    """The guard is about OTHER routes. A key re-asserting the chat it already holds
+    is not a collision, and must not be refused by the collision check."""
+    _seed_project("mess")
+    wr.bind_route("mess", MESS)
+    r = cr.consider_auto_bind(MESS, title="mess roadmap")
+    assert r["reason"] != "conversation_already_bound_to_other_route"
+    assert wr.get_route("mess")["conversation"] == MESS
+
+
+def test_a_dead_route_still_cannot_steal_an_occupied_chat():
+    """The continuation path exists so a project whose chat died can follow the owner
+    to a new one. It must not follow them into a chat another project is using."""
+    _seed_project("mess"); _seed_project("seo")
+    wr.bind_route("mess", MESS)
+    wr.bind_route("seo", OWNER)
+    cr.mark_dead(OWNER, reason="send refused")
+    r = cr.consider_auto_bind(MESS, title="seo roadmap")
+    assert r["bound"] is False
+    assert r["reason"] == "conversation_already_bound_to_other_route"
+    assert wr.get_route("mess")["conversation"] == MESS
+
+
 def test_an_existing_route_is_never_rebound_by_discovery():
     """Newer is not evidence. Moving a project's doorbell stays an explicit owner act."""
     _seed_project("mess")
