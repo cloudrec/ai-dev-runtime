@@ -665,6 +665,69 @@ async def control_plane_registry(_: bool = Depends(_auth)):
     return {"agents": _cp.get_registry(), "open_gates": _cp.get_open_gates()}
 
 
+class OwnerDecisionReq(BaseModel):
+    """One owner answer, for one or more gates that share it."""
+    gate_ids: list[str]
+    answer: str
+
+
+@router.post("/control-plane/owner/decision", operation_id="record_owner_decision")
+async def record_owner_decision(req: OwnerDecisionReq, request: Request,
+                                _: bool = Depends(_auth)):
+    """Answer owner gates through the ONE channel the provenance invariant trusts.
+
+    `provenance` names four trusted channels and, until now, nothing implemented any
+    of them: `owner_api` was a string in a set. The only production caller of
+    `record_owner_decision` is `access_recovery`, which writes a single hardcoded
+    answer. So an owner decision could not be entered for an arbitrary gate at all,
+    and the nine open `classify_scope` gates had no path to resolution.
+
+    What `authenticated=True` MEANS here is the whole point of the endpoint. It is
+    not a developer asserting trust in code — it is the fact that this request
+    carried the runtime credential and passed `_auth`, which is either an HMAC over
+    a fresh timestamp inside the replay window, or the bearer token. The actor
+    records WHICH, so a signed decision stays distinguishable from a bearer one in
+    the audit trail forever.
+
+    The route deliberately cannot widen its own trust: `source_channel` is fixed to
+    `owner_api` and is not a parameter, so no caller can post a decision claiming a
+    channel it did not come through. Resolution still goes through
+    `resolve_gate_with_decision`, which re-verifies provenance, refuses a gate that
+    is not open, refuses an already-consumed decision, and raises a critical event
+    rather than resolving on doubt. This endpoint supplies provenance; it does not
+    get to skip the check.
+    """
+    answer = (req.answer or "").strip()
+    if not answer:
+        raise HTTPException(status_code=422, detail="answer must not be empty")
+    if not req.gate_ids:
+        raise HTTPException(status_code=422, detail="gate_ids must not be empty")
+
+    from core.control_plane import api as _cp
+    from core.control_plane import provenance
+
+    method = getattr(request.state, "auth_method", "unknown")
+    open_gates = {g["id"]: g for g in _cp.get_open_gates()}
+    results = []
+    for gid in req.gate_ids:
+        gate = open_gates.get(gid)
+        if gate is None:
+            results.append({"gate_id": gid, "resolved": False, "reason": "gate_not_open"})
+            continue
+        d = provenance.record_owner_decision(
+            question_id=gate.get("correlation_id") or gid,
+            gate_id=gid,
+            source_channel="owner_api",       # fixed: never caller-supplied
+            actor=f"owner:{method}",
+            answer=answer,
+            authenticated=True)               # earned by _auth, not asserted
+        out = provenance.resolve_gate_with_decision(gid, d["id"])
+        results.append({"gate_id": gid, "decision_id": d["id"],
+                        "trusted": d["trusted"], **out})
+    return {"answered": sum(1 for r in results if r.get("resolved")),
+            "requested": len(req.gate_ids), "auth_method": method, "results": results}
+
+
 @router.get("/control-plane/notifications/status")
 async def control_plane_notifications_status(_: bool = Depends(_auth)):
     """Fail-closed delivery posture. RED (notifications_enabled=false) is a health
