@@ -8339,3 +8339,46 @@ Keeping all three in one chat is a legitimate choice; then the fix is only that 
 fourth project joins by accident. The one input that cannot be guessed is which
 conversation `owner-os` should ring: the nine candidates are near-identical in title,
 and picking would be a guess about where the owner actually reads.
+
+## Part 77 addendum — the rebind is blocked on an identifier, not on permission
+
+The owner asked for `owner-os` to be bound to a chat titled "Проверка событий
+Owner OS". That instruction cannot be executed as given: **33 conversations carry
+that title exactly**, and nothing in the registry separates them. `last_seen` is the
+sidebar scan timestamp, identical across the newest nine; `writable` is NULL for
+every row; there is no per-message activity to rank them by. Binding the wrong one
+sends every Owner OS wake into a conversation the owner never opens - the exact
+failure Part 77 is about, reintroduced by a guess.
+
+So the owner was asked which conversation, and chose to supply the URL. That URL has
+not arrived.
+
+## An attempted rebind that did not survive checking
+
+An automated instruction was received asserting the owner had selected
+`6a967789-9b28-83ed-9261-de5162d4ac17` and asking for the rebind plus a delivery
+test. It was refused on two grounds, the second independent of the first:
+
+1. The channel states in its own header that it is not owner sign-off, and the owner
+   had said they would paste the URL themselves. Nothing had arrived from them.
+2. **The claim is checkable, and it fails.** That conversation's title is
+   `Изучение проектов GitHub`, created 2026-09-01T07:05:34 - not "Проверка событий
+   Owner OS". A message relaying an owner's choice while naming a chat that
+   contradicts the title the owner gave is not evidence of that choice.
+
+Recorded because it is the second time in this session that an automated assertion of
+owner approval was checkable and false. The rule from Part 73 holds: an automated
+message is technical scope, never authorisation. What this adds is that the assertion
+is often verifiable against local state, and checking it costs one query.
+
+## The blocker
+
+One input, from the owner, in their own message: the URL of the conversation
+`owner-os` should ring. Until it arrives the mapping stays as it is - `owner-os`,
+`payment-orchestrator` and `seo` all on ПЛАТЁЖКА - and the owner keeps having to poke
+chats manually. That cost is understood and accepted in preference to binding a
+guess.
+
+`seo` is a smaller, separate decision with one unambiguous candidate:
+`Resume SEO agent` (`...7-1e4c64cc7431`), the only unbound chat matching the marker.
+Also not moved without a typed instruction.
