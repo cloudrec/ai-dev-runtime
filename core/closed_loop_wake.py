@@ -399,6 +399,31 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     # the owner is not told a second time about a state they already know is intentional.
     if _armed_external_wait(conn, target, now_ts()):
         return "intentional_external_wait"
+    # The PANE-shaped twin of `runtime_job_awaiting_owner`. The comment at the top of
+    # this module states the principle for jobs — "a job parked on an OWNER GATE is
+    # waiting, not stalled" — and a pane parked on one is in exactly the same position:
+    # the only thing that ends the state is the owner, so re-waking cannot help and
+    # escalating tells them a second and louder time about a decision already sitting in
+    # their queue.
+    #
+    # POSITIVE evidence only, which is what makes this fail-closed. It requires a durable
+    # `owner_gate` row, still open, naming this agent. Absence of a gate claims nothing,
+    # so an agent that is merely idle keeps escalating exactly as before — this is not
+    # the "idle means done" inference the `cls == "completed"` branch below refuses to
+    # make. Self-limiting in the same way: when the gate is answered its state leaves
+    # 'open', the check stops applying on its own, and a new event opens a fresh watch.
+    #
+    # Grants nothing. It suppresses a re-wake and an escalation; it changes no lifecycle,
+    # actuates nothing, and cannot move an agent's scope.
+    try:
+        idents = _identities(conn, target)
+        row = conn.execute(
+            "SELECT id FROM owner_gate WHERE state='open' AND agent_id IN (%s) LIMIT 1"
+            % ",".join("?" * len(idents)), idents).fetchone()
+        if row:
+            return "pane_awaiting_owner"
+    except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
+        pass
     # Asked BEFORE the scraped class, because it is the same question answered by
     # the runtime instead of by inference. A pane mid-turn reports `busy` here while
     # emitting no events at all, which is exactly the state that produced the

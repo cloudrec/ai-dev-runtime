@@ -458,6 +458,69 @@ def test_slo_watchdog_stays_quiet_when_progress_is_observed(conn):
     assert emit_calls == []
 
 
+# ── a pane parked on an owner gate is waiting, not stalled ──────────────────
+# The module comment states this for JOBS ("a job parked on an OWNER GATE is waiting,
+# not stalled") and runtime_job_awaiting_owner implements it. The pane-shaped twin was
+# never written, so a pane whose only blocker is a human decision kept escalating to
+# critical about a decision already in the owner's queue.
+
+def test_a_pane_with_an_open_owner_gate_is_not_stalled(conn):
+    from core.control_plane import api
+    _register_agent(conn)
+    api.open_gate(agent_id=PANE, kind="classify_scope", reason="unknown scope", conn=conn)
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=81, target=PANE, project_id="gaika-extension",
+                          conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r["rewoken"], "the only thing that ends this state is the owner"
+    assert calls == []
+    assert any(x["reason"] == "pane_awaiting_owner"
+               for x in r["deregistered"]), r["deregistered"]
+
+
+def test_an_idle_pane_with_no_gate_still_escalates(conn):
+    """The control, and the whole reason this is positive-evidence-only. Absence of a
+    gate claims nothing, so a merely-idle agent keeps escalating exactly as before."""
+    _register_agent(conn)
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=82, target=PANE, project_id="gaika-extension",
+                          conn=conn, now=NOW)
+    clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    clw.slo_scan(conn=conn, now=NOW + 2 * clw.WAKE_LOOP_SLO_SECS + 60, emit_fn=emit)
+    assert calls == ["wake_loop_no_progress", "wake_loop_stalled"]
+
+
+def test_answering_the_gate_restores_normal_stall_detection(conn):
+    """Self-limiting, like agent_parked_completed: once the gate leaves 'open' the
+    suppression stops applying on its own, with no separate reset logic."""
+    from core.control_plane import api
+    _register_agent(conn)
+    g = api.open_gate(agent_id=PANE, kind="classify_scope", reason="unknown scope",
+                      conn=conn)
+    gid = g["id"] if isinstance(g, dict) else g
+    api.answer_gate(gid, "observe_only", conn=conn)
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=83, target=PANE, project_id="gaika-extension",
+                          conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert r["rewoken"], "an answered gate must not keep suppressing"
+    assert calls == ["wake_loop_no_progress"]
+
+
+def test_another_agents_gate_does_not_shield_this_pane(conn):
+    """Gates are per-agent. One agent's pending decision must not silence another's."""
+    from core.control_plane import api
+    _register_agent(conn)
+    api.open_gate(agent_id="someone-else:0.0", kind="classify_scope", reason="x",
+                  conn=conn)
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=84, target=PANE, project_id="gaika-extension",
+                          conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert r["rewoken"]
+    assert calls == ["wake_loop_no_progress"]
+
+
 # ── a working agent whose hook went quiet (21139 -> 21178 -> 21272) ──────────
 # The session emitted 136 agent_turn_stopped events and stopped at 09:52:57. The wake
 # was delivered at 09:59:19. Over the next 33 minutes the agent pushed commits, ran two

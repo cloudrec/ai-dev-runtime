@@ -8670,3 +8670,76 @@ Remaining owner items are no longer gates in the `owner_gate` table: the Telegra
 press (`@ezzetasecurity_bot`), the unused 24 h Windows enrolment code, and the open
 actuation-scope question from the Part 78 correction - no durable signal distinguishes
 an agent idle waiting on a human from one idle and stuck.
+
+---
+
+# Part 80 — a pane parked on an owner gate is waiting, not stalled
+
+Closes the item the Part 78 correction left open: nothing distinguished an agent idle
+because a human owes it a decision from one idle and stuck.
+
+## The principle already existed, for jobs only
+
+The comment at the top of `closed_loop_wake` states it outright — "a job parked on an
+OWNER GATE is waiting, not stalled" — and `runtime_job_awaiting_owner` implements it.
+The pane-shaped twin was never written. `owner_gate` rows carry pane-shaped agent ids
+(`owneros-direct-fix:0.0`, `cp-canary:0.0`, `mess-qa-automation:0.0` and others), so
+the same fact was available for panes the whole time and simply was not read.
+
+`pane_awaiting_owner` reads it. The reasoning is the job's, unchanged: the only thing
+that ends this state is the owner, so re-waking cannot help, and escalating to critical
+tells them a second and louder time about a decision already sitting in their queue.
+
+## Why this is fail-closed and grants nothing
+
+**Positive evidence only.** It requires a durable `owner_gate` row, still `open`, naming
+this agent. The absence of a gate claims nothing, so an agent that is merely idle keeps
+escalating exactly as before. This is NOT the "idle means done" inference the
+`cls == "completed"` branch deliberately refuses to make, and the distinction is the
+whole reason it is safe.
+
+**Self-limiting.** When the gate is answered its state leaves `open`, the check stops
+applying on its own, and a new event opens a fresh watch. No reset logic, same shape as
+`agent_parked_completed` and `runtime_job_awaiting_owner`.
+
+**No authority is granted.** It suppresses a re-wake and an escalation. It changes no
+lifecycle, actuates nothing, and cannot move an agent's scope.
+
+## Evidence
+
+```
+tests/test_closed_loop_wake.py                              78 passed
+closed_loop_wake + agent_watch + wake_bridge + chat_registry
+  + wake_routes + native_supervisor + owneros_hook
+  + control_plane                                          413 passed
+```
+
+The asserting test fails when the check is removed, verified by removing it. Three
+controls pin what must not move: an idle pane with NO gate still re-wakes and
+escalates; answering the gate restores normal stall detection; and another agent's open
+gate does not shield this pane, because gates are per-agent.
+
+## What this does NOT fix
+
+It would not have prevented event 21272. That pane had no open `owner_gate` row — it
+was idle because it had reported that no safe work remained and was waiting on a human
+informally, which is a state nothing durable records. This part fixes the class where
+the waiting IS recorded. An agent waiting on an owner without a gate row remains
+indistinguishable from a stuck one, and closing that would mean opening a gate for
+every such pause, which is a scope decision and not this fix's to make.
+
+## Route verification recorded at the same time
+
+Asked for explicitly rather than inferred from "no collisions":
+
+```
+owner-os -> https://chatgpt.com/c/6a967789-9b28-83ed-9261-de5162d4ac17
+            bound_by=owner  bound_at 2026-09-02T09:51:18.771556+00:00
+            resolve() returns the same URL
+since the rebind: 99 wake_send rows for owner-os, every one to that exact URL,
+                  13 watches delivered, target tab open and responsive
+```
+
+No synthetic wake was sent to prove it. Injecting one writes a message into the owner's
+own conversation, which is not the assistant's to initiate, and 99 real deliveries are
+better evidence than a manufactured one.
