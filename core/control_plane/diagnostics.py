@@ -464,17 +464,51 @@ def loop_liveness_report(*, now: Optional[float] = None, stall_multiplier: float
     }
 
 
-def _read_canary_allowlist(dropin_path: str = None) -> set:
-    """Read the LIVE actuation canary allowlist from the systemd drop-in (read-only, no
-    secrets — the value is an agent target). Falls back to the in-process env global."""
-    path = dropin_path or "/etc/systemd/system/ai-runtime.service.d/canary.conf"
-    try:
-        for line in open(path):
-            if "CONTROL_PLANE_CANARY_AGENTS=" in line:
-                val = line.split("CONTROL_PLANE_CANARY_AGENTS=", 1)[1].strip()
-                return {t.strip() for t in val.split(",") if t.strip()}
-    except Exception:  # noqa: BLE001
-        pass
+_DROPIN_DIR = "/etc/systemd/system/ai-runtime.service.d"
+
+
+def _read_canary_allowlist(dropin_path: str = None, dropin_dir: str = None) -> set:
+    """Read the EFFECTIVE actuation canary allowlist the way systemd resolves it.
+
+    This used to open one hardcoded file, `canary.conf`. systemd reads every `*.conf`
+    in the drop-in directory in LEXICAL order and lets the last assignment win, and on
+    this host there are two:
+
+        canary.conf              (Aug 3)  …=cp-canary:0.0
+        zz-actuation-scope.conf  (Aug 5)  …=cp-canary:0.0,mess-qa-automation:0.0
+
+    `zz-` sorts last, so the live process really runs the wider list — confirmed
+    against /proc. Reading only the first file made the safety report understate the
+    actuator's scope: it declared the allowlist to be `cp-canary:0.0` alone and then
+    counted `mess-qa-automation:0.0` as a BREACH, when that target had in fact been
+    granted actuation on 2026-08-05.
+
+    That is the failure mode a scope check must never have. Anyone widening the
+    allowlist through a later-sorting drop-in would have been invisible to the very
+    report whose job is to notice, and it would have gone on reporting the scope as
+    confined. Whether the wider grant is correct is an owner's decision; the check
+    only has to see the same list the actuator enforces.
+
+    Read-only, no secrets — the value is a list of agent targets.
+    """
+    if dropin_path:
+        paths = [dropin_path]
+    else:
+        import glob
+        paths = sorted(glob.glob(os.path.join(dropin_dir or _DROPIN_DIR, "*.conf")))
+    found = None
+    for path in paths:                      # lexical order; LAST assignment wins
+        try:
+            for line in open(path):
+                line = line.strip()
+                if line.startswith("#") or "CONTROL_PLANE_CANARY_AGENTS=" not in line:
+                    continue
+                val = line.split("CONTROL_PLANE_CANARY_AGENTS=", 1)[1].strip().strip('"')
+                found = {t.strip() for t in val.split(",") if t.strip()}
+        except Exception:  # noqa: BLE001 — an unreadable drop-in is not an allowlist
+            continue
+    if found is not None:
+        return found
     try:
         from core.control_plane import actuator
         return set(actuator.CANARY_AGENTS)
@@ -483,7 +517,8 @@ def _read_canary_allowlist(dropin_path: str = None) -> set:
 
 
 def actuation_scope_report(*, now: Optional[float] = None, conn=None, allowlist: set = None,
-                           dropin_path: str = None, active_window_secs: float = 86400.0,
+                           dropin_path: str = None, dropin_dir: str = None,
+                           active_window_secs: float = 86400.0,
                            synthetic_prefixes=("canary-synthetic",)) -> dict:
     """Verify the actuator never broadened beyond the canary: every target in the durable
     `cp_action` ledger must be on the canary allowlist (or a known synthetic test target).
@@ -507,7 +542,8 @@ def actuation_scope_report(*, now: Optional[float] = None, conn=None, allowlist:
     `notification_failure_report` already uses.
     """
     now = now if now is not None else time.time()
-    allow = set(allowlist) if allowlist is not None else _read_canary_allowlist(dropin_path)
+    allow = (set(allowlist) if allowlist is not None
+             else _read_canary_allowlist(dropin_path, dropin_dir))
     own = conn is None
     if conn is None:
         from core.control_plane.store import connect, init_db
