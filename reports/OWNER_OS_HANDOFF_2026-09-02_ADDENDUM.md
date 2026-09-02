@@ -16,25 +16,31 @@ tabs).
 
 4 tests, 2 fail when reverted. Full gate at commit: 2 995 passed.
 
-## 2. Two of the three tab fixes are NOT live
+## 2. All three tab fixes are now LIVE
 
-This is the part worth carrying forward.
+Superseded. Section 2 previously recorded that two of the three were inert; the
+owner authorised the restart and they are loaded.
 
 ```
-companion started   2026-09-02 06:23:33 CEST
-404496b             2026-09-01 22:53   LIVE
-877edaf             2026-09-02 06:25   NOT live  (2 min after the restart)
-ad705eb             2026-09-02 07:53   NOT live
-worker_skew()       wake_companion, code 4 593 s newer than the running process
+companion restarted  2026-09-02 08:19:00 CEST   PID 3717100
+404496b   2026-09-01 22:53   LIVE
+877edaf   2026-09-02 06:25   LIVE
+ad705eb   2026-09-02 07:53   LIVE
+worker_skew()        []
 ```
 
-So the current healthy browser state — 1 page, 0 bare roots, 5 of 6 deliveries
-succeeding, one wedge absorbed, zero `too_many_pages` — reflects **`404496b` plus
-the manual tab cleanup at ~05:57Z only**. It is not evidence that `877edaf` or
-`ad705eb` work in production. Do not read it as such.
+Verified by introspecting the module the running process imports, not by commit
+date alone: `open_chatgpt_page` carries the `browser_degraded()` guard and closes
+its unverified tab; `recover_wedged_tab` returns the verified target and retries
+the close exactly once. Journal clean, 0 errors since restart. 19 `wake_send`
+rows in the first 10 minutes, browser at 1 page, 0 bare roots.
 
-Activating them needs a `owner-os-wake-companion` restart, which has been an owner
-decision every time in this session.
+Backup and rollback: `backups/predeploy_companion_tabguards_20260902T061835Z/`
+(control_plane.db integrity ok, `ROLLBACK.md`).
+
+The caution in the old section 2 still holds in one respect: a healthy page count
+now is consistent with the guards working but does not prove it. Proof needs a
+wedge or a `/json/new` failure to actually occur while they are loaded.
 
 ## Remaining safe work
 
@@ -42,8 +48,7 @@ None identified. Both items the handoff listed are now closed or blocked on a ga
 
 ## Owner gates
 
-* **Restart the companion** — activates `877edaf` + `ad705eb`; until then `worker_skew()`
-  stays non-empty and the two newer tab guards are inert.
+* ~~Restart the companion~~ — done 2026-09-02 08:19, all three tab fixes live.
 * **Push** — 3 commits unpushed (`135123d`, `ad705eb`, and this addendum's commit).
 * Telegram Start · `canary_agent_selection` · the three shared route keys ·
   the outstanding Windows enrollment code — all unchanged.
