@@ -8382,3 +8382,51 @@ guess.
 `seo` is a smaller, separate decision with one unambiguous candidate:
 `Resume SEO agent` (`...7-1e4c64cc7431`), the only unbound chat matching the marker.
 Also not moved without a typed instruction.
+
+## Part 77 addendum 2 — closed: 12 keys, 12 conversations
+
+The blocker recorded in addendum 1 is resolved. The owner supplied both targets in
+typed messages, and both rebinds are applied.
+
+```
+seo        -> "Resume SEO agent"          ...1e4c64cc7431   by=owner  09:49:29Z
+owner-os   -> ...de5162d4ac17             by=owner  09:51:16Z
+payment-orchestrator -> ПЛАТЁЖКА          unchanged
+```
+
+**12 route keys over 12 conversations. No collisions.** The shared chat went from 3
+route keys to 1, and every project now has its own doorbell. `resolve()` returns the
+new conversation for each of the three. No restart was needed: `wake_routes.resolve()`
+reads the table per wake.
+
+## The owner-os target, and why it was bound despite a title mismatch
+
+The chat's registry title is `Изучение проектов GitHub`, which does not name owner-os.
+The same URL had arrived earlier on the automated channel and was refused, partly
+because that title contradicted the title the owner had asked for. The owner then
+typed the URL themselves.
+
+That distinction is the whole point, so it is worth stating plainly: the refusal was
+never about the URL being wrong. It was about the *evidence* for it. A title mismatch
+is a reason to ask, not a reason to overrule the owner - it is their chat, and they
+know which one they read. An unverified assertion that the owner chose something is a
+different thing entirely, and that is what was declined. Given the same URL from the
+owner directly, it was bound without argument.
+
+Recorded so nobody later reads the refusal as "the assistant thought this chat was
+wrong". It thought the authorisation was missing.
+
+## Verification
+
+Last `owner-os` send before the rebind: 09:51:06Z, to the OLD conversation - ten
+seconds before the pointer moved, so it is correct behaviour and not a stale cache.
+No `owner-os` send has fired since, so the new route is verified by `resolve()` and by
+the audit row, not yet by a live delivery. That distinction matters: the mapping is
+proven, the delivery is not, and the first real wake to that chat will be the proof.
+
+Rollbacks: `backups/rebind_seo_20260902T094926Z/` and
+`backups/rebind_owneros_20260902T095116Z/`, each a DB backup with integrity checked
+plus a one-line undo.
+
+A rename of the owner-os chat to something self-describing would let auto-discovery
+re-derive the binding if it is ever lost. Cosmetic, and the owner's call.
