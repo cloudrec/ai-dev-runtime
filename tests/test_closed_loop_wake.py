@@ -458,6 +458,87 @@ def test_slo_watchdog_stays_quiet_when_progress_is_observed(conn):
     assert emit_calls == []
 
 
+# ── a working agent whose hook went quiet (21139 -> 21178 -> 21272) ──────────
+# The session emitted 136 agent_turn_stopped events and stopped at 09:52:57. The wake
+# was delivered at 09:59:19. Over the next 33 minutes the agent pushed commits, ran two
+# regression suites and rebound two routes, emitting ZERO events under either identity —
+# so the watchdog re-woke a working agent and escalated it to critical wake_loop_stalled.
+# Its transcript was being written the whole time.
+
+def _fake_transcript(monkeypatch, tmp_path, sid, mtime):
+    """Stand in for ~/.claude/projects/<slug>/<session>.jsonl at a chosen mtime."""
+    import os
+    d = tmp_path / ".claude" / "projects" / "-some-project"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{sid}.jsonl"
+    f.write_text("{}\n")
+    os.utime(f, (mtime, mtime))
+    monkeypatch.setenv("OWNEROS_CLAUDE_PROJECTS", str(tmp_path / ".claude" / "projects"))
+    return f
+
+
+def test_a_written_transcript_is_progress_when_no_event_was_emitted(conn, monkeypatch,
+                                                                    tmp_path):
+    """The defect exactly: events are emitted by a hook, and a hook can go quiet while
+    the agent keeps working. The runtime writes the transcript regardless."""
+    sid = "b8999cd0-54ec-445f-abd2-840455c3c369"
+    _fake_transcript(monkeypatch, tmp_path, sid, NOW + 60)
+    monkeypatch.setattr(clw, "_identities",
+                        lambda conn, target: (target, "session:" + sid[:12]))
+    emit_calls = []
+    clw.register_delivery(event_id=71, target="owner-os:0.0", project_id="owner-os",
+                          conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1,
+                     emit_fn=lambda source, etype, **kw: (emit_calls.append(etype),
+                                                          {"event_id": 1})[1])
+    assert not r["rewoken"], "a written transcript is progress"
+    assert emit_calls == []
+
+
+def test_a_stale_transcript_still_escalates(conn, monkeypatch, tmp_path):
+    """The control. An agent that genuinely stopped writes nothing, and must still be
+    re-woken and escalated exactly as before."""
+    sid = "cafe0000-1111-2222-3333-444455556666"
+    _fake_transcript(monkeypatch, tmp_path, sid, NOW - 3600)   # older than the delivery
+    monkeypatch.setattr(clw, "_identities",
+                        lambda conn, target: (target, "session:" + sid[:12]))
+    emit_calls = []
+
+    def emit(source, etype, **kw):
+        emit_calls.append(etype)
+        return {"event_id": 1}
+
+    clw.register_delivery(event_id=72, target="stuck:0.0", project_id="p",
+                          conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert r["rewoken"], "no progress anywhere must still re-wake"
+    assert emit_calls == ["wake_loop_no_progress"]
+
+
+def test_an_unfindable_transcript_fails_closed(conn, monkeypatch, tmp_path):
+    """Cannot-tell must never be the thing that silences a stall."""
+    monkeypatch.setenv("OWNEROS_CLAUDE_PROJECTS", str(tmp_path))
+    monkeypatch.setattr(clw, "_identities",
+                        lambda conn, target: (target, "session:deadbeefcafe"))
+    assert clw._transcript_advanced(conn, "gone:0.0", NOW) is False
+
+
+def test_an_ambiguous_session_prefix_refuses_to_guess(conn, monkeypatch, tmp_path):
+    """Two transcripts share the truncated prefix, so neither is evidence."""
+    _fake_transcript(monkeypatch, tmp_path, "abcdef123456-one", NOW + 60)
+    _fake_transcript(monkeypatch, tmp_path, "abcdef123456-two", NOW + 60)
+    monkeypatch.setattr(clw, "_identities",
+                        lambda conn, target: (target, "session:abcdef123456"))
+    assert clw._transcript_advanced(conn, "amb:0.0", NOW) is False
+
+
+def test_a_pane_only_target_is_unaffected(conn, monkeypatch, tmp_path):
+    """No session identity means no transcript claim, and the event oracle stands alone."""
+    monkeypatch.setenv("OWNEROS_CLAUDE_PROJECTS", str(tmp_path))
+    monkeypatch.setattr(clw, "_identities", lambda conn, target: (target,))
+    assert clw._transcript_advanced(conn, "pane:0.0", NOW) is False
+
+
 # ── observability counters ────────────────────────────────────────────────────
 def test_diagnostics_closed_loop_wake_counters_are_additive(conn):
     from core.control_plane import diagnostics

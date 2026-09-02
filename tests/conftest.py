@@ -47,3 +47,11 @@ os.environ["RUNTIME_WORKTREE_ROOT"] = os.path.join(_TEST_DB_DIR, "worktrees")
 # own assertions. Hard off, like the databases above; the tests that cover the native
 # path enable it explicitly and inject their own listing.
 os.environ["OWNEROS_NATIVE_SESSIONS"] = "0"
+
+# Same hazard, second door. `closed_loop_wake._transcript_advanced` reads the session
+# transcripts under ~/.claude/projects to answer "did this agent write anything since the
+# wake?", which on this host is the operator's REAL transcript directory. Three existing
+# stall-detection controls inverted the moment it was added: their fixed NOW is older than
+# every live transcript on the machine, so a genuinely silent test agent looked busy.
+# Empty means off; the tests that cover this oracle point it at their own tmp_path.
+os.environ["OWNEROS_CLAUDE_PROJECTS"] = ""

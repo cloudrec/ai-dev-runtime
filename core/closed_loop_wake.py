@@ -557,21 +557,71 @@ def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
             conn.close()
 
 
+def _transcript_advanced(conn, target: str, since_ts: float) -> bool:
+    """Has this agent's session transcript been written since `since_ts`?
+
+    The second progress oracle, and the one that does not depend on the agent being
+    instrumented. Events are emitted by a hook; a transcript is written by the runtime
+    itself as the agent works, so it keeps telling the truth when the hook goes quiet.
+
+    Event 21139 -> 21178 -> 21272, 2026-09-02: this session emitted 136
+    `agent_turn_stopped` events and then stopped at 09:52:57. The wake was delivered at
+    09:59:19. Over the next 33 minutes the agent pushed commits, ran two regression
+    suites and rebound two routes, and produced ZERO events under either of its
+    identities — so `_progress_since` correctly reported what it could see, re-woke a
+    working agent, and escalated it to a critical `wake_loop_stalled`. Its transcript
+    mtime advanced throughout.
+
+    Fails CLOSED: any doubt returns False and the caller keeps the behaviour it had
+    before this function existed. A missing transcript, an unreadable directory, or a
+    truncated session id matching more than one file are all "cannot tell", and cannot
+    tell must never be the thing that silences a real stall.
+    """
+    import glob
+    root = os.environ.get("OWNEROS_CLAUDE_PROJECTS")
+    if root == "":            # explicitly emptied: the oracle is off, see tests/conftest
+        return False
+    root = root or os.path.expanduser(os.path.join("~", ".claude", "projects"))
+    for ident in _identities(conn, target):
+        if not ident.startswith(_SESSION_TARGET_PREFIX):
+            continue
+        sid = ident[len(_SESSION_TARGET_PREFIX):].strip()
+        if len(sid) < 8:  # too short to identify a session; refuse to guess
+            continue
+        try:
+            hits = glob.glob(os.path.join(root, "*", sid + "*.jsonl"))
+            if len(hits) != 1:  # zero: unknown. more than one: ambiguous. both refuse.
+                continue
+            if os.stat(hits[0]).st_mtime > since_ts:
+                return True
+        except Exception:  # noqa: BLE001 — see "fails CLOSED" above
+            continue
+    return False
+
+
 def _progress_since(conn, target: str, since_ts: float) -> bool:
     """Has ANYTHING happened for this agent since the wake was delivered? Any newer CTO
     event correlated to this target — a fresh agent_watch class, a stall_doctor action,
-    a second wake decision — counts as progress. Conservative on purpose: this only
-    suppresses a re-wake/escalation, never suppresses one that is actually due.
+    a second wake decision — counts as progress, and so does a written transcript.
+    Conservative on purpose: this only suppresses a re-wake/escalation, never suppresses
+    one that is actually due.
 
     The watchdog's OWN bookkeeping events (source='closed_loop_wake' — the re-wake and
     the escalation it emits) are excluded: otherwise the re-wake's own event row would
-    read as "progress" on the very next scan and the episode could never escalate."""
+    read as "progress" on the very next scan and the episode could never escalate.
+
+    Events alone were not enough. They arrive through a hook, and an agent whose hook
+    stops emitting looks identical to an agent that has stopped working — see
+    `_transcript_advanced`, which reads what the runtime writes rather than what the
+    instrumentation reports."""
     idents = _identities(conn, target)
     row = conn.execute(
         "SELECT COUNT(*) FROM event WHERE agent_id IN (%s) AND ts_epoch > ? "
         "AND source != 'closed_loop_wake'" % ",".join("?" * len(idents)),
         (*idents, since_ts)).fetchone()
-    return bool(row and row[0])
+    if row and row[0]:
+        return True
+    return _transcript_advanced(conn, target, since_ts)
 
 
 def slo_scan(*, conn=None, now: Optional[float] = None,

@@ -8430,3 +8430,95 @@ plus a one-line undo.
 
 A rename of the owner-os chat to something self-describing would let auto-discovery
 re-derive the binding if it is ever lost. Cosmetic, and the owner's call.
+
+---
+
+# Part 78 — a working agent with a quiet hook looks exactly like a stalled one
+
+Reported as a misclassification: completed/quiescent agents with no pending work were
+producing `wake_loop_no_progress` / `wake_loop_stalled`. The classification was not
+the defect. The progress check that should have closed the watch afterwards was.
+
+## What actually happened
+
+```
+21139  09:58:53  work_stopped_incomplete   class=quiescent  state=idle
+                 class_reason=at_rest_unchanged_for_310s
+       09:59:19  delivered, watch opened
+21178  10:15:42  wake_loop_no_progress     re-wake
+21272  10:32:46  wake_loop_stalled         CRITICAL escalation
+```
+
+Event 21139 was CORRECT when emitted: the pane really was at rest and really had not
+proven it finished. What should have followed is the watch closing on the next scan,
+because the agent resumed within seconds.
+
+It did not, and the reason is narrow. `_progress_since()` had exactly one oracle: CTO
+events tagged with this agent's id. This session emitted 136 `agent_turn_stopped`
+events and then stopped at **09:52:57** - six minutes before the wake was even
+delivered. Over the following 33 minutes the agent pushed commits, ran two regression
+suites and rebound two route keys, and emitted **zero** events under either of its
+identities. So the watchdog reported exactly what it could see, re-woke an agent that
+was working, and escalated it to critical.
+
+Events arrive through a hook. A hook can go quiet while the agent keeps working, and
+at that moment "no events" and "stopped" are the same observation.
+
+## The fix
+
+`_transcript_advanced()`, a second oracle. The runtime writes the session transcript
+as the agent works, whatever the instrumentation is doing, so it keeps answering when
+the hook does not. Progress is now "a newer event OR a written transcript".
+
+Verified against the incident itself:
+
+```
+event oracle only     _progress_since  False   <- what the watchdog saw
+with the transcript   _progress_since  True    <- no re-wake, no escalation
+```
+
+Fails CLOSED throughout. A missing transcript, an unreadable directory, or a truncated
+session id matching more than one file are all "cannot tell", and cannot-tell returns
+False so the caller keeps the behaviour it had before this existed.
+
+## What was deliberately NOT done
+
+The request suggested treating quiescent/idle-with-no-pending-work as not-stalled.
+That would have removed the feature rather than fixed the bug. `quiescent` is the
+honest verdict for a pane that stopped without proving it finished - agent_watch's own
+comment calls it "the silent class this whole wake loop exists to catch" - and it is
+reached only structurally, from the inventory calling the pane at rest plus an
+unchanged bottom region for QUIESCENT_SECS. Resolving it wholesale would silence every
+genuinely silent stop. `agent_parked_completed` already covers the case where an agent
+proved it finished; the gap was never in the classification.
+
+## The mistake this fix made first
+
+Three existing stall-detection controls inverted the moment the oracle was added. Their
+fixed `NOW` is older than every live transcript on this host, so a genuinely silent
+test agent looked busy: the change had quietly made the suite read the operator's real
+`~/.claude/projects`. Same hazard as the native-sessions one, second door.
+
+The transcript root is now overridable and `tests/conftest.py` sets it empty, exactly
+as it hard-disables `OWNEROS_NATIVE_SESSIONS`. Worth recording as a pattern rather than
+an incident: any new oracle that reads the host is a test-isolation bug until proven
+otherwise, and the proof is running the existing controls, not the new tests.
+
+## Evidence
+
+```
+tests/test_closed_loop_wake.py                              74 passed
+closed_loop_wake + agent_watch + wake_bridge + chat_registry
+  + wake_routes + native_supervisor + owneros_hook         398 passed
+```
+
+The test asserting the fix fails when the oracle is disconnected, verified by
+disconnecting it. Four controls pin what must not move: a stale transcript still
+re-wakes and escalates, an unfindable one fails closed, an ambiguous session prefix
+refuses to guess, and a pane-only target with no session identity is unaffected.
+
+## Not claimed
+
+The hook going quiet at 09:52:57 is the trigger for this incident and is NOT explained
+here. This part makes the watchdog robust to it; it does not say why the hook stopped.
+That is a separate question and stays open.
