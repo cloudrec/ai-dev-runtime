@@ -6821,3 +6821,92 @@ the existing error text already distinguishes the two cases.
 6. **Decide the three route keys bound to one conversation** — not currently
    harmful (Part 60 measured all three getting through), but it is why one wedged
    chat took out three projects in Part 55.
+
+---
+
+# Part 63 — the scope check was reading a different list than the actuator
+
+Part 62 closed the "alarm that cannot clear" class and declared the remaining work
+owner-gated. Before accepting that, one question was left unasked: the actuator is
+**armed right now** (`CONTROL_PLANE_ACTUATOR_ENABLED=1`,
+`COMMANDER_AUTOPILOT_ENABLED=1`), and it demonstrably escaped its allowlist in
+August. What stops that recurring?
+
+The enforcement itself is sound — `actuator.actuate()` refuses deny-by-default:
+
+```python
+if target not in CANARY_AGENTS:
+    return {"acted": False, "reason": "not_canary"}
+```
+
+The check that *watches* it was not.
+
+## Two drop-ins, and only one was read
+
+```
+/etc/systemd/system/ai-runtime.service.d/
+  canary.conf              Aug 3   CONTROL_PLANE_CANARY_AGENTS=cp-canary:0.0
+  zz-actuation-scope.conf  Aug 5   CONTROL_PLANE_CANARY_AGENTS=cp-canary:0.0,mess-qa-automation:0.0
+```
+
+systemd reads every `*.conf` in lexical order and lets the last assignment win, so
+`zz-` decides. Confirmed against the running process rather than inferred:
+
+```
+/proc/<pid>/environ -> CONTROL_PLANE_CANARY_AGENTS=cp-canary:0.0,mess-qa-automation:0.0
+```
+
+`_read_canary_allowlist()` opened only `canary.conf`. **The strongest safety check
+the actuator has was reading a different allowlist from the one the actuator
+enforces.**
+
+Two consequences, the second far worse than the first:
+
+* it counted `mess-qa-automation:0.0` as a BREACH when that target had been
+  *granted* actuation on 2026-08-05 — the report crying wolf about the owner's own
+  decision;
+* **a widening applied through any later-sorting drop-in would have been invisible
+  to it.** The report would have gone on printing "actuation confined to the
+  canary allowlist" while the actuator was permitted somewhere else entirely.
+
+The second is the one that matters. A scope check blind to the grant it exists to
+police is worse than no check, because it answers the question with false comfort.
+
+## The fix, and what it deliberately does not change
+
+All `*.conf` in lexical order, last assignment wins, comments ignored —
+`99-autopilot.conf` mentions the variable inside a comment, and reading that as an
+assignment would have widened the allowlist to a value nobody set. An explicit
+path still selects one file; an absent directory still falls back to the
+in-process value.
+
+The verdict is unchanged where it should be: `arbitrage2-opus:0.0` appears in no
+drop-in and remains a genuine historical breach. Widening the READ did not widen
+the VERDICT, and a test pins exactly that.
+
+```
+before:  allowlist ['cp-canary:0.0']
+         unexpected ['arbitrage2-opus:0.0', 'mess-qa-automation:0.0']
+after:   allowlist ['cp-canary:0.0', 'mess-qa-automation:0.0']
+         unexpected ['arbitrage2-opus:0.0']            status amber, historical
+```
+
+## A correction to Parts 56 and 62
+
+Both parts named `arbitrage2-opus:0.0` **and** `mess-qa-automation:0.0` as scope
+breaches. Only the first is. The second was authorised on 2026-08-05, and this
+report could not see it.
+
+One honest limit remains: the check compares the ledger against the allowlist as
+it stands *today*, and keeps no history of when the allowlist changed. Some of
+`mess-qa-automation`'s actuations (2026-08-04 13:39 onward) predate its grant
+(Aug 5 17:58) and so were outside the allowlist at the time. That distinction is
+not recoverable from the current data, and this fix does not pretend to make it.
+
+## Gates
+
+1-4. done · 5. **Telegram delivery** — token valid, destination rejected;
+most likely the bot was never started by that chat · 6. **the three route keys
+bound to one conversation**
+
+`ea44808`, gate: 2 978 passed, exit 0.
