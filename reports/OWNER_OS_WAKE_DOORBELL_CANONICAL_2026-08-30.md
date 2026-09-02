@@ -6910,3 +6910,92 @@ most likely the bot was never started by that chat · 6. **the three route keys
 bound to one conversation**
 
 `ea44808`, gate: 2 978 passed, exit 0.
+
+---
+
+# Part 64 — the same trap, one layer wider
+
+Part 63 found a safety check reading a different allowlist from the one the
+actuator enforces. That is not an incident, it is a shape: **a reader that runs
+outside the unit sees defaults, not what the service runs.** Looking for the shape
+rather than the instance found another.
+
+## What `validate_config()` was actually validating
+
+`native_supervisor.validate_config()` exists to confirm "the gates are actually
+standing". Every value it checks is captured from the environment at import — so
+inside the service it validates the config in force, and from a shell it validates
+a set of defaults, saying nothing about which.
+
+Invoked from a shell on 2026-09-01 it reported:
+
+```
+targets_raw: "cp-canary:0.0"
+```
+
+and that was quoted in this record as evidence that supervision was confined to
+the canary. The live services were running three targets:
+
+```
+NATIVE_SUPERVISOR_TARGETS=cp-canary:0.0,mess-postsignup-cleanup-sonnet-v4:0.0,gaika-opus:0.0
+```
+
+**No gate was breached.** Neither extra target is denylisted, so supervising them
+is a legitimate rollout. But the scope reported was one third of the scope in
+force, and the function that exists to catch exactly that kind of drift was the
+thing that concealed it.
+
+## Two sources, and neither alone is enough
+
+```
+canary allowlist            -> a systemd drop-in   (zz-actuation-scope.conf)
+NATIVE_SUPERVISOR_TARGETS   -> the unit's EnvironmentFile (configs/.env)
+```
+
+Part 63's fix read drop-ins only, which would still have missed this one.
+`effective_service_env()` now merges both the way systemd does — EnvironmentFile
+first, then drop-ins in lexical order, last assignment wins — and
+`validate_config()` reports the effective value beside its own, raising a
+`config mismatch` problem when they differ. It never repairs, the rule every other
+check in that function already follows.
+
+Run from a shell it now says so plainly:
+
+```
+ok: False
+problems: ["config mismatch: this process was validated with
+           NATIVE_SUPERVISOR_TARGETS='cp-canary:0.0', but the service runs
+           'cp-canary:0.0,mess-postsignup-cleanup-sonnet-v4:0.0,gaika-opus:0.0'"]
+```
+
+## The power this reader deliberately does not have
+
+It refuses secret-looking names — TOKEN, SECRET, PASSWORD, KEY, CHAT_ID. The
+unit's EnvironmentFile is exactly where `RUNTIME_TOKEN` lives, so a general "read
+any variable out of the unit files" helper would be a credential-reading tool
+wearing a diagnostics label. Making configuration auditable does not require that,
+and a test pins the refusal.
+
+This matters more than it looks: while comparing live environments during this
+work, a broad `grep '^RUNTIME'` over `/proc/<pid>/environ` printed `RUNTIME_TOKEN`
+into the session transcript. It was not written to any file, report or commit, and
+the owner was told immediately. Rotating it is an owner decision. The refusal
+above is the durable version of that lesson — the next reader cannot make the same
+mistake by accident.
+
+## Hermetic, again
+
+The reader is hard-disabled in `conftest`, alongside the databases and the native
+session listing, for the third instance of one rule: **a test must not read live
+host state as fixture data.** `test_the_shipped_config_is_coherent` failed the
+moment this landed, purely because this host's supervisor targets differ from the
+module default — a test whose result depended on what the operator had deployed.
+
+## A number worth keeping
+
+The gate for this change ran **2 989 tests in 1 143 s**, on a busier machine than
+earlier runs. That single run would have exceeded the old 600 s validation cap by
+nearly double, which is the clearest justification yet for Part 61 — and a warning
+that 1 800 s has less headroom than the earlier 640-1 171 s range implied.
+
+`22e20f3`. Gates unchanged: Telegram delivery, and the three route keys.
