@@ -886,3 +886,90 @@ def test_a_close_that_fails_never_raises(monkeypatch):
     monkeypatch.setattr(cc, "_http", boom)
     assert cc._close_target("x") is False
     assert cc._close_target("") is False
+
+
+# ── the SECOND tab-creation path (2026-09-02) ──────────────────────────────
+# `recover_wedged_tab` claims in its docstring to be "the single choke point for
+# creating tabs, so the guard lives here and no caller can bypass it". That was
+# false: `open_chatgpt_page` also calls /json/new, had NO browser_degraded guard,
+# and returned `find_target(...)` after a 30-second wait without closing the tab it
+# had just opened.
+#
+# Both matter. A tab that never reached the conversation sits on the chatgpt.com
+# root, which `find_target` cannot match, so it is invisible and permanent — the
+# leak `404496b` fixed one function further up. And with no guard, this path kept
+# opening tabs while the browser was already refusing deliveries on
+# `too_many_pages`, which is exactly when another tab is most harmful.
+#
+# Observed: 4 pages grew to 13 (6 bare roots) across 8 wedge episodes in 4.5 hours,
+# with delivery blocked for the last 20 minutes of it.
+
+def _open_with(monkeypatch, *, verified, degraded=False):
+    from tools import cdp_composer as cc
+    calls = []
+
+    def fake_http(path, method="GET"):
+        calls.append(path)
+        return {"id": "fresh"} if "/json/new" in path else {}
+
+    monkeypatch.setattr(cc, "browser_degraded",
+                        lambda *a, **k: {"degraded": degraded, "reason": "too_many_pages:41"})
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc, "find_target", lambda url: {"id": "fresh"} if verified else None)
+    monkeypatch.setattr(cc, "page_responsive", lambda t, timeout=8.0: verified)
+    monkeypatch.setattr(cc.time, "sleep", lambda s: None)
+    out = cc.open_chatgpt_page("https://chatgpt.com/c/a")
+    return out, calls
+
+
+def test_open_chatgpt_page_refuses_a_degraded_browser(monkeypatch):
+    """The guard recover_wedged_tab has, which this path did not."""
+    out, calls = _open_with(monkeypatch, verified=False, degraded=True)
+    assert out is None
+    assert calls == [], "a starving browser must not be handed another tab to open"
+
+
+def test_open_chatgpt_page_closes_a_tab_it_could_not_verify(monkeypatch):
+    """The leak: opened, never reached the conversation, previously never closed."""
+    out, calls = _open_with(monkeypatch, verified=False)
+    assert "/json/close/fresh" in calls
+
+
+def test_open_chatgpt_page_keeps_a_tab_that_worked(monkeypatch):
+    """Refusing must not become closing the tab we were asked to open."""
+    out, calls = _open_with(monkeypatch, verified=True)
+    assert out == {"id": "fresh"}
+    assert "/json/close/fresh" not in calls
+
+
+def test_open_chatgpt_page_closes_the_tab_when_verification_raises(monkeypatch):
+    from tools import cdp_composer as cc
+    calls = []
+
+    def fake_http(path, method="GET"):
+        calls.append(path)
+        return {"id": "fresh"} if "/json/new" in path else {}
+
+    def boom(url):
+        raise RuntimeError("browser went away mid-verification")
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc, "find_target", boom)
+    monkeypatch.setattr(cc.time, "sleep", lambda s: None)
+    assert cc.open_chatgpt_page("https://chatgpt.com/c/a") is None
+    assert "/json/close/fresh" in calls, "an exception must not leak the tab either"
+
+
+def test_every_tab_creation_path_is_guarded():
+    """The property recover_wedged_tab's docstring asserts. If a third creation path
+    is ever added without the guard, this fails rather than leaking silently."""
+    import inspect
+    from tools import cdp_composer as cc
+    src = inspect.getsource(cc)
+    creators = [n for n, f in vars(cc).items()
+                if inspect.isfunction(f) and "/json/new" in (inspect.getsource(f) or "")]
+    assert creators, "no tab-creating function found — the guard itself is broken"
+    for name in creators:
+        body = inspect.getsource(getattr(cc, name))
+        assert "browser_degraded" in body, f"{name} creates tabs without the guard"

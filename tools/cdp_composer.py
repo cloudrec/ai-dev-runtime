@@ -216,8 +216,25 @@ def open_chatgpt_page(conversation_url: str) -> Optional[dict]:
     uses for a wedged renderer, so this adds no new transport, only the missing case
     where there was no renderer to recover in the first place. The owner's existing
     logged-in browser profile carries the session; this only asks the browser to point
-    a tab at the URL, never touches credentials."""
+    a tab at the URL, never touches credentials.
+
+    REFUSES when the browser is degraded, and CLOSES a replacement it could not verify —
+    both for the same reasons `recover_wedged_tab` does, and neither of which this
+    function had. `recover_wedged_tab` claims in its own docstring to be "the single
+    choke point for creating tabs, so the guard lives here and no caller can bypass it".
+    That was not true: this is a second creation path, it had no guard at all, and it
+    returned `find_target(...)` after a 30-second wait without closing the tab it had
+    just opened. A tab that never reached the conversation sits on the chatgpt.com root,
+    which `find_target` cannot match, so it became invisible and permanent — the exact
+    shape of the leak `404496b` fixed one function further up.
+
+    Adding the guard here makes that docstring's claim true for the first time.
+    """
     import time
+    d = browser_degraded()
+    if d.get("degraded"):
+        return None
+    fresh = None
     try:
         try:
             fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}",
@@ -231,8 +248,13 @@ def open_chatgpt_page(conversation_url: str) -> Optional[dict]:
             t = find_target(conversation_url)
             if t and t.get("id") == fresh.get("id") and page_responsive(t):
                 return t
+        # Never became the bound conversation. Whatever it did become is not ours to
+        # keep: close the id we opened, then report only what genuinely exists.
+        _close_target(fresh["id"])
         return find_target(conversation_url)
     except Exception:  # noqa: BLE001
+        if fresh and fresh.get("id"):
+            _close_target(fresh["id"])
         return None
 
 
