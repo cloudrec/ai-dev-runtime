@@ -239,6 +239,67 @@ def registry_health_report(*, now: Optional[float] = None, fresh_within_secs: fl
     }
 
 
+def _gate_subject_alive(agent_id: str, live_targets=None, native_ids=None) -> Optional[bool]:
+    """Is the agent this gate is about still present? None = cannot tell.
+
+    NATIVE FIRST: the runtime's own session list is the authority on whether a
+    session exists, and the tmux inventory is the fallback for panes it does not
+    describe. A gate with no agent subject, or an agent nothing can speak to,
+    returns None and is never called dead — ambiguity is not proof.
+    """
+    aid = (agent_id or "").strip()
+    if not aid:
+        return None
+    try:
+        if native_ids is None:
+            from core import native_sessions
+            native_ids = {(r.get("sessionId") or "")[:12] for r in native_sessions.sessions()}
+        if aid.startswith("session:") and aid[8:] in native_ids:
+            return True
+        if live_targets is None:
+            from core import agent_control as ac
+            live_targets = {a["target"] for a in ac.agent_list().get("agents", [])
+                            if a.get("is_agent") and a.get("alive")}
+        if aid in live_targets:
+            return True
+    except Exception:  # noqa: BLE001 — unreadable inventory means "cannot tell"
+        return None
+    try:
+        from core.control_plane import api as _cp
+        rec = _cp.get_agent(aid)
+    except Exception:  # noqa: BLE001
+        return None
+    if not rec:
+        return None                      # never seen: ambiguous, not dead
+    return rec.get("lifecycle_state") != "dead"
+
+
+def owner_gate_split(*, conn=None, live_targets=None, native_ids=None) -> dict:
+    """Open gates divided by whether their subject still exists.
+
+    The queue reached 140 open gates of which 131 named agents that no longer
+    existed, some 30 days old, and `owner_gate_report()` counted every one of them
+    as an SLA breach. A reader cannot tell a live obligation from a historical one
+    in that list, so the list stops being read.
+
+    The fix is deliberately a REPORTING split and not an auto-close.
+    `api.close_gates()` states the rule — "owner-DECISION gates are never
+    auto-closed; those require a verified owner_decision" — and a `classify_scope`
+    gate is an owner decision. Teaching the system to retire them on its own would
+    weaken that rule to buy tidiness. Distinguishing them costs nothing and weakens
+    nothing: every gate stays open until a human decides it, and the ones that still
+    matter stop being buried.
+    """
+    from core.control_plane import api as _cp
+    live, gone, unknown = [], [], []
+    for g in _cp.get_open_gates(conn=conn):
+        alive = _gate_subject_alive(g.get("agent_id") or "", live_targets, native_ids)
+        (live if alive is True else gone if alive is False else unknown).append(g)
+    return {"live_subject": live, "dead_subject": gone, "unknown_subject": unknown,
+            "open_total": len(live) + len(gone) + len(unknown),
+            "actionable": len(live) + len(unknown)}
+
+
 def owner_gate_report(*, now: Optional[float] = None, sla_secs: float = 86400.0,
                       breach_limit: int = 20, conn=None) -> dict:
     """Open owner gates (pending decisions) by kind + age, with an SLA escalation dimension.
