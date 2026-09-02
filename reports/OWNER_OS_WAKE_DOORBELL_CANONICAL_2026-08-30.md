@@ -7878,3 +7878,121 @@ so that is hygiene rather than live risk. Anything **off this host** that held t
 old token now receives 401 and needs the new one; the three in-repo consumers were
 restarted, but an external caller or a saved request cannot be enumerated from
 here.
+
+---
+
+# Part 73 — closeout
+
+The owner directed that Owner OS be finished: decide every remaining gated item,
+apply the safe default where it is reversible and needs no external credential, and
+stop discovering work. This is the final state.
+
+## Decisions applied
+
+**The nine `classify_scope` gates — answered, `observe_only`, no change.**
+Applying "no change" grants nothing: verified before and after, **no agent
+lifecycle state moved**. That is why it was safe to apply from a pane instruction
+where submitting an `owner_api` decision was not — the provenance invariant guards
+owner-gated *actions*, and this answer causes none. Attribution is recorded
+truthfully in each answer: an owner decision given in the pane and applied by Owner
+OS, explicitly **not** `owner_api`-authenticated. The audit trail never claims a
+credential proved the owner's presence.
+
+**The two semantic gates — retired.** `unverified_owner_decision`
+(`arbitrage2-opus:0.0`) and `governor_cross_project_work_refused`
+(`mess-qa-automation:0.0`). Both subjects are provably dead by the same criterion as
+the 128, re-asserted at the moment of retirement. No action was taken on either
+underlying question.
+
+**`canary_agent_selection` — deliberately left open.** It is the one gate whose
+answer could widen actuation scope, so it is not a safe default to apply. It is the
+single remaining open gate.
+
+```
+gates: 130 retired_stale · 23 answered · 3 resolved · 1 open
+```
+
+**Auto-retire — a reporting split, not an auto-close** (`1e97283`).
+`api.close_gates()` states that owner-decision gates are never auto-closed, and a
+scope gate is an owner decision; teaching the system to retire them would weaken
+that rule for tidiness. `owner_gate_split()` instead reports `live_subject` /
+`dead_subject` / `unknown_subject`, native first — the runtime's session list
+decides, tmux is the fallback, the registry is last, and anything unresolvable is
+`unknown`, never `dead`.
+
+## Shown, not changed: the three shared route keys
+
+```
+https://chatgpt.com/c/6a7d37d0-…-d26156937c57   (ПЛАТЁЖКА)
+   <- owner-os               2181 attempts, 1003 delivered
+   <- payment-orchestrator    577 attempts,  137 delivered
+   <- seo                     187 attempts,   83 delivered
+```
+
+Every other route is one-to-one: 12 routes across 10 conversations, fallback
+`owner-os`. **Not changed.** Any remapping moves where the owner's messages arrive,
+which is the owner's decision about their own attention, not a safe default. The
+recommendation, if it is wanted: give `payment-orchestrator` and `seo` their own
+conversations and leave `owner-os` on this one. Consequence today is contention on
+one chat and, when it wedges, three projects stalling together — not loss.
+
+## Telegram: everything local is done
+
+```
+owner_push   enabled=1  state=unhealthy  last_ok_at=None
+             last_error: telegram send failed: Bad Request: chat not found
+TELEGRAM_BOT_TOKEN  set
+TELEGRAM_CHAT_ID    set, 9 digits, positive => a private user chat
+```
+
+`Bad Request` is HTTP 400; an invalid or revoked bot token returns 401. So the
+token authenticates and the destination is rejected. Every code path is healthy and
+the dead letter now names the cause. Nothing further can be done from here.
+
+**The single remaining owner action: open that bot in Telegram and press Start.**
+Telegram refuses to let a bot message a user who has not initiated contact, which
+is exactly what a 400 `chat not found` on a positive 9-digit id means. If the id is
+genuinely wrong, replacing it is the alternative — but Start is the likelier fix
+and costs one tap.
+
+## A regression found by the final verification
+
+The browser had climbed back to **13 pages — 6 bare roots plus 7 conversations** —
+and delivery was blocked again on `too_many_pages` at the moment of checking. The
+6 roots were closed by the proven-safe path and delivery resumed within one tick
+(`05:58:51`, `payment-orchestrator`, `submitted_and_assistant_started_generating`).
+
+This is an honest correction to Part 59. That part fixed the leak in
+`recover_wedged_tab`, and the count did hold at 4 for a time — but six roots
+accumulated again in roughly four and a half hours, so **there is a second path
+creating them that `404496b` does not cover.** Also visible: three separate tabs
+open on the same `ПЛАТЁЖКА` conversation, which the composer's `find_target` will
+resolve to whichever it sees first.
+
+This is stated rather than fixed. Finding it was the point of the final live
+verification; chasing it would be the broad search the closeout instruction
+excluded, and the mitigation is known and cheap.
+
+## Final state
+
+| | |
+|---|---|
+| Full regression | **2 986 passed**, exit 0 |
+| Focused | 91 passed (diagnostics, provenance, owner-decision endpoint) |
+| `worker_skew()` | `[]` |
+| Open wake watches | 0 |
+| Services | `ai-runtime` and `owner-os-wake-companion` active, `/health` 200 |
+| Gate SLA breaches | 1 (was 136) |
+| Owner gates open | 1 |
+| Tree | clean; 32 untracked owner files preserved |
+| Commits | `1e97283`; two unpushed, push not authorised |
+
+## True external owner actions remaining
+
+1. **Telegram** — open the bot and press Start (or supply a correct chat id).
+2. **`canary_agent_selection`** — the one open gate; answering it could widen
+   actuation scope, so it needs a deliberate decision.
+3. **The three shared route keys** — remap or accept, as above.
+4. **Push** — two commits, held pending separate authorisation.
+5. **The recurring browser tabs** — a second leak path exists; closing bare roots
+   is the known mitigation until it is found.
