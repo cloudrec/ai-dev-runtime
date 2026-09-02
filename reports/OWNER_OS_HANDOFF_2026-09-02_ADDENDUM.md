@@ -49,6 +49,8 @@ None identified. Both items the handoff listed are now closed or blocked on a ga
 ## Owner gates
 
 * ~~Restart the companion~~ — done 2026-09-02 08:19, all three tab fixes live.
-* **Push** — 3 commits unpushed (`135123d`, `ad705eb`, and this addendum's commit).
+* ~~Push~~ — cleared. Two owner-authorised pushes carried everything out:
+  `836aa85` (`135123d`, `ad705eb`, `31b33b7`, `836aa85`) and `a241112`
+  (`f7bbad8`, `a241112`). `origin` in sync, 0 unpushed.
 * Telegram Start · `canary_agent_selection` · the three shared route keys ·
   the outstanding Windows enrollment code — all unchanged.

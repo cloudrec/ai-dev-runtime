@@ -10,7 +10,7 @@ the reasoning.
 | | |
 |---|---|
 | Branch | `ai-runtime/220-windows-bridge` |
-| HEAD | `877edaf` — pushed, `origin` in sync, 0 unpushed |
+| HEAD | `a241112` — pushed, `origin` in sync, 0 unpushed |
 | Tracked tree | clean |
 | Untracked | 32 files, all `reports/*.md` — **owner WIP, preserve, never `git add` them** |
 

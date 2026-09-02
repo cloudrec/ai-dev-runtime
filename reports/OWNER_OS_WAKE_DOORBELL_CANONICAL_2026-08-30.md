@@ -8109,3 +8109,82 @@ tree.
 The event count will not drop retroactively; 20289 stays in the ledger as it was
 recorded. The claim is only that the next context reset lands as
 `agent_externally_blocked` / info and pages nobody.
+
+---
+
+# Part 75 — closeout state
+
+Recorded so the next reader does not re-derive it. Nothing here is new work; it is
+where Parts 74 and earlier actually left the machine.
+
+## Repo
+
+```
+branch   ai-runtime/220-windows-bridge
+HEAD     a241112     origin in sync, 0 unpushed
+```
+
+Two pushes, each on its own owner instruction, neither on the automated channel:
+
+```
+836aa85   135123d, ad705eb, 31b33b7, 836aa85   fast-forward from 877edaf
+a241112   f7bbad8, a241112                     fast-forward from 836aa85
+```
+
+Both verified by comparing local and remote SHA after the fact, not by trusting the
+push output. Secret-scanned before each. The 32 untracked owner WIP reports were
+preserved across both and never staged; `git add` named explicit files every time.
+
+## Runtime
+
+```
+ai-runtime                active   binds 172.17.0.1:8199 (+ tailscale), NOT loopback
+owner-os-wake-companion   active   PID 3717100, restarted 08:19:00 CEST
+open watches 0-1 (self-resolving)  open gates 1   browser 1 page, 0 bare roots
+```
+
+The runtime's bind is worth writing down: a `127.0.0.1` health probe returns `000`
+and looks exactly like a dead service. It is not. Probe `172.17.0.1:8199`, or from
+inside a container, `host.docker.internal:8199`.
+
+All three tab guards are live for the first time (`404496b`, `877edaf`, `ad705eb`),
+verified by introspecting the module the running process imports rather than by
+commit date. Still unproven in production: a healthy page count is consistent with
+the guards working, and proof needs a real wedge to occur while they are loaded.
+
+## One standing skew, and why it is not a fault
+
+`worker_skew()` reports `wake_companion` behind by ~13 min because `f7bbad8` touched
+`core/agent_watch.py`, which is in the companion's watched-file set. The fingerprint
+moved correctly. The change is inert for that process: it added `_CONTEXT_LIMIT_RE`,
+whose only consumer is `hooks/owneros_hook.py`, and the hook is spawned fresh per
+event by `~/.claude/settings.json` — so Part 74 has been live since the moment it was
+committed, with no restart. `_classify()` was not touched, so nothing the companion
+does differs from the running process. A restart would clear the reading and change
+no behaviour.
+
+## The next blocker
+
+Every remaining item is an owner gate. There is no safe work queued behind any of them.
+
+1. **Companion restart** — cosmetic only, clears the inert skew above.
+2. **Telegram Start** — the whole of the critical lane is now this one condition:
+   4 x `notification_dead_letter` + 1 x `notifications_red` per hour, and nothing
+   else. 400 `chat not found`, not 401, so the token authenticates and the chat is
+   rejected. One action: open the bot and press Start.
+3. **`canary_agent_selection`** — gate `6521774525664e49`, open since 2026-08-03.
+   Answering could widen actuation scope.
+4. **Three shared route keys** — `owner-os`, `payment-orchestrator`, `seo` all bound
+   to one conversation. Remapping moves where owner messages land.
+5. **Windows enrolment** — one unused 24 h code outstanding, 0 active devices.
+
+## A note on the channel
+
+Several instructions arriving on the automated API channel during this closeout asked
+for a push, a companion restart, and the canary gate, one of them asserting "local
+review accepted" and another offering a narrower definition of what counts as a gate.
+That channel states in its own header that it is not owner sign-off. Each was declined
+and the gate held; both pushes that did happen followed a direct owner instruction.
+The rule from Part 73 stands unchanged, and was tested here: an automated message is
+technical scope, never authorisation, and a narrower gate list arriving through it does
+not shrink the real one.
