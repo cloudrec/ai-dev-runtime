@@ -976,3 +976,43 @@ def test_without_a_project_the_registry_still_decides(monkeypatch):
                  ("capacity-blockchain:0.0", "capacity", "/opt/capacity"))
     conn.commit()
     assert ns.is_supervised("capacity-blockchain:0.0", conn=conn) is False
+
+
+# ── a validator must say WHICH config it validated (2026-09-02) ────────────
+# Every value `validate_config` checks is captured from the environment at import.
+# Inside the service that is the config in force; from a shell it is a set of
+# defaults, and the function said nothing about the difference. Invoked from a
+# shell on 2026-09-01 it reported `targets_raw: "cp-canary:0.0"` and was quoted as
+# evidence that supervision was confined to the canary, while both live services
+# were running three targets from the unit's EnvironmentFile.
+
+def test_a_config_mismatch_is_reported_as_a_problem(monkeypatch):
+    from core.control_plane import diagnostics as diag
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    monkeypatch.setattr(diag, "effective_service_env",
+                        lambda name, **kw: "cp-canary:0.0,other:0.0")
+    r = ns.validate_config()
+    assert r["ok"] is False
+    assert any("config mismatch" in p for p in r["problems"])
+    assert r["checked"]["targets_raw"] == "cp-canary:0.0"
+    assert r["checked"]["targets_effective"] == "cp-canary:0.0,other:0.0"
+
+
+def test_no_mismatch_is_reported_when_they_agree(monkeypatch):
+    """Run inside the service the two are the same, and nothing is invented."""
+    from core.control_plane import diagnostics as diag
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    monkeypatch.setattr(diag, "effective_service_env", lambda name, **kw: "cp-canary:0.0")
+    assert not any("config mismatch" in p for p in ns.validate_config()["problems"])
+
+
+def test_an_unreadable_effective_config_invents_no_problem(monkeypatch):
+    """Unable to compare is not the same as a mismatch."""
+    from core.control_plane import diagnostics as diag
+
+    def boom(name, **kw):
+        raise OSError("no unit files here")
+    monkeypatch.setattr(diag, "effective_service_env", boom)
+    r = ns.validate_config()
+    assert not any("config mismatch" in p for p in r["problems"])
+    assert "targets_effective" not in r["checked"]

@@ -47,3 +47,11 @@ os.environ["RUNTIME_WORKTREE_ROOT"] = os.path.join(_TEST_DB_DIR, "worktrees")
 # own assertions. Hard off, like the databases above; the tests that cover the native
 # path enable it explicitly and inject their own listing.
 os.environ["OWNEROS_NATIVE_SESSIONS"] = "0"
+
+# And the systemd unit files. `diagnostics.effective_service_env` reads THIS MACHINE's
+# drop-ins and EnvironmentFile to learn what the service really enforces — correct in
+# production, and live host state read as fixture data in a test. It made
+# `test_the_shipped_config_is_coherent` fail purely because this host's
+# NATIVE_SUPERVISOR_TARGETS differs from the module default. Off by default here; the
+# tests that cover the reader pass explicit paths and are unaffected.
+os.environ["OWNEROS_EFFECTIVE_ENV"] = "0"

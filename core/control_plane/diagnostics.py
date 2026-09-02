@@ -465,6 +465,55 @@ def loop_liveness_report(*, now: Optional[float] = None, stall_multiplier: float
 
 
 _DROPIN_DIR = "/etc/systemd/system/ai-runtime.service.d"
+_ENV_FILE = "/root/ai-dev-runtime/configs/.env"
+
+#: Variables whose value is a SECRET. `effective_service_env` refuses to return these,
+#: so a config-truth reader can never become a way to read a credential out of a unit.
+_SECRET_ENV = ("TOKEN", "SECRET", "PASSWORD", "KEY", "API_KEY", "CHAT_ID")
+
+
+def effective_service_env(name: str, *, dropin_dir: str = None, env_files=None,
+                          default: str = "") -> str:
+    """The value systemd actually gives the service for `name`.
+
+    A config reader that runs OUTSIDE the unit sees process defaults, not what the
+    service enforces — which is how `native_supervisor.validate_config()` reported a
+    one-target supervision scope from a shell while the running services had three,
+    and how the canary allowlist was misread (see `_read_canary_allowlist`). Drop-ins
+    are merged in LEXICAL order with the last assignment winning, exactly as systemd
+    does it.
+
+    Refuses secret-looking names outright. This function exists to make CONFIG
+    auditable, and a general "read any variable out of the unit files" helper would
+    be a credential-reading tool wearing a diagnostics label.
+    """
+    if any(tok in name.upper() for tok in _SECRET_ENV):
+        raise ValueError("refusing to read a secret-looking variable: %s" % name)
+    # Hard off in tests, like the databases and the native session listing: these are
+    # THIS MACHINE's unit files, so a test that reads them is reading live host
+    # configuration as fixture data and would pass or fail by what the operator has
+    # deployed. `conftest` sets this; tests covering the reader pass explicit sources.
+    if os.getenv("OWNEROS_EFFECTIVE_ENV", "1") in ("0", "", "false", "no") \
+            and dropin_dir is None and env_files is None:
+        return default
+    import glob
+    found = None
+    # Order matters and mirrors systemd: the main unit's EnvironmentFile is applied
+    # first, then drop-ins in lexical order, and the last assignment wins. The live
+    # NATIVE_SUPERVISOR_TARGETS comes from the EnvironmentFile while the live canary
+    # allowlist comes from a drop-in, so reading only one source misses one of them.
+    sources = list(env_files or [_ENV_FILE])
+    sources += sorted(glob.glob(os.path.join(dropin_dir or _DROPIN_DIR, "*.conf")))
+    for path in sources:
+        try:
+            for line in open(path):
+                line = line.strip()
+                if line.startswith("#") or (name + "=") not in line:
+                    continue
+                found = line.split(name + "=", 1)[1].strip().strip('"')
+        except Exception:  # noqa: BLE001 — an unreadable source is not a value
+            continue
+    return found if found is not None else default
 
 
 def _read_canary_allowlist(dropin_path: str = None, dropin_dir: str = None) -> set:

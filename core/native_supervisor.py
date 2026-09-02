@@ -400,6 +400,34 @@ def validate_config() -> dict:
         # which auto_register enforces. Recorded so the combination is visible.
         checked["wildcard_rollout"] = True
 
+    # WHICH CONFIG DID THIS ACTUALLY VALIDATE?
+    #
+    # Every value above was captured from the environment at import. Run inside the
+    # service that is the config in force; run from a shell it is a set of defaults,
+    # and the function says nothing about the difference. That is not hypothetical:
+    # invoked from a shell on 2026-09-01 this reported `targets_raw: "cp-canary:0.0"`
+    # and was quoted as evidence that supervision was confined to the canary, while
+    # both live services were running three targets from the unit's EnvironmentFile.
+    #
+    # A validator that silently validates a DIFFERENT configuration than the one in
+    # force is worse than no validator, for the same reason the scope check that read
+    # the wrong drop-in was: it answers the question with false comfort. So compare,
+    # and say so. Never repaired here — the same rule as every other problem above.
+    try:
+        from core.control_plane.diagnostics import effective_service_env
+        effective = effective_service_env("NATIVE_SUPERVISOR_TARGETS",
+                                          default=_TARGETS_RAW)
+    except Exception:  # noqa: BLE001 — unable to compare is not a problem to invent
+        effective = None
+    if effective is not None:
+        checked["targets_effective"] = effective
+        if effective.strip() != _TARGETS_RAW.strip():
+            problems.append(
+                f"config mismatch: this process was validated with "
+                f"NATIVE_SUPERVISOR_TARGETS={_TARGETS_RAW!r}, but the service runs "
+                f"{effective!r} — validate inside the service, or trust the effective "
+                f"value, not this one")
+
     return {"ok": not problems, "problems": problems, "checked": checked}
 
 
