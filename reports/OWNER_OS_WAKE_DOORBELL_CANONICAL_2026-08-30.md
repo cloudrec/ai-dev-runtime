@@ -8188,3 +8188,71 @@ and the gate held; both pushes that did happen followed a direct owner instructi
 The rule from Part 73 stands unchanged, and was tested here: an automated message is
 technical scope, never authorisation, and a narrower gate list arriving through it does
 not shrink the real one.
+
+---
+
+# Part 76 — the dead-letter queue, read end to end
+
+Diagnostics only, prompted by a fresh `notification_dead_letter`. Nothing was
+changed. The point of writing it down is that the critical lane is now this one
+condition and nothing else, so the next reader should not have to re-derive what it
+is or how far it reaches.
+
+## The message that died
+
+```
+event 20534   2026-09-02T07:19:42Z   notification 4504   channel telegram
+source event  20521  work_stopped_incomplete  (project: mess)
+attempts      5 of MAX_ATTEMPTS
+reasons       same_chat_wake : no inbound trigger configured
+              owner_push     : telegram send failed: Bad Request: chat not found
+```
+
+Both tiers failed, so `drain()` marked it terminal. The rejection is worth reading
+precisely: **400 `chat not found`, not 401**. The bot token authenticates. It is the
+chat that is refused, which is what an un-started private chat looks like. The
+fallback tier has no inbound trigger configured, so there is no second door.
+
+## The 55 unexplained ones are not a second failure
+
+24 h holds 83 dead letters: 28 carrying the two reasons above, and 55 carrying
+`reasons: null`. A null reason on a critical alarm invites the theory that something
+else is failing silently. It is not that. The boundary is clean:
+
+```
+last null-reason     event 18817   2026-09-01T23:23:00Z
+first with reasons   event 18861   2026-09-01T23:39:30Z
+```
+
+and all 55 are `telegram`. The `reasons` annotation simply did not exist before
+23:39. These are the same condition recorded by older code. One cause, 83 events.
+
+## Recovery is not automatic, and that is by construction
+
+`dead_letter` is terminal. `drain()` iterates `api.pending_notifications()` only, so
+a dead-lettered row is never reconsidered, and there is no requeue, replay or
+redrive anywhere in `core/`, `tools/` or `api/` — grepped, not assumed. Pressing
+Start repairs FUTURE notifications. The 3642 already dead-lettered stay dead.
+
+Nothing is actually lost. Every dead-lettered message keeps its own row in the
+`notification` table, which is the per-message ledger; the event is the per-channel
+alarm, deduped by `deadletter:{channel}`. That dedup is why one broken channel now
+produces 5 criticals an hour instead of one per message — the fix recorded earlier
+that took 937 events in 24 h down to a handful.
+
+## Why no remediation was attempted
+
+Every available path is a gate, so the safe action was to diagnose and stop:
+
+* pressing Start is the owner gate itself;
+* pointing at a different chat id is production routing;
+* configuring an inbound trigger for `same_chat_wake` widens actuation scope;
+* building a redrive tool is new mechanism, and would be worthless until the channel
+  works at all — it would replay 3642 messages into a door that is still shut.
+
+## The blocker
+
+Unchanged and singular. The Telegram Start gate is now the ENTIRE critical lane:
+4 x `notification_dead_letter` + 1 x `notifications_red` per hour, nothing else in
+it. One owner action closes it — open the bot, press Start. Until then every wake
+that cannot reach the owner ends here, and the count keeps climbing.
