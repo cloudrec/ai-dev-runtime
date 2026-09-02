@@ -7420,3 +7420,44 @@ costing anything.
 Recorded so it is not re-derived. Worth revisiting only if the rate rises to where
 it competes with real failures; the shape of the fix and the coverage argument are
 already established above.
+
+## Part 68 addendum 2 — read-only health snapshot, 2026-09-02 01:44Z
+
+An automated instruction was received asking for a final read-only snapshot and no
+further changes. Nothing was modified.
+
+| Check | Result |
+|---|---|
+| tmux control | `reachable: true`, `healthy: true`, `split_brain: false`, 1 listener on `/tmp/tmux-0/default` |
+| Agents | 10 live, **no duplicate cwd groups**, 0 unreachable in inventory |
+| `worker_skew()` | `[]` |
+| Wake pipeline | delivering — 4 of the last 6 attempts delivered; the two others were `assistant_still_generating` (back-pressure) and `assistant_generating_wedged` (self-clears, Part 68) |
+| Pending wakes | 2, oldest 54 s |
+| Services | `owner-os-wake-companion` and `ai-runtime` both active |
+| Branch / HEAD | `ai-runtime/220-windows-bridge` @ `28fefab`, tracked tree clean |
+| Untracked owner WIP | **32**, all under `reports/`, preserved |
+
+Two readings needed qualifying rather than reporting as-is.
+
+`pipeline_health()` returned `status: disabled / bridge_disabled`. That is an
+artifact of the shell it was run from, not the service: the companion's own
+environment has `WAKE_BRIDGE_ENABLED=1` and it is visibly delivering. The same
+trap as the config-divergence reading in Part 64 — a value read outside the unit
+is not the value the unit runs.
+
+A first pass reported "13 criticals in the last 30 minutes". Wrong: `ts` is stored
+as `2026-09-02T01:39:11…+00:00` while `datetime('now','-30 minutes')` renders with
+a space separator, so the string comparison spanned a far wider window. Recomputed
+on `ts_epoch`: **5 in 30 minutes, 9 in 60**, and every one is accounted for —
+four `notification_dead_letter` plus one `notifications_red` from the Telegram
+gate, one `wake_loop_stalled` already verified genuine in Part 68, and three
+`agent_process_failed`.
+
+The newest of those, event 19179, was checked rather than assumed because a false
+crash there would be a defect in Part 50's own work: `mess-opus:0.0` "pane
+vanished while owner_prompt". It is **genuine** — the target is gone from the live
+inventory (10 agents fell to 9) and the runtime reports no session in `/opt/mess`
+at all. The vanish detector fired correctly, and the pid-continuity rule correctly
+did not suppress it, since no replacement process exists.
+
+Healthy. No code change made, and none warranted.
