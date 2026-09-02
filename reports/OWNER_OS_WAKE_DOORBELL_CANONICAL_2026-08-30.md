@@ -7215,3 +7215,76 @@ deleted, because the audit trail keeps every mistake.
 
 Owner gates unchanged and untouched: Telegram delivery, the three shared route
 keys, token rotation, and push.
+
+---
+
+# Part 67 — event 18710: both channels down, and the owner answered it by hand
+
+An automated instruction was received asking that event 18710 be investigated
+read-only, and afterwards that the chain be recorded. It is resolved historical
+delivery state, not a code defect.
+
+## The chain
+
+```
+18697  22:39:14Z  agent_prompt_needs_response   gaika-opus:0.0 [gaika-extension]
+                  "Run node test suite  Do you want to proceed?
+                   1. Yes  2. Yes, and don't ask again for: node *  3. No"
+  └─ notification 4245   channel=telegram   created 22:39:14   attempts 5
+       └─ 18710  22:42:46Z  notification_dead_letter  critical  deadletter:telegram
+```
+
+A genuine owner prompt — a real permission question on a real pane. **Both**
+automated paths were down at that moment, for two unrelated reasons:
+
+| Path | Outcome |
+|---|---|
+| Telegram (owner-push) | 5 attempts, dead-lettered — `Bad Request: chat not found` |
+| Wake bridge (ChatGPT) | 2 attempts, 22:43:13 and 22:48:49, both `browser_degraded:too_many_pages:24` |
+
+This is the clearest single illustration of what the tab leak cost. The page
+budget did not merely delay wakes in the abstract; here it blocked the fallback
+for a prompt whose primary channel was already dead.
+
+## It recovered, and a human closed it
+
+`owner_intervention` 18700 fired at **22:39:57** — forty-three seconds after the
+prompt, and before either delivery attempt. The pane resumed with no delivered
+wake, which is exactly what that metric exists to record: the owner answered it
+directly. `gaika-opus:0.0` is now `idle`, not parked.
+
+Both causes are since accounted for:
+
+* `too_many_pages` — fixed and verified. Since the tab cleanup the
+  `gaika-extension` route has delivered 8 of 10 attempts, including into the same
+  conversation; the two failures were transient `cdp_error:WebSocketTimeoutException`
+  and none was the page guard.
+* Telegram — the standing owner gate, unchanged.
+
+## The "delivery_failed=0" reading, re-verified
+
+The instruction quoted `delivery_failed=0 and no current alerts`. Live counts:
+
+```
+dead_letter 4302    failed 2    sent 2
+```
+
+`state='failed'` is a transient step on the way to dead-lettering, so any counter
+keyed on it reads ≈0 while 4 302 durable failures sit one state along; and
+`/control-plane/wake/alerts` is scoped `source=agent_watch`, so a `notifier`-sourced
+dead letter cannot appear in it. Both surfaces are behaving as designed. The
+authoritative reads remain `notifications_status()` and
+`diagnostics.notification_*_report()`. This is the same artifact recorded in
+Part 54, confirmed a second time against a specific event.
+
+## One fix moved from "deployed" to "exercised"
+
+Part 60 recorded `7fee855` as deployed but not yet exercised, because no dead
+letter had fired since the restart that activated it. Seven have now:
+
+```
+dead-lettered after max attempts — same_chat_wake: no inbound trigger configured;
+owner_push: telegram send failed: Bad Request: chat not found
+```
+
+The dead letter now names the one thing to fix, which is what that change was for.
