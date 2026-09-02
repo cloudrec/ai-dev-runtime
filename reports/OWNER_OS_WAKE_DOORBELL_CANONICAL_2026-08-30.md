@@ -7461,3 +7461,82 @@ at all. The vanish detector fired correctly, and the pid-continuity rule correct
 did not suppress it, since no replacement process exists.
 
 Healthy. No code change made, and none warranted.
+
+---
+
+# Part 69 — the owner-gate queue is 94% dead subjects
+
+An automated instruction was received directing continued non-gated work. Two
+leads were checked and closed as non-defects; the third is a real finding that
+ends at an owner decision rather than a fix.
+
+## Closed: the timestamp-comparison hazard
+
+Part 68's addendum recorded that one of my own ad-hoc queries mis-compared
+`event.ts` (TEXT, `2026-09-02T01:39:11+00:00`) against `datetime('now')` (a
+space-separated form). The obvious follow-up was whether production code does the
+same. It does not, and the codebase already knew:
+
+```
+tools/verify_gate_suppression.py:15
+  `datetime('now')` (a space-separated form) silently mis-sorts. Use `ts_epoch`.
+```
+
+Every table queried with a bare `ts >` / `ts <` comparison — `ns_signal`,
+`wake_audit`, `stall_doctor_action`, `router_decision`, `win_nonce` — declares `ts`
+as **REAL** epoch. Only `event` stores `ts` as TEXT, and it carries a separate
+`ts_epoch` REAL that the code uses. Checked, consistent, no defect.
+
+## Closed: the task queue
+
+`os_task`: 10 `done`, 1 `failed`, and **zero** non-terminal rows of any age. No
+stuck work.
+
+## The finding: gates that can never close
+
+```
+owner_gate:  140 open   14 answered   3 resolved
+
+open by kind:
+  106  classify_scope
+   27  governor_queued_input_stalled
+    2  os_task_failed
+    2  governor_stage_blocked_external
+    1  unverified_owner_decision
+    1  governor_cross_project_work_refused
+    1  canary_agent_selection
+```
+
+**131 of the 140 open gates name an agent that is dead or absent from the live
+registry.** The oldest is 30 days old; a cluster was opened on 2026-08-03 for panes
+such as `ezetta-video:0.0`, `owneros-direct-fix:0.0` and `security:0.0`, none of
+which exist now.
+
+The mechanism is plain. `control_plane.discovery` opens exactly one
+`classify_scope` gate when it meets an agent in an unconfigured cwd — deliberately,
+so an unknown scope raises one correlated decision and is never silently ignored.
+Nothing retires that gate when the agent it is about disappears. So the queue only
+grows, and `owner_gate_report()` reports **136 SLA breaches** of which the
+overwhelming majority are about panes that stopped existing weeks ago.
+
+This is the same shape as the actuation-scope alarm of Part 63: a surface that
+cannot distinguish a live obligation from a historical one, and therefore trains
+its reader to ignore the whole list. The difference is that the earlier case was
+purely a reporting bug, and this one is not — the gates are real owner decisions,
+and their state is owner-owned.
+
+## Why nothing was changed
+
+Two possible responses, and both stop here:
+
+* **Closing the dead-subject gates** would be answering or retiring owner decisions
+  on the owner's behalf. That is squarely an owner-gated action and was not taken.
+* **Teaching `owner_gate_report()` to split live-subject from dead-subject gates**
+  is a read-only observability change and would be safe on its merits — but it is
+  control-plane gate reporting, not the approved wake / watch / native-first scope.
+  This session has already been corrected twice for exactly that kind of adjacent
+  drift, so it is proposed rather than implemented.
+
+The evidence is recorded so the decision can be made without re-deriving it. No
+code was changed, no gate state was touched, and the SLA breach count stands as it
+is.
