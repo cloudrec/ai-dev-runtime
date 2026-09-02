@@ -132,11 +132,15 @@ used to gate each individual change.
 
 ## 8. Open items — all owner decisions
 
-1. **Telegram Start.** `@ezzetasecurity_bot` / https://t.me/ezzetasecurity_bot. One
-   press. `getMe` returns ok, so the credential is valid and it is the chat that
-   refuses — 400 `chat not found`, the signature of a private chat that never opened a
-   conversation with the bot. It is now the ENTIRE critical lane. **Not required for
-   autonomy**: it is one of two notification tiers and neither is in the wake path.
+1. **Telegram — a credential change, not a button press.** Corrected after the owner
+   pressed Start and nothing arrived. `getChat` still returns 400 `chat not found`.
+   `@ezzetasecurity_bot` is the SECURITY project's bot: live webhook to
+   `security.clients.help` (hence `getUpdates` → 409 Conflict), referenced from
+   `/opt/security/` and `/opt/security-qa/`. The configured chat id is one this bot
+   cannot see, and Start cannot validate a different account's id. Fix is either a
+   dedicated Owner OS bot (preferred) or a corrected chat id. Owner gate — credentials.
+   It is the ENTIRE critical lane, and still **not required for autonomy**: one of two
+   notification tiers, neither in the wake path.
 2. **Windows enrolment.** One unused 24 h code outstanding, 0 active devices.
 3. **The informal-wait gap.** `pane_awaiting_owner` covers a pane with a durable open
    gate. A pane waiting on a human WITHOUT a gate row — an agent that reported no safe

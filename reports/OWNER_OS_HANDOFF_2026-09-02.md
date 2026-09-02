@@ -108,10 +108,19 @@ post-change: 3000 passed, 0 failed. Detail in Part 74 of the canonical ledger.
   private chat, and Telegram will not accept `sendMessage` into a private chat that
   has never opened a conversation with the bot.
 
-  The bot is **@ezzetasecurity_bot** — https://t.me/ezzetasecurity_bot. One action:
-  open that link and press Start. No config edit, no token change, no restart. If it
-  still 400s afterwards, the stored chat id belongs to a different account than the
-  one that pressed Start — a routing question, and a separate gate.
+  **CORRECTED 2026-09-02 13:35Z — pressing Start does NOT fix this.** The owner
+  pressed it and `getChat` still returns 400. `@ezzetasecurity_bot` is the SECURITY
+  project's bot: it carries a live webhook to `security.clients.help` (which is why
+  `getUpdates` answers 409 Conflict) and is referenced from `/opt/security/` and
+  `/opt/security-qa/`. The configured `TELEGRAM_CHAT_ID` is a 10-digit positive id
+  this bot cannot see. Start creates a chat between the owner's account and the bot;
+  it cannot make a DIFFERENT stored id valid.
+
+  Fixing it is a credential change and therefore an owner gate. Two options:
+  (1) give Owner OS its own bot from BotFather and set its token plus the owner's own
+  chat id — preferred, no entanglement with a live customer-facing service; or
+  (2) keep this bot and correct the chat id, accepting that Owner OS then shares a bot
+  whose token already ships in another project's deployment.
 
   NOT required for autonomous operation. It is one of two notification tiers
   (`same_chat_wake`, `owner_push`) and neither is in the wake path: `wake_bridge.py`,

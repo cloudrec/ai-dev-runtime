@@ -7950,6 +7950,8 @@ token authenticates and the destination is rejected. Every code path is healthy 
 the dead letter now names the cause. Nothing further can be done from here.
 
 **The single remaining owner action: open that bot in Telegram and press Start.**
+*(WRONG — see Part 81. Start was pressed and did not fix it; the bot belongs to the
+security project and the stored chat id is not one it can see.)*
 Telegram refuses to let a bot message a user who has not initiated contact, which
 is exactly what a 400 `chat not found` on a positive 9-digit id means. If the id is
 genuinely wrong, replacing it is the alternative — but Start is the likelier fix
@@ -7989,7 +7991,8 @@ excluded, and the mitigation is known and cheap.
 
 ## True external owner actions remaining
 
-1. **Telegram** — open the bot and press Start (or supply a correct chat id).
+1. **Telegram** — supply a correct chat id, or a dedicated bot. Pressing Start does
+   NOT fix it; see Part 81.
 2. **`canary_agent_selection`** — the one open gate; answering it could widen
    actuation scope, so it needs a deliberate decision.
 3. **The three shared route keys** — remap or accept, as above.
@@ -8171,7 +8174,7 @@ Every remaining item is an owner gate. There is no safe work queued behind any o
 2. **Telegram Start** — the whole of the critical lane is now this one condition:
    4 x `notification_dead_letter` + 1 x `notifications_red` per hour, and nothing
    else. 400 `chat not found`, not 401, so the token authenticates and the chat is
-   rejected. One action: open the bot and press Start.
+   rejected. NOT fixed by pressing Start — see Part 81.
 3. **`canary_agent_selection`** — gate `6521774525664e49`, open since 2026-08-03.
    Answering could widen actuation scope.
 4. **Three shared route keys** — `owner-os`, `payment-orchestrator`, `seo` all bound
@@ -8254,7 +8257,7 @@ Every available path is a gate, so the safe action was to diagnose and stop:
 
 Unchanged and singular. The Telegram Start gate is now the ENTIRE critical lane:
 4 x `notification_dead_letter` + 1 x `notifications_red` per hour, nothing else in
-it. One owner action closes it — open the bot, press Start. Until then every wake
+it. NOT closed by pressing Start — see Part 81. Until then every wake
 that cannot reach the owner ends here, and the count keeps climbing.
 
 ---
@@ -8743,3 +8746,76 @@ since the rebind: 99 wake_send rows for owner-os, every one to that exact URL,
 No synthetic wake was sent to prove it. Injecting one writes a message into the owner's
 own conversation, which is not the assistant's to initiate, and 99 real deliveries are
 better evidence than a manufactured one.
+
+---
+
+# Part 81 — the Telegram gate was never a button press
+
+The owner pressed Start and nothing arrived. That disproved a diagnosis this ledger
+had repeated since Part 76 and which Parts 68, 73 and 76 all state as fact. The
+correction matters more than the finding, so it is recorded first.
+
+## What was claimed, and why it looked right
+
+`getMe` returns ok, and the send fails with **400 `chat not found`, not 401**. That
+pair genuinely does prove the token authenticates and the chat is what refuses. The
+inference drawn from it — that this is a private chat which never opened a conversation
+with the bot, so pressing Start would create it — was plausible and wrong.
+
+It was never tested. `getChat` was not called until after the owner pressed Start and
+reported nothing, and it is the probe that settles the question in one request.
+
+## What is actually true
+
+```
+getMe                 ok                       bot is live, token valid
+getChat(chat_id)      400 chat not found       AFTER Start was pressed
+getUpdates            409 Conflict             a webhook owns this bot's updates
+getWebhookInfo        security.clients.help    pending 0, no errors, 40 max connections
+TELEGRAM_CHAT_ID      10 digits, positive      an id this bot cannot see
+```
+
+`@ezzetasecurity_bot` belongs to the **security** project. Its username appears in
+`/opt/security/presentation/index.html`, `/opt/security-qa/reports/bot_presentation.html`
+and `/opt/security-qa/reports/ROADMAP_AND_ANSWERS_20260719.md`, and its updates are
+consumed by a live webhook at `security.clients.help`.
+
+Pressing Start creates a chat between the OWNER'S account and the bot. It cannot make
+a DIFFERENT stored id valid. Owner OS is configured with a chat id that this bot has
+no relationship with, on a bot that belongs to another project. No amount of pressing
+Start was ever going to fix it.
+
+## The lesson, stated plainly
+
+A correct observation (`400`, not `401`) carried a remedy that did not follow from it.
+The observation ruled OUT an auth problem; it did not rule IN "the chat merely needs
+creating". Both readings fit `chat not found`, and one request would have separated
+them at any point in the last several hours. The cost of not asking was that the item
+sat at the top of every gate list all session, described as fifteen seconds of work.
+
+Second time today a green-looking measurement answered a different question than the
+one under investigation — see the Part 78 correction. The pattern to watch: a probe
+that confirms a hypothesis is worth less than one that could refute it.
+
+## The gate, restated correctly
+
+This is a CREDENTIAL change, not a button press, and therefore genuinely owner-gated.
+Two options:
+
+1. **A dedicated Owner OS bot.** BotFather, then its token plus the owner's own chat id
+   in `configs/.env`. Preferred: no entanglement with a live customer-facing service.
+2. **Keep this bot, correct the chat id.** Works technically — `sendMessage` is
+   unaffected by the webhook — but Owner OS would then share a bot whose token already
+   ships inside another project's deployment, and whose updates another service owns.
+
+Nothing was changed. No token, chat id, config or deployment was touched, and no
+credential value was printed at any point: the chat id was compared by SHA-256
+fingerprint and the webhook path was redacted to its length.
+
+## What does not change
+
+Telegram remains NOT required for autonomous operation. It is one of two notification
+tiers and neither is in the wake path — `wake_bridge.py`, `closed_loop_wake.py` and
+`wake_companion.py` contain zero references to it. Wakes continue on the CDP → ChatGPT
+path. What is lost while the channel is misconfigured is the out-of-band ping, plus a
+steady 4-5 criticals an hour reporting the same shut door.
