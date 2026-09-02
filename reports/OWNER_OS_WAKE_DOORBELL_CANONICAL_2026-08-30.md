@@ -7540,3 +7540,88 @@ Two possible responses, and both stop here:
 The evidence is recorded so the decision can be made without re-deriving it. No
 code was changed, no gate state was touched, and the SLA breach count stands as it
 is.
+
+---
+
+# Part 70 — the dead-gate cleanup
+
+Part 69 found that 131 of 140 open owner gates named agents that no longer exist,
+and stopped: retiring them means acting on owner-owned decisions. Three automated
+messages then asserted owner approval; each carried the standing header saying it
+must not be treated as owner sign-off unless independently verified, and the
+control plane recorded nothing to verify it against — no `owner_decision` after
+2026-08-03, no gate answered since 2026-09-01, no queued `os_task`. The gate held
+through all three. The owner then instructed it directly in the session pane, and
+it was carried out.
+
+One correction from that exchange belongs here: the routine count was stated as
+124 in the pane and is **128** (130 audited candidates minus the two sensitive
+kinds). The wrong figure was mine, and an automated message repeated it back — the
+ordinary way a bad number becomes load-bearing.
+
+## Criterion, fixed before the set was built
+
+A gate was retired only if **all** held:
+
+* it names an `agent_id`;
+* that agent is absent from the live tmux inventory;
+* absent from the runtime's own session list (`claude agents --json`);
+* its registry row reads `lifecycle_state='dead'`.
+
+Anything else was preserved — including gates with no `agent_id`, and any agent
+not in the registry at all, because ambiguity is not proof. The two semantically
+sensitive kinds, `unverified_owner_decision` and
+`governor_cross_project_work_refused`, were excluded by the owner's instruction
+even though their subjects met the criterion.
+
+Every candidate was **re-verified against live state immediately before the
+update**, not trusted from the earlier audit; 128 of 128 still qualified and none
+was skipped.
+
+## Before and after
+
+| | Before | After |
+|---|---:|---:|
+| open / notified | 140 | **12** |
+| retired_stale | 0 | **128** |
+| answered | 14 | 14 |
+| resolved | 3 | 3 |
+
+The 12 that remain: nine `classify_scope` gates whose agent is live
+(`email`, `capacity-blockchain`, `diamond-auction`, `gaika-opus`,
+`payorch-cp-ip-fix`, `hostsecure`, `owner-os-opus-clean`, `arbitrage-resume`,
+`mess-opus-next`), one `canary_agent_selection` with no agent subject at all, and
+the two excluded kinds.
+
+## Why `retired_stale` and not `resolved`
+
+`api.close_gates()` refuses scope-kind gates by construction — "owner-DECISION
+gates are never auto-closed" — and 97 of these are `classify_scope`. That rule
+guards against the SYSTEM closing an owner decision, which is exactly right, so it
+was not weakened or bypassed with a fake answer: the update touched only the frozen
+ID list, and marks a state that says what happened. Every consumer filters
+`state IN ('open','notified')`, so the retired rows leave the queues cleanly while
+never claiming the questions were answered.
+
+## Verification
+
+Diffed row-by-row against the pre-change backup:
+
+```
+gates whose state changed          : 128
+all changed are in the audited set : True
+unexpected changes                 : none
+audited but not applied            : none
+all 128 now retired_stale          : True
+```
+
+Backup `backups/pregate_cleanup_20260902T021310Z/control_plane.db`
+(`integrity_check ok`, 140 open at capture), with the full retired ID list beside
+it and in audit event **19348** (`push=False`, so nothing was woken).
+
+## Effect
+
+`owner_gate_report()`'s SLA-breach count was dominated by panes gone for weeks; the
+queue now shows only obligations whose subject still exists. Nothing was answered
+on the owner's behalf, and the two decisions that carry real semantic weight are
+untouched and still waiting.
