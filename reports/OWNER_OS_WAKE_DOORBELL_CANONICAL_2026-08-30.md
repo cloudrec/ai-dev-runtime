@@ -7677,3 +7677,103 @@ exists" should mean for a question the owner never answered.
 
 Recorded with the rate so the decision can be made on evidence rather than
 rediscovered the next time the queue fills.
+
+---
+
+# Part 71 — the owner_api channel, built and deployed
+
+Part 70's addendum ended at nine `classify_scope` gates whose subjects are live
+agents. Answering them needs a decision the provenance invariant will accept, and
+finding that path showed there was none.
+
+## The channel did not exist
+
+`provenance` names four trusted channels — `owner_api`, `telegram_verified`,
+`signed_owner_reply`, `cto_authenticated` — and nothing implemented any of them.
+`owner_api` was a string in a set. The only production caller of
+`record_owner_decision` is `access_recovery`, which writes one hardcoded answer to
+one hardcoded question. No owner decision could be entered for an arbitrary gate at
+all.
+
+So the nine gates were unanswerable by design, not by policy. The owner's answer
+("keep as observe_only") was recorded nine times with truthful provenance —
+`source_channel=pane_text`, `authenticated=False` — which the module stores for
+audit and refuses to let resolve anything. The gates stayed open, which is what
+the invariant prescribes.
+
+## What `authenticated=True` was made to mean
+
+`POST /api/v1/control-plane/owner/decision`, in `a6a0284`.
+
+The design question was what earns that flag. `access_recovery` sets it in code,
+and copying that would have made "trusted" mean *a developer wrote True*. It is
+instead earned by `_auth`: an HMAC over a fresh timestamp inside the replay window,
+or the bearer token. The actor records which — `owner:hmac` or `owner:bearer` — so
+a signed decision stays distinguishable from a bearer one permanently.
+
+The route cannot widen its own trust. `source_channel` is fixed in code and is not
+a request field, so no caller can claim a channel it did not come through; a test
+asserts the request model has no `source_channel` and no `authenticated` field.
+Resolution still runs through `resolve_gate_with_decision`, which re-verifies
+provenance, refuses a closed gate, refuses a consumed decision, and raises a
+critical event rather than resolving on doubt.
+
+14 tests, 9 failing without the endpoint. Gate at commit time: 2 986 passed.
+
+## Deployed under the standing guarded procedure
+
+Authorised by the owner directly in the pane. Three automated messages had asserted
+the same authorisation beforehand — one of them claiming an owner instruction was
+"already visible in the pane", which was checkable and false: the owner-typed
+messages in this session were the gate cleanup, the scope answer, finding the call,
+and building the endpoint. None asked for a restart. The gate held until the owner
+typed it.
+
+| | Before | After |
+|---|---|---|
+| PID | 1002688 (01:38:05 CEST) | **2558578** (05:06:28 CEST) |
+| `/health` | 200 | 200 |
+| `POST …/owner/decision` | **404** — route absent | **401 unauthorized** — mounted and protected |
+| Jobs | 138, 0 in-flight | 138, 0 in-flight |
+| `worker_skew()` | `[]` | `[]` |
+| Journal errors | — | none |
+
+Pre-flight before acting: `restart_safe=true`, zero in-flight jobs, `/health` 200.
+Backup `backups/predeploy_ownerapi_20260902T030612Z/` — three databases, all
+`integrity_check ok` — with `ROLLBACK.md` recorded first.
+
+The 401 is the verification, deliberately: the route was probed with **no
+credential**. An auth rejection proves it is mounted without anyone authenticating,
+and the token was never read.
+
+## Deliberately not done
+
+The nine gates remain open, and no `classify_scope` decision was submitted.
+Answering them through this endpoint requires the runtime token; if Owner OS used
+it, the record would read `source_channel=owner_api, authenticated=True,
+actor=owner:bearer` while the actor was in fact the assistant reading a credential
+out of `configs/.env`. That would manufacture exactly the provenance the endpoint
+exists to guarantee, and would be worse than the gap it filled — an unverified
+decision is at least visibly untrusted, whereas a forged one is indistinguishable
+from a real owner action forever. The token is the proof of the owner's presence
+and only works while the owner holds it.
+
+```
+classify_scope gates open                        : 9
+pending untrusted decisions                      : 9
+authenticated owner decisions since 2026-09-01   : 0
+```
+
+## Next
+
+The owner runs the call themselves, so the credential never passes through the
+assistant:
+
+```
+POST http://172.17.0.1:8199/api/v1/control-plane/owner/decision
+  Authorization: Bearer $RUNTIME_TOKEN
+  {"gate_ids": [...9 ids...], "answer": "keep as observe_only — no scope change"}
+```
+
+Full gate IDs are worth taking from `GET /api/v1/control-plane/registry`, since the
+ones quoted in the pane were truncated to twelve characters for display.
