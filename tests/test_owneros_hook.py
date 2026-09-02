@@ -316,6 +316,73 @@ def test_both_doors_agree_on_the_same_banner():
         h._map("StopFailure", {"last_assistant_message": BANNER})[0]
 
 
+# ── context exhaustion is not a crash (event 20289, 2026-09-02) ───────────
+# Observed live: severity `critical`, type `agent_process_failed`, agent
+# `session:b8999cd0-54e`, message "Prompt is too long" — raised while that session
+# was alive, and it went on to compact and keep working. Same false-alarm shape the
+# provider-limit branch already removed, different cause.
+
+CONTEXT_MSG = "Prompt is too long"
+
+
+def test_a_full_context_is_not_a_dead_process():
+    from hooks import owneros_hook as h
+    etype, sev, oar = h._map("StopFailure", {"last_assistant_message": CONTEXT_MSG})
+    assert etype == "agent_externally_blocked"
+    assert sev == "info"
+    assert oar is False, "a context reset asks nothing of an owner"
+
+
+def test_a_genuine_failure_is_still_critical():
+    """The control case. Narrowing the false alarm must not cost a real crash."""
+    from hooks import owneros_hook as h
+    for msg in ("Traceback (most recent call last): MemoryError",
+                "process exited with code 137",
+                "the file is too long to read"):
+        etype, sev, oar = h._map("StopFailure", {"last_assistant_message": msg})
+        assert (etype, sev, oar) == ("agent_process_failed", "critical", True), msg
+    # No reason text at all is the most dangerous case: it must stay critical.
+    assert h._map("StopFailure", {})[1] == "critical"
+
+
+def test_context_and_provider_limits_stay_distinct():
+    """Not folded into one vocabulary on purpose: a quota window reopens on a clock,
+    a full context is the harness asking for a reset. `_classify` must never call
+    context exhaustion `provider_usage_window_exhausted`."""
+    from core import agent_watch as aw
+    from hooks import owneros_hook as h
+    assert h._is_context_limit({"last_assistant_message": CONTEXT_MSG}) is True
+    assert h._is_provider_limit({"last_assistant_message": CONTEXT_MSG}) is False
+    assert h._is_context_limit({"last_assistant_message": BANNER}) is False
+    assert not aw._PROVIDER_LIMIT_RE.search(CONTEXT_MSG)
+    assert aw._CONTEXT_LIMIT_RE.search(CONTEXT_MSG)
+
+
+def test_context_limit_is_read_from_every_reason_field():
+    from hooks import owneros_hook as h
+    api = "input length and `max_tokens` exceed context limit"
+    assert h._is_context_limit({"message": api}) is True
+    assert h._is_context_limit({"error_details": {"error": api}}) is True
+    assert h._map("StopFailure", {"error_details": {"error": api}})[1] == "info"
+
+
+def test_context_limit_fails_closed_when_the_vocabulary_is_unreachable(monkeypatch):
+    """An unreadable classifier must never be the thing that silences a real crash."""
+    import builtins
+    from hooks import owneros_hook as h
+    real_import = builtins.__import__
+
+    def boom(name, *a, **kw):
+        if name == "core.agent_watch":
+            raise ImportError("no vocabulary today")
+        return real_import(name, *a, **kw)
+
+    monkeypatch.setattr(builtins, "__import__", boom)
+    assert h._is_context_limit({"last_assistant_message": CONTEXT_MSG}) is False
+    assert h._map("StopFailure",
+                  {"last_assistant_message": CONTEXT_MSG})[0] == "agent_process_failed"
+
+
 # ── the fallback branches that have never fired (2026-09-01) ───────────────
 # The native-first audit measured which hooks actually arrive on this host over
 # 24 h: `Stop` 639, `Notification` 303 (every one of them `idle_prompt`),

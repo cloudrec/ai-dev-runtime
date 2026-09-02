@@ -7996,3 +7996,106 @@ excluded, and the mitigation is known and cheap.
 4. **Push** — two commits, held pending separate authorisation.
 5. **The recurring browser tabs** — a second leak path exists; closing bare roots
    is the known mitigation until it is found.
+
+---
+
+# Part 74 — a full context is not a dead process
+
+Found while verifying the system after the companion restart, not by going looking
+for work. The verification asked one question of the critical lane — is anything in
+here new? — and one of six criticals in the hour was not the known Telegram
+condition.
+
+## The event
+
+```
+event    20289          2026-09-02T06:19:24Z
+type     agent_process_failed        severity  critical      owner-actionable
+agent    session:b8999cd0-54e
+source   claude_hook
+message  "Prompt is too long"
+```
+
+`session:b8999cd0-54e` is this session. The event fired while it was alive, and it
+went on to compact and keep working — the session that raised the crash alarm is the
+one that wrote this paragraph. Nothing died.
+
+## Why it fired
+
+`hooks/owneros_hook.py` maps `StopFailure` through one narrowing branch and then
+falls to critical:
+
+```python
+if _is_provider_limit(payload):
+    return ("agent_externally_blocked", "info", False)
+return ("agent_process_failed", "critical", True)
+```
+
+That fallback is correct and stays. The gap is that the vocabulary it consults knows
+about one recoverable condition — a provider usage window — and a full context is a
+second one it had never been taught. So context exhaustion took the crash branch: a
+critical, and a wake asking an owner to attend to a process that was fine.
+
+This is the same false-alarm shape `0edc0e8` removed for quota banners. The lesson
+that commit recorded — that a provider limit is neither a failure nor a finish —
+turns out to have a sibling: neither is a full context.
+
+## The fix, and one thing deliberately not done
+
+The obvious move is to add "Prompt is too long" to `_PROVIDER_LIMIT_RE` and be done.
+That would be wrong. `agent_watch._classify()` reads the same regex to label a resting
+pane, and a match returns:
+
+```python
+return {"cls": "provider_limit", "reason": "provider_usage_window_exhausted"}
+```
+
+A pane whose context filled up would then be recorded as having exhausted a quota
+window — a verdict about billing drawn from evidence that says nothing about billing.
+The two conditions also differ in kind: a quota reopens on a clock and no one can
+help it, while a full context is the harness asking this session to compact and carry
+on. Same remedy at the hook, different causes, so they get different names.
+
+`core/agent_watch.py` gains `_CONTEXT_LIMIT_RE` beside the provider one — same home,
+so a reworded banner is still taught in exactly one place, which is the rule
+`_is_provider_limit` was written to honour. It is anchored on the subject
+(`prompt|conversation|input|message is too long`, the API's `input length and
+max_tokens exceed context limit`, `exceeds the maximum context window`) rather than
+on "too long", which alone would swallow unrelated errors.
+
+The hook's duplicated text-gathering became `_failure_text()` and a `_matches(payload,
+attr)` helper, so both predicates share one fail-closed path: an unreadable classifier
+returns False and the caller keeps the critical mapping. Losing a crash costs strictly
+more than repeating a false alarm.
+
+`_classify()` is untouched. There is no evidence about what pane text a context-limited
+agent leaves behind, and inventing a pane verdict without it is how a narrowing fix
+turns into a silencing one.
+
+## Evidence
+
+Five tests. Two of them fail when the call site is reverted to the provider-only
+check — verified by actually reverting it, not asserted:
+
+```
+test_a_full_context_is_not_a_dead_process                FAIL on revert
+test_context_limit_is_read_from_every_reason_field       FAIL on revert
+test_a_genuine_failure_is_still_critical                 control
+test_context_and_provider_limits_stay_distinct           control
+test_context_limit_fails_closed_when_...unreachable      control
+```
+
+The control case is the one worth keeping honest: a `MemoryError` traceback, `process
+exited with code 137`, the phrase "the file is too long to read", and an empty payload
+with no reason text at all all remain `("agent_process_failed", "critical", True)`.
+Narrowing a false alarm must not cost a real crash, and the empty payload is the
+sharpest version of that — no reason is the most dangerous input, and it stays critical.
+
+`tests/test_owneros_hook.py` 35 passed. Broader run over the hook, agent_watch,
+wake_bridge, closed_loop_wake and native_supervisor suites: see the session record.
+
+## What this does not claim
+
+The event count will not drop retroactively; 20289 stays in the ledger as it was
+recorded. The claim is only that the next context reset lands as
+`agent_externally_blocked` / info and pages nobody.

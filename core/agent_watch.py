@@ -166,6 +166,22 @@ _PROVIDER_LIMIT_RE = re.compile(
     r"|(?:weekly|usage) limit (?:reached|exceeded)"
     r"|/usage.credits)", re.IGNORECASE)
 
+# Context exhaustion. NOT folded into _PROVIDER_LIMIT_RE above, and the distinction is
+# the point: a provider window is a quota that reopens on a clock and cannot be helped by
+# anyone, whereas a full context is the harness asking THIS session to compact and carry
+# on. Merging them would make _classify() report "provider_usage_window_exhausted" on
+# evidence that says nothing about quota. Separate cause, separate name, same home — so a
+# reworded banner is still taught in exactly one place.
+#
+# Consumed by hooks/owneros_hook.py, which must not call a full context a dead process.
+# Deliberately anchored on the subject (prompt/conversation/input/context) rather than on
+# "too long", which on its own would swallow unrelated errors.
+_CONTEXT_LIMIT_RE = re.compile(
+    r"((?:prompt|conversation|input|message) is too long"
+    r"|input length and .{0,24}max_tokens.{0,24} exceed(?:s)? context limit"
+    r"|exceed(?:s|ed)? (?:the )?(?:maximum )?context (?:window|limit|length)"
+    r"|context (?:window|length) (?:exceeded|exhausted|full))", re.IGNORECASE)
+
 _BLOCKER_RE = re.compile(
     r"(waiting for (instructions|input|migration|owner|your|approval|confirmation)"
     r"|awaiting (instructions|input|approval|confirmation)"

@@ -64,12 +64,23 @@ def _load_runtime_env() -> None:
     except Exception:  # noqa: BLE001 — a missing env file must not break the session
         pass
 
-def _is_provider_limit(payload: dict) -> bool:
-    """Does this failure say only that a provider window ran out?
+def _failure_text(payload: dict) -> str:
+    """Everything in a failure payload that could carry a reason, as one string."""
+    parts = [str(payload.get("last_assistant_message") or ""),
+             str(payload.get("message") or "")]
+    details = payload.get("error_details")
+    if details:
+        parts.append(details if isinstance(details, str)
+                     else json.dumps(details, sort_keys=True))
+    return " ".join(p for p in parts if p)
+
+
+def _matches(payload: dict, attr: str) -> bool:
+    """Does the failure text match the named `core.agent_watch` vocabulary?
 
     The vocabulary is deliberately NOT duplicated here: it lives in
-    `core.agent_watch`, which already owns the provider-limit class, so a banner
-    reworded upstream is taught to both doors at once.
+    `core.agent_watch`, which already owns these classes, so a banner reworded
+    upstream is taught to both doors at once.
 
     Fails CLOSED. If the classifier cannot be consulted for any reason, the caller
     keeps the critical mapping — an unreadable message must never be the thing that
@@ -77,17 +88,28 @@ def _is_provider_limit(payload: dict) -> bool:
     false alarm this fix already narrows.
     """
     try:
-        from core.agent_watch import _PROVIDER_LIMIT_RE
-        parts = [str(payload.get("last_assistant_message") or ""),
-                 str(payload.get("message") or "")]
-        details = payload.get("error_details")
-        if details:
-            parts.append(details if isinstance(details, str)
-                         else json.dumps(details, sort_keys=True))
-        text = " ".join(p for p in parts if p)
-        return bool(text.strip()) and bool(_PROVIDER_LIMIT_RE.search(text))
+        import core.agent_watch as _aw
+        text = _failure_text(payload)
+        return bool(text.strip()) and bool(getattr(_aw, attr).search(text))
     except Exception:  # noqa: BLE001 — see "fails CLOSED" above
         return False
+
+
+def _is_provider_limit(payload: dict) -> bool:
+    """Does this failure say only that a provider window ran out?"""
+    return _matches(payload, "_PROVIDER_LIMIT_RE")
+
+
+def _is_context_limit(payload: dict) -> bool:
+    """Does this failure say only that the context window filled up?
+
+    Event 20289 was this session: severity `critical`, type `agent_process_failed`,
+    message "Prompt is too long" — raised while the session was alive and went on to
+    compact and keep working. A full context is the harness asking for a reset, not a
+    dead process, and paging an owner for it is the same false alarm the provider-limit
+    branch already removed. Distinct from that one on purpose: see `_CONTEXT_LIMIT_RE`.
+    """
+    return _matches(payload, "_CONTEXT_LIMIT_RE")
 
 
 # Event mapping. LEFT: what Claude Code tells us. RIGHT: the Owner OS class that already
@@ -113,7 +135,7 @@ def _map(ev: str, payload: dict):
         # alert class in the system describing agents that were alive, had not
         # crashed, had not completed, and needed nothing from an owner — the window
         # resets on its own.
-        if _is_provider_limit(payload):
+        if _is_provider_limit(payload) or _is_context_limit(payload):
             return ("agent_externally_blocked", "info", False)
         # The turn ended in an error the session could not recover from.
         return ("agent_process_failed", "critical", True)

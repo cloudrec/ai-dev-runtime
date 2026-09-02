@@ -86,6 +86,20 @@ Small and optional. The last several investigations closed as non-defects.
 * Watch the browser page count. If bare roots stop appearing but duplicates keep
   accruing on wedge-heavy conversations, that confirms the split above.
 
+## Part 74 — context exhaustion no longer pages the owner
+
+Found by the post-restart verification, not by a new audit. Event 20289 raised
+`agent_process_failed` / critical on the message "Prompt is too long" — this
+session's own context reset, while it was alive. `hooks/owneros_hook.py` knew one
+recoverable condition (a provider window) and treated a full context as a crash.
+
+`core/agent_watch.py` gains `_CONTEXT_LIMIT_RE` beside `_PROVIDER_LIMIT_RE` —
+deliberately NOT merged, because `_classify()` reads the provider regex and would
+have labelled a full context `provider_usage_window_exhausted`. Five tests, two of
+which fail when the call site is reverted; the control case pins that a real
+traceback, a non-zero exit, and an empty payload all stay critical. Detail in
+Part 74 of the canonical ledger.
+
 ## Genuine owner gates
 
 * **Telegram** — 400 `chat not found`, not 401, so the token authenticates and the
