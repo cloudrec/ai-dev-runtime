@@ -8591,3 +8591,82 @@ covers an agent that proved it finished. A pane idle at an owner gate with no
 Closing that gap means either recording a gate for the pane or teaching the watchdog to
 read one, and both are actuation-scope changes. Not attempted under a diagnostic
 instruction, and recorded here as the genuine open item rather than fixed quietly.
+
+---
+
+# Part 79 — the gate queue reaches zero
+
+Documentation only. Both gates were already answered when this was written; nothing
+here creates, reopens or widens anything.
+
+## The two closures
+
+```
+69a6d19193324af4  classify_scope          gaika-opus-v2:0.0
+  opened    2026-09-02T11:15:52.076269+00:00   (discovery, unknown-scope agent)
+  answered  2026-09-02T11:28:51.024607+00:00
+  audit     event 21392  owner_gate_answered  source=owner
+  answer    keep as observe_only - no scope change
+
+6521774525664e49  canary_agent_selection  (canary-selection)
+  opened    2026-08-03T04:10:01.461865+00:00   (30 days open)
+  answered  2026-09-02T11:57:09.015619+00:00
+  audit     event 21530  owner_gate_answered  source=owner
+  answer    no canary selected - P4 verified-continuation remains deferred
+
+open owner gates: 0
+```
+
+## Provenance, stated exactly
+
+Both decisions were typed by the owner in the session pane and applied with
+`api.answer_gate()`. Neither went through `owner_api`, and the answer text of each says
+so in its own words: *"Owner decision given in the session pane and applied by Owner
+OS; NOT owner_api-authenticated."* The audit rows read `source=owner` because that is
+the `append_event` source `answer_gate` uses for every gate answer; it is not a claim
+of API authentication, and the distinction matters enough to write down. The rule from
+Part 71 stands: never submit an owner decision through `owner_api` on the owner's
+behalf, because the record would read `actor=owner:bearer` while the actor was the
+assistant.
+
+## Both answers grant nothing
+
+Verified rather than asserted. `answer_gate()` writes exactly two things - an UPDATE on
+`owner_gate`, and an `owner_gate_answered` event - and contains no agent write at all.
+
+* `gaika-opus-v2:0.0` has **one** event in its entire history: `21360
+  new_agent_discovered`, `lifecycle=observe_only`. No transition has ever occurred, so
+  the agent sits exactly where discovery put it. Its `agent.updated_at` of 11:34:42 is
+  six minutes AFTER the answer and was written by the control plane's ongoing row
+  refresh, not by the gate.
+* Fleet-wide after the canary answer: 10 live agents, all `observe_only` except
+  `mess-postsignup-cleanup-sonnet-v4:0.0`, which was already `managed`. Nothing moved.
+
+## The canary gate's reason was a month stale
+
+Worth recording, because the next reader would otherwise trust it. The exclusion list
+named `arbitrage2-opus`, `security`, `ezetta-video`, `polyinput` and
+`owneros-direct-fix` as the candidates ruled out. All five are now `dead`. A gate that
+sits open for 30 days accumulates a reason describing a fleet that no longer exists, so
+P4, if it is ever exercised, needs a fresh candidate evaluation and not that text.
+
+The live evaluation offered at answer time was: `capacity-blockchain:0.0`,
+`diamond-auction:0.0` and `email:0.0` (all idle, all `observe_only`, so selecting any of
+them would genuinely widen actuation scope), and
+`mess-postsignup-cleanup-sonnet-v4:0.0` (idle, already `managed`, so it would widen
+nothing). Declining was chosen over all four.
+
+## State at the time of writing
+
+```
+open gates   0            suite         3008 passed
+services     ai-runtime + companion active, worker_skew []
+browser      4 pages, 0 bare roots, 0 duplicates
+routes       12 keys / 12 conversations, no collisions
+git          0811470, in sync with origin, 32 untracked reports preserved
+```
+
+Remaining owner items are no longer gates in the `owner_gate` table: the Telegram Start
+press (`@ezzetasecurity_bot`), the unused 24 h Windows enrolment code, and the open
+actuation-scope question from the Part 78 correction - no durable signal distinguishes
+an agent idle waiting on a human from one idle and stuck.
