@@ -7391,3 +7391,32 @@ the standing Telegram gate.
 No open non-gated defect remains in the wake or native-first path. The next
 decisions are owner-gated and unchanged: Telegram delivery, the three shared route
 keys, token rotation, and push.
+
+## Part 68 addendum — a candidate downgrade, examined and declined
+
+`API Error: Connection lost mid-response` is the largest remaining
+`agent_process_failed` cause after the quota banner, and it looked like the same
+shape as Part 49: a stop the owner cannot act on, raised as critical with
+`owner_action_required`.
+
+The evidence partly supports that and does not support acting on it:
+
+| | |
+|---|---|
+| All-time occurrences | **9** |
+| Agent resumed within 30 min | 8 (59 s to 1 229 s later) |
+| Did not resume | 1 — event 18226 |
+| That case independently escalated | yes: `wake_loop_no_progress` 18259 at +17 min, `wake_loop_stalled` 18288 at +33 min |
+
+So the alarm is mostly noise, and the one case where it mattered was covered twice
+over by machinery built for exactly that. A downgrade would be defensible.
+
+**It was not made.** Nine events all-time is not a noise problem — the quota banner
+was 131 in six hours — and `agent_process_failed` is arguably the honest type for a
+turn whose response really was truncated. Changing alarm policy on a safety surface
+from nine samples buys almost nothing and risks a signal that is not currently
+costing anything.
+
+Recorded so it is not re-derived. Worth revisiting only if the rate rises to where
+it competes with real failures; the shape of the fix and the coverage argument are
+already established above.
