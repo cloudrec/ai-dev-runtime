@@ -7288,3 +7288,106 @@ owner_push: telegram send failed: Bad Request: chat not found
 ```
 
 The dead letter now names the one thing to fix, which is what that change was for.
+
+---
+
+# Part 68 — the wake path after the cleanup, verified against live traffic
+
+Continuing the non-gated wake work after Part 67. Nothing here required a code
+change: three candidate defects were investigated and all three turned out to be
+the system working. That is the finding.
+
+## Delivery, since the tab cleanup
+
+```
+56  submitted_and_assistant_started_generating
+ 7  assistant_still_generating
+ 6  cdp_error:WebSocketTimeoutException
+ 6  assistant_generating_wedged
+ 0  browser_degraded:too_many_pages
+```
+
+**56 of 75 attempts delivered.** Before the cleanup the ratio was 502 of 1 985 in
+24 h, with 1 193 refused on the page guard. That guard has not fired once since.
+
+## Not a defect: `cdp_error` is transient and self-healing
+
+Five events hit `cdp_error:WebSocketTimeoutException`; three had a later attempt
+and all three delivered:
+
+```
+event 18716:  23:31 cdp_error -> 23:37 cdp_error -> 23:42 DELIVERED
+event 18962:  00:17 cdp_error -> 00:22 DELIVERED
+event 19052:  00:50 cdp_error -> 00:56 DELIVERED
+```
+
+The ordinary backoff recovers it. No change warranted.
+
+## Not a defect — and Part 55's claim is now retired
+
+Part 55 recorded that a wedged conversation "never clears on its own… a permanent
+route outage", because the one recovery available (`recover_wedged_tab`) refuses
+while the browser is degraded — and the browser was permanently degraded. With
+the page budget clear, that recovery can finally run, and it does:
+
+```
+event 18753:  23:33 wedged -> 23:38 DELIVERED
+event 18984:  00:25 wedged -> 00:31 DELIVERED
+event 19078:  01:00 wedged -> 01:07 DELIVERED
+```
+
+Every wedge with a follow-up attempt cleared on the next cycle, inside about five
+to seven minutes. The mechanism was correct all along; it was starved by the leak.
+All six wedges remain on the single `ПЛАТЁЖКА` conversation shared by three route
+keys — still gate 6, still not a defect.
+
+## Not a defect: the criticals that remain are TRUE
+
+Ten criticals in the last hour, each traced to its cause:
+
+| Count | Type | Verdict |
+|---|---|---|
+| 5 | `notification_dead_letter` | real — Telegram gate |
+| 1 | `notifications_red` | real — same gate |
+| 3 | `agent_process_failed` | **genuine**: `API Error: Connection lost mid-response` ×2, `Prompt is too long` |
+| 1 | `wake_loop_stalled` | **genuine** — see below |
+
+The three `StopFailure` events carry no quota banner. That is the hook fix
+holding: these are exactly the class that must stay critical.
+
+The stall was checked hardest, because the resolvers that should have caught it
+are this session's own work. Watch on event 19064, delivered 00:54:42, re-woken
+01:09:47, escalated 01:25:34. Under **both** identities — `gaika-opus:0.0` and
+`session:cc43ebcf-647` — there were **zero** events in that window; the only entry
+is the watchdog's own re-wake, correctly excluded. The pane reads `idle` and the
+runtime reports `idle`. So `progress_observed` correctly did not fire,
+`runtime_reports_agent_working` correctly did not fire, and `idle` is deliberately
+excluded from resolution as ambiguous. **An agent was woken twice and did nothing
+for half an hour. The escalation is right.**
+
+## The measurement this session was for
+
+Split at the hook fix `99b6c2f`:
+
+| | Criticals | Quota-banner false positives |
+|---|---:|---:|
+| Before | 4 617 | 131 in the final 6 h alone |
+| **After** | **36** | **0** |
+
+Criticals after the fix, by type: 18 dead letters, 9 `agent_process_failed`,
+6 `notifications_red`, 3 `wake_loop_stalled` — every one either a true failure or
+the standing Telegram gate.
+
+## State
+
+| | |
+|---|---|
+| `worker_skew()` | `[]` |
+| Pending wakes | 1, 98 s old |
+| Open watches | 1 |
+| Consecutive delivery failures | 0 |
+| `red_reasons` | `['active_failures=…']` — Telegram only |
+
+No open non-gated defect remains in the wake or native-first path. The next
+decisions are owner-gated and unchanged: Telegram delivery, the three shared route
+keys, token rotation, and push.
