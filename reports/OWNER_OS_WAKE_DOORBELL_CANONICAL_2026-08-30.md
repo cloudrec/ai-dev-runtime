@@ -9400,3 +9400,51 @@ as the owner's to make, not implemented here.
 `arbitrage-resume:0.0` stays resumable at `cb7be7ec-9f24-45d0-a6dc-07fde35fbfc4`; its
 worktree is clean and its audit was committed at `1df21f7` before it died. No lifecycle
 control, gate, backup or audit row was altered by this investigation.
+
+## Part 87 addendum — the death event now names who else lives there
+
+The gap Part 87 identified cannot be closed where it was described. Owner OS cannot LOG
+an action it did not mediate: the orchestrator kills tmux directly, so attribution would
+have to come from the orchestrator emitting, which is a change to a component outside
+this repository.
+
+What Owner OS can do is stop discarding a fact it already holds. The discovery loop
+knows, in the same pass, which agents are alive and in which directories. `agent_dead`
+carried only a conversation id, so it did not say.
+
+```python
+payload={"conversation_id": ...,
+         "cwd": cwd_now or None,
+         "live_in_same_cwd": siblings}
+```
+
+For the production case this would have read `live_in_same_cwd: ["payorch-ha-next:0.0"]`
+AT THE MOMENT OF DEATH, instead of taking two investigations across four stores — tmux
+timestamps, a transcript tail, the `session_recovery` log, and the successor's first
+prompt — to establish the same coincidence.
+
+It is a CORRELATION and is named like one. A live agent sharing a dead one's cwd is not
+proof that anything replaced it, and the field claims no actor. It grants nothing: no
+privilege, no bypass, no owner-signoff semantics for any external caller. An empty list
+is the honest answer when nothing else lives there, and the control test pins exactly
+that.
+
+## The test that was wrong before the code was
+
+The first version of the successor test gave the replacement the SAME conversation id as
+the predecessor. Discovery correctly reconciles that as a RENAME and emits no death at
+all, so the test failed on its own premise rather than on the change. Production had two
+different conversations (`b0cfda66` -> `bf4baa84`), which is a genuine death followed by
+a replacement.
+
+Worth recording because the failure was informative: same cwd plus same conversation is
+already handled and is not this case; same cwd plus a DIFFERENT conversation is the shape
+that had no explanation attached to it.
+
+```
+tests/test_control_plane_discovery.py                          11 passed
++ diagnostics + wake_routes + closed_loop_wake + agent_watch
++ wake_bridge                                                 338 passed
+```
+
+All three new tests fail when the correlation is removed, verified by removing it.

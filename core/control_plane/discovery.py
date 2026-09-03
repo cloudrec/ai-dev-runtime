@@ -258,9 +258,36 @@ def discover(inventory: Optional[dict] = None, *, config: Optional[dict] = None,
             continue
         api.set_lifecycle(rec["target"], DEAD)
         summary["dead"] += 1
+        # Who else is alive in this agent's directory RIGHT NOW. Recorded because a
+        # death and a replacement are the same event when something outside Owner OS
+        # rotates agents, and nothing said so.
+        #
+        # 2026-09-03: `payorch-ha-fresh:0.0` died at 09:18:23Z and a `payorch-ha-next`
+        # tmux session was created at 09:18:45Z in the same cwd; `arbitrage-resume:0.0`
+        # died the same way an hour earlier. Establishing that took two investigations
+        # across four stores — tmux timestamps, a transcript tail, the session_recovery
+        # log and the successor's first prompt — because the death event carried only a
+        # conversation id. This field puts the fact in the event, at the moment it is
+        # observed, from data this loop already holds.
+        #
+        # It is a CORRELATION and is named like one. A live agent sharing the dead one's
+        # cwd is not proof that anything replaced it, and this claims no actor: Owner OS
+        # cannot log an action it did not mediate, and the orchestrator kills tmux
+        # directly. What it removes is the need to reconstruct the coincidence later.
+        # Deliberately grants nothing — no privilege, no bypass, no owner-signoff
+        # semantics for any external caller.
+        cwd_now = (rec.get("cwd") or "").strip()
+        siblings = sorted(
+            t for t in live_targets
+            if cwd_now and (reg_by_target.get(t, {}).get("cwd") or "").strip() == cwd_now
+        ) if cwd_now else []
         emit("discovery", "agent_dead", project_id=rec.get("project_id") or "",
              agent_id=rec["target"], severity="high",
-             payload={"conversation_id": rec.get("conversation_id")},
+             payload={"conversation_id": rec.get("conversation_id"),
+                      "cwd": cwd_now or None,
+                      # empty list = nothing else lives here; a name = a coincidence
+                      # worth explaining, not an accusation.
+                      "live_in_same_cwd": siblings},
              action_taken="marked dead; conversation_id preserved for recovery",
              dedup_key=f"dead:{rec['target']}:{rec.get('conversation_id') or ''}")
 

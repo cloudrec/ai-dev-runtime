@@ -151,3 +151,58 @@ def test_high_severity_and_owner_action_events_enqueue_owner_push():
                  dedup_key="blk:1")
     assert r["pushed"] is True
     assert [n["dedup_key"] for n in cp.pending_notifications()] == ["blk:1"]
+
+
+# ── a death and its replacement are one event (2026-09-03) ───────────────────
+# payorch-ha-fresh:0.0 died at 09:18:23Z; a payorch-ha-next tmux session was created
+# at 09:18:45Z in the same cwd. Establishing that took two investigations across four
+# stores, because agent_dead carried only a conversation id. The fact is available in
+# the discovery loop itself, so it belongs in the event.
+
+def _dead_payload(target):
+    import json, os, sqlite3
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    row = conn.execute("SELECT payload FROM event WHERE type='agent_dead' AND agent_id=? "
+                       "ORDER BY id DESC LIMIT 1", (target,)).fetchone()
+    conn.close()
+    return json.loads(row[0]) if row and row[0] else {}
+
+
+def test_agent_dead_records_who_else_lives_in_that_cwd():
+    """The production shape: the successor carries a DIFFERENT conversation, so this is a
+    death plus a replacement, not a rename. Same cwd AND same conversation is already
+    reconciled as a rename and emits no death at all."""
+    convmap = {"/opt/payment-orchestrator": "convFresh"}
+    disc.discover(_inv(_agent("payorch-fresh:0.0", "/opt/payment-orchestrator")),
+                  config=CONFIG, conversation_fn=_conv(convmap))
+    # the predecessor goes, a successor appears in the SAME directory in one pass
+    convmap["/opt/payment-orchestrator"] = "convNext"
+    disc.discover(_inv(_agent("payorch-next:0.0", "/opt/payment-orchestrator", pid=2222)),
+                  config=CONFIG, conversation_fn=_conv(convmap))
+    p = _dead_payload("payorch-fresh:0.0")
+    assert p["cwd"] == "/opt/payment-orchestrator"
+    assert p["live_in_same_cwd"] == ["payorch-next:0.0"], p
+    # the field that already existed must survive
+    assert p["conversation_id"] == "convFresh"
+
+
+def test_an_ordinary_death_records_an_empty_list_not_a_guess():
+    """No successor means no correlation. The field must not imply one."""
+    convmap = {"/opt/arbitrage2": "convA"}
+    disc.discover(_inv(_agent("arb:0.0", "/opt/arbitrage2")), config=CONFIG,
+                  conversation_fn=_conv(convmap))
+    disc.discover(_inv(), config=CONFIG, conversation_fn=_conv(convmap))
+    p = _dead_payload("arb:0.0")
+    assert p["live_in_same_cwd"] == []
+    assert p["cwd"] == "/opt/arbitrage2"
+
+
+def test_an_agent_elsewhere_is_not_a_successor():
+    """Correlation is by DIRECTORY. A live agent in another project must not appear."""
+    convmap = {"/opt/arbitrage2": "convA", "/opt/mess": "convM"}
+    disc.discover(_inv(_agent("arb:0.0", "/opt/arbitrage2"),
+                       _agent("mess:0.0", "/opt/mess", pid=3333)),
+                  config=CONFIG, conversation_fn=_conv(convmap))
+    disc.discover(_inv(_agent("mess:0.0", "/opt/mess", pid=3333)),
+                  config=CONFIG, conversation_fn=_conv(convmap))
+    assert _dead_payload("arb:0.0")["live_in_same_cwd"] == []
