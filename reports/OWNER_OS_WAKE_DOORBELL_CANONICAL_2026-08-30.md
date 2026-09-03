@@ -8904,3 +8904,99 @@ honest close reporting, `recover_wedged_tab` now retries only when a close genui
 fails, which may remove the accrual at its source. Whether duplicates still gather is
 now an empirical question, and adding a sweeping mechanism before answering it would
 be building against a guess.
+
+---
+
+# Part 83 — the duplicate tabs, caught in the act
+
+The leak that survived `404496b`, `877edaf`, `ad705eb` and `b0109bf`. Found by watching
+rather than by reading: a read-only watcher sampled the CDP page set every 5 s for an
+hour and printed only changes, with the companion's journal lines from each moment.
+
+## The recording
+
+Three recoveries in one hour. Two closed what they replaced; one did not.
+
+```
+04:57:26  + 6ECB4BB5  ...1bb4634f4845     created
+04:57:33  - 38CABE02  ...1bb4634f4845     old closed, 7 s later     PAIRED
+05:10:43  + A22E0A24  ...d26156937c57     created, never closed     LEAKED
+  07:10:42 companion: not delivered for event 23651; stays pending
+                      (renderer_unresponsive)
+(later)   + D99FF1C9  ...de5162d4ac17     created
+          - C35582B6  ...de5162d4ac17     old closed                PAIRED
+```
+
+`renderer_unresponsive` is the caller's answer to `recover_wedged_tab` returning None,
+logged one second before the leaking create. Same function, same hour, two outcomes.
+
+## The cause
+
+`recover_wedged_tab` had two exits for a failed recovery and they did not agree.
+
+```python
+        else:
+            _close_target(fresh["id"])      # verification TIMED OUT — replacement closed
+            return None
+        ...
+    except Exception:  # noqa: BLE001
+        return None                          # verification RAISED — replacement kept
+```
+
+Verification runs `page_responsive` up to fifteen times against a browser that is
+already timing out, so a raise is the EXPECTED shape of a bad recovery, not an exotic
+one. `877edaf` gave `open_chatgpt_page` exactly this guard, on exactly this reasoning,
+and it was never back-ported to the function it was copied from.
+
+Measured rate: one leak in three recoveries.
+
+## Why every earlier fix missed it
+
+Each previous part fixed a real defect in this file and none of them could have found
+this one.
+
+* `404496b` and `877edaf` closed the two CREATION paths' unverified tabs — on the
+  timeout branch.
+* `ad705eb` fixed which tab a SUCCESSFUL recovery returns.
+* `b0109bf` fixed the close REPORT, which had made every close look like a failure.
+
+All four reasoned about the code. The exception path leaks only when the browser is
+misbehaving, which is precisely when nobody is reading the code. It took a recording of
+production to separate "created and closed 7 s later" from "created and kept".
+
+The general lesson, and it cost four attempts: a leak that only appears under fault
+conditions cannot be found by reading the happy path. Instrument the thing and watch it
+fail.
+
+## The fix
+
+Close `fresh` on the exception path, mirroring the timeout branch. `fresh` is
+pre-initialised so the handler can reference it, and the cleanup is itself wrapped so a
+failing close cannot mask the original error.
+
+It closes only the id Chrome just returned, so it cannot touch a bound conversation or
+any pre-existing tab, and the old tab is left alone — the promise the timeout branch
+already documents now holds on both exits: a failed recovery ends with exactly the tabs
+it started with.
+
+## Evidence
+
+```
+tests/test_cdp_composer.py                                   77 passed
+cdp_composer + wake_bridge + closed_loop_wake + agent_watch
+  + chat_registry                                           335 passed
+```
+
+The asserting test fails when the cleanup is removed, verified by removing it. Controls
+pin that the OLD tab is never closed on this path — a failed recovery must never leave
+no ChatGPT tab at all — and that a throwing cleanup still returns None rather than
+raising into the caller.
+
+## Not yet true
+
+The fix is committed, not live: `tools/cdp_composer.py` is in the companion's watched
+set, so it needs a restart, which is an owner decision. The leaked tab `A22E0A24` was
+deliberately left open as evidence. Whether the accrual actually stops is measurable
+after the restart by re-running the same watcher — and unlike every previous claim in
+this file about tabs, that measurement now has a recorded baseline to be compared
+against.

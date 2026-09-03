@@ -888,6 +888,63 @@ def test_a_close_that_fails_never_raises(monkeypatch):
     assert cc._close_target("") is False
 
 
+# ── the recovery leaked its replacement when verification RAISED (2026-09-03) ──
+# Caught live by a tab-set watcher, both outcomes of the same function 13 min apart:
+#   04:57:26  + 6ECB4BB5  created
+#   04:57:33  - 38CABE02  old closed 7s later    -> verification succeeded
+#   05:10:43  + A22E0A24  created, never closed  -> verification raised
+# with "not delivered for event 23651; stays pending (renderer_unresponsive)" logged one
+# second before the leaking create. The else-branch already closed `fresh` on a timeout;
+# the except-branch returned None and kept it. 877edaf gave open_chatgpt_page this exact
+# guard and it was never back-ported here.
+
+def test_recovery_closes_its_replacement_when_verification_raises(monkeypatch):
+    from tools import cdp_composer as cc
+    closed = []
+    monkeypatch.setattr(cc, "browser_degraded", lambda: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET": {"id": "FRESH"})
+    monkeypatch.setattr(cc, "_close_target", lambda tid: (closed.append(tid), True)[1])
+
+    def raising(_url):
+        raise RuntimeError("browser timing out mid-verification")
+
+    monkeypatch.setattr(cc, "find_target", raising)
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    out = cc.recover_wedged_tab({"id": "OLD"}, "https://chatgpt.com/c/x")
+    assert out is None, "a failed recovery still reports failure"
+    assert closed == ["FRESH"], "the replacement must be closed, and the OLD tab left alone"
+
+
+def test_recovery_leaves_the_old_tab_alone_when_it_raises(monkeypatch):
+    """The promise the timeout branch documents must hold on this path too: a failed
+    recovery ends with exactly the tabs it started with, never with none."""
+    from tools import cdp_composer as cc
+    closed = []
+    monkeypatch.setattr(cc, "browser_degraded", lambda: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET": {"id": "FRESH"})
+    monkeypatch.setattr(cc, "_close_target", lambda tid: (closed.append(tid), True)[1])
+    monkeypatch.setattr(cc, "find_target", lambda _u: (_ for _ in ()).throw(OSError("gone")))
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    cc.recover_wedged_tab({"id": "OLD"}, "https://chatgpt.com/c/x")
+    assert "OLD" not in closed
+
+
+def test_cleanup_failure_does_not_mask_the_original_outcome(monkeypatch):
+    """If the cleanup close itself throws, the function must still return None rather
+    than raising into the caller."""
+    from tools import cdp_composer as cc
+    monkeypatch.setattr(cc, "browser_degraded", lambda: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET": {"id": "FRESH"})
+
+    def boom_close(_tid):
+        raise RuntimeError("close exploded")
+
+    monkeypatch.setattr(cc, "_close_target", boom_close)
+    monkeypatch.setattr(cc, "find_target", lambda _u: (_ for _ in ()).throw(OSError("gone")))
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    assert cc.recover_wedged_tab({"id": "OLD"}, "https://chatgpt.com/c/x") is None
+
+
 # ── a successful close reported itself as a failure (2026-09-03) ───────────
 # /json/close/<id> answers HTTP 200 with the plain text "Target is closing". _http
 # ended in json.loads(body), the parse raised, _close_target swallowed it and returned

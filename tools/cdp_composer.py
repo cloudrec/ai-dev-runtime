@@ -184,6 +184,7 @@ def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict
     d = browser_degraded()
     if d.get("degraded"):
         return None
+    fresh = None
     try:
         try:
             fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}",
@@ -232,6 +233,35 @@ def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict
         # whether or not the old tab could be closed.
         return t
     except Exception:  # noqa: BLE001
+        # Close the replacement before giving up. The `else` branch above already does
+        # this when verification merely times out; this path is the same failure with a
+        # raised exception instead of an exhausted loop, and it was the only way out of
+        # this function that leaked. `open_chatgpt_page` was given exactly this guard in
+        # 877edaf and it was never back-ported here.
+        #
+        # Caught live, 2026-09-03. A tab-set watcher recorded both outcomes of this one
+        # function twenty minutes apart:
+        #
+        #   04:57:26  + 6ECB4BB5   created
+        #   04:57:33  - 38CABE02   old closed, 7s later      verification succeeded
+        #   05:10:43  + A22E0A24   created, never closed     verification raised
+        #
+        # and the companion logged `not delivered for event 23651; stays pending
+        # (renderer_unresponsive)` one second before the leaking create —
+        # `renderer_unresponsive` being the caller's answer to this function returning
+        # None. Verification runs `page_responsive` up to 15 times against a browser that
+        # is already timing out, so the raise is the EXPECTED shape of a bad recovery,
+        # not an exotic one.
+        #
+        # Closing only `fresh` — the id Chrome just returned — cannot touch a bound
+        # conversation or any pre-existing tab, and leaves the old tab alone, so the
+        # promise the `else` branch documents holds here too: a failed recovery ends
+        # with exactly the tabs it started with.
+        try:
+            if fresh and fresh.get("id"):
+                _close_target(fresh["id"])
+        except Exception:  # noqa: BLE001 — never let cleanup mask the original failure
+            pass
         return None
 
 
