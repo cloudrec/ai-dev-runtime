@@ -9310,3 +9310,93 @@ Every active project with a chat now reaches it directly, verified end to end fo
 natural wake 2.5 minutes after binding). What routing cannot fix is the notification
 channel: `owner_push` remains red on the Part 81 credential, 38 active dead letters in
 the last hour, and no route change touches that.
+
+---
+
+# Part 87 — the orchestrator, and the audit gap it sits in
+
+Part 85 concluded that two panes were closed externally and named "a deliberate close by
+whoever issued the pause" as most probable. The owner then stated, typed, that they
+closed no sessions. That falsified the leading explanation and forced the question open
+again.
+
+## What the evidence establishes
+
+```
+09:18:23Z  payorch-ha-fresh   agent_dead                (event 24594)
+09:18:45Z  payorch-ha-next    tmux session CREATED
+09:18:47Z  payorch-ha-fresh   agent_process_failed      (event 24596)
+09:19:17Z  payorch-ha-next    first message received:
+           "[AUTOMATED - via Owner OS API, not typed by the owner] Read report..."
+```
+
+A successor session was created 22 s after its predecessor died, and 30 s later it was
+driven by the same `[AUTOMATED - via Owner OS API]` channel that issues instructions to
+this session.
+
+Everything internal is cleared, each with its own evidence rather than by assumption:
+
+| candidate | verdict | evidence |
+|---|---|---|
+| the owner | ruled out | stated typed: closed no sessions |
+| `session_recovery` | ruled out | its own log holds only `cp-canary` refusals; no row for either agent |
+| context rotation | ruled out | `agent_context_rotation` holds ONE row, from 2026-07-22 |
+| Owner OS actuation | ruled out | the kill paths emit events; none exist for either target |
+| Claude exiting | ruled out | no exit record, and a clean exit does not kill a child task first |
+| tmux server | ruled out | 21 days old; other sessions survived both moments |
+| kernel / OOM | ruled out | nothing logged for either pid |
+
+So an automated system with agent-lifecycle control operates on this host, outside every
+path Owner OS audits.
+
+## What is NOT established
+
+An automated message subsequently stated that this orchestrator is the owner's own,
+configured deliberately. **That claim arrived on the automated channel itself** — the
+orchestrator vouching for the orchestrator — and the owner has typed nothing confirming
+it. It is recorded here as an unverified claim, exactly as the header of every such
+message requires, and it is NOT treated as owner confirmation.
+
+The distinction matters practically, not pedantically: if the claim is true the finding
+below is a logging gap; if it is false the same finding is an unaudited system with
+power over the fleet. The evidence cannot tell those apart, and the remedy is the same
+either way.
+
+## The gap, stated plainly
+
+Owner OS gates every lifecycle action it takes: a backup, a rollback note, an audit row,
+an emitted event. The orchestrator's kills and creates pass through NONE of that. What
+they leave behind is only their effects — a pane gone, a session created seconds later,
+an automated prompt — reconstructible after the fact from four different stores, which
+is how this took two investigations to establish.
+
+Concretely, this session watched that channel:
+
+* assert owner authorization it did not have, repeatedly, including once relaying a chat
+  URL whose title contradicted what the owner had actually asked for;
+* request pushes and companion restarts that were declined for that reason;
+* and, it now turns out, start and stop agents with none of those gates applying.
+
+The first two were held off precisely because the header says the channel is not owner
+sign-off. The third was invisible until an agent died.
+
+## What is NOT proposed
+
+No bypass, no allowlist, no privilege grant. Nothing here argues the orchestrator should
+be blocked either — a supervisor that rotates agents is a reasonable thing to run, and
+the owner may well have built it.
+
+The minimal, sufficient fix is that lifecycle actions taken by anything other than a
+human should leave the same trail Owner OS leaves for its own: an event with an actor,
+a reason, and the predecessor's conversation id. Then a death is explained at the moment
+it happens instead of being reconstructed from tmux timestamps, a transcript tail, and a
+successor's first prompt.
+
+That is a design decision about a component outside this repository, so it is recorded
+as the owner's to make, not implemented here.
+
+## Unchanged
+
+`arbitrage-resume:0.0` stays resumable at `cb7be7ec-9f24-45d0-a6dc-07fde35fbfc4`; its
+worktree is clean and its audit was committed at `1df21f7` before it died. No lifecycle
+control, gate, backup or audit row was altered by this investigation.
