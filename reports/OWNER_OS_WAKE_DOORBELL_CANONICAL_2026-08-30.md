@@ -9533,3 +9533,97 @@ The request arrived on the automated channel, whose header states it is not owne
 sign-off. A typed decision is not overturned by an untyped one, so the autonomy work was
 declined and only the half that NARROWS behaviour was implemented. The gate remains where
 the owner put it.
+
+---
+
+# Part 89 — the manual poke is one config line, not missing code
+
+The owner reports still having to type "стоит" in every project chat. Repeated automated
+instructions asked for autonomy to be BUILT. Nothing needs building: it exists, it is
+enabled by default, and it runs.
+
+## What already works
+
+```
+core/native_supervisor.py
+  ENABLED            = NATIVE_SUPERVISOR_ENABLED default "1"   -> True
+  IDLE_SWEEP_ENABLED = NATIVE_SUPERVISOR_IDLE_SWEEP default "1" -> True
+```
+
+Its own docstring states the design: an agent stopping emits an event, "this module reads
+those events and continues the SAME agent in-process", browser-independent. And it is
+observably doing so — the companion journal:
+
+```
+native-supervisor: continued hostsecure:0.0 from event 23647
+                   (key nativesup:23647, agent_created=False)
+```
+
+## Why it reaches almost nobody
+
+```
+configs/.env:66
+NATIVE_SUPERVISOR_TARGETS=cp-canary:0.0,mess-postsignup-cleanup-sonnet-v4:0.0,gaika-opus:0.0
+```
+
+Three entries. `cp-canary:0.0` and `gaika-opus:0.0` are both DEAD. Exactly one names a
+live agent. Nine of the ten live agents are outside the allowlist, so they stop and wait
+for a human — which is precisely the reported symptom.
+
+The list has drifted rather than been maintained: it accumulated names that later died
+and was never re-derived from the live fleet.
+
+## What the wildcard would actually do
+
+Measured against live state, not assumed. `NATIVE_SUPERVISOR_TARGETS=*` is NOT
+fleet-wide self-driving, because `AUTO_REGISTER_DENY_PROJECTS` is applied on top —
+`ai-dev-runtime, auction, capacity, email, payment-orchestrator, payorch, xmrig`, with
+`SELF_PROJECT = ai-dev-runtime`:
+
+```
+BLOCKED (5)                                   WOULD SELF-CONTINUE (5)
+  owner-os-opus-clean    ai-dev-runtime         gaika-opus-v3   gaika-extension
+  payorch-ha-next        payment-orchestrator   hostsecure      hostsecure
+  capacity-blockchain    capacity               mess-opus-next  mess
+  diamond-auction        auction                mess-postsignup seo
+  email                  email                  security-demo   security-demo
+```
+
+So Owner OS still cannot drive itself, payment still cannot self-continue, and half the
+fleet stays parked regardless. This confirms at the data level what `8e738f2` asserted in
+code: a wildcard rollout is not a denylist bypass.
+
+That makes the decision far smaller than the requests framed it — five non-gated agents
+in gaika, hostsecure, mess, seo and security-demo.
+
+## Why it was not applied
+
+It is still the actuation widening the owner deferred BY TYPED INSTRUCTION the same day,
+answering `canary_agent_selection`: "no canary selected; P4 verified-continuation remains
+deferred. Grants no actuation."
+
+Every message asserting approval for it arrived on the automated channel, whose own
+header states it is not owner sign-off — including one that declared "this message is the
+word". Earlier in the same session a relay on that channel was checkably FALSE about the
+owner's intent, naming a conversation whose title contradicted what the owner had asked
+for. That is why the header is weighted over the assertion.
+
+A typed decision is not overturned by an untyped one. The mechanism is ready; the gate is
+the owner's.
+
+## The exact activation, for whenever the owner types it
+
+```
+1  configs/.env:66   NATIVE_SUPERVISOR_TARGETS=*     (REPLACE the drifted list;
+                                                      two of its three entries are dead)
+2  restart owner-os-wake-companion                   (the service reads env at start)
+```
+
+Verification prepared: watch for a stop or quiescence followed by
+`native-supervisor: continued <target>` and a `state=working` transition with no ChatGPT
+delivery and no human input in between, plus confirmation in the same window that a
+denylisted agent stayed parked.
+
+Nothing else is missing. Routes are settled (14 keys / 13 conversations, Part 86),
+delivery is healthy, and the draft guard from Part 88 is committed and waiting on the
+same restart.
