@@ -44,6 +44,63 @@ def _split(timestamps, now: float, window: float) -> dict:
     }
 
 
+def route_health(*, conn=None, agents=None) -> dict:
+    """Which LIVE agents reach a chat of their own, and which fall back to owner-os.
+
+    `wake_routes.resolve()` falls back to the owner-os route for any project without a
+    binding, and that is correct — a wake delivered to the wrong chat beats a wake
+    dropped. What was missing is that the fallback is SILENT. The reason string
+    (`unmapped_route:<key>`) is computed at resolve time and thrown away: `wake_send` has
+    no column for it, and nothing anywhere reported it.
+
+    So an owner sees a project chat that never reacts to its own agent, and the owner-os
+    chat receiving traffic about projects it does not own, with nothing to explain
+    either. Measured 2026-09-03: 56 wakes in 24 h for `arbitrage-resume:0.0`
+    (project `arbitrage2-fable-audit`) delivered to the owner-os conversation, plus
+    `capacity-blockchain:0.0`, neither project having a binding.
+
+    Read-only and advisory. It resolves the same way the emitter does and reports what
+    it finds; it binds nothing, because moving where an owner's messages land is the
+    owner's decision.
+    """
+    from core import wake_routes as _wr
+    if agents is None:
+        try:
+            from core import agent_control as _ac
+            agents = [a["target"] for a in _ac.agent_list().get("agents", [])
+                      if a.get("is_agent") and a.get("alive")]
+        except Exception:  # noqa: BLE001 — an unreadable inventory is not a route fault
+            agents = []
+    own = conn is None
+    if own:
+        conn = sqlite3.connect(os.environ.get("CONTROL_PLANE_DB", "control_plane.db"),
+                               timeout=15)
+    try:
+        direct, fallback, unbound = [], [], []
+        for target in sorted(agents):
+            row = conn.execute("SELECT project_id FROM agent WHERE target=?",
+                               (target,)).fetchone()
+            project = (row[0] if row else "") or ""
+            res = _wr.resolve(project_id=project, agent_id=target, conn=conn)
+            rec = {"agent": target, "project": project,
+                   "route_key": res.get("route_key"),
+                   "reason": res.get("route_reason"),
+                   "conversation": res.get("conversation")}
+            if not res.get("bound"):
+                unbound.append(rec)
+            elif str(res.get("route_reason") or "").startswith("explicit_route"):
+                direct.append(rec)
+            else:
+                fallback.append(rec)
+        return {"direct": direct, "fallback": fallback, "unbound": unbound,
+                "live_agents": len(agents),
+                # The number an owner acts on: projects whose own chat stays silent.
+                "needs_binding": sorted({r["project"] for r in fallback if r["project"]})}
+    finally:
+        if own:
+            conn.close()
+
+
 def notification_failure_report(*, now: Optional[float] = None,
                                 active_window_secs: float = 3600, conn=None) -> dict:
     """Dead-lettered notifications split historical vs active (read-only)."""

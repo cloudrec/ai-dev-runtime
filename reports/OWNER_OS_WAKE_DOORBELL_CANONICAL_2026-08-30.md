@@ -9000,3 +9000,91 @@ deliberately left open as evidence. Whether the accrual actually stops is measur
 after the restart by re-running the same watcher — and unlike every previous claim in
 this file about tabs, that measurement now has a recorded baseline to be compared
 against.
+
+---
+
+# Part 84 — the project chats that never ring
+
+The complaint was that project ChatGPT chats do not reliably react to their own agents.
+Audited live rather than from reports, and the loop turned out to be healthy at every
+stage except the last one that nobody could see.
+
+## Delivery is not the problem
+
+```
+last hour   27 delivered, 3 failed
+            payment-orchestrator 10 · owner-os 7 · mess 5 · seo 4 · hostsecure 1
+failures    2 x WebSocketTimeout, 1 x assistant_still_generating
+blocks      all global_cooldown (6-544 s); no fail-closed refusals
+loaded      b76fee7, b0109bf, 877edaf all present in the RUNNING companion
+worker_skew []
+```
+
+## The defect: the fallback is silent
+
+`wake_routes.resolve()` falls back to the owner-os route for any project without a
+binding. That is correct and deliberate — a wake delivered to the wrong chat beats a
+wake dropped. What was missing is that nothing ever says it happened. The reason string
+`unmapped_route:<key>` is computed at resolve time and thrown away: `wake_send` has no
+column for it, and no diagnostic anywhere reported it.
+
+```
+live agents 10   ->   direct 7 · fallback 3 · unbound 0
+
+arbitrage-resume:0.0     arbitrage2-fable-audit   unmapped_route
+capacity-blockchain:0.0  capacity                 unmapped_route
+owner-os-opus-clean:0.0  ai-dev-runtime           unmapped_route
+```
+
+**56 wakes in 24 h for `arbitrage-resume:0.0` were delivered into the owner-os
+conversation.** So the arbitrage2 chat never reacts to its own agent, and the owner-os
+chat receives traffic about a project it does not own — and both facts were invisible.
+That is the reported symptom, exactly.
+
+The three are not equivalent: `ai-dev-runtime` falls back to owner-os and that happens
+to be the RIGHT chat, so it is only a missing explicit binding. The other two land
+somewhere the owner is not looking for them.
+
+This is the mirror of Part 77. There, three keys pointed at one chat by BINDING; here,
+two projects point at one chat by FALLBACK. Same end state — one conversation absorbing
+several projects' wakes — reached from opposite directions.
+
+## The fix
+
+`diagnostics.route_health()`. It resolves exactly as the emitter does and reports
+direct / fallback / unbound per live agent, with `needs_binding` naming the projects
+whose own chat stays silent. Read-only and advisory: it binds nothing, because moving
+where an owner's messages land is the owner's decision.
+
+## A mistake, and what it cost
+
+The new tests appeared to break 18 existing ones. They were dismissed as a pre-existing
+isolation quirk on the strength of stashing `diagnostics.py` and seeing the failures
+persist. That was the wrong experiment: the culprit was the TEST file, which had not
+been stashed. A helper appended at the end of the file, `_agent_row(conn, target,
+project)`, shadowed an existing `_agent_row(target, ts, state)` defined earlier, so
+every prior caller passed a string where a connection was expected.
+
+Stashing BOTH files gave 71 passed and settled it in one run.
+
+Two lessons. "Not my change" requires stashing the WHOLE change, not the half under
+suspicion — a partial revert that still fails is not evidence of innocence. And
+appending to a shared test file can silently shadow a helper, which no import error
+catches because the name resolves fine.
+
+## Evidence
+
+```
+test_control_plane_diagnostics.py + test_wake_routes.py          101 passed
++ wake_bridge + chat_registry + closed_loop_wake + cdp_composer  360 passed
+```
+
+Three tests pin that `route_health` names the projects whose chat never rings, that it
+is advisory and creates no binding as a side effect, and that an unreadable inventory
+reports nothing rather than raising.
+
+## The owner decision this surfaces
+
+Two projects need a conversation of their own; a third needs its accidental correctness
+made explicit. Binding them moves where messages land, so it is not the assistant's to
+do — the point of this part is that the need is now VISIBLE, which it was not before.

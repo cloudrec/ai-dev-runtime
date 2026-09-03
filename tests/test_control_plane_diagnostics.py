@@ -826,3 +826,61 @@ def test_the_summary_stays_healthy_for_a_historical_breach_but_still_records_it(
     assert s["actuation_scope_breach"] is False, "not a LIVE escape"
     assert s["actuation_scope_breach_ever"] is True, "and it never disappears"
     assert not [r for r in s["red_reasons"] if "actuation_scope" in r]
+
+
+# ── route_health: which projects reach a chat of their own (2026-09-03) ─────
+# resolve() falls back to owner-os for any project without a binding, which is
+# correct — a wake in the wrong chat beats a dropped one. The fallback was SILENT:
+# the reason is computed at resolve time and thrown away, wake_send has no column
+# for it, and nothing reported it. So a project chat that never reacts to its own
+# agent looked identical to one with nothing to say. Measured live: 56 wakes in 24h
+# for arbitrage-resume:0.0 delivered to the owner-os conversation.
+
+def _route_agent_row(conn, target, project):
+    conn.execute("INSERT OR REPLACE INTO agent(id,target,project_id,lifecycle_state) "
+                 "VALUES(?,?,?,?)", (target, target, project, "observe_only"))
+    conn.commit()
+
+
+def test_route_health_names_the_projects_whose_own_chat_never_rings():
+    from core import wake_routes as wr
+    import os
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    cp.init_db(conn=conn)
+    wr.bind_route("owner-os", "https://chatgpt.com/c/owner", conn=conn)
+    wr.bind_route("mess", "https://chatgpt.com/c/mess", conn=conn)
+    _route_agent_row(conn, "mess-a:0.0", "mess")
+    _route_agent_row(conn, "arb-a:0.0", "arbitrage2-fable-audit")
+
+    out = diag.route_health(conn=conn, agents=["mess-a:0.0", "arb-a:0.0"])
+    assert [r["agent"] for r in out["direct"]] == ["mess-a:0.0"]
+    assert [r["agent"] for r in out["fallback"]] == ["arb-a:0.0"]
+    assert out["needs_binding"] == ["arbitrage2-fable-audit"]
+    assert out["fallback"][0]["reason"].startswith("unmapped_route:")
+    # The fallback still DELIVERS — it names the owner-os conversation, not nothing.
+    assert out["fallback"][0]["conversation"] == "https://chatgpt.com/c/owner"
+    conn.close()
+
+
+def test_route_health_is_advisory_and_binds_nothing():
+    """It reports; it must never create a binding as a side effect."""
+    from core import wake_routes as wr
+    import os
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    cp.init_db(conn=conn)
+    wr.bind_route("owner-os", "https://chatgpt.com/c/owner", conn=conn)
+    _route_agent_row(conn, "arb-a:0.0", "arbitrage2-fable-audit")
+    before = {r["route_key"] for r in wr.list_routes(conn=conn)}
+    diag.route_health(conn=conn, agents=["arb-a:0.0"])
+    assert {r["route_key"] for r in wr.list_routes(conn=conn)} == before
+    conn.close()
+
+
+def test_route_health_survives_an_unreadable_inventory():
+    """An inventory it cannot read is not a routing fault; report nothing, raise nothing."""
+    import os
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    cp.init_db(conn=conn)
+    out = diag.route_health(conn=conn, agents=[])
+    assert out["live_agents"] == 0 and out["needs_binding"] == []
+    conn.close()
