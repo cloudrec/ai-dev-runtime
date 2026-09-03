@@ -27,14 +27,25 @@ Measured rate: **one leak in three recoveries**.
 Not by reading — by recording. A read-only watcher sampled the CDP page set every 5 s
 for an hour, printing only changes plus the companion's journal lines at that moment.
 
+The window ran to completion, 04:50:21 -> 05:45:24, and the tally is final:
+
 ```
+3 creates, 2 closes, net +1 tab in 55 minutes
+
 04:57:26  + 6ECB4BB5  ...1bb4634f4845    created
 04:57:33  - 38CABE02  ...1bb4634f4845    old closed 7 s later      PAIRED
 05:10:43  + A22E0A24  ...d26156937c57    created, never closed     LEAKED
   07:10:42 companion: not delivered for event 23651; stays pending
                       (renderer_unresponsive)
-   later   + D99FF1C9 / - C35582B6  ...de5162d4ac17                PAIRED
+(later)   + D99FF1C9  ...de5162d4ac17    created
+          - C35582B6  ...de5162d4ac17    old closed                PAIRED
 ```
+
+Leak rate **1 in 3 recoveries**, and the one that leaked is precisely the one whose
+delivery logged `renderer_unresponsive`. Drift of +1 tab per ~55 min at this traffic
+level matches the 5 -> 7 growth seen earlier over about an hour, and explains how the
+browser reached 12 pages and began refusing deliveries with
+`browser_degraded:too_many_pages` on 2026-09-01.
 
 `renderer_unresponsive` is the caller's answer to this function returning `None`,
 logged one second before the leaking create.
@@ -100,9 +111,14 @@ restart.
 
 1. **Push** `b76fee7`.
 2. **Restart** `owner-os-wake-companion` to load the fix.
-3. Then, and only then, **re-run the watcher** against this baseline. If recoveries pair
-   create-with-close every time and the page count stops climbing, the leak is closed —
-   measured, not asserted. Clear the residue afterwards.
+3. Then, and only then, **re-run the watcher** against this baseline for a comparable
+   window. The pass condition is explicit: **creates and closes pair 3-for-3, net drift
+   zero**, against the 3/2/+1 recorded above. That is the first tab claim in this ledger
+   that can be settled by measurement rather than assertion. Clear the residue only
+   after the comparison is made.
+
+   Watcher script: `scratchpad/tabwatch2.sh` (read-only; samples `/json/list` every 5 s,
+   prints only changes with the companion's journal lines at that moment).
 
 Unrelated and still open: the Telegram credential decision (Part 81) and the unused 24 h
 Windows enrolment code.
