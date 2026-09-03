@@ -9231,3 +9231,82 @@ The arbitrage death is what finally exercised the binding made an hour earlier:
 
 Delivered AND the assistant began responding. Before the bind, both death wakes would
 have landed in the owner-os chat.
+
+---
+
+# Part 86 — the routing topology, settled
+
+Five owner-typed route changes on 2026-09-03, closing the work Part 77 opened. Recorded
+because the topology is now the answer to "why does a project chat not react", and the
+next reader should not have to reconstruct it from five separate audit rows.
+
+## What changed today
+
+```
+07:54:52  bind     arbitrage2-fable-audit   unbound        -> АРБИТРАЖНИК
+08:54:48  rebind   hostsecure               HostSecure old -> Проверка агента HostSecure
+08:54:48  bind     security-demo            unbound        -> Проверка агента HostSecure
+09:36:10  rebind   payment-orchestrator     ПЛАТЁЖКА       -> Платёжный оркестратор
+09:44:51  rebind   mess                     МЕССЕНДЖЕР     -> MESSENGER
+```
+
+Each was preceded by a live pre-check (chat unique, active, not dead, not held by
+another key) and followed by verification through the emitter's own path —
+`route_key_for_event()` then `resolve()` — never by reading the table back. Each has a
+DB backup with an integrity check and a one-line rollback.
+
+## Final topology: 14 keys, 13 conversations
+
+```
+arbitrage2-fable-audit   АРБИТРАЖНИК
+auction                  ACAP + Auction Watch
+email                    EMAIL SYSTEM
+gaika-drop               Разработка корзины
+gaika-extension          GAIKA Agent Watch
+gaika-video              ВИДЕО
+hostsecure               Проверка агента HostSecure   ┐ declared collision
+security-demo            Проверка агента HostSecure   ┘
+jobhunter-ai             АРБИТРАЖНЫЙ БОТ
+mess                     MESSENGER
+owner-os                 OWNER
+payment-orchestrator     Платёжный оркестратор
+seo                      Resume SEO agent
+treasure                 Treasure №3 ...
+```
+
+`route_health()`: direct 8, fallback 2, unbound 0. The two remaining fallbacks are
+`capacity` (no chat exists) and `ai-dev-runtime` (whose fallback already lands on the
+right chat — binding it would create a second, pointless collision).
+
+## The one collision, and why it is not the Part 77 disease
+
+`hostsecure` and `security-demo` share one conversation deliberately: two agents in
+different directories (`/opt/hostsecure`, `/opt/security-demo`), supervised together,
+declared by the owner and confirmed against live state before binding.
+
+The difference from Part 77 is not the shape but the visibility. There, auto-discovery
+stacked three keys onto one chat silently, and two of the three never rang while nothing
+reported it. Here both keys resolve with reason `explicit_route`, `route_health()` counts
+both as direct, and the guard added in `dfab6cb` still refuses to create such a pairing
+automatically — a human declaring it is exactly the case that guard leaves open.
+
+## Three chats are now unrouted
+
+```
+ПЛАТЁЖКА         freed   (was the busiest chat on the box; briefly held 3 keys)
+МЕССЕНДЖЕР       freed   (was delivering 9 of 9 in the hour before the rebind)
+HostSecure old   freed
+```
+
+Worth stating plainly: traffic that used to arrive in these three now arrives elsewhere.
+If any of them is still read, that reading now shows silence. The `mess` case is the one
+to watch — `MESSENGER` and `МЕССЕНДЖЕР` differ only by alphabet, and its rollback note
+says so in those words.
+
+## What routing can and cannot fix
+
+Every active project with a chat now reaches it directly, verified end to end for
+`arbitrage2` (`submitted_and_assistant_started_generating`) and `security-demo` (a
+natural wake 2.5 minutes after binding). What routing cannot fix is the notification
+channel: `owner_push` remains red on the Part 81 credential, 38 active dead letters in
+the last hour, and no route change touches that.
