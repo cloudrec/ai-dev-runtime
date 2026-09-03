@@ -8819,3 +8819,88 @@ tiers and neither is in the wake path — `wake_bridge.py`, `closed_loop_wake.py
 `wake_companion.py` contain zero references to it. Wakes continue on the CDP → ChatGPT
 path. What is lost while the channel is misconfigured is the out-of-band ping, plus a
 steady 4-5 criticals an hour reporting the same shut door.
+
+---
+
+# Part 82 — a successful close reported itself as a failure
+
+Found while clearing duplicate tabs, not by looking for it. Every close reported
+`False`; every close worked.
+
+## The bug
+
+```
+/json/close/<id>   ->  HTTP 200, body: Target is closing     (plain text, not JSON)
+_http              ->  json.loads(body)  raises ValueError
+_close_target      ->  except: return False
+```
+
+`_close_target` could not return True against a real Chrome. Measured live: three
+duplicate tabs closed, three `False` returns, page count 8 -> 5.
+
+The close really happens, so nothing visibly broke and the bug survived every previous
+tab investigation in this ledger — including `404496b`, `877edaf` and `ad705eb`, all of
+which touched this exact function. It is invisible from the outside because the only
+wrong thing is the report.
+
+## What it actually broke
+
+The caller that trusts the answer. `ad705eb` reads it as a retry condition:
+
+```python
+if not _close_target(old_target["id"]):
+    _close_target(old_target["id"])
+```
+
+Since the first call always answered False, EVERY close was followed by a second close
+of an already-closing target, and the single retry that exists for genuinely wedged
+tabs was spent on healthy ones every time. Part 63's lesson repeats in a new place: a
+guard that reads the wrong value is not a guard.
+
+It also misled this session's own diagnosis twice — duplicates were read as tabs that
+"refused to close" when they had closed fine.
+
+## The fix
+
+In `_http`, not in `_close_target`. A successful request whose body is not JSON now
+returns `{}` instead of raising. A real transport failure still raises, so a dead
+browser still reports False, which the control test pins.
+
+## The mistake made first, and why it matters
+
+The obvious fix — have `_close_target` skip `_http` and read the HTTP status itself —
+was written, and it broke five existing tests. Those tests patch `_http` as their
+isolation seam, so bypassing it would have let them reach the operator's live browser.
+
+That is the THIRD time in two days a change reached for live host state: native
+sessions, the transcript oracle, and now this. The pattern is worth naming. A helper
+that wraps I/O is not just a convenience, it is the seam the tests hold. Fixing a bug
+by stepping around the seam trades a small bug for a test suite that reads the machine
+it runs on, and the existing controls are what catch it — running only the new tests
+would have shown green.
+
+## Evidence
+
+```
+tests/test_cdp_composer.py                                    74 passed
+cdp_composer + wake_bridge + closed_loop_wake + agent_watch
+  + chat_registry                                            332 passed
+```
+
+Five tests fail when the tolerance is reverted, verified by reverting. Controls pin
+that JSON endpoints still parse and that a real transport failure still reports False.
+
+## Cleanup done at the same time
+
+Duplicate tabs cleared: 8 pages -> 5, one per bound conversation, 0 bare roots, not
+degraded. The bare-root leak stays fixed; what remained was duplicates on two
+conversations, all of them RESPONSIVE and closing cleanly, which is what pointed at the
+reporting bug rather than at wedged tabs.
+
+## Not built
+
+The periodic duplicate sweep proposed in the previous part was NOT written. With
+honest close reporting, `recover_wedged_tab` now retries only when a close genuinely
+fails, which may remove the accrual at its source. Whether duplicates still gather is
+now an empirical question, and adding a sweeping mechanism before answering it would
+be building against a guess.

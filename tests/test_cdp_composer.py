@@ -888,6 +888,59 @@ def test_a_close_that_fails_never_raises(monkeypatch):
     assert cc._close_target("") is False
 
 
+# ── a successful close reported itself as a failure (2026-09-03) ───────────
+# /json/close/<id> answers HTTP 200 with the plain text "Target is closing". _http
+# ended in json.loads(body), the parse raised, _close_target swallowed it and returned
+# False. Against a real Chrome it could NEVER return True. Measured live: three
+# duplicate tabs closed, three False returns, page count 8 -> 5.
+
+def test_a_plain_text_body_is_not_a_failure(monkeypatch):
+    """The endpoint's real answer. HTTP succeeded, so the close succeeded."""
+    from tools import cdp_composer as cc
+    seen = []
+
+    def fake_http(path, method="GET"):
+        seen.append(path)
+        raise AssertionError("unreachable — patched below")
+
+    class _R:
+        status = 200
+        def read(self): return b"Target is closing"
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(cc.urllib.request, "urlopen", lambda *a, **k: _R())
+    assert cc._http("/json/close/abc") == {}, "a non-JSON 200 body is not an error"
+    assert cc._close_target("abc") is True, "a successful close must report True"
+
+
+def test_json_endpoints_still_parse(monkeypatch):
+    """The tolerance must not swallow real JSON."""
+    from tools import cdp_composer as cc
+
+    class _R:
+        status = 200
+        def read(self): return b'[{"id":"a","type":"page","url":"https://chatgpt.com/c/x"}]'
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(cc.urllib.request, "urlopen", lambda *a, **k: _R())
+    out = cc._http("/json/list")
+    assert isinstance(out, list) and out[0]["id"] == "a"
+
+
+def test_a_real_transport_failure_still_reports_false(monkeypatch):
+    """The control. Tolerating a non-JSON body must not hide a browser that is gone."""
+    from tools import cdp_composer as cc
+
+    def boom(*a, **k):
+        raise OSError("browser gone")
+
+    monkeypatch.setattr(cc.urllib.request, "urlopen", boom)
+    assert cc._close_target("x") is False
+    assert cc._close_target("") is False
+
+
 # ── the SECOND tab-creation path (2026-09-02) ──────────────────────────────
 # `recover_wedged_tab` claims in its docstring to be "the single choke point for
 # creating tabs, so the guard lives here and no caller can bypass it". That was

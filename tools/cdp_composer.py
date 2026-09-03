@@ -60,7 +60,19 @@ def _http(path: str, method: str = "GET"):
     req = urllib.request.Request(f"http://{CDP_HOST}:{CDP_PORT}{path}", method=method)
     with urllib.request.urlopen(req, timeout=8) as r:
         body = r.read().decode()
-        return json.loads(body) if body.strip() else {}
+        if not body.strip():
+            return {}
+        try:
+            return json.loads(body)
+        except ValueError:
+            # Not every DevTools endpoint answers JSON. `/json/close/<id>` returns the
+            # plain text `Target is closing` with HTTP 200, and raising on that made
+            # `_close_target` report False for every SUCCESSFUL close — see its
+            # docstring. Reaching here means the request SUCCEEDED and the body simply
+            # was not JSON, so an empty dict is the honest answer; the caller that
+            # cares about status already has it, because a real failure raises before
+            # this point.
+            return {}
 
 
 # BROWSER-level health, as distinct from one tab's renderer. The difference decides
@@ -130,7 +142,22 @@ def page_responsive(target: dict, timeout: float = 8.0) -> bool:
 
 def _close_target(target_id: str) -> bool:
     """Close one tab by id, best-effort. A tab that will not close is worse to fight
-    than to leave, so a failure here is swallowed exactly as the old-tab close is."""
+    than to leave, so a failure here is swallowed exactly as the old-tab close is.
+
+    Returning True means the browser ACCEPTED the close. It used to mean nothing at
+    all: `/json/close/<id>` answers HTTP 200 with the plain text `Target is closing`,
+    `_http` ended in `json.loads(body)`, the parse raised, this except swallowed it,
+    and every SUCCESSFUL close was reported as a failure. Against a real Chrome the
+    function could not return True. Measured 2026-09-03: three duplicate tabs closed,
+    three False returns, page count 8 -> 5.
+
+    The bug was invisible because the close really happens — only the report was wrong.
+    What it broke is the caller that trusts the answer: `recover_wedged_tab` reads False
+    as "try once more", so every close was followed by a redundant second close of an
+    already-closing target, and the retry that exists for genuinely wedged tabs was
+    spent on healthy ones. Fixed in `_http`, which now tolerates a non-JSON body rather
+    than raising on success.
+    """
     if not target_id:
         return False
     try:
