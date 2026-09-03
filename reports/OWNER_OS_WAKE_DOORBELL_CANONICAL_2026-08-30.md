@@ -9088,3 +9088,57 @@ reports nothing rather than raising.
 Two projects need a conversation of their own; a third needs its accidental correctness
 made explicit. Binding them moves where messages land, so it is not the assistant's to
 do — the point of this part is that the need is now VISIBLE, which it was not before.
+
+## Part 84 addendum — arbitrage2 bound, and two more projects found on the fallback
+
+`arbitrage2-fable-audit` is bound, owner-typed:
+
+```
+arbitrage2-fable-audit -> АРБИТРАЖНИК  ...a-e50ee8510664  by=owner  07:54:52
+resolve() reason: explicit_route (was unmapped_route)
+13 keys / 13 conversations, collisions none
+```
+
+Verified through the emitter's own path — `route_key_for_event()` then `resolve()` — not
+by reading the table. Backup and one-line `unbind_route` rollback in
+`backups/bind_arbitrage2_20260903T075449Z/`.
+
+**Not yet proven end to end.** `wake_send` has zero rows for this route: the agent's last
+event was 07:44:46, eight minutes before the bind, and nothing has fired since. The
+pre-delivery chain is correct; the delivery itself is unobserved, and manufacturing one
+would write into the owner's chat.
+
+## The fallback list grew while being audited
+
+```
+direct 8 · fallback 3 · unbound 0
+
+capacity        capacity-blockchain:0.0   no chat with that name exists
+security-demo   security-demo:0.0         NEW - not present in the earlier audit
+ai-dev-runtime  owner-os-opus-clean:0.0   lands correctly; binding optional
+```
+
+`security-demo:0.0` appeared between the two audits. It is worth stating why that
+matters more than one extra row: the owner-os chat now shows 29 claims an hour, and
+that number is not owner-os traffic — it is THREE projects sharing one conversation
+through the fallback. Every new unbound project silently increases the load on the one
+chat the owner uses for control, and before `route_health()` nothing would have said so.
+
+`ai-dev-runtime` is deliberately left unbound. Its fallback already lands on the right
+chat, and binding it would put two keys on one conversation — the exact collision shape
+Part 77 was written about.
+
+## An ambiguity to flag rather than resolve
+
+`hostsecure` is bound to a chat titled **"HostSecure old"** and delivers successfully
+(2 of 2 in the audited hour). A second, UNBOUND chat exists: **"Проверка агента
+HostSecure"**, seen just as recently.
+
+Both readings are consistent with the evidence. Either the owner named the working chat
+"old" and it is fine, or wakes land in a chat the owner has stopped reading and the
+"Проверка агента" chat is them checking manually — which is the same signature as the
+nine "Проверка событий Owner OS" chats that revealed the original problem in Part 77.
+
+Delivery succeeding proves the tab was written to. It does not prove anyone reads it.
+That distinction is only resolvable by the owner, so it is recorded here rather than
+guessed at.
