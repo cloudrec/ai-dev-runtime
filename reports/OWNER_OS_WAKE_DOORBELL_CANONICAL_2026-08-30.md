@@ -9142,3 +9142,92 @@ nine "Проверка событий Owner OS" chats that revealed the original
 Delivery succeeding proves the tab was written to. It does not prove anyone reads it.
 That distinction is only resolvable by the owner, so it is recorded here rather than
 guessed at.
+
+---
+
+# Part 85 — two panes vanished, and what the evidence can and cannot say
+
+`arbitrage-resume:0.0` (event 24454) and then `payorch-ha-fresh:0.0` (event 24596)
+both died with the same classification: **pane vanished while working**. Recorded
+because the investigation's value is in what it RULED OUT, and because a second case
+arrived while the first was still being written up.
+
+## The decisive artifact
+
+The agent's own transcript, written by the process up to the moment it stopped:
+
+```
+08:45:42  assistant runs a Bash tool call
+08:46:03  assistant: "Pause complete. Idle."      turn finished normally
+08:46:07  Stop hook ran (Owner OS lifecycle, 2084 ms); turn_duration 653932 ms
+08:46:34  queue: <status>killed</status>
+          Background command "Wait for pytest to exit" was stopped
+08:46:34  dequeue
+08:46:56  pane gone -> agent_dead
+```
+
+A background command and its pane share a process group. Both going away 22 s apart
+means the GROUP was terminated. A clean Claude exit does not kill a child task first,
+and would leave an exit record; there is none.
+
+## What was ruled out, with the evidence
+
+| candidate | verdict | evidence |
+|---|---|---|
+| Owner OS killed it | ruled out | zero actuation events on the target in the hour; every event is observational (`discovery`, `agent_watch`, `closed_loop_wake`). The kill paths exist — `agent_control.py:1927` `kill-pane`, `:1802` `kill-session` behind an all-dead fence, `session_recovery.py:475` — and they EMIT events. None exist, and the companion journal logged no kill. |
+| Claude exited on its own | ruled out | no exit record, no error, no context-limit message; last write is an ordinary dequeue |
+| tmux server died | ruled out | server 21 days old and still running; `payorch-sbp`, `mess-opus-next`, `payorch-ha-fresh` all survived that moment untouched |
+| kernel / OOM | ruled out | no OOM kill logged for pid 4009331 in the window |
+| external session close | **most probable** | the only reading left, and it matches the killed-task-then-pane sequence exactly |
+
+## The second case, which arrived 31 minutes later
+
+```
+09:18:47  payorch-ha-fresh:0.0   pane vanished while working   (event 24596)
+09:18:59  new gate: classify_scope for payorch-ha-next:0.0 at /opt/payment-orchestrator
+```
+
+A pane died and a NAMED SUCCESSOR appeared in the same directory twelve seconds later.
+That is a deliberate swap, not a fault — and it is the same signature as the arbitrage
+death. Two identical events in 31 minutes, one of them immediately followed by a
+replacement, is what turns "external close" from the last surviving hypothesis into the
+only one consistent with both.
+
+## What still cannot be proven
+
+The ACTOR. Nothing on this host audits tmux session closure: the transcript ends where
+Claude stopped writing, and `agent_watch` only observes the pid already gone. Confidence
+is high on the mechanism (process group terminated externally) and moderate on the
+actor. That gap is not closable from logs and is recorded as such rather than papered
+over.
+
+## No Owner OS defect
+
+Every stage did its job on both deaths:
+
+* detection immediate — dead at 08:46:56, pane vanished ~08:46:56;
+* classification accurate — it WAS working when last observed;
+* recovery state preserved — `conversation_id cb7be7ec-9f24-45d0-a6dc-07fde35fbfc4`,
+  transcript intact, worktree clean on `fable/pre-money-audit-20260830`, the audit
+  already committed at `1df21f7`;
+* the wake reached the correct chat with
+  `submitted_and_assistant_started_generating`.
+
+One item was examined and deliberately NOT filed: `wake_loop_no_progress` fired at
+09:09 for an agent already dead. Re-waking a chat about a dead agent is defensible —
+the human reading that chat is who acts — and `_session_target_gone` already resolves
+watches whose session is gone. Changing it without evidence of a misfire would be
+speculation.
+
+## The route bind proved itself here
+
+The arbitrage death is what finally exercised the binding made an hour earlier:
+
+```
+08:47:08  wake_send 36621  event 24443  -> ...a-e50ee8510664
+10:47:41  companion: delivered wake for event 24443
+          [route arbitrage2-fable-audit] submitted_and_assistant_started_generating
+```
+
+Delivered AND the assistant began responding. Before the bind, both death wakes would
+have landed in the owner-os chat.
