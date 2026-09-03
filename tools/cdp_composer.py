@@ -861,6 +861,25 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                 return {"ok": False, "reason": "assistant_generating_wedged"}
             return {"ok": False, "reason": "assistant_still_generating"}
 
+        # REFUSE if the composer already holds text. `Input.insertText` APPENDS; it does
+        # not replace. Without this check a wake typed into a box that already contained
+        # someone's half-written message concatenated the two and then clicked send —
+        # submitting a human's unsent draft on their behalf, under their account, with no
+        # way to recall it. The composer is a person's workspace, not the automation's.
+        #
+        # Length only, never content: this module's rule is that it may know the composer
+        # is non-empty and must never learn what it says. That rule is what made the bug
+        # invisible — the existing check below asks the same question AFTER inserting, by
+        # which point a pre-existing draft and the wake are one string.
+        #
+        # Refuse rather than clear. Clearing destroys work nobody authorised us to touch,
+        # and the wake is not urgent enough to justify it: the event stays pending and the
+        # next attempt succeeds once the box is empty.
+        already = s.boolean(
+            f"(document.querySelector({COMPOSER_SEL!r})||{{}}).textContent?.length > 0")
+        if already is True:
+            return {"ok": False, "reason": "composer_holds_unsent_text"}
+
         # The ONLY string ever sent into the page.
         s.call("Input.insertText", {"text": phrase})
 

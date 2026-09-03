@@ -49,6 +49,12 @@ class _S:
         self.exprs.append(expression)
         if "readyState" in expression:
             return True          # the readiness gate is not what these tests exercise
+        if "?.length" in expression:
+            # The pre-insert "is someone's draft already in the box" guard.
+            # Structural, for the reason the stop-button note gives: a new
+            # infrastructure check must not shift the scripted queue every
+            # other test depends on. Default False = empty = proceed.
+            return getattr(self, "composer_dirty", False)
         if "stop-button" in expression:
             # Back-pressure probe. Answered STRUCTURALLY, like readyState, so it does not
             # consume the scripted queue below — otherwise adding an infrastructure check
@@ -538,6 +544,12 @@ def test_a_turn_in_flight_is_reported_as_back_pressure_not_a_composer_fault():
 
     class _Gen(_FakeSession):
         def boolean(self, expression):
+            if "?.length" in expression:
+                # The pre-insert "is someone's draft already in the box" guard.
+                # Structural, for the reason the stop-button note gives: a new
+                # infrastructure check must not shift the scripted queue every
+                # other test depends on. Default False = empty = proceed.
+                return getattr(self, "composer_dirty", False)
             if "stop-button" in expression:
                 return True
             return super().boolean(expression)
@@ -606,6 +618,12 @@ class _WedgeSession(_FakeSession):
         self.turn_ids = list(turn_ids or ["m1", "m1", "m1"])
 
     def boolean(self, expression):
+        if "?.length" in expression:
+            # The pre-insert "is someone's draft already in the box" guard.
+            # Structural, for the reason the stop-button note gives: a new
+            # infrastructure check must not shift the scripted queue every
+            # other test depends on. Default False = empty = proceed.
+            return getattr(self, "composer_dirty", False)
         if "stop-button" in expression:
             return True
         if "result-streaming" in expression:
@@ -643,6 +661,12 @@ def test_the_stop_control_clearing_proves_it_is_not_wedged():
             self._n = 0
 
         def boolean(self, expression):
+            if "?.length" in expression:
+                # The pre-insert "is someone's draft already in the box" guard.
+                # Structural, for the reason the stop-button note gives: a new
+                # infrastructure check must not shift the scripted queue every
+                # other test depends on. Default False = empty = proceed.
+                return getattr(self, "composer_dirty", False)
             if "stop-button" in expression:
                 self._n += 1
                 return self._n < 2
@@ -886,6 +910,42 @@ def test_a_close_that_fails_never_raises(monkeypatch):
     monkeypatch.setattr(cc, "_http", boom)
     assert cc._close_target("x") is False
     assert cc._close_target("") is False
+
+
+# ── never submit a human's unsent draft (2026-09-03) ───────────────────────
+# Input.insertText APPENDS; it does not replace. The only composer check ran AFTER the
+# insert and asked merely "is it non-empty", by which point a pre-existing draft and the
+# wake are one string — so a wake typed into a box holding someone's half-written message
+# concatenated the two and clicked send, submitting their draft under their account.
+
+def test_it_refuses_when_the_composer_already_holds_someone_elses_text(wired):
+    """The composer is a person's workspace. A wake is not urgent enough to spend it."""
+    s = wired({"n": 1}, bools=[True])
+    s.composer_dirty = True
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is False and r["reason"] == "composer_holds_unsent_text"
+    assert s.inserted == [], "nothing may be typed into a box that is not empty"
+
+
+def test_it_never_reads_what_the_draft_says(wired):
+    """Length only. The module may know the composer is non-empty and must never learn
+    what it contains — that rule is also what hid this bug."""
+    s = wired({"n": 1}, bools=[True])
+    s.composer_dirty = True
+    cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    guard = [e for e in s.exprs if "?.length" in e]
+    assert guard, "the guard must have run"
+    assert all("textContent?.length" in e for e in guard)
+    assert not any("substring" in e or "slice" in e or "innerText" in e for e in guard)
+
+
+def test_an_empty_composer_still_delivers(wired):
+    """The control. Refusing must cost nothing when the box is empty, which is the
+    ordinary case."""
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is True, r
+    assert s.inserted == ["PHRASE"]
 
 
 # ── the recovery leaked its replacement when verification RAISED (2026-09-03) ──

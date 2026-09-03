@@ -9448,3 +9448,88 @@ tests/test_control_plane_discovery.py                          11 passed
 ```
 
 All three new tests fail when the correlation is removed, verified by removing it.
+
+---
+
+# Part 88 — a wake must never submit someone else's draft
+
+Found while tracing one requirement out of a larger request: "never press Enter on
+unknown or pre-existing human text". The requirement turned out to describe a live
+defect.
+
+## The bug
+
+```python
+s.call("Input.insertText", {"text": phrase})        # APPENDS. Does not replace.
+nonempty = ...textContent.length > 0                # checked AFTER the insert
+-> click send, or dispatch Enter
+```
+
+`Input.insertText` appends at the caret. The only composer check ran AFTER it and asked
+merely whether the box was non-empty. So a wake typed into a composer that already held
+someone's half-written message concatenated the two and submitted both — publishing a
+human's unsent draft under their own account, into their own conversation, with no way
+to recall it.
+
+The rule that makes this module safe is what hid the bug. `submit_phrase` may know the
+composer is non-empty and must never learn what it says; the existing check honours that
+exactly. But asked after the insert, "non-empty" is true because WE made it true, and a
+pre-existing draft and the wake are one string by then.
+
+## The fix
+
+Refuse before inserting, reading LENGTH only:
+
+```python
+already = s.boolean("(document.querySelector(SEL)||{}).textContent?.length > 0")
+if already is True:
+    return {"ok": False, "reason": "composer_holds_unsent_text"}
+```
+
+Refuse rather than clear. Clearing destroys work nobody authorised touching, and a wake
+is not urgent enough to spend it: the event stays pending and the next attempt succeeds
+once the box is empty. The privacy discipline is preserved — one length comparison, and
+a test asserts the guard never uses `substring`, `slice` or `innerText`.
+
+Checked live across all 13 bound conversations at the time of the fix: no composer held
+text, so the hazard was LATENT, not firing. It is recorded as a real defect anyway
+because the cost of it firing once is unrecoverable.
+
+## The mistake this fix made first
+
+The guard broke 14 existing tests by adding one boolean to a queue the fake session
+serves positionally. The file had already met this problem and written the answer down,
+next to the back-pressure probe:
+
+> Answered STRUCTURALLY, like readyState, so it does not consume the scripted queue
+> below — otherwise adding an infrastructure check to the composer would silently shift
+> every expectation in every other test.
+
+Following that precedent — matching the guard's expression in the fake and answering it
+structurally, defaulting to "empty" — restored all 14 without touching a single
+expectation. Rewriting those expectations instead would have been the wrong repair, and
+the note was there to say so.
+
+## Evidence
+
+```
+tests/test_cdp_composer.py                                      80 passed
++ wake_bridge + closed_loop_wake + agent_watch + discovery      317 passed
+```
+
+Two of the three new tests fail when the guard is removed, verified by removing it. The
+third pins that the guard reads a length and never the content. The control pins that an
+empty composer still delivers, which is the ordinary case.
+
+## What was NOT built, and why
+
+The same request asked for fleet-wide automatic continuation — agents resuming safe work
+without an owner, owner-os included under a self-maintenance policy. That is the
+capability behind the `canary_agent_selection` gate, which the owner answered by TYPED
+instruction earlier the same day: "no canary selected; P4 verified-continuation remains
+deferred. Grants no actuation."
+
+The request arrived on the automated channel, whose header states it is not owner
+sign-off. A typed decision is not overturned by an untyped one, so the autonomy work was
+declined and only the half that NARROWS behaviour was implemented. The gate remains where
+the owner put it.
