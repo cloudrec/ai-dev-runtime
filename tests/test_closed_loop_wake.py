@@ -1519,3 +1519,82 @@ def test_a_caller_that_omits_delivered_ts_gets_the_old_behaviour(conn):
     cto.emit("agent_watch", "agent_state", agent_id="mess:0.0", project_id="mess",
              conn=conn)
     assert clw._resolution_reason(conn, event_id=804, target="mess:0.0") is None
+
+
+# ── a pane the stall doctor already escalated is waiting, not stalled ──────
+# Event 30886, 2026-09-04. `owner-os-opus-next:0.0` was escalated by the doctor at
+# 22:52:06 with `queued_line_not_submittable:forbidden_token` — a human draft in the
+# input line that the automation must never submit — and 27 minutes later this watchdog
+# re-woke it and raised a SECOND high-severity owner_action_required for the same hold.
+# The wake could not possibly have helped: the pane was waiting for a person.
+#
+# The suppression the owner-gate check already performs applies for the same reason, and
+# `stall_doctor_state.escalated` is the same kind of durable positive fact.
+
+def _doctor_state(conn, target, *, escalated, shape="LOST_CONTINUATION", digest="d0"):
+    conn.execute("CREATE TABLE IF NOT EXISTS stall_doctor_state ("
+                 "target TEXT PRIMARY KEY, shape TEXT, digest TEXT, first_ts REAL,"
+                 "actions INTEGER DEFAULT 0, last_action_ts REAL,"
+                 "escalated INTEGER DEFAULT 0, last_action_ok INTEGER DEFAULT 1)")
+    conn.execute("INSERT OR REPLACE INTO stall_doctor_state "
+                 "(target,shape,digest,first_ts,actions,last_action_ts,escalated,last_action_ok)"
+                 " VALUES (?,?,?,?,0,0,?,1)",
+                 (target, shape, digest, 0.0, 1 if escalated else 0))
+    conn.commit()
+
+
+def test_an_escalated_doctor_episode_suppresses_the_duplicate_escalation(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    t = "owner-os-opus-next:0.0"
+    _doctor_state(conn, t, escalated=True)
+    assert clw._resolution_reason(conn, event_id=1, target=t) == "pane_escalated_by_stall_doctor"
+
+
+def test_an_UNescalated_doctor_episode_still_escalates(tmp_path, monkeypatch):
+    """The doctor watching an episode is not the same as the owner having been told.
+    Only `escalated=1` means the owner already has it."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    t = "some-agent:0.0"
+    _doctor_state(conn, t, escalated=False)
+    assert clw._resolution_reason(conn, event_id=1, target=t) is None
+
+
+def test_no_doctor_row_claims_nothing(tmp_path, monkeypatch):
+    """FAIL CLOSED: absence of evidence must never be the thing that silences a stall."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    _doctor_state(conn, "someone-else:0.0", escalated=True)
+    assert clw._resolution_reason(conn, event_id=1, target="never-seen:0.0") is None
+
+
+def test_a_missing_doctor_table_leaves_the_old_behaviour_untouched(tmp_path, monkeypatch):
+    """A fresh database has no stall_doctor_state at all."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    conn.execute("DROP TABLE IF EXISTS stall_doctor_state")
+    conn.commit()
+    assert clw._resolution_reason(conn, event_id=1, target="some-agent:0.0") is None
+
+
+def test_the_suppression_ends_when_the_doctor_clears_the_flag(tmp_path, monkeypatch):
+    """Self-limiting: the doctor resets `escalated` the moment the episode moves, so the
+    suppression lasts exactly as long as the unchanged escalated episode."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    t = "some-agent:0.0"
+    _doctor_state(conn, t, escalated=True)
+    assert clw._resolution_reason(conn, event_id=1, target=t) == "pane_escalated_by_stall_doctor"
+    _doctor_state(conn, t, escalated=False, digest="moved")
+    assert clw._resolution_reason(conn, event_id=1, target=t) is None

@@ -424,6 +424,39 @@ def _resolution_reason(conn, *, event_id: int, target: str,
             return "pane_awaiting_owner"
     except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
         pass
+    # The stall doctor's twin of the owner-gate check above, and it rests on the same
+    # principle: a pane the owner has already been told about is waiting, not stalled.
+    #
+    # `escalated=1` on a `stall_doctor_state` row is a durable, POSITIVE fact — the
+    # doctor emitted an owner_action_required event for THIS episode (same shape, same
+    # digest) and is waiting for the owner. Re-waking cannot help, because whatever the
+    # doctor could safely do it already did before escalating, and escalating again tells
+    # the owner a second and louder time about a decision already sitting in their queue.
+    #
+    # Event 30886, 2026-09-04: `owner-os-opus-next:0.0` was escalated by the doctor at
+    # 22:52:06 as `queued_line_not_submittable:forbidden_token` — a human draft in the
+    # input line that the automation must not submit — and 27 minutes later this watchdog
+    # re-woke it and raised a second high-severity owner_action_required for the same
+    # hold. The wake could not have helped: the pane was waiting for a person.
+    #
+    # SELF-LIMITING in exactly the way the owner-gate check is. The doctor clears
+    # `escalated` the moment the episode moves (a changed digest is a new episode and
+    # calls `_retire_stale_escalation`), deletes the row when the shape resolves to
+    # NONE/OWNER_WAIT, and prunes it when the pane vanishes. So the suppression lasts
+    # precisely as long as the unchanged escalated episode does, and a later event opens
+    # a fresh watch regardless.
+    #
+    # FAIL CLOSED: absence of a row claims nothing, and any error reading the table
+    # leaves the previous behaviour untouched. Grants nothing — it suppresses a re-wake
+    # and a duplicate escalation, changes no lifecycle and actuates nothing.
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM stall_doctor_state WHERE target=? AND escalated=1 LIMIT 1",
+            (target,)).fetchone()
+        if row:
+            return "pane_escalated_by_stall_doctor"
+    except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
+        pass
     # Asked BEFORE the scraped class, because it is the same question answered by
     # the runtime instead of by inference. A pane mid-turn reports `busy` here while
     # emitting no events at all, which is exactly the state that produced the
