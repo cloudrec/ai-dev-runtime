@@ -164,3 +164,51 @@ def test_the_module_writes_nothing_and_opens_no_database():
     for forbidden in ("sqlite3", "connect(", "INSERT", "UPDATE", "execute(",
                       "control_plane.store", "emit("):
         assert forbidden not in src, f"{forbidden} has no business in dormant instrumentation"
+
+
+# ── the window must be BOUNDED, or the test cannot fail (2026-09-04) ───────
+# Found by replaying nine real gaika-opus-v5:0.0 continuations: the timeout was consulted
+# only when NO qualifying turn existed, so a turn at any later time counted. Latencies of
+# 5428s, 6487s and 7058s all returned `verified` against a 600s timeout. That agent
+# produced 474 turn events, so some turn always eventually follows — every continuation
+# passed, and a check that cannot fail proves nothing.
+
+def test_a_turn_after_the_timeout_does_not_count():
+    out = _classify(turns=[{"ts": T0 + 5428, "digest": "new"}],
+                    now=T0 + 6000, timeout_secs=600)
+    assert out["verdict"] == cv.UNVERIFIED, \
+        "a turn 90 minutes later is not evidence for a continuation with a 10-minute window"
+
+
+def test_a_turn_inside_the_window_still_counts():
+    out = _classify(turns=[{"ts": T0 + 599, "digest": "new"}],
+                    now=T0 + 700, timeout_secs=600)
+    assert out["verdict"] == cv.VERIFIED
+
+
+def test_the_window_boundary_is_inclusive():
+    out = _classify(turns=[{"ts": T0 + 600, "digest": "new"}],
+                    now=T0 + 700, timeout_secs=600)
+    assert out["verdict"] == cv.VERIFIED
+
+
+def test_a_later_continuation_truncates_the_window():
+    """From the moment a second continuation fires it is the better explanation, so one
+    turn can never be credited to two continuations."""
+    out = _classify(turns=[{"ts": T0 + 500, "digest": "new"}],
+                    now=T0 + 700, timeout_secs=600, next_continuation_ts=T0 + 300)
+    assert out["verdict"] == cv.UNVERIFIED
+
+
+def test_a_turn_before_the_next_continuation_is_still_credited():
+    out = _classify(turns=[{"ts": T0 + 200, "digest": "new"}],
+                    now=T0 + 700, timeout_secs=600, next_continuation_ts=T0 + 300)
+    assert out["verdict"] == cv.VERIFIED
+
+
+def test_pending_respects_the_truncated_window():
+    """Still open, but only until the truncation point."""
+    out = _classify(turns=[], now=T0 + 100, timeout_secs=600, next_continuation_ts=T0 + 300)
+    assert out["verdict"] == cv.PENDING
+    out2 = _classify(turns=[], now=T0 + 400, timeout_secs=600, next_continuation_ts=T0 + 300)
+    assert out2["verdict"] == cv.UNVERIFIED

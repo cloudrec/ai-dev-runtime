@@ -60,22 +60,41 @@ def is_active() -> bool:
 def classify_continuation(*, t0: float, digest_at_t0: str,
                           turns: Sequence[dict], deliveries: Sequence[dict],
                           now: float,
-                          timeout_secs: int = DEFAULT_TIMEOUT_SECS) -> dict:
+                          timeout_secs: int = DEFAULT_TIMEOUT_SECS,
+                          next_continuation_ts: Optional[float] = None) -> dict:
     """One sample's verdict. Pure — no I/O, no clock of its own, no writes.
 
     `turns`      `agent_turn_stopped` records for the target: {"ts": float, "digest": str}
     `deliveries` wake_delivery rows to that target's route: {"ts": float}
+    `next_continuation_ts`  when the NEXT continuation fired, if one has
+
+    THE WINDOW IS BOUNDED, and that bound is load-bearing rather than cosmetic. An
+    earlier version consulted `timeout_secs` only when NO qualifying turn existed, so a
+    turn arriving at any later time counted — and a replay of nine real
+    `gaika-opus-v5:0.0` continuations then returned `verified` for latencies of 5428s,
+    6487s and 7058s against a 600s timeout. That agent produced 474 turn events, so some
+    turn always eventually follows and every continuation "passed": a test that cannot
+    fail proves nothing.
+
+    A turn also stops counting once a LATER continuation has fired, because from that
+    moment the later one is the better explanation. Windows therefore never overlap and
+    one turn can be credited to at most one continuation.
     """
+    horizon = t0 + timeout_secs
+    if next_continuation_ts is not None:
+        horizon = min(horizon, float(next_continuation_ts))
     qualifying = sorted(
         (t for t in turns
-         if float(t.get("ts", 0)) > t0 and (t.get("digest") or "") != digest_at_t0),
+         if t0 < float(t.get("ts", 0)) <= horizon
+         and (t.get("digest") or "") != digest_at_t0),
         key=lambda t: float(t["ts"]))
     if not qualifying:
         # Fail closed. A window that has expired with no turn is a FAILURE, and one that
         # has not expired yet is not an answer — neither may read as success.
-        if now - t0 >= timeout_secs:
+        if now >= horizon:
             return {"verdict": UNVERIFIED, "reason": "no_qualifying_turn_before_timeout",
-                    "waited_secs": round(now - t0)}
+                    "waited_secs": round(now - t0),
+                    "window_secs": round(horizon - t0)}
         return {"verdict": PENDING, "reason": "window_still_open",
                 "waited_secs": round(now - t0)}
     turn = qualifying[0]
