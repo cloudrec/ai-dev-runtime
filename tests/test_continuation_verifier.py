@@ -212,3 +212,113 @@ def test_pending_respects_the_truncated_window():
     assert out["verdict"] == cv.PENDING
     out2 = _classify(turns=[], now=T0 + 400, timeout_secs=600, next_continuation_ts=T0 + 300)
     assert out2["verdict"] == cv.UNVERIFIED
+
+
+# ── the verifier had no caller, so activating it would have proved nothing ──
+# `core/continuation_verifier` shipped with no call site anywhere: setting
+# NATIVE_CANARY_TARGET would have recorded no verdict, because nothing invoked it. The
+# caller is a READ-ONLY diagnostic, because every input is already durable —
+# native_supervision holds the continuations, event holds the turns and their digests,
+# wake_delivery holds the deliveries — so the verdict is computed from history and the
+# verifier keeps its promise of writing nothing.
+
+def _seed(conn):
+    conn.execute("CREATE TABLE IF NOT EXISTS native_supervision (event_id INTEGER, ts TEXT,"
+                 " ts_epoch REAL, target TEXT, action TEXT, reason TEXT, ok INTEGER, detail TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS wake_delivery (id INTEGER PRIMARY KEY,"
+                 " ts TEXT, at TEXT, source TEXT, event_id INTEGER, delivered INTEGER,"
+                 " reason TEXT, conversation TEXT, route_key TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS agent (target TEXT PRIMARY KEY, session TEXT,"
+                 " project_id TEXT, cwd TEXT)")
+    conn.commit()
+
+
+def _cont(conn, target, event_id, ts, digest):
+    import json as _j
+    conn.execute("INSERT INTO native_supervision (event_id,ts,ts_epoch,target,action,reason,ok)"
+                 " VALUES (?,?,?,?,'continue','continued_same_agent',1)",
+                 (event_id, "t", ts, target))
+    conn.execute("INSERT INTO event (id,ts,ts_epoch,source,type,agent_id,project_id,severity,payload)"
+                 " VALUES (?,?,?,?,?,?,?,?,?)",
+                 (event_id, "t", ts, "agent_watch", "work_stopped_incomplete", target,
+                  "proj", "info", _j.dumps({"digest": digest})))
+    conn.commit()
+
+
+_TURN_ID = [8000]
+
+
+def _turn(conn, ts, digest, project="proj"):
+    """Explicit ids: autoincrement would collide with the ids `_cont` writes."""
+    import json as _j
+    _TURN_ID[0] += 1
+    conn.execute("INSERT INTO event (id,ts,ts_epoch,source,type,agent_id,project_id,severity,payload)"
+                 " VALUES (?,?,?,?,?,?,?,?,?)",
+                 (_TURN_ID[0], "t", ts, "claude_hook", "agent_turn_stopped", "session:sess",
+                  project, "info", _j.dumps({"digest": digest})))
+    conn.commit()
+
+
+def test_the_diagnostic_is_dormant_with_no_canary(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    monkeypatch.delenv(cv.CANARY_ENV, raising=False)
+    from core.control_plane import diagnostics as d
+    out = d.native_continuation_effectiveness()
+    assert out["active"] is False and out["verdict"] == cv.DORMANT
+
+
+def test_the_diagnostic_computes_a_verdict_from_history(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core.control_plane import diagnostics as d
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    _seed(conn)
+    conn.execute("INSERT INTO agent (target,session,project_id) VALUES ('a:0.0','sess','proj')")
+    conn.commit()
+    base = 10_000.0
+    for i in range(3):
+        t0 = base + i * 10_000
+        _cont(conn, "a:0.0", 500 + i, t0, "d%d" % i)
+        _turn(conn, t0 + 100, "moved%d" % i)
+    out = d.native_continuation_effectiveness(conn=conn, target="a:0.0",
+                                              timeout_secs=600, required=3,
+                                              now=base + 40_000)
+    assert out["active"] is True
+    assert out["counts"].get(cv.VERIFIED) == 3
+    assert out["verdict"] == "proven"
+
+
+def test_the_diagnostic_refuses_to_credit_a_delivery(tmp_path, monkeypatch):
+    """The attribution guard must survive the trip through real tables."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core.control_plane import diagnostics as d
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    _seed(conn)
+    conn.execute("INSERT INTO agent (target,session,project_id) VALUES ('a:0.0','sess','proj')")
+    base = 10_000.0
+    _cont(conn, "a:0.0", 900, base, "d0")
+    _turn(conn, base + 100, "moved")
+    from datetime import datetime, timezone
+    at = datetime.fromtimestamp(base + 50, timezone.utc).isoformat()
+    conn.execute("INSERT INTO wake_delivery (at,route_key,delivered,reason) VALUES (?,?,1,'ok')",
+                 (at, "proj"))
+    conn.commit()
+    out = d.native_continuation_effectiveness(conn=conn, target="a:0.0",
+                                              timeout_secs=600, required=1,
+                                              now=base + 5_000)
+    assert out["counts"].get(cv.UNATTRIBUTABLE) == 1
+    assert out["verdict"] == "unproven", "a chat wake must never read as effectiveness"
+
+
+def test_the_diagnostic_writes_nothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core.control_plane import diagnostics as d
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    _seed(conn)
+    conn.execute("INSERT INTO agent (target,session,project_id) VALUES ('a:0.0','sess','proj')")
+    _cont(conn, "a:0.0", 700, 10_000.0, "d0")
+    before = conn.execute("SELECT COUNT(*) FROM event").fetchone()[0]
+    d.native_continuation_effectiveness(conn=conn, target="a:0.0", now=99_999.0)
+    assert conn.execute("SELECT COUNT(*) FROM event").fetchone()[0] == before

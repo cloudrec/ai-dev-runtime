@@ -7,6 +7,7 @@ totals. These helpers are strictly read-only (SELECT only) and never mutate any 
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -92,6 +93,113 @@ def browser_tab_health(*, conn=None, list_fn=None) -> dict:
                 "duplicated": sorted(set(dupes)),
                 # what a reader acts on: reclaimable without touching a live route
                 "reclaimable": len(orphans) + len(dupes)}
+    finally:
+        if own:
+            conn.close()
+
+
+def native_continuation_effectiveness(*, conn=None, target: Optional[str] = None,
+                                      timeout_secs: Optional[int] = None,
+                                      required: Optional[int] = None,
+                                      now: Optional[float] = None) -> dict:
+    """Did native continuations for the canary actually produce work? Read-only.
+
+    `core/continuation_verifier` holds the rules and shipped with NO CALLER — setting
+    `NATIVE_CANARY_TARGET` alone would therefore have proved nothing, because nothing
+    invoked it. This is that caller, and it needs neither new storage nor any change to
+    the supervisor, because every input is already durable:
+
+        native_supervision   the continuations (target, ts, triggering event id)
+        event                agent_turn_stopped records, carrying the pane digest
+        wake_delivery        deliveries on the target's route, for the attribution guard
+
+    So the verdict is COMPUTED FROM HISTORY rather than accumulated, which is why the
+    verifier can keep its promise of writing nothing. Dormant unless a canary is named.
+    """
+    from core import continuation_verifier as cv
+    from core import native_supervisor as ns
+    own = conn is None
+    if own:
+        conn = sqlite3.connect(os.environ.get("CONTROL_PLANE_DB", "control_plane.db"),
+                               timeout=15)
+    try:
+        tgt = (target or cv.canary_target() or "").strip()
+        if not tgt:
+            return {"active": False, "verdict": cv.DORMANT,
+                    "reason": "no canary selected; owner decision outstanding"}
+        now = time.time() if now is None else now
+        timeout_secs = int(timeout_secs if timeout_secs is not None
+                           else cv.DEFAULT_TIMEOUT_SECS)
+        required = int(required if required is not None else cv.DEFAULT_REQUIRED)
+
+        conts = [dict(zip(("event_id", "ts"), r)) for r in conn.execute(
+            "SELECT event_id, ts_epoch FROM native_supervision WHERE target=? "
+            "AND action='continue' AND ok=1 ORDER BY ts_epoch", (tgt,)).fetchall()]
+
+        try:
+            project = ns._project_for_target(tgt, conn=conn) or ""
+        except Exception:  # noqa: BLE001 — an unknown project only widens attribution
+            project = ""
+        idents = (tgt,)
+        try:
+            row = conn.execute("SELECT session, COALESCE(project_id,'') FROM agent "
+                               "WHERE target=?", (tgt,)).fetchone()
+            if row:
+                if row[0]:
+                    idents = (tgt, "session:%s" % str(row[0])[:12])
+                # `_project_for_target` reads the SUPERVISOR REGISTRY, which a target
+                # supervised through the `*` wildcard may never have been written to. The
+                # agent row knows the project regardless, and without this fallback such a
+                # target resolves to "" — losing both the turn match by project and the
+                # route whose deliveries the attribution guard depends on, which would
+                # quietly make every sample look attributable.
+                project = project or (row[1] or "")
+        except Exception:  # noqa: BLE001
+            pass
+
+        turns = []
+        for ts_epoch, payload in conn.execute(
+                "SELECT ts_epoch, payload FROM event WHERE type='agent_turn_stopped' "
+                "AND (project_id=? OR agent_id IN (%s)) ORDER BY ts_epoch"
+                % ",".join("?" * len(idents)), (project, *idents)).fetchall():
+            try:
+                turns.append({"ts": float(ts_epoch),
+                              "digest": (json.loads(payload) or {}).get("digest") or ""})
+            except Exception:  # noqa: BLE001 — an unreadable row is simply not evidence
+                continue
+
+        deliveries = []
+        for (at,) in conn.execute(
+                "SELECT at FROM wake_delivery WHERE route_key=?", (project,)).fetchall():
+            e = _epoch(at)
+            if e is not None:
+                deliveries.append({"ts": e})
+
+        samples = []
+        for i, k in enumerate(conts):
+            d0 = ""
+            try:
+                r = conn.execute("SELECT payload FROM event WHERE id=?",
+                                 (k["event_id"],)).fetchone()
+                if r:
+                    d0 = (json.loads(r[0]) or {}).get("digest") or ""
+            except Exception:  # noqa: BLE001
+                pass
+            nxt = conts[i + 1]["ts"] if i + 1 < len(conts) else None
+            samples.append(cv.classify_continuation(
+                t0=float(k["ts"]), digest_at_t0=d0, turns=turns, deliveries=deliveries,
+                now=now, timeout_secs=timeout_secs, next_continuation_ts=nxt))
+
+        roll = cv.rollup(samples, required=required)
+        counts = {v: sum(1 for s in samples if s["verdict"] == v)
+                  for v in {s["verdict"] for s in samples}}
+        return {"active": True, "target": tgt, "project": project,
+                "route_key": project, "samples": len(samples), "counts": counts,
+                "timeout_secs": timeout_secs, "streak": roll["streak"],
+                "required": roll["required"],
+                # The whole point: effectiveness is PROVEN or it is not. There is no
+                # third state that a reader can mistake for success.
+                "verdict": "proven" if roll["proven"] else "unproven"}
     finally:
         if own:
             conn.close()
