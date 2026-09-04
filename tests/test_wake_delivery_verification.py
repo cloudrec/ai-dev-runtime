@@ -80,6 +80,17 @@ class _S:
             return getattr(self, "streaming", False)
         if "activeElement" in e:
             return self.focused
+        if "?.length" in e:
+            # The PRE-insert draft guard. Must be matched before the generic
+            # "length > 0" branch below, which answers the POST-insert check: both
+            # contain "length > 0" and only the optional chaining tells them apart.
+            # Default False = empty box = proceed, so every existing test keeps its
+            # meaning.
+            return getattr(self, "composer_dirty", False)
+        if "trim() ===" in e:
+            # "is the box exactly our OWN stranded phrase" — one bit, about a string
+            # the module already knows.
+            return getattr(self, "composer_is_ours", False)
         if "textContent.length === 0" in e or "length === 0" in e:
             return self.cleared
         if "textContent.length > 0" in e or "length > 0" in e:
@@ -94,6 +105,12 @@ class _S:
         if selector == cdp.USER_TURN_SEL:
             return self.turns.pop(0) if self.turns else 0
         return 1
+
+    def last_len(self, selector):
+        """Rendered length of the newest matching turn. Default 999 = a real answer, so
+        the settle check treats these deliveries as genuine; a test that cares sets
+        `assistant_len`."""
+        return getattr(self, "assistant_len", 999)
 
     def last_attr(self, selector, attr):
         return ""          # id never changes here; the count alone decides

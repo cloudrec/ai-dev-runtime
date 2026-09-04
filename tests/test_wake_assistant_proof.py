@@ -41,6 +41,12 @@ class _FakeSession:
             return self._next(self._acounts, 0)
         return 0
 
+    def last_len(self, selector):
+        """Rendered length of the newest matching turn. Default 999 = a real
+        answer, so the settle check treats these proofs as genuine deliveries;
+        a test that cares about an EMPTY turn sets `assistant_len`."""
+        return getattr(self, "assistant_len", 999)
+
     def last_attr(self, selector, attr):
         if selector == cc.ASSISTANT_TURN_SEL:
             return self._next(self._aids, None)
