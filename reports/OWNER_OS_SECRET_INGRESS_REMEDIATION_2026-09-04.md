@@ -31,16 +31,24 @@ be determined without reading them.
 | `0988577` | `core/agent_control.py` | bare-credential patterns + `redact_obj()` |
 | `2288f7c` | `core/agent_watch.py` | `excerpt` + `action_taken` |
 | `2288f7c` | `core/stall_doctor.py` | `pending` x2 + `action_taken` |
+| `81778e6` | `core/os_task_queue.py` | `text` x2 (queued instruction text) |
 
 Two classes of defect:
 
-1. **Three writers persisted captured agent/user text with no redaction.** The hook
+1. **Four writers persisted captured agent/user text with no redaction.** The hook
    (600 chars of model output), the pane excerpt (`excerpt_of(tail)`), and the agent's
    INPUT LINE (`pending_input_text` — text typed but not yet submitted). The project had
    already settled the rule in `windows_bridge`, which redacts everything a device
    returns before storing it; these three paths bypassed it. `pending` is the sharpest,
    because an unsent input line is exactly where a pasted credential sits and the
-   standing gate is "paste the BotFather token in the file".
+   standing gate is "paste the BotFather token in the file". The fourth is
+   `os_task_queue`, which copies a queued task's instruction text into the event
+   payload; its `os_task` ROW is left verbatim on purpose, because the task must be
+   delivered as written.
+
+   The remaining nine payload-writing modules were checked individually rather than
+   assumed internal — tmux socket stderr, host probe results, SSH key-selection detail
+   and literal explanatory strings. None carry captured pane, model or user content.
 
 2. **The redactor only caught ASSIGNMENTS.** Every pattern but the private-key block
    required `token=` / `Bearer` in front. A pasted credential has no prefix. Bare
