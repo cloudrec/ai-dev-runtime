@@ -358,6 +358,17 @@ _FOOTER_RE = re.compile(r"(enter to select|↑/↓|↑ ?↓|esc to cancel|tab to
                         re.IGNORECASE)
 
 
+def _redact(text: str) -> str:
+    """Credential-scrub anything headed for durable storage. Fail CLOSED: if the
+    redactor is unavailable the text is withheld, because an event missing its excerpt
+    is a small loss and one carrying a credential is not."""
+    try:
+        from core.agent_control import redact
+        return redact(text or "")
+    except Exception:  # noqa: BLE001
+        return "***REDACTION UNAVAILABLE — text withheld***"
+
+
 def excerpt_of(tail: str, limit: int = 300, cls: str = "") -> str:
     """`concise last meaningful line(s)` — chrome-free, bounded.
 
@@ -671,7 +682,13 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                     continue
             etype, severity, oar = _EVENT_FOR[cls]
             project = project_for(a, conn=conn)
-            ex = excerpt_of(tail, cls=cls) or "process gone from pane"
+            # REDACT the pane excerpt before it can reach the event store or the
+            # action_taken line below. `excerpt_of` returns raw tmux text; a pane is
+            # exactly as likely to hold a credential as a Windows one, which is why
+            # `windows_bridge` already redacts everything a device returns before
+            # storing it. Redacting here rather than inside `excerpt_of` keeps the
+            # classifier reading the real text — only what is PERSISTED is rewritten.
+            ex = _redact(excerpt_of(tail, cls=cls) or "process gone from pane")
             ev = emit_fn(
                 "agent_watch", etype, project_id=project, agent_id=target,
                 severity=severity, owner_action_required=oar,

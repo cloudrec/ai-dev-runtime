@@ -1205,3 +1205,88 @@ def test_redact_obj_terminates_on_deep_nesting():
         cur["n"] = {}
         cur = cur["n"]
     assert redact_obj(deep)
+
+
+# ── the other two ingress paths into the durable event store (2026-09-04) ──
+# The hook was not the only writer of agent/user text. `agent_watch` puts a raw tmux
+# excerpt into the payload AND the action_taken line; `stall_doctor` puts the agent's
+# INPUT LINE — text typed but not yet submitted — into both. On this host the input line
+# is the likeliest place of all for a credential to sit, because the standing owner gate
+# is literally "paste the BotFather token in the file". Events 28159 (excerpt) and 28149
+# (pending) show ordinary pane content already flowing down both.
+
+def _token():
+    return "7123456789:" + "A" * 35
+
+
+def test_agent_watch_redacts_the_pane_excerpt():
+    from core import agent_watch
+    out = agent_watch._redact(f"assistant said {_token()} ok")
+    assert _token() not in out and "REDACTED" in out
+
+
+def test_stall_doctor_redacts_the_input_line():
+    from core import stall_doctor
+    out = stall_doctor._redact(_token())
+    assert _token() not in out and "REDACTED" in out
+
+
+def test_both_redactors_fail_closed(monkeypatch):
+    """If the redactor cannot be reached the text is withheld, never emitted raw."""
+    import sys
+    from core import agent_watch, stall_doctor
+    broken = type(sys)("core.agent_control")
+    def boom(*a, **k):
+        raise RuntimeError("unavailable")
+    broken.redact = boom
+    monkeypatch.setitem(sys.modules, "core.agent_control", broken)
+    for mod in (agent_watch, stall_doctor):
+        out = mod._redact(_token())
+        assert _token() not in out
+        assert "UNAVAILABLE" in out
+
+
+def test_redaction_does_not_touch_the_doctor_decision_path():
+    """`may_submit_queued` and `decide` must keep seeing the REAL input text — redaction
+    is applied at the emit boundary only, or it would change what the doctor DOES rather
+    than only what it records."""
+    import inspect
+    from core import stall_doctor
+    for fn in (stall_doctor.may_submit_queued, stall_doctor.decide,
+               stall_doctor.classify_wait):
+        assert "_redact" not in inspect.getsource(fn), (
+            f"{fn.__name__} must read the real text, not a redacted copy")
+
+
+def test_ordinary_pane_text_survives_both():
+    from core import agent_watch, stall_doctor
+    for benign in ("да, продолжай", "1. Yes  2. No", "waiting for review"):
+        assert agent_watch._redact(benign) == benign
+        assert stall_doctor._redact(benign) == benign
+
+
+# The helpers above prove the redactor WORKS. These prove it is CONNECTED — without
+# them the call sites could be unwired and every test above would still pass. Same
+# source-assertion approach `test_no_creation_path_bypasses_the_guard` uses for the
+# tab-creation guard.
+
+def test_agent_watch_actually_wires_redaction_into_the_excerpt():
+    import inspect
+    from core import agent_watch
+    src = inspect.getsource(agent_watch)
+    assert "_redact(excerpt_of(" in src, (
+        "the pane excerpt must be redacted where it is computed, so both the payload "
+        "and the action_taken line built from it are covered")
+
+
+def test_stall_doctor_actually_wires_redaction_into_every_pending_it_emits():
+    import inspect, re
+    from core import stall_doctor
+    src = inspect.getsource(stall_doctor)
+    emitted = re.findall(r'"pending":\s*([^,\n]+)', src)
+    assert emitted, "expected pending to be emitted somewhere"
+    for expr in emitted:
+        assert "_redact(" in expr, f"unredacted pending reaches the event store: {expr}"
+    # the action_taken summary is persisted too, and carried it verbatim
+    assert "(pending or '')[:80]" not in src.replace(" ", ""), \
+        "action_taken must not interpolate the raw input line"

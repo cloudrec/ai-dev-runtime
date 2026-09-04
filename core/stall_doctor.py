@@ -183,6 +183,25 @@ def may_submit_queued(text: str) -> tuple[bool, str]:
     return True, "queued_line_provenance_safe"
 
 
+def _redact(text: str) -> str:
+    """Credential-scrub text headed for durable storage.
+
+    `pending` is the agent's INPUT LINE — text typed but not yet submitted. On this host
+    that is the single likeliest place for a credential to sit, because the standing
+    owner gate is literally "paste the BotFather token", and it was reaching both the
+    event payload and the `action_taken` summary verbatim.
+
+    Applied ONLY at the emit boundary, never to the value the decision path reads:
+    `may_submit_queued` and `decide` must keep seeing the real text, or redaction would
+    change what the doctor does rather than only what it records. Fails CLOSED.
+    """
+    try:
+        from core.agent_control import redact
+        return redact(text or "")
+    except Exception:  # noqa: BLE001
+        return "***REDACTION UNAVAILABLE — text withheld***"
+
+
 def classify_wait(tail: str, *, state: str = "", pending: str = "") -> dict:
     """(pane tail, inventory state, queued input) -> wait shape + evidence."""
     from core import agent_watch
@@ -523,9 +542,9 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                     "stall_doctor", etype, project_id=project,
                     agent_id=target, severity="high", owner_action_required=True,
                     payload={"target": target, "shape": shape, "reason": d["reason"],
-                             "pending": (pending or "")[:200], "digest": dg},
+                             "pending": _redact(pending)[:200], "digest": dg},
                     action_taken=(f"{target}: {shape} needs the owner — {d['reason']} "
-                                  f"({(pending or '')[:80]})"),
+                                  f"({_redact(pending)[:80]})"),
                     correlation_id=f"waiting:{target}",
                     dedup_key=f"doctor:{target}:{shape}:{dg}",
                     dedup_window_secs=86400, conn=conn)
@@ -555,7 +574,7 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 agent_id=target, severity="info", owner_action_required=False,
                 payload={"target": target, "shape": shape, "action": d["action"],
                          "delivered": ok, "reason": d["reason"], "digest": dg,
-                         "pending": (pending or "")[:120]},
+                         "pending": _redact(pending)[:120]},
                 action_taken=(f"doctor {d['action']} on {target} ({shape}): "
                               f"delivered={ok}"),
                 correlation_id=f"doctor:{target}",
