@@ -719,6 +719,25 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
     # replacing the tab on the SAME bound conversation, which keeps the exact-route
     # guarantee — and exactly one retry. Ordinary back-pressure is NOT recovered: a turn
     # genuinely in flight resolves itself and interrupting it would be destructive.
+    # A composer that is ABSENT on a loaded, responsive page is the same permanent
+    # outage as a wedged generation, and earns the same single recovery. Measured
+    # 2026-09-04: `payment-orchestrator` failed 21 of 21 attempts in one hour with
+    # `composer_ambiguous_or_absent:0` while every other route submitted normally
+    # through the identical selector. The tab was on the right URL, `readyState`
+    # complete, responsive, showing three assistant turns — and held zero
+    # `#prompt-textarea`, zero `[contenteditable]`, zero `textarea`. The registry still
+    # read `writable=1` from a delivery proven at 03:43, so the flag was stale and
+    # nothing re-checked it.
+    #
+    # Only the ABSENT case (`:0`) is recovered, never the ambiguous one. Zero means the
+    # renderer lost the input entirely and will never regain it for this tab; more than
+    # one means we cannot tell which is real, and replacing a tab to resolve our own
+    # uncertainty is how a phrase lands somewhere unintended.
+    if res.get("reason") == "composer_ambiguous_or_absent:0":
+        target = find_target(conversation_url)
+        if target and recover_wedged_tab(target, conversation_url):
+            res = _attempt(conversation_url, phrase, source=source, event_id=event_id)
+            res["after_composer_absent_recovery"] = True
     if res.get("reason") == "assistant_generating_wedged":
         target = find_target(conversation_url)
         if target and recover_wedged_tab(target, conversation_url):

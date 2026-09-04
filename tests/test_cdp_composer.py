@@ -929,6 +929,47 @@ def test_a_close_that_fails_never_raises(monkeypatch):
     assert cc._close_target("") is False
 
 
+# ── an absent composer is a permanent outage too (2026-09-04) ──────────────
+# payment-orchestrator failed 21 of 21 attempts in one hour with
+# composer_ambiguous_or_absent:0 while every other route submitted through the identical
+# selector. The tab was on the right URL, readyState complete, responsive, three
+# assistant turns rendered - and zero #prompt-textarea, zero [contenteditable], zero
+# textarea. The registry still read writable=1 from a delivery proven hours earlier.
+
+def test_an_absent_composer_earns_one_recovery(monkeypatch):
+    from tools import cdp_composer as cc
+    calls, recovered = [], []
+    monkeypatch.setattr(cc, "_attempt",
+                        lambda *a, **k: (calls.append(1),
+                                         {"ok": False, "reason": "composer_ambiguous_or_absent:0"}
+                                         if len(calls) == 1 else
+                                         {"ok": True, "reason": "submitted_and_assistant_responded"})[1])
+    monkeypatch.setattr(cc, "find_target", lambda u: {"id": "T"})
+    monkeypatch.setattr(cc, "recover_wedged_tab",
+                        lambda t, u: (recovered.append(u), {"id": "FRESH"})[1])
+    monkeypatch.setattr(cc, "_record_delivery", lambda *a, **k: a[2])
+    out = cc.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert recovered == ["https://chatgpt.com/c/a"], "the tab must be replaced once"
+    assert out["ok"] is True and out.get("after_composer_absent_recovery") is True
+    assert len(calls) == 2, "exactly one retry, never a loop"
+
+
+def test_an_ambiguous_composer_is_never_recovered(monkeypatch):
+    """Zero means the renderer lost the input. MORE than one means we cannot tell which
+    is real, and replacing a tab to resolve our own uncertainty is how a phrase lands
+    somewhere unintended."""
+    from tools import cdp_composer as cc
+    recovered = []
+    monkeypatch.setattr(cc, "_attempt",
+                        lambda *a, **k: {"ok": False, "reason": "composer_ambiguous_or_absent:3"})
+    monkeypatch.setattr(cc, "find_target", lambda u: {"id": "T"})
+    monkeypatch.setattr(cc, "recover_wedged_tab", lambda t, u: recovered.append(u))
+    monkeypatch.setattr(cc, "_record_delivery", lambda *a, **k: a[2])
+    out = cc.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert recovered == [], "ambiguity must never replace a tab"
+    assert out["ok"] is False
+
+
 # ── started is not answered (2026-09-04) ───────────────────────────────────
 # _await_assistant returned success the instant the stop control appeared, before a
 # single character existed, and nothing revisited it. Measured live in the `mess`
