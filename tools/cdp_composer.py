@@ -146,31 +146,61 @@ def page_responsive(target: dict, timeout: float = 8.0) -> bool:
         return False
 
 
-def _close_target(target_id: str) -> bool:
-    """Close one tab by id, best-effort. A tab that will not close is worse to fight
-    than to leave, so a failure here is swallowed exactly as the old-tab close is.
+def _close_target(target_id: str, *, verify_secs: float = 6.0) -> bool:
+    """Close one tab by id and CONFIRM it is gone. A tab that will not close is worse to
+    fight than to leave, so a failure here is swallowed exactly as the old-tab close is —
+    but it must be reported as a failure, because the caller acts on the answer.
 
-    Returning True means the browser ACCEPTED the close. It used to mean nothing at
-    all: `/json/close/<id>` answers HTTP 200 with the plain text `Target is closing`,
-    `_http` ended in `json.loads(body)`, the parse raised, this except swallowed it,
-    and every SUCCESSFUL close was reported as a failure. Against a real Chrome the
-    function could not return True. Measured 2026-09-03: three duplicate tabs closed,
-    three False returns, page count 8 -> 5.
+    Returning True used to mean only that the browser ACCEPTED the close, and before that
+    it meant nothing at all: `/json/close/<id>` answers HTTP 200 with the plain text
+    `Target is closing`, `_http` ended in `json.loads(body)`, the parse raised, this
+    except swallowed it, and every SUCCESSFUL close was reported as a failure. Against a
+    real Chrome the function could not return True. Measured 2026-09-03: three duplicate
+    tabs closed, three False returns, page count 8 -> 5. That was fixed in `_http`, which
+    now tolerates a non-JSON body rather than raising on success.
 
-    The bug was invisible because the close really happens — only the report was wrong.
-    What it broke is the caller that trusts the answer: `recover_wedged_tab` reads False
-    as "try once more", so every close was followed by a redundant second close of an
-    already-closing target, and the retry that exists for genuinely wedged tabs was
-    spent on healthy ones. Fixed in `_http`, which now tolerates a non-JSON body rather
-    than raising on success.
+    Which uncovered the opposite error. `Target is closing` is an ACKNOWLEDGEMENT, not a
+    completion: `/json/close` asks the target to close, and a renderer wedged on its main
+    thread can fail to act on it. `recover_wedged_tab` is called PRECISELY when the
+    renderer is wedged, so that is the ordinary case there, not an exotic one — and its
+    one retry, written for "a wedged renderer that needs a moment before the browser will
+    drop it", could never fire once every close reported True.
+
+    The result is a tab creation whose paired close silently did not happen: the replaced
+    tab stays open next to its replacement, one leaked page per SUCCESSFUL recovery. It
+    hid for days because the leak is on the success path — this module logs nothing, and
+    a recovery that works is recorded only as `submitted_and_assistant_started_generating`,
+    indistinguishable from a delivery that recovered nothing. Every recovery that FAILS is
+    loudly visible as `renderer_unresponsive`, and those already close their replacement
+    correctly (404496b, 877edaf). Live state 2026-09-04, hours after the event:
+
+        152DFF60FC46  .../c/6a98e672-...-733306a73900  responsive=False   <- "closed"
+        01FFBEE5C2BE  .../c/6a98e672-...-733306a73900  responsive=True    <- replacement
+
+    both open on one bound conversation, which only a create without its close can build.
+    So the close is now verified against `/json/list` before it is believed. Being unable
+    to READ the list is not proof of removal either: that reports False, so the caller
+    retries rather than trusting an answer it never got.
     """
     if not target_id:
         return False
     try:
         _http(f"/json/close/{target_id}")
-        return True
     except Exception:  # noqa: BLE001 — a zombie tab is worse to fight than to leave
         return False
+    deadline = time.monotonic() + verify_secs
+    while True:
+        try:
+            pages = _http("/json/list")
+        except Exception:  # noqa: BLE001 — cannot prove it is gone, so do not claim it
+            return False
+        if not isinstance(pages, list):
+            return False
+        if not any(isinstance(t, dict) and t.get("id") == target_id for t in pages):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
 
 
 def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict]:

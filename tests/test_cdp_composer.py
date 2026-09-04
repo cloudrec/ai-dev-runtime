@@ -1167,23 +1167,130 @@ def test_cleanup_failure_does_not_mask_the_original_outcome(monkeypatch):
 # duplicate tabs closed, three False returns, page count 8 -> 5.
 
 def test_a_plain_text_body_is_not_a_failure(monkeypatch):
-    """The endpoint's real answer. HTTP succeeded, so the close succeeded."""
-    from tools import cdp_composer as cc
-    seen = []
+    """The endpoint's real answer. HTTP succeeded, and the tab really went away.
 
-    def fake_http(path, method="GET"):
-        seen.append(path)
-        raise AssertionError("unreachable — patched below")
+    The fixture now answers `/json/list` as well, because the close is verified against
+    it — the tab is absent there, which is what a genuinely successful close looks like.
+    """
+    from tools import cdp_composer as cc
 
     class _R:
+        def __init__(self, body): self._body = body
         status = 200
-        def read(self): return b"Target is closing"
+        def read(self): return self._body
         def __enter__(self): return self
         def __exit__(self, *a): return False
 
-    monkeypatch.setattr(cc.urllib.request, "urlopen", lambda *a, **k: _R())
+    def fake_urlopen(req, *a, **k):
+        url = req.full_url if hasattr(req, "full_url") else str(req)
+        if "/json/list" in url:
+            return _R(b"[]")                      # the tab is gone
+        return _R(b"Target is closing")
+
+    monkeypatch.setattr(cc.urllib.request, "urlopen", fake_urlopen)
     assert cc._http("/json/close/abc") == {}, "a non-JSON 200 body is not an error"
     assert cc._close_target("abc") is True, "a successful close must report True"
+
+
+# ── an ACCEPTED close is not a COMPLETED close (2026-09-04) ────────────────
+# `/json/close/<id>` answers 200 `Target is closing` whether or not the target ever
+# closes, and a renderer wedged on its main thread can fail to act on it — which is
+# exactly the state `recover_wedged_tab` is called in. Reporting True there left the
+# replaced tab open beside its replacement, one leaked page per SUCCESSFUL recovery,
+# and disarmed the single retry that exists for this case. Caught live: two tabs on
+# `.../c/6a98e672-...-733306a73900`, 152DFF60FC46 unresponsive and 01FFBEE5C2BE
+# answering, hours after the recovery that "closed" the first.
+
+def _close_fixture(monkeypatch, list_answers):
+    """`/json/close` always succeeds; `/json/list` answers from `list_answers` in turn,
+    the last entry repeating once exhausted."""
+    from tools import cdp_composer as cc
+    calls = {"close": 0, "list": 0}
+    answers = list(list_answers)
+
+    def fake_http(path, method="GET"):
+        if "/json/close/" in path:
+            calls["close"] += 1
+            return {}
+        calls["list"] += 1
+        return answers[min(calls["list"] - 1, len(answers) - 1)]
+
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    return cc, calls
+
+
+def test_a_close_the_browser_accepted_but_never_performed_reports_false(monkeypatch):
+    """The live defect. 200 `Target is closing`, and the target is still listed."""
+    still_there = [{"id": "WEDGED", "type": "page", "url": "https://chatgpt.com/c/a"}]
+    cc, calls = _close_fixture(monkeypatch, [still_there])
+    assert cc._close_target("WEDGED", verify_secs=0.0) is False, \
+        "an acknowledged close that left the tab open is not a close"
+    assert calls["close"] == 1
+
+
+def test_a_close_that_completes_a_moment_later_still_reports_true(monkeypatch):
+    """A wedged renderer the browser needs a moment to drop is the ordinary case this
+    verification must tolerate, not fail."""
+    still_there = [{"id": "WEDGED", "type": "page", "url": "https://chatgpt.com/c/a"}]
+    cc, calls = _close_fixture(monkeypatch, [still_there, still_there, []])
+    assert cc._close_target("WEDGED", verify_secs=30.0) is True
+    assert calls["list"] == 3, "it must keep looking until the deadline, not give up once"
+
+
+def test_an_unreadable_page_list_is_not_proof_of_removal(monkeypatch):
+    """Being unable to READ the list is not the same as the tab being gone. Claiming
+    True there is how the original defect got its answer wrong in the first place."""
+    from tools import cdp_composer as cc
+
+    def fake_http(path, method="GET"):
+        if "/json/close/" in path:
+            return {}
+        raise OSError("browser gone")
+
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    assert cc._close_target("WEDGED", verify_secs=0.0) is False
+
+    # Same rule for an answer that is not a page list at all.
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET": {})
+    assert cc._close_target("WEDGED", verify_secs=0.0) is False
+
+
+def test_the_recovery_retry_can_now_actually_fire(monkeypatch):
+    """What the defect disarmed, driven through the REAL `_close_target`.
+
+    `recover_wedged_tab` retries the old-tab close once, for "a wedged renderer that
+    needs a moment before the browser will drop it". While every close reported True on
+    the acknowledgement alone, that branch was unreachable — the leak and the disabled
+    remedy were the same bug. Here the browser accepts both closes and drops neither, so
+    the tab stays listed and the retry must be spent.
+    """
+    from tools import cdp_composer as cc
+    closes = []
+    old_tab = {"id": "OLD", "type": "page", "url": "https://chatgpt.com/c/a"}
+
+    def fake_http(path, method="GET"):
+        if "/json/new" in path:
+            return {"id": "FRESH"}
+        if "/json/close/" in path:
+            closes.append(path.rsplit("/", 1)[1])
+            return {}                             # 200 `Target is closing` — and it does not
+        return [old_tab]                          # /json/list: still there, every time
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc, "find_target", lambda u: {"id": "FRESH", "url": u})
+    monkeypatch.setattr(cc, "page_responsive", lambda t, timeout=8.0: True)
+    # A fake clock, so the verification deadline is reached instantly instead of
+    # spinning for `verify_secs` of real time twice.
+    now = {"t": 0.0}
+    monkeypatch.setattr(cc.time, "monotonic", lambda: now["t"])
+    monkeypatch.setattr(cc.time, "sleep", lambda s=0.0: now.__setitem__("t", now["t"] + (s or 1.0)))
+    out = cc.recover_wedged_tab(old_tab, "https://chatgpt.com/c/a")
+    assert out == {"id": "FRESH", "url": "https://chatgpt.com/c/a"}, \
+        "the verified replacement is still what a recovery hands back"
+    assert closes == ["OLD", "OLD"], "the second attempt is the retry the defect disabled"
 
 
 def test_json_endpoints_still_parse(monkeypatch):
