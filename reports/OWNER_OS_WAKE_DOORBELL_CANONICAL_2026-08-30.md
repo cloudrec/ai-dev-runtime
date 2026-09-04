@@ -9717,3 +9717,85 @@ The native supervisor remains unactivated solely because of the existing activat
 284 is `waiting_approval`. Nothing in this part touched it. The outage and the autonomy
 gate are independent: delivery is now working, and agents still wait for a human because
 that is what the gate says.
+
+---
+
+# Part 91 — started is not answered
+
+Part 90 ended by calling the wake path healthy on the strength of
+`submitted_and_assistant_started_generating`. That was wrong, and the owner said so:
+chats still were not visibly getting a reply. The evidence is in the conversations
+themselves.
+
+## What the pages actually contain
+
+Rendered turn sequences, roles and LENGTHS only, never text:
+
+```
+mess             a367, u191, a475, u193, a753, u185, a1, u190, a36
+                                                      ^^  ONE character
+gaika-extension  u86, a994, u18, u188, a1391
+                            ^^^ two consecutive user turns - u18 never answered
+owner-os         a1065, u195, a899, u201, a812, ...      healthy, alternating
+```
+
+An assistant turn of one character is a generation that began and produced nothing.
+Every `mess` delivery in the same window recorded
+`delivered=1 submitted_and_assistant_started_generating`.
+
+## The defect
+
+`_await_assistant` has three success paths — a new assistant turn, the newest turn id
+advancing, or the streaming control appearing — and ALL THREE returned terminal success
+the moment they fired. The streaming control is rendered before a single character
+exists, so "delivered" could mean nothing more than "the backend accepted the turn".
+Nothing ever went back to ask whether text arrived.
+
+The docstring was honest: it says "did the assistant actually START". The caller then
+recorded that as delivery, and the accounting inherited a claim the check never made.
+
+## The fix
+
+`_settled()` now gates every success path:
+
+* still streaming -> success. A long answer is an answer in progress, and waiting
+  further would stall the delivery loop.
+* streaming finished, newest assistant turn under two rendered characters -> FAILURE,
+  named `assistant_started_but_produced_nothing:<n>`, so the closed-loop watchdog
+  re-wakes instead of believing the wake landed.
+* length unreadable -> success. Cannot-tell must not manufacture a failure.
+
+The emptiness test is deliberately blunt. A real two-character reply is a reply; only a
+turn that produced nothing at all is called a failure. `_Session.last_len()` reads a
+LENGTH and never the text, the same discipline `last_attr` keeps by reading an opaque id.
+
+## Two mistakes made getting there
+
+Both caught by tests, both worth recording.
+
+**Only one path was gated first.** `_settled` was wired into the streaming branch alone,
+leaving the other two success paths terminal — the more common ones. A fix that covers
+one of three doors is not a fix.
+
+**The settle loop burned real time in tests.** The first version slept up to twenty
+seconds inside every test that reached the success path, and one run took four minutes
+before it was stopped. The window is now injectable and the loop sleeps only while
+streaming is actually observed.
+
+## Evidence
+
+```
+tests/test_cdp_composer.py                                    84 passed
++ wake_bridge + closed_loop_wake + diagnostics + agent_watch  388 passed
+```
+
+The asserting test fails when the settle check is disconnected, verified by
+disconnecting it. Controls pin that a two-character reply succeeds, that an unreadable
+length does not invent a failure, and that still-streaming is success.
+
+## What this does not claim
+
+It does not prove the owner sees a USEFUL reply — only that a non-empty assistant turn
+persisted. A wake that lands and is answered with something unhelpful still counts as
+delivered, and should: judging the content of an owner's conversation is not this
+module's business.

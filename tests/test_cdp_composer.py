@@ -6,6 +6,9 @@ import sys
 
 import pytest
 
+import os as _os
+_os.environ.setdefault("WAKE_ASSISTANT_SETTLE_SECS", "0")
+
 spec = importlib.util.spec_from_file_location(
     "cdp_composer", "/root/ai-dev-runtime/tools/cdp_composer.py")
 cdp = importlib.util.module_from_spec(spec)
@@ -73,6 +76,11 @@ class _S:
         if selector == cdp.ASSISTANT_TURN_SEL:
             return self.assistant.pop(0) if len(self.assistant) > 1 else self.assistant[0]
         return self.counts.get("n", 1)
+
+    def last_len(self, selector):
+        """Rendered length of the newest matching turn. Default 999 = a real answer, so
+        the pre-existing tests keep their meaning; a test that cares sets `assistant_len`."""
+        return getattr(self, "assistant_len", 999)
 
     def last_attr(self, selector, attr):
         # Selector-aware: the assistant lookup must not consume the script that
@@ -630,6 +638,11 @@ class _WedgeSession(_FakeSession):
             return self.streaming
         return super().boolean(expression)
 
+    def last_len(self, selector):
+        """Rendered length of the newest matching turn. Default 999 = a real answer, so
+        the pre-existing tests keep their meaning; a test that cares sets `assistant_len`."""
+        return getattr(self, "assistant_len", 999)
+
     def last_attr(self, selector, attr):
         return self.turn_ids.pop(0) if self.turn_ids else "m1"
 
@@ -910,6 +923,60 @@ def test_a_close_that_fails_never_raises(monkeypatch):
     monkeypatch.setattr(cc, "_http", boom)
     assert cc._close_target("x") is False
     assert cc._close_target("") is False
+
+
+# ── started is not answered (2026-09-04) ───────────────────────────────────
+# _await_assistant returned success the instant the stop control appeared, before a
+# single character existed, and nothing revisited it. Measured live in the `mess`
+# conversation: rendered turns ... a753, u185, a1, u190, a36 — an assistant turn of ONE
+# character — while every delivery for that route read delivered=1
+# submitted_and_assistant_started_generating. The owner sees a wake with no reply.
+
+def test_a_turn_that_starts_and_produces_nothing_is_not_delivered(wired):
+    # streaming=[0]: generation has FINISHED. A turn still streaming is a long answer,
+    # not an empty one, and is correctly treated as success.
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.streaming = [1, 0]   # starts, then FINISHES
+    s.assistant = [1]      # a turn exists...
+    s.assistant_len = 1          # the live value observed in `mess`
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is False, r
+    assert r["reason"].startswith("assistant_started_but_produced_nothing"), r
+
+
+def test_a_real_answer_still_succeeds(wired):
+    """The control. Only an EMPTY turn is a failure; a two-character reply is a reply."""
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.streaming = [1, 0]
+    s.assistant = [1]
+    s.assistant_len = 2
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is True, r
+
+
+def test_an_unreadable_length_does_not_invent_a_failure(wired):
+    """last_len returning None means 'cannot tell'. Cannot-tell must not manufacture a
+    failure for a turn that may be perfectly fine."""
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.streaming = [1, 0]
+    s.assistant = [1]
+    s.assistant_len = None
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is True, r
+
+
+def test_still_streaming_when_the_window_closes_is_success(wired):
+    """A long answer is still an answer in progress; waiting further would stall the
+    delivery loop."""
+    from tools import cdp_composer as cc
+
+    class _Streaming:
+        def count(self, sel):
+            return 1 if sel == cc.STREAMING_SEL else 0
+        def last_len(self, sel):
+            return 0
+    out = cc._settled(_Streaming(), "started", settle_secs=0)
+    assert out == {"ok": True, "reason": "started"}
 
 
 # ── never submit a human's unsent draft (2026-09-03) ───────────────────────

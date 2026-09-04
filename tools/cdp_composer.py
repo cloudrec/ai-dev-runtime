@@ -379,6 +379,20 @@ class _Session:
         v = ((r.get("result") or {}).get("value"))
         return int(v) if isinstance(v, (int, float)) else -1
 
+    def last_len(self, selector: str) -> Optional[int]:
+        """How many characters the LAST matching element renders. A length, never the
+        text — the same discipline `last_attr` keeps by reading an opaque id. Used to
+        tell a real answer from a turn that started and produced nothing. None when
+        unreadable, which fails closed at the caller."""
+        expr = (f"(function(){{const n=document.querySelectorAll({selector!r});"
+                f"if(!n.length)return -1;"
+                f"return (n[n.length-1].textContent||'').trim().length;}})()")
+        r = self.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
+        v = ((r.get("result") or {}).get("value"))
+        if not isinstance(v, (int, float)):
+            return None
+        return None if int(v) < 0 else int(v)
+
     def last_attr(self, selector: str, attr: str) -> Optional[str]:
         """The named ATTRIBUTE of the last element matching the selector — an opaque id,
         never text. Returns None when unreadable, "" when absent; both fail closed at the
@@ -725,6 +739,48 @@ def _latch_submitted(source: str, event_id: Optional[int]) -> None:
         pass
 
 
+ASSISTANT_SETTLE_SECS = int(os.getenv("WAKE_ASSISTANT_SETTLE_SECS", "20"))
+
+
+def _settled(s, started_reason: str, settle_secs: Optional[float] = None) -> dict:
+    """Generation STARTED. Did it produce anything?
+
+    `submitted_and_assistant_started_generating` was returned the instant the stop
+    control appeared — before a single character existed — and nothing ever revisited
+    it. Measured live 2026-09-04 in the `mess` conversation: the rendered turn sequence
+    was `... a753, u185, a1, u190, a36`, an assistant turn of ONE character, while every
+    delivery for that route read `delivered=1 submitted_and_assistant_started_generating`.
+    Started is not answered, and an owner reading that chat sees a wake with no reply.
+
+    So: wait a bounded moment for the newest assistant turn to stop being empty. Still
+    streaming is success — a long answer is still an answer in progress. Streaming
+    finished with an essentially empty turn is a FAILURE, named as one, so the
+    closed-loop watchdog re-wakes instead of believing the wake landed.
+
+    The emptiness test is deliberately blunt: fewer than two rendered characters. A real
+    reply of two characters is possible and is treated as success; only a turn that
+    produced nothing at all is called a failure. Length only — never the text.
+    """
+    window = ASSISTANT_SETTLE_SECS if settle_secs is None else settle_secs
+    deadline = time.time() + window
+    while True:
+        if s.count(STREAMING_SEL) > 0:
+            if time.time() >= deadline:
+                # Still producing when the window closed: a long answer is
+                # still an answer, and waiting longer would stall the loop.
+                return {"ok": True, "reason": started_reason}
+            time.sleep(2)
+            continue
+        n = s.count(ASSISTANT_TURN_SEL)
+        if n <= 0:
+            return {"ok": False, "reason": "assistant_started_then_left_no_turn"}
+        length = s.last_len(ASSISTANT_TURN_SEL)
+        if length is not None and length < 2:
+            return {"ok": False, "reason": f"assistant_started_but_produced_nothing:{length}"}
+        return {"ok": True, "reason": started_reason}
+
+
+
 def _await_assistant(s, asst_before: int, asst_id_before) -> dict:
     """Did the assistant actually start after our message landed?
 
@@ -745,13 +801,13 @@ def _await_assistant(s, asst_before: int, asst_id_before) -> dict:
     deadline = time.time() + ASSISTANT_START_SECS
     while time.time() < deadline:
         if s.count(STREAMING_SEL) > 0:
-            return {"ok": True, "reason": "submitted_and_assistant_started_generating"}
+            return _settled(s, "submitted_and_assistant_started_generating")
         if s.count(ASSISTANT_TURN_SEL) > asst_before:
-            return {"ok": True, "reason": "submitted_and_assistant_responded"}
+            return _settled(s, "submitted_and_assistant_responded")
         asst_id_now = s.last_attr(ASSISTANT_TURN_SEL, "data-message-id")
         if (asst_id_before is not None and asst_id_now
                 and asst_id_now != asst_id_before):
-            return {"ok": True, "reason": "submitted_and_assistant_turn_advanced"}
+            return _settled(s, "submitted_and_assistant_turn_advanced")
         time.sleep(2)
     return {"ok": False,
             "reason": f"user_turn_landed_but_assistant_never_started_in_{ASSISTANT_START_SECS}s"}
