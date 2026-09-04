@@ -203,6 +203,27 @@ def _close_target(target_id: str, *, verify_secs: float = 6.0) -> bool:
         time.sleep(0.5)
 
 
+def _reap(target_id: str) -> bool:
+    """Close a tab we are responsible for, and if the browser has not dropped it yet,
+    ask exactly once more.
+
+    `_close_target` waits for the target to leave `/json/list` before it believes the
+    close, so a False here means the browser accepted the request and still holds the
+    page. Measured three times on 2026-09-04 during live cleanups: the close completed
+    on its own a moment AFTER the deadline. One more ask covers that, and stopping at two
+    keeps the existing rule — "a zombie tab is worse to fight than to leave".
+
+    The old-tab close on the success path already worked this way. The cleanup closes did
+    not, and that asymmetry is the leak: a recovery that FAILS verification closes the
+    replacement it opened, once, and if that close was merely accepted the page stayed —
+    against `BROWSER_MAX_PAGES`, on a bound conversation, forever. Watched live for 50
+    minutes on 2026-09-04: `006DB4FC881E` appeared on the `mess` conversation at 18:16:47
+    beside `7A1FAF18A477`, `mess renderer_unresponsive` was recorded 22 seconds later —
+    that reason IS this branch — and the page count never came back down.
+    """
+    return _close_target(target_id) or _close_target(target_id)
+
+
 def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict]:
     """Replace a wedged renderer with a fresh tab on the SAME bound conversation.
 
@@ -249,15 +270,14 @@ def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict
             # untouched, so the promise above holds: a failed recovery still cannot
             # leave us with no ChatGPT tab at all. It ends with exactly the tabs it
             # started with.
-            _close_target(fresh["id"])
+            _reap(fresh["id"])
             return None
         if old_target.get("id") and old_target["id"] != fresh["id"]:
             # One retry, then stop. `_close_target` swallows failures on purpose —
             # "a zombie tab is worse to fight than to leave" — but a single retry
             # costs nothing and covers the ordinary case of a wedged renderer that
             # needs a moment before the browser will drop it.
-            if not _close_target(old_target["id"]):
-                _close_target(old_target["id"])
+            _reap(old_target["id"])
         # Return the tab we VERIFIED, never a re-scan.
         #
         # This used to `return find_target(conversation_url)`, which walks the page
@@ -295,7 +315,7 @@ def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict
         # with exactly the tabs it started with.
         try:
             if fresh and fresh.get("id"):
-                _close_target(fresh["id"])
+                _reap(fresh["id"])
         except Exception:  # noqa: BLE001 — never let cleanup mask the original failure
             pass
         return None
@@ -357,11 +377,11 @@ def open_chatgpt_page(conversation_url: str) -> Optional[dict]:
                 return t
         # Never became the bound conversation. Whatever it did become is not ours to
         # keep: close the id we opened, then report only what genuinely exists.
-        _close_target(fresh["id"])
+        _reap(fresh["id"])
         return find_target(conversation_url)
     except Exception:  # noqa: BLE001
         if fresh and fresh.get("id"):
-            _close_target(fresh["id"])
+            _reap(fresh["id"])
         return None
 
 

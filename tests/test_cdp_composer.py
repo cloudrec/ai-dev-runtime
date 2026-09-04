@@ -879,11 +879,17 @@ def test_an_unverified_replacement_tab_is_closed_not_leaked(monkeypatch):
 
 def test_a_failed_recovery_leaves_the_old_tab_alone(monkeypatch):
     """The module's standing promise: a failed recovery cannot leave us with no
-    ChatGPT tab at all. It must end with exactly the tabs it started with."""
+    ChatGPT tab at all. It must end with exactly the tabs it started with.
+
+    Every close it issues is of the replacement — the count of asks is `_reap`'s
+    business, and it retries once when the browser accepts a close without performing
+    it, so what matters here is WHICH id is closed, never how many times."""
     out, calls = _recover_with(monkeypatch, verified=False)
     assert out is None
     assert "/json/close/old" not in calls
-    assert len([c for c in calls if "/json/close/" in c]) == 1
+    closes = [c for c in calls if "/json/close/" in c]
+    assert closes and set(closes) == {"/json/close/fresh"}, \
+        "a failed recovery may close only the tab it opened"
 
 
 def test_a_successful_recovery_keeps_the_new_tab_and_closes_the_old(monkeypatch):
@@ -1358,6 +1364,106 @@ def test_non_chatgpt_pages_are_never_probed(monkeypatch):
     monkeypatch.setattr(cc, "page_responsive", probe)
     assert cc.find_chatgpt_page()["id"] == "LIVE"
     assert probed == ["LIVE"], "only ChatGPT pages may be probed"
+
+
+# ── the cleanup close had no retry, and that was the leak (2026-09-04) ────
+# `_close_target` waits for the target to leave /json/list, so False means the browser
+# accepted the close and still holds the page — observed three times in live cleanups,
+# each completing on its own just after the deadline. The old-tab close on the SUCCESS
+# path already asked twice. The cleanup closes asked once, so a recovery that failed
+# verification left the replacement it had opened sitting against BROWSER_MAX_PAGES.
+# Watched live for 50 minutes: 006DB4FC881E appeared on the `mess` conversation at
+# 18:16:47 beside 7A1FAF18A477, `mess renderer_unresponsive` (this exact branch) was
+# recorded 22s later, and the count never came back down.
+
+def test_a_close_that_lands_on_the_second_ask_is_a_close(monkeypatch):
+    from tools import cdp_composer as cc
+    calls = []
+    monkeypatch.setattr(cc, "_close_target",
+                        lambda tid: (calls.append(tid), len(calls) > 1)[1])
+    assert cc._reap("SLOW") is True
+    assert calls == ["SLOW", "SLOW"], "one retry, because the browser can be slow to drop"
+
+
+def test_reap_stops_at_two_asks(monkeypatch):
+    """A zombie tab is worse to fight than to leave — the rule the old-tab close kept."""
+    from tools import cdp_composer as cc
+    calls = []
+    monkeypatch.setattr(cc, "_close_target",
+                        lambda tid: (calls.append(tid), False)[1])
+    assert cc._reap("STUCK") is False
+    assert len(calls) == 2
+
+
+def test_reap_does_not_ask_twice_when_the_first_close_worked(monkeypatch):
+    from tools import cdp_composer as cc
+    calls = []
+    monkeypatch.setattr(cc, "_close_target",
+                        lambda tid: (calls.append(tid), True)[1])
+    assert cc._reap("GONE") is True
+    assert len(calls) == 1
+
+
+def _leaky_recovery(monkeypatch, *, raise_instead):
+    """A recovery that never verifies its replacement, with a close the browser accepts
+    but does not perform on the first ask."""
+    from tools import cdp_composer as cc
+    closed = []
+
+    def fake_close(tid, **_kw):
+        closed.append(tid)
+        return len([c for c in closed if c == tid]) > 1   # lands on the second ask
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", lambda p, method="GET":
+                        {"id": "FRESH"} if "/json/new" in p else {})
+    monkeypatch.setattr(cc, "_close_target", fake_close)
+    if raise_instead:
+        monkeypatch.setattr(cc, "find_target",
+                            lambda u: (_ for _ in ()).throw(OSError("browser timing out")))
+    else:
+        monkeypatch.setattr(cc, "find_target", lambda u: None)   # never becomes ours
+    monkeypatch.setattr(cc, "page_responsive", lambda t, timeout=8.0: False)
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    out = cc.recover_wedged_tab({"id": "OLD"}, "https://chatgpt.com/c/a")
+    return out, closed
+
+
+def test_a_failed_recovery_reaps_the_replacement_it_could_not_verify(monkeypatch):
+    """The verification-timeout branch. The replacement must not survive the failure."""
+    out, closed = _leaky_recovery(monkeypatch, raise_instead=False)
+    assert out is None, "a failed recovery still reports failure"
+    assert closed == ["FRESH", "FRESH"], "the retry is what actually removes the page"
+    assert "OLD" not in closed, "the old tab is still left alone"
+
+
+def test_a_recovery_that_raises_also_reaps_its_replacement(monkeypatch):
+    """The sibling except-branch, same promise: a failed recovery ends with exactly the
+    tabs it started with."""
+    out, closed = _leaky_recovery(monkeypatch, raise_instead=True)
+    assert out is None
+    assert closed == ["FRESH", "FRESH"]
+    assert "OLD" not in closed
+
+
+def test_open_chatgpt_page_reaps_a_replacement_it_could_not_verify(monkeypatch):
+    """The second creation path carries the same guarantee."""
+    from tools import cdp_composer as cc
+    closed = []
+
+    def fake_close(tid, **_kw):
+        closed.append(tid)
+        return len(closed) > 1
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", lambda p, method="GET":
+                        {"id": "FRESH"} if "/json/new" in p else {})
+    monkeypatch.setattr(cc, "_close_target", fake_close)
+    monkeypatch.setattr(cc, "find_target", lambda u: None)
+    monkeypatch.setattr(cc, "page_responsive", lambda t, timeout=8.0: False)
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    assert cc.open_chatgpt_page("https://chatgpt.com/c/a") is None
+    assert closed == ["FRESH", "FRESH"]
 
 
 def test_json_endpoints_still_parse(monkeypatch):
