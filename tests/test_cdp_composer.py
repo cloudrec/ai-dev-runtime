@@ -58,7 +58,7 @@ class _S:
             # infrastructure check must not shift the scripted queue every
             # other test depends on. Default False = empty = proceed.
             return getattr(self, "composer_dirty", False)
-        if "textContent||'').trim() ===" in expression:
+        if "endsWith" in expression:
             # "is the box exactly our OWN phrase" - one bit, about a string this
             # module already knows. Structural, same reason as the probes above.
             return getattr(self, "composer_is_ours", False)
@@ -1029,6 +1029,33 @@ def test_still_streaming_when_the_window_closes_is_success(wired):
 # insert and asked merely "is it non-empty", by which point a pre-existing draft and the
 # wake are one string — so a wake typed into a box holding someone's half-written message
 # concatenated the two and clicked send, submitting their draft under their account.
+
+def test_a_stranded_phrase_from_ANOTHER_agent_is_still_ours(wired):
+    """Two agents deliberately share one conversation (hostsecure + security-demo), and
+    the sent text is prefixed per agent - `agent=<target>. <phrase>`. Exact equality
+    therefore never matched text stranded by the other agent, and the shared box stayed
+    blocked. insertText also appends, so a failed submit followed by a later attempt
+    stacks two phrases: measured live, composers held 187-190 characters where one
+    phrase is 93-97. Matching the invariant tail covers both shapes."""
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.composer_dirty = True
+    s.composer_is_ours = True          # the fake answers the tail probe
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "agent=other:0.0. " + "P" * 80,
+                          claim=False)
+    assert r["ok"] is True, r
+
+
+def test_the_probe_asks_for_a_tail_not_equality(wired):
+    """Equality is what failed. The expression must test endsWith, and must still send
+    only a string the module already holds - never read foreign text."""
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.composer_dirty = True
+    s.composer_is_ours = True
+    cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE-" + "x" * 80, claim=False)
+    probes = [e for e in s.exprs if "endsWith" in e]
+    assert probes, "the guard must compare by tail"
+    assert not any("substring" in e or "innerText" in e for e in probes)
+
 
 def test_our_own_stranded_phrase_is_typed_over_not_refused(wired):
     """A submit that fails AFTER insertText leaves the phrase in the box. Refusing on

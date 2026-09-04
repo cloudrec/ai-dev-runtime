@@ -87,7 +87,7 @@ class _S:
             # Default False = empty box = proceed, so every existing test keeps its
             # meaning.
             return getattr(self, "composer_dirty", False)
-        if "trim() ===" in e:
+        if "endsWith" in e:
             # "is the box exactly our OWN stranded phrase" — one bit, about a string
             # the module already knows.
             return getattr(self, "composer_is_ours", False)

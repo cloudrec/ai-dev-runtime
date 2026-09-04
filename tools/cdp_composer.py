@@ -969,10 +969,24 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
             # one bit: "is the box exactly our own phrase". Nothing about a human's draft
             # is learned, so the privacy rule holds — we still never read foreign text.
             # Only our own leftover may be typed over; anything else is still refused.
+            # Match our TAIL, not the whole string. Exact equality fails on two counts
+            # seen live: the sent text is prefixed per agent (`agent=<target>. <phrase>`),
+            # so a phrase stranded by one agent can never equal another's — and
+            # `hostsecure` and `security-demo` deliberately SHARE one conversation, so
+            # they strand text in each other's box. Worse, `insertText` appends, so a
+            # failed submit followed by a later attempt stacks two phrases: measured
+            # 2026-09-04, composers held 187-190 characters where one phrase is 93-97.
+            # Equality against a single phrase could never match either shape, and the
+            # route stayed blocked.
+            #
+            # The tail is the fixed part of WAKE_PHRASE, identical for every agent and
+            # not something a person types. Still one bit, still about a string this
+            # module already holds: no foreign content is read.
+            tail = phrase.strip()[-60:]
             mine = s.boolean(
                 "(function(){const e=document.querySelector(%s);"
-                "return !!e && (e.textContent||'').trim() === %s;})()"
-                % (json.dumps(COMPOSER_SEL), json.dumps(phrase.strip())))
+                "return !!e && (e.textContent||'').trim().endsWith(%s);})()"
+                % (json.dumps(COMPOSER_SEL), json.dumps(tail)))
             if mine is not True:
                 return {"ok": False, "reason": "composer_holds_unsent_text"}
             # Our own phrase, stranded by a failed submit. Clear it before re-inserting,
