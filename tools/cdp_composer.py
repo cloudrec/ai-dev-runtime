@@ -940,7 +940,28 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         already = s.boolean(
             f"(document.querySelector({COMPOSER_SEL!r})||{{}}).textContent?.length > 0")
         if already is True:
-            return {"ok": False, "reason": "composer_holds_unsent_text"}
+            # OURS or THEIRS. A submit that failed after `Input.insertText` leaves the
+            # phrase sitting in the box; refusing on that forever deadlocks the route,
+            # which is exactly what happened within minutes of this guard going live —
+            # mess, hostsecure and security-demo each held ~190 characters, the length of
+            # the wake phrase, and every subsequent wake was refused.
+            #
+            # The comparison is against a string this module ALREADY KNOWS, and it yields
+            # one bit: "is the box exactly our own phrase". Nothing about a human's draft
+            # is learned, so the privacy rule holds — we still never read foreign text.
+            # Only our own leftover may be typed over; anything else is still refused.
+            mine = s.boolean(
+                "(function(){const e=document.querySelector(%s);"
+                "return !!e && (e.textContent||'').trim() === %s;})()"
+                % (json.dumps(COMPOSER_SEL), json.dumps(phrase.strip())))
+            if mine is not True:
+                return {"ok": False, "reason": "composer_holds_unsent_text"}
+            # Our own phrase, stranded by a failed submit. Clear it before re-inserting,
+            # since insertText APPENDS and would otherwise send the phrase twice.
+            s.call("Runtime.evaluate", {"expression":
+                "(function(){const e=document.querySelector(%s);"
+                "if(e){e.textContent='';e.dispatchEvent(new Event('input',{bubbles:true}));}})()"
+                % json.dumps(COMPOSER_SEL)})
 
         # The ONLY string ever sent into the page.
         s.call("Input.insertText", {"text": phrase})

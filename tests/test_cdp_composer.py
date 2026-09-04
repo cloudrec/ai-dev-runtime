@@ -58,6 +58,10 @@ class _S:
             # infrastructure check must not shift the scripted queue every
             # other test depends on. Default False = empty = proceed.
             return getattr(self, "composer_dirty", False)
+        if "textContent||'').trim() ===" in expression:
+            # "is the box exactly our OWN phrase" - one bit, about a string this
+            # module already knows. Structural, same reason as the probes above.
+            return getattr(self, "composer_is_ours", False)
         if "stop-button" in expression:
             # Back-pressure probe. Answered STRUCTURALLY, like readyState, so it does not
             # consume the scripted queue below — otherwise adding an infrastructure check
@@ -984,6 +988,22 @@ def test_still_streaming_when_the_window_closes_is_success(wired):
 # insert and asked merely "is it non-empty", by which point a pre-existing draft and the
 # wake are one string — so a wake typed into a box holding someone's half-written message
 # concatenated the two and clicked send, submitting their draft under their account.
+
+def test_our_own_stranded_phrase_is_typed_over_not_refused(wired):
+    """A submit that fails AFTER insertText leaves the phrase in the box. Refusing on
+    that forever deadlocks the route, which is exactly what happened within minutes of
+    the guard going live: mess, hostsecure and security-demo each held ~190 characters —
+    the phrase's own length — and every later wake was refused.
+
+    The comparison is against a string this module already knows and yields one bit, so
+    nothing about a human's draft is learned. Only our own leftover may be typed over."""
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.composer_dirty = True
+    s.composer_is_ours = True
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r["ok"] is True, r
+    assert s.inserted == ["PHRASE"], "sent once, not appended to the stranded copy"
+
 
 def test_it_refuses_when_the_composer_already_holds_someone_elses_text(wired):
     """The composer is a person's workspace. A wake is not urgent enough to spend it."""
