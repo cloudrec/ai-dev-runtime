@@ -183,12 +183,16 @@ def notifications_status(conn=None) -> dict:
     is enabled + healthy. The durable inbox alone is not "working delivery" — it is pull
     only. `notifications_enabled=false` is surfaced as red, never healthy."""
     caps = detect_capabilities(conn=conn)
-    proactive_ok = (caps["same_chat_wake"]["available"]
-                    or caps["owner_push"]["available"]
-                    # The browser path is proactive by the tier's own definition: it puts
-                    # an assistant turn in the same chat. Counting it is what makes the
-                    # posture honest; excluding it reported red while 267 wakes landed.
-                    or caps["cdp_same_chat"]["available"])
+    # NOTIFIER tiers only. `notifier._TIERS` is ("same_chat_wake", "owner_push") and
+    # nothing in that module can reach the browser, so `cdp_same_chat` must NOT make this
+    # green: it would claim owner alerts are being delivered while every one of them
+    # dead-letters. Corrected 2026-09-04 within the hour of introducing it — status read
+    # green with 19 active dead letters, which is the same lie as the red one it replaced,
+    # pointing the other way.
+    #
+    # The browser capability is still REPORTED below, because it is true and it is what
+    # the owner needs to know: wakes are landing even though alerts are not.
+    proactive_ok = caps["same_chat_wake"]["available"] or caps["owner_push"]["available"]
     same_chat_complete = caps["same_chat_wake"]["available"] and caps["same_chat_wake"]["verified"]
     status = "green" if proactive_ok else "red"
     reasons = []
@@ -202,8 +206,10 @@ def notifications_status(conn=None) -> dict:
         # and chasing it is wasted effort.
         reasons.append("same_chat_wake unavailable — no server->ChatGPT inbound trigger "
                        "exists on this platform; browser wake covers this instead")
-    if not caps["cdp_same_chat"]["available"]:
-        reasons.append("cdp_same_chat: " + caps["cdp_same_chat"]["detail"])
+    # Reported either way: its presence explains why agents keep working while this
+    # posture is red, and its absence is the more serious of the two failures.
+    reasons.append("cdp_same_chat (wake path, NOT a notifier tier): "
+                   + caps["cdp_same_chat"]["detail"])
     return {
         "status": status,
         "notifications_enabled": proactive_ok,

@@ -388,24 +388,44 @@ def _delivered(n=1, age=10.0):
     conn.close()
 
 
-def test_a_proven_browser_delivery_is_a_proactive_channel():
+def test_a_proven_browser_delivery_is_reported_but_is_not_a_notifier_tier():
+    """The correction to the first version of this change. notifier._TIERS is
+    ("same_chat_wake", "owner_push") and nothing there can reach the browser, so proven
+    CDP deliveries must NOT turn this posture green: that would claim owner alerts are
+    landing while every one of them dead-letters. Measured within the hour of the
+    mistake - status green with 19 active dead letters, the same lie as the red one it
+    replaced, pointing the other way."""
     _delivered(3)
     caps = delivery.detect_capabilities()
     assert caps["cdp_same_chat"]["available"] is True
     assert caps["cdp_same_chat"]["proven_in_window"] == 3
     st = delivery.notifications_status()
-    assert st["status"] == "green" and st["notifications_enabled"] is True
+    assert st["status"] == "red", "no notifier tier works, whatever the browser is doing"
+    assert st["notifications_enabled"] is False
+    # ...but the owner must still be told the wake path is alive, since it explains why
+    # agents keep working while alerts do not arrive.
+    assert any("cdp_same_chat" in r and "proven" in r for r in st["reasons"])
+
+
+def test_a_working_notifier_tier_is_what_turns_it_green():
+    """The control: only a real notifier channel may make this green."""
+    import os
+    os.environ["CONTROL_PLANE_SAMECHAT_WAKE_URL"] = "https://example.invalid/hook"
+    try:
+        api.upsert_channel("same_chat_wake", enabled=True, healthy=True, kind="inbound_trigger")
+        st = delivery.notifications_status()
+        assert st["status"] == "green" and st["notifications_enabled"] is True
+    finally:
+        os.environ.pop("CONTROL_PLANE_SAMECHAT_WAKE_URL", None)
 
 
 def test_no_recent_delivery_fails_closed():
-    """Evidence, never configuration. An empty log or a broken browser must go red
-    within the window rather than coast on a delivery proven yesterday."""
+    """Evidence, never configuration. An empty log or a broken browser must report the
+    capability as unavailable rather than coasting on a delivery proven yesterday."""
     _delivered(1, age=delivery.CDP_WAKE_WINDOW_SECS + 60)   # outside the window
     caps = delivery.detect_capabilities()
     assert caps["cdp_same_chat"]["available"] is False
     assert caps["cdp_same_chat"]["verified"] is True, "it HAS worked before"
-    st = delivery.notifications_status()
-    assert st["status"] == "red" and st["notifications_enabled"] is False
 
 
 def test_same_chat_wake_is_reported_as_a_platform_boundary():
