@@ -954,3 +954,62 @@ def test_an_unreachable_browser_is_not_a_tab_fault():
     out = diag.browser_tab_health(conn=conn, list_fn=boom)
     assert out["reachable"] is False and out["reason"] == "OSError"
     conn.close()
+
+
+# ── supervisor coverage (2026-09-04) ────────────────────────────────────────
+# NATIVE_SUPERVISOR_TARGETS held three entries of which two were long dead, so exactly
+# one live agent of ten could be continued and the other nine waited for a human to type
+# into their chat. Nothing reported that, which is why the list rotted unseen.
+
+def _sup_agent(conn, target, project):
+    conn.execute("INSERT OR REPLACE INTO agent(id,target,project_id,lifecycle_state) "
+                 "VALUES(?,?,?,?)", (target, target, project, "observe_only"))
+    conn.commit()
+
+
+def test_uncovered_agents_are_named_and_denied_ones_are_not(monkeypatch):
+    """Only `uncovered` is a setting an owner acts on. A denylisted project is a
+    deliberate refusal and must never appear as a gap to close."""
+    import os
+    from core import native_supervisor as ns
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    cp.init_db(conn=conn)
+    _sup_agent(conn, "mess-a:0.0", "mess")            # permitted, not allowlisted
+    _sup_agent(conn, "pay-a:0.0", "payment-orchestrator")   # denylisted
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "somebody-else:0.0")
+    out = diag.supervisor_coverage(conn=conn, agents=["mess-a:0.0", "pay-a:0.0"])
+    assert out["needs_allowlisting"] == ["mess-a:0.0"]
+    assert [r["agent"] for r in out["denied"]] == ["pay-a:0.0"]
+    assert out["denied"][0]["reason"] == "denylisted_project"
+    assert out["covered"] == []
+    conn.close()
+
+
+def test_a_stale_allowlist_entry_is_surfaced(monkeypatch):
+    """The rot itself: an entry naming an agent that no longer exists."""
+    import os
+    from core import native_supervisor as ns
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    cp.init_db(conn=conn)
+    _sup_agent(conn, "mess-a:0.0", "mess")
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "mess-a:0.0,long-dead:0.0")
+    out = diag.supervisor_coverage(conn=conn, agents=["mess-a:0.0"])
+    assert out["stale_allowlist_entries"] == ["long-dead:0.0"]
+    assert [r["agent"] for r in out["covered"]] == ["mess-a:0.0"]
+    conn.close()
+
+
+def test_the_wildcard_covers_everything_except_the_denylist(monkeypatch):
+    import os
+    from core import native_supervisor as ns
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    cp.init_db(conn=conn)
+    _sup_agent(conn, "mess-a:0.0", "mess")
+    _sup_agent(conn, "self-a:0.0", ns.SELF_PROJECT)
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    out = diag.supervisor_coverage(conn=conn, agents=["mess-a:0.0", "self-a:0.0"])
+    assert out["wildcard"] is True
+    assert [r["agent"] for r in out["covered"]] == ["mess-a:0.0"]
+    assert out["denied"][0]["reason"] == "self_project", "the supervisor never drives itself"
+    assert out["needs_allowlisting"] == []
+    conn.close()

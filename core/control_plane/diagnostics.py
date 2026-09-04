@@ -97,6 +97,70 @@ def browser_tab_health(*, conn=None, list_fn=None) -> dict:
             conn.close()
 
 
+def supervisor_coverage(*, conn=None, agents=None) -> dict:
+    """Which LIVE agents the native supervisor may continue, and why not for the rest.
+
+    `route_health()` names projects whose chat never rings. Nothing named agents the
+    SUPERVISOR cannot continue, and that omission is why the allowlist rotted unseen:
+    `NATIVE_SUPERVISOR_TARGETS` held three entries of which two — `cp-canary:0.0` and
+    `gaika-opus:0.0` — were long dead, so exactly one live agent of ten was covered and
+    the other nine waited for a human to type into their chat. Nothing reported that.
+
+    Three outcomes, and the distinction matters because only one of them is a setting:
+
+      * `covered`   — allowlisted and not denied; the supervisor may continue it.
+      * `denied`    — the project is on `AUTO_REGISTER_DENY_PROJECTS`, or is the
+                      supervisor's own. A deliberate refusal, never a gap to close.
+      * `uncovered` — live, permitted, and simply absent from the allowlist. THIS is the
+                      list that explains manual poking, and the only one an owner acts on.
+
+    Read-only and advisory. It changes no allowlist: widening actuation is an owner
+    decision, and this reports what that decision would cover.
+    """
+    from core import native_supervisor as _ns
+    if agents is None:
+        try:
+            from core import agent_control as _ac
+            agents = [a["target"] for a in _ac.agent_list().get("agents", [])
+                      if a.get("is_agent") and a.get("alive")]
+        except Exception:  # noqa: BLE001 — an unreadable inventory is not a coverage fault
+            agents = []
+    own = conn is None
+    if own:
+        conn = sqlite3.connect(os.environ.get("CONTROL_PLANE_DB", "control_plane.db"),
+                               timeout=15)
+    try:
+        allowed = _ns.allowed_targets()
+        wildcard = "*" in allowed
+        deny = set(_ns.AUTO_REGISTER_DENY_PROJECTS)
+        covered, denied, uncovered = [], [], []
+        for target in sorted(agents):
+            row = conn.execute("SELECT project_id FROM agent WHERE target=?",
+                               (target,)).fetchone()
+            project = (row[0] if row else "") or ""
+            rec = {"agent": target, "project": project}
+            if project in deny:
+                rec["reason"] = ("self_project" if project == _ns.SELF_PROJECT
+                                 else "denylisted_project")
+                denied.append(rec)
+            elif wildcard or target in allowed:
+                covered.append(rec)
+            else:
+                rec["reason"] = "absent_from_NATIVE_SUPERVISOR_TARGETS"
+                uncovered.append(rec)
+        # Entries naming something that no longer exists. The rot itself, made visible.
+        live = set(agents)
+        stale = sorted(t for t in allowed if t != "*" and t not in live)
+        return {"covered": covered, "denied": denied, "uncovered": uncovered,
+                "wildcard": wildcard, "live_agents": len(agents),
+                "stale_allowlist_entries": stale,
+                # the number an owner acts on: live, permitted, and not covered
+                "needs_allowlisting": [r["agent"] for r in uncovered]}
+    finally:
+        if own:
+            conn.close()
+
+
 def route_health(*, conn=None, agents=None) -> dict:
     """Which LIVE agents reach a chat of their own, and which fall back to owner-os.
 
