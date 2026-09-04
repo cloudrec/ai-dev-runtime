@@ -242,6 +242,29 @@ def main() -> int:
         body = {k: v for k, v in body.items() if v not in (None, "", {})}
 
         _load_runtime_env()
+        # REDACT before anything is persisted. Every free-text field above comes
+        # straight from the runtime — `last_assistant_message` is 600 characters of model
+        # output, `message` and `error_details` are whatever the session was handling —
+        # and a pane is exactly as likely to hold a credential as a Windows one is, which
+        # is why `windows_bridge` already redacts everything a device returns before it is
+        # stored. This path had no redaction at all, and it is the path that persisted
+        # `token=` and `password=` values into `agent_turn_stopped` payloads.
+        #
+        # The digest above is deliberately computed on the RAW text: it is a SHA-256
+        # prefix, it leaks nothing, and dedupe must stay stable regardless of what the
+        # redactor rewrites.
+        #
+        # FAIL CLOSED. If the redactor itself raises, the free-text fields are dropped
+        # rather than emitted raw — an event missing its excerpt is a small loss, an
+        # event carrying a credential is not.
+        try:
+            from core.agent_control import redact_obj
+            body = redact_obj(body)
+        except Exception:  # noqa: BLE001
+            body = {k: v for k, v in body.items()
+                    if k not in ("last_assistant_message", "message", "error_details",
+                                 "task_subject")}
+            body["redaction"] = "unavailable — free text withheld"
         from core.control_plane import cto
         _emitted = cto.emit("claude_hook", etype, project_id=ident["project"], agent_id=ident["agent"],
                  severity=severity, owner_action_required=oar, payload=body,

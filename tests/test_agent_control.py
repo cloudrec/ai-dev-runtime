@@ -1141,3 +1141,67 @@ def test_provider_limit_variants_are_recognised():
 def test_a_warning_short_of_exhaustion_is_not_external():
     """Approaching a limit is not hitting it; a working agent must not be parked."""
     assert ac._STATE_EXTERNAL_RE.search("approaching your weekly limit") is None
+
+
+# ── bare credentials, and redaction inside a structure (2026-09-04) ────────
+# Every pattern in `_REDACTIONS` but the private-key block required the credential to
+# arrive as an ASSIGNMENT — `token=...`, `Bearer ...`. A credential does not have to
+# arrive that way: the owner pastes the thing itself into a pane and the pane is
+# captured. Found while auditing a report that a credential-shaped value had reached an
+# event summary: two `agent_turn_stopped` payloads held `token=`/`password=` values, and
+# `hooks/owneros_hook.py` was persisting `last_assistant_message` with no redaction at
+# all. The Telegram bot token is the shape this host will actually see, because the
+# standing owner gate is literally "put the BotFather token in the file".
+
+def test_a_bare_telegram_bot_token_is_redacted():
+    from core.agent_control import redact
+    raw = "7123456789:" + "A" * 35
+    assert len(raw.split(":")[1]) == 35
+    out = redact(f"here it is {raw} thanks")
+    assert raw not in out
+    assert "REDACTED" in out
+
+
+def test_other_bare_provider_keys_are_redacted():
+    from core.agent_control import redact
+    for raw in ("sk-ant-" + "a" * 30, "ghp_" + "b" * 32, "AKIA" + "C" * 16):
+        out = redact(f"prefix {raw} suffix")
+        assert raw not in out, f"{raw[:8]}... survived redaction"
+
+
+def test_ordinary_text_is_not_mangled():
+    """The cost of a false positive is a destroyed audit trail, so the bare patterns
+    must be specific enough to leave prose, ids and timestamps alone."""
+    from core.agent_control import redact
+    for benign in ("the token is in the file",
+                   "2026-09-04T18:06:28.771074+00:00",
+                   "event 29790 dedup=notifications_red",
+                   "https://chatgpt.com/c/6a98e672-7b38-83eb-bd75-733306a73900",
+                   "12345678:short"):
+        assert redact(benign) == benign, benign
+
+
+def test_redaction_inside_a_structure_keeps_it_serializable():
+    """Running the redactor across finished JSON corrupts it — the assignment pattern
+    eats the closing quote and the comma. Redact the values, then serialize."""
+    import json
+    from core.agent_control import redact_obj
+    raw = "7123456789:" + "A" * 35
+    body = {"last_assistant_message": f"use {raw}",
+            "error_details": {"note": "password: hunter2hunter2hunter2"},
+            "background_tasks": [{"cmd": f"curl -H 'Bearer {'z' * 40}'"}],
+            "stop_hook_active": True, "count": 3, "nothing": None}
+    out = redact_obj(body)
+    blob = json.dumps(out)
+    assert json.loads(blob) == out, "the redacted structure must still serialize"
+    assert raw not in blob and "hunter2hunter2hunter2" not in blob
+    assert out["stop_hook_active"] is True and out["count"] == 3 and out["nothing"] is None
+
+
+def test_redact_obj_terminates_on_deep_nesting():
+    from core.agent_control import redact_obj
+    deep = cur = {}
+    for _ in range(30):
+        cur["n"] = {}
+        cur = cur["n"]
+    assert redact_obj(deep)

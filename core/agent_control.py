@@ -77,6 +77,21 @@ _REDACTIONS: tuple[tuple[re.Pattern, str], ...] = (
                 r"[A-Z0-9_]*)\s*[:=]\s*[\"']?([^\s\"'&]{6,})[\"']?"), r"\1=***REDACTED***"),
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
      "***REDACTED PRIVATE KEY***"),
+    # BARE tokens — no `token=` in front of them, so every pattern above misses them.
+    # A credential does not have to arrive as an assignment: the owner pastes the thing
+    # itself into a pane, and the pane is captured. The Telegram bot token is the shape
+    # this host will actually see, because the standing gate is exactly "put the
+    # BotFather token in the file".
+    #
+    # `<8-10 digits>:<32-45 chars>` — the suffix is 35 today, but pinning it exactly
+    # means a format change silently stops redacting, and the failure mode of being
+    # slightly wide here is a redacted log line while the failure mode of being narrow
+    # is a leaked credential. Still specific enough to leave prose, ISO timestamps and
+    # `host:port` alone, which `test_ordinary_text_is_not_mangled` pins.
+    (re.compile(r"\b\d{8,10}:[A-Za-z0-9_-]{32,45}\b"), "***REDACTED TELEGRAM TOKEN***"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9_-]{20,}"), "***REDACTED***"),
+    (re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}"), "***REDACTED***"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "***REDACTED***"),
 )
 
 
@@ -87,6 +102,27 @@ def redact(text: str) -> str:
     for pattern, replacement in _REDACTIONS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def redact_obj(obj: Any, _depth: int = 0) -> Any:
+    """Redact INSIDE a structure, never across its serialization.
+
+    Running the redactor over a finished JSON document corrupts it: the assignment
+    pattern happily eats the closing quote and the comma after a value, and what comes
+    back no longer parses. Redacting each string value and then serializing keeps the
+    document valid, which is the same reason `windows_bridge` redacts this way.
+    """
+    if _depth > 6:
+        return "***DEPTH***"
+    if obj is None or isinstance(obj, (bool, int, float)):
+        return obj
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, dict):
+        return {str(k): redact_obj(v, _depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [redact_obj(v, _depth + 1) for v in obj]
+    return redact(str(obj))
 
 
 # ── configuration ───────────────────────────────────────────────────────────

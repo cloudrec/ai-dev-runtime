@@ -419,3 +419,66 @@ def test_the_never_seen_branches_still_map_to_known_classes():
                         ("Notification", {"notification_type": "agent_completed"})):
         etype, _sev, _oar = _map(ev, **payload)
         assert etype in known, f"{ev}/{payload} maps to an unknown class {etype}"
+
+
+# ── the hook persisted free text with no redaction at all (2026-09-04) ────
+# `body["last_assistant_message"]` is 600 characters of model output taken straight from
+# the runtime and handed to `cto.emit`. `windows_bridge` already redacts everything a
+# device returns before storing it, on the stated grounds that a pane is exactly as
+# likely to hold an API key as anything else; this path had no equivalent. Two
+# `agent_turn_stopped` payloads in control_plane.db carry unredacted `token=` and
+# `password=` values as a result.
+
+def _run_hook(monkeypatch, payload):
+    """Drive main() with the REAL cto module's emit patched out.
+
+    `main()` does `from core.control_plane import cto` and then `cto.emit(...)`, so the
+    interception has to be on the module object's attribute. Replacing the entry in
+    `sys.modules` does not work once the package attribute is bound, and getting that
+    wrong means the test writes to the live event store.
+    """
+    import importlib, io as _io, json as _json
+    from core.control_plane import cto as real_cto
+    captured = {}
+    monkeypatch.setattr(real_cto, "emit",
+                        lambda *a, **kw: (captured.update(kw), 1)[1])
+    hook = importlib.import_module("hooks.owneros_hook")
+    monkeypatch.setattr(hook, "_load_runtime_env", lambda: None)
+    monkeypatch.setattr(hook, "_trigger_supervisor", lambda: None, raising=False)
+    monkeypatch.setattr(sys, "stdin", _io.StringIO(_json.dumps(payload)))
+    hook.main()
+    return captured.get("payload") or {}
+
+
+_STOP = {"hook_event_name": "Stop", "session_id": "abcdef123456",
+         "cwd": "/root/ai-dev-runtime"}
+
+
+def test_the_hook_redacts_a_credential_before_it_is_persisted(monkeypatch):
+    raw = "7123456789:" + "A" * 35
+    body = _run_hook(monkeypatch, dict(_STOP,
+                     last_assistant_message=f"the bot token is {raw} — put it in the file"))
+    blob = json.dumps(body)
+    assert raw not in blob, "a credential must never reach the event store"
+    assert "REDACTED" in blob
+
+
+def test_the_hook_still_carries_its_ordinary_content(monkeypatch):
+    """Redaction must not gut the record it is protecting."""
+    body = _run_hook(monkeypatch, dict(_STOP,
+                     last_assistant_message="finished the refactor, tests green"))
+    assert body.get("last_assistant_message") == "finished the refactor, tests green"
+    assert body.get("hook_event") == "Stop"
+
+
+def test_the_hook_fails_closed_when_the_redactor_is_unavailable(monkeypatch):
+    """An event missing its excerpt is a small loss; one carrying a credential is not."""
+    from core import agent_control
+    def boom(*a, **k):
+        raise RuntimeError("redactor unavailable")
+    monkeypatch.setattr(agent_control, "redact_obj", boom)
+    raw = "7123456789:" + "A" * 35
+    body = _run_hook(monkeypatch, dict(_STOP, last_assistant_message=f"token {raw}"))
+    assert raw not in json.dumps(body)
+    assert "last_assistant_message" not in body
+    assert body.get("redaction", "").startswith("unavailable")
