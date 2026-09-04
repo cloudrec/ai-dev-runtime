@@ -1293,6 +1293,73 @@ def test_the_recovery_retry_can_now_actually_fire(monkeypatch):
     assert closes == ["OLD", "OLD"], "the second attempt is the retry the defect disabled"
 
 
+# ── a ChatGPT page that cannot answer is not a usable page (2026-09-04) ───
+# `_attempt` navigates whatever `find_chatgpt_page` returns to the bound conversation,
+# over a CDP session, and has no responsiveness check on that path — the wedged-renderer
+# probe runs only after a target was found on the bound URL. `/json/list` orders by
+# recent activity, so a dead tab drifts to the front on its own. Measured live with
+# eight of fourteen routes holding no tab: the function returned 5EAECCDE1973, parked on
+# the client-side placeholder url `.../c/WEB:b535cc94-...`, page_responsive False. Every
+# tabless route would have been navigated through that corpse in turn.
+
+def _pages_fixture(monkeypatch, pages, dead=()):
+    from tools import cdp_composer as cc
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET": pages)
+    monkeypatch.setattr(cc, "page_responsive",
+                        lambda t, timeout=8.0: t["id"] not in set(dead))
+    return cc
+
+
+def test_it_skips_a_chatgpt_page_whose_renderer_is_dead(monkeypatch):
+    pages = [
+        {"id": "DEAD", "type": "page", "url": "https://chatgpt.com/c/WEB:placeholder"},
+        {"id": "LIVE", "type": "page", "url": "https://chatgpt.com/c/real"},
+    ]
+    cc = _pages_fixture(monkeypatch, pages, dead=["DEAD"])
+    assert cc.find_chatgpt_page()["id"] == "LIVE", \
+        "a wedged tab first in /json/list must not be handed to the navigate path"
+
+
+def test_the_first_answering_page_is_still_the_answer(monkeypatch):
+    """When every candidate answers, behaviour is unchanged."""
+    pages = [
+        {"id": "FIRST", "type": "page", "url": "https://chatgpt.com/c/a"},
+        {"id": "SECOND", "type": "page", "url": "https://chatgpt.com/c/b"},
+    ]
+    cc = _pages_fixture(monkeypatch, pages)
+    assert cc.find_chatgpt_page()["id"] == "FIRST"
+
+
+def test_it_reports_none_when_no_chatgpt_page_answers(monkeypatch):
+    """The honest outcome, and the one the caller can act on: `_attempt` then opens a
+    fresh tab through `open_chatgpt_page`, which carries the browser_degraded guard."""
+    pages = [
+        {"id": "DEAD1", "type": "page", "url": "https://chatgpt.com/c/x"},
+        {"id": "DEAD2", "type": "page", "url": "https://chatgpt.com/c/y"},
+    ]
+    cc = _pages_fixture(monkeypatch, pages, dead=["DEAD1", "DEAD2"])
+    assert cc.find_chatgpt_page() is None
+
+
+def test_non_chatgpt_pages_are_never_probed(monkeypatch):
+    """Host matching still comes first — a foreign tab is not ours to poke at."""
+    from tools import cdp_composer as cc
+    probed = []
+    pages = [
+        {"id": "FOREIGN", "type": "page", "url": "https://example.com/"},
+        {"id": "LIVE", "type": "page", "url": "https://chatgpt.com/c/a"},
+    ]
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET": pages)
+
+    def probe(t, timeout=8.0):
+        probed.append(t["id"])
+        return True
+
+    monkeypatch.setattr(cc, "page_responsive", probe)
+    assert cc.find_chatgpt_page()["id"] == "LIVE"
+    assert probed == ["LIVE"], "only ChatGPT pages may be probed"
+
+
 def test_json_endpoints_still_parse(monkeypatch):
     """The tolerance must not swallow real JSON."""
     from tools import cdp_composer as cc

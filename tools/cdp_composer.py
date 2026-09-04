@@ -366,12 +366,39 @@ def open_chatgpt_page(conversation_url: str) -> Optional[dict]:
 
 
 def find_chatgpt_page() -> Optional[dict]:
-    """Any open ChatGPT page, matched on host only — never on title or content."""
+    """Any open ChatGPT page whose renderer ANSWERS, matched on host only — never on
+    title or content.
+
+    The caller navigates whatever this returns to the bound conversation, and it opens a
+    CDP session to do it. A page whose renderer is wedged accepts neither, so returning
+    one spends the whole attempt on a guaranteed `cdp_error:WebSocketTimeoutException` —
+    and `_attempt` has no responsiveness check on this path, because the wedged-renderer
+    probe it does have runs only after a target was found on the bound URL.
+
+    Which page is first is not stable: `/json/list` orders by recent activity, so a dead
+    tab drifts to the front on its own. Measured 2026-09-04, with eight of fourteen routes
+    holding no tab of their own: this function returned `5EAECCDE1973`, a ChatGPT page
+    left on the client-side placeholder url `.../c/WEB:b535cc94-...` — a new chat that
+    never became a conversation — and `page_responsive` was False for it. Every route
+    without a tab would have been navigated through that corpse in turn.
+
+    Skipping it also RETIRES the healthy ones. A page on a conversation no route points
+    at is exactly the tab that should be reused rather than left to sit against
+    `BROWSER_MAX_PAGES`, and navigating it to the bound conversation is what reclaims it.
+    Preferring a page that answers is the whole of the change: when every candidate
+    answers, the first is still the answer, unchanged.
+
+    Returning None when nothing answers is the honest outcome, not a regression — the
+    caller then opens a fresh tab through `open_chatgpt_page`, which carries the
+    `browser_degraded` guard and closes what it cannot verify.
+    """
     for t in _http("/json/list"):
         if t.get("type") != "page":
             continue
         u = t.get("url") or ""
-        if u.startswith("https://chatgpt.com") or u.startswith("https://chat.openai.com"):
+        if not (u.startswith("https://chatgpt.com") or u.startswith("https://chat.openai.com")):
+            continue
+        if page_responsive(t):
             return t
     return None
 
