@@ -44,6 +44,59 @@ def _split(timestamps, now: float, window: float) -> dict:
     }
 
 
+def browser_tab_health(*, conn=None, list_fn=None) -> dict:
+    """Pages the browser holds, split by whether any route still points at them.
+
+    Delivery dies ALL AT ONCE when the page count passes `BROWSER_MAX_PAGES`:
+    `browser_degraded()` refuses every route, not the one that leaked. On 2026-09-04 the
+    count reached 13 and seven projects went silent simultaneously — the guard behaving
+    correctly, the accounting honest, and nobody watching the number climb.
+
+    Two things push it up, and only one of them is a bug. Duplicates are a leak. ORPHANS
+    are ordinary bookkeeping: rebinding a route frees the conversation it left, and that
+    tab stays open forever pointing at a chat nothing delivers to. Four of today's
+    rebinds freed three conversations, whose tabs then counted toward the cap that
+    stopped delivery.
+
+    Read-only and advisory. It closes nothing — deciding which of an owner's browser tabs
+    may be closed is not a diagnostic's call.
+    """
+    from tools import cdp_composer as _cdp
+    from core import wake_routes as _wr
+    own = conn is None
+    if own:
+        conn = sqlite3.connect(os.environ.get("CONTROL_PLANE_DB", "control_plane.db"),
+                               timeout=15)
+    try:
+        try:
+            pages = (list_fn or (lambda: _cdp._http("/json/list")))()
+        except Exception as e:  # noqa: BLE001 — an unreachable browser is not a tab fault
+            return {"reachable": False, "reason": type(e).__name__}
+        pages = [p for p in pages if isinstance(p, dict) and p.get("type") == "page"]
+        routed = {(r.get("conversation") or "").rstrip("/")
+                  for r in _wr.list_routes(conn=conn)}
+        seen, orphans, dupes = {}, [], []
+        for p in pages:
+            u = (p.get("url") or "").rstrip("/")
+            if u in seen:
+                dupes.append(u)
+            seen[u] = seen.get(u, 0) + 1
+            if u not in routed:
+                orphans.append(u)
+        n = len(pages)
+        return {"reachable": True, "pages": n,
+                "max_pages": _cdp.BROWSER_MAX_PAGES,
+                "headroom": _cdp.BROWSER_MAX_PAGES - n,
+                "routed": sorted({u for u in seen if u in routed}),
+                "orphaned": sorted(set(orphans)),
+                "duplicated": sorted(set(dupes)),
+                # what a reader acts on: reclaimable without touching a live route
+                "reclaimable": len(orphans) + len(dupes)}
+    finally:
+        if own:
+            conn.close()
+
+
 def route_health(*, conn=None, agents=None) -> dict:
     """Which LIVE agents reach a chat of their own, and which fall back to owner-os.
 

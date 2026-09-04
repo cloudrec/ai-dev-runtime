@@ -114,7 +114,13 @@ def browser_degraded(list_fn=None, clock=None) -> dict:
         return {"degraded": True, "reason": f"endpoint_slow:{elapsed:.1f}s", "pages": n}
     if n > BROWSER_MAX_PAGES:
         return {"degraded": True, "reason": f"too_many_pages:{n}", "pages": n}
-    return {"degraded": False, "reason": "ok", "pages": n, "elapsed": elapsed}
+    # Headroom, so the creep toward the cap is visible BEFORE it refuses everything.
+    # 2026-09-04: the count reached 13 against a limit of 12 and every route was refused
+    # at once — hostsecure, email, owner-os, payment-orchestrator, mess, gaika-extension
+    # and security-demo all silent, 17 consecutive `too_many_pages` refusals. The guard
+    # was right and the accounting was honest; nothing was watching the number rise.
+    return {"degraded": False, "reason": "ok", "pages": n, "elapsed": elapsed,
+            "headroom": BROWSER_MAX_PAGES - n}
 
 
 def page_responsive(target: dict, timeout: float = 8.0) -> bool:

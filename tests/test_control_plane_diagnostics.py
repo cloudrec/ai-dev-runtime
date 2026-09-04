@@ -884,3 +884,73 @@ def test_route_health_survives_an_unreadable_inventory():
     out = diag.route_health(conn=conn, agents=[])
     assert out["live_agents"] == 0 and out["needs_binding"] == []
     conn.close()
+
+
+# ── browser tab headroom (2026-09-04) ──────────────────────────────────────
+# The page count reached 13 against a limit of 12 and delivery died for SEVEN projects
+# at once: 17 consecutive browser_degraded:too_many_pages refusals across hostsecure,
+# email, owner-os, payment-orchestrator, mess, gaika-extension and security-demo. The
+# guard was right and wake_delivery recorded the reason honestly every time. Nothing
+# reported the number climbing, so the first symptom was total silence.
+
+def _pages(*urls):
+    return [{"type": "page", "id": "T%d" % i, "url": u} for i, u in enumerate(urls)]
+
+
+def test_orphaned_tabs_are_named_before_they_stop_delivery():
+    """A rebind frees the conversation it left; that tab stays open pointing at a chat
+    nothing delivers to, and still counts toward the cap."""
+    from core import wake_routes as wr
+    import os
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    cp.init_db(conn=conn)
+    wr.bind_route("mess", "https://chatgpt.com/c/live", conn=conn)
+    out = diag.browser_tab_health(
+        conn=conn,
+        list_fn=lambda: _pages("https://chatgpt.com/c/live",
+                               "https://chatgpt.com/c/freed-by-a-rebind"))
+    assert out["reachable"] is True and out["pages"] == 2
+    assert out["orphaned"] == ["https://chatgpt.com/c/freed-by-a-rebind"]
+    assert out["routed"] == ["https://chatgpt.com/c/live"]
+    assert out["reclaimable"] == 1
+    conn.close()
+
+
+def test_headroom_is_reported_while_still_healthy():
+    """The number that would have shown the creep. Visible BEFORE the cap refuses."""
+    from core import wake_routes as wr
+    import os
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    cp.init_db(conn=conn)
+    wr.bind_route("mess", "https://chatgpt.com/c/live", conn=conn)
+    out = diag.browser_tab_health(conn=conn, list_fn=lambda: _pages("https://chatgpt.com/c/live"))
+    assert out["headroom"] == out["max_pages"] - 1
+    conn.close()
+
+
+def test_duplicates_are_counted_as_reclaimable_too():
+    from core import wake_routes as wr
+    import os
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    cp.init_db(conn=conn)
+    wr.bind_route("mess", "https://chatgpt.com/c/live", conn=conn)
+    out = diag.browser_tab_health(
+        conn=conn,
+        list_fn=lambda: _pages("https://chatgpt.com/c/live", "https://chatgpt.com/c/live"))
+    assert out["duplicated"] == ["https://chatgpt.com/c/live"]
+    assert out["orphaned"] == [], "a duplicate of a ROUTED chat is not an orphan"
+    assert out["reclaimable"] == 1
+    conn.close()
+
+
+def test_an_unreachable_browser_is_not_a_tab_fault():
+    import os
+    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    cp.init_db(conn=conn)
+
+    def boom():
+        raise OSError("cdp gone")
+
+    out = diag.browser_tab_health(conn=conn, list_fn=boom)
+    assert out["reachable"] is False and out["reason"] == "OSError"
+    conn.close()

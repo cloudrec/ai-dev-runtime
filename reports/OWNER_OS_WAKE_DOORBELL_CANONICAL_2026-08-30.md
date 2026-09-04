@@ -9627,3 +9627,93 @@ denylisted agent stayed parked.
 Nothing else is missing. Routes are settled (14 keys / 13 conversations, Part 86),
 delivery is healthy, and the draft guard from Part 88 is committed and waiting on the
 same restart.
+
+---
+
+# Part 90 — every chat went silent, and the guard was right
+
+Two symptoms reported live: the Owner OS pane idle, and project chats not being woken
+when their agents stopped. One cause, and it was not in the wake logic.
+
+## The chain, traced on five real events
+
+```
+26238 hostsecure · 26248 email · 26262 owner-os · 26263 payment-orchestrator
+                                                 · 26270 security-demo
+
+event -> should_wake -> claim allowed=1 -> route resolved correctly
+      -> CDP composer -> REFUSED  browser_degraded:too_many_pages:13
+```
+
+Every stage worked. Routes resolved to the right conversations. Claims were allowed.
+Delivery never reached the composer: 13 pages against `BROWSER_MAX_PAGES=12`, so
+`browser_degraded()` refused EVERY route at once — seven projects silent simultaneously,
+17 consecutive refusals.
+
+Notification status read `sent` / `delivery_failed=0` because notifications and wake
+delivery are different subsystems. There was no false success accounting: `wake_delivery`
+recorded `delivered=0` with the exact reason on all 17 rows. The accounting was honest.
+Nothing was reading it.
+
+## Why the count reached 13
+
+Two contributions, and only one is a defect.
+
+**Duplicates** — the leak class of Part 83.
+
+**Orphans** — ordinary bookkeeping nobody had named. Rebinding a route frees the
+conversation it left, and that tab stays open forever pointing at a chat nothing
+delivers to. Today's five rebinds (Part 86) freed ПЛАТЁЖКА, МЕССЕНДЖЕР and
+"HostSecure old"; their tabs then counted toward the cap that stopped delivery.
+
+A third contribution was this session's own doing: tabs were deliberately PRESERVED as
+evidence for the Part 83 measurement and left in place for hours. That was the right
+call for the measurement and the wrong call to leave standing.
+
+## Fix applied
+
+Seven tabs closed — three duplicates and four belonging to conversations no route points
+at. 13 -> 6 pages, `degraded=False`. Two `WebSocketTimeoutException` rows during the
+following two minutes were renderers settling after seven closes; they cleared with no
+intervention.
+
+Proven live, on a real non-gated agent and a real event, with no manual poke and no
+synthetic test:
+
+```
+02:34:37  delivered=1  submitted_and_assistant_started_generating   gaika-extension
+02:45:24  delivered=1  submitted_and_assistant_started_generating   email
+02:48:59  delivered=1  submitted_and_assistant_started_generating   owner-os
+```
+
+## The durable change
+
+Closing tabs fixes today. The reason it became an outage is that delivery went from
+healthy to totally dead with no intermediate signal — the page count is only ever
+consulted as a pass/fail gate at the moment of delivery.
+
+* `browser_degraded()` now returns `headroom` while healthy — the number that would have
+  shown the creep.
+* `diagnostics.browser_tab_health()` splits pages into `routed` / `orphaned` /
+  `duplicated`, with `reclaimable` as the figure a reader acts on. Read-only and
+  advisory: it closes nothing, because deciding which of an owner's browser tabs may be
+  closed is not a diagnostic's call.
+
+## Evidence
+
+```
+diagnostics + cdp_composer                                    158 passed
++ wake_bridge + closed_loop_wake + wake_routes                335 passed
+```
+
+All four new tests fail when `browser_tab_health` is removed, verified by removing it.
+Controls pin that a duplicate of a ROUTED chat is not an orphan, and that an unreachable
+browser reports `reachable: False` rather than raising.
+
+## Not this
+
+The native supervisor remains unactivated solely because of the existing activation gate
+— `NATIVE_SUPERVISOR_TARGETS` still lists three targets of which two are dead, and task
+284 is `waiting_approval`. Nothing in this part touched it. The outage and the autonomy
+gate are independent: delivery is now working, and agents still wait for a human because
+that is what the gate says.
