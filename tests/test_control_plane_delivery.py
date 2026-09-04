@@ -362,3 +362,67 @@ def test_other_channels_keep_their_existing_semantics(monkeypatch):
     assert caps["same_chat_wake"]["available"] is True
     assert caps["scheduled_chatgpt"]["available"] is True
     assert caps["cto_inbox"]["available"] is True and caps["cto_inbox"]["verified"] is True
+
+
+# ── the browser wake is a real proactive channel (2026-09-04) ────────────────
+# same_chat_wake is modelled as needing an inbound trigger URL - a webhook that makes
+# ChatGPT speak. No such API exists, so that tier is permanently unavailable here. The
+# CDP composer meanwhile does exactly what the tier describes, and on 2026-09-04 had 267
+# proven deliveries in 24h across nine routes while notifications_status() still reported
+# red / notifications_enabled=False. That told the owner there was no proactive channel
+# while 267 wakes were landing.
+
+def _delivered(n=1, age=10.0):
+    """Record n proven deliveries `age` seconds ago, as the companion does."""
+    conn = api._c(None)[0]
+    # the companion owns this table; a control-plane test DB has not created it yet
+    conn.execute("CREATE TABLE IF NOT EXISTS wake_delivery ("
+                 "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, at TEXT, source TEXT, "
+                 "event_id INTEGER, delivered INTEGER, reason TEXT)")
+    for i in range(n):
+        conn.execute("INSERT INTO wake_delivery(ts,at,source,event_id,delivered,reason) "
+                     "VALUES(?,?,?,?,?,?)",
+                     (store.now_ts() - age, store.now_iso(), "companion", 900 + i, 1,
+                      "submitted_and_assistant_responded"))
+    conn.commit()
+    conn.close()
+
+
+def test_a_proven_browser_delivery_is_a_proactive_channel():
+    _delivered(3)
+    caps = delivery.detect_capabilities()
+    assert caps["cdp_same_chat"]["available"] is True
+    assert caps["cdp_same_chat"]["proven_in_window"] == 3
+    st = delivery.notifications_status()
+    assert st["status"] == "green" and st["notifications_enabled"] is True
+
+
+def test_no_recent_delivery_fails_closed():
+    """Evidence, never configuration. An empty log or a broken browser must go red
+    within the window rather than coast on a delivery proven yesterday."""
+    _delivered(1, age=delivery.CDP_WAKE_WINDOW_SECS + 60)   # outside the window
+    caps = delivery.detect_capabilities()
+    assert caps["cdp_same_chat"]["available"] is False
+    assert caps["cdp_same_chat"]["verified"] is True, "it HAS worked before"
+    st = delivery.notifications_status()
+    assert st["status"] == "red" and st["notifications_enabled"] is False
+
+
+def test_same_chat_wake_is_reported_as_a_platform_boundary():
+    """Not a misconfiguration the owner could fix: no server->ChatGPT inbound trigger
+    exists, so the reason must say so instead of implying a missing setting."""
+    st = delivery.notifications_status()
+    assert any("no server->ChatGPT inbound trigger exists" in r for r in st["reasons"])
+
+
+def test_an_unreadable_delivery_log_proves_nothing():
+    caps = delivery._cdp_same_chat(conn=object())      # not a connection
+    assert caps["available"] is False and caps["verified"] is False
+
+
+def test_a_missing_delivery_table_is_not_a_proactive_channel():
+    """A fresh install has never delivered anything. Absence of the table must read as
+    'not proven', never as an error and never as available."""
+    caps = delivery.detect_capabilities()
+    assert caps["cdp_same_chat"]["available"] is False
+    assert delivery.notifications_status()["status"] == "red"

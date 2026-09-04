@@ -72,6 +72,65 @@ def _owner_push_detail(row: Optional[dict], state: str) -> str:
     return row.get("last_error") or UNVERIFIED_DETAIL
 
 
+CDP_WAKE_WINDOW_SECS = int(os.getenv("CDP_WAKE_EVIDENCE_SECS", "3600"))
+
+
+def _cdp_same_chat(conn=None) -> dict:
+    """The proactive channel that actually works here, reported from EVIDENCE.
+
+    `same_chat_wake` means "a proactive assistant turn in the SAME chat", and it is
+    modelled as needing an inbound trigger URL — a webhook that makes ChatGPT speak.
+    No such API exists: nothing outside a browser can push a turn into a user's
+    conversation. So that tier is permanently unavailable in this environment, and it
+    always will be.
+
+    Meanwhile the CDP composer does exactly what the tier describes: it types into the
+    bound conversation and the assistant answers. Measured 2026-09-04: 267 deliveries
+    proven in 24 h across nine routes, every one recorded in `wake_delivery` with
+    `delivered=1`. `notifications_status()` nonetheless reported red and
+    `notifications_enabled=False`, because it enumerated only the URL tier and Telegram
+    and was blind to the one channel carrying the traffic.
+
+    That is not a cosmetic mislabel. It told the owner there was no proactive channel
+    while 267 wakes were landing, which is precisely backwards for someone trying to
+    decide what to fix.
+
+    Evidence, never configuration: `available` requires a delivery PROVEN inside the
+    window, so a broken browser or an empty log fails closed within the hour. `verified`
+    means it has ever worked.
+    """
+    from core.control_plane.api import _c
+    conn, own = _c(conn)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) n, MAX(ts) last FROM wake_delivery "
+            "WHERE delivered=1 AND ts > ?", (now_ts() - CDP_WAKE_WINDOW_SECS,)).fetchone()
+        recent = int(row[0] or 0) if row else 0
+        last_ts = (row[1] if row else None)
+        ever = conn.execute(
+            "SELECT COUNT(*) FROM wake_delivery WHERE delivered=1").fetchone()[0]
+    except Exception:  # noqa: BLE001 — an unreadable log proves nothing; fail closed
+        return {"tier": "cdp_same_chat", "available": False, "verified": False,
+                "detail": "delivery log unreadable — cannot prove a proactive wake"}
+    finally:
+        if own:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return {
+        "tier": "cdp_same_chat",
+        "available": recent > 0,
+        "verified": bool(ever),
+        "proven_in_window": recent,
+        "window_secs": CDP_WAKE_WINDOW_SECS,
+        "last_delivered_ts": last_ts,
+        "detail": ("%d delivery(s) proven in the last %ds" % (recent, CDP_WAKE_WINDOW_SECS)
+                   if recent else
+                   "no delivery proven in the window — browser wake not currently working"),
+    }
+
+
 def detect_capabilities(conn=None) -> dict:
     """Honest, evidence-based capability report. `available` requires real configuration;
     `verified` requires a proven end-to-end delivery (set only by a live acceptance run
@@ -115,6 +174,7 @@ def detect_capabilities(conn=None) -> dict:
     cto_inbox = {"tier": "cto_inbox", "available": True, "verified": True,
                  "detail": "durable pull; consumed on next CTO invocation"}
     return {"same_chat_wake": same_chat, "owner_push": owner_push,
+            "cdp_same_chat": _cdp_same_chat(conn),
             "scheduled_chatgpt": scheduled, "cto_inbox": cto_inbox}
 
 
@@ -123,7 +183,12 @@ def notifications_status(conn=None) -> dict:
     is enabled + healthy. The durable inbox alone is not "working delivery" — it is pull
     only. `notifications_enabled=false` is surfaced as red, never healthy."""
     caps = detect_capabilities(conn=conn)
-    proactive_ok = caps["same_chat_wake"]["available"] or caps["owner_push"]["available"]
+    proactive_ok = (caps["same_chat_wake"]["available"]
+                    or caps["owner_push"]["available"]
+                    # The browser path is proactive by the tier's own definition: it puts
+                    # an assistant turn in the same chat. Counting it is what makes the
+                    # posture honest; excluding it reported red while 267 wakes landed.
+                    or caps["cdp_same_chat"]["available"])
     same_chat_complete = caps["same_chat_wake"]["available"] and caps["same_chat_wake"]["verified"]
     status = "green" if proactive_ok else "red"
     reasons = []
@@ -132,7 +197,13 @@ def notifications_status(conn=None) -> dict:
         reasons.append("owner_push unverified — no delivery proven since start"
                        if op_state == "unverified" else f"owner_push disabled/{op_state}")
     if not caps["same_chat_wake"]["available"]:
-        reasons.append("same_chat_wake unavailable (no proven inbound trigger)")
+        # Stated as a PLATFORM boundary, not a misconfiguration: there is no API by
+        # which a server can make ChatGPT speak, so this tier cannot be configured here
+        # and chasing it is wasted effort.
+        reasons.append("same_chat_wake unavailable — no server->ChatGPT inbound trigger "
+                       "exists on this platform; browser wake covers this instead")
+    if not caps["cdp_same_chat"]["available"]:
+        reasons.append("cdp_same_chat: " + caps["cdp_same_chat"]["detail"])
     return {
         "status": status,
         "notifications_enabled": proactive_ok,
