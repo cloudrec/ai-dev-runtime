@@ -188,6 +188,25 @@ def turn_finished(cwd: str, ack_ts: float, target: str = "") -> bool:
 
 
 # ── queue operations ─────────────────────────────────────────────────────────
+def _redact(text) -> str:
+    """Credential-scrub task text headed for the durable EVENT store.
+
+    A task's text is an arbitrary instruction — whatever `enqueue` was handed — and on
+    this host the standing owner gate is "put the BotFather token in the file", so a
+    queued continuation is a plausible carrier.
+
+    Applied at the emit boundary only. The `os_task` row itself keeps the text verbatim,
+    because the task has to be DELIVERED as written; redacting the stored copy would
+    corrupt the instruction rather than protect it. This narrows what the event ledger
+    holds, which is the store that is read, exported and reasoned over. Fails CLOSED.
+    """
+    try:
+        from core.agent_control import redact
+        return redact(str(text or ""))
+    except Exception:  # noqa: BLE001
+        return "***REDACTION UNAVAILABLE — text withheld***"
+
+
 def enqueue(target: str, text: str, *, project: str = "", kind: str = "continuation",
             conn=None) -> dict:
     """Add a task. This — not a pane — is what makes a continuation exist."""
@@ -366,7 +385,7 @@ def _emit_task_event(task: dict, kind: str, *, severity: str = "info",
         emit("os_task_queue", kind, agent_id=task.get("target", ""),
              project_id=task.get("project", ""), severity=severity,
              owner_action_required=owner_action_required,
-             payload={"task_id": task.get("id"), "text": str(task.get("text") or "")[:200],
+             payload={"task_id": task.get("id"), "text": _redact(task.get("text"))[:200],
                       "attempts": task.get("attempts"), "detail": detail[:200]},
              action_taken=kind.replace("_", " "),
              correlation_id=f"ostask:{task.get('id')}",
@@ -388,7 +407,7 @@ def _notify_owner(task: dict, reason: str, detail: str) -> Optional[str]:
         emit("os_task_queue", "task_failed", agent_id=task["target"], severity="high",
              owner_action_required=True,
              payload={"task_id": task["id"], "reason": reason, "detail": detail[:200],
-                      "attempts": task.get("attempts"), "text": task["text"][:200]},
+                      "attempts": task.get("attempts"), "text": _redact(task["text"])[:200]},
              action_taken=f"task {reason} — owner notified",
              dedup_key=f"ostaskfail:{task['id']}")
         return (g or {}).get("id")

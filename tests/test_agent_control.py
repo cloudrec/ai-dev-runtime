@@ -1290,3 +1290,47 @@ def test_stall_doctor_actually_wires_redaction_into_every_pending_it_emits():
     # the action_taken summary is persisted too, and carried it verbatim
     assert "(pending or '')[:80]" not in src.replace(" ", ""), \
         "action_taken must not interpolate the raw input line"
+
+
+# ── the task queue emits its instruction text into the event store too ────
+# `enqueue(target, text, ...)` takes an arbitrary instruction and two emit sites copy it
+# verbatim into the event payload. On this host a queued continuation is a plausible
+# carrier, because the standing owner gate is "put the BotFather token in the file".
+# The os_task ROW keeps the text verbatim on purpose — the task must be delivered as
+# written — so only the event copy is redacted.
+
+def test_os_task_queue_redacts_task_text_for_the_event_store():
+    from core import os_task_queue
+    out = os_task_queue._redact("put " + _token() + " in configs/.env")
+    assert _token() not in out and "REDACTED" in out
+
+
+def test_os_task_queue_redaction_fails_closed(monkeypatch):
+    import sys
+    from core import os_task_queue
+    broken = type(sys)("core.agent_control")
+    def boom(*a, **k):
+        raise RuntimeError("unavailable")
+    broken.redact = boom
+    monkeypatch.setitem(sys.modules, "core.agent_control", broken)
+    out = os_task_queue._redact(_token())
+    assert _token() not in out and "UNAVAILABLE" in out
+
+
+def test_os_task_queue_actually_wires_redaction_into_every_emitted_text():
+    import inspect, re
+    from core import os_task_queue
+    src = inspect.getsource(os_task_queue)
+    emitted = re.findall(r'"text":\s*([^,\n]+)', src)
+    payload_exprs = [e for e in emitted if "task" in e]
+    assert payload_exprs, "expected task text to be emitted somewhere"
+    for expr in payload_exprs:
+        assert "_redact(" in expr, f"unredacted task text reaches the event store: {expr}"
+
+
+def test_the_stored_task_row_is_left_verbatim():
+    """Redacting the stored copy would corrupt the instruction rather than protect it."""
+    import inspect
+    from core import os_task_queue
+    src = inspect.getsource(os_task_queue.enqueue)
+    assert "_redact" not in src, "enqueue must store the task text as written"
