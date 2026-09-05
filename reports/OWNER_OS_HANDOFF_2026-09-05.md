@@ -340,6 +340,40 @@ a failure reason, five leaked pages, 8 -> 13. Post-fix, 06:34 -> 07:38Z: at leas
 Evidence kept: `tabs_after_cleanup.json` and `tabs_after_live_recovery.json` in the session
 scratchpad.
 
+### One-hour regrowth watch — RUNNING, no regrowth so far
+
+Armed 09:47 CEST / 07:47Z, 59 minutes, baseline 8 pages, from `wake_delivery` id > 11320.
+It prints only on a page count above 8, a duplicate, or a `/json/list` failure, plus a
+heartbeat every 15 minutes. **Not finished; nothing here is a final verdict.**
+
+One `REGROWTH` line has fired, and it is a FALSE POSITIVE — a healthy replacement caught
+mid-flight:
+
+```
+REGROWTH 10:04:31  pages=9 (baseline 8) dups={'1648-2b08-83': 2} new_tabs=['CEFB2BC4FC3E']
+ok       10:05:32  pages=8 peak=9 dups=- creates=3 closes=3 listfail=0
+```
+
+`CEFB2BC4FC3E` was created at 08:04:15Z and the sample landed at 08:04:31Z — **16 seconds
+into the window between `/json/new` and the old tab's close**, which is the one moment a
+correct recovery legitimately holds two tabs on one conversation. The next sample, 60 s
+later, was back to 8 with no duplicate, and `CEFB2BC4FC3E` is now the SOLE tab on mess.
+This is exactly the classifier hazard the 2026-09-04 proof report recorded, where two
+"LEAK CANDIDATE" events were healthy replacements sampled in flight; a leak is a duplicate
+that PERSISTS, and this one lasted less than one sample.
+
+Three create-and-close cycles inside the watch so far, `creates=3 closes=3`, zero list
+failures, count back at 8 every time it was not mid-swap:
+
+```
+CEFB2BC4FC3E  1648  created 08:04:15Z    43DF1FA3F9F1  e672  created 08:06:46Z
+9284B81A7E49  7789  created 08:11:45Z
+```
+
+The watch's own threshold is the lesson to carry forward: a single sample above baseline is
+not evidence of a leak, and any future alert must be confirmed across at least two
+consecutive samples before it is treated as regrowth.
+
 ### What is NOT claimed
 
 None of these creations is shown to have TIMED OUT, and the leak required a timeout. So
@@ -435,7 +469,11 @@ owner-os-wake-companion`. Native continuation runs INSIDE it, so that stops auto
 
 ## Next safe step
 
-Nothing open in this workstream. The tab leak is proven, fixed, pushed, live, and now
+Record the one-hour regrowth watch's final summary when it exits at ~10:46 CEST / 08:46Z;
+it is still running and has no verdict yet. Its one `REGROWTH` line is a replacement caught
+16 s mid-swap and is written up as a false positive in the browser section.
+
+Otherwise nothing open in this workstream. The tab leak is proven, fixed, pushed, live, and now
 observed end to end: at least five live `/json/new` creations after the fix, including one
 recorded recovery failure, with the page count holding at 8 and zero duplicates.
 
