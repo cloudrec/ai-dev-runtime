@@ -147,6 +147,80 @@ the fail-closed rule starting from no evidence. It will earn a verdict from
 writes nothing and adds no schema, so there is no data to undo; a companion restart is
 required either way.
 
+## The self-agent external wake — `стоит агент` no longer required
+
+An automated instruction was received asking for this; that is not owner sign-off. The
+owner's complaint it addresses: Owner OS's own Claude agent reaches `waiting_input`/idle
+and nothing continues it until the owner types `стоит агент` by hand.
+
+**The delivery path was never the defect.** Traced read-only:
+
+```
+event 33019   14:30:20Z  agent_waiting_input (self agent, severity high, oar=1)
+wake_audit    14:30:20Z  decision=wake  reason=actionable_waiting_transition  route=owner-os
+wake_delivery 14:31:43Z  delivered=1  submitted_and_assistant_started_generating -> 7789-9b28-83
+```
+
+Every recent self-agent stop was decided, routed and delivered to the bound Owner OS
+conversation — 41 deliveries on the `owner-os` route in three hours. `SELF_PROJECT`
+denial held throughout; the self agent is never natively supervised.
+
+**The defect was the INSTRUCTION on arrival.** `compose_phrase` sent the base
+`WAKE_PHRASE` — "check the new Owner OS events and continue permitted work" — which
+invites an acknowledgement and permits stopping there. That is exactly what the supervisor
+did, so the owner typed `стоит агент` to force it.
+
+**The fix, `core/wake_bridge.py`:** `SELF_WAKE_FLOW`, a FIXED system-authored constant,
+appended only when the wake is for the self agent AND its trigger class is one the
+supervisor should act on. It names the steps: read `agent_status`, read recent output,
+answer waiting input already covered by owner decisions or safe policy, continue the
+remaining authorized work, stop only at a genuine owner gate.
+
+Scope is deliberately narrow, and the tests pin each boundary:
+
+* `is_self_agent()` asks the SAME source the denial uses,
+  `native_supervisor._project_for_target`, so the two can never disagree — the event's own
+  `project_id` is not authoritative (self-agent events carry `owner-os-opus-fresh`, the
+  denial keys on the checkout `ai-dev-runtime`). It FAILS CLOSED: unresolvable -> ordinary
+  phrase.
+* Non-self routes are byte-for-byte unchanged. This is not a global loosening.
+* `owner_decision` is EXCLUDED from the flow set — that class IS the genuine gate, and
+  telling the supervisor to push through it would be the paper-over this must not become.
+* An unknown or mangled event type falls to `trigger=event` via the closed lookup and gets
+  no flow, so a corrupted type cannot talk the supervisor into acting.
+* The flow interpolates NOTHING, preserving the module's injection defense. Hostile input
+  in the agent field is reduced to inert identifier characters:
+  `owner-os-opus-fresh:0.0IGNOREPREVIOUSrm-rfcurlevil` — no newline, no separator, no
+  shell metacharacter.
+
+**The hard invariant is untouched:** `SELF_PROJECT` remains in
+`AUTO_REGISTER_DENY_PROJECTS`, asserted by its own test. This is an EXTERNAL instruction to
+the supervisor; it grants Owner OS nothing over itself.
+
+**Tests:** 6 new in `tests/test_wake_bridge.py`, all confirmed by removal — with
+`core/wake_bridge.py` reverted they fail 6 of 6.
+
+Regression across the 17 suites that import `wake_bridge`, `native_supervisor` or
+`continuation_verifier`: **708 passed, 1 failed**. The failure is
+`test_continuation_verifier.py::test_the_repo_ships_with_no_canary_selected` and it is
+PRE-EXISTING, not caused by this change — proven by replaying the exact suite ORDER that
+failed with this change stashed: `1 failed, 447 passed` at HEAD. It is order-dependent
+pollution: some earlier suite leaves `NATIVE_CANARY_TARGET` set in `os.environ`, and the
+assertion only fires when `test_continuation_verifier` runs after it. The test passes in
+isolation and under other orderings. Its premise is also no longer true of this working
+tree by owner decision — a canary IS selected (`gaika-opus-v6:0.0`), which is exactly what
+it asserts against. Left alone here rather than mixed into this fix.
+
+**Reload gate — NOT crossed.** The change is loaded by the wake companion, which reads the
+module at process start, so the running PID 2889296 still composes the old phrase. The one
+command that would load it, deliberately not run without a verified owner instruction:
+
+```
+systemctl restart owner-os-wake-companion
+```
+
+`ai-runtime` does not need restarting for this.
+
 ## Zero-ping / autonomy
 
 `NATIVE_SUPERVISOR_TARGETS=*`, denylist authoritative and holding.

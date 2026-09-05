@@ -312,12 +312,75 @@ def _sanitize_agent_ref(agent_id: str, limit: int = 80) -> str:
     return _AGENT_REF_RE.sub("", (agent_id or "").strip())[:limit] or "unknown"
 
 
+# ── the self-agent external wake (2026-09-05) ───────────────────────────────
+# Owner OS's own agent is DENIED from native supervision on purpose — the recursion guard
+# in `native_supervisor.SELF_PROJECT` — so the only thing that can continue it is the
+# EXTERNAL supervisor in the bound ChatGPT conversation. That path already works end to
+# end: `agent_waiting_input` for the self agent is decided `wake /
+# actionable_waiting_transition` on the `owner-os` route and delivered (41 deliveries in
+# three hours, every self-agent stop among them).
+#
+# What did NOT work is what the supervisor was ASKED to do on arrival. The base phrase
+# says "check the events and continue permitted work", which invites an acknowledgement
+# and permits stopping there — and that is the observed failure: the owner had to type
+# `стоит агент` by hand before anything continued. The delivery was never the defect; the
+# instruction was.
+#
+# So this names the standard flow explicitly, and ONLY for the self agent's actionable
+# wakes. Every other route keeps its phrase byte-for-byte. This is an instruction to an
+# EXTERNAL reader; it grants Owner OS nothing over itself and does not touch the denial.
+SELF_WAKE_FLOW = (
+    " Это событие собственного агента Owner OS (self-project), намеренно исключённого из "
+    "нативного супервизора, поэтому продолжить его можешь только ты. Выполни стандартный "
+    "поток в этом же ходе: 1) прочитай agent_status; 2) прочитай последний вывод агента; "
+    "3) если ожидаемый ввод уже покрыт действующими решениями владельца или безопасной "
+    "политикой — ответь и продолжи; 4) продолжи остальную разрешённую безопасную работу; "
+    "5) остановись только на настоящем владельческом гейте."
+)
+
+# The classes where the supervisor is expected to ACT. `owner_decision` is excluded because
+# that class IS the genuine gate, and `event` because it is the residual bucket.
+SELF_FLOW_TRIGGER_CLASSES = frozenset({
+    TRIGGER_CLASS_BLOCKER, TRIGGER_CLASS_COMPLETION,
+    TRIGGER_CLASS_FAILURE, TRIGGER_CLASS_LOOP_WATCHDOG,
+})
+
+
+def is_self_agent(agent_id: str = "", project_id: str = "") -> bool:
+    """Is this wake about Owner OS's OWN agent — the one the supervisor refuses to touch?
+
+    Asked of the SAME source the denial uses, `native_supervisor._project_for_target`,
+    so the two can never disagree: an agent that is denied as `self_project` is exactly
+    the agent that gets the flow. The event's own `project_id` is NOT authoritative here
+    (self-agent events carry the tmux-derived key `owner-os-opus-fresh`, while the denial
+    keys on the checkout directory `ai-dev-runtime`), so it is only a fallback.
+
+    Fails CLOSED: anything unresolvable returns False and the ordinary phrase is sent.
+    """
+    try:
+        from core import native_supervisor as ns
+    except Exception:  # noqa: BLE001 — a phrase must never depend on an optional import
+        return False
+    self_proj = (getattr(ns, "SELF_PROJECT", "") or "").strip()
+    if not self_proj:
+        return False
+    try:
+        proj = (ns._project_for_target(agent_id) or "").strip()
+    except Exception:  # noqa: BLE001
+        proj = ""
+    if proj:
+        return proj == self_proj
+    return wake_routes.normalize_key(project_id) == wake_routes.normalize_key(self_proj)
+
+
 def compose_phrase(*, event_id, event_type: str = "", project_id: str = "",
                    agent_id: str = "", trigger_class: str = "") -> str:
     """The ONLY text the companion may submit, extended with system-authored context.
 
     Every field is either a number, drawn from a closed lookup table, or run through a
     validator/sanitizer — never free text echoed from an agent pane or a ChatGPT reply.
+    The self-agent flow appended below is a FIXED constant for the same reason: it
+    interpolates nothing, so no pane content can reach ChatGPT through it either.
     """
     tc = (trigger_class or trigger_class_for(event_type) or TRIGGER_CLASS_EVENT)
     et = _sanitize_token(event_type) or "unknown"
@@ -327,8 +390,11 @@ def compose_phrase(*, event_id, event_type: str = "", project_id: str = "",
         eid = int(event_id)
     except (TypeError, ValueError):
         eid = 0
-    return (f"[Owner OS wake] event={eid} trigger={tc} type={et} project={proj} "
+    base = (f"[Owner OS wake] event={eid} trigger={tc} type={et} project={proj} "
             f"agent={agent}. {WAKE_PHRASE}")
+    if tc in SELF_FLOW_TRIGGER_CLASSES and is_self_agent(agent_id, project_id):
+        return base + SELF_WAKE_FLOW
+    return base
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS wake_audit (
