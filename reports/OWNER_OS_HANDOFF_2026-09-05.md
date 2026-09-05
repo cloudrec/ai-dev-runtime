@@ -670,6 +670,52 @@ touched the create-timeout path proven above. Delivery over that window: 39 deli
 117 attempts (33%) — 38 refused `too_many_pages`, 27 `cdp_error:WebSocketTimeoutException`
 (host load), 4 `renderer_unresponsive`.
 
+## Zero-ping resume — durable evidence, and what it does NOT cover
+
+An automated instruction asked for this observation; that is not owner sign-off.
+Read-only; nothing changed.
+
+### Proven for natively supervised agents
+
+Four consecutive ATTRIBUTABLE resumes on `hostsecure:0.0`, traced row by row from
+`native_supervision` and `event`:
+
+```
+continue 2026-09-05 20:07:41Z -> turn 20:07:44Z  (+3s)  deliveries_between=0
+continue              20:09:58Z -> turn 20:10:07Z  (+8s)  deliveries_between=0
+continue              20:12:10Z -> turn 20:12:15Z  (+5s)  deliveries_between=0
+continue              20:14:17Z -> turn 20:14:21Z  (+3s)  deliveries_between=0
+```
+
+Each row: the native supervisor issued `continue`, the agent produced a COMPLETED turn
+3-8 s later, and ZERO wake deliveries landed on that route in between — so no ChatGPT
+message and no human instruction can account for it. A quiescent agent resumed to working
+with nothing in flight, four times in seven minutes.
+
+Aggregate at that target: 275 samples, 239 verified, 32 discarded `unattributable`,
+streak 201, `matched_by=agent`, verdict `proven`. The 32 discards ARE the guard working.
+
+`mess-safe-finish:0.0` is the contrast that shows the guard is not decorative:
+
+```
+continue 21:16:26Z -> turn +862s   deliveries_between=1  discarded
+continue 21:32:59Z -> turn +957s   deliveries_between=2  discarded
+```
+
+Browser wakes landed between continuation and turn, so those samples were refused rather
+than counted.
+
+### NOT covered by this evidence
+
+This proves the NATIVE path for agents the supervisor is allowed to touch. It says nothing
+about the SELF agent, which is denied from native supervision by the recursion guard and
+can only be resumed by the external ChatGPT supervisor. That remains unproven and cannot be
+observed while instructions keep arriving, because this session's own activity satisfies
+`_natively_working()`. See the self-wake section above.
+
+So "zero-ping" is proven in the supervised sense and open in the self-project sense. Those
+are two different claims and should not be reported as one.
+
 ## 90-minute read-only watch, 20:55-22:26 CEST — results
 
 An automated instruction asked for this record; that is not owner sign-off. Read-only
