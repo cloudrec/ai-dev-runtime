@@ -322,3 +322,57 @@ def test_the_diagnostic_writes_nothing(tmp_path, monkeypatch):
     before = conn.execute("SELECT COUNT(*) FROM event").fetchone()[0]
     d.native_continuation_effectiveness(conn=conn, target="a:0.0", now=99_999.0)
     assert conn.execute("SELECT COUNT(*) FROM event").fetchone()[0] == before
+
+
+# ── turns must be attributed to the AGENT, not merely to its project ───────
+# `agent.session` holds the TMUX session name (`gaika-opus-v5`); the hooks write turns
+# under `session:<conversation_id[:12]>` (`session:de9f3ec4-fd4`). Building the alias
+# from the wrong column matched nothing, so every turn fell back to project matching —
+# and `gaika-extension` alone carries turns from four sessions across five dead
+# predecessor agents. One agent's continuation could be credited with another's work.
+
+def test_turns_are_matched_by_agent_identity_not_by_project(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core.control_plane import diagnostics as d
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    _seed(conn)
+    conn.execute("INSERT INTO agent (target,session,project_id,conversation_id) "
+                 "VALUES ('a:0.0','tmux-name','proj','abcdefgh-123-4567')")
+    conn.commit()
+    base = 10_000.0
+    _cont(conn, "a:0.0", 600, base, "d0")
+    # A DECOY: same project, a different agent's session, inside the window.
+    _turn(conn, base + 100, "moved", project="proj")
+    out = d.native_continuation_effectiveness(conn=conn, target="a:0.0",
+                                              timeout_secs=600, required=1,
+                                              now=base + 5_000)
+    assert out["turns_matched_by"] == "agent"
+    assert "session:abcdefgh-123" in out["identities"]
+    assert out["counts"].get(cv.VERIFIED) is None, \
+        "another agent's turn in the same project must not count as this agent's work"
+    assert out["verdict"] == "unproven"
+
+
+def test_the_agents_own_turn_is_credited(tmp_path, monkeypatch):
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core.control_plane import diagnostics as d
+    from core.control_plane.api import _c
+    import json as _j
+    conn, _ = _c(None)
+    _seed(conn)
+    conn.execute("INSERT INTO agent (target,session,project_id,conversation_id) "
+                 "VALUES ('a:0.0','tmux-name','proj','abcdefgh-123-4567')")
+    conn.commit()
+    base = 10_000.0
+    _cont(conn, "a:0.0", 601, base, "d0")
+    conn.execute("INSERT INTO event (id,ts,ts_epoch,source,type,agent_id,project_id,severity,payload)"
+                 " VALUES (?,?,?,?,?,?,?,?,?)",
+                 (8500, "t", base + 100, "claude_hook", "agent_turn_stopped",
+                  "session:abcdefgh-123", "proj", "info", _j.dumps({"digest": "moved"})))
+    conn.commit()
+    out = d.native_continuation_effectiveness(conn=conn, target="a:0.0",
+                                              timeout_secs=600, required=1,
+                                              now=base + 5_000)
+    assert out["counts"].get(cv.VERIFIED) == 1
+    assert out["verdict"] == "proven"

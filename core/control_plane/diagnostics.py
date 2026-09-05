@@ -140,28 +140,49 @@ def native_continuation_effectiveness(*, conn=None, target: Optional[str] = None
             project = ns._project_for_target(tgt, conn=conn) or ""
         except Exception:  # noqa: BLE001 — an unknown project only widens attribution
             project = ""
-        idents = (tgt,)
+        # `_project_for_target` reads the SUPERVISOR REGISTRY, which a target supervised
+        # through the `*` wildcard may never have been written to. The agent row knows
+        # the project regardless, and without this fallback such a target resolves to ""
+        # — losing the route whose deliveries the attribution guard depends on, which
+        # would quietly make every sample look attributable.
         try:
-            row = conn.execute("SELECT session, COALESCE(project_id,'') FROM agent "
-                               "WHERE target=?", (tgt,)).fetchone()
+            row = conn.execute("SELECT COALESCE(project_id,'') FROM agent WHERE target=?",
+                               (tgt,)).fetchone()
             if row:
-                if row[0]:
-                    idents = (tgt, "session:%s" % str(row[0])[:12])
-                # `_project_for_target` reads the SUPERVISOR REGISTRY, which a target
-                # supervised through the `*` wildcard may never have been written to. The
-                # agent row knows the project regardless, and without this fallback such a
-                # target resolves to "" — losing both the turn match by project and the
-                # route whose deliveries the attribution guard depends on, which would
-                # quietly make every sample look attributable.
-                project = project or (row[1] or "")
+                project = project or (row[0] or "")
         except Exception:  # noqa: BLE001
             pass
+        # The agent's OTHER name. `agent_watch` writes under the tmux target; the native
+        # hooks write under `session:<conversation_id[:12]>`, and turns — the evidence
+        # this whole verdict rests on — arrive only under the latter.
+        #
+        # Resolved through `closed_loop_wake._identities`, which reads `conversation_id`.
+        # An earlier version of this function built the alias from `agent.session`, which
+        # holds the TMUX SESSION NAME (`gaika-opus-v5`), so it matched nothing and every
+        # turn was matched by PROJECT instead. `gaika-extension` alone carries turns from
+        # four distinct sessions across five dead predecessor agents, so project matching
+        # can credit one agent's continuation with another agent's work. It happened to
+        # be unambiguous for the window measured — the predecessors all stopped before
+        # the first continuation — which is luck, not a guarantee.
+        try:
+            from core import closed_loop_wake as _clw
+            idents = tuple(_clw._identities(conn, tgt))
+        except Exception:  # noqa: BLE001
+            idents = (tgt,)
+        session_idents = [i for i in idents if i.startswith("session:")]
 
+        # Prefer the AGENT's own turns. Falling back to the project is deliberately a
+        # last resort and is reported, because it is the loose match: a reader must be
+        # able to see that the evidence was attributed by project rather than by agent.
+        if session_idents:
+            where, params = ("agent_id IN (%s)" % ",".join("?" * len(idents))), idents
+            matched_by = "agent"
+        else:
+            where, params, matched_by = "project_id=?", (project,), "project"
         turns = []
         for ts_epoch, payload in conn.execute(
                 "SELECT ts_epoch, payload FROM event WHERE type='agent_turn_stopped' "
-                "AND (project_id=? OR agent_id IN (%s)) ORDER BY ts_epoch"
-                % ",".join("?" * len(idents)), (project, *idents)).fetchall():
+                "AND " + where + " ORDER BY ts_epoch", params).fetchall():
             try:
                 turns.append({"ts": float(ts_epoch),
                               "digest": (json.loads(payload) or {}).get("digest") or ""})
@@ -194,7 +215,9 @@ def native_continuation_effectiveness(*, conn=None, target: Optional[str] = None
         counts = {v: sum(1 for s in samples if s["verdict"] == v)
                   for v in {s["verdict"] for s in samples}}
         return {"active": True, "target": tgt, "project": project,
-                "route_key": project, "samples": len(samples), "counts": counts,
+                "route_key": project, "turns_matched_by": matched_by,
+                "identities": list(idents),
+                "samples": len(samples), "counts": counts,
                 "timeout_secs": timeout_secs, "streak": roll["streak"],
                 "required": roll["required"],
                 # The whole point: effectiveness is PROVEN or it is not. There is no
