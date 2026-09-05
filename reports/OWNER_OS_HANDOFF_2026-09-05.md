@@ -77,7 +77,7 @@ short of the finish; it was never a failure.
 
 ```
 ai-runtime   PID 1196430  up 2026-09-05 06:05:35 CEST  active   (was 2690604, up 09-02)
-companion    PID 4170370  up 2026-09-05 18:25:24 CEST  active   (was 2889296, up 13:00)
+companion    PID 529251   up 2026-09-05 20:39:38 CEST  active   (was 4170370, up 18:25)
 ```
 
 **Deploy skew CLEARED.** Owner typed "restart ai-runtime". The first hourly tick after it,
@@ -95,7 +95,7 @@ Evidence the running process carries the fix: source finalised 08:20:34,
 `NRestarts=0`. Autonomy alive on the first ticks — `native-supervisor: continued
 security-demo:0.0 from event 31638`.
 
-## Canary retargeted to the live gaika agent
+## Canary retargeted to the live gaika agent (SUPERSEDED — see hostsecure below)
 
 Owner typed "retarget the canary to gaika-opus-v6". The companion restart that loaded it
 arrived through the automated Owner OS API channel — an automated instruction was
@@ -146,6 +146,31 @@ the fail-closed rule starting from no evidence. It will earn a verdict from
 `ROLLBACK.md` carrying both the one-line undo and the whole-file restore. The verifier
 writes nothing and adds no schema, so there is no data to undo; a companion restart is
 required either way.
+
+## Canary retargeted again — `hostsecure:0.0` (current)
+
+Owner typed "retarget the canary to hostsecure", then "restart the companion".
+
+```
+NATIVE_CANARY_TARGET=gaika-opus-v6:0.0  ->  hostsecure:0.0     (one line, 2 diff lines)
+NATIVE_SUPERVISOR_TARGETS=*             unchanged
+NATIVE_CANARY_TIMEOUT_SECS=3600         unchanged
+companion PID 4170370 -> 529251, active since 2026-09-05 20:39:38 CEST
+loaded NATIVE_CANARY_TARGET=hostsecure:0.0  (read from /proc/<pid>/environ, that var only)
+ai-runtime PID 1196430 untouched
+```
+
+**Why.** `gaika-opus-v6` was a thin instrument: 5 continuations total, streak stuck at 2/3
+with one sample expired past its window. `hostsecure:0.0` reads 275 samples / 239 verified
+/ 32 discarded `unattributable` / streak 201 / `matched_by=agent` / verdict `proven`.
+
+**CAVEAT, recorded rather than buried.** This target was chosen AFTER its verdict was known
+to be `proven`. That is selection bias: the `proven` reading is not fresh evidence the
+canary gathered, it is what the read-only survey had already established hours earlier.
+What the retarget buys is a better instrument going forward, not a new result.
+
+Rollback: `backups/canary_retarget_hostsecure_20260905T182744Z/` — `.env.before` (mode 600)
+plus `ROLLBACK.md` carrying the one-line undo, the whole-file restore and this same caveat.
 
 ## The self-agent external wake — `стоит агент` no longer required
 
