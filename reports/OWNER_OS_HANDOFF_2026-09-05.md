@@ -858,16 +858,50 @@ fresh subprocess per event. These two rows persist; nothing new joins them.
 
 ## Genuine owner gates
 
-1. **Telegram BotFather token** — a dedicated bot, token into `configs/.env` as
-   `TELEGRAM_BOT_TOKEN`; Owner OS then derives the chat id from `getUpdates` and verifies
-   with `getChat`. `owner_push` is `Bad Request: chat not found`; 5986 dead letters, 18
-   active. This is the SOLE cause of health red — `loop_liveness`, `registry_health` and
-   `browser_degraded`-as-a-check are all green, and 5942 of 5944 dead letters are telegram.
+1. **Telegram BotFather token** — the SOLE cause of health red, all session.
+
+   Non-secret remediation, in order — step 2 is the one people miss:
+
+   1. create a dedicated bot with BotFather, token into `configs/.env` as
+      `TELEGRAM_BOT_TOKEN`;
+   2. send that bot ONE message from the owner's Telegram account, so an inbound update
+      exists;
+   3. Owner OS derives the chat id from `getUpdates` and verifies with `getChat`.
+
+   Until step 2 happens there is nothing for `getUpdates` to return, which is precisely why
+   the current id resolves to `Bad Request: chat not found`.
+
+   Counts at 2026-09-05 23:10Z: **6652 dead letters, 30 active** (was 5986/18 at 05:15Z —
+   the backlog grows by roughly one per agent-watch notification and will keep growing
+   until the token is in place). Two dead-letter events were traced end to end and BOTH are
+   this gate rather than a defect: 31943 (`mess-safe-finish`) in
+   `reports/OWNER_OS_EVENT_31943_DEAD_LETTER_2026-09-05.md`, and 34453
+   (`capacity-blockchain`) at 23:08:30Z, identical chain, identical terminal reason.
+
+   Accounting re-verified against the raw table at 23:10Z and it is HONEST — nothing hides
+   or misclassifies these:
+
+   ```
+   raw            dead_letter 6652 · sent 2
+   history_report total 6652 · active 30 · historical 6622 · status red
+   failure_report total 6652 · active 30 · classification active
+   notifications_status  red · owner_push "telegram send failed: Bad Request: chat not found"
+   ```
+
 2. **Rows 21903 / 24179** — one question per project: is that value live? If yes, rotate at
    the issuing service; `control_plane.db` is a plain file on this host, so scrubbing the
    row is cosmetic beside rotation. If no, nothing is required.
-3. **Host memory** — conditional only. Currently recovering; becomes a gate if it reverses
-   and processes must be shed.
+3. **Host memory** — conditional only. Five spikes on 2026-09-05, each self-clearing within
+   ~3 minutes; by 00:25Z load was back to 10.13 with PSI decaying. NOT currently a gate;
+   becomes one only if free memory stays under ~300 MB with PSI `avg10 > avg60` across
+   CONSECUTIVE readings and processes must be shed.
+4. **Push** — four documentation-only commits on
+   `reports/OWNER_OS_HANDOFF_2026-09-05.md` are unpushed (`105f731`, `3f009d5`, `9177606`,
+   `db6cbc1`). Repeated automated instructions both to push and NOT to push arrived on the
+   same channel; neither is owner-typed, so the gate stands.
+5. **`acap-voice` route/project registration** — its events carry an empty `project_id` and
+   fall back to the `owner-os` route by design (`wake_routes.route_key_for_event`). Fixing
+   that means registering the project or binding a route: both owner-only.
 
 ## Do NOT touch
 
