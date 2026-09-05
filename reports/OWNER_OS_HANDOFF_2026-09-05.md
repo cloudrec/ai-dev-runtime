@@ -77,7 +77,7 @@ short of the finish; it was never a failure.
 
 ```
 ai-runtime   PID 1196430  up 2026-09-05 06:05:35 CEST  active   (was 2690604, up 09-02)
-companion    PID 1770858  up 2026-09-05 08:28:39 CEST  active   (was 1036186, up 05:28)
+companion    PID 2889296  up 2026-09-05 13:00:07 CEST  active   (was 1770858, up 08:28)
 ```
 
 **Deploy skew CLEARED.** Owner typed "restart ai-runtime". The first hourly tick after it,
@@ -94,6 +94,58 @@ Evidence the running process carries the fix: source finalised 08:20:34,
 `tools/__pycache__/cdp_composer.cpython-312.pyc` compiled 08:20, process started 08:28:39,
 `NRestarts=0`. Autonomy alive on the first ticks — `native-supervisor: continued
 security-demo:0.0 from event 31638`.
+
+## Canary retargeted to the live gaika agent
+
+Owner typed "retarget the canary to gaika-opus-v6". The companion restart that loaded it
+arrived through the automated Owner OS API channel — an automated instruction was
+received; that part is not owner sign-off.
+
+**Why.** `NATIVE_CANARY_TARGET` still named `gaika-opus-v5:0.0`, which had been retired:
+last event 2026-09-05 08:13:16Z, no tmux session. `native_continuation_effectiveness()`
+therefore read `verdict=proven, streak=3/3, {verified 13, unverified 7, unattributable 1}`
+— counts that had not moved in over two hours and could never move again, because the
+agent producing them no longer runs. Green with nothing behind it, which is the more
+misleading direction of failure. The live agent is `gaika-opus-v6:0.0` (tmux session
+created 09:27:24), already `covered` under `NATIVE_SUPERVISOR_TARGETS=*`.
+
+**The change.** One line in `configs/.env`, verified as exactly two diff lines against the
+backup:
+
+```
+NATIVE_CANARY_TARGET=gaika-opus-v5:0.0  ->  gaika-opus-v6:0.0
+```
+
+`NATIVE_SUPERVISOR_TARGETS`, the denylist, routes and every other line were untouched.
+
+**Skew closed.** Before the restart the running process (PID 1770858) still held
+`NATIVE_CANARY_TARGET=gaika-opus-v5:0.0` — read from `/proc/<pid>/environ`, that variable
+only, out of 40. After the restart PID 2889296 holds `gaika-opus-v6:0.0`. `ai-runtime` was
+NOT restarted and still runs PID 1196430 from 06:05:35.
+
+**Verified after the restart:**
+
+```
+service      active (running) since 13:00:07 CEST, NRestarts=0
+canary       target gaika-opus-v6:0.0 · verdict unproven · streak 0/3 · counts {} · active
+coverage     covered 5 · denied 5 · uncovered 0
+             gaika-opus-v6 · hostsecure · mess-postsignup-cleanup-sonnet-v4
+             mess-safe-finish · security-demo
+browser      8 pages · headroom 4 · degraded=False
+delivery     six consecutive submitted_and_assistant_started_generating after the restart
+             (11477-11482), no regression
+notifications red — Telegram gate, unchanged
+```
+
+`unproven` with zero samples is the CORRECT post-retarget state, not a regression: it is
+the fail-closed rule starting from no evidence. It will earn a verdict from
+`gaika-opus-v6`'s own turns, needing a streak of 3 inside the 3600 s window. The previous
+`proven` was the untrustworthy reading.
+
+**Rollback.** `backups/canary_retarget_20260905T104016Z/` — `.env.before` (mode 600) plus
+`ROLLBACK.md` carrying both the one-line undo and the whole-file restore. The verifier
+writes nothing and adds no schema, so there is no data to undo; a companion restart is
+required either way.
 
 ## Zero-ping / autonomy
 
