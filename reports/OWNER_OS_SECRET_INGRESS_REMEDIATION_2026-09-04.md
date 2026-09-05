@@ -74,11 +74,51 @@ what is already stored.
 
 ## What requires the owner's direct action
 
-1. **Decide on rows 21903 and 24179.** If those values are live credentials, the ledger
-   is a plain file on this host and anything with filesystem access can read it —
-   rotation at the issuing service is the only real remedy, and scrubbing the rows is
-   cosmetic by comparison. If they are not live, no action is needed. Determining which
-   requires reading them, which is the owner's call, not an agent's.
+### What read-only investigation on 2026-09-05 settled
+
+Both rows are `agent_turn_stopped` hook events carrying the AGENT'S OWN end-of-turn
+message — not a config file, not a user paste:
+
+| row | when | project / cwd | key | value len |
+|---|---|---|---|---|
+| 21903 | 2026-09-02 15:37:59 | `arbitrage2-fable-audit` · `/opt/arbitrage2-fable-audit` | `token=` | 20 |
+| 24179 | 2026-09-03 07:45:58 | `payment-orchestrator` · `/opt/payment-orchestrator` | `password=` | 33 |
+
+(The earlier note said 22 for 21903. That measurement ran the regex over the raw payload
+JSON, so the capture ran into the string escaping; parsing the JSON first gives 20.)
+
+Established WITHOUT reading either value — every check below reported a boolean only:
+
+* **Neither is a secret of this repo.** No exact match to any live value in
+  `configs/.env`, and no containment either way.
+* **Neither is a repo fixture or example.** Absent from the tracked working tree and from
+  the entire git history (`git log -S`).
+* **Neither is a placeholder.** No `<...>`, `XXXX`, `YOUR_`, `example`, `changeme`.
+* **Neither is prose.** No spaces, no terminal sentence punctuation.
+
+So they are credential-SHAPED strings belonging, if to anything, to the two OTHER
+projects whose agents emitted them. Nothing in this repo's runtime, git or reports can
+say whether they are live: that requires reading the values and comparing them against
+those projects' own systems, which is precisely the step being withheld.
+
+Ingress is closed going forward — the hook redaction has been live since the companion
+restart at 2026-09-05 05:28, and the hook itself has run redacted since `0988577`
+because it is a fresh subprocess per event. These two rows persist; nothing new joins
+them.
+
+1. **Decide on rows 21903 and 24179 — one question per project.** Is the value a LIVE
+   credential of `arbitrage2-fable-audit` (row 21903) or of `payment-orchestrator`
+   (row 24179)? The second is the higher-stakes one: that project is denylisted and
+   money-related.
+
+   If live: rotate at the issuing service. `control_plane.db` is a plain file on this
+   host, so anything with filesystem access has already had it; scrubbing the row is
+   cosmetic next to rotation. If not live: nothing is required, and scrubbing is
+   optional tidying.
+
+   Answering requires reading the values and checking them against those projects' live
+   configuration — an agent cannot do it without both reading the secret and reaching
+   into two out-of-scope projects.
 
 2. **Push `aaf1bd4`, `0988577`, `2288f7c`** — three local commits, tracked tree clean.
 
