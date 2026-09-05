@@ -670,6 +670,65 @@ touched the create-timeout path proven above. Delivery over that window: 39 deli
 117 attempts (33%) — 38 refused `too_many_pages`, 27 `cdp_error:WebSocketTimeoutException`
 (host load), 4 `renderer_unresponsive`.
 
+## 90-minute read-only watch, 20:55-22:26 CEST — results
+
+An automated instruction asked for this record; that is not owner sign-off. Read-only
+throughout: nothing shed, restarted or configured.
+
+### Browser — the tab fix held under adverse conditions
+
+`pages=8`, zero duplicates, on EVERY sample of the window. Not one deviation across five
+memory-pressure alerts and five recovery-triggering delivery failures. Five
+`assistant_generating_wedged` events each drove `recover_wedged_tab` — the create-and-close
+path that leaked a page every time before `ffe63c2` — and the count never left 8.
+
+This is stronger evidence than the morning soak, which ran in a quiet window.
+
+### Delivery — 45 of 61 (74%)
+
+```
+45  submitted_and_assistant_started_generating
+ 8  cdp_error:WebSocketTimeoutException
+ 5  assistant_generating_wedged
+ 2  assistant_still_generating
+ 1  assistant_started_but_produced_nothing:1
+```
+
+### Memory — five alerts, all self-clearing, gate 3 CLOSED
+
+```
+21:16  psi_full 5.15   free 192MB  so=14848  ->  21:19  psi 2.14  so=0
+21:41  psi_full 3.32   free 559MB  so=0
+21:44  psi_full 11.65  free 140MB  so=17032  ->  21:47  psi 1.01  so=0   worst of session
+22:02  psi_full 3.49   free 624MB  so=2512   ->  22:08  psi 0.00  so=0
+22:20  psi_full 5.25   free 243MB  so=0                                  OPEN at window close
+```
+
+Each episode recovered in about three minutes and every one involving eviction returned
+`so` to 0. Bursty, not degenerative.
+
+**Two things stated as OBSERVATION, not proof:**
+
+* The failure clusters CORRELATE with the memory spikes; they were not traced
+  event-by-event to them. Correlation across a 90-minute window is not causation, and no
+  attempt was made to establish it.
+* The 22:20 alert was still open when the window ended. Its shape matches the four that
+  cleared and it carried `so=0` (pressure without eviction), but it was NOT observed
+  clearing. Do not read the run as "five spikes, all resolved".
+
+### Repo
+
+`f73b6cd`, `origin` in sync, tracked tree clean, zero open owner gates.
+
+### The gates, restated
+
+1. **Telegram token** — owner-controlled. Still the sole cause of health red.
+2. **`acap-voice` route/project registration** — owner-controlled; never driven from here.
+3. **Supervisor resumption** — NOT a gate and NOT a config change. It needs only a quiet
+   observation window: a self-agent wake resolving `pane_alive_and_working` with no
+   instruction in flight. The signal is already durable in `wake_loop_watch`; nothing needs
+   building, enabling or restarting to capture it.
+
 ## Host memory — spiked and recovered inside one hour, still monitor only
 
 At 05:15Z:
