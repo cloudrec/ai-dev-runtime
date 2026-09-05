@@ -19,6 +19,7 @@ import json
 import re
 import os
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Optional
@@ -56,9 +57,16 @@ STREAMING_SEL = ("button[data-testid='stop-button'], button[aria-label*='Stop'],
 ASSISTANT_START_SECS = int(os.getenv("WAKE_ASSISTANT_START_SECS", "45"))
 
 
-def _http(path: str, method: str = "GET"):
+# The generic ceiling for a browser-level DevTools call. Every one of them is a lookup
+# the browser process answers from memory — except `/json/new`, which must spawn a
+# renderer first, so that call carries its own, far larger budget. See `_create_tab`.
+CDP_HTTP_SECS = float(os.getenv("CDP_HTTP_SECS", "8"))
+CDP_NEW_TAB_SECS = float(os.getenv("CDP_NEW_TAB_SECS", "30"))
+
+
+def _http(path: str, method: str = "GET", timeout: Optional[float] = None):
     req = urllib.request.Request(f"http://{CDP_HOST}:{CDP_PORT}{path}", method=method)
-    with urllib.request.urlopen(req, timeout=8) as r:
+    with urllib.request.urlopen(req, timeout=timeout or CDP_HTTP_SECS) as r:
         body = r.read().decode()
         if not body.strip():
             return {}
@@ -224,6 +232,133 @@ def _reap(target_id: str) -> bool:
     return _close_target(target_id) or _close_target(target_id)
 
 
+def _page_ids() -> Optional[set]:
+    """Every page id the browser currently holds, or None if the list could not be READ.
+
+    None is not "no pages open". It means the snapshot is untrustworthy, and a sweep that
+    cannot tell a tab it just created from one that was already there must close nothing
+    at all.
+    """
+    try:
+        pages = _http("/json/list")
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(pages, list):
+        return None
+    return {t.get("id") for t in pages
+            if isinstance(t, dict) and t.get("type") == "page" and t.get("id")}
+
+
+def _sweep_unnamed_tab(before: Optional[set], conversation_url: str, *,
+                       tries: int = 3, gap: float = 2.0) -> list:
+    """Close the tab a failed create made but never told us the id of.
+
+    Every other cleanup in this module closes an id Chrome handed back. This one exists
+    for the case where Chrome created the tab and the ANSWER never arrived, so there is
+    no id to close — the leak proven in `_create_tab`. The tab is identified by exclusion
+    instead: it is a page that was not in the snapshot taken immediately before the
+    create, and whose URL is one that create could have produced (the conversation we
+    asked for, or the blank/root it sits on until that navigation completes). A page open
+    before the create is never a candidate, so no bound conversation and no tab of the
+    owner's can be caught by this.
+
+    Retried, because the create call timed out precisely because the browser was slow:
+    the tab may appear a moment AFTER the timeout that made us give up on it.
+    """
+    if before is None:
+        return []
+    want = (conversation_url or "").rstrip("/")
+    roots = ("", "about:blank", "https://chatgpt.com", "https://chat.openai.com")
+    reaped: list = []
+    for i in range(tries):
+        if i:
+            time.sleep(gap)
+        try:
+            pages = _http("/json/list")
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(pages, list):
+            continue
+        for t in pages:
+            if not isinstance(t, dict) or t.get("type") != "page":
+                continue
+            tid = t.get("id")
+            if not tid or tid in before or tid in reaped:
+                continue
+            u = (t.get("url") or "").rstrip("/")
+            if not (u in roots or (want and u.startswith(want))):
+                continue
+            if _reap(tid):
+                reaped.append(tid)
+        if reaped:
+            break
+    return reaped
+
+
+def _create_tab(conversation_url: str) -> Optional[dict]:
+    """Open ONE tab on the bound conversation, and never leave behind a tab we cannot name.
+
+    THE single choke point for creating tabs: the `browser_degraded` refusal lives here,
+    so no creation path can bypass it, and so does the cleanup for a create that fails.
+
+    ROOT CAUSE of the duplicate-tab accrual, proven 2026-09-05. `/json/new` is the only
+    browser-level call that does real work — Chrome must spawn a renderer and start the
+    navigation before it answers. Measured on this host with 13 pages open: 4.56 s. The
+    generic 8 s ceiling `_http` applied to every call was therefore not a ceiling for
+    this one, it was a coin flip, and losing it leaked a tab every time:
+
+        fresh = _http("/json/new?...", method="PUT")   # times out at 8 s
+      except Exception:                                 # "pre-111 Chrome used GET here"
+        fresh = _http("/json/new?...")                  # Chrome 151 answers 405
+
+    The tab was ALREADY created — the timeout was on the answer, not on the action. The
+    GET fallback then raised `HTTPError 405: Using unsafe HTTP verb GET to invoke
+    /json/new`, which escaped to the outer handler with `fresh` still None, so the guard
+    there (`if fresh and fresh.get("id")`) closed nothing. The orphan finished loading
+    the bound conversation seconds later and stayed: a duplicate on a ROUTED
+    conversation, with no root and no placeholder to give it away.
+
+    Measured signature, 2026-09-05, over the 8 -> 13 regrowth in the 1 h 50 m after a
+    cleanup: five extra pages against five failed recoveries, matched conversation by
+    conversation (hostsecure x2, mess, seo, payment-orchestrator), and each leaked
+    document created 7-9 s before its own `renderer_unresponsive` record — the 8 s
+    timeout plus an immediate 405. The previously suspected cause, both `_reap` attempts
+    failing on the OLD tab, was ruled out against the live browser: `/json/close` answers
+    `Target is closing` and the page leaves `/json/list` in under 0.5 s.
+
+    Three things follow, and all three are needed:
+
+    * the create gets a budget that fits what it does (`CDP_NEW_TAB_SECS`);
+    * the GET fallback fires ONLY for a browser that rejected the VERB (405/501). A
+      timeout must never re-issue a create, because on the pre-111 Chrome that fallback
+      exists for, the second call would open a SECOND tab;
+    * a create that fails for any reason sweeps for the tab it may have made anyway.
+    """
+    d = browser_degraded()
+    if d.get("degraded"):
+        return None
+    before = _page_ids()
+    path = f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}"
+    try:
+        fresh = _http(path, method="PUT", timeout=CDP_NEW_TAB_SECS)
+    except urllib.error.HTTPError as e:
+        if e.code not in (405, 501):
+            _sweep_unnamed_tab(before, conversation_url)
+            return None
+        try:
+            fresh = _http(path, timeout=CDP_NEW_TAB_SECS)  # pre-111 Chrome used GET
+        except Exception:  # noqa: BLE001
+            _sweep_unnamed_tab(before, conversation_url)
+            return None
+    except Exception:  # noqa: BLE001
+        _sweep_unnamed_tab(before, conversation_url)
+        return None
+    if not isinstance(fresh, dict) or not fresh.get("id"):
+        _sweep_unnamed_tab(before, conversation_url)
+        return None
+    return fresh
+
+
 def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict]:
     """Replace a wedged renderer with a fresh tab on the SAME bound conversation.
 
@@ -243,12 +378,8 @@ def recover_wedged_tab(old_target: dict, conversation_url: str) -> Optional[dict
         return None
     fresh = None
     try:
-        try:
-            fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}",
-                          method="PUT")
-        except Exception:  # noqa: BLE001 — pre-111 Chrome used GET here
-            fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}")
-        if not fresh.get("id"):
+        fresh = _create_tab(conversation_url)
+        if not fresh:
             return None
         for _ in range(15):
             time.sleep(2)
@@ -363,12 +494,8 @@ def open_chatgpt_page(conversation_url: str) -> Optional[dict]:
         return None
     fresh = None
     try:
-        try:
-            fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}",
-                          method="PUT")
-        except Exception:  # noqa: BLE001 — pre-111 Chrome used GET here
-            fresh = _http(f"/json/new?{urllib.parse.urlencode({'': conversation_url})[1:]}")
-        if not fresh.get("id"):
+        fresh = _create_tab(conversation_url)
+        if not fresh:
             return None
         for _ in range(15):
             time.sleep(2)

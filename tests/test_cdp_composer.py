@@ -792,7 +792,7 @@ def test_a_degraded_browser_opens_NO_replacement_tab(monkeypatch):
     opened = []
     monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": True,
                                                                  "reason": "too_many_pages:41"})
-    monkeypatch.setattr(cc, "_http", lambda path, method="GET": opened.append(path) or {})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET", **_kw: opened.append(path) or {})
     assert cc.recover_wedged_tab({"id": "old"}, "https://chatgpt.com/c/a") is None
     assert opened == [], "a starving browser must not be handed another tab to open"
 
@@ -804,7 +804,7 @@ def test_a_healthy_browser_still_gets_its_replacement_tab(monkeypatch):
     opened = []
     monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
 
-    def fake_http(path, method="GET"):
+    def fake_http(path, method="GET", **_kw):
         opened.append(path)
         return {"id": "fresh"}
 
@@ -857,7 +857,7 @@ def _recover_with(monkeypatch, *, verified, old_id="old"):
     from tools import cdp_composer as cc
     calls = []
 
-    def fake_http(path, method="GET"):
+    def fake_http(path, method="GET", **_kw):
         calls.append(path)
         return {"id": "fresh"} if "/json/new" in path else {}
 
@@ -906,7 +906,7 @@ def test_nothing_is_closed_when_no_tab_was_ever_opened(monkeypatch):
     calls = []
     monkeypatch.setattr(cc, "browser_degraded",
                         lambda *a, **k: {"degraded": True, "reason": "too_many_pages:41"})
-    monkeypatch.setattr(cc, "_http", lambda path, method="GET": calls.append(path) or {})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET", **_kw: calls.append(path) or {})
     assert cc.recover_wedged_tab({"id": "old"}, "https://chatgpt.com/c/a") is None
     assert calls == []
 
@@ -917,7 +917,7 @@ def test_a_new_tab_with_no_id_closes_nothing(monkeypatch):
     calls = []
     monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
     monkeypatch.setattr(cc, "_http",
-                        lambda path, method="GET": calls.append(path) or {})
+                        lambda path, method="GET", **_kw: calls.append(path) or {})
     assert cc.recover_wedged_tab({"id": "old"}, "https://chatgpt.com/c/a") is None
     assert not [c for c in calls if "/json/close/" in c]
 
@@ -927,7 +927,7 @@ def test_a_close_that_fails_never_raises(monkeypatch):
     close already followed."""
     from tools import cdp_composer as cc
 
-    def boom(path, method="GET"):
+    def boom(path, method="GET", **_kw):
         raise OSError("browser gone")
 
     monkeypatch.setattr(cc, "_http", boom)
@@ -1123,7 +1123,7 @@ def test_recovery_closes_its_replacement_when_verification_raises(monkeypatch):
     from tools import cdp_composer as cc
     closed = []
     monkeypatch.setattr(cc, "browser_degraded", lambda: {"degraded": False})
-    monkeypatch.setattr(cc, "_http", lambda path, method="GET": {"id": "FRESH"})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET", **_kw: {"id": "FRESH"})
     monkeypatch.setattr(cc, "_close_target", lambda tid: (closed.append(tid), True)[1])
 
     def raising(_url):
@@ -1142,7 +1142,7 @@ def test_recovery_leaves_the_old_tab_alone_when_it_raises(monkeypatch):
     from tools import cdp_composer as cc
     closed = []
     monkeypatch.setattr(cc, "browser_degraded", lambda: {"degraded": False})
-    monkeypatch.setattr(cc, "_http", lambda path, method="GET": {"id": "FRESH"})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET", **_kw: {"id": "FRESH"})
     monkeypatch.setattr(cc, "_close_target", lambda tid: (closed.append(tid), True)[1])
     monkeypatch.setattr(cc, "find_target", lambda _u: (_ for _ in ()).throw(OSError("gone")))
     monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
@@ -1155,7 +1155,7 @@ def test_cleanup_failure_does_not_mask_the_original_outcome(monkeypatch):
     than raising into the caller."""
     from tools import cdp_composer as cc
     monkeypatch.setattr(cc, "browser_degraded", lambda: {"degraded": False})
-    monkeypatch.setattr(cc, "_http", lambda path, method="GET": {"id": "FRESH"})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET", **_kw: {"id": "FRESH"})
 
     def boom_close(_tid):
         raise RuntimeError("close exploded")
@@ -1214,7 +1214,7 @@ def _close_fixture(monkeypatch, list_answers):
     calls = {"close": 0, "list": 0}
     answers = list(list_answers)
 
-    def fake_http(path, method="GET"):
+    def fake_http(path, method="GET", **_kw):
         if "/json/close/" in path:
             calls["close"] += 1
             return {}
@@ -1249,7 +1249,7 @@ def test_an_unreadable_page_list_is_not_proof_of_removal(monkeypatch):
     True there is how the original defect got its answer wrong in the first place."""
     from tools import cdp_composer as cc
 
-    def fake_http(path, method="GET"):
+    def fake_http(path, method="GET", **_kw):
         if "/json/close/" in path:
             return {}
         raise OSError("browser gone")
@@ -1259,7 +1259,7 @@ def test_an_unreadable_page_list_is_not_proof_of_removal(monkeypatch):
     assert cc._close_target("WEDGED", verify_secs=0.0) is False
 
     # Same rule for an answer that is not a page list at all.
-    monkeypatch.setattr(cc, "_http", lambda path, method="GET": {})
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET", **_kw: {})
     assert cc._close_target("WEDGED", verify_secs=0.0) is False
 
 
@@ -1276,7 +1276,7 @@ def test_the_recovery_retry_can_now_actually_fire(monkeypatch):
     closes = []
     old_tab = {"id": "OLD", "type": "page", "url": "https://chatgpt.com/c/a"}
 
-    def fake_http(path, method="GET"):
+    def fake_http(path, method="GET", **_kw):
         if "/json/new" in path:
             return {"id": "FRESH"}
         if "/json/close/" in path:
@@ -1310,7 +1310,7 @@ def test_the_recovery_retry_can_now_actually_fire(monkeypatch):
 
 def _pages_fixture(monkeypatch, pages, dead=()):
     from tools import cdp_composer as cc
-    monkeypatch.setattr(cc, "_http", lambda path, method="GET": pages)
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET", **_kw: pages)
     monkeypatch.setattr(cc, "page_responsive",
                         lambda t, timeout=8.0: t["id"] not in set(dead))
     return cc
@@ -1355,7 +1355,7 @@ def test_non_chatgpt_pages_are_never_probed(monkeypatch):
         {"id": "FOREIGN", "type": "page", "url": "https://example.com/"},
         {"id": "LIVE", "type": "page", "url": "https://chatgpt.com/c/a"},
     ]
-    monkeypatch.setattr(cc, "_http", lambda path, method="GET": pages)
+    monkeypatch.setattr(cc, "_http", lambda path, method="GET", **_kw: pages)
 
     def probe(t, timeout=8.0):
         probed.append(t["id"])
@@ -1415,7 +1415,7 @@ def _leaky_recovery(monkeypatch, *, raise_instead):
         return len([c for c in closed if c == tid]) > 1   # lands on the second ask
 
     monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
-    monkeypatch.setattr(cc, "_http", lambda p, method="GET":
+    monkeypatch.setattr(cc, "_http", lambda p, method="GET", **_kw:
                         {"id": "FRESH"} if "/json/new" in p else {})
     monkeypatch.setattr(cc, "_close_target", fake_close)
     if raise_instead:
@@ -1456,7 +1456,7 @@ def test_open_chatgpt_page_reaps_a_replacement_it_could_not_verify(monkeypatch):
         return len(closed) > 1
 
     monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
-    monkeypatch.setattr(cc, "_http", lambda p, method="GET":
+    monkeypatch.setattr(cc, "_http", lambda p, method="GET", **_kw:
                         {"id": "FRESH"} if "/json/new" in p else {})
     monkeypatch.setattr(cc, "_close_target", fake_close)
     monkeypatch.setattr(cc, "find_target", lambda u: None)
@@ -1513,7 +1513,7 @@ def _open_with(monkeypatch, *, verified, degraded=False):
     from tools import cdp_composer as cc
     calls = []
 
-    def fake_http(path, method="GET"):
+    def fake_http(path, method="GET", **_kw):
         calls.append(path)
         return {"id": "fresh"} if "/json/new" in path else {}
 
@@ -1551,7 +1551,7 @@ def test_open_chatgpt_page_closes_the_tab_when_verification_raises(monkeypatch):
     from tools import cdp_composer as cc
     calls = []
 
-    def fake_http(path, method="GET"):
+    def fake_http(path, method="GET", **_kw):
         calls.append(path)
         return {"id": "fresh"} if "/json/new" in path else {}
 
@@ -1614,7 +1614,7 @@ def _recover(monkeypatch, *, close_ok, old_still_matches_first):  # noqa: D401
         return True
 
     monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
-    monkeypatch.setattr(cc, "_http", lambda p, method="GET":
+    monkeypatch.setattr(cc, "_http", lambda p, method="GET", **_kw:
                         {"id": "fresh"} if "/json/new" in p else {})
     monkeypatch.setattr(cc, "_close_target", fake_close)
     monkeypatch.setattr(cc, "find_target", fake_find)
@@ -1647,3 +1647,184 @@ def test_a_failed_close_is_retried_exactly_once(monkeypatch):
 def test_a_close_that_succeeds_is_not_retried(monkeypatch):
     out, closed = _recover(monkeypatch, close_ok=True, old_still_matches_first=False)
     assert closed.count("old") == 1
+
+
+# ── the create that times out AFTER Chrome made the tab (2026-09-05) ───────
+# ROOT CAUSE of the duplicate-tab accrual on ROUTED conversations. `/json/new` is the
+# one browser-level call that does real work — Chrome spawns a renderer and starts the
+# navigation before it answers — and it was held to the same 8 s ceiling as the lookups.
+# Measured on the live host with 13 pages open: 4.56 s. When it lost that race the tab
+# EXISTED and only the answer was missing, and the code then did:
+#
+#     except Exception:                    # "pre-111 Chrome used GET here"
+#         fresh = _http("/json/new?...")   # Chrome 151 answers 405
+#
+# so the fallback raised, `fresh` stayed None, the outer handler's `if fresh and
+# fresh.get("id")` closed nothing, and the orphan finished loading the bound
+# conversation. Five leaks in the 1 h 50 m after a cleanup took 13 -> 8, matched one for
+# one against five failed recoveries, each leaked document created 7-9 s before its own
+# `renderer_unresponsive` record: the 8 s timeout plus an immediate 405.
+
+def _timing_out_create(monkeypatch, *, before_pages, after_pages, exc=None):
+    """A `/json/new` that never answers, against a browser that made the tab anyway."""
+    from tools import cdp_composer as cc
+    seen = {"created": False}
+    closed = []
+
+    def fake_http(path, method="GET", **_kw):
+        if "/json/new" in path:
+            seen["created"] = True
+            raise (exc or TimeoutError("browser did not answer in time"))
+        if "/json/list" in path:
+            return list(after_pages) if seen["created"] else list(before_pages)
+        raise AssertionError("unexpected path " + path)
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc, "_reap", lambda tid: closed.append(tid) or True)
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    return cc, closed
+
+
+def _page(pid, url):
+    return {"id": pid, "type": "page", "url": url}
+
+
+def test_a_create_that_times_out_still_closes_the_tab_it_made(monkeypatch):
+    """The leak itself. Chrome never answered, so there is no id to close — the tab is
+    found by exclusion against the snapshot taken before the create."""
+    cc, closed = _timing_out_create(
+        monkeypatch,
+        before_pages=[_page("OLD", "https://chatgpt.com/c/a")],
+        after_pages=[_page("OLD", "https://chatgpt.com/c/a"),
+                     _page("ORPHAN", "https://chatgpt.com/c/a")])
+    assert cc.recover_wedged_tab({"id": "OLD"}, "https://chatgpt.com/c/a") is None
+    assert closed == ["ORPHAN"], "a create that failed must not leave a tab behind"
+
+
+def test_a_create_that_times_out_never_issues_a_second_create(monkeypatch):
+    """The GET fallback exists for a browser that rejects the VERB, not for one that is
+    slow. Re-issuing after a timeout is how a pre-111 Chrome would be handed a SECOND
+    tab, and on Chrome 151 it is what raised 405 and skipped the cleanup entirely."""
+    from tools import cdp_composer as cc
+    paths = []
+
+    def fake_http(path, method="GET", **_kw):
+        paths.append((path, method))
+        if "/json/new" in path:
+            raise TimeoutError("slow")
+        return []
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    assert cc._create_tab("https://chatgpt.com/c/a") is None
+    assert len([p for p, _m in paths if "/json/new" in p]) == 1
+
+
+def test_the_orphan_sweep_only_looks_at_pages_the_create_could_have_made(monkeypatch):
+    """A page that was already open is never a candidate, whatever its URL — that is the
+    whole reason a bound conversation cannot be closed by this."""
+    cc, closed = _timing_out_create(
+        monkeypatch,
+        before_pages=[_page("BOUND", "https://chatgpt.com/c/a"),
+                      _page("OWNER", "https://example.com/anything")],
+        after_pages=[_page("BOUND", "https://chatgpt.com/c/a"),
+                     _page("OWNER", "https://example.com/anything"),
+                     _page("NEWMAIL", "https://mail.example.com/inbox"),
+                     _page("ORPHAN", "about:blank")])
+    assert cc._create_tab("https://chatgpt.com/c/a") is None
+    assert closed == ["ORPHAN"], \
+        "only a page that appeared during the create, on a URL that create could produce"
+
+
+def test_the_sweep_refuses_to_act_without_a_trustworthy_baseline(monkeypatch):
+    """An unreadable page list is not an empty one. Without a before-snapshot every page
+    looks new, so the sweep must close nothing rather than guess."""
+    from tools import cdp_composer as cc
+    closed = []
+
+    def fake_http(path, method="GET", **_kw):
+        if "/json/list" in path:
+            raise OSError("browser not answering")
+        raise TimeoutError("slow")
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc, "_reap", lambda tid: closed.append(tid) or True)
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    assert cc._create_tab("https://chatgpt.com/c/a") is None
+    assert closed == []
+
+
+def test_a_create_answered_without_an_id_is_swept_too(monkeypatch):
+    """Chrome answered, the body carried no handle, and the tab is still real."""
+    from tools import cdp_composer as cc
+    closed = []
+    state = {"created": False}
+
+    def fake_http(path, method="GET", **_kw):
+        if "/json/new" in path:
+            state["created"] = True
+            return {}
+        if state["created"]:
+            return [_page("OLD", "https://chatgpt.com/c/a"),
+                    _page("ORPHAN", "https://chatgpt.com/c/a")]
+        return [_page("OLD", "https://chatgpt.com/c/a")]
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc, "_reap", lambda tid: closed.append(tid) or True)
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    assert cc._create_tab("https://chatgpt.com/c/a") is None
+    assert closed == ["ORPHAN"]
+
+
+def test_the_get_fallback_still_serves_a_browser_that_rejects_put(monkeypatch):
+    """No regression for pre-111 Chrome: 405 is a verb refusal, and only that re-issues
+    the create."""
+    import urllib.error
+    from tools import cdp_composer as cc
+    paths = []
+
+    def fake_http(path, method="GET", **_kw):
+        if "/json/new" in path:
+            paths.append(method)
+            if method == "PUT":
+                raise urllib.error.HTTPError(path, 405, "Method Not Allowed", {}, None)
+            return {"id": "FRESH"}
+        return []
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", fake_http)
+    monkeypatch.setattr(cc.time, "sleep", lambda *_a: None)
+    assert cc._create_tab("https://chatgpt.com/c/a") == {"id": "FRESH"}
+    assert paths == ["PUT", "GET"]
+
+
+def test_open_chatgpt_page_does_not_leak_a_create_that_timed_out(monkeypatch):
+    """The second creation path shares the choke point, so it shares the cleanup."""
+    cc, closed = _timing_out_create(
+        monkeypatch,
+        before_pages=[],
+        after_pages=[_page("ORPHAN", "https://chatgpt.com/c/a")])
+    assert cc.open_chatgpt_page("https://chatgpt.com/c/a") is None
+    assert closed == ["ORPHAN"]
+
+
+def test_the_new_tab_call_gets_a_bigger_budget_than_a_lookup(monkeypatch):
+    """8 s was not a ceiling for a call measured at 4.56 s on this host; it was a coin
+    flip, and losing it is what leaked the tab."""
+    from tools import cdp_composer as cc
+    seen = {}
+
+    def fake_http(path, method="GET", timeout=None, **_kw):
+        if "/json/new" in path:
+            seen["timeout"] = timeout
+            return {"id": "FRESH"}
+        return []
+
+    monkeypatch.setattr(cc, "browser_degraded", lambda *a, **k: {"degraded": False})
+    monkeypatch.setattr(cc, "_http", fake_http)
+    assert cc._create_tab("https://chatgpt.com/c/a") == {"id": "FRESH"}
+    assert seen["timeout"] == cc.CDP_NEW_TAB_SECS > cc.CDP_HTTP_SECS
