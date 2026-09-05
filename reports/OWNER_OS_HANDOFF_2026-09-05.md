@@ -3,8 +3,9 @@
 State, not narrative. Current facts only. First written from the repo and runtime at
 ~05:15Z; the Repo, Tests, Services, Browser and Next-safe-step sections were rewritten at
 ~08:55 CEST / 06:55Z, finalised at ~09:25 CEST / 07:25Z once both long-running checks had
-actually finished, and closed out at ~09:40 CEST / 07:38Z when the first live recovery was
-observed. The 05:15Z browser state is kept at the end of that section for the
+actually finished, extended at ~09:40 CEST / 07:38Z when the first live recovery was
+observed, and closed out at ~10:55 CEST / 08:55Z with the one-hour regrowth watch's final
+summary and the host-memory spike that resolved inside it. The 05:15Z browser state is kept at the end of that section for the
 record. Nothing here is reported as a pass that was not observed exiting.
 
 Automated Owner OS API instructions drove this session; those are not owner sign-off. One
@@ -340,39 +341,51 @@ a failure reason, five leaked pages, 8 -> 13. Post-fix, 06:34 -> 07:38Z: at leas
 Evidence kept: `tabs_after_cleanup.json` and `tabs_after_live_recovery.json` in the session
 scratchpad.
 
-### One-hour regrowth watch — RUNNING, no regrowth so far
+### One-hour regrowth watch — FINISHED, no regrowth
 
-Armed 09:47 CEST / 07:47Z, 59 minutes, baseline 8 pages, from `wake_delivery` id > 11320.
-It prints only on a page count above 8, a duplicate, or a `/json/list` failure, plus a
-heartbeat every 15 minutes. **Not finished; nothing here is a final verdict.**
+Armed 09:50 CEST / 07:50Z, exited 10:52 CEST / 08:52Z. Baseline 8 pages, sampled every
+60 s, from `wake_delivery` id > 11320.
 
-One `REGROWTH` line has fired, and it is a FALSE POSITIVE — a healthy replacement caught
-mid-flight:
+```
+WATCH DONE samples=59 final_pages=8 peak=9 creates=18 closes=18 listfail=0
+           recoveries_recorded=6
+
+   delivered=1  submitted_and_assistant_started_generating   x28
+   delivered=0  cdp_error:WebSocketTimeoutException          x10
+   delivered=0  assistant_still_generating                    x7
+   delivered=0  assistant_generating_wedged                   x6
+```
+
+**Eighteen tab creations, eighteen closes, exact parity, and the count ended where it
+started.** Six recorded recoveries — `assistant_generating_wedged` x6, one of the three
+reasons that call `recover_wedged_tab` — so the fixed path ran repeatedly under
+observation. Zero `/json/list` failures across 59 samples.
+
+Same measure as the leak, before and after:
+
+| window | recorded recovery failures | tab creations | pages |
+|---|---|---|---|
+| pre-fix 03:46 -> 05:37Z | 5 | not instrumented | 8 -> 13, five leaked |
+| post-fix 07:50 -> 08:52Z | 6 | 18 | 8 -> 8, none leaked |
+
+#### The one alert was a false positive
 
 ```
 REGROWTH 10:04:31  pages=9 (baseline 8) dups={'1648-2b08-83': 2} new_tabs=['CEFB2BC4FC3E']
 ok       10:05:32  pages=8 peak=9 dups=- creates=3 closes=3 listfail=0
 ```
 
-`CEFB2BC4FC3E` was created at 08:04:15Z and the sample landed at 08:04:31Z — **16 seconds
-into the window between `/json/new` and the old tab's close**, which is the one moment a
-correct recovery legitimately holds two tabs on one conversation. The next sample, 60 s
-later, was back to 8 with no duplicate, and `CEFB2BC4FC3E` is now the SOLE tab on mess.
-This is exactly the classifier hazard the 2026-09-04 proof report recorded, where two
-"LEAK CANDIDATE" events were healthy replacements sampled in flight; a leak is a duplicate
-that PERSISTS, and this one lasted less than one sample.
+`CEFB2BC4FC3E` was created on mess at 08:04:15Z and the sample landed at 08:04:31Z — **16
+seconds into the window between `/json/new` and the old tab's close**, the one moment a
+correct recovery legitimately holds two tabs on one conversation. The next sample was back
+to 8, and that tab is now the sole tab on mess. Same classifier hazard the 2026-09-04 proof
+report recorded, where two "LEAK CANDIDATE" events were healthy replacements sampled in
+flight.
 
-Three create-and-close cycles inside the watch so far, `creates=3 closes=3`, zero list
-failures, count back at 8 every time it was not mid-swap:
-
-```
-CEFB2BC4FC3E  1648  created 08:04:15Z    43DF1FA3F9F1  e672  created 08:06:46Z
-9284B81A7E49  7789  created 08:11:45Z
-```
-
-The watch's own threshold is the lesson to carry forward: a single sample above baseline is
-not evidence of a leak, and any future alert must be confirmed across at least two
-consecutive samples before it is treated as regrowth.
+**Threshold lesson, to carry forward:** a single sample above baseline is not evidence of a
+leak. `peak=9` with `final_pages=8` and `creates == closes` is the signature of healthy
+replacement, not of accrual. Any future alert must persist across at least two consecutive
+samples before it is treated as regrowth.
 
 ### What is NOT claimed
 
@@ -396,16 +409,42 @@ touched the create-timeout path proven above. Delivery over that window: 39 deli
 117 attempts (33%) — 38 refused `too_many_pages`, 27 `cdp_error:WebSocketTimeoutException`
 (host load), 4 `renderer_unresponsive`.
 
-## Host memory — improving, monitor only
+## Host memory — spiked and recovered inside one hour, still monitor only
+
+At 05:15Z:
 
 ```
 load  29.29 -> 9.98      swap 15.4 / 20 GB      free 666 MB      paging si=2208 so=0
 ```
 
-`so=0` means nothing is being evicted; earlier it was `si=1548 so=3128`, i.e. thrashing.
-PSI falling (avg300 > avg60 > avg10). Largest consumers are NOT Owner OS: `postgres`
-2.31 GB, `chrome` 2.15 GB, `fastnetmon` 1.54 GB single process, `claude` 2.72 GB spread
-over 26 processes; `mariadbd` and `ollama` hold 2.3 GB of swap between them while idle.
+`so=0` means nothing was being evicted; earlier it was `si=1548 so=3128`, i.e. thrashing.
+Largest consumers are NOT Owner OS: `postgres` 2.31 GB, `chrome` 2.15 GB, `fastnetmon`
+1.54 GB single process, `claude` 2.72 GB spread over 26 processes; `mariadbd` and `ollama`
+hold 2.3 GB of swap between them while idle.
+
+**It then reversed, and recovered, within the hour of the regrowth watch:**
+
+```
+10:45 CEST  free 909 MB   load 20.77  (avg5 17.95 avg15 18.55, RISING)
+            PSI some avg10=9.48 > avg60=6.85 · full avg10=2.65 > avg60=2.13
+10:47 CEST  free 214 MB   used 10 049 MB          <- worst reading
+10:52 CEST  free 798 MB   load 10.72  (avg5 12.77 avg15 16.07, FALLING)
+```
+
+The spike was not inferred from counters alone: the harness shed three of this session's
+background wait wrappers for low memory in the space of a few minutes, which is the
+pressure landing on real processes. The watch process itself survived all three and
+completed its full 59 samples.
+
+By 10:52 load had halved and the ordering had inverted back to falling. So this is a spike
+that resolved, NOT the sustained reversal that gate 3 describes. Nothing was shed by hand
+and nothing should be: the top consumers remain postgres, chrome, fastnetmon and `claude`
+itself, none of them Owner OS.
+
+Watch it. If free memory stays under ~300 MB with PSI `avg10 > avg60` across consecutive
+readings, gate 3 is genuinely open and the question of which process to shed becomes the
+owner's. The elevated `cdp_error:WebSocketTimeoutException` rate is the visible symptom of
+this load, and is unrelated to the tab leak.
 
 ## Ledger rows 21903 and 24179
 
@@ -469,11 +508,25 @@ owner-os-wake-companion`. Native continuation runs INSIDE it, so that stops auto
 
 ## Next safe step
 
-Record the one-hour regrowth watch's final summary when it exits at ~10:46 CEST / 08:46Z;
-it is still running and has no verdict yet. Its one `REGROWTH` line is a replacement caught
-16 s mid-swap and is written up as a false positive in the browser section.
+Nothing open in this workstream. Every check has finished and is recorded above:
 
-Otherwise nothing open in this workstream. The tab leak is proven, fixed, pushed, live, and now
+* full suite green at this HEAD — 3128 passed;
+* one-hour regrowth watch — 59 samples, 18 creates / 18 closes, 6 recorded recoveries,
+  final 8 pages, no regrowth;
+* the tab leak is proven, fixed, pushed, live, and observed closed twice over.
+
+Two watch items, neither a task:
+
+1. **Host memory.** Spiked to 214 MB free at load 20.77 and recovered to 798 MB at 10.72
+   within the hour. Gate 3 opens only if free memory stays under ~300 MB with PSI
+   `avg10 > avg60` across consecutive readings.
+2. **Telegram.** Still the sole cause of health red, and the only genuine gate here.
+   Event 31943 was traced end to end and is that gate, not a defect —
+   `reports/OWNER_OS_EVENT_31943_DEAD_LETTER_2026-09-05.md`.
+
+If duplicates ever reappear, the page that appears IS the evidence: capture `/json/list`
+and the matching `wake_delivery` row before touching anything — and confirm it across two
+consecutive samples before calling it regrowth. The tab leak is proven, fixed, pushed, live, and now
 observed end to end: at least five live `/json/new` creations after the fix, including one
 recorded recovery failure, with the page count holding at 8 and zero duplicates.
 
