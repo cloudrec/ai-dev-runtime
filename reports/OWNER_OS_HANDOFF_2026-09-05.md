@@ -19,13 +19,13 @@ were verified.
 | | |
 |---|---|
 | Branch | `ai-runtime/220-windows-bridge` |
-| HEAD | `5919b00` + this handoff commit — pushed, `origin` in sync, **0 unpushed** |
+| HEAD | `9177606` — **3 unpushed** docs commits (`105f731`, `3f009d5`, `9177606`); push is an owner gate |
 | Upstream | `origin/ai-runtime/220-windows-bridge` |
 | Tracked tree | clean |
 | Untracked | 34 files, all under `reports/` — preserve, never `git add reports/`; every commit below staged EXPLICIT paths |
 
-19 commits landed this session: 9 fixes, 1 feature, 9 reports. The load-bearing ones,
-newest first:
+16 commits landed on this branch since `e60a00b`: 4 fixes, 12 reports/handoff revisions.
+The load-bearing ones, newest first:
 
 ```
 5a9f015  the tab accrual, proven rather than suspected            (report)
@@ -899,36 +899,44 @@ owner-os-wake-companion`. Native continuation runs INSIDE it, so that stops auto
 
 ## Next safe step
 
-Nothing open in this workstream. Every check has finished and is recorded above:
+**The only gate in this workstream is the push.** Three documentation commits are staged
+locally on `reports/OWNER_OS_HANDOFF_2026-09-05.md` and nothing else:
 
-* full suite green at this HEAD — 3128 passed;
-* one-hour regrowth watch — 59 samples, 18 creates / 18 closes, 6 recorded recoveries,
-  final 8 pages, no regrowth;
-* the tab leak is proven, fixed, pushed, live, and observed closed twice over.
+```
+9177606  record the hostsecure retarget and refresh the stale PID
+3f009d5  zero-ping resume proven for supervised agents, still open for self
+105f731  the 90-minute watch, with its correlations marked as such
+```
 
-Two watch items, neither a task:
+Everything finished in this workstream is recorded above: the tab leak proven, fixed,
+live and observed closed; the self-wake flow live after shipping inert once; six owner
+gates answered; the canary on `hostsecure:0.0`; full suite green at 3128.
 
-1. **Host memory.** Spiked to 214 MB free at load 20.77 and recovered to 798 MB at 10.72
-   within the hour. Gate 3 opens only if free memory stays under ~300 MB with PSI
-   `avg10 > avg60` across consecutive readings.
-2. **Telegram.** Still the sole cause of health red, and the only genuine gate here.
-   Event 31943 was traced end to end and is that gate, not a defect —
-   `reports/OWNER_OS_EVENT_31943_DEAD_LETTER_2026-09-05.md`.
+### Open, and each one belongs to the owner
 
-If duplicates ever reappear, the page that appears IS the evidence: capture `/json/list`
-and the matching `wake_delivery` row before touching anything — and confirm it across two
-consecutive samples before calling it regrowth. The tab leak is proven, fixed, pushed, live, and now
-observed end to end: at least five live `/json/new` creations after the fix, including one
-recorded recovery failure, with the page count holding at 8 and zero duplicates.
+1. **Telegram token** — sole cause of health red, unchanged all session. Traced end to end
+   in `reports/OWNER_OS_EVENT_31943_DEAD_LETTER_2026-09-05.md`: a gate, not a defect.
+2. **`acap-voice` route/project registration** — never driven from here.
+3. **Push** of the three commits above.
 
-Full suite green at this HEAD (3128). Both long-running checks finished and are recorded
-above.
+### Open, and NOT a gate
 
-Two standing conditions, neither caused nor changed by this work:
+**Self-project supervisor resumption.** Needs no config change and no approval — only a
+quiet observation window: a self-agent wake resolving `pane_alive_and_working` with no
+instruction in flight. The signal is already durable in `wake_loop_watch`. It could not be
+obtained in this session because every wake arrived while instructions were in flight, and
+this session's own activity satisfies `_natively_working()`.
 
-* delivery is host-load-limited — `cdp_error:WebSocketTimeoutException` is 21 of 46
-  attempts since the cleanup, unrelated to the tab leak;
-* the Telegram token remains the sole cause of health red (gate 1 below).
+Distinguish the two zero-ping claims when reporting: PROVEN for natively supervised agents
+(four attributable resumes on `hostsecure`, deliveries_between=0), OPEN for the self agent.
 
-If duplicates ever reappear, the page that appears IS the evidence: capture `/json/list`
-and the matching `wake_delivery` row before touching anything.
+### Watch items, neither a task
+
+* **Host memory** — five spikes across the session, each self-clearing within ~3 minutes,
+  every eviction returning `so` to 0. Gate 3 opens only if free memory stays under ~300 MB
+  with PSI `avg10 > avg60` across CONSECUTIVE readings. The last observed alert (22:20) was
+  still open when its window ended and was never seen clearing.
+* **Duplicate tabs** — if any reappear, the page that appears IS the evidence: capture
+  `/json/list` and the matching `wake_delivery` row before touching anything, and confirm
+  across two consecutive samples before calling it regrowth. A single sample above baseline
+  is a replacement caught mid-swap, not a leak.
