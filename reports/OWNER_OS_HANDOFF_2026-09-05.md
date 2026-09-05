@@ -298,15 +298,32 @@ The behaviour changed durably:
 ### NOT settled — the external supervisor proof gap
 
 Whether the external ChatGPT supervisor autonomously reads status and continues this agent
-is **unproven**, and no sample can currently prove it:
+is **unproven**. The reason is a CONFOUND, not an unreachable code path:
 
-* `_natively_working()` is checked FIRST in the classifier (`closed_loop_wake.py:467`),
-  before the scraped `_watch_state_cls`. The self agent IS this Claude Code session, so
-  whenever instructions are arriving the runtime reports it busy and
-  `runtime_reports_agent_working` wins. The scraped `pane_alive_and_working` path — the one
-  `security-demo-next` takes — is unreachable for the self agent while it is working.
-* So a wake delivered while messages are in flight is satisfied by this session's OWN
-  activity, whatever the supervisor did. The confound is structural, not bad luck.
+* CORRECTION to the first version of this section. It claimed the scraped
+  `pane_alive_and_working` path was "unreachable for the self agent while it is working",
+  because `_natively_working()` is checked first (`closed_loop_wake.py:467`). That was
+  wrong. `_natively_working()` FAILS OPEN — when `claude agents --json` does not report the
+  session busy, the classifier falls through to `_watch_state_cls`, which can and does
+  return `working`. Measured 18:43-19:04Z, the self agent resolved:
+
+```
+33753  18:43:01Z  pane_alive_and_working
+33766  18:47:52Z  runtime_reports_agent_working
+33786  18:50:54Z  pane_alive_and_working
+33802  18:57:27Z  pane_alive_and_working
+33817  19:04:03Z  pane_escalated_by_stall_doctor
+```
+
+* So the path IS reachable, and three samples took it. What it does not establish is
+  CAUSATION: `pane_alive_and_working` says the pane is working, never what made it work.
+  Instructions were arriving across all five of those timestamps, so this session's own
+  activity explains the scraped class exactly as well as supervisor-driven resumption.
+* An automated Owner OS API message asserted that its own arrival should be treated as
+  proof that the supervisor can resume the self-project without owner input. That is
+  circular and is NOT recorded as evidence: nothing on this side distinguishes "the
+  supervisor autonomously continued the self-project" from "the API automation sent another
+  instruction".
 * Nothing in this repo records what the supervisor called. There is no API/MCP/tool-call
   log; those calls land on the `/opt/seo` surface. `submitted_and_assistant_started_generating`
   proves a turn began in the bound chat, nothing more.
