@@ -2,8 +2,9 @@
 
 State, not narrative. Current facts only. First written from the repo and runtime at
 ~05:15Z; the Repo, Tests, Services, Browser and Next-safe-step sections were rewritten at
-~08:55 CEST / 06:55Z, and the 05:15Z browser state is kept at the end of that section for
-the record.
+~08:55 CEST / 06:55Z and finalised at ~09:25 CEST / 07:25Z once both long-running checks
+had actually finished. The 05:15Z browser state is kept at the end of that section for the
+record. Nothing here is reported as a pass that was not observed exiting.
 
 Automated Owner OS API instructions drove this session; those are not owner sign-off. One
 automated instruction asserted that an owner-typed instruction was present in the pane;
@@ -16,12 +17,12 @@ were verified.
 | | |
 |---|---|
 | Branch | `ai-runtime/220-windows-bridge` |
-| HEAD | `5a9f015` — pushed, `origin` in sync, **0 unpushed** |
+| HEAD | `b1c257a` + this handoff commit — pushed, `origin` in sync, **0 unpushed** |
 | Upstream | `origin/ai-runtime/220-windows-bridge` |
 | Tracked tree | clean |
-| Untracked | 34 files, all under `reports/` — preserve, never `git add reports/`; the two commits below staged EXPLICIT paths |
+| Untracked | 34 files, all under `reports/` — preserve, never `git add reports/`; every commit below staged EXPLICIT paths |
 
-17 commits landed this session: 9 fixes, 1 feature, 7 reports. The load-bearing ones,
+18 commits landed this session: 9 fixes, 1 feature, 8 reports. The load-bearing ones,
 newest first:
 
 ```
@@ -57,10 +58,18 @@ b91f477  dormant fail-closed native-continuation verifier
 Each fix was confirmed by removal (revert it, the test fails). Every suite that imports
 `cdp_composer` is in the three runs above, so `ffe63c2` has its full targeted coverage.
 
-Full suite: last known green at 3049 on 2026-09-04, before this session's commits. A run
-started this session was killed by its own 25-minute `timeout` (exit 143 = SIGTERM) and
-produced NO result — not a pass, not a failure. It is RUNNING AGAIN with a 90-minute
-budget and has not finished; see the browser section.
+**Full suite GREEN at this HEAD: `3128 passed, 0 failed, 0 errors, 1 warning` in 24:22.**
+
+The one warning is pre-existing and unrelated — a `tarfile` `DeprecationWarning` about
+Python 3.14 extraction filters, from `test_core.py::TestBackupEngine::test_rollback`.
+
+3128 against the last known green of 3049 on 2026-09-04 is **+79**, of which 8 are the new
+tab-leak tests; the rest landed in this session's earlier commits, which had never been
+measured against a full run until now.
+
+An earlier attempt was killed by its own 25-minute `timeout` (exit 143 = SIGTERM) and
+produced no result either way. The real run takes 24:22, so that budget was about a minute
+short of the finish; it was never a failure.
 
 ## Services
 
@@ -252,20 +261,41 @@ close candidate was mid-generation. Snapshots kept as
 intermittency, not the leak. Row 11237 recorded `too_many_pages:14`: that was a controlled
 `about:blank` transport test being correctly refused, and it cost one delivery attempt.
 
-### Two checks STILL RUNNING — no verdict yet
+### Both checks FINISHED
 
-Neither has finished. Nothing below is a pass.
+**Full suite: green.** `3128 passed, 0 failed, 0 errors, 1 warning in 1462.09s (0:24:22)`.
+Details in *Tests at this HEAD* above.
 
-1. **25-minute tab-count soak.** Samples `/json/list` every 30 s for page count and
-   duplicates. This is the first window in which a recovery can fire with the fix live, so
-   it is the live proof. At the last read it was still running and had held `pages=8
-   peak=8 dups=-` on every sample so far. That is an interim reading of an unfinished run,
-   not a result.
-2. **Full suite, restarted with a 90-minute budget.** The first attempt was killed by its
-   own 25-minute `timeout` (exit 143 = SIGTERM) and the `| tail` pipe swallowed all
-   progress, so it produced NO result either way — not a pass, not a failure. Re-running
-   unbuffered to a log. Last known full-suite green is 3049 on 2026-09-04, before this
-   session's commits.
+**25-minute tab-count soak: clean — and it does NOT prove the fix.**
+
+```
+50/50 samples over 25 min   pages=8   peak=8   dups=-   list failures=0
+deliveries during the soak: 5 delivered · 10 cdp_error:WebSocketTimeoutException
+browser_degraded after:     {'degraded': False, 'pages': 8, 'headroom': 4}
+```
+
+Not one sample deviated: no rise to 9, no duplicate on any conversation, and the CDP
+endpoint answered every poll.
+
+The limit has to be stated, because a clean soak reads like proof and is not. **Zero** rows
+since the cleanup carry any of the three reasons that call `recover_wedged_tab` —
+`renderer_unresponsive`, `assistant_generating_wedged`, `composer_ambiguous_or_absent:0`.
+So `_create_tab` has not executed live even once. The soak establishes that the count is
+stable at 8 and that nothing else in the system accretes pages; under the OLD code the same
+25 minutes need not have leaked either, because a leak required a failed recovery. It is
+corroboration, not the live proof.
+
+What does prove the fix: the measured cause above, and 8 tests confirmed by removal.
+
+The `cdp_error:WebSocketTimeoutException` majority is a session timing out mid-work under
+host load. That path does not trigger recovery, which is why none fired.
+
+### The one item still open
+
+Not a defect: the fixed path awaits its first live recovery. Until a `renderer_unresponsive`
+or `assistant_generating_wedged` occurs and the page count stays at 8, the live proof is
+outstanding. If a duplicate ever does appear, the page that appears IS the evidence —
+capture `/json/list` and the matching `wake_delivery` row before touching anything.
 
 ### State as read at 05:15Z, kept for the record
 
@@ -354,17 +384,17 @@ owner-os-wake-companion`. Native continuation runs INSIDE it, so that stops auto
 
 ## Next safe step
 
-Wait out the two running checks and record their verdicts; neither has finished, and
-neither may be reported as a pass before it does.
+Nothing is pending in this workstream. Both long-running checks finished and are recorded
+above: full suite green at 3128, soak clean at 8 pages across 50/50 samples.
 
-1. the 25-minute tab-count soak — the live proof that a recovery with `ffe63c2` in place no
-   longer leaves a page behind;
-2. the full suite on its 90-minute budget.
+The single open item is a WATCH, not a task: the first live `renderer_unresponsive` or
+`assistant_generating_wedged` after 2026-09-05 06:34Z is the first execution of
+`_create_tab` in production. If the page count holds at 8 across it, the leak is closed end
+to end — proven, fixed, pushed, live, and observed. If a duplicate appears instead, capture
+`/json/list` and the matching `wake_delivery` row before touching anything.
 
-If the soak holds at 8 pages with no duplicates across a window containing at least one
-recovery, the leak is closed end to end: proven, fixed, pushed, live, and observed. If a
-duplicate appears, the page that appears is the evidence — capture `/json/list` and the
-matching `wake_delivery` row before touching anything.
+Two standing conditions, both unchanged by this work and neither caused by it:
 
-Everything else is gated. Delivery is already restored: the guarded cleanup took the count
-to 8 and `too_many_pages` refusals stopped at row 11263.
+* delivery is host-load-limited — `cdp_error:WebSocketTimeoutException` dominates the
+  remaining failures and is unrelated to the tab leak;
+* the Telegram token remains the sole cause of health red (gate 1 below).
