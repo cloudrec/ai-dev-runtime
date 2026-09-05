@@ -77,7 +77,7 @@ short of the finish; it was never a failure.
 
 ```
 ai-runtime   PID 1196430  up 2026-09-05 06:05:35 CEST  active   (was 2690604, up 09-02)
-companion    PID 2889296  up 2026-09-05 13:00:07 CEST  active   (was 1770858, up 08:28)
+companion    PID 4170370  up 2026-09-05 18:25:24 CEST  active   (was 2889296, up 13:00)
 ```
 
 **Deploy skew CLEARED.** Owner typed "restart ai-runtime". The first hourly tick after it,
@@ -214,7 +214,7 @@ it asserts against. Left alone here rather than mixed into this fix.
 **Loaded. Owner typed "restart the companion".**
 
 ```
-companion  PID 2889296 -> 4154783   active since 2026-09-05 18:21:24 CEST   NRestarts=0
+companion  PID 2889296 -> 4154783 -> 4170370   active since 2026-09-05 18:25:24 CEST
 ai-runtime PID 1196430 unchanged (06:05:35)   — NOT restarted
 source core/wake_bridge.py mtime 17:13:02, pyc compiled 17:13, process start 18:21:24
 loaded module: SELF_WAKE_FLOW present, is_self_agent present,
@@ -252,6 +252,92 @@ is_self_agent('hostsecure:0.0', ...)          -> False
 flow appended to the self phrase              -> True
 tests/test_wake_bridge.py                     -> 81 passed
 ```
+
+## Self-wake: what is settled and what is not (18:00-19:40 CEST)
+
+State only. An automated instruction asked for this update; that is not owner sign-off.
+Owner-typed instructions in this window were "restart the companion", "answer the scope
+gate for owner-os-opus-fresh", "answer the remaining scope gates" and "stop the watch".
+
+### Live
+
+`e285901` is loaded in companion PID 4170370 (18:25:24 CEST). Verified by composing the
+live phrase: the self-agent wake carries `SELF_WAKE_FLOW`, a non-self wake does not.
+`ai-runtime` PID 1196430 untouched since 06:05:35. Coverage 6/5/0, browser 8 pages,
+headroom 4, `degraded=False`.
+
+### Settled — the parking defect
+
+Self-agent wakes were resolving `pane_awaiting_owner` because
+`closed_loop_wake.py:424` returns that whenever an OPEN `owner_gate` names the agent.
+`owner-os-opus-fresh:0.0` had an unanswered `classify_scope` gate (`0ea48864bbf04c56`,
+"unknown-scope agent at /root/ai-dev-runtime") open since 06:07:24Z — over ten hours. The
+classifier was correct: a pane parked on an owner gate is waiting, not stalled.
+
+Six `classify_scope` gates were answered through `api.answer_gate()` (never hand-written
+SQL), each appending an `owner_gate_answered` audit event: the self agent, plus
+`gaika-opus-v6/v7/v8`, `security-demo-next` and `acap-voice`. The five non-self gates got
+the standing house default used by all 19 prior ones — `keep as observe_only - no scope
+change` — which GRANTS NO NEW SCOPE; that is what made it safe to apply to projects this
+session does not own. The provenance clause was rewritten to name the actual Claude Code
+instruction rather than repeat the precedent's "Owner decision given in the session pane",
+which would have been untrue. **Zero owner gates of any kind are now open.**
+
+The behaviour changed durably:
+
+```
+33368  16:40:39Z  pane_awaiting_owner              ]
+33405  16:47:03Z  pane_awaiting_owner              ]  gates open — all parked
+33424  16:50:12Z  pane_awaiting_owner              ]
+--- scope gates answered 17:05:53Z ---
+33474  17:13:33Z  runtime_reports_agent_working    ]
+33487  17:25:28Z  pane_escalated_by_stall_doctor   ]  four verdicts, none parked
+33526  17:32:17Z  prompt_no_longer_present         ]
+```
+
+### NOT settled — the external supervisor proof gap
+
+Whether the external ChatGPT supervisor autonomously reads status and continues this agent
+is **unproven**, and no sample can currently prove it:
+
+* `_natively_working()` is checked FIRST in the classifier (`closed_loop_wake.py:467`),
+  before the scraped `_watch_state_cls`. The self agent IS this Claude Code session, so
+  whenever instructions are arriving the runtime reports it busy and
+  `runtime_reports_agent_working` wins. The scraped `pane_alive_and_working` path — the one
+  `security-demo-next` takes — is unreachable for the self agent while it is working.
+* So a wake delivered while messages are in flight is satisfied by this session's OWN
+  activity, whatever the supervisor did. The confound is structural, not bad luck.
+* Nothing in this repo records what the supervisor called. There is no API/MCP/tool-call
+  log; those calls land on the `/opt/seo` surface. `submitted_and_assistant_started_generating`
+  proves a turn began in the bound chat, nothing more.
+
+Event 33325 was earlier offered as end-to-end proof; it is not. It was delivered 16:24:30Z,
+54 seconds BEFORE the working build loaded at 16:25:24Z, so its phrase carried no flow.
+
+**What would close it:** a self-agent `agent_waiting_input` delivered during a genuine idle
+gap, with no instruction in flight, resolving `pane_alive_and_working`. Needs no new
+instrumentation — the signal is already durable in `wake_loop_watch`.
+
+### Observations recorded, deliberately not "fixed"
+
+* `owner_gate.notified_at` is declared at `store.py:130` and never written or read anywhere.
+  A dead column: nothing re-notifies on it, no behaviour depends on it. All 172 rows empty.
+* All 32 gate/scope notifications are `dead_letter` on the Telegram gate, yet 24 gates have
+  been answered — so gates reach the owner through the chat, not the notifier.
+* `agent_waiting_input` is ~390 of the owner-action events in 24 h, 27 of them from the self
+  pane simply being idle between turns. Suppressing those is an alerting-policy judgement,
+  not a defect, and could hide a genuinely stuck Owner OS.
+* Three gaika generations (v6, v7, v8) opened scope gates within eight hours. Agents are
+  rotating faster than their gates get answered.
+
+### Gates still standing
+
+1. **Telegram token** — sole cause of health red, unchanged all session.
+2. **Canary retarget to `hostsecure:0.0`** — declined three times on the automated channel;
+   needs a typed instruction. Not needed for the proof, which already reads
+   `streak 172, matched_by=agent` read-only at that target.
+3. **`acap-voice` route/project registration** and its interactive prompt — never driven
+   from here.
 
 ## Zero-ping / autonomy
 
