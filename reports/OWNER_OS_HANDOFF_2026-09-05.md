@@ -2,8 +2,9 @@
 
 State, not narrative. Current facts only. First written from the repo and runtime at
 ~05:15Z; the Repo, Tests, Services, Browser and Next-safe-step sections were rewritten at
-~08:55 CEST / 06:55Z and finalised at ~09:25 CEST / 07:25Z once both long-running checks
-had actually finished. The 05:15Z browser state is kept at the end of that section for the
+~08:55 CEST / 06:55Z, finalised at ~09:25 CEST / 07:25Z once both long-running checks had
+actually finished, and closed out at ~09:40 CEST / 07:38Z when the first live recovery was
+observed. The 05:15Z browser state is kept at the end of that section for the
 record. Nothing here is reported as a pass that was not observed exiting.
 
 Automated Owner OS API instructions drove this session; those are not owner sign-off. One
@@ -17,12 +18,12 @@ were verified.
 | | |
 |---|---|
 | Branch | `ai-runtime/220-windows-bridge` |
-| HEAD | `b1c257a` + this handoff commit — pushed, `origin` in sync, **0 unpushed** |
+| HEAD | `5919b00` + this handoff commit — pushed, `origin` in sync, **0 unpushed** |
 | Upstream | `origin/ai-runtime/220-windows-bridge` |
 | Tracked tree | clean |
 | Untracked | 34 files, all under `reports/` — preserve, never `git add reports/`; every commit below staged EXPLICIT paths |
 
-18 commits landed this session: 9 fixes, 1 feature, 8 reports. The load-bearing ones,
+19 commits landed this session: 9 fixes, 1 feature, 9 reports. The load-bearing ones,
 newest first:
 
 ```
@@ -123,7 +124,7 @@ continuing; hostsecure gated by `continuation_cap_reached_without_progress`
 (MAX_CONSECUTIVE=6, by design); gaika-opus-v5 `cls=working` mid-turn; mess-postsignup
 held by the supervisor's own continuation gate. No regression.
 
-## Browser — the tab leak, ROOT CAUSE PROVEN and FIXED
+## Browser — the tab leak, PROVEN, FIXED, LIVE and OBSERVED CLOSED
 
 Superseded the "top OPEN technical issue" section of the 05:15Z state below. Worked under
 an automated Owner OS API instruction; a later automated instruction asserted an
@@ -290,12 +291,62 @@ What does prove the fix: the measured cause above, and 8 tests confirmed by remo
 The `cdp_error:WebSocketTimeoutException` majority is a session timing out mid-work under
 host load. That path does not trigger recovery, which is why none fired.
 
-### The one item still open
+### CLOSED END TO END — the fixed path ran in production, and nothing leaked
 
-Not a defect: the fixed path awaits its first live recovery. Until a `renderer_unresponsive`
-or `assistant_generating_wedged` occurs and the page count stays at 8, the live proof is
-outstanding. If a duplicate ever does appear, the page that appears IS the evidence —
-capture `/json/list` and the matching `wake_delivery` row before touching anything.
+Read-only verification at 07:38Z under an automated instruction; not owner sign-off.
+
+The watch is satisfied. A recovery fired after the 06:34Z cutoff, `/json/new` ran live
+several times, and the page count never moved off 8.
+
+```
+wake_delivery 11287 · 2026-09-05 07:11:49Z · mess (1648) · assistant_generating_wedged
+```
+
+That reason is one of the three that call `recover_wedged_tab`. Its replacement tab
+`4AFE7549CE41` was created at 07:10:53Z — 56 s before the row — the old tab
+`D020C47C0524` is gone, and mess held exactly one tab throughout. The recorded failure is
+the RETRY still finding generation in flight, not a failed recovery; mess delivered
+normally 6 minutes later (11291, 07:18:04Z).
+
+Diffing the live list against `tabs_after_cleanup.json` shows four complete create-and-close
+cycles, four tabs created and four closed, net zero:
+
+```
+GONE since cleanup            NEW since cleanup
+  F50ACC3FC28A  e672            18A03E3D5670  e672
+  D020C47C0524  1648            4AFE7549CE41  1648
+  B38671ACBE96  e63a            F399D6E47FA1  e63a
+  5E240CA39977  7789            B24345268AB8  7789
+UNCHANGED: 416895EB5762 0690 · E0DA45FEAC8F 459a · D5AE3402B075 487a · 48BE29644EA9 0e62
+```
+
+A target id changes only when a tab is created or destroyed, so these are genuine
+`/json/new` creations, not navigations. There were at least FIVE: `7789` was read as
+`B87BDCF4190F` and then as `B24345268AB8` about a minute apart, so it cycled twice inside
+the observation itself.
+
+```
+07:38Z  8 pages · headroom 4 · degraded=False · duplicates NONE
+```
+
+Successful recoveries remain invisible in `wake_delivery` — they are recorded only as
+`submitted_and_assistant_started_generating`, the standing observability gap — which is why
+this had to be established from tab identity rather than from records.
+
+**Before and after, same measure.** Pre-fix, 03:46 -> 05:37Z: five recoveries that recorded
+a failure reason, five leaked pages, 8 -> 13. Post-fix, 06:34 -> 07:38Z: at least five
+`/json/new` creations including one recorded failure, zero leaked pages, 8 -> 8.
+
+Evidence kept: `tabs_after_cleanup.json` and `tabs_after_live_recovery.json` in the session
+scratchpad.
+
+### What is NOT claimed
+
+None of these creations is shown to have TIMED OUT, and the leak required a timeout. So
+this window proves the fixed code path runs correctly in production and no longer accrues
+pages; it is not an observation of the specific 8 s-timeout race being survived. The proof
+of that remains the measured cause (4.56 s live create against a fixed 8 s ceiling, GET
+fallback answering 405) and the eight tests confirmed by removal.
 
 ### State as read at 05:15Z, kept for the record
 
@@ -384,17 +435,18 @@ owner-os-wake-companion`. Native continuation runs INSIDE it, so that stops auto
 
 ## Next safe step
 
-Nothing is pending in this workstream. Both long-running checks finished and are recorded
-above: full suite green at 3128, soak clean at 8 pages across 50/50 samples.
+Nothing open in this workstream. The tab leak is proven, fixed, pushed, live, and now
+observed end to end: at least five live `/json/new` creations after the fix, including one
+recorded recovery failure, with the page count holding at 8 and zero duplicates.
 
-The single open item is a WATCH, not a task: the first live `renderer_unresponsive` or
-`assistant_generating_wedged` after 2026-09-05 06:34Z is the first execution of
-`_create_tab` in production. If the page count holds at 8 across it, the leak is closed end
-to end — proven, fixed, pushed, live, and observed. If a duplicate appears instead, capture
-`/json/list` and the matching `wake_delivery` row before touching anything.
+Full suite green at this HEAD (3128). Both long-running checks finished and are recorded
+above.
 
-Two standing conditions, both unchanged by this work and neither caused by it:
+Two standing conditions, neither caused nor changed by this work:
 
-* delivery is host-load-limited — `cdp_error:WebSocketTimeoutException` dominates the
-  remaining failures and is unrelated to the tab leak;
+* delivery is host-load-limited — `cdp_error:WebSocketTimeoutException` is 21 of 46
+  attempts since the cleanup, unrelated to the tab leak;
 * the Telegram token remains the sole cause of health red (gate 1 below).
+
+If duplicates ever reappear, the page that appears IS the evidence: capture `/json/list`
+and the matching `wake_delivery` row before touching anything.
