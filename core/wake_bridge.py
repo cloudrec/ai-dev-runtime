@@ -368,6 +368,25 @@ def is_self_agent(agent_id: str = "", project_id: str = "") -> bool:
         proj = (ns._project_for_target(agent_id) or "").strip()
     except Exception:  # noqa: BLE001
         proj = ""
+    # `_project_for_target` reads the SUPERVISOR REGISTRY, and a target covered through the
+    # `*` wildcard — or DENIED, which is exactly our case — may never have been written to
+    # it. Measured live 2026-09-05, minutes after this shipped: it returned "" for
+    # `owner-os-opus-fresh:0.0` while the `agent` row held `ai-dev-runtime`, so the flow
+    # silently never appended. `diagnostics.native_continuation_effectiveness` carries this
+    # same fallback for the same reason; it was not back-ported here.
+    if not proj:
+        try:
+            conn, own = _conn()
+            try:
+                row = conn.execute(
+                    "SELECT COALESCE(project_id,'') FROM agent WHERE target=?",
+                    (agent_id,)).fetchone()
+            finally:
+                if own:
+                    conn.close()
+            proj = (row[0] if row else "").strip()
+        except Exception:  # noqa: BLE001 — a phrase must never depend on a readable store
+            proj = ""
     if proj:
         return proj == self_proj
     return wake_routes.normalize_key(project_id) == wake_routes.normalize_key(self_proj)

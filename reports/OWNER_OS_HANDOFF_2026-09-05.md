@@ -211,15 +211,47 @@ isolation and under other orderings. Its premise is also no longer true of this 
 tree by owner decision — a canary IS selected (`gaika-opus-v6:0.0`), which is exactly what
 it asserts against. Left alone here rather than mixed into this fix.
 
-**Reload gate — NOT crossed.** The change is loaded by the wake companion, which reads the
-module at process start, so the running PID 2889296 still composes the old phrase. The one
-command that would load it, deliberately not run without a verified owner instruction:
+**Loaded. Owner typed "restart the companion".**
 
 ```
-systemctl restart owner-os-wake-companion
+companion  PID 2889296 -> 4154783   active since 2026-09-05 18:21:24 CEST   NRestarts=0
+ai-runtime PID 1196430 unchanged (06:05:35)   — NOT restarted
+source core/wake_bridge.py mtime 17:13:02, pyc compiled 17:13, process start 18:21:24
+loaded module: SELF_WAKE_FLOW present, is_self_agent present,
+               flow classes ['blocker','completion','failure','loop_watchdog']
+coverage covered=6 denied=5 uncovered=0 · browser 8 pages headroom 4 degraded=False
 ```
 
-`ai-runtime` does not need restarting for this.
+**The restart immediately exposed a defect the tests had hidden.** Composing the live
+phrase for the self agent showed the flow was NOT appended:
+
+```
+is_self_agent('owner-os-opus-fresh:0.0', 'owner-os-opus-fresh') -> False
+ns._project_for_target('owner-os-opus-fresh:0.0')              -> ''      <- the miss
+agent row project_id                                            -> 'ai-dev-runtime'
+```
+
+`_project_for_target` reads the SUPERVISOR REGISTRY, and the self agent is DENIED from
+supervision, so it may never have a row there. It returned `""`, and `is_self_agent` fell
+through to the event's `project_id` (`owner-os-opus-fresh`), which is not the checkout
+name — so the flow silently never appended. This is the SAME trap
+`diagnostics.native_continuation_effectiveness` already documents and guards against; the
+fallback had simply not been back-ported.
+
+The first round of tests mocked `_project_for_target` to return a value, so they never
+exercised the empty-registry path — the fix passed 6/6 under test and did nothing in
+production. Fixed by falling back to the `agent` row exactly as diagnostics does, with two
+further tests: one that fails without the fallback, one asserting an unknown agent with an
+empty registry still fails CLOSED.
+
+Verified live after the fix:
+
+```
+is_self_agent('owner-os-opus-fresh:0.0', ...) -> True
+is_self_agent('hostsecure:0.0', ...)          -> False
+flow appended to the self phrase              -> True
+tests/test_wake_bridge.py                     -> 81 passed
+```
 
 ## Zero-ping / autonomy
 

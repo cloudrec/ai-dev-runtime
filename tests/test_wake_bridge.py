@@ -1054,3 +1054,33 @@ def test_an_unknown_event_type_degrades_to_no_flow(monkeypatch):
                           agent_id="owner-os-opus-fresh:0.0")
     assert "trigger=event" in p
     assert wb.SELF_WAKE_FLOW not in p
+
+
+def test_the_self_agent_resolves_when_the_supervisor_registry_is_empty(monkeypatch):
+    """The live miss. `_project_for_target` reads the SUPERVISOR REGISTRY, and the self
+    agent is DENIED from supervision, so it may never have a row there — it returned ""
+    against the real store while the `agent` row held `ai-dev-runtime`, and the flow
+    silently never appended. The first version of these tests mocked
+    `_project_for_target` to return a value, so it never exercised this path at all."""
+    from core import native_supervisor as ns
+    monkeypatch.setattr(ns, "SELF_PROJECT", "ai-dev-runtime", raising=False)
+    monkeypatch.setattr(ns, "_project_for_target", lambda t, **kw: "", raising=False)
+    conn, _own = wb._conn()
+    conn.execute("CREATE TABLE IF NOT EXISTS agent (target TEXT PRIMARY KEY, project_id TEXT)")
+    conn.execute("INSERT OR REPLACE INTO agent (target, project_id) VALUES (?,?)",
+                 ("owner-os-opus-fresh:0.0", "ai-dev-runtime"))
+    conn.commit()
+    assert wb.is_self_agent("owner-os-opus-fresh:0.0", "owner-os-opus-fresh") is True, \
+        "an empty registry must fall back to the agent row, not to the event's project_id"
+    p = wb.compose_phrase(event_id=33256, event_type="agent_waiting_input",
+                          project_id="owner-os-opus-fresh",
+                          agent_id="owner-os-opus-fresh:0.0")
+    assert wb.SELF_WAKE_FLOW in p
+
+
+def test_an_unknown_agent_with_an_empty_registry_still_fails_closed(monkeypatch):
+    """The fallback must not become a yes. No registry row and no agent row means no flow."""
+    from core import native_supervisor as ns
+    monkeypatch.setattr(ns, "SELF_PROJECT", "ai-dev-runtime", raising=False)
+    monkeypatch.setattr(ns, "_project_for_target", lambda t, **kw: "", raising=False)
+    assert wb.is_self_agent("stranger:0.0", "stranger") is False
