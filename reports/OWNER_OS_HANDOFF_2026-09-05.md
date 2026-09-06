@@ -1213,6 +1213,53 @@ watch retired — this pane sat on real owner gates (push, deploy) all session �
 verdict on whether the supervisor acted. Audit `deliveries` + `delivery_attribution`;
 `resolved_reason` alone would score both successes as failures.
 
+## Event 36728 `notifications_red` — diagnosed, owner gate, NOT the deploy gate
+
+Hourly recurring, `dedup_key=notifications_red`, severity critical, `owner_action_required=1`.
+(The wake described it as project `owner-os`; the event row's own `project_id` is empty.)
+
+**Exact condition and channel.** Red is driven by ONE tier:
+
+```
+owner_push        available=False  state=unhealthy
+                  last_error = "telegram send failed: Bad Request: chat not found"
+                  last_ok_at = NULL          <- has never once succeeded
+same_chat_wake    available=False  — platform boundary, no server->ChatGPT inbound trigger
+cdp_same_chat     available=True  verified=True   34 deliveries proven in the last 3600s
+cto_inbox         available=True  verified=True   durable pull
+```
+
+`notifications_status` is RED unless a PROACTIVE tier is available. `cto_inbox` is pull-only
+and `cdp_same_chat` is the wake path, not a notifier — it was deliberately excluded on
+2026-09-04 after counting it read green while 19 alerts dead-lettered. **The accounting is
+correct.** Wakes land; owner alerts do not; red says exactly that.
+
+**It is the chat binding, not the token.** Evidence, from shape and error class only — no
+credential value was read or printed:
+
+* the token is 46 chars in BotFather's two-part `<bot_id>:<secret>` form;
+* Telegram answered `Bad Request: chat not found`, a CHAT-level rejection. A bad token
+  returns `Unauthorized`. So the token authenticated;
+* `TELEGRAM_CHAT_ID` is a 10-digit POSITIVE id — a private user chat. Telegram refuses a
+  bot's message to a user who has never started that bot.
+
+Remediation is therefore step 2 alone, and it is owner-only: **the owner sends that bot one
+message from their own Telegram account.** Nothing in this repo can do it, and no config
+change here would help — `TELEGRAM_ENABLED` being absent is irrelevant, since the code keys
+off `WATCHDOG_TELEGRAM_ENABLED` or the presence of token+chat id, and it plainly did attempt
+a send.
+
+**Not caused by the undeployed fix, and a restart will NOT clear it.** This session's
+commits touch `api/v1.py`, `core/agent_control.py`, `core/agent_orchestrator.py` and
+`core/wake_bridge.py` — none of the notification path. The red is hourly across the whole
+day and predates them. A restart would only move `owner_push` from `unhealthy` to
+`unverified` (`_owner_push_state` keeps a proven verdict only within its runtime epoch,
+currently `1196430:…`) — still not green, until the next probe fails again.
+
+**No code defect found, so nothing was changed.** `_owner_push_state` already derives health
+from evidence rather than configuration — hardened 2026-08-06 against this exact
+"creds present ⇒ healthy ⇒ green" conflation.
+
 ## Worker-loop cost, measured
 
 What the two `to_thread` fixes actually took off the event loop (read-only bench;
@@ -1269,6 +1316,10 @@ re-run of the removal proof then failed 2 tests instead of 1.
 
 ## Gates — all owner-only
 
+0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
+   handoff's earlier framing of this gate as "put the BotFather token in `configs/.env`"
+   is **wrong and has been corrected**: the token is present, well-formed and
+   authenticating. What is missing is its step 2 — the owner opening a chat with the bot.
 1. **Deploy.** Both changes are inert until `systemctl restart ai-runtime`. The running
    service (PID 1196430, up since 2026-09-05 06:05:35) still executes pre-fix code. This
    session treated the restart as an owner gate and did NOT do it.
