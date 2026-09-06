@@ -1260,6 +1260,67 @@ currently `1196430:…`) — still not green, until the next probe fails again.
 from evidence rather than configuration — hardened 2026-08-06 against this exact
 "creds present ⇒ healthy ⇒ green" conflation.
 
+## Event 37041 `notification_dead_letter` — same gate, and the MCP 0/0 boundary
+
+Same root cause as 36728. No code changed, because no local defect exists.
+
+**The failed channel and reason.** `telegram`, dead-lettered after **5 attempts**:
+
+```
+notification 7227   dedup_key waiting:payorch-ha-fresh:0.0:91faf9b8b3b52a05
+                    correlation_id waiting:payorch-ha-fresh:0.0
+                    state dead_letter   attempts 5   receipt NULL
+reasons  owner_push      "telegram send failed: Bad Request: chat not found"
+         same_chat_wake  "no inbound trigger configured"
+```
+
+Not distinct, and not new. Of the last 200 dead-letter events, **199** carry that exact
+`chat not found` string; the remaining one is a transient
+`[Errno 104] Connection reset by peer`. Telegram dead letters run unbroken from
+2026-08-03T02:00:09Z to 2026-09-06T23:08:56Z — 7228 of them. The only two `sent` rows in
+the whole table are `owner_push` from 2026-08-03, before this began.
+
+**Remediation is unchanged and owner-only, and involves no secret:** the owner sends that
+bot one message from their own Telegram account. The token is present and authenticating;
+it is the chat binding that is missing. Nothing here can do it.
+
+### The `delivery_failed=0 / current_alerts=0` surface — boundary, not a defect
+
+This repository's accounting is correct, non-zero, and red. `/control-plane/observability`
+(`diagnostics.observability_summary()`) reports, live:
+
+```
+notifications        total 7230   active 27   historical 7203   status red
+notification_history current_dead_letter 7230   active_dead_letter 27
+                     dead_letter_events_logged 4012   notifications_red_events 821
+                     cumulative_failure_attempts 36150   status red
+```
+
+So `0/0` is not this repo under-reporting. Two facts pin the boundary:
+
+1. **Those field names do not exist anywhere in this repository.** A grep for
+   `delivery_failed` and `current_alerts` across `core/` and `api/` returns nothing (the
+   only near-match is an unrelated `last_wake_delivery_failed` reason string in
+   `project_supervisor`). This repo cannot emit a field it does not define.
+2. **The posture endpoint carries no counters at all, by design.**
+   `/control-plane/notifications/status` returns exactly
+   `capabilities, checked_at, notifications_enabled, reasons, same_chat_wake_complete,
+   status` — no `current[]`, no counts. It answers "can we reach the owner?", not "how many
+   failed".
+
+The most likely mechanism, offered as a hypothesis and NOT asserted: a consumer reading the
+POSTURE endpoint, finding no counter fields, and defaulting them to `0` — which renders
+`delivery_failed=0 / current_alerts=0` while the authoritative counters sit on a different
+endpoint reading 7230/27/red. That is the same shape the 2026-09-03 boundary report
+predicted. The mapping lives in `/opt/seo`, outside this repo, and was not touched.
+
+**Trust order for anyone auditing delivery:** `/control-plane/observability` for counts,
+`notifications_status()` for posture, the MCP snapshot for neither.
+
+**Recommended, NOT done:** `notifications_status()` could carry `active_dead_letter` so a
+consumer cannot render `0` from it. Deliberately left alone — it changes a surface external
+consumers already parse, which is a cross-boundary decision, not a local cleanup.
+
 ## Worker-loop cost, measured
 
 What the two `to_thread` fixes actually took off the event loop (read-only bench;
