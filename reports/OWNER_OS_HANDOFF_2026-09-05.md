@@ -1079,15 +1079,18 @@ approval. Full evidence:
 | | |
 |---|---|
 | Branch | `ai-runtime/220-windows-bridge` |
-| HEAD | `25930ef` — **2 unpushed** commits (`a7a438c`, `25930ef`); push is an owner gate |
+| HEAD | `31a9309` — **5 unpushed** commits (`a7a438c`, `25930ef`, `8584047`, `e024d0f`, `31a9309`); push is an owner gate |
 | Upstream | `origin/ai-runtime/220-windows-bridge` at `b615fbc`, verified 2026-09-06 12:2xZ |
 | Before this session | `b615fbc`, local == remote, ahead=0 behind=0 |
 | Tracked tree | clean apart from the two commits above |
 | Untracked | reports only — never `git add reports/`; both commits staged EXPLICIT paths |
 
 ```
+31a9309  docs(handoff): the suite result, and the one failure I cannot name
+e024d0f  docs(comment): the lock note said four routes; it is five
+8584047  docs(handoff): the 2026-09-06 session, and what it did not prove
 25930ef  docs(report): the control-path root cause, and the self-resumption chain
-a7a438c  fix(api): take the MCP control path off the event loop
+a7a438c  fix(api): take the MCP control path off the event loop   <- the only code change
 ```
 
 ## Criterion 1 — MCP control path reliability: ROOT CAUSE PROVEN, FIXED, NOT DEPLOYED
