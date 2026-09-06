@@ -1151,6 +1151,37 @@ Gap closed for future runs: `agent_status` / `agent_read` now record `actor`/`so
 (keyword-only; omitted entirely when unset, so worker audit lines stay byte-identical).
 Live-verified. It cannot be back-filled for the 33823 window.
 
+## Tests at `e024d0f`
+
+The suite could not be run as one process: the host was in memory exhaustion (see below)
+and three full runs were reaped. It was run in ten 12-file batches instead, twice.
+
+```
+pass 1 (under memory pressure)   3158 passed, 1 FAILED, 1 warning
+pass 2 (after memory recovered)  3159 passed, 0 failed, 1 warning
+```
+
+Both passes total 3159 tests, so pass 1's failure was a real test failure, not a collection
+error. **It is unidentified**: the first batch runner captured only each batch's summary
+line and threw the `FAILED` line away. That was a defect in my harness, fixed for pass 2,
+which captures `^FAILED`/`^ERROR` and recorded none.
+
+It is NOT claimed to be unrelated to this session's change. What is known:
+
+* it fell in batch 6 — the run that took 365s against ~120s for the same twelve files in
+  four later runs, i.e. it coincided with peak swap exhaustion;
+* that batch has since passed **five** times (4 × full batch, plus pass 2), and the three
+  files in it that touch `agent_control` — `test_owneros_hook`, `test_owner_status`,
+  `test_pinger_shadow` — passed a further **six** consecutive runs, 69 tests each;
+* eleven clean runs in total, no reproduction.
+
+Most consistent with a timing flake under swap exhaustion. Anyone resuming who sees a
+failure in `tests/test_owner_os_policy.py` … `tests/test_prospect_audit_batch.py` should
+capture the test name — that is the one piece of evidence this session did not keep.
+
+The 1 warning is the pre-existing `tarfile` `DeprecationWarning` from
+`test_core.py::TestBackupEngine::test_rollback`, unchanged and unrelated.
+
 ## Gates — all owner-only
 
 1. **Deploy.** Both changes are inert until `systemctl restart ai-runtime`. The running
