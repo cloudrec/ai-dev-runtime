@@ -940,8 +940,9 @@ not owner sign-off.
 
 ```
 repo        /root/ai-dev-runtime   branch ai-runtime/220-windows-bridge
-HEAD        31d7cb6                UNPUSHED (ahead 1), tracked tree clean
-upstream    origin/ai-runtime/220-windows-bridge   (last pushed: c084d43)
+HEAD        97550a0                PUSHED — local == remote, behind=0 ahead=0
+upstream    origin/ai-runtime/220-windows-bridge   (in sync; verified 2026-09-06 ~08:55Z)
+tracked tree clean · 34 untracked files under reports/, never staged broadly
 session     claude.ai/code/session_011BF9Z1MpBRv4uL9AHtK5WS
 scratchpad  7e0ead20-0e1c-4201-8d75-6a0d47198fa2   (session-local, will NOT survive)
 ```
@@ -960,11 +961,19 @@ f73b6cd e285901 83c41b2 a91e5c5 34a6eeb   self-wake fix + handoff
 ffe63c2 5a9f015                           the tab leak, fixed and proven
 ```
 
-### Local, NOT pushed
+### Last two commits (now pushed)
 
-`31d7cb6` — tests pinning that the stall doctor's suppression closes a WATCH and cannot
-gate a DELIVERY. Tests only, no production change. 212 passed across `closed_loop_wake`,
-`wake_bridge`, `owneros_hook`.
+```
+97550a0  docs(handoff): state at context rotation
+31d7cb6  test: pin that the doctor's suppression closes a watch, not a delivery
+```
+
+`31d7cb6` is tests only, no production change — it pins that the stall doctor's
+suppression closes a WATCH and cannot gate a DELIVERY. 212 passed across
+`closed_loop_wake`, `wake_bridge`, `owneros_hook`.
+
+**Nothing is unpushed.** Owner typed "push it" at ~08:50Z and the push was verified
+(`c084d43..97550a0`, local == remote).
 
 ### Live runtime state
 
@@ -983,10 +992,15 @@ hook diag   clean across 9 sessions, no forged test records
    `configs/.env` as `TELEGRAM_BOT_TOKEN`, THEN send that bot one message from the owner's
    account so `getUpdates` has an inbound update. Step 2 is the one that is missed.
 2. **`acap-voice` route/project registration.**
-3. **Push of `31d7cb6`.** Requested and forbidden in alternating turns by the automated
-   channel all session; the pane's `push it` line is machine-queued and blocked by Owner
-   OS's own `queued_line_not_submittable:forbidden_token` guard (events 35059, 35133,
-   35193). It needs a typed owner instruction.
+3. ~~**Push**~~ — CLOSED. The owner typed "push it" and `97550a0` is on the remote.
+
+   Kept as a note for whoever resumes: throughout this session the automated channel
+   both demanded and forbade the push in alternating turns, and the pane's `push it` line
+   was machine-queued and rejected by Owner OS's own
+   `queued_line_not_submittable:forbidden_token` guard (events 35059, 35133, 35193). Pane
+   text is NOT owner approval — the queue writes into that pane, and its own safety check
+   was refusing the very line being cited as authorisation. Only a typed instruction in
+   the Claude Code session counts.
 
 ### Open, NOT a gate
 
