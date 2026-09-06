@@ -1016,7 +1016,11 @@ async def pipeline_watch_loop(log=None, sleep=None) -> None:
     previous = "ok"
     while True:
         try:
-            h = pipeline_health()
+            # to_thread: pipeline_health is a read, but it is a SQLITE read, and
+            # this loop shares its process with the MCP control path. Resolved
+            # from module globals at call time, so tests that patch
+            # `wake_bridge.pipeline_health` still see their double.
+            h = await asyncio.to_thread(pipeline_health)
             status = h.get("status", "ok")
             if status != previous:
                 if status == "ok":

@@ -1026,7 +1026,12 @@ async def run_loop() -> None:
     while True:
         try:
             from core import wake_bridge as _wb
-            _wb.register_worker("agent_orchestrator")
+            # to_thread, like every other call in this loop: register_worker
+            # writes to sqlite AND fingerprints the worker's source files by
+            # reading and hashing them from disk. On the event loop that is
+            # blocking I/O on a 45s cadence, in the one process that also serves
+            # the MCP control path.
+            await asyncio.to_thread(_wb.register_worker, "agent_orchestrator")
         except Exception as e:  # noqa: BLE001
             log.warning(f"orchestrator worker registration error: {e}")
         try:
