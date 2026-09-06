@@ -1063,3 +1063,133 @@ Distinguish the two zero-ping claims when reporting: PROVEN for natively supervi
   `/json/list` and the matching `wake_delivery` row before touching anything, and confirm
   across two consecutive samples before calling it regrowth. A single sample above baseline
   is a replacement caught mid-swap, not a leak.
+
+---
+
+# Session of 2026-09-06 — the MCP control path, and self-project resumption
+
+Appended to the canonical handoff rather than started as a new one, because an automated
+instruction named this file as the resume point. An automated Owner OS API instruction
+drove this session; that is **not** owner sign-off, and nothing below is recorded as owner
+approval. Full evidence:
+`reports/OWNER_OS_MCP_CONTROL_PATH_AND_SELF_RESUMPTION_2026-09-06.md`.
+
+## Repo
+
+| | |
+|---|---|
+| Branch | `ai-runtime/220-windows-bridge` |
+| HEAD | `25930ef` — **2 unpushed** commits (`a7a438c`, `25930ef`); push is an owner gate |
+| Upstream | `origin/ai-runtime/220-windows-bridge` at `b615fbc`, verified 2026-09-06 12:2xZ |
+| Before this session | `b615fbc`, local == remote, ahead=0 behind=0 |
+| Tracked tree | clean apart from the two commits above |
+| Untracked | reports only — never `git add reports/`; both commits staged EXPLICIT paths |
+
+```
+25930ef  docs(report): the control-path root cause, and the self-resumption chain
+a7a438c  fix(api): take the MCP control path off the event loop
+```
+
+## Criterion 1 — MCP control path reliability: ROOT CAUSE PROVEN, FIXED, NOT DEPLOYED
+
+`agent_status` / `agent_read` / `agent_send` / `agent_answer` were `async def` while
+calling blocking tmux code (`subprocess.run`, `_TMUX_TIMEOUT=15`, plus `time.sleep(0.4)`
+on delivery). On single-worker uvicorn that runs ON the event loop and freezes every other
+request; the MCP client times out and reports JSON-RPC failure while the server answers
+`200`. The access log is clean because the failure is latency, never an error.
+
+Ruled out first: HTTP layer healthy — 42,513 × 200 vs ~886 non-200 (2.0%), the 400s being
+`AgentControlError` refusals for dead targets (`mess-qa-automation`, `arbitrage2-opus`,
+`cp-canary`) and the 401s being auth.
+
+Measured live (read-only, nothing mutated): `/health` p50 **7.8ms → 213ms** under six
+concurrent `agent_read`; **max 4028.6ms under ambient traffic alone**. Matched A/B, two
+worktrees, real router, no startup workers:
+
+```
+probe p50 under load   220.2ms -> 30.3ms      agent_read p50    228.2ms -> 85.9ms
+probe p99 under load   787.1ms -> 123.5ms     agent_read p99    788.5ms -> 210.8ms
+probe samples/s        3.7     -> 16.2        read throughput   23.5/s  -> 64.7/s
+```
+
+Fix, two narrow parts: five handlers declared `def` (Starlette threadpool), and a
+reentrant `_DELIVER_LOCK` preserving the serialisation the event loop supplied by
+accident — without it, concurrent callers can double-paste a replayed idempotency key and
+bypass `agent_send`'s anti-queue guard.
+
+12 tests in `tests/test_mcp_control_path_concurrency.py`. Removal proof both halves:
+`async def` restored → 2 fail; lock removed → 3 fail (4 messages pasted into one pane
+instead of 1); restored → 12 pass.
+
+## Criterion 2 — self-project supervisor resumption: PROVEN from durable records
+
+The previous section of this handoff recorded this as open. It was **observable all
+along** — the records existed across three tables and had not been correlated.
+
+Event **33823**, self agent `owner-os-opus-fresh:0.0`, project `ai-dev-runtime`:
+
+```
+19:04:06.080  event 33823 work_stopped_incomplete, high, actionable=1     event
+19:06:02.554  wake decision WAKE / actionable_waiting_transition          wake_audit 136282
+19:09:48.921  delivered=1 submitted_and_assistant_started_generating      wake_delivery 11809
+              conversation 6a967789-… (route owner-os, bound_by=owner)
+19:09:59.036  +10.1s agent_send key owner-self-handoff-33823-continue     deliveries +
+              actor api:bearer  source 172.20.0.2 ua=python-httpx         delivery_attribution
+      —       watch resolved pane_alive_and_working                       wake_loop_watch
+      —       NO owner_intervention_log row for this target that day      owner_intervention_log
+```
+
+Not isolated: of 208 self-pane watches, 16 are followed by an `api:bearer` continuation
+inside the 900s SLO and **9 carry a key naming their own wake event id**.
+
+`SELF_PROJECT` denial and `SELF_WAKE_FLOW` intact, verified for the CURRENT self pane
+(`owner-os-opus-final:0.0` — this session): `is_self_agent` True. Note it resolves True via
+the `agent`-table fallback, because `_project_for_target` returns `''`; the guard holds by
+its fallback, not its primary path.
+
+Gap closed for future runs: `agent_status` / `agent_read` now record `actor`/`source`
+(keyword-only; omitted entirely when unset, so worker audit lines stay byte-identical).
+Live-verified. It cannot be back-filled for the 33823 window.
+
+## Gates — all owner-only
+
+1. **Deploy.** Both changes are inert until `systemctl restart ai-runtime`. The running
+   service (PID 1196430, up since 2026-09-05 06:05:35) still executes pre-fix code. This
+   session treated the restart as an owner gate and did NOT do it.
+2. **Push** of `a7a438c` and `25930ef`.
+3. **Telegram token** — unchanged, still the sole cause of health red.
+4. **`acap-voice` route/project registration** — unchanged, never driven from here.
+
+## Host memory — gate 3 criterion MET, then eased
+
+The criterion this handoff set (free < ~300 MB with PSI `avg10 > avg60` across CONSECUTIVE
+readings) was met on four consecutive samples, and swap was effectively exhausted:
+
+```
+12:27:02  free=157MB  swapfree=5MB   avg10=67.43 > avg60=58.34
+12:27:23  free=189MB  swapfree=5MB   avg10=62.21 > avg60=58.55
+12:27:43  free=222MB  swapfree=1MB   avg10=60.92 > avg60=60.57
+12:28:04  free=239MB  swapfree=3MB   avg10=72.56 > avg60=64.38
+12:28:47  free=253MB  swapfree=28MB  avg10=52.32 < avg60=59.86   <- easing
+```
+
+**Proximate cause identified and NOT acted on:** `/opt/elect/.venv/bin/python -m pytest
+tests -q -x`, PID 3243627, **1.88 GB RSS, running 6h08m**. That is another project's
+runaway test run; out of scope here, and killing it was not attempted. It reaped this
+repo's own full-suite run twice (both killed for low memory), which is why the suite was
+re-run in 12-file batches instead.
+
+## Not claimed
+
+* The fix is **not live**. Everything is proven in the repo, in tests and in a matched
+  A/B — not in production.
+* The 33823 chain is **historical** (2026-09-05, predecessor pane), durable and
+  re-queryable, but not staged by this session.
+* The pane did **not stay** working — further `agent_waiting_input` at 19:11:30, 19:18:20,
+  19:19:58, 19:23:17. Resumption without an owner message is what is shown; sustained
+  autonomy is not.
+* **No JSON-RPC message was read directly.** The MCP server is not in this repository; the
+  root cause is proven on this side of that boundary. `/opt/seo` was not touched.
+* The event loop is **not fully clear**: the eight `asyncio.create_task` worker loops in
+  `api/main.py` still call blocking tmux work on it. Converting them is a larger change,
+  deliberately not attempted.
