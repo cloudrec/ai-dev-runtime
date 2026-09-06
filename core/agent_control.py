@@ -31,6 +31,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -44,6 +45,23 @@ MAX_REPORT_BYTES = 262144
 MAX_REPORT_FILES = 50
 _TMUX_TIMEOUT = 15
 _IDEMPOTENCY_TTL_SECS = 24 * 3600
+
+# Deliveries are check-then-act: `_seen_delivery` reads the idempotency key, the
+# paste happens, `_record_delivery` writes it. Until 2026-09-06 every caller ran
+# on the API's single event loop, so that sequence could not interleave and the
+# gap was invisible. The four control-plane routes now run in the threadpool (so
+# a 15s tmux call can no longer stall the loop), which makes the gap reachable:
+# two callers replaying one key would both read "unseen" and both paste. This
+# lock keeps deliveries as mutually exclusive as the event loop made them, and
+# covers the in-process worker loops as well, since they call `_deliver` too.
+#
+# Reentrant because `agent_send` holds it across its anti-queue busy check as
+# well, and then calls `_deliver`, which takes it again. That check is the other
+# thing the event loop was silently serialising: two concurrent sends to one
+# pane would both read "not busy", and the second would stack behind the turn
+# the first had just started -- the exact queued-message failure the check
+# exists to prevent.
+_DELIVER_LOCK = threading.RLock()
 
 # ── validation ──────────────────────────────────────────────────────────────
 # tmux session names we accept. Deliberately stricter than tmux itself: no
@@ -863,6 +881,24 @@ def delivery_attribution(key: str) -> Optional[dict]:
         conn.close()
 
 
+def attribution(actor: Optional[str], source: Optional[str]) -> dict:
+    """Attribution fields for an audit line, or nothing when the caller is internal.
+
+    Deliveries have carried `actor`/`source` since 2026-08-04; the READ side never
+    did, so "the external supervisor looked at the pane before continuing it" could
+    only ever be inferred from a continuation that named the event, never read off
+    the audit log. Omitted entirely when unset, so the in-process worker loops --
+    which call these functions positionally and know nothing about actors -- keep
+    writing exactly the audit lines they wrote before.
+    """
+    out = {}
+    if actor:
+        out["actor"] = actor
+    if source:
+        out["source"] = source
+    return out
+
+
 def audit(action: str, target: str, idempotency_key: Optional[str] = None, **fields: Any) -> None:
     """Append-only action log: timestamp, target, idempotency key, outcome."""
     entry = {"ts": _now(), "action": action, "target": target,
@@ -1408,14 +1444,19 @@ def agent_list() -> dict:
     }
 
 
-def agent_status(target: str) -> dict:
-    """Inspect one existing agent. Read-only: changes nothing about the pane."""
+def agent_status(target: str, *, actor: Optional[str] = None,
+                 source: Optional[str] = None) -> dict:
+    """Inspect one existing agent. Read-only: changes nothing about the pane.
+
+    `actor`/`source` are recorded for attribution only, exactly as on the delivery
+    path: who asked, from where. Keyword-only, so every existing positional caller
+    is untouched."""
     validate_target(target)
     inventory = agent_list()
     matches = [a for a in inventory["agents"]
                if a["target"] == target or a["session"] == target]
     if not matches:
-        audit("agent_status", target, found=False)
+        audit("agent_status", target, found=False, **attribution(actor, source))
         raise AgentControlError(f"no tmux pane matches target {target!r}")
     if len(matches) > 1:
         raise AgentControlError(
@@ -1437,7 +1478,8 @@ def agent_status(target: str) -> dict:
                 pending = _pane_pending_input(agent["target"], cwd=agent_cwd)
     state = classify_state(agent["alive"], agent["is_agent"], recent, pending_input=pending,
                            shell_running=shell_running, recently_active=recently_active)
-    audit("agent_status", agent["target"], found=True, alive=agent["alive"], is_agent=agent["is_agent"])
+    audit("agent_status", agent["target"], found=True, alive=agent["alive"],
+          is_agent=agent["is_agent"], **attribution(actor, source))
     return {
         "target": agent["target"],
         "session": agent["session"],
@@ -1507,13 +1549,15 @@ def conversation_evidence(cwd: str) -> dict:
     }
 
 
-def agent_read(target: str, lines: Any = DEFAULT_CAPTURE_LINES) -> dict:
+def agent_read(target: str, lines: Any = DEFAULT_CAPTURE_LINES, *,
+               actor: Optional[str] = None, source: Optional[str] = None) -> dict:
     """Read recent output from a pane, bounded and redacted."""
     validate_target(target)
     n = _bound_lines(lines)
     rc, out, err = _tmux(["capture-pane", "-p", "-t", target, "-S", f"-{n}"])
     if rc != 0:
-        audit("agent_read", target, ok=False, error=err.strip()[:120])
+        audit("agent_read", target, ok=False, error=err.strip()[:120],
+              **attribution(actor, source))
         raise AgentControlError(f"cannot read {target!r}: {err.strip()[:200]}")
     text = redact(out)
     captured = text.splitlines()
@@ -1521,7 +1565,8 @@ def agent_read(target: str, lines: Any = DEFAULT_CAPTURE_LINES) -> dict:
     # the pane *plus* N — not N lines. The slice is the real bound, and
     # lines_returned must describe what the caller actually got.
     returned = captured[-n:]
-    audit("agent_read", target, ok=True, lines=len(returned))
+    audit("agent_read", target, ok=True, lines=len(returned),
+          **attribution(actor, source))
     return {
         "target": target,
         "lines_requested": n,
@@ -1643,6 +1688,18 @@ def _tag_if_automated(text: str, actor: Optional[str]) -> str:
 
 def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str],
              actor: Optional[str] = None, source: Optional[str] = None) -> dict:
+    """Serialise deliveries, then deliver. See `_DELIVER_LOCK`.
+
+    Held across the whole delivery, not just the idempotency read: the paste
+    itself must not interleave with another paste into the same pane.
+    """
+    with _DELIVER_LOCK:
+        return _deliver_locked(target, text, action, idempotency_key,
+                               actor=actor, source=source)
+
+
+def _deliver_locked(target: str, text: str, action: str, idempotency_key: Optional[str],
+                    actor: Optional[str] = None, source: Optional[str] = None) -> dict:
     """Deliver multiline text to a pane through a tmux buffer.
 
     A tmux buffer is used rather than `send-keys` because send-keys would
@@ -1734,18 +1791,19 @@ def agent_send(target: str, text: str, idempotency_key: Optional[str] = None,
 
     `actor`/`source` are recorded for attribution only (who asked, from where)."""
     validate_target(target)
-    if not allow_queue:
-        busy = _busy_for_send(target)
-        if busy:
-            audit("agent_send", target, idempotency_key, delivered=False,
-                  refused=busy, actor=actor, source=source)
-            return {"target": target, "action": "agent_send", "delivered": False,
-                    "submitted": False, "queued": False, "refused": busy,
-                    "reason": f"agent is {busy}; a message sent now would be queued "
-                              f"behind the active turn instead of executed — retry "
-                              f"when it is idle or waiting"}
-    return _deliver(text=text, target=target, action="agent_send",
-                    idempotency_key=idempotency_key, actor=actor, source=source)
+    with _DELIVER_LOCK:
+        if not allow_queue:
+            busy = _busy_for_send(target)
+            if busy:
+                audit("agent_send", target, idempotency_key, delivered=False,
+                      refused=busy, actor=actor, source=source)
+                return {"target": target, "action": "agent_send", "delivered": False,
+                        "submitted": False, "queued": False, "refused": busy,
+                        "reason": f"agent is {busy}; a message sent now would be queued "
+                                  f"behind the active turn instead of executed — retry "
+                                  f"when it is idle or waiting"}
+        return _deliver(text=text, target=target, action="agent_send",
+                        idempotency_key=idempotency_key, actor=actor, source=source)
 
 
 def agent_answer(target: str, text: str, idempotency_key: Optional[str] = None,

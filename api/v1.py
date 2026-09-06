@@ -299,6 +299,19 @@ async def rollback(req: RollbackReq, _: bool = Depends(_auth)):
 # PID namespace, so it cannot address these agents itself. It proxies here.
 # There is deliberately no arbitrary-command endpoint: every route below maps to
 # one bounded, validated, audited operation in core.agent_control.
+#
+# The five routes the MCP control path actually uses -- agents_list,
+# agents_status, agents_read, agents_send, agents_answer -- are declared `def`,
+# not `async def`, ON PURPOSE. Every one of them calls straight into
+# core.agent_control, which shells out to tmux with a blocking subprocess.run
+# (up to _TMUX_TIMEOUT = 15s) and, on the delivery path, a hard time.sleep(0.4).
+# Declared `async def`, that work runs ON the single uvicorn event loop and
+# stalls every other request on this process -- measured 2026-09-06: the trivial
+# sync /health went from p50 7.8ms to p50 213ms under six concurrent
+# agent_read, with a 4.0s stall observed under ambient traffic alone. That is
+# what reached the MCP client as an intermittent JSON-RPC failure: a timeout
+# upstream, not an error here. Plain `def` hands them to Starlette's threadpool
+# instead. Do not "modernise" these back to `async def`.
 from core import agent_control  # noqa: E402
 
 
@@ -311,19 +324,26 @@ def _agent_call(fn, *args, **kwargs):
 
 
 @router.get("/agents")
-async def agents_list(_: bool = Depends(_auth)):
+def agents_list(_: bool = Depends(_auth)):
     return _agent_call(agent_control.agent_list)
 
 
 @router.get("/agents/status")
-async def agents_status(target: str, _: bool = Depends(_auth)):
-    return _agent_call(agent_control.agent_status, target)
+def agents_status(target: str, request: Request,
+                  x_runtime_actor: Optional[str] = Header(None),
+                  _: bool = Depends(_auth)):
+    actor, source = caller_identity(request, x_runtime_actor)
+    return _agent_call(agent_control.agent_status, target, actor=actor, source=source)
 
 
 @router.get("/agents/read")
-async def agents_read(target: str, lines: int = agent_control.DEFAULT_CAPTURE_LINES,
-                      _: bool = Depends(_auth)):
-    return _agent_call(agent_control.agent_read, target, lines)
+def agents_read(target: str, request: Request,
+                lines: int = agent_control.DEFAULT_CAPTURE_LINES,
+                x_runtime_actor: Optional[str] = Header(None),
+                _: bool = Depends(_auth)):
+    actor, source = caller_identity(request, x_runtime_actor)
+    return _agent_call(agent_control.agent_read, target, lines,
+                       actor=actor, source=source)
 
 
 class AgentSendReq(BaseModel):
@@ -333,18 +353,18 @@ class AgentSendReq(BaseModel):
 
 
 @router.post("/agents/send")
-async def agents_send(req: AgentSendReq, request: Request,
-                      x_runtime_actor: Optional[str] = Header(None),
-                      _: bool = Depends(_auth)):
+def agents_send(req: AgentSendReq, request: Request,
+                x_runtime_actor: Optional[str] = Header(None),
+                _: bool = Depends(_auth)):
     actor, source = caller_identity(request, x_runtime_actor)
     return _agent_call(agent_control.agent_send, req.target, req.text, req.idempotency_key,
                        actor=actor, source=source)
 
 
 @router.post("/agents/answer")
-async def agents_answer(req: AgentSendReq, request: Request,
-                        x_runtime_actor: Optional[str] = Header(None),
-                        _: bool = Depends(_auth)):
+def agents_answer(req: AgentSendReq, request: Request,
+                  x_runtime_actor: Optional[str] = Header(None),
+                  _: bool = Depends(_auth)):
     actor, source = caller_identity(request, x_runtime_actor)
     return _agent_call(agent_control.agent_answer, req.target, req.text, req.idempotency_key,
                        actor=actor, source=source)
