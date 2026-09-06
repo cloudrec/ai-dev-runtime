@@ -1193,6 +1193,41 @@ capture the test name — that is the one piece of evidence this session did not
 The 1 warning is the pre-existing `tarfile` `DeprecationWarning` from
 `test_core.py::TestBackupEngine::test_rollback`, unchanged and unrelated.
 
+## Criterion 2 — now proven LIVE on the current pane
+
+Beyond the historical 33823 chain, the loop closed twice on `owner-os-opus-final:0.0`,
+the pane running the session that wrote this:
+
+```
+ev 35869  wake delivered 14:12:27Z -> self-wake-35869-safe-continue-20260906   +2m02s  api:bearer
+ev 35897  wake delivered 14:27:30Z -> owner-self-event-35897-continue-safe-fixes  +25s  api:bearer
+```
+
+Both continuation keys name their own wake event; both arrived as instructions this session
+acted on. Self agent stopped -> wake to the bound `owner-os` chat -> supervisor continuation
+-> pane working, no owner message.
+
+**Trap for whoever audits this next:** all seven of this pane's watches today resolved
+`pane_awaiting_owner`, *including those two*. The reason describes the pane's state when the
+watch retired — this pane sat on real owner gates (push, deploy) all session — and is NOT a
+verdict on whether the supervisor acted. Audit `deliveries` + `delivery_attribution`;
+`resolved_reason` alone would score both successes as failures.
+
+## Worker-loop cost, measured
+
+What the two `to_thread` fixes actually took off the event loop (read-only bench;
+`register_worker` itself was NOT called, as it writes a heartbeat row — its dominant cost
+`_module_fingerprint` was measured instead):
+
+```
+_module_fingerprint   p50   0.23ms  p95  10.11ms  max   11.28ms   (3 source files, sha256)
+pipeline_health       p50 190.03ms  p95 339.01ms  max 2424.33ms   (sqlite reads)
+```
+
+`pipeline_health` is the load-bearing one: a **190ms median, up to 2.4s** stall of the whole
+event loop, every `WAKE_PIPELINE_WATCH_SECS=120`, in the process serving the MCP control
+path. Same failure mode as criterion 1, from a different call site.
+
 ## Worker loops — inspected, two fixed
 
 Read-only inspection of all eight `asyncio.create_task` loops in `api/main.py`, prompted by

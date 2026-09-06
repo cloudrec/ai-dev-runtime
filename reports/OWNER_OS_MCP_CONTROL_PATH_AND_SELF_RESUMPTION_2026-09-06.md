@@ -170,6 +170,34 @@ The route conversation is owner-bound; `bound_by='owner'`, note "owner-typed URL
 2026-09-02". That binding is owner provenance recorded earlier, not a claim about this
 session.
 
+### LIVE on the current pane, this session (added 19:0xZ)
+
+The chain above is from 2026-09-05 on the predecessor pane. The same loop then closed
+**twice on `owner-os-opus-final:0.0` — the pane running this very session** — while this
+work was being done:
+
+| wake event | delivered | continuation | lag | actor |
+|---|---|---|---|---|
+| 35869 | 14:12:27Z `submitted_and_assistant_started_generating` | `self-wake-35869-safe-continue-20260906` (`agent_send`) | +2m02s | `api:bearer` |
+| 35897 | 14:27:30Z same | `owner-self-event-35897-continue-safe-fixes` (`agent_answer`) | **+25s** | `api:bearer` |
+
+Both keys name their own wake event. Both arrived as the automated instructions this
+session actually acted on: the self agent stopped, the wake reached the bound `owner-os`
+ChatGPT conversation, the supervisor composed a safe continuation naming the event, and the
+pane went back to work — with no owner message in between. That is criterion 2 observed
+live rather than reconstructed.
+
+### `pane_awaiting_owner` does NOT mean the supervisor declined
+
+Worth writing down, because it reads exactly backwards. All **seven** of this pane's wake
+watches today resolved `pane_awaiting_owner`, including 35869 and 35897 — the two that
+demonstrably DID get a supervisor continuation. The resolution reason describes the pane's
+state when the watch was retired, and this pane spent the session parked on genuine owner
+gates (push, deploy). It is not a verdict on whether the supervisor acted.
+
+**Audit deliveries + `delivery_attribution`, not `resolved_reason`.** Judging supervisor
+resumption by resolution reason alone would have scored these two as failures.
+
 ### Not an isolated case
 
 Of 208 self-pane wake watches examined, **16** are followed by an `api:bearer` continuation
