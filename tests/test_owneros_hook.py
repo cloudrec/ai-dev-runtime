@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 HOOK = "/root/ai-dev-runtime/hooks/owneros_hook.py"
 sys.path.insert(0, "/root/ai-dev-runtime")
@@ -22,10 +23,22 @@ def _map(ev, **payload):
     return _map(ev, payload)
 
 
-def _run(payload: dict):
+# The hook's diagnostic file defaults to `logs/owneros_hook_diag.jsonl`, which is EVIDENCE
+# — it is what distinguished "hook never fired" from "fired and crashed" from "deduped"
+# when this session's stream looked dark. A test suite writing into it makes that evidence
+# untrustworthy, and it did: the live file picked up `session: 's'`, `abcdef123456` and
+# empty-session `failed` lines straight from these tests, 102 of 120 records. Every
+# subprocess run gets its own throwaway path instead.
+_DIAG_ENV = "OWNEROS_HOOK_DIAG"
+
+
+def _run(payload: dict, diag_path: str = ""):
     """The hook as the runtime actually invokes it: JSON on stdin."""
+    env = dict(os.environ)
+    env[_DIAG_ENV] = diag_path or os.path.join(
+        tempfile.mkdtemp(prefix="owneros_hook_diag_"), "diag.jsonl")
     return subprocess.run([sys.executable, HOOK], input=json.dumps(payload),
-                          capture_output=True, text=True, timeout=30)
+                          capture_output=True, text=True, timeout=30, env=env)
 
 
 # ── the mapping: only three things may ever wake ─────────────────────────────
@@ -495,6 +508,7 @@ def _hook(tmp_path, monkeypatch):
     """The module with its diagnostic file redirected into a tmp dir."""
     import importlib.util
     spec = importlib.util.spec_from_file_location("oh_diag", HOOK)
+    monkeypatch.setenv(_DIAG_ENV, str(tmp_path / "diag.jsonl"))
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     m.DIAG_PATH = str(tmp_path / "diag.jsonl")
@@ -580,3 +594,19 @@ def test_normal_success_still_returns_zero_and_records_accepted(tmp_path, monkey
     m._diag("emitted", event="Stop", session="sess-ok", detail="12345")
     rec = _lines(m)[-1]
     assert rec["outcome"] == "emitted" and rec["detail"] == "12345"
+
+
+def test_the_suite_never_writes_to_the_live_diagnostic_file(tmp_path):
+    """The pollution this fixes. `logs/owneros_hook_diag.jsonl` is evidence; a test run
+    must not appear in it. Pins the guarantee at the point the runtime uses — a real
+    subprocess invocation, not an in-process call."""
+    live = "/root/ai-dev-runtime/logs/owneros_hook_diag.jsonl"
+    before = os.path.getsize(live) if os.path.exists(live) else -1
+    mine = str(tmp_path / "diag.jsonl")
+    _run({"hook_event_name": "Stop", "session_id": "polltest0001",
+          "last_assistant_message": "x"}, diag_path=mine)
+    after = os.path.getsize(live) if os.path.exists(live) else -1
+    assert after == before, "the suite must not append to the live diagnostic file"
+    if os.path.exists(mine):
+        assert "polltest0001" in open(mine, encoding="utf-8").read(), \
+            "the redirected file is where the record actually went"

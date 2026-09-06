@@ -48,6 +48,17 @@ os.environ["RUNTIME_WORKTREE_ROOT"] = os.path.join(_TEST_DB_DIR, "worktrees")
 # path enable it explicitly and inject their own listing.
 os.environ["OWNEROS_NATIVE_SESSIONS"] = "0"
 
+# The hook's failure-path diagnostic, for the same reason as the databases above. That
+# file is EVIDENCE: it is what distinguished "hook never fired" from "fired and crashed"
+# from "event deduped" when a session's event stream looked dark. A test run writing into
+# it makes that evidence untrustworthy, and it did — 102 of 120 records in the live file
+# came from this suite, under sessions like `s` and `abcdef123456`.
+#
+# Set HERE rather than per-test, because the polluting call sites were the two that invoke
+# the hook through `subprocess.run` directly instead of the suite's helper. Pinning it at
+# the process level covers every call site, including ones added later that forget.
+os.environ["OWNEROS_HOOK_DIAG"] = os.path.join(_TEST_DB_DIR, "owneros_hook_diag.jsonl")
+
 # Same hazard, second door. `closed_loop_wake._transcript_advanced` reads the session
 # transcripts under ~/.claude/projects to answer "did this agent write anything since the
 # wake?", which on this host is the operator's REAL transcript directory. Three existing
