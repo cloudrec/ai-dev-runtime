@@ -222,14 +222,28 @@ From the next deploy on, step 7 above is preceded by attributed `agent_status` a
 
 ## What is NOT claimed
 
-* **The event loop is not fully clear.** The eight background worker loops started by
-  `api/main.py` are `asyncio.create_task`, and several call `agent_send` and friends
-  directly — so they still run blocking tmux work on the loop. This change moves the five
-  HTTP control-path routes off it, which is what the criterion names and what the A/B
-  measures; it does not convert the workers. A worker waiting on `_DELIVER_LOCK` while a
-  threadpool thread holds it will block the loop for that wait, which is no worse than the
-  serialisation it already imposed, but it is not zero. Converting the worker loops is a
-  larger change and was deliberately not attempted here.
+* **CORRECTED 2026-09-06, after the worker loops were actually read.** An earlier
+  revision of this report said the eight `asyncio.create_task` worker loops "still run
+  blocking tmux work on the loop" and that converting them was "a larger change". **Both
+  statements were wrong**, and they were written from the `create_task` call sites in
+  `api/main.py` without opening a single loop body.
+
+  What is actually true: **no worker loop runs blocking tmux work on the event loop.** All
+  eight hand their tick to `asyncio.to_thread` and wait with `asyncio.sleep`. The
+  `agent_send` calls in `agent_orchestrator` sit inside `refresh_and_resolve`, which is
+  itself invoked via `to_thread` — so they run in a worker thread, and a worker waiting on
+  `_DELIVER_LOCK` blocks that thread, not the loop.
+
+  Two call sites had skipped the `to_thread` their siblings use, and both are now fixed
+  (one line each, no refactor):
+  * `agent_orchestrator.run_loop` called `wake_bridge.register_worker` inline — sqlite
+    writes plus `_module_fingerprint`, which opens and SHA-256-hashes the worker's source
+    files off disk, every 45s tick.
+  * `wake_bridge.pipeline_watch_loop` called `pipeline_health` inline — sqlite reads,
+    every watch interval.
+
+  Pinned by `tests/test_worker_loops_off_event_loop.py`, which asserts on the thread the
+  call lands on rather than on behaviour.
 * **Threadpool capacity is now the bound.** Starlette's default limiter is 40 threads. A
   flood of concurrent `agent_read` will queue there rather than on the loop — better
   behaviour, but still a bound, and it has not been load-tested to that edge.

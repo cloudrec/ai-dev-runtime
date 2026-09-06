@@ -1079,13 +1079,15 @@ approval. Full evidence:
 | | |
 |---|---|
 | Branch | `ai-runtime/220-windows-bridge` |
-| HEAD | `31a9309` — **5 unpushed** commits (`a7a438c`, `25930ef`, `8584047`, `e024d0f`, `31a9309`); push is an owner gate |
+| HEAD | `78c3d09` and one docs commit after it — **8 unpushed**; push is an owner gate |
 | Upstream | `origin/ai-runtime/220-windows-bridge` at `b615fbc`, verified 2026-09-06 12:2xZ |
 | Before this session | `b615fbc`, local == remote, ahead=0 behind=0 |
 | Tracked tree | clean apart from the two commits above |
 | Untracked | reports only — never `git add reports/`; both commits staged EXPLICIT paths |
 
 ```
+78c3d09  fix(workers): the last two ticks that ran on the event loop   <- code
+1f3e603  docs(handoff): the repo table listed a HEAD two commits stale
 31a9309  docs(handoff): the suite result, and the one failure I cannot name
 e024d0f  docs(comment): the lock note said four routes; it is five
 8584047  docs(handoff): the 2026-09-06 session, and what it did not prove
@@ -1160,9 +1162,15 @@ The suite could not be run as one process: the host was in memory exhaustion (se
 and three full runs were reaped. It was run in ten 12-file batches instead, twice.
 
 ```
-pass 1 (under memory pressure)   3158 passed, 1 FAILED, 1 warning
-pass 2 (after memory recovered)  3159 passed, 0 failed, 1 warning
+pass 1  batched, under memory pressure   3158 passed, 1 FAILED, 1 warning
+pass 2  batched, memory recovered        3159 passed, 0 failed, 1 warning
+pass 3  ONE PROCESS, memory recovered    3159 passed, 0 failed, 1 warning  exit 0, 16:46
+pass 4  ONE PROCESS, + worker-loop fixes 3170 passed, 0 failed, 1 warning  exit 0, 13:34
 ```
+
+Passes 3 and 4 ran as a single `pytest tests/` with `-rf` and `^FAILED`/`^ERROR`
+capture — the batching was only ever a workaround for the memory exhaustion, and it is
+no longer needed. Pass 4 is the current HEAD; 3170 = 3159 + the 11 new worker-loop tests.
 
 Both passes total 3159 tests, so pass 1's failure was a real test failure, not a collection
 error. **It is unidentified**: the first batch runner captured only each batch's summary
@@ -1184,6 +1192,45 @@ capture the test name — that is the one piece of evidence this session did not
 
 The 1 warning is the pre-existing `tarfile` `DeprecationWarning` from
 `test_core.py::TestBackupEngine::test_rollback`, unchanged and unrelated.
+
+## Worker loops — inspected, two fixed
+
+Read-only inspection of all eight `asyncio.create_task` loops in `api/main.py`, prompted by
+the incorrect claim above.
+
+| loop | tick offloaded? |
+|---|---|
+| `agent_supervisor.run_loop` | `to_thread(heartbeat)`, `to_thread(poll_once)` |
+| `agent_orchestrator.run_loop` | `to_thread(refresh_and_resolve)`, `to_thread(ac.agent_list)`, `to_thread(_dal.sweep)` |
+| `control_plane.engine.run_loop` | `to_thread(tick_once)` |
+| `agent_continuation_watchdog.run_loop` | `to_thread(run_once)`, `to_thread(health)` |
+| `commander_autopilot.run_loop` | `to_thread(tick)` |
+| `project_supervisor.run_loop` | `to_thread(tick, …)` |
+| `context_budget.run_loop` | `to_thread(tick)` |
+| `wake_bridge.pipeline_watch_loop` | `pipeline_health()` **inline** ← fixed |
+
+Every loop also waits with `asyncio.sleep`, never `time.sleep`. So the architecture was
+already right, and the remainder was two call sites, not a refactor:
+
+```
+core/agent_orchestrator.py  _wb.register_worker("agent_orchestrator")   -> await asyncio.to_thread(...)
+core/wake_bridge.py         h = pipeline_health()                       -> h = await asyncio.to_thread(...)
+```
+
+`register_worker` is the heavier of the two: sqlite writes plus `_module_fingerprint`,
+which opens and SHA-256-hashes the worker's watched source files off disk, on a 45s cadence
+in the process that serves the MCP control path.
+
+`tests/test_worker_loops_off_event_loop.py`, 11 tests. The two targeted ones assert on
+**which thread** the call lands on — `asyncio.run` drives the loop on the main thread, so a
+call executing there is a call executing on the event loop. Removal proof: revert either
+fix and exactly its test fails; restored, 11 pass.
+
+One note worth keeping, because it nearly produced a vacuous test: the parametrised
+"every loop offloads its tick" pin originally did `"to_thread" in source`. Reverting the
+`wake_bridge` fix left the explanatory COMMENT behind, so that assertion stayed green over
+the restored defect. It now parses the body with `ast` and requires a real call node;
+re-run of the removal proof then failed 2 tests instead of 1.
 
 ## Gates — all owner-only
 
@@ -1224,6 +1271,9 @@ re-run in 12-file batches instead.
   autonomy is not.
 * **No JSON-RPC message was read directly.** The MCP server is not in this repository; the
   root cause is proven on this side of that boundary. `/opt/seo` was not touched.
-* The event loop is **not fully clear**: the eight `asyncio.create_task` worker loops in
-  `api/main.py` still call blocking tmux work on it. Converting them is a larger change,
-  deliberately not attempted.
+* ~~The event loop is not fully clear: the eight worker loops still call blocking tmux
+  work on it.~~ **WRONG — corrected the same day.** Written from the `create_task` call
+  sites without reading a loop body. All eight already offload their tick with
+  `asyncio.to_thread`; no worker runs blocking tmux work on the loop. Two call sites had
+  skipped it (`register_worker`, `pipeline_health` — sqlite, and file hashing in the first)
+  and are fixed one line each. See the Worker loops section below.
