@@ -49,7 +49,7 @@ _IDEMPOTENCY_TTL_SECS = 24 * 3600
 # Deliveries are check-then-act: `_seen_delivery` reads the idempotency key, the
 # paste happens, `_record_delivery` writes it. Until 2026-09-06 every caller ran
 # on the API's single event loop, so that sequence could not interleave and the
-# gap was invisible. The four control-plane routes now run in the threadpool (so
+# gap was invisible. The five control-plane routes now run in the threadpool (so
 # a 15s tmux call can no longer stall the loop), which makes the gap reachable:
 # two callers replaying one key would both read "unseen" and both paste. This
 # lock keeps deliveries as mutually exclusive as the event loop made them, and
