@@ -1598,3 +1598,67 @@ def test_the_suppression_ends_when_the_doctor_clears_the_flag(tmp_path, monkeypa
     assert clw._resolution_reason(conn, event_id=1, target=t) == "pane_escalated_by_stall_doctor"
     _doctor_state(conn, t, escalated=False, digest="moved")
     assert clw._resolution_reason(conn, event_id=1, target=t) is None
+
+
+# ── the suppression closes a WATCH, it does not gate a DELIVERY (2026-09-06) ──
+# Read wrong three times in one session, each time concluding that a self-project wake had
+# been "suppressed instead of resumed". The durable chain for event 34527 says otherwise:
+#
+#   00:24:48Z  agent_prompt_needs_response   owner-os-opus-fresh:0.0
+#   00:26:24Z  wake_delivery delivered=1     submitted_and_assistant_started_generating
+#   00:26:42Z  wake_loop_watch resolved=1    pane_escalated_by_stall_doctor
+#
+# The wake WAS delivered; the resolution landed eighteen seconds later and only marked the
+# watch closed so a duplicate re-wake and a second owner escalation would not fire. These
+# pin that structurally, so the misreading cannot come back.
+
+def test_the_resolution_reason_has_exactly_one_caller_and_it_only_closes_watches():
+    """If `_resolution_reason` ever gains a caller on a delivery or decision path, the
+    suppression stops being a bookkeeping fact and starts silently gating wakes."""
+    import inspect
+    from core import closed_loop_wake as clw
+    src = inspect.getsource(clw)
+    calls = [l.strip() for l in src.splitlines()
+             if "_resolution_reason(" in l and not l.strip().startswith("def ")]
+    assert len(calls) == 1, f"expected one caller, found {len(calls)}: {calls}"
+    # and that caller's whole effect is marking the watch row resolved
+    fn = inspect.getsource(clw.deregister_resolved) if hasattr(clw, "deregister_resolved") else src
+    assert "UPDATE wake_loop_watch SET resolved=1" in src, \
+        "the only write behind this reason must be the watch row"
+
+
+def test_the_wake_path_never_consults_stall_doctor_state():
+    """`wake_bridge` decides deliveries. It must not know about the doctor's escalation
+    flag at all — otherwise an escalated pane could stop being woken."""
+    import inspect
+    from core import wake_bridge as wb
+    src = inspect.getsource(wb)
+    assert "stall_doctor_state" not in src, \
+        "the delivery decision must stay independent of the doctor's suppression fact"
+
+
+def test_an_escalated_pane_still_has_its_wake_delivered(tmp_path, monkeypatch):
+    """The behavioural half, on the SELF agent this was misread about. `escalated=1`
+    resolves the WATCH; the wake_delivery row for that same event stands untouched. Both
+    facts coexisted on event 34527 — delivered=1 at 00:26:24Z, resolution at 00:26:42Z."""
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    from core import closed_loop_wake as clw
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    t = "owner-os-opus-fresh:0.0"
+    _doctor_state(conn, t, escalated=True)
+    conn.execute("CREATE TABLE IF NOT EXISTS wake_delivery ("
+                 "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, at TEXT, source TEXT,"
+                 "event_id INTEGER, delivered INTEGER, reason TEXT,"
+                 "conversation TEXT DEFAULT '', route_key TEXT DEFAULT '')")
+    conn.execute("INSERT INTO wake_delivery (ts, event_id, delivered, reason, route_key) "
+                 "VALUES (?,?,?,?,?)",
+                 (1788654384.0, 34527, 1, "submitted_and_assistant_started_generating",
+                  "owner-os"))
+    conn.commit()
+    assert clw._resolution_reason(conn, event_id=34527, target=t) == \
+        "pane_escalated_by_stall_doctor"
+    delivered = conn.execute(
+        "SELECT delivered FROM wake_delivery WHERE event_id=34527").fetchone()[0]
+    assert delivered == 1, \
+        "the suppression must not retract or contradict a delivery that already happened"
