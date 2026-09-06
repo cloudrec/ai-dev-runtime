@@ -931,6 +931,81 @@ sed -i '/^NATIVE_CANARY_TARGET=/d;/^NATIVE_CANARY_TIMEOUT_SECS=/d;/^# canary for
 Cheapest degrade for anything companion-related: `systemctl stop
 owner-os-wake-companion`. Native continuation runs INSIDE it, so that stops autonomy too.
 
+## State at context rotation — 2026-09-06 ~08:45Z
+
+Written for a fresh session to resume from. An automated instruction asked for it; that is
+not owner sign-off.
+
+### Resume identifiers
+
+```
+repo        /root/ai-dev-runtime   branch ai-runtime/220-windows-bridge
+HEAD        31d7cb6                UNPUSHED (ahead 1), tracked tree clean
+upstream    origin/ai-runtime/220-windows-bridge   (last pushed: c084d43)
+session     claude.ai/code/session_011BF9Z1MpBRv4uL9AHtK5WS
+scratchpad  7e0ead20-0e1c-4201-8d75-6a0d47198fa2   (session-local, will NOT survive)
+```
+
+Durable evidence lives in `control_plane.db`, `logs/owneros_hook_diag.jsonl` and this file.
+Scratchpad logs (watch runs, test output) do not survive rotation and are already
+summarised here.
+
+### Landed and pushed this session
+
+```
+c084d43  test: keep the suite out of the live hook diagnostic
+080eb6f  feat(hook): tell the three silences apart
+2c53af7 db6cbc1 9177606 3f009d5 105f731   handoff revisions
+f73b6cd e285901 83c41b2 a91e5c5 34a6eeb   self-wake fix + handoff
+ffe63c2 5a9f015                           the tab leak, fixed and proven
+```
+
+### Local, NOT pushed
+
+`31d7cb6` — tests pinning that the stall doctor's suppression closes a WATCH and cannot
+gate a DELIVERY. Tests only, no production change. 212 passed across `closed_loop_wake`,
+`wake_bridge`, `owneros_hook`.
+
+### Live runtime state
+
+```
+companion   PID 529251   ai-runtime PID 1196430   both active
+coverage    6 covered / 4 denied / 0 uncovered
+canary      hostsecure:0.0 · streak 216 · proven · matched_by=agent
+browser     8 pages · headroom 4 · degraded=False · duplicates NONE
+owner gates 0 open
+hook diag   clean across 9 sessions, no forged test records
+```
+
+### The three gates — all owner-only
+
+1. **Telegram token.** Sole cause of health red. Remediation: BotFather token into
+   `configs/.env` as `TELEGRAM_BOT_TOKEN`, THEN send that bot one message from the owner's
+   account so `getUpdates` has an inbound update. Step 2 is the one that is missed.
+2. **`acap-voice` route/project registration.**
+3. **Push of `31d7cb6`.** Requested and forbidden in alternating turns by the automated
+   channel all session; the pane's `push it` line is machine-queued and blocked by Owner
+   OS's own `queued_line_not_submittable:forbidden_token` guard (events 35059, 35133,
+   35193). It needs a typed owner instruction.
+
+### Open, NOT a gate
+
+Self-project supervisor resumption. The wake reaches the bound chat and a turn starts;
+whether the supervisor then continues the work is unobserved, because nothing durable
+records pane progress after a delivered wake. Closing it means writing progress state into
+the watch path — a real change, not read-only observability.
+
+### Carried forward for owner judgement
+
+* `observe_only` gate answers do NOT constrain supervision. `discovery.classify_scope`
+  derives lifecycle from orchestrator config and never reads `owner_gate.answer`;
+  `owner_status` classes `classify_scope` as diagnostic, "a mapping gap, not a decision".
+  `acap-voice:0.0` is natively covered despite its answer.
+* `mess` agent churn: five generations in 36 minutes, four dead
+  (`mess-ru-edge` 366s, `-edge-sonnet` 244s, `-final` 586s, `-go` 1073s,
+  `-54582145` alive). Replacements are created ~2 s BEFORE the predecessor is declared
+  dead. Cause lives in `/opt/mess`, out of scope here.
+
 ## Next safe step
 
 **The only gate in this workstream is the push.** Three documentation commits are staged
