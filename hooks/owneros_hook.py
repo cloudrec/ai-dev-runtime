@@ -32,7 +32,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
+from datetime import datetime, timezone
 
 sys.path.insert(0, "/root/ai-dev-runtime")
 
@@ -195,16 +197,83 @@ def _trigger_supervisor() -> None:
         pass
 
 
+# ── failure-path diagnostics (2026-09-06) ───────────────────────────────────
+# This module's first rule is that a hook must NEVER break the session it observes, so
+# every path exits 0 and swallows every exception. The cost of that, discovered when the
+# `session:7e0ead20-0e1` event stream went dark for five hours: a hook that is not firing,
+# one that is firing and crashing, and one whose event is being DEDUPED are all
+# indistinguishable from outside — each looks like silence in the `event` table, and
+# nothing anywhere records which it was.
+#
+# So the swallowing stays exactly as it is, and a bounded breadcrumb is written beside it.
+#
+# NON-SECRET BY CONSTRUCTION. Only an ISO timestamp, the hook event NAME, the first 12
+# characters of the session id (already used as the correlation id), an outcome token and
+# an exception CLASS NAME are recorded. No payload, no assistant text, no error detail, no
+# environment — none of the fields the redactor exists to scrub can reach this file.
+#
+# BOUNDED: the file is trimmed to its last half once it passes the cap, so it can never
+# grow without limit on a host that has run out of memory twice today.
+#
+# FAILS SILENT, like everything else here: if the breadcrumb itself cannot be written the
+# hook carries on. A diagnostic that can break the session it diagnoses is worse than none.
+DIAG_PATH = os.environ.get("OWNEROS_HOOK_DIAG",
+                           "/root/ai-dev-runtime/logs/owneros_hook_diag.jsonl")
+DIAG_MAX_BYTES = int(os.environ.get("OWNEROS_HOOK_DIAG_MAX_BYTES", "262144"))
+
+
+# `detail` carries an exception CLASS NAME or an event id and nothing else. Truncation
+# alone would not guarantee that — 60 characters of free text is still free text, and a
+# credential is shorter than that. So the value must MATCH a safe shape or it is replaced
+# outright: no caller, present or future, can leak through this field by passing the wrong
+# thing. Structural, not a convention.
+_DIAG_DETAIL_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]{0,59}$|^[0-9]{1,20}$")
+
+
+def _safe_detail(detail: str) -> str:
+    d = str(detail or "")
+    return d if _DIAG_DETAIL_RE.match(d) else ("withheld" if d else "")
+
+
+def _diag(outcome: str, *, event: str = "", session: str = "", detail: str = "") -> None:
+    """One bounded, non-secret line per hook invocation outcome. Never raises."""
+    try:
+        line = json.dumps({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "outcome": str(outcome)[:40],
+            "event": str(event)[:40],
+            "session": str(session)[:12],
+            "detail": _safe_detail(detail),
+        }, sort_keys=True)
+        path = DIAG_PATH
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        try:
+            if os.path.getsize(path) > DIAG_MAX_BYTES:
+                with open(path, "r+", encoding="utf-8") as fh:
+                    kept = fh.readlines()[len(fh.readlines()) // 2:] or []
+                    fh.seek(0), fh.truncate()
+                    fh.writelines(kept)
+        except FileNotFoundError:
+            pass
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:  # noqa: BLE001 — a diagnostic must never break the observed session
+        pass
+
+
 def main() -> int:
     try:
         raw = sys.stdin.read()
         payload = json.loads(raw) if raw.strip() else {}
-    except Exception:  # noqa: BLE001 — a malformed payload must not break the session
+    except Exception as e:  # noqa: BLE001 — a malformed payload must not break the session
+        _diag("payload_unreadable", detail=type(e).__name__)
         return 0
     try:
         ev = payload.get("hook_event_name") or (sys.argv[1] if len(sys.argv) > 1 else "")
         mapped = _map(ev, payload)
+        _diag("invoked", event=ev, session=(payload.get("session_id") or ""))
         if not mapped:
+            _diag("unmapped", event=ev, session=(payload.get("session_id") or ""))
             return 0
         etype, severity, oar = mapped
         ident = _identity(payload)
@@ -272,6 +341,12 @@ def main() -> int:
                  correlation_id=f"claudehook:{ident['session_id'][:12]}",
                  dedup_key=f"claudehook:{ident['session_id'][:12]}:{ev}:{digest}",
                  dedup_window_secs=900)
+        # `emit` returns {event_id, ...}; a dedup hit yields no NEW id. Recording which of
+        # the two happened is the whole point: a deduped turn and an unfired hook are the
+        # same silence in the event table, and they need opposite fixes.
+        _diag("emitted" if (_emitted or {}).get("event_id") else "deduped",
+              event=ev, session=ident["session_id"],
+              detail=str((_emitted or {}).get("event_id") or "")[:20])
         # EVENT-DRIVEN, not polled. The supervisor used to learn about a stop on the
         # companion's next tick, which cost tens of seconds for no reason: the fact
         # arrived here, in this process, the instant the turn ended. Hand it straight on.
@@ -283,7 +358,8 @@ def main() -> int:
         # companion's tick is still there as the fallback path.
         if ev == "Stop" and etype == "agent_turn_stopped":
             _trigger_supervisor()
-    except Exception:  # noqa: BLE001 — observation must never break the observed session
+    except Exception as e:  # noqa: BLE001 — observation must never break the observed session
+        _diag("failed", event=locals().get("ev", ""), detail=type(e).__name__)
         return 0
     return 0
 

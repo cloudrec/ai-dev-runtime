@@ -482,3 +482,101 @@ def test_the_hook_fails_closed_when_the_redactor_is_unavailable(monkeypatch):
     assert raw not in json.dumps(body)
     assert "last_assistant_message" not in body
     assert body.get("redaction", "").startswith("unavailable")
+
+
+# ── failure-path diagnostics (2026-09-06) ──────────────────────────────────
+# The module swallows every exception so it can never break the session it observes. The
+# cost: when this session's event stream went dark for five hours, "hook never fired",
+# "hook fired and crashed" and "event was deduped" were indistinguishable — all three are
+# the same silence in the `event` table. These pin the breadcrumb that tells them apart,
+# and pin that it cannot leak what the redactor exists to scrub.
+
+def _hook(tmp_path, monkeypatch):
+    """The module with its diagnostic file redirected into a tmp dir."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("oh_diag", HOOK)
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m.DIAG_PATH = str(tmp_path / "diag.jsonl")
+    return m
+
+
+def _lines(m):
+    import json as _j
+    with open(m.DIAG_PATH, encoding="utf-8") as fh:
+        return [_j.loads(l) for l in fh if l.strip()]
+
+
+def test_an_exception_leaves_a_durable_record(tmp_path, monkeypatch):
+    """The defect: a crashing hook was indistinguishable from one that never ran."""
+    m = _hook(tmp_path, monkeypatch)
+    m._diag("failed", event="Stop", session="abcdef123456789", detail="RuntimeError")
+    rec = _lines(m)[-1]
+    assert rec["outcome"] == "failed"
+    assert rec["event"] == "Stop"
+    assert rec["detail"] == "RuntimeError"
+    assert rec["ts"], "a breadcrumb without a timestamp cannot bound an outage"
+
+
+def test_the_three_silences_are_distinguishable(tmp_path, monkeypatch):
+    """Not-invoked, invoked-and-failed, and deduped need OPPOSITE fixes, so the record
+    must separate them. Not-invoked is the absence of any line for that session."""
+    m = _hook(tmp_path, monkeypatch)
+    m._diag("invoked", event="Stop", session="sess-A")
+    m._diag("failed", event="Stop", session="sess-A", detail="OperationalError")
+    m._diag("invoked", event="Stop", session="sess-B")
+    m._diag("deduped", event="Stop", session="sess-B")
+    outcomes = [(r["session"], r["outcome"]) for r in _lines(m)]
+    assert ("sess-A", "failed") in outcomes
+    assert ("sess-B", "deduped") in outcomes
+    assert not [o for s, o in outcomes if s == "sess-C"], \
+        "a session that never invoked the hook leaves no line at all"
+
+
+def test_the_record_cannot_carry_secrets(tmp_path, monkeypatch):
+    """`last_assistant_message` is 600 characters of model output and `error_details` is
+    whatever the session was handling — this file is the one place in the hook that is
+    NOT redacted, so it must never be given free text in the first place."""
+    m = _hook(tmp_path, monkeypatch)
+    m._diag("failed", event="Stop", session="s" * 64,
+            detail="token=SUPERSECRET password=hunter2 " + "x" * 500)
+    raw = open(m.DIAG_PATH, encoding="utf-8").read()
+    assert "SUPERSECRET" not in raw and "hunter2" not in raw, \
+        "detail must MATCH an exception-class/id shape or be replaced outright"
+    rec = _lines(m)[-1]
+    assert rec["detail"] == "withheld", "free text is refused, not merely trimmed"
+    # and the shapes it exists for still pass through untouched
+    m._diag("failed", event="Stop", session="s", detail="OperationalError")
+    assert _lines(m)[-1]["detail"] == "OperationalError"
+    m._diag("emitted", event="Stop", session="s", detail="34566")
+    assert _lines(m)[-1]["detail"] == "34566"
+    rec = _lines(m)[0]
+    assert len(rec["detail"]) <= 60 and len(rec["session"]) <= 12
+    assert set(rec) == {"ts", "outcome", "event", "session", "detail"}, \
+        "no payload, no assistant text, no environment may be added to this record"
+
+
+def test_the_file_is_bounded(tmp_path, monkeypatch):
+    """The host ran out of memory twice on 2026-09-05; an unbounded diagnostic on a busy
+    hook is its own outage."""
+    m = _hook(tmp_path, monkeypatch)
+    m.DIAG_MAX_BYTES = 2048
+    for i in range(400):
+        m._diag("invoked", event="Stop", session="sess-%d" % i)
+    assert os.path.getsize(m.DIAG_PATH) < 60000, "the file must be trimmed, not grow forever"
+    assert _lines(m), "trimming must leave the file readable and non-empty"
+
+
+def test_a_broken_diagnostic_never_breaks_the_session(tmp_path, monkeypatch):
+    """The module's first rule. A breadcrumb that can raise is worse than no breadcrumb."""
+    m = _hook(tmp_path, monkeypatch)
+    m.DIAG_PATH = "/proc/cannot/be/written/diag.jsonl"
+    m._diag("failed", event="Stop", session="s")        # must not raise
+
+
+def test_normal_success_still_returns_zero_and_records_accepted(tmp_path, monkeypatch):
+    """Instrumentation must not change what the hook DOES: every path still exits 0."""
+    m = _hook(tmp_path, monkeypatch)
+    m._diag("emitted", event="Stop", session="sess-ok", detail="12345")
+    rec = _lines(m)[-1]
+    assert rec["outcome"] == "emitted" and rec["detail"] == "12345"
