@@ -209,3 +209,40 @@ def test_unrelated_event_types_are_untouched():
     d = wb.should_wake(event_id=5, severity="high", owner_action_required=True,
                        event_type="work_stopped_incomplete", project_id="owner-os", conn=conn)
     assert d["reason"] != "recurring_cause_already_signalled"
+
+
+def test_recovery_re_arm_does_not_depend_on_matching_a_float_timestamp():
+    """Regression: the re-arm once re-looked the timestamp up with `WHERE ts=?`.
+
+    Float equality on a REAL column, resolved with `ORDER BY id DESC LIMIT 1` — so when
+    another wake row shared that ts, the lookup returned THAT row's `at` instead of the
+    one being evaluated, and a real recovery in between was missed. The alert then stayed
+    suppressed for a reason unrelated to recovery.
+
+    Shaped to discriminate: the matching prior is the OLD row (00:00), while a newer,
+    NON-matching row (different reason) shares its ts and carries a later `at` (05:00).
+    The old lookup resolves to 05:00 and misses the 01:00 recovery; the caller already
+    holds 00:00, so it must see it.
+    """
+    conn = _conn()
+    _dead_letter_event(conn, 1)                                   # same cause
+    _dead_letter_event(conn, 3, reason="telegram send failed: Unauthorized")   # different
+    _record_wake(conn, 1, ts=1000.0, at="2026-09-07T00:00:00+00:00")
+    _record_wake(conn, 3, ts=1000.0, at="2026-09-07T05:00:00+00:00")
+    conn.execute("INSERT INTO notification (channel,state,created_at) VALUES "
+                 "('telegram','sent','2026-09-07T01:00:00+00:00')")
+    conn.commit()
+
+    _dead_letter_event(conn, 4)                                   # same cause as event 1
+    sig, chan = wb.cause_signature(conn, 4, DEAD_LETTER)
+    assert wb.recurring_cause_already_signalled(
+        conn, event_id=4, event_type=DEAD_LETTER, signature=sig, channel=chan) is None, (
+        "the 01:00 recovery after the matching 00:00 wake was missed — the re-arm is "
+        "resolving the timestamp from the wrong row")
+
+
+def test_a_missing_timestamp_never_silently_suppresses():
+    """No `at` means no recovery evidence, but must not crash or mis-answer."""
+    conn = _conn()
+    assert wb._channel_delivered_since(conn, "telegram", "") is False
+    assert wb._channel_delivered_since(conn, "", "2026-09-07T00:00:00+00:00") is False

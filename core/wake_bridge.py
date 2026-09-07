@@ -580,15 +580,21 @@ def cause_signature(conn, event_id: int, event_type: str) -> tuple:
         return ("", "")
 
 
-def _channel_delivered_since(conn, channel: str, ts: float) -> bool:
-    """Did this channel prove a delivery after `ts`? A recovery re-arms the alarm."""
-    if not channel:
+def _channel_delivered_since(conn, channel: str, at_iso: str) -> bool:
+    """Did this channel prove a delivery after `at_iso`? A recovery re-arms the alarm.
+
+    Takes the timestamp the caller already holds. The first version re-looked it up with
+    `WHERE ts=?` — float equality on a REAL column — and a miss there yields NULL, making
+    `created_at > NULL` NULL, so the function would answer "no recovery" for a reason that
+    has nothing to do with recovery. A guard whose failure mode is silent suppression is
+    the wrong guard; the row is already in hand, so there is nothing to look up.
+    """
+    if not channel or not at_iso:
         return False
     try:
         r = conn.execute(
-            "SELECT 1 FROM notification WHERE channel=? AND state='sent' AND created_at > "
-            "(SELECT at FROM wake_audit WHERE ts=? ORDER BY id DESC LIMIT 1) LIMIT 1",
-            (channel, ts)).fetchone()
+            "SELECT 1 FROM notification WHERE channel=? AND state='sent' "
+            "AND created_at > ? LIMIT 1", (channel, at_iso)).fetchone()
         return bool(r)
     except Exception:  # noqa: BLE001
         return False
@@ -611,7 +617,7 @@ def recurring_cause_already_signalled(conn, *, event_id: int, event_type: str,
         sig, _ch = cause_signature(conn, int(prior_id), event_type)
         if sig != signature:
             continue
-        if _channel_delivered_since(conn, channel, prior_ts):
+        if _channel_delivered_since(conn, channel, prior_at):
             return None                      # broke -> healed -> broke again: that is news
         return {"event_id": int(prior_id), "at": prior_at}
     return None
