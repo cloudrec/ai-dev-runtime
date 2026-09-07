@@ -1635,6 +1635,79 @@ tracebacks. The `api:bearer` half of the loop is untouched and needs `/opt/seo` 
 
 Rollback: delete that one line, restart. Whole-file restore in the backup's ROLLBACK.md.
 
+## Per-agent supervision exclusion — shipped and DEPLOYED 2026-09-07T09:16:24Z
+
+Closes the other half of the `mess` continue-loop without the trade that was refused.
+
+### Why the project denylist was the wrong tool
+
+`mess-postsignup-cleanup-sonnet-v4:0.0` runs with cwd `/opt/seo`, so it resolves to project
+`seo` — the project denylist would have silenced it only by denying `seo` outright, which
+also hosts the MCP connector backend. Losing supervision of a whole project to quiet one
+stale pane conflicts with the standing goal of broad zero-ping continuation, so it was not
+done.
+
+### The code — `a0c09ac`, on the remote
+
+`NATIVE_SUPERVISOR_DENY_TARGETS`, empty by default. It contains no syntax that can GRANT
+supervision: every check is an early return to False or a skip, so the worst a
+misconfiguration can do is supervise LESS. That is what made it safe to add without a
+rollout. Wired into all five paths that could otherwise grant or retain supervision:
+
+```
+is_supervised()       checked AHEAD of the allowlist/wildcard
+auto_register()       skip, why="deny_listed_target"
+registered_targets()  filtered on read
+purge_denied()        drops an EXISTING registration when an exclusion is added later
+send_block_reason()   distinct reason "target_excluded", so the journal stays diagnosable
+```
+
+Fail-closed where it matters: an empty or unreadable target is denied, not allowed.
+Session-name matching is equality on the first segment, never a prefix — `mess` denies a
+session literally named `mess` and does NOT capture `mess-ru-54582145-resumed`.
+
+The load-bearing test is the wildcard one. `NATIVE_SUPERVISOR_TARGETS="*"` returns True
+from the wildcard branch before any later filter runs — the exact shape of the bug the
+PROJECT denylist already had, where a rollout switch silently became a denylist bypass.
+14 tests; removal proof: move the guard after the wildcard and 4 fail (that one by name),
+remove the purge and 1 fails. Full suite 3186 passed, 0 failed.
+
+### The deploy
+
+```
+configs/.env  +1 line:  NATIVE_SUPERVISOR_DENY_TARGETS=mess-postsignup-cleanup-sonnet-v4:0.0
+backup:  backups/deny_target_mess_postsignup_20260907T091556Z/{.env.before,ROLLBACK.md}
+restart: PID 446168 -> 737206, active, 8 loops clean, 0 tracebacks
+```
+
+Scope was verified BEFORE the restart, not assumed:
+
+```
+mess-postsignup-cleanup-sonnet-v4:0.0  project seo                  -> False  (target_excluded)
+seo-audit:0.0                          project seo                  -> True   <- seo stays supervised
+hostsecure:0.0                         project hostsecure           -> True
+gaika-opus-v8:0.0                      project gaika-extension      -> True
+anything:0.0                           project payment-orchestrator -> False  (still blocked)
+```
+
+After the restart: the pane is purged from `native_supervised_target`, 21 targets remain
+registered, 0 deliveries to it, 0 tracebacks.
+
+**One reading that looks alarming and is not.** The registry now reports
+`seo project targets: []`. That is not the exclusion over-reaching — this pane was the ONLY
+one the registry had classified under `seo`, so removing it emptied that project's rows.
+`seo` is NOT denied: `is_supervised("seo-audit:0.0", project="seo")` is still True, and any
+`seo` pane that appears auto-registers normally.
+
+Rollback: delete the one line, restart; the pane re-registers by itself on the next
+discovery pass. The only durable effect is the removed registry row.
+
+### What this does NOT fix
+
+Only the `native_supervisor` half of the loop. 25 of the peer's 53 pokes came from
+`api:bearer` — the ChatGPT supervisor path in `/opt/seo` — which no setting in this
+repository governs.
+
 ## Gates — all owner-only
 
 0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
