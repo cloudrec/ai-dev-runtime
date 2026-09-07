@@ -1479,6 +1479,68 @@ companion restart is not required by anything in this session.
 `api.main` imports clean on the committed tree (smoke-checked, import only — importing does
 not fire the startup events, so no worker loop was started and no agent was touched).
 
+## DEPLOYED 2026-09-07T07:35:40Z — criterion 1 is now LIVE
+
+The owner typed `push it`, then `restart ai-runtime`. Both were done; both are recorded
+here as owner-typed instructions in the Claude Code session, which is the only thing this
+handoff has ever counted as authorisation.
+
+```
+push     b615fbc..f4a9292  ai-runtime/220-windows-bridge   local == remote, ahead=0 behind=0
+restart  ai-runtime.service   PID 1196430 (up since 2026-09-05 06:05:35)  ->  PID 368613
+         ActiveState=active  SubState=running  NRestarts=0
+```
+
+All eight worker loops came up clean — supervisor, orchestrator, control plane,
+continuation watchdog, commander autopilot, project supervisor (dormant, no projects),
+context budget. No traceback on startup.
+
+**Skew cleared, by the system's own check:**
+
+```
+agent_orchestrator  pid 368613   MATCH — running == disk     (was SKEW)
+wake_companion      pid 499953   SKEW — 78c3d09's wake_bridge.py edit only, inert there
+```
+
+The companion still reads skewed and that is expected: `pipeline_watch_loop` runs in
+`ai-runtime`, so for the companion that file is only inside its fingerprint set. No
+companion restart was ordered or needed.
+
+### The live A/B — measured under identical load, after the restart
+
+**Read this before trusting any single probe.** The first measurement taken ~90s after the
+restart looked catastrophic: ambient p50 238ms, `agent_read` p50 1319ms. It was neither the
+fix nor a regression — it was the cold-start storm (eight loops doing first sweeps at once)
+on a host at **load average 29 across 6 cores**, with 11 live agents, a 45-minute `sqlite3`
+process and Chrome competing. Proof it was not the API: `agent_list` measured **1782ms in a
+separate process with no API involved at all**, while raw `tmux capture-pane` stayed at
+17.7ms.
+
+The honest comparison is both builds under that same load, on spare ports:
+
+| | pre-fix `b615fbc` | deployed `f4a9292` |
+|---|---|---|
+| probe idle p50 | 13.5 ms | 16.5 ms |
+| probe under 6x read p50 | 256.8 ms | **86.7 ms** |
+| probe under 6x read p99 | 2653.7 ms | **220.4 ms** |
+| probe under 6x read max | 2653.7 ms | 317.1 ms |
+| probe samples/s under load | 2.9 | 8.1 |
+| `agent_read` p50 | 271.5 ms | 205.0 ms |
+| `agent_read` p99 | 2740.4 ms | **397.5 ms** |
+| `agent_read` max | 3291.9 ms | 536.9 ms |
+| throughput | 18.1/s | 28.1/s |
+
+Tail latency for UNRELATED requests improves **12x at p99**; control-plane read p99
+improves **6.9x**; throughput **1.55x**. The fix matters more under load, not less — which
+is the case that produced the original intermittent JSON-RPC failures.
+
+Post-restart control path, from the access log: 73 `agents/read`, 4 `agents/status`, 1
+`agents/answer`, all 200; one 400, a stale-target refusal.
+
+**Still red, and untouched:** notifications remain red on the Telegram chat-binding gate.
+Nothing in this deploy addresses it, and nothing here tried to. `cdp_same_chat` continues
+proving deliveries (18 in the last hour), so wakes keep landing.
+
 ## Gates — all owner-only
 
 0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
