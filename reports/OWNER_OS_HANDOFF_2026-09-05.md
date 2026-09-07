@@ -1885,6 +1885,43 @@ SELECT count(*) FROM wake_audit wa JOIN event e ON e.id=wa.event_id
 WHERE e.type='notification_dead_letter' AND wa.reason='recurring_cause_already_signalled';
 ```
 
+### The one new-cause wake: superseded, not stranded
+
+Worth recording because the shape looks alarming and the first read of it was wrong.
+
+Event 39832 (the `Errno 104 connection reset` dead letter — a genuinely NEW cause) was
+decided `wake` at 21:21:58 and had **zero delivery attempts** half an hour later, with
+`acknowledged=0`, not abandoned and not expired. That shape CAN mean a lost alert, so it
+was flagged rather than glossed. But the conclusion drawn from it — "a novel failure could
+be detected without being announced" — was **wrong**, and checking `superseded_by` before
+speculating would have shown it:
+
+```
+39832  notification_dead_letter (new cause)  decided 21:21:58  actionable=0
+   superseded_by 143791 at 21:41:29
+143791 -> event 40077  notifications_red  decided 21:39:29  acknowledged=1
+   DELIVERED 21:42:01  route owner-os  submitted_and_assistant_started_generating
+```
+
+`coalesce_generic_backlog` folds NON-actionable wakes per route down to the newest member —
+N generic wakes for one chat are one instruction — and never folds across routes. Both are
+non-actionable on `owner-os`, so 39832 folded into 40077, which was delivered. Exactly one
+wake was folded; no delivery attempt was spent on 39832 because none was needed. The
+conversation WAS woken, and the generic phrase points at the event log, where the specific
+cause is recorded.
+
+**Diagnostic rule:** a `wake` row with zero deliveries is not evidence of a lost alert
+until `superseded_by` AND `wake_submitted` have both been checked. Absence of delivery rows
+is the EXPECTED state for a folded wake.
+
+**Residual limitation — a product/policy question, not a bug.** Coalescing means a
+new-cause dead letter can surface as a generic "check Owner OS events" wake rather than one
+naming that cause. That is the intended trade: the phrase deliberately points at the event
+log instead of carrying content. Embedding a distinct reason in the phrase would mean
+changing `coalesce_generic_backlog` — a decision about what wake phrases may contain, which
+is the owner's to make, not a defect to fix. No code change was made.
+
+
 ### What this does NOT fix
 
 The Telegram channel is still down and still dead-lettering. This stops the
