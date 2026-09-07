@@ -24,6 +24,7 @@ event and the Telegram tier still carries the urgent ones.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 from typing import Optional
@@ -532,6 +533,90 @@ def _cooldown_scope(route_key: str, conversation: str) -> tuple:
     return _ROUTE_MATCH, _route_params(route_key)
 
 
+# ── recurring-cause suppression ──────────────────────────────────────────────────────
+# Some conditions recur unchanged for DAYS and mint a fresh event every dedup window.
+# `notification_dead_letter` is the live example: Telegram has answered
+# `Bad Request: chat not found` since 2026-08-03, and each new dead-letter event was a new
+# event_id, so `already_woke_for_this_event` never matched and the non-actionable cooldown
+# only spaced the wakes out. Measured 2026-09-07: 1029 wakes of the owner-os conversation
+# for ONE unchanging cause, 8 of them in a single afternoon.
+#
+# Waking a human conversation again for a cause it has already been told about, and which
+# only the owner can clear, is not alerting — it is noise that trains the reader to ignore
+# the channel. Suppression here is deliberately NARROW:
+#
+#   * the event is still EMITTED and still recorded — accounting, the per-message ledger,
+#     retry history and the red posture are all untouched;
+#   * a CHANGED cause (any different reason string, or a different channel) is a different
+#     signature and wakes normally;
+#   * a cause that RECURS AFTER A RECOVERY wakes again, because a successful send on that
+#     channel between the two re-arms it. "It broke, healed, and broke again" is news;
+#     "it is still broken" is not.
+#
+# Fails OPEN: anything unreadable yields no signature and the wake proceeds as before.
+# Silencing an alert on an internal error is the one outcome worth avoiding here.
+RECURRING_CAUSE_EVENT_TYPES = frozenset({"notification_dead_letter"})
+RECURRENCE_LOOKBACK_ROWS = 60
+
+
+def cause_signature(conn, event_id: int, event_type: str) -> tuple:
+    """(signature, channel) identifying WHY this event fired. ("", "") when not applicable."""
+    if event_type not in RECURRING_CAUSE_EVENT_TYPES:
+        return ("", "")
+    try:
+        row = conn.execute("SELECT payload FROM event WHERE id=?", (int(event_id),)).fetchone()
+        if not row or not row[0]:
+            return ("", "")
+        pl = json.loads(row[0])
+        channel = str(pl.get("channel") or "")
+        reasons = pl.get("reasons") or {}
+        if not isinstance(reasons, dict):
+            return ("", "")
+        body = ";".join(f"{k}={reasons[k]}" for k in sorted(reasons))
+        if not channel and not body:
+            return ("", "")
+        return (f"{event_type}|{channel}|{body}", channel)
+    except Exception:  # noqa: BLE001 — never silence an alert because of a parse error
+        return ("", "")
+
+
+def _channel_delivered_since(conn, channel: str, ts: float) -> bool:
+    """Did this channel prove a delivery after `ts`? A recovery re-arms the alarm."""
+    if not channel:
+        return False
+    try:
+        r = conn.execute(
+            "SELECT 1 FROM notification WHERE channel=? AND state='sent' AND created_at > "
+            "(SELECT at FROM wake_audit WHERE ts=? ORDER BY id DESC LIMIT 1) LIMIT 1",
+            (channel, ts)).fetchone()
+        return bool(r)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def recurring_cause_already_signalled(conn, *, event_id: int, event_type: str,
+                                      signature: str, channel: str) -> Optional[dict]:
+    """The most recent wake for this same cause, or None if it is new / re-armed."""
+    if not signature:
+        return None
+    try:
+        rows = conn.execute(
+            "SELECT wa.event_id, wa.ts, wa.at FROM wake_audit wa JOIN event e ON e.id = wa.event_id "
+            "WHERE wa.decision='wake' AND e.type=? AND wa.event_id<>? "
+            "ORDER BY wa.id DESC LIMIT ?",
+            (event_type, int(event_id), RECURRENCE_LOOKBACK_ROWS)).fetchall()
+    except Exception:  # noqa: BLE001
+        return None
+    for prior_id, prior_ts, prior_at in rows:
+        sig, _ch = cause_signature(conn, int(prior_id), event_type)
+        if sig != signature:
+            continue
+        if _channel_delivered_since(conn, channel, prior_ts):
+            return None                      # broke -> healed -> broke again: that is news
+        return {"event_id": int(prior_id), "at": prior_at}
+    return None
+
+
 def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
                 owner_action_required: bool = False, event_type: str = "",
                 project_id: str = "", agent_id: str = "", conn=None,
@@ -566,6 +651,19 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
         if prior:
             return {"wake": False, "reason": "already_woke_for_this_event",
                     "acknowledged": bool(prior[1]), "actionable": actionable}
+        # Same CAUSE as one already signalled, with no recovery in between. Checked after
+        # per-event dedupe and before any cooldown, because the cooldown only delays a
+        # repeat it should never have produced.
+        _sig, _chan = cause_signature(conn, int(event_id), event_type)
+        if _sig:
+            seen = recurring_cause_already_signalled(
+                conn, event_id=int(event_id), event_type=event_type,
+                signature=_sig, channel=_chan)
+            if seen:
+                return {"wake": False, "reason": "recurring_cause_already_signalled",
+                        "actionable": actionable,
+                        "first_signalled_event_id": seen["event_id"],
+                        "first_signalled_at": seen["at"]}
         if actionable:
             # The generic floor is deliberately NOT consulted. A blocked pane waiting out a
             # cooldown earned by a two-day-old backlog entry is the exact stall this fixes.
