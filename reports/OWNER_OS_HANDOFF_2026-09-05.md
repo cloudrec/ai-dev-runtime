@@ -1317,6 +1317,46 @@ predicted. The mapping lives in `/opt/seo`, outside this repo, and was not touch
 **Trust order for anyone auditing delivery:** `/control-plane/observability` for counts,
 `notifications_status()` for posture, the MCP snapshot for neither.
 
+### Event 37150 — same gate again, now swallowing a stall-doctor alert
+
+Checked independently rather than assumed. Same terminal cause, different and more
+serious cargo:
+
+```
+notification 7263   channel telegram   attempts 5   state dead_letter   receipt NULL
+  dedup_key      doctor:payorch-ha-fresh:0.0:LOST_CONTINUATION:f4fc9a1076f7ec87
+  from event     37145  agent_waiting_input  payorch-ha-fresh:0.0
+  created 00:34:17Z -> last attempt 00:37:52Z   (5 attempts in ~3m35s)
+  reason         owner_push: "telegram send failed: Bad Request: chat not found"
+```
+
+37041 lost a routine `waiting:` alert; **this one lost a stall-doctor
+`LOST_CONTINUATION` alert** — the class that says an agent may have dropped its
+continuation. The gate is not just muting noise. (`payorch-ha-fresh` is another project's
+agent; nothing was done to it from here.)
+
+**Retry behaviour is correct.** `notifier.MAX_ATTEMPTS = 5`, and `drain` dead-letters on
+`attempts >= max_attempts`. Five attempts then terminal is the policy working, not a
+runaway.
+
+**Both surfaces represent it accurately** — verified live, no defect:
+
+```
+notifications_status()      status red · owner_push "telegram send failed: Bad Request: chat not found"
+observability_summary()     total 7283 · active 3 (3600s window) · historical 7280 · status red
+```
+
+`dead_letter_events_logged` 4025 against 7283 notifications is also correct, not a
+mismatch: the EVENT is deduped per CHANNEL (`deadletter:telegram`), deliberately — an
+earlier build minted 937 distinct critical events in 24h for one unchanging cause. The
+per-message ledger is the `notification` table; the event is the per-channel alarm. The
+dead-letter emit also sets `push=False`, so the alarm about a failed notification cannot
+itself try to notify — the zero-ping invariant holds.
+
+**Remediation unchanged, owner-only, no secret involved:** the owner sends the bot one
+message. Configuration/credential-only; no code, secret, chat id, route, or service was
+touched.
+
 **Recommended, NOT done:** `notifications_status()` could carry `active_dead_letter` so a
 consumer cannot render `0` from it. Deliberately left alone — it changes a surface external
 consumers already parse, which is a cross-boundary decision, not a local cleanup.
