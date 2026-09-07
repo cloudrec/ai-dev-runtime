@@ -245,6 +245,43 @@ AUTO_REGISTER_DENY_PROJECTS = {
 } | {SELF_PROJECT}
 AUTO_REGISTER = os.getenv("NATIVE_SUPERVISOR_AUTO_REGISTER", "1") not in ("0", "false", "no")
 
+# Per-AGENT exclusion. The project denylist above is the right tool for "this project is
+# value-bearing"; it is the wrong tool for "this one stale pane should be left alone",
+# because projects and panes do not correspond. Observed 2026-09-07: a peer session asked
+# for its agent to stop being continued, and the only project-level answer would have been
+# to denylist `seo` — which also hosts the MCP connector backend, so silencing one pane
+# would have cost supervision of an entire project. That trade is not one this mechanism
+# should force.
+#
+# Empty by default, so this changes nothing until someone names a target. It can only ever
+# REMOVE supervision: there is no syntax here that grants it, and every check below is an
+# early return to False / skip. That is what makes it safe to add without a rollout.
+_DENY_TARGETS_RAW = os.getenv("NATIVE_SUPERVISOR_DENY_TARGETS", "")
+DENY_TARGETS = {t.strip() for t in _DENY_TARGETS_RAW.split(",") if t.strip()}
+
+
+def target_denied(target: str) -> bool:
+    """Is this specific pane excluded from supervision, whatever its project says?
+
+    Fail-CLOSED in the direction that matters: anything unparseable or empty is treated as
+    denied rather than allowed, because the failure mode being guarded is typing into a
+    pane that should have been left alone.
+
+    Matches an exact target (`sess:0.0`) or the session name alone (`sess`), so an operator
+    who lists the name they see in tmux gets what they meant. The session comparison is
+    equality on the first segment, never a prefix, so `mess` does not silently capture
+    `mess-ru-54582145`.
+    """
+    if not DENY_TARGETS:
+        return False
+    try:
+        t = (target or "").strip()
+        if not t:
+            return True                      # unnamed pane: fail closed
+        return t in DENY_TARGETS or t.split(":", 1)[0] in DENY_TARGETS
+    except Exception:  # noqa: BLE001 — an unreadable target is never supervised
+        return True
+
 _REG_SCHEMA = """
 CREATE TABLE IF NOT EXISTS native_supervised_target (
     target TEXT PRIMARY KEY, project TEXT, cwd TEXT, since TEXT, since_ts REAL,
@@ -278,6 +315,9 @@ def auto_register(agents: list, *, conn=None, now: Optional[float] = None,
         for a in agents or []:
             t = a.get("target") or ""
             if not t or not a.get("is_agent") or not a.get("alive") or t in known:
+                continue
+            if target_denied(t):
+                skipped.append({"target": t, "why": "deny_listed_target"})
                 continue
             proj = _project_of(a)
             if proj in AUTO_REGISTER_DENY_PROJECTS:
@@ -322,7 +362,7 @@ def registered_targets(conn=None) -> set:
     try:
         return {r[0] for r in conn.execute(
             "SELECT target, COALESCE(project,'') FROM native_supervised_target")
-            if r[1] not in AUTO_REGISTER_DENY_PROJECTS}
+            if r[1] not in AUTO_REGISTER_DENY_PROJECTS and not target_denied(r[0])}
     finally:
         if own:
             conn.close()
@@ -335,7 +375,7 @@ def purge_denied(conn=None) -> list:
     try:
         rows = [r[0] for r in conn.execute(
             "SELECT target, COALESCE(project,'') FROM native_supervised_target")
-            if r[1] in AUTO_REGISTER_DENY_PROJECTS]
+            if r[1] in AUTO_REGISTER_DENY_PROJECTS or target_denied(r[0])]
         for t in rows:
             conn.execute("DELETE FROM native_supervised_target WHERE target=?", (t,))
         if rows:
@@ -423,6 +463,8 @@ def send_block_reason(target: str, project: str = "", *, conn=None) -> str:
         boundaries and drive the session that edits it.
       not_registered — simply never registered. Auto-registration fixes this by itself.
     """
+    if target_denied(target):
+        return "target_excluded"
     if project and project in AUTO_REGISTER_DENY_PROJECTS:
         return ("supervisor_self_reference" if project == SELF_PROJECT
                 else "value_bearing_send_blocked")
@@ -444,6 +486,11 @@ def is_supervised(target: str, *, conn=None, project: str = "") -> bool:
     registered target is still resolved through the registry, which carries its project.
     """
     if not target:
+        return False
+    # Ahead of every positive path, for the reason in the docstring above: the wildcard
+    # branch returns True before any later filter runs, so a check placed after it is not
+    # a check at all.
+    if target_denied(target):
         return False
     if project and project in AUTO_REGISTER_DENY_PROJECTS:
         return False
