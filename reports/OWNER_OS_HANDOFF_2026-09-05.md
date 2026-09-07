@@ -1357,6 +1357,35 @@ itself try to notify — the zero-ping invariant holds.
 message. Configuration/credential-only; no code, secret, chat id, route, or service was
 touched.
 
+### Events 37244 / 37256 — checked, nothing new (2026-09-07)
+
+37244 is not a dead letter at all: `agent_waiting_input`, dedup_key
+`doctor:owner-os-opus-final:0.0:LOST_CONTINUATION:…` — the stall doctor firing on THIS
+pane while it sits on the push gate.
+
+37256 is one more of the same: notification 7292, telegram, 5 attempts, terminal
+`Bad Request: chat not found`, from event 37250 `agent_waiting_input hostsecure:0.0`.
+
+The aggregate is the useful part. **Every one of the 17 dead letters since 37150 carries a
+byte-identical reason string.** There is no second failure mode hiding in the stream.
+
+**Not a CDP/browser problem** — that path is healthy and is a different channel entirely:
+
+```
+cdp_same_chat  available=True verified=True   15 deliveries proven in the last 3600s
+wake_delivery  last hour: 26 attempts, 15 delivered   (the rest are normal
+               "assistant_still_generating" backpressure, not failures)
+owner_push     available=False               "Bad Request: chat not found"
+```
+
+Wakes are landing; owner ALERTS are not. One channel, one cause, unchanged since
+2026-08-03.
+
+**Stop re-inspecting these.** Each new dead letter costs a full investigation and returns
+this same answer. The signal worth waking on is a dead letter whose reason string is NOT
+`chat not found` — that would be genuinely new. Everything else is the same gate, and the
+gate is one owner action.
+
 **Recommended, NOT done:** `notifications_status()` could carry `active_dead_letter` so a
 consumer cannot render `0` from it. Deliberately left alone — it changes a surface external
 consumers already parse, which is a cross-boundary decision, not a local cleanup.
