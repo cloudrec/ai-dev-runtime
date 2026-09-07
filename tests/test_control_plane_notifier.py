@@ -145,3 +145,60 @@ def test_reading_the_reason_never_breaks_the_alarm(monkeypatch):
         raise RuntimeError("channel table unreadable")
     monkeypatch.setattr(notifier.api, "get_channel", boom)
     assert notifier._failure_reasons() == {}
+
+
+# ── the alarm must not push through the channel it is complaining about ──────────────
+# `emit` decides to enqueue with
+#     want_push = push if push is not None else (severity in _PUSH_SEVERITIES
+#                                                or owner_action_required)
+# and the dead-letter alarm is emitted `severity="critical",
+# owner_action_required=True` — so it satisfies that condition twice over. Only the
+# explicit `push=False` at the emit site keeps it inbox-only. Drop it and the alarm
+# enqueues a notification through the very channel that just dead-lettered, which fails,
+# which dead-letters, which raises another alarm: an unbounded feedback loop on a dead
+# channel. Live, that channel has been down since 2026-08-03.
+#
+# Two tests above DO break when `push=False` is dropped — verified by reverting it, which
+# fails four tests in total. But neither of them names this invariant: they fail because
+# their own counts drift, and a reader chasing that failure learns "some count is off",
+# not "the alarm is feeding the channel it is complaining about". These two say it
+# outright, and add the bound the others do not have: draining a dead channel may retire
+# work, never create it.
+
+def test_the_dead_letter_alarm_does_not_enqueue_through_the_dead_channel():
+    delivery.refresh_channel_health()                      # RED
+    cp.enqueue_notification(channel="owner_push", dedup_key="norecurse")
+    for _ in range(6):
+        notifier.drain(max_attempts=5)
+
+    events = _dead_letter_events()
+    assert events, "no dead-letter alarm was raised — the test proves nothing"
+    alarm_ids = {e["event_id"] for e in events}
+
+    conn = cp.api._c(None)[0]
+    rows = conn.execute("SELECT id, event_id, channel FROM notification").fetchall()
+    spawned = [r for r in rows if r[1] in alarm_ids]
+    assert not spawned, (
+        f"the dead-letter alarm enqueued {len(spawned)} notification(s) of its own "
+        f"({[(r[0], r[2]) for r in spawned]}). It is critical + owner_action_required, so "
+        f"emit() will push it unless the emit site passes push=False — and pushing it "
+        f"sends it through the channel that just died, which dead-letters, which raises "
+        f"another alarm.")
+
+
+def test_a_dead_channel_does_not_grow_its_own_backlog():
+    """The loop's signature, stated as a bound: draining a dead channel must not add work."""
+    delivery.refresh_channel_health()
+    for i in range(3):
+        cp.enqueue_notification(channel="owner_push", dedup_key=f"bounded{i}")
+
+    conn = cp.api._c(None)[0]
+    before = conn.execute("SELECT COUNT(*) FROM notification").fetchone()[0]
+    for _ in range(8):
+        notifier.drain(max_attempts=5)
+    after = conn.execute("SELECT COUNT(*) FROM notification").fetchone()[0]
+
+    assert after == before == 3, (
+        f"notification count moved {before} -> {after} while draining a dead channel. "
+        f"Draining may retire work, never create it.")
+    assert cp.pending_notifications() == []
