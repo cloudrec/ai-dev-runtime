@@ -1415,6 +1415,41 @@ One note worth keeping, because it nearly produced a vacuous test: the parametri
 the restored defect. It now parses the body with `ast` and requires a real call node;
 re-run of the removal proof then failed 2 tests instead of 1.
 
+## Deploy skew — what a restart would ACTUALLY load (verified 2026-09-07)
+
+The deploy gate is bigger than this session's fixes. Verified with the repo's own
+`_module_fingerprint`, comparing each worker's stored fingerprint against disk:
+
+```
+agent_orchestrator  pid 1196430  started 2026-09-05T04:05:41Z   SKEW (running != disk)
+wake_companion      pid  499953  started 2026-09-06T13:17:17Z   SKEW (running != disk)
+```
+
+**`ai-runtime` (PID 1196430) is missing five production commits, not three.** It started
+2026-09-05T04:05:41Z; everything below landed after, and Python caches a module at first
+import, so the process still holds the Sep-5-morning versions:
+
+```
+a7a438c  MCP control path off the event loop        (this session)
+e024d0f  comment correction                          (this session)
+78c3d09  the last two worker ticks off the loop      (this session)
+e285901  the self agent has no supervisor-registry row, so resolve by agent
+83c41b2  tell the external supervisor what to DO for the self agent
+```
+
+The last two are the **self-wake fixes criterion 2 depends on**, and the API process never
+received them. It works anyway because the phrase is composed in the COMPANION, which
+restarted 2026-09-06T13:17:17Z and does have them — see criterion 2 proven live above.
+That split is worth knowing before anyone reasons about which process proves what.
+
+**The companion is also skewed now**, but only by `78c3d09`'s `wake_bridge.py` edit.
+`pipeline_watch_loop` runs in `ai-runtime`, not the companion, so for the companion that
+change is inert — `wake_bridge.py` is simply inside its watched fingerprint set. A
+companion restart is not required by anything in this session.
+
+`api.main` imports clean on the committed tree (smoke-checked, import only — importing does
+not fire the startup events, so no worker loop was started and no agent was touched).
+
 ## Gates — all owner-only
 
 0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
