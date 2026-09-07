@@ -1541,6 +1541,50 @@ Post-restart control path, from the access log: 73 `agents/read`, 4 `agents/stat
 Nothing in this deploy addresses it, and nothing here tried to. `cdp_same_chat` continues
 proving deliveries (18 in the last hour), so wakes keep landing.
 
+## Post-deploy verification, 2026-09-07 ~07:49Z (read-only)
+
+Taken ~13 minutes after the restart, once the cold-start storm had passed.
+
+```
+service     PID 368613  active  NRestarts=0  up 13:08
+control path since restart:  80 read · 14 status · 4 answer · 2 send  — ALL 200
+tracebacks since restart:    0
+```
+
+**Native-supervisor continuation: PROVEN.** Canary `hostsecure:0.0`, 351 samples,
+303 verified / 9 continuation_unverified / 39 unattributable, streak 5 against a required
+3, `matched_by=agent`.
+
+A correction on how that was reached, because the first reading was wrong and would have
+looked alarming: `native_continuation_effectiveness()` first returned
+`dormant — no canary selected; owner decision outstanding`. That was **my measurement
+error, not a regression** — it ran in a plain shell that had not sourced `configs/.env`, so
+`NATIVE_CANARY_TARGET` was unset in MY process. The service process has it
+(`/proc/368613/environ` confirms `NATIVE_CANARY_TARGET=hostsecure:0.0`). Anyone checking
+this must load the env or ask the service; a bare `python -c` will report a false dormant.
+The streak reading 5 rather than the pre-restart 216 is expected — it is runtime-scoped and
+resets with the process.
+
+**cdp_same_chat: delivering.** 16 proven in the last hour; 92 of 138 attempts over 6h.
+Non-delivery is mostly benign backpressure, but not entirely:
+
+```
+ 21x assistant_still_generating          (backpressure, not failure)
+ 15x cdp_error:WebSocketTimeoutException  <- watch item
+  6x assistant_generating_wedged
+  3x user_turn_not_observed_after_send
+  1x could_not_open_bound_conversation
+```
+
+The ~60-67% delivered ratio matches what was observed before the restart (26/15, 32/19), so
+it is steady state rather than a deploy effect. The 15 WebSocket timeouts are worth a watch,
+not a task — no evidence yet that the count is growing.
+
+**Dead-letter accounting: accurate and unchanged in cause.** 7407 total / 31 active / red,
+single reason, Telegram.
+
+Nothing here needed a fix. No code was changed by this verification.
+
 ## Gates — all owner-only
 
 0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
