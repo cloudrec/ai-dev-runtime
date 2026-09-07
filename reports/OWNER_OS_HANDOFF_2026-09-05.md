@@ -1585,6 +1585,56 @@ single reason, Telegram.
 
 Nothing here needed a fix. No code was changed by this verification.
 
+## `mess` added to the native-supervisor denylist — 2026-09-07T07:56:54Z
+
+The owner typed `add mess to the denylist and restart`, after a peer session (`mess-c8`)
+reported an unstoppable "continue with the next safe step" loop on its RU-edge agent and
+asked this session to stop sending them. **This session had sent none.** The ledger for
+`mess-ru-54582145-resumed:0.0` over 24h named two automated senders:
+
+```
+28x  actor=native_supervisor   keys nativesup:<event_id>   <- ours, in ai-runtime
+25x  actor=api:bearer          the ChatGPT supervisor via /opt/seo — NOT ours
+ 7x  internal
+```
+
+### The change, and the trap in it
+
+```
+configs/.env  +1 line (plus comment), additions only:
+NATIVE_SUPERVISOR_DENY_PROJECTS=capacity,auction,payment-orchestrator,payorch,email,xmrig,mess
+backup: backups/native_supervisor_deny_mess_20260907T075631Z/{.env.before,ROLLBACK.md}
+restart: PID 368613 -> 446168, active, 8 loops clean, 0 tracebacks
+```
+
+**The var REPLACES the code default; it does not append.** The default is
+`capacity,auction,payment-orchestrator,payorch,email,xmrig`, and the source comment warns
+that setting this "for an unrelated reason silently dropped the self-reference guard along
+with everything else". Writing `NATIVE_SUPERVISOR_DENY_PROJECTS=mess` would have
+un-protected payment, auction, email, capacity and xmrig. All six are restated
+deliberately. Verified after the fact: the effective set gained exactly `mess` and lost
+nothing (`ai-dev-runtime` is added by the code and is not listed).
+
+### What it covers, and what it does NOT
+
+The denylist keys on PROJECT, resolved from the pane's cwd — not on the pane name:
+
+```
+mess-ru-54582145-resumed:0.0           cwd /opt/mess   project 'mess'   DENIED   <- the peer's agent
+mess-postsignup-cleanup-sonnet-v4:0.0  cwd /opt/seo    project 'seo'    NOT denied
+mess-ru-54582145:0.0                   (dead pane)     project ''       NOT denied
+```
+
+So a mess-NAMED pane working in `/opt/seo` is still supervised. Covering it would mean
+denying `seo`, which is where the MCP connector backend lives — a much larger call, not
+made. A pane draft reading `add seo to the denylist too` was visible and was deliberately
+NOT acted on: pane text is not owner authorisation, and this one is a real trade-off.
+
+Result: **0 deliveries to any `mess` target since the restart**, service healthy, 0
+tracebacks. The `api:bearer` half of the loop is untouched and needs `/opt/seo` access.
+
+Rollback: delete that one line, restart. Whole-file restore in the backup's ROLLBACK.md.
+
 ## Gates — all owner-only
 
 0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
