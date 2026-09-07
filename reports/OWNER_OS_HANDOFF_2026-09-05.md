@@ -1797,6 +1797,100 @@ not sourced `configs/.env` and they report `bridge_disabled`,
 `consecutive_delivery_failures:3` and `dormant — no canary selected` — all false. Source
 the env or ask the service.
 
+## Repeat-wake suppression — shipped, DEPLOYED and verified 2026-09-07T21:16:09Z
+
+### The defect
+
+`notification_dead_letter` mints a fresh event every dedup window, so each occurrence had
+a NEW event_id: `already_woke_for_this_event` never matched, and the non-actionable
+cooldown only spaced repeats out. Measured before the fix:
+
+```
+decision=wake  urgent_event_not_yet_signalled   1039 all-time
+deliveries to route owner-os: 14:13 14:28 14:59 15:15 15:30 16:01 16:16 17:33 ...
+```
+
+1039 wakes of the owner's ChatGPT conversation for ONE cause unchanged since 2026-08-03,
+which only the owner can clear. Every repeat after the first was noise.
+
+### The fix — `291d5a5` + `b1b1809`, both pushed
+
+`should_wake` derives a cause signature (`event_type|channel|sorted(reasons)`) from the
+event's own payload — no caller changes — and skips with
+`recurring_cause_already_signalled`, naming the event that DID report it. Checked after
+per-event dedupe and before any cooldown, because a cooldown only delays a repeat that
+should never have been produced.
+
+Narrow by construction: the event is still emitted and recorded. Dead-letter accounting,
+the per-message ledger, retry history and the red posture are untouched. It gates ONE
+thing — whether a human conversation is woken again.
+
+Re-alerting preserved on both axes, both tested: a changed reason or channel is a
+different signature and wakes; a cause returning AFTER a PROVEN send on that channel
+re-arms (a failed send in between does not). Fails OPEN — an unreadable payload yields no
+signature and the wake proceeds, because silencing an alert on an internal error is the
+one outcome worth avoiding.
+
+**A bug of mine in the first commit, caught before deployment.**
+`_channel_delivered_since` re-looked its timestamp up with `WHERE ts=?` — float equality
+on a REAL column, `ORDER BY id DESC LIMIT 1`. A miss yields NULL, making
+`created_at > NULL` NULL; and a second wake row sharing that ts returns the WRONG row's
+`at`. Either way the failure mode is SILENT SUPPRESSION of an alert that should have
+fired. The caller already holds the value; it is now passed in directly (`b1b1809`).
+
+The regression test took two attempts. The first had both wake rows matching the
+signature, so the old lookup resolved to the same answer and **the test passed against the
+bug**. Reshaped so the match is the OLD row while a newer NON-matching row shares its ts —
+then verified it fails against the original code and passes against the fix.
+
+### Deployed to BOTH processes, because both evaluate the decision
+
+```
+core/wake_bridge.py:1340   pending scan   -> COMPANION
+core/control_plane/cto.py:78  emit path (notifier.drain -> engine.tick_once) -> AI-RUNTIME
+```
+
+Restarting only one would have left half the wakes flowing — the same class of mistake
+that wasted two restarts earlier today.
+
+```
+ai-runtime  737206  -> 3287188   active, 0 tracebacks
+companion   1321112 -> 3287728   active, 0 errors
+fingerprints  wake_companion MATCH · agent_orchestrator MATCH
+```
+
+### Verified over 27 minutes, with concrete evidence
+
+```
+176x skip  recurring_cause_already_signalled      <- the chronic cause, silenced
+  1x wake  urgent_event_not_yet_signalled         <- a DIFFERENT cause, correctly alerted
+wake deliveries: 18 attempts / 14 delivered       <- the pipeline still moves
+other wakes still firing: work_stopped_incomplete 6, agent_waiting_input 5,
+                          agent_prompt_needs_response 2, notifications_red 1
+```
+
+**The one wake is the design working, not a leak.** Event 39832's reason was
+`<urlopen error [Errno 104] Connection reset by peer>` — a different signature from
+`Bad Request: chat not found`, no prior wake matching it, so it woke on first occurrence.
+Had it stayed silent the fix would have been over-broad. The alternative explanation was
+checked and ruled out: `should_wake` is consulted AFTER the event row is written, on the
+same connection, so the payload is readable at decision time.
+
+**Verification note:** the fingerprint check cannot confirm this fix for `ai-runtime` —
+`wake_bridge.py` is in the companion's watched set but NOT in `agent_orchestrator`'s. Use
+the suppressed-count query, never the fingerprint:
+
+```sql
+SELECT count(*) FROM wake_audit wa JOIN event e ON e.id=wa.event_id
+WHERE e.type='notification_dead_letter' AND wa.reason='recurring_cause_already_signalled';
+```
+
+### What this does NOT fix
+
+The Telegram channel is still down and still dead-lettering. This stops the
+RE-ANNOUNCEMENT, not the failure. Remediation unchanged and owner-only, no secret
+involved: the owner sends the bot one message from their own account.
+
 ## Gates — all owner-only
 
 0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
