@@ -1708,6 +1708,95 @@ Only the `native_supervisor` half of the loop. 25 of the peer's 53 pokes came fr
 `api:bearer` — the ChatGPT supervisor path in `/opt/seo` — which no setting in this
 repository governs.
 
+## CORRECTION — both denylists were deployed to the WRONG PROCESS (2026-09-07)
+
+Recorded prominently because two earlier claims in this handoff were wrong, and because
+the system had already said so in a signal that was explained away.
+
+**`native_supervisor.scan` runs ONLY in `tools/wake_companion.py`.** `ai-runtime` never
+calls it — `grep -rln "ns.scan("` matches the companion and `tools/native_supervise_once.py`,
+nothing else. So restarting `ai-runtime` could not apply either denylist, and both deploys
+were inert:
+
+```
+07:56Z  mess added to NATIVE_SUPERVISOR_DENY_PROJECTS + ai-runtime restart   -> no effect
+09:16Z  NATIVE_SUPERVISOR_DENY_TARGETS + ai-runtime restart                  -> no effect
+```
+
+Proof the loop never stopped — `native_supervisor` deliveries AFTER the 09:16 restart:
+
+```
+09:31:21  mess-ru-54582145-resumed:0.0            nativesup:37955
+09:53:13  mess-ru-54582145-resumed:0.0            nativesup:38030
+10:47:35 .. 11:10:30  mess-postsignup-cleanup-sonnet-v4:0.0   5 deliveries
+```
+
+The companion (PID 499953, started 2026-09-06 15:17 local) had read `configs/.env` at ITS
+start, before either line existed, and had imported `core/native_supervisor.py` from disk
+before `a0c09ac` — so it held neither the config nor the code.
+
+### Two process errors of mine, worth more than the fix
+
+1. **I verified inside the cycle.** Both times I checked "0 deliveries since restart" about
+   a minute after restarting, while the supervision cadence for that pane was ~6 minutes,
+   and called it proven. This handoff already says a single sample is not evidence — about
+   tab regrowth — and I did not apply it to my own claim.
+2. **The health check told me and I explained it away.** `pipeline_health` reported
+   `worker_running_stale_code:wake_companion`. I recorded it as "inert for the companion,
+   no companion restart required by anything in this session". It was not inert: it was the
+   system correctly reporting that the process which ACTUALLY supervises agents was running
+   stale code and stale config. That flag was the whole answer.
+
+### Fixed and verified properly — companion restarted 2026-09-07T11:43:33Z
+
+```
+companion   PID 499953 -> 1321112, active, NRestarts=0, browser 5 pages healthy
+env now     NATIVE_SUPERVISOR_DENY_PROJECTS=...,mess
+            NATIVE_SUPERVISOR_DENY_TARGETS=mess-postsignup-cleanup-sonnet-v4:0.0
+fingerprint wake_companion MATCH · agent_orchestrator MATCH   <- skew fully cleared
+```
+
+Verified over **17 minutes across multiple cycles**, with POSITIVE evidence rather than
+absence — the journal names which exclusion fired:
+
+```
+mess-postsignup-cleanup-sonnet-v4:0.0   skip  target_excluded                (per-agent)
+mess-ru-54582145-resumed:0.0            skip  value_bearing_send_blocked x3  (project)
+deliveries to all three gated panes: 0
+non-gated meanwhile: gaika-sonnet-v11 2x, security-demo-fresh 1x  <- autonomy intact
+```
+
+**Rule for anyone deploying a supervision setting:** `native_supervisor` lives in the
+COMPANION. `ai-runtime` hosts the API and the eight worker loops. Changing a
+`NATIVE_SUPERVISOR_*` value means restarting `owner-os-wake-companion`, not `ai-runtime`.
+
+## Wake-delivery degradation — investigated, environmental, no in-repo defect
+
+Prompted by rising `cdp_error:WebSocketTimeoutException` (1,3,4,8,9,13,12 per hour across
+02:00-10:00Z) and a last-hour delivery rate of 30% against 70% over 24h.
+
+**No reproducible in-repo defect found; nothing was changed.**
+
+* **Accounting is sound.** Per-EVENT eventual delivery is 80% over 24h and 66% over 6h —
+  the raw attempt rate understates success because retries are counted as attempts.
+  Retry, expiry (`event_older_than_max_age` at ~10800s) and abandonment
+  (`wake_abandoned`, 136 rows) all fire. `STUCK_PENDING_SECS=600` is a health WARNING
+  threshold, not an expiry, so a pending wake at 7905s is flagged long before it expires.
+* **Not the tab leak.** 5 pages, no duplicates, well inside headroom.
+* **Environmental.** Host load 25-30 across 6 cores with 11+ live agents; the
+  `browser_degraded:endpoint_slow:2.2-3.6s` readings sit just over
+  `BROWSER_SLOW_SECS=2.0` (`CDP_SLOW_SECS`), and the wedged-renderer case is already
+  guarded by `page_responsive` (the 4214 incident).
+
+Watch item, not a task: if delivery rate keeps falling while host load is normal, the
+2.0s threshold and the 15s `_Session` socket timeout are the two knobs to examine.
+
+**A trap that cost me twice today:** `pipeline_health()` and
+`native_continuation_effectiveness()` read env at call time. Run them in a shell that has
+not sourced `configs/.env` and they report `bridge_disabled`,
+`consecutive_delivery_failures:3` and `dormant — no canary selected` — all false. Source
+the env or ask the service.
+
 ## Gates — all owner-only
 
 0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
