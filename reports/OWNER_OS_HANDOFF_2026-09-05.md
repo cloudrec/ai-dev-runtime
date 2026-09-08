@@ -1997,6 +1997,88 @@ runs `5c0291c`, so reds still wake as they always did. No regression: this is a 
 not yet effective.
 
 
+## Deploy runbook for `f136e91` — PREPARED, NOT EXECUTED
+
+Both commits are pushed (`e58b20e`, local == remote). Production runs `5c0291c`, whose red
+signature never matches, so reds still wake exactly as before. No regression — a fix that
+is not yet loaded.
+
+### The two restarts
+
+```
+systemctl restart ai-runtime
+systemctl restart owner-os-wake-companion
+```
+
+BOTH are required. `should_wake` is evaluated in two places:
+
+```
+core/wake_bridge.py:1340      pending scan   -> COMPANION
+core/control_plane/cto.py:78  emit path (notifier.drain -> engine.tick_once) -> AI-RUNTIME
+```
+
+Restarting one leaves half the wakes flowing. Two restarts were already wasted this session
+by assuming `ai-runtime` alone was enough.
+
+### Proof it worked — wait ≥60 min first
+
+`notifications_red` fires hourly, so a check inside the first few minutes proves nothing.
+(Checking inside the cycle produced two false "verified" claims earlier in this session.)
+
+```sql
+SELECT count(*) FROM wake_audit wa JOIN event e ON e.id = wa.event_id
+WHERE e.type='notifications_red' AND wa.reason='recurring_cause_already_signalled';
+```
+
+0 before, NON-ZERO after = the fix is live. The query was validated 2026-09-08: the same
+query against `notification_dead_letter` returns 1275, so a 0 for reds is a real reading
+and not a typo in the reason string.
+
+Cross-checks, in order:
+
+```
+1  both services active, NRestarts=0, no traceback in the startup log
+2  no NEW notifications_red row with decision='wake' after the restart timestamp
+3  unrelated wakes still firing (agent_waiting_input, work_stopped_incomplete)
+4  wake_delivery still non-zero — suppressing everything would look identical to success
+```
+
+**Do NOT verify with the fingerprint check.** `wake_bridge.py` is in the companion's
+watched set but NOT in `agent_orchestrator`'s, so a MATCH for `agent_orchestrator` says
+nothing about whether `ai-runtime` carries this change.
+
+### Rollback
+
+```
+git revert f136e91          # or: git checkout 5c0291c -- core/wake_bridge.py
+systemctl restart ai-runtime && systemctl restart owner-os-wake-companion
+```
+
+Nothing durable is written by the change: it only adds `skip` rows to `wake_audit`, which
+are audit records, not state. Reverting restores the previous behaviour immediately —
+reds wake every hour again. No schema, no config, no data migration.
+
+### Known residual, VERIFIED, and inside the owner's chosen semantics
+
+A red -> green -> red cycle **within the same day is suppressed**: the owner is not
+re-told. Confirmed empirically 2026-09-08.
+
+Why: `notifications_red` carries no `channel`, so the recovery re-arm — which for dead
+letters keys on a proven send for that channel — cannot fire, and the capability map at the
+second red is identical to the first. Only the 24h floor re-arms it.
+
+This follows directly from the chosen rule ("re-alert once a day while red") rather than
+contradicting it, so it was NOT unilaterally changed. Closing it would need a recovery
+signal that does not exist today — a green/recovered event type, or keying the probe on
+`channel.last_ok_at` — which is a design decision for the owner.
+
+### Also unchanged by decision
+
+`coalesce_generic_backlog` still folds non-actionable wakes per route, so a new-cause dead
+letter can surface as a generic "check Owner OS events" wake rather than one naming the
+cause. Documented trade-off, not a defect; left exactly as it is.
+
+
 ## Gates — all owner-only
 
 0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
