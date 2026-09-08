@@ -599,14 +599,32 @@ def test_normal_success_still_returns_zero_and_records_accepted(tmp_path, monkey
 def test_the_suite_never_writes_to_the_live_diagnostic_file(tmp_path):
     """The pollution this fixes. `logs/owneros_hook_diag.jsonl` is evidence; a test run
     must not appear in it. Pins the guarantee at the point the runtime uses — a real
-    subprocess invocation, not an in-process call."""
+    subprocess invocation, not an in-process call.
+
+    Asserts on THIS invocation's marker, not on the file's size. The size comparison it
+    used to make was racy by construction: the live diagnostic is shared by every agent
+    session on the host, and any of them writing a hook record inside the window failed
+    the run. Observed 2026-09-08 — the suite wrote nothing (marker count 0) while SEVEN
+    live sessions appended 96 records between them, one of which was the session running
+    the suite. A guard that fails on other people's correct behaviour trains everyone to
+    ignore it.
+    """
     live = "/root/ai-dev-runtime/logs/owneros_hook_diag.jsonl"
-    before = os.path.getsize(live) if os.path.exists(live) else -1
+    marker = "polltest0001"
+
+    def _live_has_marker():
+        if not os.path.exists(live):
+            return False
+        with open(live, encoding="utf-8", errors="replace") as fh:
+            return marker in fh.read()
+
+    assert not _live_has_marker(), \
+        f"{marker} was already in the live diagnostic before this test ran"
     mine = str(tmp_path / "diag.jsonl")
-    _run({"hook_event_name": "Stop", "session_id": "polltest0001",
+    _run({"hook_event_name": "Stop", "session_id": marker,
           "last_assistant_message": "x"}, diag_path=mine)
-    after = os.path.getsize(live) if os.path.exists(live) else -1
-    assert after == before, "the suite must not append to the live diagnostic file"
+    assert not _live_has_marker(), \
+        "the suite must not append to the live diagnostic file"
     if os.path.exists(mine):
-        assert "polltest0001" in open(mine, encoding="utf-8").read(), \
+        assert marker in open(mine, encoding="utf-8").read(), \
             "the redirected file is where the record actually went"
