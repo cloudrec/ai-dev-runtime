@@ -2226,3 +2226,106 @@ re-run in 12-file batches instead.
   `asyncio.to_thread`; no worker runs blocking tmux work on the loop. Two call sites had
   skipped it (`register_worker`, `pipeline_health` — sqlite, and file hashing in the first)
   and are fixed one line each. See the Worker loops section below.
+
+---
+
+# FINAL SESSION REPORT — 2026-09-06 .. 2026-09-08
+
+32 commits, `b615fbc` -> `f41ec17`, 7 of them code. All pushed, tracked tree clean, both
+services running the new code. Automated Owner OS API instructions drove most of this
+session; those are NOT owner sign-off. Owner-typed instructions in the Claude Code session
+are marked as such where they occurred (`push it`, `restart both`, `перезапусти оба`,
+`add mess to the denylist and restart`, `deploy the exclusion…`, `commit it once the suite
+is green`).
+
+## Both acceptance criteria: MET and live
+
+**1. MCP control path reliability.** Root cause: `agent_status`/`read`/`send`/`answer` were
+`async def` while calling blocking tmux (`subprocess.run`, `_TMUX_TIMEOUT=15`, plus
+`time.sleep(0.4)`). On single-worker uvicorn that ran ON the event loop and froze every
+other request — the client timed out while the server answered `200`. That is why the
+failures looked intermittent and the logs looked clean.
+
+```
+live measure   /health p50 7.8ms -> 213ms under 6x agent_read; 4.0s stall on ambient load
+matched A/B    probe p99 under load 2653.7ms -> 220.4ms
+               agent_read p99 2740.4ms -> 397.5ms · throughput 18.1/s -> 28.1/s
+```
+
+Fix: five handlers `def` (Starlette threadpool) + reentrant `_DELIVER_LOCK` preserving the
+serialisation the event loop had been providing by accident. Without the lock, concurrent
+callers could double-paste one idempotency key and bypass the anti-queue guard.
+
+**2. Self-project resume with no manual `стоит агент`.** Proven live on the current pane —
+events 35869 (+2m02s) and 35897 (+25s), continuations from `api:bearer` keyed to their own
+wake events, no owner message. Plus the historical 33823 chain.
+
+## Also found and fixed
+
+* **Two worker ticks on the event loop** — `register_worker` (sqlite write + SHA-256 of
+  source files, every 45s) and `pipeline_health` (sqlite reads, p50 190ms, max 2.4s).
+  Seven of the eight loops were already correct.
+* **Repeat wakes.** `notification_dead_letter` woke the chat 1029 times and
+  `notifications_red` 684 times, all for unchanged causes. Cause-signature suppression with
+  a daily re-alert (owner's chosen semantics). Verified after deploy: **0 wakes across 2
+  red events**, 100 suppression rows, pipeline still delivering.
+* **Notifier no-recursion guard** — the dead-letter alarm is `critical` +
+  `owner_action_required`, so without its explicit `push=False` it would enqueue through
+  the very channel that just died. Now pinned by tests.
+* **`mess` denylist + per-agent exclusion** — one stale pane silenced without giving up
+  supervision of the whole `seo` project.
+
+## Where I was wrong — six times
+
+Recorded because every one passed a green suite.
+
+1. **Two deploys hit the wrong process.** `native_supervisor.scan` runs only in the
+   COMPANION; I restarted `ai-runtime` twice and checked the result a minute later against
+   a ~6-minute cycle, declaring success both times. `pipeline_health` was reporting
+   `worker_running_stale_code:wake_companion` throughout and I dismissed it as "inert".
+2. **Claimed the worker loops ran blocking tmux on the loop.** Seven of eight were already
+   correct; I wrote it from the `create_task` call sites without opening a body.
+3. **`f136e91` shipped broken.** The signature was built from reason prose containing an
+   hourly delivery counter, so it almost never matched. The tests could not catch it: one
+   fixed reasons list meant every fixture matched by construction.
+4. **A test certified the bug it existed to catch.** The first removal proof passed on the
+   reverted code because my own comment contained the word `to_thread`.
+5. **Overstated a defect.** Said the red suppression "never fired once" from an 8-minute
+   window holding ONE event. It fired coincidentally, ~1 wake per 3 events.
+6. **Nearly reported a push that failed.** `| tail` swallowed git's non-zero exit.
+
+All six are fixed in code and recorded here rather than quietly rewritten.
+
+## Method that actually caught things
+
+Green tests did not distinguish working from inert — twice. What did: stating the expected
+live outcome BEFORE looking, then waiting a full cycle. Two red events (~90 min) rather
+than one, because the previous build suppressed by luck often enough to fool a single
+sample. And always checking a control — unrelated wakes still firing — because silencing
+everything looks identical to success from one counter.
+
+## Final state
+
+```
+HEAD        f41ec17 · local == remote · tracked tree clean · 34 untracked reports preserved
+ai-runtime  pid 4063733 active     companion pid 4064329 active
+fingerprints  both MATCH
+tests       3209 passed, 1 pre-existing tarfile warning
+red wakes   0 across 2 events (was ~1 per event), 100 suppressions, 0 delivered to chat
+```
+
+## Open — owner only
+
+1. **Telegram.** Send the Owner OS bot one message from the owner's own account. The only
+   action that clears the cause: `owner_push` unhealthy, `last_ok_at` NULL, ~7900 dead
+   letters since 2026-08-03. Token is valid and authenticating; `chat not found` is a
+   chat-level refusal because a bot cannot message a user who never started it.
+2. **Two design decisions.** Whether a specific cause may appear in the wake phrase
+   (`coalesce_generic_backlog`), and whether a red -> green -> red cycle inside one day
+   should re-alert. Both are documented trade-offs, not defects, and were deliberately not
+   decided here.
+3. **Cloudflare/DNS** — the peer session's five items plus the deferred
+   `MESS_DOWNLOAD_ORIGIN`.
+
+**The system is still RED and that is correct.** Everything built here changed how often
+the owner is woken, never the underlying failure.
