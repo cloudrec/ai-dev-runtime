@@ -1937,7 +1937,12 @@ by watching live behaviour.
 
 `5c0291c` extended the recurring-cause suppression to `notifications_red` with a daily
 re-alert (owner decision: "re-alert once a day while red"). Deployed to both processes at
-12:43:49Z. It suppressed **nothing**. First red after the restart woke exactly as before:
+12:43:49Z. The first red after the restart woke exactly as before:
+
+**(Superseded — see the correction further down. This section originally concluded it
+suppressed NOTHING. That was wrong: over hours it suppresses whenever the hourly counter in
+the reason prose happens to repeat, giving 1 wake against 3 red events. The defect is that
+it is COINCIDENTAL, not that it never fires.)**
 
 ```
 notifications_red        26x skip already_woke_for_this_event · 1x WAKE   <- not suppressed
@@ -2030,9 +2035,36 @@ SELECT count(*) FROM wake_audit wa JOIN event e ON e.id = wa.event_id
 WHERE e.type='notifications_red' AND wa.reason='recurring_cause_already_signalled';
 ```
 
-0 before, NON-ZERO after = the fix is live. The query was validated 2026-09-08: the same
-query against `notification_dead_letter` returns 1275, so a 0 for reds is a real reading
-and not a typo in the reason string.
+**CORRECTED 2026-09-08 ~15:30Z — the "0 before" baseline was wrong, and so was the claim
+above that the shipped version suppressed nothing.**
+
+`5c0291c` DOES suppress reds, just unreliably. It signs the reason prose, which embeds an
+hourly delivery counter, so two consecutive reds match only when that counter happens to
+repeat — 10 distinct prose signatures across the last 12 reds, with two pairs coinciding.
+Measured since the 12:43:49Z deploy: **3 red events, 1 wake, 131 suppression rows**,
+against 684 wakes all-time before it. The earlier "never fired ONCE" was drawn from an
+8-minute window holding a single event; that was too small a sample and stated far too
+strongly.
+
+So a raw count is NOT a valid before/after, and "suppressed > 0" no longer distinguishes
+the two builds. Capture the baseline immediately before restarting, and judge on the RATE:
+
+```sql
+-- baseline, run JUST BEFORE the restart
+SELECT count(*) FROM wake_audit wa JOIN event e ON e.id = wa.event_id
+WHERE e.type='notifications_red' AND wa.decision='wake';
+
+-- after >=2 red events (>=2h), the discriminating test: this must stay at the baseline
+```
+
+Under `f136e91` every red shares ONE signature, so after the first, every subsequent red is
+suppressed and NEW red wakes should be **zero** across two or more events. Under `5c0291c`
+roughly one red in three still wakes. That difference is the proof, not the suppression
+count.
+
+The query shape itself is still validated: the same query against
+`notification_dead_letter` returns a large non-zero (1355 at the time of writing), so a
+reading of 0 would be a real reading and not a typo in the reason string.
 
 Cross-checks, in order:
 
