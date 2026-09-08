@@ -578,15 +578,23 @@ def cause_signature(conn, event_id: int, event_type: str) -> tuple:
             return ("", "")
         pl = json.loads(row[0])
         channel = str(pl.get("channel") or "")
+        # WHAT IS BROKEN, never prose that happens to describe it. `notifications_red`'s
+        # reasons list embeds a LIVE COUNTER — "cdp_same_chat …: 24 delivery(s) proven in
+        # the last 3600s" — which changes every hour. Signing the reason strings therefore
+        # produced a unique signature every time, nothing ever matched, and the
+        # suppression never fired once in production (observed 2026-09-08: counts of
+        # 24, 25, 10, 21, 20, 12, 17, 22, 15 across consecutive reds). The capability map
+        # underneath was byte-identical across every one of them.
+        caps = pl.get("capabilities")
+        if isinstance(caps, dict) and caps:
+            body = ";".join(f"{k}={bool((caps.get(k) or {}).get('available'))}"
+                            for k in sorted(caps))
+            return (f"{event_type}|{channel}|{body}", channel)
+        # `notification_dead_letter` has no capability map: its reasons dict is keyed by
+        # tier and holds the raw rejection, which is the condition itself and is stable.
         reasons = pl.get("reasons")
-        # Two shapes in the wild: `notification_dead_letter` carries a dict keyed by tier,
-        # `notifications_red` carries a flat list of reason strings. Both are stable
-        # descriptions of the same condition, so both make a signature; anything else does
-        # not, and no signature means no suppression.
         if isinstance(reasons, dict):
             body = ";".join(f"{k}={reasons[k]}" for k in sorted(reasons))
-        elif isinstance(reasons, list):
-            body = ";".join(sorted(str(x) for x in reasons))
         else:
             return ("", "")
         if not channel and not body:

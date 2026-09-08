@@ -260,11 +260,16 @@ RED_REASONS = ["owner_push disabled/unhealthy",
                "same_chat_wake unavailable — no server->ChatGPT inbound trigger exists"]
 
 
-def _red_event(conn, event_id, *, reasons=None):
-    """notifications_red carries a flat LIST of reasons and no channel at all."""
+RED_CAPS = {"same_chat_wake": {"available": False}, "owner_push": {"available": False},
+            "cdp_same_chat": {"available": True}, "scheduled_chatgpt": {"available": False},
+            "cto_inbox": {"available": True}}
+
+
+def _red_event(conn, event_id, *, reasons=None, caps=None):
+    """notifications_red carries a capability map, a reasons LIST, and no channel."""
     payload = json.dumps({"status": "red", "notifications_enabled": False,
                           "reasons": reasons if reasons is not None else RED_REASONS,
-                          "capabilities": {}})
+                          "capabilities": RED_CAPS if caps is None else caps})
     conn.execute("INSERT OR REPLACE INTO event (id,ts,type,severity,payload) VALUES (?,?,?,?,?)",
                  (event_id, "2026-09-08T00:00:00+00:00", RED, "critical", payload))
     conn.commit()
@@ -287,11 +292,36 @@ def test_a_list_of_reasons_makes_a_signature():
     assert wb.cause_signature(conn, 2, RED)[0] == sig
 
 
-def test_a_changed_red_reason_is_a_different_signature():
+def test_a_changed_CAPABILITY_is_a_different_signature():
+    """A tier flipping is a real state change and must re-alert."""
     conn = _conn()
     _red_event(conn, 1)
-    _red_event(conn, 2, reasons=RED_REASONS + ["cto_inbox unavailable"])
+    worse = {**RED_CAPS, "cto_inbox": {"available": False}}
+    _red_event(conn, 2, caps=worse)
     assert wb.cause_signature(conn, 1, RED) != wb.cause_signature(conn, 2, RED)
+
+
+def test_a_live_counter_in_the_reason_prose_does_NOT_change_the_signature():
+    """The production defect, pinned.
+
+    `notifications_red` reasons embed "cdp_same_chat …: N delivery(s) proven in the last
+    3600s", and N changes every hour. Signing the prose gave every red a unique signature,
+    so nothing ever matched and the suppression never fired once in production — observed
+    2026-09-08 with counts 24, 25, 10, 21, 20, 12, 17, 22, 15 across consecutive reds,
+    while the capability map underneath was byte-identical every time.
+
+    The original tests could not catch this: they used one fixed reasons list, so every
+    fixture signature matched by construction.
+    """
+    conn = _conn()
+    _red_event(conn, 1, reasons=["owner_push disabled/unhealthy",
+                                 "cdp_same_chat (wake path, NOT a notifier tier): "
+                                 "24 delivery(s) proven in the last 3600s"])
+    _red_event(conn, 2, reasons=["owner_push disabled/unhealthy",
+                                 "cdp_same_chat (wake path, NOT a notifier tier): "
+                                 "9 delivery(s) proven in the last 3600s"])
+    assert wb.cause_signature(conn, 1, RED) == wb.cause_signature(conn, 2, RED), \
+        "a live counter in the reason prose is churning the signature"
 
 
 def test_an_unchanged_red_is_suppressed_within_the_day():
