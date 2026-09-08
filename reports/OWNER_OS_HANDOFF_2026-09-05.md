@@ -2111,6 +2111,72 @@ letter can surface as a generic "check Owner OS events" wake rather than one nam
 cause. Documented trade-off, not a defect; left exactly as it is.
 
 
+## `f136e91` DEPLOYED and VERIFIED — 2026-09-08T16:13:42Z
+
+Owner typed `перезапусти оба`. Both services restarted; the red-wake suppression is live
+and proven.
+
+```
+ai-runtime  2973088 -> 4063733   active, NRestarts=0, 0 tracebacks
+companion   2973885 -> 4064329   active, NRestarts=0, 0 errors
+fingerprints  wake_companion MATCH · agent_orchestrator MATCH   (skew cleared)
+pipeline      waiting (ordinary cooldown), not stuck
+on disk       last 6 reds -> 1 signature (was 6) = f136e91 loaded
+```
+
+Both restarts were required: `should_wake` runs in the companion's pending scan
+(`wake_bridge.py:1340`) AND in the emit path inside `ai-runtime`
+(`cto.py:78` via `notifier.drain` -> `engine.tick_once`).
+
+### The result, against a criterion fixed BEFORE the outcome was known
+
+Baseline captured immediately before the restart: **686 red wakes, 862 red events**.
+
+```
+red events after restart : 2     ev 42520 16:44:55Z · ev 42728 17:45:08Z
+NEW red WAKES            : 0     <- the proof
+suppressed by the rule   : 100
+red DELIVERED to a chat  : 0
+total red wakes          : 686 = baseline, zero growth
+```
+
+Two events were required deliberately. The previous build (`5c0291c`) suppressed
+COINCIDENTALLY — roughly 1 wake per 3 events, whenever the hourly delivery counter in the
+reason prose happened to repeat — so a single quiet red cannot distinguish a working fix
+from luck. Waiting ~90 minutes for the second event was the whole point; two earlier
+claims this session were wrong precisely because they were made inside the cycle.
+
+### The control half, which matters as much
+
+```
+36x agent_waiting_input · 11x agent_prompt_needs_response
+ 6x work_stopped_incomplete · 1x agent_process_failed
+wake deliveries: 52/58
+```
+
+Everything else still wakes and still delivers. Suppressing the whole pipeline would have
+produced an identical-looking "0 red wakes", so the control is what makes the result mean
+anything.
+
+### Progression, for the record
+
+```
+before any fix   684 wakes, ~1 per red event
+5c0291c live       1 wake per 3 events   (coincidental counter match)
+f136e91 live       0 wakes per 2 events, 100 suppression rows
+```
+
+### What this does NOT fix
+
+The system is still RED. `f136e91` removes the repeated waking, not the cause.
+`owner_push` remains unhealthy (`Bad Request: chat not found`, `last_ok_at` NULL), dead
+letters keep accruing, and `notifications_red` keeps being emitted — correctly.
+
+Remediation is unchanged, owner-only, no secret involved: **the owner sends the Owner OS
+bot one message from their own Telegram account.** A bot cannot message a user who has
+never started it.
+
+
 ## Gates — all owner-only
 
 0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
