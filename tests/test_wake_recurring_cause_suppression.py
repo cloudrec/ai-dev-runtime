@@ -18,6 +18,7 @@ What must survive the suppression, and is asserted here:
 from __future__ import annotations
 
 import json
+import time
 
 import pytest
 
@@ -62,7 +63,10 @@ def _dead_letter_event(conn, event_id, *, reason=CHAT_NOT_FOUND, channel="telegr
     conn.commit()
 
 
-def _record_wake(conn, event_id, *, ts=1000.0, at="2026-09-07T00:00:00+00:00"):
+def _record_wake(conn, event_id, *, ts=None, at="2026-09-07T00:00:00+00:00"):
+    """ts defaults to NOW: the daily re-alert measures age, so a 1970 fixture timestamp
+    would look like a year-old alert and correctly re-fire, masking what these assert."""
+    ts = time.time() if ts is None else ts
     conn.execute("INSERT INTO wake_audit (ts,at,event_id,decision,reason,event_type,actionable) "
                  "VALUES (?,?,?,'wake','urgent_event_not_yet_signalled',?,0)",
                  (ts, at, event_id, DEAD_LETTER))
@@ -182,7 +186,9 @@ def test_should_wake_still_wakes_for_a_new_reason(monkeypatch):
     conn = _conn()
     _bind_route(conn)
     _dead_letter_event(conn, 1)
-    _record_wake(conn, 1)
+    # An hour back: clear of the route cooldown, well inside the daily re-alert window,
+    # so what this asserts is the SIGNATURE difference and nothing else.
+    _record_wake(conn, 1, ts=time.time() - 3600)
     _dead_letter_event(conn, 2, reason="telegram send failed: Unauthorized")
     d = wb.should_wake(event_id=2, severity="critical", owner_action_required=True,
                        event_type=DEAD_LETTER, project_id="owner-os", conn=conn)
@@ -246,3 +252,103 @@ def test_a_missing_timestamp_never_silently_suppresses():
     conn = _conn()
     assert wb._channel_delivered_since(conn, "telegram", "") is False
     assert wb._channel_delivered_since(conn, "", "2026-09-07T00:00:00+00:00") is False
+
+
+# ── notifications_red: a posture alarm with no channel and no green event ────
+RED = "notifications_red"
+RED_REASONS = ["owner_push disabled/unhealthy",
+               "same_chat_wake unavailable — no server->ChatGPT inbound trigger exists"]
+
+
+def _red_event(conn, event_id, *, reasons=None):
+    """notifications_red carries a flat LIST of reasons and no channel at all."""
+    payload = json.dumps({"status": "red", "notifications_enabled": False,
+                          "reasons": reasons if reasons is not None else RED_REASONS,
+                          "capabilities": {}})
+    conn.execute("INSERT OR REPLACE INTO event (id,ts,type,severity,payload) VALUES (?,?,?,?,?)",
+                 (event_id, "2026-09-08T00:00:00+00:00", RED, "critical", payload))
+    conn.commit()
+
+
+def _record_red_wake(conn, event_id, *, ts, at):
+    conn.execute("INSERT INTO wake_audit (ts,at,event_id,decision,reason,event_type,actionable) "
+                 "VALUES (?,?,?,'wake','urgent_event_not_yet_signalled',?,0)",
+                 (ts, at, event_id, RED))
+    conn.commit()
+
+
+def test_a_list_of_reasons_makes_a_signature():
+    """The dead-letter shape is a dict; this one is a list. Both must work."""
+    conn = _conn()
+    _red_event(conn, 1)
+    sig, chan = wb.cause_signature(conn, 1, RED)
+    assert sig and chan == ""              # no channel in this payload, and that is fine
+    _red_event(conn, 2)
+    assert wb.cause_signature(conn, 2, RED)[0] == sig
+
+
+def test_a_changed_red_reason_is_a_different_signature():
+    conn = _conn()
+    _red_event(conn, 1)
+    _red_event(conn, 2, reasons=RED_REASONS + ["cto_inbox unavailable"])
+    assert wb.cause_signature(conn, 1, RED) != wb.cause_signature(conn, 2, RED)
+
+
+def test_an_unchanged_red_is_suppressed_within_the_day():
+    conn = _conn()
+    _red_event(conn, 1)
+    _record_red_wake(conn, 1, ts=1_000_000.0, at="2026-09-08T00:00:00+00:00")
+    _red_event(conn, 2)
+    sig, chan = wb.cause_signature(conn, 2, RED)
+    seen = wb.recurring_cause_already_signalled(
+        conn, event_id=2, event_type=RED, signature=sig, channel=chan,
+        now=1_000_000.0 + 3600)            # an hour later
+    assert seen and seen["event_id"] == 1
+
+
+def test_a_still_red_condition_re_alerts_after_a_day():
+    """Owner decision: still broken says so once a day. Silence must not become the norm."""
+    conn = _conn()
+    _red_event(conn, 1)
+    _record_red_wake(conn, 1, ts=1_000_000.0, at="2026-09-08T00:00:00+00:00")
+    _red_event(conn, 2)
+    sig, chan = wb.cause_signature(conn, 2, RED)
+    assert wb.recurring_cause_already_signalled(
+        conn, event_id=2, event_type=RED, signature=sig, channel=chan,
+        now=1_000_000.0 + wb.RE_ALERT_SECS + 1) is None
+
+
+def test_the_day_boundary_is_not_crossed_early():
+    conn = _conn()
+    _red_event(conn, 1)
+    _record_red_wake(conn, 1, ts=1_000_000.0, at="2026-09-08T00:00:00+00:00")
+    _red_event(conn, 2)
+    sig, chan = wb.cause_signature(conn, 2, RED)
+    seen = wb.recurring_cause_already_signalled(
+        conn, event_id=2, event_type=RED, signature=sig, channel=chan,
+        now=1_000_000.0 + wb.RE_ALERT_SECS - 60)
+    assert seen and seen["event_id"] == 1
+
+
+def test_the_daily_re_alert_also_applies_to_dead_letters():
+    """Same rule, both recurring types: a still-dead channel speaks once a day."""
+    conn = _conn()
+    _dead_letter_event(conn, 1)
+    _record_wake(conn, 1, ts=1_000_000.0, at="2026-09-08T00:00:00+00:00")
+    _dead_letter_event(conn, 2)
+    sig, chan = wb.cause_signature(conn, 2, DEAD_LETTER)
+    assert wb.recurring_cause_already_signalled(
+        conn, event_id=2, event_type=DEAD_LETTER, signature=sig, channel=chan,
+        now=1_000_000.0 + wb.RE_ALERT_SECS + 1) is None
+
+
+def test_without_a_clock_the_re_alert_never_fires_but_nothing_breaks():
+    """`now=None` (the old call shape) must still suppress rather than raise."""
+    conn = _conn()
+    _red_event(conn, 1)
+    _record_red_wake(conn, 1, ts=1_000_000.0, at="2026-09-08T00:00:00+00:00")
+    _red_event(conn, 2)
+    sig, chan = wb.cause_signature(conn, 2, RED)
+    seen = wb.recurring_cause_already_signalled(
+        conn, event_id=2, event_type=RED, signature=sig, channel=chan, now=None)
+    assert seen and seen["event_id"] == 1

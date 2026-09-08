@@ -555,8 +555,17 @@ def _cooldown_scope(route_key: str, conversation: str) -> tuple:
 #
 # Fails OPEN: anything unreadable yields no signature and the wake proceeds as before.
 # Silencing an alert on an internal error is the one outcome worth avoiding here.
-RECURRING_CAUSE_EVENT_TYPES = frozenset({"notification_dead_letter"})
+RECURRING_CAUSE_EVENT_TYPES = frozenset({"notification_dead_letter", "notifications_red"})
 RECURRENCE_LOOKBACK_ROWS = 60
+
+# A condition that is STILL broken says so once a day. Suppressing an unchanging cause
+# forever is the opposite failure to spamming it: a channel that has been dead for weeks
+# should not go completely silent, or the absence of alerts stops meaning anything.
+# Owner decision 2026-09-08, answering what "recovery" means for a posture alarm that has
+# no green event and no channel to prove a send on: re-alert once a day while red.
+#
+# This only ever ADDS alerts. It cannot suppress anything that would otherwise have fired.
+RE_ALERT_SECS = int(os.getenv("WAKE_RE_ALERT_SECS", str(24 * 3600)))
 
 
 def cause_signature(conn, event_id: int, event_type: str) -> tuple:
@@ -569,10 +578,17 @@ def cause_signature(conn, event_id: int, event_type: str) -> tuple:
             return ("", "")
         pl = json.loads(row[0])
         channel = str(pl.get("channel") or "")
-        reasons = pl.get("reasons") or {}
-        if not isinstance(reasons, dict):
+        reasons = pl.get("reasons")
+        # Two shapes in the wild: `notification_dead_letter` carries a dict keyed by tier,
+        # `notifications_red` carries a flat list of reason strings. Both are stable
+        # descriptions of the same condition, so both make a signature; anything else does
+        # not, and no signature means no suppression.
+        if isinstance(reasons, dict):
+            body = ";".join(f"{k}={reasons[k]}" for k in sorted(reasons))
+        elif isinstance(reasons, list):
+            body = ";".join(sorted(str(x) for x in reasons))
+        else:
             return ("", "")
-        body = ";".join(f"{k}={reasons[k]}" for k in sorted(reasons))
         if not channel and not body:
             return ("", "")
         return (f"{event_type}|{channel}|{body}", channel)
@@ -601,7 +617,8 @@ def _channel_delivered_since(conn, channel: str, at_iso: str) -> bool:
 
 
 def recurring_cause_already_signalled(conn, *, event_id: int, event_type: str,
-                                      signature: str, channel: str) -> Optional[dict]:
+                                      signature: str, channel: str,
+                                      now: Optional[float] = None) -> Optional[dict]:
     """The most recent wake for this same cause, or None if it is new / re-armed."""
     if not signature:
         return None
@@ -619,6 +636,12 @@ def recurring_cause_already_signalled(conn, *, event_id: int, event_type: str,
             continue
         if _channel_delivered_since(conn, channel, prior_at):
             return None                      # broke -> healed -> broke again: that is news
+        if now is not None and RE_ALERT_SECS > 0:
+            try:
+                if (float(now) - float(prior_ts or 0)) >= RE_ALERT_SECS:
+                    return None              # still broken, but a day has passed: say so
+            except (TypeError, ValueError):
+                pass                         # unreadable age never suppresses
         return {"event_id": int(prior_id), "at": prior_at}
     return None
 
@@ -664,7 +687,7 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
         if _sig:
             seen = recurring_cause_already_signalled(
                 conn, event_id=int(event_id), event_type=event_type,
-                signature=_sig, channel=_chan)
+                signature=_sig, channel=_chan, now=now)
             if seen:
                 return {"wake": False, "reason": "recurring_cause_already_signalled",
                         "actionable": actionable,
