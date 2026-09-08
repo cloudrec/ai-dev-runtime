@@ -2320,10 +2320,20 @@ red wakes   0 across 2 events (was ~1 per event), 100 suppressions, 0 delivered 
    action that clears the cause: `owner_push` unhealthy, `last_ok_at` NULL, ~7900 dead
    letters since 2026-08-03. Token is valid and authenticating; `chat not found` is a
    chat-level refusal because a bot cannot message a user who never started it.
-2. **Two design decisions.** Whether a specific cause may appear in the wake phrase
-   (`coalesce_generic_backlog`), and whether a red -> green -> red cycle inside one day
-   should re-alert. Both are documented trade-offs, not defects, and were deliberately not
-   decided here.
+2. ~~**Two design decisions.**~~ **CLOSED 2026-09-08 — owner typed `оставить как есть по
+   обоим вопросам` in the Claude Code session, which is the only thing this handoff counts
+   as authorisation.**
+
+   * **Wake phrase content** — stays generic. `coalesce_generic_backlog` keeps folding
+     non-actionable wakes per route, and the phrase keeps pointing at the event log rather
+     than carrying the specific cause. N problems in one window remain ONE wake.
+   * **red -> green -> red inside one day** — stays suppressed. The 24h floor is the only
+     re-arm for `notifications_red`; a same-day recovery-and-refail will NOT re-alert.
+
+   Both were explained to the owner in plain terms with the trade-off each way before the
+   decision. No code change: the current behaviour already implements both. Anyone
+   proposing to "fix" either of these should read this line first — they are chosen, not
+   overlooked.
 3. **Cloudflare/DNS** — the peer session's five items plus the deferred
    `MESS_DOWNLOAD_ORIGIN`.
 
