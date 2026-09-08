@@ -1928,6 +1928,75 @@ The Telegram channel is still down and still dead-lettering. This stops the
 RE-ANNOUNCEMENT, not the failure. Remediation unchanged and owner-only, no secret
 involved: the owner sends the bot one message from their own account.
 
+## notifications_red suppression — SHIPPED BROKEN, then fixed (2026-09-08)
+
+Kept in full because the defect passed its tests, reached production, and was caught only
+by watching live behaviour.
+
+### What shipped, and why it never worked
+
+`5c0291c` extended the recurring-cause suppression to `notifications_red` with a daily
+re-alert (owner decision: "re-alert once a day while red"). Deployed to both processes at
+12:43:49Z. It suppressed **nothing**. First red after the restart woke exactly as before:
+
+```
+notifications_red        26x skip already_woke_for_this_event · 1x WAKE   <- not suppressed
+notification_dead_letter 24x skip recurring_cause_already_signalled       <- working
+```
+
+Cause: the signature was built from the `reasons` prose, and `notifications_red`'s reasons
+embed a LIVE COUNTER — `cdp_same_chat (wake path, NOT a notifier tier): N delivery(s)
+proven in the last 3600s`. N changes hourly. Observed across consecutive reds: 24, 25, 10,
+21, 20, 12, 17, 22, 15. Every red therefore had a unique signature, nothing ever matched,
+and the suppression could never fire. The capability map underneath was byte-identical in
+every one of them.
+
+### The fix — `f136e91`
+
+Sign WHAT IS BROKEN, not prose describing it: `capabilities[tier].available`. Verified
+against four real production payloads — one distinct signature where there had been four.
+The dead-letter path is unchanged and still signs its reasons dict, whose values are raw
+rejection strings and genuinely stable; that half was already working.
+
+### Why the tests could not have caught it
+
+They used ONE fixed `RED_REASONS` list, so every fixture signature matched by
+construction. The tests were internally consistent with the code and both were wrong about
+production data. The regression added with the fix uses two reason lists differing ONLY in
+the delivery count and asserts an identical signature; a second test asserts a flipped
+capability still re-alerts, since that is a real state change. Removal proof: reverting to
+prose-signing fails both.
+
+**Pattern worth carrying:** this is the SECOND suppression change in one day that passed a
+green suite and failed on real payload shape — the first being `json` never imported in
+`wake_bridge`, which the `except` would have swallowed into a permanently disabled feature.
+Both were found by predicting the live outcome in advance and then checking it. Green tests
+did not distinguish working from inert; an observation window did.
+
+### Verifying it after the NEXT deploy
+
+The fingerprint check cannot confirm this — `wake_bridge.py` is in the companion's watched
+set but not in `agent_orchestrator`'s. Use the suppressed-count query, which was validated
+2026-09-08 (returns 1275 for dead letters, so a 0 for reds is a real reading and not a
+typo):
+
+```sql
+SELECT count(*) FROM wake_audit wa JOIN event e ON e.id = wa.event_id
+WHERE e.type='notifications_red' AND wa.reason='recurring_cause_already_signalled';
+```
+
+Pre-deploy that is 0. Non-zero after a restart of BOTH `ai-runtime` and
+`owner-os-wake-companion` is the proof.
+
+### State as of this writing
+
+`f136e91` is committed LOCALLY and unpushed: GitHub egress is down from this host
+(`github.com:22`, `:443` and `ssh.github.com:443` all time out; DNS resolves). Not an auth
+or repo problem, and not worked around — changing the remote is a config gate. Production
+runs `5c0291c`, so reds still wake as they always did. No regression: this is a fix that is
+not yet effective.
+
+
 ## Gates — all owner-only
 
 0. **Telegram CHAT BINDING — not the token.** See the event 36728 section below. The
