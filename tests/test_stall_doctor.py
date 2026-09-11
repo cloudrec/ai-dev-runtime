@@ -164,19 +164,34 @@ def test_lost_continuation_resubmits_after_slo(conn):
     # first sight: episode opens, within SLO -> quiet
     r1 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW)
     assert not r1["acted"] and not dlv.calls
-    # past the queued-line SLO with no progress -> Enter on the owner's own line
+    # past the queued-line SLO with no progress -> SAY SO, never press Enter.
+    # Removed 2026-09-11 on owner instruction: an unsent draft is a human's decision
+    # not to send yet, and the doctor submitted 2976 of them across a dozen panes
+    # before this was noticed.
     r2 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
-    assert [a["action"] for a in r2["acted"]] == ["submit_queued"]
-    assert dlv.calls[0]["action"] == "submit" and dlv.calls[0]["text"] == GAIKA_PENDING
-    # the auto-action is audited, not woken
-    assert emit.calls[-1]["type"] == "stall_doctor_action"
-    assert emit.calls[-1]["owner_action_required"] is False
+    assert [a["action"] for a in r2["acted"]] == ["escalate"]
+    assert not [c for c in dlv.calls if c.get("action") == "submit"], \
+        "the doctor pressed Enter on a draft the human had not sent"
+    # escalation tells the OWNER, which is the point: they decide, not the doctor
+    assert emit.calls[-1]["type"] == "agent_waiting_input"
+    assert emit.calls[-1]["owner_action_required"] is True
 
 
-def test_russian_lost_continuation_end_to_end_submits(conn):
-    """The EXACT second-incident shape: Russian benign instruction queued,
-    agent waiting_input, no progress — must be auto-submitted, not escalated
-    and not left for the owner to find in the terminal."""
+def test_a_benign_russian_draft_is_still_not_submitted(conn):
+    """Inverted 2026-09-11. This test used to REQUIRE auto-submission of exactly this
+    shape — a benign Russian instruction sitting unsent — on the grounds that leaving
+    it "for the owner to find in the terminal" was the failure.
+
+    That reasoning had the question backwards. `may_submit_queued` establishes a HUMAN
+    WROTE the text; it cannot establish that a human RELEASED it, and a composer still
+    holding text is that answered no. The owner of `mess-ru-54582145-resumed:0.0`
+    reported twice that prompts "appeared in the input field and executed themselves"
+    and were not written by them — 113 of this pane's submissions came from here. On
+    2026-09-11 the same path sent this repo's owner a half-considered `вариант А`,
+    which reached a peer session as an instruction to edit a production DNS zone.
+
+    Benign content does not make it the doctor's to send.
+    """
     emit, dlv = Emit(), Deliver()
     ru = "Продолжай по инструкции: почини вступление, затем проверь ссылки UA и EN."
     ag = [_agent()]
@@ -184,11 +199,9 @@ def test_russian_lost_continuation_end_to_end_submits(conn):
     pend = {"gaika-video:0.0": ru}
     _scan(ag, tails, pend, emit, dlv, conn, now=NOW)
     r = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
-    assert [a["action"] for a in r["acted"]] == ["submit_queued"]
-    assert dlv.calls[0]["action"] == "submit" and dlv.calls[0]["text"] == ru
-    # audited, no owner wake
-    assert emit.calls[-1]["type"] == "stall_doctor_action"
-    assert all(not c.get("owner_action_required") for c in emit.calls)
+    assert [a["action"] for a in r["acted"]] == ["escalate"]
+    assert not [c for c in dlv.calls if c.get("action") == "submit"], \
+        f"a human's unsent line was submitted: {dlv.calls}"
 
 
 def test_unsubmittable_queued_line_escalates_once(conn):
@@ -317,9 +330,11 @@ def test_pause_target_stops_actuation_for_that_target_only(conn):
     assert not any(c["target"] == "gaika-server:0.0" for c in dlv.calls)
     assert any(s["target"] == "gaika-server:0.0" and s["why"] == "paused"
               for s in r["skipped"])
-    # the OTHER target's normal auto-submit behaviour is completely unaffected
-    assert [a["action"] for a in r["acted"]] == ["submit_queued"]
-    assert dlv.calls[0]["target"] == "gaika-video:0.0"
+    # the OTHER target still gets the doctor's normal attention — which since
+    # 2026-09-11 is an escalation, not a submission. Pause must remain a per-target
+    # scope test, not an assertion about what the unpaused action happens to be.
+    assert [a["action"] for a in r["acted"]] == ["escalate"]
+    assert not [c for c in dlv.calls if c.get("action") == "submit"]
 
 
 def test_paused_target_is_observed_not_silently_dropped(conn):
@@ -341,14 +356,16 @@ def test_resume_target_restores_normal_actuation(conn):
     _scan(ag, tails, pend, emit, dlv, conn, now=NOW)
     r1 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
     assert not dlv.calls and r1["skipped"][0]["why"] == "paused"
-
-    assert sd.resume_target("gaika-server:0.0", conn=conn) is True
-    # a fresh episode opens (paused ticks never started the clock) then acts after the SLO
-    _scan(ag, tails, pend, emit, dlv, conn, now=NOW + sd.QUEUED_SLO_SECS + 2)
-    r2 = _scan(ag, tails, pend, emit, dlv, conn,
-              now=NOW + sd.QUEUED_SLO_SECS + 2 + sd.QUEUED_SLO_SECS + 1)
-    assert [a["action"] for a in r2["acted"]] == ["submit_queued"]
-    assert dlv.calls[0]["target"] == "gaika-server:0.0"
+    sd.resume_target("gaika-server:0.0", conn=conn)
+    # A resumed target needs TWO scans, not a bigger clock jump: while paused the
+    # episode's `first_ts` is refreshed on every pass, so the first scan after resume
+    # only re-opens the episode (age 0) and the SECOND one crosses the SLO.
+    r_open = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + 2 * sd.QUEUED_SLO_SECS)
+    assert not r_open["acted"], r_open
+    r2 = _scan(ag, tails, pend, emit, dlv, conn, now=NOW + 3 * sd.QUEUED_SLO_SECS + 1)
+    # resumed means the doctor acts again — escalating, never submitting
+    assert [a["action"] for a in r2["acted"]] == ["escalate"]
+    assert not [c for c in dlv.calls if c.get("action") == "submit"]
 
 
 def test_resume_of_a_never_paused_target_reports_false(conn):
@@ -384,42 +401,53 @@ def _submit_episode(agents, target, text, emit, dlv, conn, t0):
     return _scan(agents, tails, pend, emit, dlv, conn, now=t0 + sd.QUEUED_SLO_SECS + 1)
 
 
-def test_rate_limit_escalates_after_repeated_different_digest_submits(conn):
-    """The exact gaika-server 2026-08-28 shape: three DIFFERENT self-generated
-    suggestions submitted within ~15 minutes, none of them repeating a digest —
-    the fourth in the same rolling window must escalate, not submit."""
+def test_no_submission_however_many_episodes(conn):
+    """Was `test_rate_limit_escalates_after_repeated_different_digest_submits`.
+
+    That cap existed to BOUND auto-submission after the 2026-08-28 gaika-server loop,
+    where Claude Code's own dim "suggested next input" redraw was submitted back at it
+    three times. Capping the loop treated the symptom. With submission removed there is
+    nothing to cap — so this now asserts the stronger property the cap approximated:
+    across four episodes with four different drafts, ZERO are sent.
+    """
     emit, dlv = Emit(), Deliver()
     ag = [_agent("gaika-server:0.0", "/opt/gaika-extension")]
     t = NOW
-    for text in ("check status", "check status tomorrow", "next safe roadmap item"):
+    for text in ("check status", "check status tomorrow",
+                 "next safe roadmap item", "ok stopping here"):
         r = _submit_episode(ag, "gaika-server:0.0", text, emit, dlv, conn, t)
-        assert [a["action"] for a in r["acted"]] == ["submit_queued"], text
+        assert [a["action"] for a in r["acted"]] == ["escalate"], text
         t += sd.QUEUED_SLO_SECS + 60
-    r4 = _submit_episode(ag, "gaika-server:0.0", "ok stopping here", emit, dlv, conn, t)
-    assert [a["action"] for a in r4["acted"]] == ["escalate"]
-    assert emit.calls[-1]["type"] == "agent_waiting_input"
-    assert "lost_continuation_submit_rate_exceeded" in emit.calls[-1]["payload"]["reason"]
-    assert len([c for c in dlv.calls if c["action"] == "submit"]) == 3
+    assert not [c for c in dlv.calls if c["action"] == "submit"], \
+        f"the self-feeding loop is back: {dlv.calls}"
 
 
-def test_rate_limit_does_not_affect_a_single_legitimate_submission(conn):
-    """One real queued instruction, one submit — the ordinary shape for every
-    OTHER project — is completely unaffected."""
+def test_one_ordinary_queued_instruction_is_also_not_sent(conn):
+    """Was `test_rate_limit_does_not_affect_a_single_legitimate_submission`.
+
+    The old name carried the assumption being retired: that a lone queued line is a
+    "legitimate submission" for the doctor to make. It is legitimate TEXT; releasing it
+    is the human's call.
+    """
     emit, dlv = Emit(), Deliver()
     r = _submit_episode([_agent()], "gaika-video:0.0", GAIKA_PENDING, emit, dlv, conn, NOW)
-    assert [a["action"] for a in r["acted"]] == ["submit_queued"]
+    assert [a["action"] for a in r["acted"]] == ["escalate"]
+    assert not [c for c in dlv.calls if c["action"] == "submit"]
 
 
-def test_decide_boundary_for_recent_lc_submits():
-    below = sd.decide(sd.LOST_CONTINUATION, pending="proceed",
-                      age_secs=sd.QUEUED_SLO_SECS + 1,
-                      recent_lc_submits=sd.LOST_CONTINUATION_MAX_SUBMITS_PER_WINDOW - 1)
-    assert below["action"] == "submit_queued"
-    at_cap = sd.decide(sd.LOST_CONTINUATION, pending="proceed",
-                       age_secs=sd.QUEUED_SLO_SECS + 1,
-                       recent_lc_submits=sd.LOST_CONTINUATION_MAX_SUBMITS_PER_WINDOW)
-    assert at_cap["action"] == "escalate"
-    assert "lost_continuation_submit_rate_exceeded" in at_cap["reason"]
+def test_no_recent_submit_count_can_produce_a_submission():
+    """Was `test_decide_boundary_for_recent_lc_submits`.
+
+    It pinned the cap's boundary: below the cap -> submit, at the cap -> escalate. The
+    cap is gone with the behaviour it bounded, so the boundary is now everywhere —
+    no value of `recent_lc_submits`, and no draft, yields a submission.
+    """
+    for n in (0, 1, sd.LOST_CONTINUATION_MAX_SUBMITS_PER_WINDOW - 1,
+              sd.LOST_CONTINUATION_MAX_SUBMITS_PER_WINDOW, 99):
+        d = sd.decide(sd.LOST_CONTINUATION, pending="proceed",
+                      age_secs=sd.QUEUED_SLO_SECS + 1, recent_lc_submits=n)
+        assert d["action"] == "escalate", f"recent_lc_submits={n} produced {d}"
+        assert d["reason"] == "lost_continuation_unsent_draft"
 
 
 def test_progress_resets_episode_and_rearm(conn):

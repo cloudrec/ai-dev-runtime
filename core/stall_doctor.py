@@ -276,13 +276,27 @@ def decide(shape: str, *, pending: str = "", age_secs: float = 0.0,
                 "reason": "action_cooldown" if last_action_ok
                 else "failed_action_cooldown"}
     if shape == LOST_CONTINUATION:
-        if recent_lc_submits >= LOST_CONTINUATION_MAX_SUBMITS_PER_WINDOW:
-            return {"action": "escalate",
-                   "reason": f"lost_continuation_submit_rate_exceeded:{recent_lc_submits}"}
-        ok, why = may_submit_queued(pending)
-        if ok:
-            return {"action": "submit_queued", "reason": why}
-        return {"action": "escalate", "reason": f"queued_line_not_submittable:{why}"}
+        # ── 2026-09-11: the doctor no longer presses Enter on anyone's draft ──
+        # `may_submit_queued` answers "did a HUMAN WRITE this", which is not the
+        # question. The question is "did a human RELEASE it", and text still sitting in
+        # a composer is that question answered NO. An unsent draft is the one piece of
+        # text in this system a person has demonstrably decided not to send yet.
+        #
+        # Measured before removing it: 2976 `submit_queued` deliveries since 2026-08-15
+        # across a dozen panes — the doctor's most frequent action by 3x. 113 of them
+        # went into `mess-ru-54582145-resumed:0.0`, whose owner reported twice that
+        # "продолжай аудит" prompts "appeared in the input field and executed
+        # themselves" and were not written by them. They may well have written them —
+        # and then chosen not to send. On 2026-09-11 the same path submitted this
+        # owner's half-considered `вариант А`, which arrived downstream as an
+        # instruction to go and edit a production DNS zone.
+        #
+        # Owner decision, typed 2026-09-11: remove it. Escalating instead is strictly
+        # safer — a pane that sits until its human returns is the CORRECT outcome, and
+        # the owner still hears about it. `may_submit_queued` is kept (tests pin its
+        # refusals, and it documents what was once considered safe) but nothing calls
+        # it for a decision any more.
+        return {"action": "escalate", "reason": "lost_continuation_unsent_draft"}
     if shape == CHILD_WORKFLOW_WAIT:
         return {"action": "nudge", "text": NUDGE_CHILD,
                 "reason": "child_workflow_static_past_slo"}

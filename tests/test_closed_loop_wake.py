@@ -160,7 +160,7 @@ def test_three_terminal_incident_no_cross_talk(conn):
     tails["jobhunter-audit:0.0"] = jobhunter_tail(done=45)
     r2 = _scan(NOW + sd.QUEUED_SLO_SECS + 1)
     acted = {a["target"]: a["action"] for a in r2["acted"]}
-    assert acted["gaika-video:0.0"] == "submit_queued"
+    assert acted["gaika-video:0.0"] == "escalate"
     assert acted.get("payorch-live:0.0") is None, "payorch not yet past its own SLO"
     assert "jobhunter-audit:0.0" not in acted, "progressing child stays silent"
 
@@ -168,13 +168,22 @@ def test_three_terminal_incident_no_cross_talk(conn):
     acted3 = {a["target"]: a["action"] for a in r3["acted"]}
     assert acted3.get("payorch-live:0.0") == "nudge"
 
-    # None of gaika's submit or payorch's nudge is a ChatGPT wake — both are audited as
-    # `stall_doctor_action`, which is a routine (non-waking) event type.
-    assert wb.health()["wakes_total"] == 0, "no cross-talk: nothing here wakes ChatGPT"
+    # The no-cross-talk property is about SHAPES not bleeding into each other, which is
+    # asserted above and unchanged. What DID change on 2026-09-11: gaika's shape no
+    # longer resolves itself by submitting the human's unsent line, so it escalates and
+    # that legitimately reaches the owner. payorch's nudge and jobhunter's silence stay
+    # non-waking, which is the part this guards.
+    payorch_and_child_quiet = [c for c in dlv.calls if c.get("action") == "submit"]
+    assert not payorch_and_child_quiet, "nothing here may submit a human's draft"
 
 
-# ── (b) lost continuation: doctor acts, no wake ──────────────────────────────
-def test_lost_continuation_no_wake_needed(conn):
+# ── (b) lost continuation: doctor escalates, which DOES reach the owner ──────
+# Inverted 2026-09-11. This case used to be the flagship "the doctor handles it
+# silently" example: it submitted the human's unsent line and deliberately did NOT
+# wake anyone. Removing auto-submission removes that silence — an unsent draft is now
+# the owner's to release, so the doctor tells them instead of deciding for them.
+# The wake is the cost of the fix, not a regression.
+def test_lost_continuation_escalates_to_the_owner(conn):
     _bind("gaika-drop", "https://chatgpt.com/c/gaika-chat")
     agents = [_doctor_agent("gaika-video:0.0", "/opt/gaika-drop", state="waiting_input")]
     tails = {"gaika-video:0.0": GAIKA_TAIL}
@@ -186,12 +195,13 @@ def test_lost_continuation_no_wake_needed(conn):
     r = sd.scan(agents=agents, read_fn=lambda t: tails[t],
                pending_fn=lambda t, tail, cwd: pend[t], deliver_fn=dlv, emit_fn=cto.emit,
                conn=conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
-    assert [a["action"] for a in r["acted"]] == ["submit_queued"]
-    assert wb.health()["wakes_total"] == 0
+    assert [a["action"] for a in r["acted"]] == ["escalate"]
+    assert not [c for c in dlv.calls if c.get("action") == "submit"], \
+        "the doctor pressed Enter on a line the human had not sent"
 
 
-# ── (c) queued-messages stall: doctor submits ────────────────────────────────
-def test_queued_line_at_rest_gets_submitted(conn):
+# ── (c) queued-messages stall: doctor reports, never sends ───────────────────
+def test_queued_line_at_rest_is_not_submitted(conn):
     _bind("gaika-drop", "https://chatgpt.com/c/gaika-chat")
     agents = [_doctor_agent("gaika-video:0.0", "/opt/gaika-drop", state="waiting_input")]
     tails = {"gaika-video:0.0": GAIKA_TAIL}
@@ -203,7 +213,8 @@ def test_queued_line_at_rest_gets_submitted(conn):
     sd.scan(agents=agents, read_fn=lambda t: tails[t],
            pending_fn=lambda t, tail, cwd: pend[t], deliver_fn=dlv, emit_fn=cto.emit,
            conn=conn, now=NOW + sd.QUEUED_SLO_SECS + 1)
-    assert dlv.calls[0]["action"] == "submit" and dlv.calls[0]["text"] == GAIKA_PENDING
+    assert not [c for c in dlv.calls if c.get("action") == "submit"], \
+        f"a line left at rest in the composer was submitted: {dlv.calls}"
 
 
 # ── (d) child workflow wait: progressing silent, static -> nudge, terminal -> wake ──
