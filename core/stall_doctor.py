@@ -560,7 +560,24 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                     action_taken=(f"{target}: {shape} needs the owner — {d['reason']} "
                                   f"({_redact(pending)[:80]})"),
                     correlation_id=f"waiting:{target}",
-                    dedup_key=f"doctor:{target}:{shape}:{dg}",
+                    # ── one alert per pane per day for an unsent draft ──────────
+                    # The digest is normally part of the key so a DIFFERENT problem on
+                    # the same pane is a new alert. For LOST_CONTINUATION that defeats
+                    # the 24h window entirely: the digest is derived from the pane's
+                    # bottom content line, which moves on essentially every episode, so
+                    # the key is unique every time and nothing ever collapses. Measured
+                    # 2026-09-11 over the week before this: 121 submissions on one day
+                    # deduped to 114 distinct keys — a 6% saving on what would now be
+                    # 114 owner notifications for the same standing condition.
+                    #
+                    # "This pane has a draft its human has not sent" is ONE fact about
+                    # ONE pane. It does not become new information because the text
+                    # changed, so the digest is dropped from the key for this shape
+                    # only. Owner decision, typed 2026-09-11: "да, ограничь одной в
+                    # сутки". Every other shape keeps per-digest alerting.
+                    dedup_key=(f"doctor:{target}:{shape}"
+                               if shape == LOST_CONTINUATION
+                               else f"doctor:{target}:{shape}:{dg}"),
                     dedup_window_secs=86400, conn=conn)
                 conn.execute("UPDATE stall_doctor_state SET escalated=1 WHERE target=?",
                              (target,))

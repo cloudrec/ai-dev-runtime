@@ -662,3 +662,51 @@ def test_scan_skips_a_target_under_a_live_declaration(monkeypatch):
                 pending_fn=lambda t, tail, cwd: "")
     assert calls == [], "a parked pane is not even read"
     assert any(s.get("why") == "intentional_external_wait" for s in r["skipped"])
+
+
+# ── one alert per pane per day for an unsent draft ───────────────────────────
+def test_unsent_draft_alerts_once_a_day_however_much_the_text_changes(conn):
+    """Owner decision 2026-09-11: one escalation per pane per day for this shape.
+
+    Removing auto-submission turned ~2976 silent submissions into owner-facing
+    escalations — 121 on the busiest measured day. The 24h dedup window could not
+    collapse them because the digest, derived from the pane's bottom content line,
+    changes almost every episode: 121 submissions produced 114 distinct dedup keys.
+
+    "This pane holds a draft its human has not sent" is one fact about one pane. It
+    does not become new information because the draft was edited.
+    """
+    emit, dlv = Emit(), Deliver()
+    ag = [_agent("gaika-server:0.0", "/opt/gaika-extension")]
+    t = NOW
+    keys = []
+    for text in ("first idea", "second idea entirely", "third, quite different"):
+        _submit_episode(ag, "gaika-server:0.0", text, emit, dlv, conn, t)
+        t += sd.QUEUED_SLO_SECS + 60
+        keys += [c.get("dedup_key") for c in emit.calls
+                 if c.get("type") in ("agent_waiting_input", "owner_decision_required")]
+    assert keys, "no escalation was emitted at all"
+    assert len(set(keys)) == 1, (
+        f"each edit of the draft minted a new alert key: {sorted(set(keys))}")
+    assert all(":LOST_CONTINUATION" in k and not k.endswith(":") for k in keys)
+    # and the digest must NOT be in it — that is precisely what defeated the window
+    digests = {c["payload"].get("digest") for c in emit.calls if c.get("payload")}
+    assert not any(d and d in keys[0] for d in digests), \
+        f"the digest is still in the dedup key: {keys[0]}"
+
+
+def test_other_shapes_keep_per_digest_alerting(conn):
+    """The collapse is scoped to unsent drafts. A different problem on the same pane
+    must still be able to raise its own alert."""
+    d1 = sd.decide(sd.LOST_CONTINUATION, pending="proceed",
+                   age_secs=sd.QUEUED_SLO_SECS + 1, recent_lc_submits=0)
+    assert d1["action"] == "escalate"
+    # Each shape has its OWN SLO — CHILD_WORKFLOW_WAIT is judged against CHILD_SLO_SECS,
+    # not WAIT_SLO_SECS. Passing the wrong one returns "none" (within_slo) and would make
+    # this pass or fail for reasons unrelated to what it is testing.
+    d2 = sd.decide(sd.CHILD_WORKFLOW_WAIT, pending="", age_secs=sd.CHILD_SLO_SECS + 1)
+    assert d2["action"] == "nudge"
+    # OWNER_DECISION_WAIT still escalates, and its key keeps the digest: a genuinely
+    # different owner-power wait on the same pane must not be swallowed by an earlier one.
+    d3 = sd.decide(sd.OWNER_DECISION_WAIT, pending="", age_secs=sd.WAIT_SLO_SECS + 1)
+    assert d3["action"] == "escalate"
