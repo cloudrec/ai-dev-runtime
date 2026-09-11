@@ -2339,3 +2339,78 @@ red wakes   0 across 2 events (was ~1 per event), 100 suppressions, 0 delivered 
 
 **The system is still RED and that is correct.** Everything built here changed how often
 the owner is woken, never the underlying failure.
+
+---
+
+# TELEGRAM GATE CLOSED — 2026-09-11T02:35:04Z
+
+The longest-standing gate in this handoff is closed. `owner_push` is **healthy**, posture
+is **green**, and delivery is proven — not inferred from status.
+
+```
+channel owner_push   unhealthy -> healthy
+last_ok_at           NULL -> 2026-09-11T02:35:04Z   (never once succeeded before)
+notification 9320    state=sent, attempts=0         (the three before it: dead_letter, 5 attempts each)
+notifications_status green · "delivery proven at 2026-09-11T02:35:04Z"
+```
+
+## The diagnosis I got wrong, and for how long
+
+Throughout this handoff the gate was recorded as: *"the owner must send the bot one
+message, because a bot cannot open a conversation the human never started."* That reading
+came from `reports/SERVER_DOWN_TELEGRAM_ALERTS_2026-08-16.md` and was repeated here
+without being re-tested.
+
+The owner did press Start on `@ezzetasecurity_bot`. It changed nothing, because the real
+fault was different: **`TELEGRAM_CHAT_ID` pointed at a chat that does not exist for this
+bot.**
+
+```
+getChat(8212214695)  -> 400 Bad Request: chat not found   <- what was configured
+getChat(5498907359)  -> found: private chat, Andrew / @tehnonom   <- the owner's real id
+```
+
+One read-only `getChat` call settles it in under a minute. It was never made — not on
+2026-08-16, not across this entire session — because `chat not found` was assumed to mean
+"conversation not started" when it equally means "this id is not a chat I can see". The
+owner lost days to a confidently stated, unverified cause.
+
+**Rule for next time: when an API says an object is missing, ask the API about that object
+before theorising about why it is missing.**
+
+## The fix
+
+```
+configs/.env   TELEGRAM_CHAT_ID: 8212214695 -> 5498907359    (one value; token untouched)
+backup         backups/telegram_chat_id_fix_20260911T023331Z/{.env.before,ROLLBACK.md}
+restart        ai-runtime 4063733 -> 3720454, active, 0 tracebacks
+```
+
+`@ezzetasecurity_bot` was always the right bot and the token was always valid — it is a
+shared product bot, and another project uses the same token with its own working chat id,
+which is why `getMe` always passed while every send failed.
+
+## What the notifications actually carry
+
+Asked by the owner, answered from the data rather than from design intent:
+
+```
+5130x agent_waiting_input        an agent is stuck on a question
+1489x work_stopped_incomplete    an agent went quiet mid-task
+ 802x agent_process_failed       the agent process died
+ 728x agent_prompt_needs_response
+ 275x wake_loop_no_progress  +  179x wake_loop_stalled   the waking system itself jammed
+ 228x agent_dead · 136x new_agent_discovered · 129x agent_recovered
+  53x owner_decision_required    blocked on something only the owner can decide
+```
+
+The ~9000 accrued while the channel was down are `dead_letter` and are NOT re-sent; only
+new events flow. Combined with the repeat-wake suppression (4445 duplicates absorbed and
+2 wakes in the preceding 48h), a green channel does not become a flood.
+
+## Remaining
+
+Nothing in Owner OS. The only open item is Cloudflare/DNS plus the deferred
+`MESS_DOWNLOAD_ORIGIN`, which belong to the peer `mess` session and lie outside this
+repository.
+
