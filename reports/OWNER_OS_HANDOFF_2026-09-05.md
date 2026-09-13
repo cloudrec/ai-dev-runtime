@@ -2861,3 +2861,38 @@ Not investigated further this turn; recorded so it is not rediscovered from scra
 
 Nothing here needs approval. The two standing gates are unchanged: push the local commits,
 and the two `ai-runtime` restarts for the identity-provenance deploy.
+
+---
+
+## Deployed: the fail-closed wake verdict (2026-09-13 13:50 UTC)
+
+Owner typed "пушь и перезапускай оба". Pushed `12f5f81`, `origin` verified equal to local,
+zero unpushed. Both units restarted: `ai-runtime` PID 3167940, `owner-os-wake-companion`
+PID 3167915.
+
+**The prediction held exactly.** Baseline before the restart: 189 `wake_abandoned` rows,
+all `submitted_delivery_unproven`. On the companion's first sweep after the restart:
+
+```
+205 total = 189 submitted_delivery_unproven  (unchanged, nothing reclassified)
+           +  16 acknowledged_without_delivery_proof
+```
+
+Sixteen, the number counted on the live database before the change. The oldest had been
+stranded 11.1 days.
+
+**The invariant now holds live.** The query for a submitted wake with no terminal record —
+not delivered, not abandoned, not expired, not superseded — returns **0** against the
+production database. It returned 16 an hour ago.
+
+Verified after the restart, not before: `worker_skew()` `[]` (both units on current code —
+this fix ships with the COMPANION, since the sweep ticks inside `pending_wake()`, and
+twice this session a deploy went to the wrong unit); `/health` 200 in 9.8ms; reverse-path
+watch `ok`, probing again 43s after restart against its 120s tick; the wake pipeline
+delivering normally, four consecutive `submitted_and_assistant_started_generating`.
+
+No control-plane events were emitted by the sweep, by design — an abandonment event would
+itself become a wake candidate that could fail delivery and be abandoned in turn.
+
+**Still not built:** the identity-provenance marker and self-clearing crash alerts. The
+checklist above stands; nothing in this deploy touched it.
