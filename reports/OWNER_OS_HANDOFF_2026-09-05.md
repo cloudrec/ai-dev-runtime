@@ -2535,3 +2535,61 @@ Two of my own defects were caught by these tests before the commit, not after:
 `status()` raised on an unreadable store, and the watch called every clean start a
 recovery — a restart-triggered lie, and the fastest way to teach someone to ignore
 the channel.
+
+---
+
+## Delivery rate is degrading, and the renderer is the suspect (2026-09-13 10:16 UTC)
+
+An automated instruction was received via the Owner OS API to re-check health; it is not
+owner sign-off. Read-only apart from one local doc commit. Nothing pushed, no service
+touched, no process killed.
+
+**Healthy.** `ai-runtime` and `owner-os-wake-companion` active. Reverse-path watch `ok`,
+last probe 51s ago against a 120s tick. Inbound `seo:8088` 200 in 6ms.
+
+**Tab accrual is fixed and holding.** `browser_tab_health()`: 1 page, headroom 11,
+`duplicated` empty, `orphaned` empty, `reclaimable` 0. A recovery ran during this sweep
+(10:13 UTC) and its replaced tab is gone — which is exactly what the verified
+`_close_target` was written for, now observed working in production rather than in tests.
+
+**The finding.** Wake delivery is getting worse, monotonically:
+
+| window | delivered | rate |
+|---|---|---|
+| last 24h | 122/139 | 88% |
+| last 6h  | 51/60   | 85% |
+| last 1h  | 24/30   | 80% |
+
+`assistant_generating_wedged` dominates, and it is recent: all 6 of the last 24 hours'
+occurrences fall inside the last 6 hours, 4 of them inside the last hour.
+
+**What the renderer is doing.** The companion's single ChatGPT renderer grows about
+2.5 MB/s. Sampled 653 MB at 2 min, 926 MB at 13 min, 1006 MB at 13.8 min, then it was
+replaced at 10:13 UTC — the same minute event 48835 failed `assistant_generating_wedged`.
+Its replacement was at 542 MB after 3.6 minutes.
+
+**What I have NOT proven.** That the size causes the wedge. The wedges cluster —
+08:21, 08:31 … 09:35, 09:41, 09:42 … 10:13 — rather than following a clean memory clock,
+so a growing renderer and a wedging renderer are so far only correlated. Saying otherwise
+would be the same mistake as the four-day Telegram diagnosis: a plausible story repeated
+without a test.
+
+**No wake is lost to this.** Failed events are re-emitted by the stall doctor and
+re-woken by the closed-loop watch (`re-woke hostsecure:0.0 for stalled event 48660
+(new event 48811)`). The cost is latency and noise, not silence.
+
+**Memory pressure is not Owner OS.** Available 2.1 GB of 11.9 GB, swap 12.5 GB free —
+the kernel is not OOM-ing; the background tasks killed earlier were killed by the client's
+memory watchdog. Owner OS's whole footprint is 257 MB (uvicorn 213 + companion 44), about
+2% of what is used. The rest is other projects' live work: ~10 claude sessions at 3.8 GB,
+a transient 1.08 GB JVM build, six concurrent `/opt/capacity` pytest runs at 494 MB.
+
+**Owner gate.** Nothing further reclaims memory or restores the delivery rate without
+crossing a gate. The minimum concrete action, if either is wanted: recycle the companion's
+Chrome renderer (currently PID 2342683) — which is killing a live process on the owner's
+own browser, so it is not mine to do. Everything cheaper has been done.
+
+**Do not delete** `/tmp/pytest-of-root`. Five of its directories are held open right now by
+other sessions' running pytest processes (2156078 holds `governance.db-wal` in
+`pytest-1097`). Only four two-day-old dirs were removed, each `lsof`-checked first; that
+reclaimed 16 MB of disk and zero RAM.
