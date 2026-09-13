@@ -2492,3 +2492,46 @@ owner decision. Until then it is a function that must be called by hand.
 * The `seo` stack is up again (owner instruction "поднимай seo"); its containers were
   started, nothing in that project was modified.
 
+
+---
+
+## Reverse-path watch — committed, pushed, live (2026-09-13 09:43 UTC)
+
+`a96b64e` on `ai-runtime/220-windows-bridge`, remote confirmed at the same hash.
+Suite green before the commit: 3223 passed.
+
+**What it watches.** The ChatGPT -> Owner OS direction only. Owner OS reaches the
+chat through its own browser and depends on nobody; the chat reaches Owner OS
+through the `seo` containers (nginx :8088 -> seo-backend -> this API), and that is
+the half carrying `agent_status` / `agent_read` / `agent_send` / `agent_answer`.
+Nothing was watching it, which is why the four-day outage read as green: /health
+answered in 9ms, 15 of 15 wakes delivered, 14 watches closed `pane_awaiting_owner`,
+and the owner found out from a 502 in the chat.
+
+**Live, verified outside the cycle.** `ai-runtime` restarted 09:41:27 UTC
+(MainPID 2213564). Two consecutive probes recorded 120.1s apart —
+09:41:35.852807 then 09:43:35.967840 — so the loop is repeating, not just firing
+once at startup. Current verdict `ok`, `last_failure_at` 08:24:52 preserved from
+today's earlier testing. The restart announced nothing, which is the clean-start
+guard behaving.
+
+**Noise budget.** Speaks only on a change of verdict. At a 120s tick a four-day
+outage is 2880 chances to shout and takes two messages. Both edges of that
+suppression are pinned: a clean start (unknown -> ok) is silent, but a real
+recovery after the watch was interrupted mid-outage — also unknown -> ok — is
+still announced, because a failure is on record with no success after it.
+
+**It reports and never repairs.** The alert names `seo`, carries `last_ok_at`, and
+says "core is separate" so the reader does not conclude Owner OS is at fault. It
+does not prescribe a restart: the worker last exited 137 (OOM), and raising the
+stack is the owner's call.
+
+**Fail-closed.** `unknown` — never probed, or a verdict older than
+`STALE_AFTER_SECS` — reports `healthy=False`. An unreadable store answers
+`healthy=False` rather than raising. A stale "ok" is the exact failure the module
+exists to prevent, so the store cannot produce one.
+
+Two of my own defects were caught by these tests before the commit, not after:
+`status()` raised on an unreadable store, and the watch called every clean start a
+recovery — a restart-triggered lie, and the fastest way to teach someone to ignore
+the channel.
