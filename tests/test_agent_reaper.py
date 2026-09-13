@@ -130,3 +130,38 @@ def test_the_pane_rule_is_idempotent():
     first = ao.reap_vanished({"hostsecure-clean"}, live_targets={"hostsecure-clean:0.0"})
     second = ao.reap_vanished({"hostsecure-clean"}, live_targets={"hostsecure-clean:0.0"})
     assert len(first) == 1 and second == []
+
+
+# ── a pane with no agent in it is not a live agent ──────────────────────────
+# `inv["agents"]` is the whole pane inventory, not the agents in it. A window whose
+# Claude exited but whose shell stayed open reports is_agent=False, alive=True,
+# state="stale". Counting those as live is why hostsecure-clean:1.0 survived the
+# session rule for hours — its sibling window 0 is exactly such a shell — and it would
+# defeat the pane rule in the very case the pane rule exists for.
+
+def test_a_stale_shell_at_the_same_target_does_not_keep_the_record_alive():
+    """The agent died; tmux kept the window on a prompt. The record must not stay
+    `working` just because something is still sitting at that address."""
+    _seed("job:0.0", "job", "working", goal="g")
+    reaped = ao.reap_vanished({"job"}, live_targets={"job:1.0"})   # agent-holding panes
+    assert [r["agent"] for r in reaped] == ["job:0.0"]
+    assert _state("job:0.0") == "vanished"
+
+
+def test_the_caller_passes_agent_holding_panes_only():
+    """Read off the source: if this ever reverts to every pane, the two tests above
+    keep passing while the live system silently stops reaping again."""
+    import ast, inspect, textwrap
+    src = textwrap.dedent(inspect.getsource(ao.refresh_and_resolve))
+    tree = ast.parse(src)
+    found = False
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(getattr(t, "id", "") == "live_targets" for t in node.targets):
+            continue
+        gen = ast.dump(node.value)
+        found = True
+        assert "is_agent" in gen and "alive" in gen, \
+            "live_targets must be built from panes that hold a live agent"
+    assert found, "live_targets assignment not found in refresh_and_resolve"

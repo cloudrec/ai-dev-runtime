@@ -3151,3 +3151,71 @@ wake bridge, agent watch, provenance and reconcile: **332 passed**.
 **Gate.** One local commit is unpushed and one restart would flip that single stale row.
 The owner was asked and answered: do not restart. So nothing is pending on a gate — the
 work is parked by decision, not blocked.
+
+---
+
+## Why the false-live record survived at all — and a hole in my own fix (2026-09-13 18:05 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. Local
+commit only; live databases untouched, no pane killed, nothing pushed or restarted.
+
+### The root cause is one missing filter
+
+`inv["agents"]` is the whole pane inventory, not the agents in it. The reaper's caller
+built both `live_sessions` and `live_targets` from every entry:
+
+```
+hostsecure-clean:0.0   is_agent=False  alive=True  state=stale   <- a shell, no Claude
+hostsecure-clean-resumed:0.0  is_agent=True  alive=True
+```
+
+So a stale shell in window 0 kept the whole session `hostsecure-clean` in
+`live_sessions`, and the session rule skipped `hostsecure-clean:1.0` for hours. That is
+the actual reason the record read `working` — not a missing sweep, a missing filter.
+
+### And it would have defeated yesterday's fix in the case that fix exists for
+
+The pane rule I committed in `d5745e6` took `live_targets` from the same unfiltered list.
+An agent dying while tmux keeps its window open on a prompt leaves the pane present with
+`is_agent=False` — so `agent_key in live_targets` would be true and the record would stay
+`working`. Precisely the shape the pane rule was written to catch. Found by tracing the
+inventory rather than by a failing test, which is why the test now reads the source.
+
+`live_targets` is now built only from panes holding a live agent
+(`is_agent and alive`). `alive` is a property of the tmux pane and `is_agent` of what
+runs in it, so requiring both is a positive finding, not a failed read: a pane that
+cannot be read does not appear at all, and a wholly empty inventory still raises rather
+than reaping everything.
+
+`live_sessions` is deliberately unchanged — a wider blast radius for records judged by
+session alone. Worth naming: a session whose only pane is a stale shell still counts as
+alive there. Unreachable for this table today, all 154 keys being pane-shaped, so the
+pane rule governs every one of them.
+
+### Verified against real state
+
+Dry run on a copy, live `agent_control.db` untouched afterwards:
+
+```
+15 panes, 13 agent-holding; excluded: audit:0.0, hostsecure-clean:0.0
+before  working 4 … vanished 140
+reaped  ['hostsecure-clean:1.0']   owner events 0
+after   working 3 … vanished 141
+```
+
+Still exactly one record and no false alarm, even though the stricter rule now discounts
+two panes. Neither excluded pane has an orchestrator record.
+
+### Coverage
+
+14 reaper tests. The new source-reading test was checked both ways: reverting
+`live_targets` to every pane makes it fail, restoring it makes it pass — otherwise the
+two behavioural tests would keep passing while the live system silently stopped reaping.
+Suite 3275 passed.
+
+### Gate
+
+Unchanged and owner-decided: two local commits unpushed, and activation of the stale row
+needs a restart. The owner said not to restart and not to push, so this is parked by
+decision, not blocked. No other unresolved zero-ping or control-plane item is actionable
+without one of those two.

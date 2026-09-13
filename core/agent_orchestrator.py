@@ -833,7 +833,21 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         # real inventory (never mass-reap on a transient empty/failed read).
         live_sessions = {a.get("session") for a in live_agents if a.get("session")}
         # Panes too, not only sessions: a window can die inside a session that lives on.
-        live_targets = {a.get("target") for a in live_agents if a.get("target")}
+        #
+        # AGENT-HOLDING panes only. `inv["agents"]` is the whole pane inventory, not
+        # just the agents in it — `is_agent` False with `state` "stale" means the tmux
+        # window is still there with a shell in it and no Claude. Counting those as live
+        # is why `hostsecure-clean:1.0` survived the session rule for hours: its
+        # sibling window 0 is a stale shell, which kept the whole session "alive".
+        # It would also defeat the pane rule outright in the case that rule exists for —
+        # an agent dying while its window stays open on a prompt.
+        #
+        # `alive` is a property of the PANE (tmux `pane_dead`), `is_agent` of what runs
+        # in it, so requiring both is a positive finding rather than a failed read: a
+        # pane we could not read at all does not appear here, and a totally empty
+        # inventory still raises below rather than reaping everything.
+        live_targets = {a.get("target") for a in live_agents
+                        if a.get("target") and a.get("is_agent") and a.get("alive")}
         if not live_agents:
             raise RuntimeError("empty inventory — skip reaping")
 
