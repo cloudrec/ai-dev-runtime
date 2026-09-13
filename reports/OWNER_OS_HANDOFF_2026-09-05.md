@@ -3107,3 +3107,47 @@ row above, not a completion marker.
 Suite 3273 passed; focused set across reaper, orchestrator, plan, provenance and
 reconcile: 87 passed. New tests fail against the unfixed module. Nothing deployed — this
 ships with the runtime, which is a restart, which is an owner gate.
+
+---
+
+## Event 49686 traced end to end — the self-project loop closes (2026-09-13 17:30 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. Read-only
+verification plus this note; no code changed, nothing pushed, no service restarted.
+
+Full chain, from Owner OS data rather than assumption:
+
+```
+17:22:08  event 49686   work_stopped_incomplete, quiescent, at_rest_unchanged_for_345s
+17:22:08  wake_audit    decision=wake, route_key=owner-os
+17:22:57  wake_send     allowed, claimed_actionable
+17:23:13  wake_submitted
+17:23:35  wake_delivery delivered=1  submitted_and_assistant_started_generating
+17:24:44  continuation  self-wake-49686-safe-continue-20260913  actor=api:bearer
+          wake_loop_watch  resolved=1  pane_awaiting_owner   rewoken=0  escalated=0
+```
+
+Wake to delivery 87s; event to continuation 2.6 min. The watch closed on its own with no
+re-wake and no escalation.
+
+**The conversation is the right one, checked not assumed.** `wake_send` and
+`wake_delivery` both name `6a967789-9b28-83eb-9261-de5162d4ac17`, and `wake_route` binds
+`owner-os` to exactly that, `bound_by=owner`, 2026-09-02, note "owner-typed URL".
+
+**Why the pane was idle:** it had finished the previous turn. The event's own excerpt is
+that turn's closing text. Nothing to fix.
+
+**No remaining false-working accounting.** Scanned both stores against the live pane list:
+
+- `agent_orchestrator`: 14 records in a live state, 13 with a live pane, **1 false-live** —
+  `hostsecure-clean:1.0`, which is exactly what the local fix `d5745e6` handles.
+- `agent_watch_state`: **0** stale live-class rows. That subsystem tracks tmux targets and
+  is already correct.
+
+The dead-pane fix is finished, not pending: committed with 12 tests, five of which fail
+against the unfixed module. Regression set for reaper, orchestrator, closed-loop wake,
+wake bridge, agent watch, provenance and reconcile: **332 passed**.
+
+**Gate.** One local commit is unpushed and one restart would flip that single stale row.
+The owner was asked and answered: do not restart. So nothing is pending on a gate — the
+work is parked by decision, not blocked.
