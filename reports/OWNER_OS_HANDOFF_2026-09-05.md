@@ -2788,3 +2788,76 @@ appear. A drop from 89 toward zero in one sweep is a bug, not a success.
   **281 passed**.
 - No deploy skew: last code commit `a96b64e` at 11:40:31, `ai-runtime` restarted 11:41:30,
   no `.py` under `core/ api/ tools/` newer than that start, `worker_skew()` returns `[]`.
+
+---
+
+## Zero-ping status, and the meter is alive (2026-09-13 11:10 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. Read-only
+against the runtime plus this doc commit. Nothing pushed, no service touched.
+
+### The pgrep self-match: diagnostic only, no code changed
+
+`pgrep -f "pytest … tests/"` matched the bash wrapper whose own command line contained the
+pattern, so a waiter reported RUNNING with no pytest alive. Searched the tree: the only
+occurrence of `pgrep` in `core/ api/ tools/ scripts/` is the name in
+`permission_resolver.py`'s read-only-command allowlist. No product, supervisor or waiter
+code scans the process table by substring — liveness is checked per known pid
+(`os.kill(pid, 0)`, `/proc/<pid>/cmdline`). Ad-hoc shell fault, no product defect, no code
+churn.
+
+### Owner interventions — the zero-ping metric
+
+`owner_intervention` fires when a pane notified `owner_prompt`/`blocker` resumes with
+positive proof that no wake for it was delivered: the owner acted by hand.
+
+```
+2026-09-05   7      2026-09-09   3
+2026-09-06  19      2026-09-10   3
+2026-09-07  51      2026-09-11   7
+2026-09-08  47      2026-09-12   0      last 24h: 0
+```
+
+**Zero is real, not a dead meter.** The precondition is busy: 131 `owner_prompt`/`blocker`
+notifications in the last 48h, 122 of them with a delivered wake. The detector is
+unchanged since before 09-09 (`git log --since=2026-09-09` on `closed_loop_wake.py` and
+`agent_watch.py` is empty). It fires on RESUME, and the only two undelivered prompts from
+today belong to panes that have not resumed yet — so today's zero is not yet evidence of
+success either. Those two are the pending test.
+
+### The nine undelivered prompts, resolved per episode
+
+Counting per event overstates the gap. Resolved individually:
+
+| shape | n | outcome |
+|---|---|---|
+| coalesced into a newer actionable event | 3 | 2 successors delivered; 1 (today) hit `assistant_still_generating` |
+| `cdp_error:WebSocketTimeoutException` | 5 | all five on 09-11, genuinely undelivered |
+| allowed send, no delivery verdict ever | 1 | `ev47842`, silent |
+
+Coalescing is correct behaviour, not a hole: `superseded_by_newer_actionable_same_agent`,
+with the successor carrying the wake. So the real 48h gap is 5 CDP timeouts on one bad
+night plus one silent send, not nine.
+
+### CDP timeouts are collapsing
+
+```
+09-05 154   09-07  92   09-09 14   09-11 38
+09-06 101   09-08  54   09-10  9   09-12 10
+```
+
+Down roughly fifteen-fold across the week, with a bump on 09-11 that accounts for all five
+undelivered prompts above.
+
+### The one residual worth naming
+
+Six allowed sends in seven days produced no delivery verdict at all — no `wake_delivery`
+row, delivered or failed. They are invisible to the 88/85/80% delivery figures because a
+missing row is not a failed row. Six in a week is small, but it is the one shape that can
+hide: everything else either delivers, records a reason, or is audited as coalesced.
+Not investigated further this turn; recorded so it is not rediscovered from scratch.
+
+### No new owner gate
+
+Nothing here needs approval. The two standing gates are unchanged: push the local commits,
+and the two `ai-runtime` restarts for the identity-provenance deploy.
