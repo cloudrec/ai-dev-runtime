@@ -135,3 +135,115 @@ def test_the_summary_blames_the_dependency_not_owner_os():
 def test_the_healthy_summary_is_unambiguous():
     rp.check(probe=_ok, now=1000.0)
     assert "OK" in rp.summary_line(rp.status(now=1000.0))
+
+
+# ── the periodic watch: speak on CHANGE, never per tick ─────────────────────
+class _Emit:
+    def __init__(self): self.calls = []
+    def __call__(self, source, type, **kw):
+        self.calls.append({"source": source, "type": type, **kw}); return {"event_id": len(self.calls)}
+
+
+def test_a_multi_day_outage_is_two_messages_not_hundreds():
+    """The incident lasted four days. At a 120s tick that is 2880 chances to shout.
+
+    This is the same noise failure removed from the stall doctor earlier the same day:
+    a standing condition must announce itself once, not on every poll.
+    """
+    emit = _Emit()
+    t = 1000.0
+    rp.watch_once(probe=_ok, emit_fn=emit, now=t)          # healthy
+    for i in range(40):                                     # ~80 minutes of outage
+        t += 120
+        rp.watch_once(probe=_down, emit_fn=emit, now=t)
+    broken = [c for c in emit.calls if c["type"] == "reverse_path_broken"]
+    assert len(broken) == 1, f"the outage was announced {len(broken)} times"
+    t += 120
+    rp.watch_once(probe=_ok, emit_fn=emit, now=t)           # recovery
+    rec = [c for c in emit.calls if c["type"] == "reverse_path_recovered"]
+    assert len(rec) == 1, f"recovery announced {len(rec)} times"
+
+
+def test_the_broken_alert_carries_what_the_owner_needs():
+    emit = _Emit()
+    rp.watch_once(probe=_ok, emit_fn=emit, now=1000.0)
+    rp.watch_once(probe=_down, emit_fn=emit, now=2000.0)
+    a = [c for c in emit.calls if c["type"] == "reverse_path_broken"][0]
+    assert a["severity"] == "critical" and a["owner_action_required"] is True
+    assert "seo" in a["payload"]["depends_on"]
+    assert a["payload"]["last_ok_at"], "must say since when"
+    assert "core is separate" in a["action_taken"]
+
+
+def test_a_steady_healthy_path_says_nothing_at_all():
+    emit = _Emit()
+    t = 1000.0
+    for _ in range(20):
+        t += 120
+        rp.watch_once(probe=_ok, emit_fn=emit, now=t)
+    assert [c for c in emit.calls if c["type"] == "reverse_path_broken"] == []
+    # the first transition from "never probed" to ok is a recovery from unknown, once
+    assert len([c for c in emit.calls if c["type"] == "reverse_path_recovered"]) <= 1
+
+
+def test_a_flapping_path_reports_each_real_transition():
+    """Suppression must not hide a path that is genuinely coming and going."""
+    emit = _Emit()
+    t = 1000.0
+    for probe in (_ok, _down, _ok, _down, _ok):
+        t += 120
+        rp.watch_once(probe=probe, emit_fn=emit, now=t)
+    assert len([c for c in emit.calls if c["type"] == "reverse_path_broken"]) == 2
+
+
+def test_watch_once_reports_whether_it_changed():
+    emit = _Emit()
+    first = rp.watch_once(probe=_ok, emit_fn=emit, now=1000.0)
+    again = rp.watch_once(probe=_ok, emit_fn=emit, now=1120.0)
+    assert first["changed"] is True and again["changed"] is False
+    assert again["previous_state"] == "ok"
+
+
+def test_the_watch_loop_offloads_its_probe_to_a_thread():
+    """The probe is a blocking socket read in the process serving the MCP control path.
+
+    Two worker ticks were found running blocking work on the event loop earlier this
+    same session; this asserts by parsing the body that this one does not join them.
+    """
+    import ast, inspect, textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(rp.watch_loop)))
+    calls = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and n.func.attr == "to_thread"]
+    assert calls, "watch_loop runs its blocking probe on the event loop"
+
+
+def test_a_clean_start_does_not_announce_a_recovery():
+    """Found by the outage test emitting two recoveries on a run with one outage.
+
+    unknown -> ok is what EVERY service start looks like. Calling it a recovery tells
+    the owner something was fixed when nothing had broken — a restart-triggered lie,
+    and the fastest way to teach someone to ignore the channel.
+    """
+    emit = _Emit()
+    rp.watch_once(probe=_ok, emit_fn=emit, now=1000.0)
+    assert [c for c in emit.calls if c["type"] == "reverse_path_recovered"] == []
+    assert [c for c in emit.calls if c["type"] == "reverse_path_broken"] == []
+
+
+def test_recovery_after_the_watch_was_interrupted_mid_outage_is_still_announced():
+    """The opposite trap: suppressing unknown -> ok must not swallow a REAL recovery.
+
+    If the watch stops during an outage its verdict goes stale, so the first probe after
+    it resumes sees unknown -> ok. A failure is on record with no success after it, so
+    that is genuine news and must be said.
+    """
+    emit = _Emit()
+    rp.watch_once(probe=_ok, emit_fn=emit, now=1000.0)       # good
+    rp.watch_once(probe=_down, emit_fn=emit, now=2000.0)     # breaks
+    # ... watch stops; the verdict ages past STALE_AFTER_SECS ...
+    later = 2000.0 + rp.STALE_AFTER_SECS + 60
+    assert rp.status(now=later)["state"] == "unknown"
+    rp.watch_once(probe=_ok, emit_fn=emit, now=later)        # resumes, and it is back
+    rec = [c for c in emit.calls if c["type"] == "reverse_path_recovered"]
+    assert len(rec) == 1, "a real recovery was swallowed by the stale-start guard"

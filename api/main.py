@@ -206,6 +206,29 @@ async def _start_project_supervisor():
 
 
 @app.on_event("startup")
+async def _start_reverse_path_watch():
+    # Says out loud when the CHATGPT -> OWNER OS direction dies. Owner OS reaches the
+    # chat through its own browser and depends on nobody; the chat reaches Owner OS only
+    # through the `seo` containers (nginx :8088 -> seo-backend -> this API). On
+    # 2026-09-13 that half had been down four days: all 15 wakes delivered, zero acted
+    # on, and every self-check green because Owner OS itself was fine. The owner found
+    # out from a 502 in the chat.
+    #
+    # Speaks only on a CHANGE of verdict, so a multi-day outage is two messages rather
+    # than 720 a day. Reports and never repairs: raising the `seo` stack is the owner's
+    # decision, its worker having last exited 137 (OOM).
+    import asyncio
+    try:
+        from core.control_plane.reverse_path import watch_loop as _rp_loop
+        from core.control_plane.cto import emit as _emit
+        asyncio.create_task(_rp_loop(
+            log=lambda level, msg: getattr(logger, level, logger.info)(msg),
+            emit_fn=_emit))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"reverse path watch not started: {e}")
+
+
+@app.on_event("startup")
 async def _start_context_budget():
     # Context budget / checkpoint / rotation: tracks conversation size + phase for every
     # registered critical agent (read-only, durable), writes an ATOMIC verified checkpoint

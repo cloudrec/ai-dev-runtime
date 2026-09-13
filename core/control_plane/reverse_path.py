@@ -225,3 +225,99 @@ def summary_line(st: Optional[dict] = None) -> str:
         return (f"reverse control path BROKEN since {since} — ChatGPT cannot control "
                 f"agents. Dependency: {st['depends_on']}. Owner OS core is separate.")
     return f"reverse control path UNKNOWN — {st.get('reason')}"
+
+
+# ── the periodic watch ───────────────────────────────────────────────────────
+WATCH_INTERVAL_SECS = int(os.getenv("REVERSE_PATH_WATCH_SECS", "120"))
+WATCH_ENABLED = os.getenv("REVERSE_PATH_WATCH_ENABLED", "1") not in ("0", "", "false", "no")
+
+
+def _is_real_recovery(before: dict) -> bool:
+    """Did this `ok` follow something that was actually broken?
+
+    The first probe after a service start goes unknown -> ok, and announcing that as a
+    RECOVERY would mean every restart telling the owner something was fixed when nothing
+    had broken. A test caught exactly that: a clean run emitted two recoveries.
+
+    A prior `unknown` still counts when a failure is on record with no success after it —
+    that is the stale-after-outage case, where the watch was interrupted mid-incident and
+    the recovery is genuine news.
+    """
+    prev = before.get("state")
+    if prev == "broken":
+        return True
+    if prev != "unknown":
+        return False
+    fail, ok = before.get("last_failure_at"), before.get("last_ok_at")
+    return bool(fail) and (not ok or fail > ok)
+
+
+def watch_once(*, probe: Optional[Callable[[], tuple]] = None, emit_fn=None,
+               log=None, conn=None, now: Optional[float] = None) -> dict:
+    """One cycle: probe, persist, and speak ONLY when the verdict changes.
+
+    Speaking on change rather than on every tick is not politeness, it is the whole
+    design. This condition lasts days — the incident it was written for lasted four —
+    so a per-tick alert would be 720 identical messages a day into the owner's Telegram,
+    which is the noise problem removed from the stall doctor earlier in the same session.
+    One message when it breaks, one when it recovers.
+
+    The alert reaches the owner even while the reverse path is down, because Telegram and
+    the wake browser do not route through `seo`. That asymmetry is the reason this is
+    worth emitting at all rather than only logging.
+    """
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        before = status(conn=conn, now=now)
+        st = check(probe=probe, conn=conn, now=now)
+        changed = before.get("state") != st.get("state")
+        if changed and emit_fn is not None:
+            if st["state"] == "broken":
+                emit_fn(
+                    "reverse_path", "reverse_path_broken", severity="critical",
+                    owner_action_required=True,
+                    payload={"channel": st["channel"], "depends_on": st["depends_on"],
+                             "detail": st.get("detail"), "last_ok_at": st.get("last_ok_at"),
+                             "probe_url": st["probe_url"]},
+                    action_taken=summary_line(st)[:400],
+                    dedup_key="reverse_path_broken", dedup_window_secs=86400,
+                    # inbox + owner push, but NEVER through the path being reported on
+                    conn=conn)
+            elif st["state"] == "ok" and _is_real_recovery(before):
+                emit_fn(
+                    "reverse_path", "reverse_path_recovered", severity="info",
+                    owner_action_required=False,
+                    payload={"channel": st["channel"],
+                             "was_down_since": before.get("last_ok_at"),
+                             "detail": st.get("detail")},
+                    action_taken=summary_line(st)[:400],
+                    dedup_key="reverse_path_recovered", dedup_window_secs=3600,
+                    conn=conn)
+        if changed and log is not None:
+            log("warning" if st["state"] != "ok" else "info", summary_line(st))
+        return {**st, "changed": changed, "previous_state": before.get("state")}
+    finally:
+        if own:
+            conn.close()
+
+
+async def watch_loop(log=None, emit_fn=None, sleep=None) -> None:
+    """Background watch. Started from `api/main.py` alongside the other loops."""
+    import asyncio
+    log = log or (lambda level, msg: None)
+    sleep = sleep or asyncio.sleep
+    if not WATCH_ENABLED:
+        log("info", "reverse path watch disabled (REVERSE_PATH_WATCH_ENABLED=0)")
+        return
+    log("info", f"reverse path watch started (every {WATCH_INTERVAL_SECS}s, "
+                f"probing {REVERSE_PATH_URL})")
+    while True:
+        try:
+            # to_thread: the probe is a blocking socket read and this shares a process
+            # with the MCP control path. Two worker ticks were found on the event loop
+            # earlier in this same session; this one does not join them.
+            await asyncio.to_thread(watch_once, emit_fn=emit_fn, log=log)
+        except Exception as e:  # noqa: BLE001 — a watcher must never kill the daemon
+            log("warning", f"reverse path watch error: {type(e).__name__}: {e}")
+        await sleep(WATCH_INTERVAL_SECS)
