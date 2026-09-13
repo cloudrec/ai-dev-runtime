@@ -1505,18 +1505,38 @@ def record_abandoned_wakes(conn=None, now: Optional[float] = None) -> list:
         conn.execute(_SUBMIT_SCHEMA)
         conn.execute(_DELIVERY_SCHEMA)
         conn.execute(_ABANDON_SCHEMA)
+        conn.execute(_EXPIRE_SCHEMA)
+        # ACKNOWLEDGEMENT IS NOT A VERDICT. This query used to carry
+        # `AND a.acknowledged=0`, which quietly made acknowledgement an exit from the
+        # obligation to record an outcome: `acknowledge()` is called from four places
+        # (the companion on verified delivery, `_retire_crash_alerts`, the stall doctor,
+        # and the API), and only the first of them implies the wake was delivered. A
+        # submitted wake acknowledged by any of the other three left wake_audit,
+        # wake_send and wake_submitted rows with no terminal verdict anywhere — invisible
+        # to delivery percentages, because a missing row is not a failed row.
+        #
+        # Event 38297 is the shape: submitted 11:43:26, acknowledged 11:44:24 by another
+        # path 58 seconds later, and thereafter permanently outside this sweep — its
+        # three-hour window could never be reached. 16 events sat in that state.
+        #
+        # So the predicate is now the presence of a TERMINAL RECORD, not the state of the
+        # doorbell: delivered, already abandoned, or expired. Expiry must be excluded
+        # explicitly now that `acknowledged=0` no longer does it by side effect, or an
+        # expired wake would be terminalised twice under two different names.
         rows = conn.execute(
-            "SELECT a.event_id, a.ts, e.ts_epoch FROM wake_audit a "
+            "SELECT a.event_id, a.ts, e.ts_epoch, a.acknowledged FROM wake_audit a "
             "LEFT JOIN event e ON e.id = a.event_id "
-            "WHERE a.decision='wake' AND a.acknowledged=0 "
+            "WHERE a.decision='wake' "
             "AND a.superseded_by IS NULL "
             "AND EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
             "AND NOT EXISTS (SELECT 1 FROM wake_delivery d "
             "                WHERE d.event_id=a.event_id AND d.delivered=1) "
-            "AND NOT EXISTS (SELECT 1 FROM wake_abandoned b WHERE b.event_id=a.event_id)"
+            "AND NOT EXISTS (SELECT 1 FROM wake_abandoned b WHERE b.event_id=a.event_id) "
+            "AND NOT EXISTS (SELECT 1 FROM wake_expire_audit x "
+            "                WHERE x.event_id=a.event_id)"
         ).fetchall()
         out = []
-        for event_id, decision_ts, event_ts_epoch in rows:
+        for event_id, decision_ts, event_ts_epoch, acknowledged in rows:
             decision_age = now - float(decision_ts or 0)
             event_age = (now - float(event_ts_epoch)) if event_ts_epoch is not None else None
             age = event_age if event_age is not None else decision_age
@@ -1525,10 +1545,17 @@ def record_abandoned_wakes(conn=None, now: Optional[float] = None) -> list:
             last = conn.execute(
                 "SELECT reason FROM wake_delivery WHERE event_id=? ORDER BY id DESC LIMIT 1",
                 (int(event_id),)).fetchone()
+            # Two shapes, kept apart so the audit says which happened. The wake that was
+            # never acknowledged simply ran out of time; the wake that WAS acknowledged
+            # had its doorbell switched off by something that had no delivery evidence,
+            # which is the more interesting failure and should not hide inside the older
+            # name.
+            reason = ("submitted_delivery_unproven" if not acknowledged
+                      else "acknowledged_without_delivery_proof")
             conn.execute(
                 "INSERT OR IGNORE INTO wake_abandoned "
                 "(event_id,ts,at,reason,last_delivery_reason,age_secs) VALUES (?,?,?,?,?,?)",
-                (int(event_id), now, now_iso(), "submitted_delivery_unproven",
+                (int(event_id), now, now_iso(), reason,
                  (last[0] if last else "") or "", age))
             # Same retirement mechanism expire_stale uses: the doorbell stops, the
             # event stays fully readable in the durable CTO inbox. It was already
@@ -1537,7 +1564,7 @@ def record_abandoned_wakes(conn=None, now: Optional[float] = None) -> list:
             conn.execute("UPDATE wake_audit SET acknowledged=1, acknowledged_at=? "
                          "WHERE event_id=? AND decision='wake'", (now_iso(), int(event_id)))
             out.append({"event_id": int(event_id),
-                        "reason": "submitted_delivery_unproven",
+                        "reason": reason,
                         "last_delivery_reason": (last[0] if last else "") or "",
                         "age_secs": int(age)})
         if out:

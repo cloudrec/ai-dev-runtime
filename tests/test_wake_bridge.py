@@ -1084,3 +1084,156 @@ def test_an_unknown_agent_with_an_empty_registry_still_fails_closed(monkeypatch)
     monkeypatch.setattr(ns, "SELF_PROJECT", "ai-dev-runtime", raising=False)
     monkeypatch.setattr(ns, "_project_for_target", lambda t, **kw: "", raising=False)
     assert wb.is_self_agent("stranger:0.0", "stranger") is False
+
+
+# ── acknowledgement is not a verdict ─────────────────────────────────────────
+# The abandonment sweep carried `AND a.acknowledged=0`, which made acknowledgement an
+# exit from the obligation to record an outcome. `acknowledge()` has four callers and
+# only ONE of them — the companion, on verified delivery — implies the wake arrived;
+# `_retire_crash_alerts`, the stall doctor and the API all switch the doorbell off with
+# no delivery evidence at all. A wake acknowledged by one of those three left wake_audit,
+# wake_send and wake_submitted rows behind and no terminal verdict anywhere, so it was
+# invisible to every delivery percentage — a missing row is not a failed row.
+#
+# Event 38297 is the shape: submitted 2026-09-07T11:43:26, acknowledged 11:44:24 by
+# another path 58 seconds later, and from then on permanently outside the sweep, because
+# its three-hour window could not be reached. 16 events were in that state on the live
+# database when this was found.
+
+def _submitted_then_acknowledged(event_id, *, at):
+    """Submitted, never delivered, and acknowledged by something that is not the
+    companion — the exact hole. No delivery row of either polarity."""
+    _wake(event_id, now=at)
+    wb.mark_submitted(event_id, source="companion", now=at)
+    wb.acknowledge(event_id, now=at + 58)
+
+
+def test_an_acknowledged_wake_with_no_delivery_proof_still_reaches_a_verdict():
+    t = 20000.0
+    _submitted_then_acknowledged(101, at=t)
+    out = wb.record_abandoned_wakes(now=t + wb.MAX_WAKE_AGE_SECS + 1)
+    assert [o["event_id"] for o in out] == [101], out
+    assert [a["event_id"] for a in wb.abandoned_wakes()] == [101]
+
+
+def test_the_two_shapes_are_told_apart_in_the_record():
+    """Ran out of time vs had its doorbell switched off without evidence. The second is
+    the more interesting failure and must not hide inside the older name."""
+    t = 21000.0
+    _submitted_but_failed(102, at=t)              # never acknowledged
+    # far enough after the first that should_wake is not in cooldown, or the second
+    # event is recorded as a skip and never enters the sweep at all
+    t2 = t + wb.MAX_WAKE_AGE_SECS
+    _submitted_then_acknowledged(103, at=t2)      # acknowledged by another path
+    out = {o["event_id"]: o["reason"]
+           for o in wb.record_abandoned_wakes(now=t2 + wb.MAX_WAKE_AGE_SECS + 1)}
+    assert out[102] == "submitted_delivery_unproven"
+    assert out[103] == "acknowledged_without_delivery_proof"
+
+
+def test_a_delivered_wake_is_still_never_abandoned_though_it_is_acknowledged_too():
+    """The companion acknowledges on success. Dropping `acknowledged=0` from the query
+    must not start abandoning the deliveries that worked."""
+    t = 22000.0
+    _wake(104, now=t)
+    wb.mark_submitted(104, source="companion", now=t)
+    wb.record_delivery("companion", event_id=104, delivered=True,
+                       reason="submitted_and_assistant_started_generating", now=t)
+    wb.acknowledge(104, now=t)
+    assert wb.record_abandoned_wakes(now=t + wb.MAX_WAKE_AGE_SECS + 1) == []
+    assert wb.abandoned_wakes() == []
+
+
+def test_an_expired_wake_is_not_terminalised_a_second_time():
+    """`acknowledged=0` used to exclude expiries by side effect. Now that it is gone the
+    exclusion must be explicit, or one event ends up carrying two different terminal
+    names for the same stop."""
+    t = 23000.0
+    _wake(105, now=t)
+    later = t + wb.MAX_WAKE_AGE_SECS + 1
+    expired = wb.expire_stale(now=later)          # not submitted, so expiry owns it
+    assert [e["event_id"] for e in expired] == [105], expired
+    assert wb.record_abandoned_wakes(now=later + 10) == []
+    assert wb.abandoned_wakes() == []
+
+
+def test_the_acknowledged_case_is_recorded_once_and_never_re_offered():
+    t = 24000.0
+    _submitted_then_acknowledged(106, at=t)
+    later = t + wb.MAX_WAKE_AGE_SECS + 1
+    first = wb.record_abandoned_wakes(now=later)
+    second = wb.record_abandoned_wakes(now=later + 10)
+    assert len(first) == 1 and second == [], "recorded twice"
+    d = wb.should_wake(event_id=106, severity="critical", now=later + 20)
+    assert d["wake"] is False and d["reason"] == "already_woke_for_this_event"
+
+
+def test_it_is_still_left_alone_inside_its_window():
+    """Fail-closed must not mean impatient: an acknowledged wake may still be proven."""
+    t = 25000.0
+    _submitted_then_acknowledged(107, at=t)
+    assert wb.record_abandoned_wakes(now=t + 60) == []
+    assert wb.abandoned_wakes() == []
+
+
+def test_a_superseded_wake_is_still_the_successors_problem_not_this_sweeps():
+    """Coalescing already gives the event a home; abandoning it as well would double
+    count one episode and overstate the gap — which is how nine 'undelivered' prompts
+    turned out to be five."""
+    t = 26000.0
+    _wake(108, now=t)
+    wb.mark_submitted(108, source="companion", now=t)
+    wb.acknowledge(108, now=t + 10)
+    import os, sqlite3
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    try:
+        c.execute("UPDATE wake_audit SET superseded_by=999 WHERE event_id=108")
+        c.commit()
+    finally:
+        c.close()
+    assert wb.record_abandoned_wakes(now=t + wb.MAX_WAKE_AGE_SECS + 1) == []
+
+
+def test_every_submitted_wake_ends_somewhere():
+    """The invariant the whole sweep exists for, stated once: after the window closes,
+    a submitted wake is delivered, expired, superseded, or abandoned — never nothing.
+
+    The three events are spaced a full window apart on purpose. Bunched at one
+    timestamp, should_wake refuses the second and third for cooldown, they are recorded
+    as skips, and this test passes against the very bug it exists to catch — which is
+    exactly what the first draft of it did.
+    """
+    t = 27000.0
+    w = wb.MAX_WAKE_AGE_SECS
+    _submitted_but_failed(110, at=t)                    # -> abandoned (unacknowledged)
+    _submitted_then_acknowledged(111, at=t + w)         # -> abandoned (acknowledged)
+    _wake(112, now=t + 2 * w)                           # -> delivered
+    wb.mark_submitted(112, source="companion", now=t + 2 * w)
+    wb.record_delivery("companion", event_id=112, delivered=True,
+                       reason="submitted_and_assistant_started_generating", now=t + 2 * w)
+    import os, sqlite3
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    try:
+        c.execute(wb._EXPIRE_SCHEMA)
+        decided = {r[0] for r in c.execute(
+            "SELECT event_id FROM wake_audit WHERE decision='wake'")}
+    finally:
+        c.close()
+    assert {110, 111, 112} <= decided, \
+        f"setup did not produce three wake decisions ({decided}) — the assertion below "\
+        f"would hold vacuously"
+    wb.record_abandoned_wakes(now=t + 3 * w)
+    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
+    try:
+        stranded = c.execute(
+            "SELECT a.event_id FROM wake_audit a "
+            "WHERE a.decision='wake' AND a.superseded_by IS NULL "
+            "AND EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
+            "AND NOT EXISTS (SELECT 1 FROM wake_delivery d "
+            "                WHERE d.event_id=a.event_id AND d.delivered=1) "
+            "AND NOT EXISTS (SELECT 1 FROM wake_abandoned b WHERE b.event_id=a.event_id) "
+            "AND NOT EXISTS (SELECT 1 FROM wake_expire_audit x "
+            "                WHERE x.event_id=a.event_id)").fetchall()
+    finally:
+        c.close()
+    assert stranded == [], f"submitted wakes with no terminal verdict: {stranded}"
