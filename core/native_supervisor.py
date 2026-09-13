@@ -131,6 +131,19 @@ CREATE INDEX IF NOT EXISTS ix_native_sup_target ON native_supervision (target, t
 -- 2026-09-13, answering "Нет." to each. The event path's PK is correct and unchanged —
 -- one decision per event is the point there — so the fix is to stop pretending an idle
 -- decision is event zero.
+-- Deregistration was unrecorded. `purge_denied` deletes rows and RETURNS them, and its
+-- only production caller — inside `auto_register` — discards the return value, so a
+-- supervised target could stop being supervised with nothing durable saying when, by
+-- which rule, or what its project was. On 2026-09-14 the registered set went from 26 to
+-- 7 within an hour with no companion restart, and the question "what removed them" had
+-- no answer available anywhere in the system: the only evidence would have been the rows
+-- that were deleted. An append-only line per removal costs almost nothing and makes that
+-- question a single query next time.
+CREATE TABLE IF NOT EXISTS native_supervision_dereg (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ts_epoch REAL, target TEXT,
+    project TEXT, by TEXT, reason TEXT);
+CREATE INDEX IF NOT EXISTS ix_native_sup_dereg_target
+    ON native_supervision_dereg (target, ts_epoch);
 CREATE TABLE IF NOT EXISTS native_supervision_idle (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ts_epoch REAL, target TEXT,
     action TEXT, reason TEXT, ok INTEGER, detail TEXT);
@@ -396,6 +409,37 @@ def refresh_known_projects(agents: list, conn=None) -> list:
             conn.close()
 
 
+def _record_dereg(conn, target: str, project: str, by: str, reason: str) -> None:
+    """One append-only line per removal. Never raises: losing the audit is bad, losing
+    the removal it describes is worse, and a purge must not fail because of its log."""
+    try:
+        conn.execute(
+            "INSERT INTO native_supervision_dereg "
+            "(ts,ts_epoch,target,project,by,reason) VALUES (?,?,?,?,?,?)",
+            (now_iso(), now_ts(), target, project or "", by, reason))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def deregistrations(conn=None, limit: int = 50, target: str = "") -> list:
+    """Why a target stopped being supervised, newest first."""
+    conn, own = _conn(conn)
+    try:
+        if target:
+            rows = conn.execute(
+                "SELECT ts,target,project,by,reason FROM native_supervision_dereg "
+                "WHERE target=? ORDER BY id DESC LIMIT ?", (target, int(limit))).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT ts,target,project,by,reason FROM native_supervision_dereg "
+                "ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+        return [{"at": r[0], "target": r[1], "project": r[2], "by": r[3], "reason": r[4]}
+                for r in rows]
+    finally:
+        if own:
+            conn.close()
+
+
 def purge_stale(agents: list, conn=None) -> list:
     """Drop auto-registrations whose pane no longer holds a live agent.
 
@@ -422,11 +466,17 @@ def purge_stale(agents: list, conn=None) -> list:
         return []
     conn, own = _conn(conn)
     try:
-        rows = [r[0] for r in conn.execute(
-            "SELECT target FROM native_supervised_target WHERE by='auto-discovery'")
-            if r[0] not in live]
-        for t in rows:
+        rows = [(r[0], r[1] or "") for r in conn.execute(
+            "SELECT target, COALESCE(project,'') FROM native_supervised_target "
+            "WHERE by='auto-discovery'") if r[0] not in live]
+        for t, proj in rows:
             conn.execute("DELETE FROM native_supervised_target WHERE target=?", (t,))
+            try:
+                _record_dereg(conn, t, proj, "purge_stale",
+                              "pane_no_longer_holds_a_live_agent")
+            except Exception:  # noqa: BLE001 — the audit must never abort the removal
+                pass
+        rows = [t for t, _ in rows]
         if rows:
             conn.commit()
         return rows
@@ -472,11 +522,18 @@ def purge_denied(conn=None) -> list:
     on every pass — a denylist change takes effect without anyone remembering to clean up."""
     conn, own = _conn(conn)
     try:
-        rows = [r[0] for r in conn.execute(
+        rows = [(r[0], r[1] or "") for r in conn.execute(
             "SELECT target, COALESCE(project,'') FROM native_supervised_target")
             if r[1] in AUTO_REGISTER_DENY_PROJECTS or target_denied(r[0])]
-        for t in rows:
+        for t, proj in rows:
             conn.execute("DELETE FROM native_supervised_target WHERE target=?", (t,))
+            try:
+                _record_dereg(conn, t, proj, "purge_denied",
+                              "deny_listed_target" if target_denied(t)
+                              else f"deny_listed_project:{proj}")
+            except Exception:  # noqa: BLE001 — the audit must never abort the removal
+                pass
+        rows = [t for t, _ in rows]
         if rows:
             conn.commit()
         return rows

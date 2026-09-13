@@ -1177,3 +1177,79 @@ def test_a_reused_target_name_is_re_examined_rather_than_inherited(monkeypatch):
     ns.auto_register([reborn], conn=conn)
     assert "recycled:0.0" not in ns.registered_targets(conn=conn)
     assert ns.is_supervised("recycled:0.0", conn=conn) is False
+
+
+# ── a target that stops being supervised must say so somewhere ───────────────
+# `purge_denied` deletes rows and RETURNS them; its only production caller, inside
+# `auto_register`, discards the return value. So supervision could end with nothing
+# durable recording when, under which rule, or with what project. On 2026-09-14 the
+# registered set went from 26 to 7 inside an hour with no companion restart, and the
+# question "what removed them" had no answer available anywhere — the only evidence
+# would have been the rows that had just been deleted.
+
+def test_a_denied_purge_leaves_a_durable_line():
+    conn, _ = ns._conn()
+    _register(conn, "victim:0.0", project="email")          # email is deny-listed
+    assert ns.purge_denied(conn=conn) == ["victim:0.0"]
+    log = ns.deregistrations(conn=conn)
+    assert len(log) == 1
+    assert log[0]["target"] == "victim:0.0"
+    assert log[0]["by"] == "purge_denied"
+    assert "email" in log[0]["reason"]
+    assert log[0]["project"] == "email", "the project it had is the thing you cannot recover after"
+
+
+def test_a_stale_purge_says_which_rule_removed_it():
+    conn, _ = ns._conn()
+    _register(conn, "gone:0.0", project="p")
+    ns.purge_stale([_agent()], conn=conn)
+    log = ns.deregistrations(conn=conn, target="gone:0.0")
+    assert log and log[0]["by"] == "purge_stale"
+    assert log[0]["reason"] == "pane_no_longer_holds_a_live_agent"
+
+
+def test_the_two_rules_are_told_apart_in_the_log():
+    """Which rule fired is the whole question when a registered set shrinks.
+
+    The denied target is LIVE, so only the denylist can remove it; the other pane is
+    gone, so only the stale rule can. Registering both as dead would have had
+    purge_stale take both and the test would prove nothing — which is what its first
+    draft did.
+    """
+    conn, _ = ns._conn()
+    _register(conn, "cp-canary:0.0", project="xmrig")     # live pane, denied project
+    _register(conn, "dead:0.0", project="p")              # pane gone
+    ns.purge_stale([_agent()], conn=conn)
+    ns.purge_denied(conn=conn)
+    by = {e["target"]: e["by"] for e in ns.deregistrations(conn=conn)}
+    assert by == {"cp-canary:0.0": "purge_denied", "dead:0.0": "purge_stale"}, by
+
+
+def test_a_purge_that_removes_nothing_writes_nothing():
+    conn, _ = ns._conn()
+    _register(conn, "cp-canary:0.0", project="p")
+    ns.purge_denied(conn=conn)
+    ns.purge_stale([_agent()], conn=conn)
+    assert ns.deregistrations(conn=conn) == []
+
+
+def test_the_log_never_blocks_the_removal(monkeypatch):
+    """Losing the audit is bad; losing the removal it describes is worse."""
+    conn, _ = ns._conn()
+    _register(conn, "victim:0.0", project="email")
+    monkeypatch.setattr(ns, "_record_dereg",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("disk")))
+    try:
+        removed = ns.purge_denied(conn=conn)
+    except RuntimeError:
+        pytest.fail("a failing audit must not abort the purge")
+    assert removed == ["victim:0.0"]
+    assert "victim:0.0" not in ns.registered_targets(conn=conn)
+
+
+def test_the_log_is_append_only_across_repeated_removals():
+    conn, _ = ns._conn()
+    for i in range(3):
+        _register(conn, f"v{i}:0.0", project="email")
+        ns.purge_denied(conn=conn)
+    assert len(ns.deregistrations(conn=conn)) == 3

@@ -3405,3 +3405,84 @@ identified what removed those 19 rows. Worth a look before trusting registration
 
 Seven local commits unpushed. The denylist change and the reconciliation both need the
 companion restarted to take effect. Both declined by the owner, so parked by decision.
+
+---
+
+## Root cause of the 26 → 7: I did it, and "local until restart" was wrong (2026-09-14 02:00 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off.
+
+### Proven
+
+`hooks/owneros_hook.py:185` spawns `/root/ai-dev-runtime/tools/native_supervise_once.py`
+on **Stop, StopFailure, SubagentStop, TaskCompleted, TeammateIdle and Notification** —
+every turn boundary of every agent on this box. That script is a **fresh Python process**
+that does `sys.path.insert(0, "/root/ai-dev-runtime")`, imports `core.native_supervisor`
+and calls `ns.scan()`. `scan()` → `auto_register()` → `purge_stale()`.
+
+So the `purge_stale` I wrote earlier in that same turn went live **the moment the file was
+saved**, ran against the production `control_plane.db`, and deleted exactly the
+registrations whose panes were gone. The seven survivors are precisely the seven live
+panes — `purge_stale`'s predicate, verbatim.
+
+Corroboration: `native_supervision_dereg`, the table added minutes ago, already **exists
+in the live database with 0 rows**. Nothing I ran could have created it — my reads use
+`mode=ro`. A hook-spawned process running my working-tree code created it.
+
+### The correction, which matters more than the incident
+
+I have said several times this session that local commits are "inert until a restart".
+That is true of the two long-running daemons and **false for anything the hooks spawn**.
+On this box an edit to `core/` is a production change with no deploy step: the next agent
+turn anywhere picks it up. `ns.scan()` also SENDS continuations, so a bad edit to that
+module can write into panes immediately.
+
+Everything I called "local and reversible" this session that touched `core/` should be
+read with that caveat. The specific claims about `agent_orchestrator` and `wake_bridge`
+happen to hold, because their code paths run only inside `ai-runtime` and the companion —
+but the reasoning I gave for them was wrong, and it would not hold for the next module.
+
+### What is NOT affected
+
+The `diamond` denylist default is still ineffective, exactly as reported. The hook process
+calls `_load_runtime_env()`, which loads the same env file the companion uses, and that
+file sets `NATIVE_SUPERVISOR_DENY_PROJECTS=capacity,auction,payment-orchestrator,payorch,
+email,xmrig,mess` — no `diamond`, and the env overrides the code default outright.
+Verified by running the hook's own loader:
+
+```
+effective deny: ai-dev-runtime, auction, capacity, email, mess,
+                payment-orchestrator, payorch, xmrig
+diamond denied? False
+```
+
+So Auction is still being continued, and only changing that env file or the companion's
+environment stops it. That remains an owner gate.
+
+### The defect fixed
+
+The reason this took an investigation rather than a query: **deregistration was
+unrecorded**. `purge_denied` deletes rows and returns them; its only production caller
+discards the return value. A target could stop being supervised with nothing durable
+saying when, under which rule, or what project it had — and the project is the one field
+you cannot recover afterwards, since the row is gone.
+
+`native_supervision_dereg` is now written by both purge paths, one append-only line each,
+naming the rule and the project. Had it existed, "what removed those 19" would have been
+one query.
+
+Its own test caught a hole in it: the audit call was guarded inside `_record_dereg` but
+not at the call site, so a raising audit aborted the purge mid-loop. Both call sites are
+now wrapped — losing the audit is bad, losing the removal it describes is worse.
+
+A second test was too weak on first writing: it registered two dead targets, so
+`purge_stale` took both and it proved nothing about telling the rules apart. It now uses
+one live-but-denied target and one dead one, so each rule fires exactly once.
+
+Six new tests. Suite 3296 passed.
+
+### Gate
+
+Seven local commits unpushed. Stopping the Auction continuations needs the runtime env
+file or the companion environment changed, and a companion restart to pick it up — both
+owner calls.
