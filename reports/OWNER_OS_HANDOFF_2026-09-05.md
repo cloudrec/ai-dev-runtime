@@ -2991,3 +2991,46 @@ reverse-path watch `ok` 21s into its 120s tick.
 than the tree, by 536s and 341s. That is the detector working, not a fault: these edits
 are deliberately undeployed. Deploying them needs a restart, which is an owner gate, and
 the discovery change ships with the COMPANION.
+
+---
+
+## Deployed: provenance and evidence-gated retirement (2026-09-13 15:25 UTC)
+
+Owner typed "пушь и перезапускай оба". Pushed `c7b013c`, `origin` verified equal, zero
+unpushed. Both units restarted: `ai-runtime` PID 3519192, `owner-os-wake-companion`
+PID 3519164. `worker_skew()` went from two stale workers to `[]`.
+
+**Identity provenance is being written.** Baseline before restart: table absent. After the
+first discovery sweep, 13 rows, every one `runtime`-sourced — matching the 13 of 15 live
+panes measured by hand earlier. The two panes with no runtime session id got no row at
+all, which reads as unknown, which is the fail-closed answer.
+
+**Nothing was bulk-closed.** Open critical `agent_process_failed`: 89 before, **89 after**.
+Exactly as designed — discovery records provenance for live panes only, so the panes that
+died before this deploy will never have a row and can never satisfy the rule. The rule is
+forward-looking, and today it correctly did nothing.
+
+**Delivery fingerprints are being written.** First live one, 15:22:29:
+
+```
+nativesup:49366  hostsecure-clean-resumed:0.0  e28c50cb85bd432e
+                 actor=native_supervisor  source=claude_hook
+```
+
+The native supervisor continued that pane, and the turn it wrote is now attributable. The
+hash is stored, never the text.
+
+**The classifier refuses to over-claim, live.** Against the production store, on the pane
+that just received an automated continuation:
+
+```
+"пушь и перезапускай оба"                        -> unknown   authority=False
+"Continue the remaining safe Owner OS work now." -> unknown   authority=False
+"approved by the owner"                          -> unknown   authority=False
+```
+
+and the line it produces says why: *no record that Owner OS delivered it, which is NOT
+evidence a human did.*
+
+Health after: `/health` 200 in 20ms, reverse-path watch `ok` 39s into its 120s tick, both
+units active.
