@@ -247,16 +247,36 @@ def all_records() -> list[dict]:
 _REAPED_STATES = ("vanished", "ended")
 
 
-def reap_vanished(live_sessions, emit=None) -> list:
-    """Reconcile records whose tmux session has VANISHED (no live pane).
+_TARGET_RE = _re.compile(r"^.+:\d+\.\d+$")
+
+
+def reap_vanished(live_sessions, emit=None, live_targets=None) -> list:
+    """Reconcile records whose pane is gone.
 
     Atomically transitions each such record to `vanished` (guarded so a concurrent
     sweep / restart can never double-process it) and, ONLY when it carried approved
     unfinished work, invokes `emit(agent_key, session, info)` exactly once. Never
-    recreates an agent and never touches a live pane. `live_sessions` is the set of
-    sessions that currently have a live agent pane.
+    recreates an agent and never touches a live pane.
+
+    Reconciling by SESSION alone misses a pane that dies inside a session that keeps
+    running. `hostsecure-clean:1.0` died on 2026-09-13 at 09:37 — `agent_watch` saw it
+    and raised a critical `agent_process_failed` — but window 0 of `hostsecure-clean`
+    was still alive, so the session was in `live_sessions`, this reaper skipped the
+    record, and it sat at state `working` for hours. A dead agent reporting `working`
+    is the one state nothing looks for: the reaper will not touch it, and no one is
+    told its work is unfinished.
+
+    `live_targets` closes that. When supplied, a record whose key is pane-shaped
+    (`session:window.pane`) must ALSO be present among live panes. Omitted, behaviour
+    is exactly what it was, and an empty inventory still reaps nothing — absence of
+    evidence is not evidence of death.
     """
     live = set(live_sessions or [])
+    # An EMPTY pane set is not proof that every pane died — it is a failed or racing
+    # inventory read, and acting on it would reap every pane-shaped record at once.
+    # Treated as "no pane evidence", which falls back to the session rule. The caller
+    # guards this too; the function must be safe called directly.
+    targets = set(live_targets) if live_targets else None
     conn = _db()
     try:
         rows = conn.execute(
@@ -264,7 +284,13 @@ def reap_vanished(live_sessions, emit=None) -> list:
         ).fetchall()
         reaped = []
         for agent_key, session, state, goal, task in rows:
-            if session in live or state in _REAPED_STATES:
+            if state in _REAPED_STATES:
+                continue
+            session_alive = session in live
+            pane_alive = True
+            if targets is not None and _TARGET_RE.match(agent_key or ""):
+                pane_alive = agent_key in targets
+            if session_alive and pane_alive:
                 continue
             # approved unfinished work = had a goal/task and was not already finished.
             had_work = bool(goal or task) and state not in ("completed", "failed")
@@ -806,6 +832,8 @@ def refresh_and_resolve(approve: bool = True) -> dict:
         # Derive live sessions from the actual panes; only reconcile when we have a
         # real inventory (never mass-reap on a transient empty/failed read).
         live_sessions = {a.get("session") for a in live_agents if a.get("session")}
+        # Panes too, not only sessions: a window can die inside a session that lives on.
+        live_targets = {a.get("target") for a in live_agents if a.get("target")}
         if not live_agents:
             raise RuntimeError("empty inventory — skip reaping")
 
@@ -818,7 +846,8 @@ def refresh_and_resolve(approve: bool = True) -> dict:
             escalations.append({"agent": agent_key, "project": cfg.get("project") or session,
                                 "event": "agent_vanished_unfinished", "reason": info})
 
-        reaped = reap_vanished(live_sessions, emit=_emit_vanished)
+        reaped = reap_vanished(live_sessions, emit=_emit_vanished,
+                               live_targets=live_targets)
         if reaped:
             resolved.append({"event": "sessions_reaped", "count": len(reaped),
                              "sessions": [r["session"] for r in reaped]})

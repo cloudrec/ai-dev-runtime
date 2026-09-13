@@ -3034,3 +3034,76 @@ evidence a human did.*
 
 Health after: `/health` 200 in 20ms, reverse-path watch `ok` 39s into its 120s tick, both
 units active.
+
+---
+
+## Self-project zero-ping reconciled, and a dead pane that still said "working" (2026-09-13 16:10 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. Local
+commit only; nothing pushed, no service restarted, both live databases verified unchanged.
+
+### The self-project loop closes, measured
+
+`owner-os-opus-final:0.0` is deliberately outside the native supervisor
+(`is_supervised` False, `send_block_reason` `not_registered`, `SELF_PROJECT`
+`ai-dev-runtime` on the denylist) — the recursion guard. The compensating path is the
+external supervisor over the reverse channel, and it is working:
+
+- 8 of the last 8 wakes for this pane delivered
+  (`submitted_and_assistant_started_generating`, no failures).
+- 8 of the last 12 delivered wakes are followed by a continuation whose idempotency key
+  names the event, `actor=api:bearer`, round trip **1.2 to 5.1 minutes**.
+
+The 4 without a continuation were delivered to the chat and not acted on. Their payloads
+say `class=quiescent`, `at_rest_unchanged_for_358s` — and a pane running a 15-minute
+pytest looks exactly like that from outside, since the bottom region does not move. So
+whether the supervisor correctly declined to interrupt live work, or dropped a real
+prompt, is **not decidable from this data** and is not claimed either way here.
+
+### The bookkeeping defect: reaping by session cannot see a dead window
+
+`agent_orchestrator` had `hostsecure-clean:1.0` at state **`working`** — the pane that
+died at 09:37 and holds open critical alert 48674. Every other dead record is `vanished`.
+
+`reap_vanished` reconciled by SESSION. `hostsecure-clean:1.0` lives in session
+`hostsecure-clean`, whose window 0 is still alive, so the session was in `live_sessions`,
+the record was skipped, and it stayed `working`. `agent_watch` got this right — it tracks
+tmux targets and raised the crash alert — but the orchestrator's reaper is coarser.
+
+A dead agent reporting `working` is the one state nothing looks for: the reaper will not
+touch it, and nobody is told its work is unfinished. Exactly the shape of stale
+bookkeeping that hides unfinished orchestration.
+
+Fixed by also reconciling against live PANES. A record whose key is pane-shaped
+(`session:window.pane`) must be present among live targets. Omit `live_targets` and
+behaviour is byte-for-byte what it was.
+
+An empty pane set is treated as **no evidence**, not as "every pane died" — the first
+version reaped every pane-shaped record when handed an empty set, which is a mass-reap on
+a failed inventory read. Caught by its own test.
+
+### Proven against real state
+
+Dry run on a copy of `agent_control.db`, live database verified unchanged afterwards
+(`hostsecure-clean:1.0` still reads `working` in production):
+
+```
+before  working 6, waiting_input 4, idle 3, waiting_owner 1, vanished 140
+reaped  ['hostsecure-clean:1.0']   working -> vanished
+after   working 5, waiting_input 4, idle 3, waiting_owner 1, vanished 141
+```
+
+Exactly one record, and no owner event: it carried no goal or task, so
+`had_approved_unfinished_work` is False and nothing false-alarms.
+
+### No stale GOAL_COMPLETE
+
+Checked: no record in any state resembling `GOAL_COMPLETE` /
+`GOAL_COMPLETE_WAITING_EXTERNAL` is outstanding. The stale bookkeeping was the `working`
+row above, not a completion marker.
+
+### State
+
+Suite 3273 passed; focused set across reaper, orchestrator, plan, provenance and
+reconcile: 87 passed. New tests fail against the unfixed module. Nothing deployed — this
+ships with the runtime, which is a restart, which is an owner gate.
