@@ -2593,3 +2593,94 @@ own browser, so it is not mine to do. Everything cheaper has been done.
 other sessions' running pytest processes (2156078 holds `governance.db-wal` in
 `pytest-1097`). Only four two-day-old dirs were removed, each `lsof`-checked first; that
 reclaimed 16 MB of disk and zero RAM.
+
+---
+
+## Event 48674 — the vanished pane is accounted for, and the obvious fix is a regression (2026-09-13 10:35 UTC)
+
+An automated instruction was received via the Owner OS API to trace whether a vanished
+agent pane is fully accounted for and whether its alert clears after recovery. Not owner
+sign-off. Read-only against the runtime; two local doc commits, nothing pushed, no service
+touched, no process killed, no agent created.
+
+### What happened
+
+`hostsecure-clean:1.0` died mid-work. Event **48674** `agent_process_failed`, critical,
+`owner_action_required=1`, 09:37:22 UTC. Its conversation `08c1a936-…` is alive right now
+under `hostsecure-clean-resumed:0.0` (PID 2188971, `claude --resume 08c1a936-…`), a pane
+discovered at 09:35:06 — **two minutes before** the death alert.
+
+### Accounting: clean
+
+Every `wake_loop_watch` row for the dead target is `resolved=1` (48674, 48647, 48342).
+The alert paged exactly once — `notification` 9721 `state=sent`, `receipt telegram:646`
+lineage, `attempts=0` — and cannot re-page inside its 86400s dedup window. Nothing leaked
+and nothing is re-paging. Notifications posture is green, 23 CDP deliveries in the last
+hour.
+
+### The alert never clears — and that is correct
+
+`_reconcile_recovered_crash` retires a crash alert only when THE SAME target is observed
+alive again. `hostsecure-clean:1.0` never comes back; the work moved to a different pane.
+So the alert stands. Eight such alerts are open across the history.
+
+The obvious repair is to retire T's crash alert when another agent shares T's
+`conversation_id`. **That repair is wrong, and the runtime proves it live:**
+
+```
+hostsecure-clean:0.0            cwd=/opt/hostsecure   no runtime session id
+                                cwd-fallback id -> 08c1a936-7785-4b6d-a604-2eae1f914f94
+hostsecure-clean-resumed:0.0    cwd=/opt/hostsecure   runtime id 08c1a936-…
+```
+
+A live pane with no runtime session id inherits, from the per-directory fallback, the
+session id of a *different* pane. Three panes in `/opt/hostsecure` carry one id. Had the
+resumed pane died, its real crash alert would have been retired by a neighbour that merely
+shares a directory.
+
+The stored history says the same. Among the eight open alerts, two pairs point at each
+other as one another's "successor" — `mess-ru-go:0.0` ↔ `mess-ru-final:0.0`, and
+`security-demo:0.0` ↔ `security-demo-next:0.0` — so the naive rule would have each real
+crash silence the other.
+
+This is the regression `discovery.py` already documents removing (event 18172), and the
+reason its `same_process` pid gate exists. A `claude --resume` is a new pid, so that gate
+correctly refuses to call a resume a rename. There is also an ordering gap behind it —
+the rename branch requires the old target to be absent already, while a resume opens the
+new pane first — but fixing the ordering alone would change nothing, because the pid gate
+would still refuse.
+
+### Measured, so the gap is precise, not guessed
+
+13 of 15 live panes get a strong per-pid runtime session id and **none of the 13 collide**.
+Two panes (`audit:0.0`, `hostsecure-clean:0.0`) have no runtime id and fall back to the
+per-directory guess. Strong identity is the norm; the collision hazard is confined to that
+fallback.
+
+The registry stores `conversation_id` without recording **which source produced it**. That
+is the whole defect: with provenance, "a live agent holds this dead pane's session" is
+decidable and the alert can retire itself; without it, no downstream rule can separate a
+resume from a directory collision, and provenance cannot be recovered after the fact.
+
+### Why no code was written
+
+Recording provenance is a schema plus discovery-write change, inert until deployed, and
+the retirement rule it enables is the part with a history of silencing real crashes. I am
+not willing to write that rule blind, against data that does not exist yet, in the one
+module already burned by exactly this. Writing it would not be a safe local fix; it would
+be an unvalidated one. The honest state is: diagnosed, mechanism proven live, fix
+specified, not built.
+
+### Cost of leaving it
+
+Eight stale criticals in the default `recent_alerts` view. They page once and never again,
+so the cost is a reader seeing a critical process failure for a project whose conversation
+is working — misleading, not load-bearing. No manual intervention is required by any of
+them today.
+
+### Owner gate
+
+The next real action is a deploy: add identity provenance to the registry, then let the
+crash alert retire itself when a live pane provably holds the dead pane's session. Both
+halves need `ai-runtime` restarted to take effect, and the rule needs live observation
+before it can be trusted. Restart and push both remain owner gates.
