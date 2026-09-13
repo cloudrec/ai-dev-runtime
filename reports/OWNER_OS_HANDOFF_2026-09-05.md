@@ -2414,3 +2414,81 @@ Nothing in Owner OS. The only open item is Cloudflare/DNS plus the deferred
 `MESS_DOWNLOAD_ORIGIN`, which belong to the peer `mess` session and lie outside this
 repository.
 
+---
+
+# OWNER OS DEPENDS ON THE `seo` PROJECT — 2026-09-13
+
+The architectural fact this session paid to learn. The owner asked it directly —
+"овнер ос что зависит ещё от кого то?" — and the answer is yes, for half of its function.
+
+## Two channels, failing independently
+
+```
+outbound  wake    companion -> CDP browser (:9222) -> the chat      depends on NOBODY
+inbound   control chat -> nginx :8088 -> seo-backend -> API :8199   depends on `seo`
+```
+
+Owner OS listens only on `172.17.0.1:8199`, an internal address. It has no entrance of
+its own. Everything the supervisor sends — `agent_status`, `agent_read`, `agent_send` —
+physically traverses the `seo` containers.
+
+## What that produced
+
+`seo-frontend-1`, `seo-backend-1`, `seo-postgres-1`, `seo-redis-1` all `Exited` four days
+earlier; `seo-worker-1` `Exited (137)`, an OOM kill. Nothing was listening on :8088.
+
+```
+wakes delivered      15/15   the browser path, unaffected
+continuations        0       since 2026-09-12, and no api:bearer row at all
+wake watches         14      every one closed pane_awaiting_owner
+Owner OS /health     200 in 9ms, the entire time
+```
+
+Every alarm reached the supervisor and not one could be acted on. Owner OS reported
+itself healthy and was telling the truth. The owner discovered it by hitting a 502 in
+the chat.
+
+**Diagnosis order that would have been faster:** the owner's report was "ChatGPT says
+Owner OS unavailable". Two hours were spent fixing a real but unrelated slowness
+(`/api/v1/agents` at 13.4s, commit `46a6d3f`) before checking WHO was calling. Four
+requests were arriving; they were all from `84.247.139.105`, not the connector's
+`172.20.0.2`. Checking the source address first would have found this immediately.
+**When a client reports a service unreachable, establish whether the client is arriving
+at all before optimising what happens when it does.**
+
+## Secondary couplings to `seo`
+
+* runtime job reports are written to `/opt/seo/reports/runtime/` (`RUNTIME_REPORT_DIR`);
+* model routing references the dispatcher in `/opt/seo/backend`.
+
+## The monitor — `4242ec1`, committed, NOT running
+
+`core/control_plane/reverse_path.py` answers the question no existing check asked: can
+the supervisor still reach us? It probes :8088, so it exercises nginx and the backend
+behind it. `notifications_status` and `observability_summary` cannot see this: they
+describe Owner OS, and Owner OS was fine.
+
+It names the dependency in the alert and states that Owner OS core is separate, so the
+next reader does not begin by suspecting this repo. It never restarts or mutates `seo` —
+a test asserts the remediation text contains no "restart", because the worker died of
+OOM and raising the stack on this host is a decision with consequences. It fails closed:
+no probe, a probe older than 15 minutes, or an unreadable store all read `unknown` or
+`broken`, never `ok`.
+
+```
+live now      ok, http_200 in 79ms
+dead port     broken, "unreachable:URLError"
+502 shape     broken, "upstream_error:502"
+```
+
+**Nothing runs it.** Wiring it into the service cycle changes live behaviour and is an
+owner decision. Until then it is a function that must be called by hand.
+
+## Open
+
+* **Push** — `4242ec1` and this entry are local only.
+* **Service-cycle integration** — otherwise the monitor exists and never fires, which
+  is the same silence it was written to end.
+* The `seo` stack is up again (owner instruction "поднимай seo"); its containers were
+  started, nothing in that project was modified.
+
