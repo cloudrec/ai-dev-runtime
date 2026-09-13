@@ -566,6 +566,58 @@ _MODE_PLAN_RE = re.compile(r"\bplan mode on\b", re.I)
 NONSTALL_MODES = ("auto", "accept_edits")
 
 
+# How far back from the end of a transcript to look for the last submitted message.
+# The last user line is normally within a few KB of the end; this is generous by orders
+# of magnitude while still bounding the work to a constant instead of file length.
+TRANSCRIPT_TAIL_BYTES = int(os.getenv("AGENT_TRANSCRIPT_TAIL_BYTES", str(4 * 1024 * 1024)))
+
+
+def _scan_back_for_user_text(blob: bytes) -> str:
+    """Last submitted user text in a JSONL blob, scanning from its end."""
+    import json as _json
+    for raw in reversed(blob.split(b"\n")):
+        if not raw.strip():
+            continue
+        try:
+            d = _json.loads(raw.decode("utf-8", "replace"))
+        except Exception:  # noqa: BLE001 — a torn line is not a reason to give up
+            continue
+        if d.get("type") != "user":
+            continue
+        m = d.get("message") or {}
+        c = m.get("content")
+        t = c if isinstance(c, str) else " ".join(
+            x.get("text", "") for x in (c or []) if isinstance(x, dict))
+        if (t or "").strip():
+            return t.strip()
+    return ""
+
+
+def _last_user_text_from_tail(path: str) -> str:
+    """The last submitted user text in a JSONL transcript, reading only its tail."""
+    import json as _json
+    try:
+        size = os.path.getsize(path)
+        start = max(0, size - TRANSCRIPT_TAIL_BYTES)
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            if start:
+                fh.readline()          # discard the partial line the seek landed inside
+            chunk = fh.read()
+        hit = _scan_back_for_user_text(chunk)
+        if hit or start == 0:
+            return hit
+        # Nothing in the tail. That happens on a pane whose agent has produced megabytes
+        # of output since the human last spoke — measured on a live 41MB transcript where
+        # the last user line sat beyond the window. Falling back to "" there would SILENTLY
+        # change classification for exactly the longest-running agents, so pay the full
+        # read in that rare case and stay bit-identical to the old behaviour.
+        with open(path, "rb") as fh:
+            return _scan_back_for_user_text(fh.read())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def last_submitted_text(cwd: str) -> str:
     """The most recent message actually SUBMITTED in this project's Claude conversation.
 
@@ -581,22 +633,17 @@ def last_submitted_text(cwd: str) -> str:
         files = sorted(glob.glob(proj + "/*.jsonl"), key=os.path.getmtime)
         if not files:
             return ""
-        last = ""
-        with open(files[-1], "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                try:
-                    d = _json.loads(line)
-                except Exception:  # noqa: BLE001
-                    continue
-                if d.get("type") != "user":
-                    continue
-                m = d.get("message") or {}
-                c = m.get("content")
-                t = c if isinstance(c, str) else " ".join(
-                    x.get("text", "") for x in (c or []) if isinstance(x, dict))
-                if (t or "").strip():
-                    last = t.strip()
-        return last
+        # Read BACKWARDS. The answer is the LAST matching line, so parsing the file
+        # forwards means JSON-decoding the entire transcript to reach it. Measured
+        # 2026-09-13, with Owner OS effectively unavailable to the MCP client: one
+        # `agent_list` was decoding 85,343 JSON lines and taking 4.6s locally / 16.3s
+        # through the API, and `agent_list` is this control plane's most-called
+        # function. Transcripts only grow, so this got worse every day.
+        #
+        # Bounded: only the tail is examined. Past that this returns "" and the caller
+        # stays conservative, which is the same contract the docstring already gives for
+        # an unreadable transcript.
+        return _last_user_text_from_tail(files[-1])
     except Exception:  # noqa: BLE001
         return ""
 
