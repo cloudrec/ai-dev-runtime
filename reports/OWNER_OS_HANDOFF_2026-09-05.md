@@ -2684,3 +2684,107 @@ The next real action is a deploy: add identity provenance to the registry, then 
 crash alert retire itself when a live pane provably holds the dead pane's session. Both
 halves need `ai-runtime` restarted to take effect, and the rule needs live observation
 before it can be trusted. Restart and push both remain owner gates.
+
+---
+
+## Post-approval deploy checklist — identity provenance + self-clearing crash alerts (2026-09-13 10:50 UTC)
+
+An automated instruction was received via the Owner OS API to prepare this. Not owner
+sign-off. Nothing below has been built, pushed or deployed.
+
+### Correction to the section above: 89, not 8
+
+That section said "eight stale criticals". Wrong — it counted only the alerts with a
+same-conversation row inside a 40-row window. The real numbers, whole table:
+
+```
+130 agent_watch agent_process_failed events ever
+ 89 still open in the default alert view (no invalid overlay)
+```
+
+So the noise surface is an order of magnitude larger than reported, and the earlier
+"misleading, not load-bearing" judgement was made against the wrong denominator. It is
+still true that none of them re-page; it is no longer true that they are a minor cosmetic
+detail.
+
+### The two changes, in dependency order
+
+**A. Record where a conversation id came from.** `_identity_of` returns the runtime's
+per-pid `sessionId` when it has one and a per-directory guess when it does not, and the
+registry stores the result without saying which. Add `conversation_id_source` to `agent`
+(`runtime` | `cwd_fallback` | `""`), set it in `_identity_of`/`register_agent`. No
+backfill: every existing row stays `""`, which must never satisfy rule B. Inert on its
+own — it changes no behaviour, which is exactly why it deploys first and alone.
+
+**B. Let a crash alert retire itself when the session is provably alive elsewhere.**
+Retire target T's open `agent_process_failed` only when ALL of:
+
+1. T is absent from the live inventory (still dead);
+2. T's `conversation_id` is non-empty and its source is `runtime`;
+3. exactly ONE live agent L carries that same id, and L's source is also `runtime`;
+4. L is not T.
+
+Any other count — zero matches, two matches, either side `cwd_fallback` or `""` — leaves
+the alert standing. Fail closed: an alert wrongly left open is noise, an alert wrongly
+retired is a death nobody hears about.
+
+**Not `mark_invalid`.** Its contract is "retire a PROVEN-FALSE alert", and these alerts
+are true: the pane really did die. Retiring them under that reason would corrupt the one
+overlay the audit trail depends on. B needs its own retirement kind — superseded by
+resumption — plus a `resolves=<crash event id>` event naming the successor.
+
+### The negative control is already on this host
+
+`hostsecure-clean:0.0` is live, sits in `/opt/hostsecure`, has **no** runtime session id,
+and its cwd fallback yields `08c1a936-…` — the session id of a different pane. Three
+panes, one id. Rule 3 rejects it because its source is `cwd_fallback`, so it must never
+retire anything. If it ever does, B is wrong and comes straight back out.
+
+Measured on the live host: 13 of 15 panes have a runtime id and none of the 13 collide;
+`audit:0.0` and `hostsecure-clean:0.0` have none. Re-probed five times each — the absence
+is stable, not a timing flake.
+
+### Deploy order
+
+1. Push (owner gate). Verify `origin` hash equals local.
+2. Deploy A alone. `systemctl restart ai-runtime` (owner gate) — B must not be in this
+   restart.
+3. Watch one full discovery cycle. Confirm new registrations carry a source and that the
+   two fallback panes are marked `cwd_fallback`, not `runtime`.
+4. Only then deploy B, second restart.
+5. `wake_bridge.worker_skew()` must return `[]` after each restart — the wake companion is
+   a separate unit and has twice this session been left running stale code.
+
+### Live-observation success criteria for B
+
+Sharp and falsifiable, computed against today's live state — **exactly two** alerts retire:
+
+```
+48674  hostsecure-clean:1.0    -> hostsecure-clean-resumed:0.0   (live, runtime id)
+36542  mess-ru-54582145:0.0    -> mess-ru-54582145-resumed:0.0   (live, runtime id)
+```
+
+and **87 stay open**, including every one of these, which must not move:
+
+- `mess-ru-go:0.0` ↔ `mess-ru-final:0.0` and `security-demo:0.0` ↔
+  `security-demo-next:0.0` — mutual pairs; both halves dead, so rule 1 or 3 fails. If
+  either pair silences itself, B is silencing real crashes and comes out.
+- the three `arbitrage2-fable*` alerts — three-way same-id collision, rule 3 fails.
+- anything retired with a `cwd_fallback` or `""` source on either side. Must be zero.
+
+**Back it out if:** any retirement names a fallback-sourced pane; the retired count on the
+first sweep is anything but 2; or a target retires while still present in the inventory.
+
+**Only then** is the count allowed to fall further, and only as genuinely resumed sessions
+appear. A drop from 89 toward zero in one sweep is a bug, not a success.
+
+### Verification state at the time of writing
+
+- Three local commits (`08c52fd`, `69b6449`, `9541518`) are docs-only: `git diff --name-only
+  6ae132a..HEAD` outside `reports/` is empty. Tracked tree clean, 34 untracked files all
+  under `reports/`.
+- Focused suite for every module in scope — reverse path, agent watch, crash false
+  positives, rename-not-crash, watcher, discovery, closed-loop wake, stall doctor —
+  **281 passed**.
+- No deploy skew: last code commit `a96b64e` at 11:40:31, `ai-runtime` restarted 11:41:30,
+  no `.py` under `core/ api/ tools/` newer than that start, `worker_skew()` returns `[]`.
