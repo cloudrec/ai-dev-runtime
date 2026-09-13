@@ -3219,3 +3219,40 @@ Unchanged and owner-decided: two local commits unpushed, and activation of the s
 needs a restart. The owner said not to restart and not to push, so this is parked by
 decision, not blocked. No other unresolved zero-ping or control-plane item is actionable
 without one of those two.
+
+---
+
+## Event 49732 closed; the provenance sidecar is now recording this pane's own instructions (2026-09-13 18:10 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. Read-only
+verification plus this note. No live database, pane or service touched.
+
+49732 needed nothing — it had already closed itself:
+
+```
+18:04:12  event 49732   quiescent, at_rest_unchanged_for_311s
+18:04:57  wake_send     allowed          18:04:59  submitted
+18:05:19  wake_delivery delivered=1      conversation 6a967789-…  (route owner-os)
+18:05:21  wake_loop_watch resolved=1  pane_awaiting_owner  rewoken=0  escalated=0
+```
+
+67 seconds wake to delivery. No re-wake, no escalation.
+
+**First fingerprinted delivery to this pane.** The continuation that carried this
+instruction is recorded as `event-49732-safe-hold-20260913`, `actor=api:bearer`,
+`172.20.0.4 ua=python-httpx/0.27.0`, **fingerprinted: True**. The sidecar deployed at
+15:21 is now capturing the self-project's own inbound instructions, which is what makes
+them distinguishable from owner input at all.
+
+**The draft, classified.** `classify_turn("owner-os-opus-final:0.0", "пушь и
+перезапускай оба")` returns `unknown`, `is_owner_authority=False`,
+reason `no_matching_delivery`.
+
+Worth being exact about what that does and does not establish. It does **not** say the
+draft is not the owner's — `unknown` never says that, by design. It says only that Owner
+OS has no record of delivering it. The reason it is not being acted on is separate and
+stronger: the owner's last typed message on the subject asked why a restart was wanted at
+all, and was answered that none is needed. That is the standing decision.
+
+**Holding on the gate.** Three local commits unpushed; the stale-row activation needs a
+restart. Both are owner calls and both were declined. Nothing else is actionable.
