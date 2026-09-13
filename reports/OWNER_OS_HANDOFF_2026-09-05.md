@@ -19,7 +19,7 @@ were verified.
 | | |
 |---|---|
 | Branch | `ai-runtime/220-windows-bridge` |
-| HEAD | `9177606` — **3 unpushed** docs commits (`105f731`, `3f009d5`, `9177606`); push is an owner gate |
+| HEAD | `08c52fd` — **1 unpushed** docs commit (`08c52fd`); push is an owner gate. `origin` is at `6ae132a`. This row was last `9177606`/3-unpushed on 09-05 and is corrected here on 09-13 because the header claims current facts; the dated sections below are the history. |
 | Upstream | `origin/ai-runtime/220-windows-bridge` |
 | Tracked tree | clean |
 | Untracked | 34 files, all under `reports/` — preserve, never `git add reports/`; every commit below staged EXPLICIT paths |
