@@ -3332,3 +3332,76 @@ record, and it is not re-poked only because the pane is gone.
 
 Unchanged. Five local commits unpushed; the fix is inert until the wake companion is
 restarted, since the sweep runs there. Both declined by the owner, so parked by decision.
+
+---
+
+## Auction denied by its real key; registration stops being write-only (2026-09-14 01:15 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. Local
+commits only. `/opt/diamond` untouched, no pane written to, no live database mutated,
+nothing pushed or restarted.
+
+### The denylist now spells the key the registry uses
+
+`AUTO_REGISTER_DENY_PROJECTS`'s code default gains `diamond`. `auction` stays — it costs
+nothing and is the name the project is discussed by. This is restrictive only: it removes
+autonomy, never grants it, and one word reverts it.
+
+**It is inert until the wake companion restarts.** The sweep runs there, and that process
+has been up since 17:21 on the previous build. Read from its own environment:
+
+```
+NATIVE_SUPERVISOR_TARGETS=*
+NATIVE_SUPERVISOR_DENY_PROJECTS=capacity,auction,payment-orchestrator,payorch,email,xmrig,mess
+NATIVE_SUPERVISOR_DENY_TARGETS=mess-postsignup-cleanup-sonnet-v4:0.0
+```
+
+No `diamond` anywhere, and the env overrides the code default outright. So **the poking
+continues until either the companion restarts on the new default or `diamond` is added to
+that environment variable.** Both are the owner's. Saying otherwise would be claiming a
+fix that is not running.
+
+### Correction to the instruction's premise
+
+`hostsecure-clean:0.0` is **not** supervised — `is_supervised` returns False and it never
+registered, because `auto_register` already refuses a pane that is not a live agent. The
+target that IS wrongly supervised is `hostsecure-clean:1.0`, the pane that died at 09:37.
+
+### Registration was write-only
+
+`auto_register` refuses a dead pane, but nothing ever removed a row once a pane went away.
+A dead row cannot be poked, since the sweep iterates live agents — the harm is that tmux
+target names are REUSED. A new agent at a previously-registered address is supervised on
+the old row, and the old row's `project` is what both `registered_targets` and
+`purge_denied` read the denylist against. A pane recycled into a deny-listed project would
+stay supervised on the strength of what it used to host. That is fail-open.
+
+Two additions: `purge_stale` drops auto-registrations whose pane no longer holds a live
+agent, and `refresh_known_projects` re-reads the project of the rows that survive, before
+the deny sweep runs. Order in `auto_register` is now purge_stale → refresh → purge_denied,
+so a recycled target is judged on what it is now.
+
+Fail-closed both ways: an empty or unreadable inventory purges nothing, and only
+`auto-discovery` rows are touched, so a deliberate registration is never silently
+withdrawn. The recycled-target case was found by its own test failing — the first version
+kept the stale row because the pane was live.
+
+Six new tests, all six failing against HEAD. Suite 3290 passed.
+
+### Something I cannot explain, recorded rather than smoothed over
+
+Early in this turn `registered_targets()` returned **26** targets, 19 of them long-dead
+panes. An hour later the raw table holds **7** rows. The only code that deletes from it is
+`purge_denied`, running in the companion, which drops rows whose stored project is
+deny-listed — and the projects I sampled (`gaika-extension`, `arbitrage2-fable-audit`,
+`cp-canary-v2`) are not on its list. The companion has not restarted, and there are no
+triggers on the table.
+
+I did not cause it: the tests isolate the database by conftest and a per-file fixture, and
+the copy taken for the dry run already read 7 before that run touched anything. I have not
+identified what removed those 19 rows. Worth a look before trusting registration counts.
+
+### Gate
+
+Seven local commits unpushed. The denylist change and the reconciliation both need the
+companion restarted to take effect. Both declined by the owner, so parked by decision.

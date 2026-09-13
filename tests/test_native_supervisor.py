@@ -1071,3 +1071,109 @@ def test_a_repeatedly_poked_agent_reaches_the_cap_and_is_gated(monkeypatch):
                        "WHERE target='cp-canary:0.0' ORDER BY id DESC LIMIT 1").fetchone()
     assert row[0] == "gate" or "cap_reached" in (row[1] or "") or reasons, \
         f"expected a gate after the cap, got {row}"
+
+
+# ── the Auction project is parked, under the key the registry actually uses ──
+def test_the_auction_project_is_denied_by_its_registry_key():
+    """The list carried `auction`, the name the project is discussed by. The agent
+    registers as project `diamond` (cwd /opt/diamond), so the entry never matched and
+    the idle sweep continued it 32 times in three hours while it answered "Нет.".
+    A denylist entry has to spell the key the registry uses."""
+    assert "diamond" in ns.AUTO_REGISTER_DENY_PROJECTS
+    assert "auction" in ns.AUTO_REGISTER_DENY_PROJECTS, "the old spelling stays; it costs nothing"
+
+
+def test_a_diamond_agent_cannot_auto_register(monkeypatch):
+    conn, _ = ns._conn()
+    a = _agent(target="diamond-auction:0.0", cwd="/opt/diamond")
+    monkeypatch.setattr(ns, "_project_of", lambda x: "diamond")
+    r = ns.auto_register([a], conn=conn)
+    assert r["registered"] == []
+    assert r["skipped"] and r["skipped"][0]["why"] == "deny_listed_project"
+    assert "diamond-auction:0.0" not in ns.registered_targets(conn=conn)
+
+
+def test_an_already_registered_diamond_target_is_purged_on_the_next_pass():
+    """`purge_denied` runs on every pass so a denylist change needs no manual cleanup —
+    this is the row that exists on the live host right now."""
+    conn, _ = ns._conn()
+    conn.execute("INSERT OR REPLACE INTO native_supervised_target "
+                 "(target,project,cwd,since,since_ts,by,reason) VALUES (?,?,?,?,?,?,?)",
+                 ("diamond-auction:0.0", "diamond", "/opt/diamond", "t", 1.0,
+                  "auto-discovery", "pre-existing"))
+    conn.commit()
+    assert "diamond-auction:0.0" in ns.purge_denied(conn=conn)
+    assert ns.is_supervised("diamond-auction:0.0", conn=conn) is False
+
+
+# ── registration was write-only ─────────────────────────────────────────────
+# `auto_register` refuses a pane that is not a live agent, but nothing removed a row
+# once the pane went away: 19 of 26 registered targets were dead panes on 2026-09-14.
+# A dead row cannot be poked — the sweep iterates live agents — but tmux target names
+# are REUSED, and a new agent at an old address would be supervised on the strength of
+# the old row, with the OLD project recorded, which is what the denylist is read
+# against. That is the one way a deny-listed project could end up supervised.
+
+def _register(conn, target, project="p", by="auto-discovery"):
+    conn.execute("INSERT OR REPLACE INTO native_supervised_target "
+                 "(target,project,cwd,since,since_ts,by,reason) VALUES (?,?,?,?,?,?,?)",
+                 (target, project, "/tmp", "t", 1.0, by, "seed"))
+    conn.commit()
+
+
+def test_a_registration_whose_pane_is_gone_is_dropped():
+    conn, _ = ns._conn()
+    _register(conn, "gone:0.0")
+    _register(conn, "cp-canary:0.0")
+    dropped = ns.purge_stale([_agent()], conn=conn)      # only cp-canary:0.0 is live
+    assert dropped == ["gone:0.0"]
+    assert ns.registered_targets(conn=conn) == {"cp-canary:0.0"}
+
+
+def test_a_pane_that_is_alive_but_holds_no_agent_does_not_keep_its_registration():
+    """hostsecure-clean:0.0 exactly: the tmux window is there, the Claude in it is not."""
+    conn, _ = ns._conn()
+    _register(conn, "shell:0.0")
+    live_agent = _agent()
+    stale_shell = _agent(target="shell:0.0")
+    stale_shell["is_agent"] = False                      # window present, no Claude
+    assert ns.purge_stale([live_agent, stale_shell], conn=conn) == ["shell:0.0"]
+
+
+def test_an_empty_inventory_purges_nothing():
+    """Absence of evidence is not evidence a pane died — otherwise one failed inventory
+    read deregisters every agent on the box."""
+    conn, _ = ns._conn()
+    _register(conn, "cp-canary:0.0")
+    assert ns.purge_stale([], conn=conn) == []
+    assert ns.purge_stale([{"target": "x", "is_agent": False, "alive": True}], conn=conn) == []
+    assert "cp-canary:0.0" in ns.registered_targets(conn=conn)
+
+
+def test_a_deliberate_registration_is_never_silently_withdrawn():
+    conn, _ = ns._conn()
+    _register(conn, "owner-put-this-here:0.0", by="owner")
+    assert ns.purge_stale([_agent()], conn=conn) == []
+    assert "owner-put-this-here:0.0" in ns.registered_targets(conn=conn)
+
+
+def test_auto_register_reconciles_before_it_registers(monkeypatch):
+    """The reconcile has to run on the ordinary path, not only when called by hand."""
+    monkeypatch.setattr(ns, "_project_of", lambda a: "p")
+    conn, _ = ns._conn()
+    _register(conn, "long-dead:0.0")
+    ns.auto_register([_agent()], conn=conn)
+    assert "long-dead:0.0" not in ns.registered_targets(conn=conn)
+    assert "cp-canary:0.0" in ns.registered_targets(conn=conn)
+
+
+def test_a_reused_target_name_is_re_examined_rather_than_inherited(monkeypatch):
+    """The reason this matters. The old row said project `p`; the pane now belongs to a
+    deny-listed one. Inheriting the row would supervise it without ever asking."""
+    conn, _ = ns._conn()
+    _register(conn, "recycled:0.0", project="p")
+    reborn = _agent(target="recycled:0.0", cwd="/opt/diamond")
+    monkeypatch.setattr(ns, "_project_of", lambda a: "diamond")
+    ns.auto_register([reborn], conn=conn)
+    assert "recycled:0.0" not in ns.registered_targets(conn=conn)
+    assert ns.is_supervised("recycled:0.0", conn=conn) is False

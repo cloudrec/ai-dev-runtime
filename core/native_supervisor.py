@@ -251,10 +251,17 @@ SELF_PROJECT = os.path.basename(os.path.dirname(os.path.dirname(os.path.abspath(
 # Value-bearing and irreversible-risk projects. Env may WIDEN this; it can never narrow it
 # past SELF_PROJECT. ACAP C1/C2 · Auction value gates · payment · outbound mail · miner
 # triage.
+# `diamond` is the Auction project's REGISTRY key — `diamond-auction:0.0` runs in
+# /opt/diamond and registers as project `diamond`. The list already carried `auction`,
+# the name the project is discussed by, which never matched anything, so the agent
+# auto-registered and the idle sweep continued it 32 times in three hours on
+# 2026-09-13 while it answered "Нет." to each. A denylist entry has to spell the key
+# the registry uses, not the name people use.
 AUTO_REGISTER_DENY_PROJECTS = {
     p.strip() for p in os.getenv(
         "NATIVE_SUPERVISOR_DENY_PROJECTS",
-        "capacity,auction,payment-orchestrator,payorch,email,xmrig").split(",") if p.strip()
+        "capacity,auction,diamond,payment-orchestrator,payorch,email,xmrig").split(",")
+    if p.strip()
 } | {SELF_PROJECT}
 AUTO_REGISTER = os.getenv("NATIVE_SUPERVISOR_AUTO_REGISTER", "1") not in ("0", "false", "no")
 
@@ -322,6 +329,11 @@ def auto_register(agents: list, *, conn=None, now: Optional[float] = None,
     try:
         if not AUTO_REGISTER:
             return {"registered": [], "skipped": [{"why": "auto_register_disabled"}]}
+        # Order matters: drop rows whose pane is gone, re-read the project of the rows
+        # that remain, and only then apply the denylist — so a recycled target is judged
+        # on what it is now rather than on what it used to be.
+        purge_stale(agents, conn=conn)
+        refresh_known_projects(agents, conn=conn)
         purge_denied(conn=conn)
         known = {r[0] for r in conn.execute("SELECT target FROM native_supervised_target")}
         registered, skipped = [], []
@@ -344,6 +356,80 @@ def auto_register(agents: list, *, conn=None, now: Optional[float] = None,
             registered.append({"target": t, "project": proj})
         conn.commit()
         return {"registered": registered, "skipped": skipped}
+    finally:
+        if own:
+            conn.close()
+
+
+def refresh_known_projects(agents: list, conn=None) -> list:
+    """Re-read the project of already-registered targets from the live inventory.
+
+    tmux target names are reused. A registered address that comes back carrying a
+    DIFFERENT project keeps the old row — and the old row's `project` is what the
+    denylist is read against, by both `registered_targets` and `purge_denied`. So a
+    pane recycled into a deny-listed project stays supervised on the strength of the
+    project it used to host, without `auto_register` ever being asked again.
+
+    Refreshing before `purge_denied` runs closes that: the row now names what the pane
+    actually is, and the ordinary deny sweep removes it.
+    """
+    changed = []
+    conn, own = _conn(conn)
+    try:
+        known = {r[0]: (r[1] or "") for r in conn.execute(
+            "SELECT target, COALESCE(project,'') FROM native_supervised_target")}
+        for a in agents or []:
+            t = a.get("target") or ""
+            if not t or t not in known or not a.get("is_agent") or not a.get("alive"):
+                continue
+            proj = _project_of(a)
+            if proj and proj != known[t]:
+                conn.execute("UPDATE native_supervised_target SET project=?, cwd=? "
+                             "WHERE target=?",
+                             (proj, a.get("claude_cwd") or a.get("cwd") or "", t))
+                changed.append({"target": t, "was": known[t], "now": proj})
+        if changed:
+            conn.commit()
+        return changed
+    finally:
+        if own:
+            conn.close()
+
+
+def purge_stale(agents: list, conn=None) -> list:
+    """Drop auto-registrations whose pane no longer holds a live agent.
+
+    Registration was write-only: `auto_register` correctly refuses a pane that is not a
+    live agent, but nothing ever removed a row once the pane went away. 19 of 26
+    registered targets were dead panes on 2026-09-14 — `hostsecure-clean:1.0`,
+    `gaika-opus-v2:0.0` and the rest.
+
+    A dead row cannot be poked, since the sweep iterates live agents, so the cost is not
+    a stray continuation today. It is that tmux target names are REUSED. A new agent
+    appearing at a previously-registered address is supervised on the strength of the old
+    row, never passing `auto_register`'s checks for the project it actually belongs to
+    now — and the stale row's `project` is the OLD project, so the denylist on read and
+    `purge_denied` both evaluate the wrong one. That is fail-open, and it is the one way
+    a deny-listed project could end up supervised.
+
+    Fail-closed in both directions: an empty or unreadable inventory purges NOTHING —
+    absence of evidence is not evidence a pane died — and only `auto-discovery` rows are
+    touched, so a registration someone made deliberately is never silently withdrawn.
+    """
+    live = {a.get("target") for a in agents or []
+            if a.get("target") and a.get("is_agent") and a.get("alive")}
+    if not live:
+        return []
+    conn, own = _conn(conn)
+    try:
+        rows = [r[0] for r in conn.execute(
+            "SELECT target FROM native_supervised_target WHERE by='auto-discovery'")
+            if r[0] not in live]
+        for t in rows:
+            conn.execute("DELETE FROM native_supervised_target WHERE target=?", (t,))
+        if rows:
+            conn.commit()
+        return rows
     finally:
         if own:
             conn.close()
