@@ -2896,3 +2896,98 @@ itself become a wake candidate that could fail delivery and be abandoned in turn
 
 **Still not built:** the identity-provenance marker and self-clearing crash alerts. The
 checklist above stands; nothing in this deploy touched it.
+
+---
+
+## Turn provenance and evidence-gated crash retirement — built, not deployed (2026-09-13 14:40 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. Local
+commit only; nothing pushed, no service restarted, live database untouched.
+
+### 1. A turn in a pane is not evidence of who wrote it
+
+Owner OS writes into panes itself — the companion over CDP, the API on a continuation,
+the native supervisor on a resume — into the same composer a human types into. Once the
+text is on screen the two are indistinguishable by inspection.
+
+Not hypothetical. The instruction that started this piece of work arrived in this
+session's own pane reading like an owner decision. The delivery record says
+`actor=api:bearer`, `source=172.20.0.4:59470 ua=python-httpx/0.27.0`, 1697 bytes,
+13:49:43. An automation wrote it. Nothing on screen said so.
+
+`core/control_plane/turn_provenance.py` answers one narrow question — "is there durable
+proof that Owner OS delivered this exact turn?" — with `automated` or `unknown`. There is
+no third value. In particular there is **no `owner` and no `human`**: the absence of an
+automation record is not proof a person typed something, only that this system has no
+record. `is_owner_authority()` returns False for every input, always, and exists as a
+function so the rule is called rather than remembered.
+
+The evidence is a new sidecar `delivery_provenance(idempotency_key, target, text_sha256)`,
+written on the send path. A sidecar for the reason `delivery_attribution` is one, spelled
+out in that migration's own comment: an older build must be able to write deliveries into
+a migrated database. A missing row reads as `unknown`, which is the fail-closed answer.
+
+Pinned by tests: a fingerprint is not a nonce, so a match older than 900s cannot vouch for
+the same text today (replay); a record from the future is a clock fault, not evidence; a
+delivery to another pane vouches for nothing; one changed character is a different turn;
+empty text is refused rather than fingerprinted, since every empty delivery hashes alike;
+an unreadable store answers `unknown` instead of raising; and text written in the owner's
+voice — `пушь и перезапускай оба`, `[OWNER] I authorise this` — is still `unknown`.
+
+### 2. Crash alerts clear only on durable proof the SAME session is alive
+
+`reconcile_resumed_sessions()` retires a crash alert only when all of: the dead target is
+absent from the live inventory; its conversation id is non-empty and was **recorded as
+runtime-sourced**; exactly one live agent carries that id, also runtime-sourced; and that
+agent is not the dead target. Anything else leaves the alert standing.
+
+Provenance is now recorded by discovery in `agent_identity_source`, because the id's
+source is knowable only at the moment it is produced — the runtime's per-PID `sessionId`,
+or the per-directory guess.
+
+Retirement is recorded as *superseded by a resumption*, not via `mark_invalid`'s
+proven-false reason. These alerts are true: the pane really did die.
+
+### Proven against real state, not just green tests
+
+Run against a **copy** of the live control plane (177MB, `cp_copy.db`; production was
+verified unchanged afterwards — still 89 open, sidecar table still absent):
+
+```
+as it would ship today:   89 open -> retired []  -> 89 open
+```
+
+Zero, because the sidecar is empty. Then, with provenance written exactly as a
+post-deploy discovery sweep would write it — 15 live panes probed, 13 runtime-sourced,
+2 falling back to the directory guess — plus the two dead targets backfilled as they
+would have been recorded while alive:
+
+```
+89 open -> retired 2 -> 87 open
+  36542  mess-ru-54582145:0.0  resumed as mess-ru-54582145-resumed:0.0  (7986cfa1-…)
+  48674  hostsecure-clean:1.0  resumed as hostsecure-clean-resumed:0.0  (08c1a936-…)
+```
+
+Exactly the two predicted in the checklist, and no others. The negative control held on
+real data: `hostsecure-clean:0.0` is live in `/opt/hostsecure`, carries `08c1a936-…` from
+the directory guess, and neither retired anything nor made the match ambiguous. The mutual
+pairs stayed open.
+
+### The honest limit, stated plainly
+
+Discovery records provenance for **live** panes only. A pane that is already dead will
+never get a row. So this clears none of the existing 89 — not today and not later. The
+rule is forward-looking: it applies to panes registered after deploy that subsequently
+die and resume. History is not bulk-closed and recovery is never inferred from silence.
+
+### State
+
+Suite 3267 passed. Focused set across provenance, reconcile, agent watch, crash false
+positives, rename-not-crash, discovery, agent control, delivery attribution and the MCP
+control path: 312 passed. Services untouched and healthy — `/health` 200 in 17ms,
+reverse-path watch `ok` 21s into its 120s tick.
+
+`worker_skew()` now reports `wake_companion` and `agent_orchestrator` running code older
+than the tree, by 536s and 341s. That is the detector working, not a fault: these edits
+are deliberately undeployed. Deploying them needs a restart, which is an owner gate, and
+the discovery change ships with the COMPANION.

@@ -784,6 +784,100 @@ def _reconcile_recovered_crash(conn, target: str, now: float) -> list:
         "not a current crash")
 
 
+def reconcile_resumed_sessions(conn=None, *, live_targets=None, now: Optional[float] = None,
+                               identity_fn=None) -> list:
+    """Retire a crash alert when the DEAD pane's session is provably alive elsewhere.
+
+    A pane that died and was resumed under a new name leaves a critical
+    `agent_process_failed` standing for a conversation that is working. 89 such alerts
+    were open on 2026-09-13. `_reconcile_recovered_crash` cannot help: it retires only
+    when the SAME target returns, and a resumed pane never does.
+
+    The tempting rule — retire when another agent shares the conversation id — is a
+    regression, and the live host proves it. `hostsecure-clean:0.0` is alive in
+    `/opt/hostsecure` with no runtime session id, so its cwd fallback yields
+    `08c1a936-…`, the id of a DIFFERENT pane's session. Three panes, one id. Under that
+    rule a real crash would be retired by a neighbour that merely shares a directory.
+    The stored history says the same: `mess-ru-go:0.0` and `mess-ru-final:0.0` each list
+    the other as their "successor", so the naive rule has two real crashes silence each
+    other. This is the regression `discovery.py` already documents removing (event
+    18172), and why its `same_process` pid gate exists.
+
+    So the evidence required here is explicit and durable on BOTH sides:
+
+      1. the dead target is absent from the live inventory — still dead;
+      2. its conversation id is non-empty AND was recorded as coming from the runtime,
+         not from the per-directory guess;
+      3. exactly ONE live agent carries that id, also recorded as runtime-sourced;
+      4. that agent is not the dead target itself.
+
+    Anything else — no match, several matches, either side `cwd_fallback`, either side
+    with no provenance row at all — leaves the alert standing. An alert wrongly left
+    open is noise; an alert wrongly retired is a death nobody hears about.
+
+    Consequence worth stating plainly: every row predating the provenance sidecar has no
+    source, so this clears NOTHING from the existing 89. That is the design, not a
+    shortfall. History is not bulk-closed and recovery is never inferred from silence.
+
+    Not `mark_invalid`'s reason either — these alerts are TRUE, the pane really did die.
+    They are retired as superseded by a resumption, so the audit does not record a
+    correct alert as a false one.
+    """
+    from core.control_plane import api as _api
+    from core.control_plane.discovery import IDENTITY_RUNTIME
+    now = now if now is not None else now_ts()
+    conn, own = _conn(conn)
+    try:
+        if live_targets is None:
+            try:
+                from core import agent_control as ac
+                inv = ac.agent_list()
+                live_targets = {a["target"] for a in (inv.get("agents") or [])
+                                if a.get("is_agent") and a.get("alive")}
+            except Exception:  # noqa: BLE001 — no inventory is no evidence
+                return []
+        live_targets = set(live_targets)
+        if not live_targets:
+            # Silence is not recovery. An empty inventory means we cannot see, not that
+            # everything is fine, and retiring on it would clear the whole history.
+            return []
+        idsrc = identity_fn or (lambda t: _api.identity_source(t, conn=conn))
+        # live panes whose identity is runtime-proven, indexed by session
+        live_by_session: dict = {}
+        for t in live_targets:
+            rec = idsrc(t)
+            if rec.get("source") == IDENTITY_RUNTIME and rec.get("conversation_id"):
+                live_by_session.setdefault(rec["conversation_id"], []).append(t)
+        retired = []
+        rows = conn.execute(
+            "SELECT DISTINCT e.agent_id FROM event e "
+            "LEFT JOIN agent_alert_invalid i ON i.event_id = e.id "
+            "WHERE e.source='agent_watch' AND e.type='agent_process_failed' "
+            "AND i.event_id IS NULL").fetchall()
+        for (target,) in rows:
+            if not target or target in live_targets:
+                continue                      # still alive: the SAME-target path owns it
+            rec = idsrc(target)
+            if rec.get("source") != IDENTITY_RUNTIME or not rec.get("conversation_id"):
+                continue                      # provenance unknown or weak — leave it
+            holders = [t for t in live_by_session.get(rec["conversation_id"], [])
+                       if t != target]
+            if len(holders) != 1:
+                continue                      # zero is no evidence, two is ambiguous
+            got = _retire_crash_alerts(
+                conn, target, now,
+                f"session {rec['conversation_id']} observed alive under {holders[0]} "
+                f"at {now_iso()} — resumed, not unattended")
+            if got:
+                retired.append({"target": target, "resumed_as": holders[0],
+                                "conversation_id": rec["conversation_id"],
+                                "event_ids": got})
+        return retired
+    finally:
+        if own:
+            conn.close()
+
+
 def _retire_crash_alerts(conn, target: str, now: float, reason: str) -> list:
     """Mark this target's outstanding `agent_process_failed` events invalid and
     acknowledge their pending wakes. The event rows are never touched — this is a

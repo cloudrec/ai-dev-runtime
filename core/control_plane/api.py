@@ -223,6 +223,53 @@ def register_agent(target: str, *, session: str = "", project_id: str = "", cwd:
             conn.close()
 
 
+_IDENTITY_SOURCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS agent_identity_source (
+    target TEXT PRIMARY KEY, conversation_id TEXT, source TEXT,
+    recorded_at TEXT, recorded_ts REAL)
+"""
+
+
+def record_identity_source(target: str, *, conversation_id: str, source: str,
+                           conn=None, now: Optional[float] = None) -> None:
+    """Record WHERE a pane's conversation id came from — the runtime, or the cwd guess.
+
+    Kept beside the registry rather than inside it so a build without this code can
+    still write `agent` rows, and so an absent row is unambiguous: provenance unknown.
+    """
+    import time
+    now = now if now is not None else time.time()
+    conn, own = _c(conn)
+    try:
+        conn.execute(_IDENTITY_SOURCE_SCHEMA)
+        conn.execute(
+            "INSERT OR REPLACE INTO agent_identity_source "
+            "(target, conversation_id, source, recorded_at, recorded_ts) VALUES (?,?,?,?,?)",
+            ((target or "").strip(), conversation_id or "", source or "", now_iso(), now))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def identity_source(target: str, conn=None) -> dict:
+    """`{conversation_id, source}` for a target, or empty strings when nothing is
+    recorded. Never raises: an unreadable sidecar is the same as an absent row."""
+    conn, own = _c(conn)
+    try:
+        try:
+            conn.execute(_IDENTITY_SOURCE_SCHEMA)
+            r = conn.execute("SELECT conversation_id, source FROM agent_identity_source "
+                             "WHERE target=?", ((target or "").strip(),)).fetchone()
+        except Exception:  # noqa: BLE001
+            return {"conversation_id": "", "source": ""}
+        return {"conversation_id": (r[0] if r else "") or "",
+                "source": (r[1] if r else "") or ""}
+    finally:
+        if own:
+            conn.close()
+
+
 def set_lifecycle(target: str, lifecycle_state: str, *, duplicate_of: str = "",
                   project_id: str = "", responsible_controller: str = "", conn=None) -> None:
     conn, own = _c(conn)

@@ -25,6 +25,7 @@ Design rules this module is built on
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -364,6 +365,26 @@ def _migrate_delivery_attribution(conn: sqlite3.Connection) -> None:
         recorded_at TEXT, recorded_ts REAL)""")
 
 
+def _migrate_delivery_provenance(conn: sqlite3.Connection) -> None:
+    """Content fingerprint of what was delivered. Idempotent; safe on every open.
+
+    `delivery_attribution` answers WHO sent a delivery; nothing answered WHAT text it
+    was, so a turn sitting in a pane could not be traced back to the automation that
+    put it there. Only `bytes` and a 1200-char pane excerpt survive in `result`, and
+    neither identifies a turn.
+
+    Its own table for the reason `delivery_attribution` is one: a build that predates
+    this must be able to write deliveries into a migrated database, and this one must
+    be able to read a database that build wrote. A missing row is not an error — it is
+    the fail-closed answer, `unknown`.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS delivery_provenance (
+        idempotency_key TEXT PRIMARY KEY, target TEXT, text_sha256 TEXT,
+        recorded_at TEXT, recorded_ts REAL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_delivery_provenance_lookup "
+                 "ON delivery_provenance(target, text_sha256, recorded_ts)")
+
+
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(_db_path(), timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS deliveries (
@@ -376,6 +397,7 @@ def _db() -> sqlite3.Connection:
     # nullable columns — pre-existing rows keep reading fine with actor/source NULL, and
     # an older build writing to a migrated DB still works (named-column INSERT below).
     _migrate_delivery_attribution(conn)
+    _migrate_delivery_provenance(conn)
     # Supervisor decisions per (target, prompt hash) — persisted so the same
     # prompt is never re-processed or re-alerted after a service restart.
     conn.execute("""CREATE TABLE IF NOT EXISTS supervisor_prompts (
@@ -835,8 +857,18 @@ def _seen_delivery(key: str) -> Optional[dict]:
         conn.close()
 
 
+def text_fingerprint(text: str) -> str:
+    """The identity of a delivered turn: sha256 of its exact UTF-8 bytes.
+
+    A hash, not the text: the provenance table must be safe to read from anywhere,
+    and pane content is exactly what this codebase never copies around.
+    """
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
 def _record_delivery(key: str, target: str, action: str, result: dict,
-                     actor: Optional[str] = None, source: Optional[str] = None) -> None:
+                     actor: Optional[str] = None, source: Optional[str] = None,
+                     text_sha256: Optional[str] = None) -> None:
     """Record the delivery WITH its caller. `actor` = who asked (authenticated principal
     / declared caller), `source` = where from (client address, transport). Both are
     observability only — no safety gate reads them, and both may be None for an internal
@@ -863,6 +895,20 @@ def _record_delivery(key: str, target: str, action: str, result: dict,
                 # delivery is not.
                 try:
                     audit("delivery_attribution_failed", target, key, error=str(e)[:200])
+                except Exception:  # noqa: BLE001
+                    pass
+        # Same rule as attribution: an unfingerprinted delivery is acceptable, a failed
+        # delivery is not. An absent row reads as `unknown`, which is the safe answer.
+        if text_sha256:
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO delivery_provenance "
+                    "(idempotency_key, target, text_sha256, recorded_at, recorded_ts) "
+                    "VALUES (?,?,?,?,?)",
+                    (key, target, text_sha256, now, ts))
+            except Exception as e:  # noqa: BLE001
+                try:
+                    audit("delivery_provenance_failed", target, key, error=str(e)[:200])
                 except Exception:  # noqa: BLE001
                     pass
         conn.commit()
@@ -1812,7 +1858,8 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     }
     if rc_enter != 0:
         result["error"] = enter_err.strip()[:200]
-    _record_delivery(key, resolved, action, result, actor=actor, source=source)
+    _record_delivery(key, resolved, action, result, actor=actor, source=source,
+                     text_sha256=text_fingerprint(text))
     audit(action, resolved, key, delivered=result["delivered"], pane_changed=pane_changed,
           bytes=result["bytes"], actor=actor, source=source)
     return result

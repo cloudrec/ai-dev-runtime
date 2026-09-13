@@ -93,6 +93,35 @@ def _conversation_id(cwd: str) -> Optional[str]:
         return None
 
 
+IDENTITY_RUNTIME = "runtime"          # the process's own sessionId, per pid
+IDENTITY_CWD_FALLBACK = "cwd_fallback"  # the newest conversation in a DIRECTORY
+IDENTITY_NONE = ""
+
+
+def _identity_with_source(agent: dict, cwd: str, conversation_fn):
+    """`_identity_of`, but saying WHERE the answer came from.
+
+    The two sources are not interchangeable and nothing downstream could tell them
+    apart, because only the id was ever stored. The runtime's `sessionId` is per-PID and
+    unique per pane; the cwd guess is per-DIRECTORY, so every pane in one directory
+    carries the same value. Measured live 2026-09-13: three panes in `/opt/hostsecure`
+    all answer `08c1a936-…`, of which exactly one is really that session.
+
+    Any rule that treats "same conversation id" as "same session" is therefore only safe
+    when BOTH sides came from the runtime — which is knowable only if it is recorded at
+    the moment the answer is produced. This is that moment.
+    """
+    try:
+        from core import native_sessions
+        sid = native_sessions.session_id_for_pid(agent.get("pid"))
+        if sid:
+            return sid, IDENTITY_RUNTIME
+    except Exception:  # noqa: BLE001 — the native view never breaks discovery
+        pass
+    guess = conversation_fn(cwd) if cwd else None
+    return (guess, IDENTITY_CWD_FALLBACK) if guess else (None, IDENTITY_NONE)
+
+
 def _identity_of(agent: dict, cwd: str, conversation_fn) -> Optional[str]:
     """Who this pane IS, preferring the runtime's own answer over our inference.
 
@@ -145,7 +174,7 @@ def discover(inventory: Optional[dict] = None, *, config: Optional[dict] = None,
         target = a["target"]
         session = a.get("session") or target.split(":", 1)[0]
         cwd = a.get("claude_cwd") or a.get("cwd") or ""
-        conv = _identity_of(a, cwd, conversation_fn)
+        conv, conv_source = _identity_with_source(a, cwd, conversation_fn)
         prior = api.get_agent(target)
 
         # rename / move / restart reconciliation: a record with this conversation but a
@@ -187,6 +216,15 @@ def discover(inventory: Optional[dict] = None, *, config: Optional[dict] = None,
 
         reg = api.register_agent(target, session=session, cwd=cwd, pid=a.get("pid"),
                                  command=a.get("command"), conversation_id=conv or "")
+        # Sidecar, not a column on `agent`: an older build must be able to write that
+        # table into a migrated database and this one must read what it wrote. A missing
+        # row means "provenance unknown", which is the fail-closed answer and is exactly
+        # what every row predating this records.
+        try:
+            api.record_identity_source(target, conversation_id=conv or "",
+                                       source=conv_source)
+        except Exception:  # noqa: BLE001 — provenance must never break discovery
+            pass
         summary["discovered"] += 1
 
         scope = classify_scope(cwd, session, config)
