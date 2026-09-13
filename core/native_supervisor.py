@@ -123,6 +123,19 @@ CREATE TABLE IF NOT EXISTS native_supervision (
     event_id INTEGER PRIMARY KEY, ts TEXT, ts_epoch REAL, target TEXT, action TEXT,
     reason TEXT, ok INTEGER, detail TEXT);
 CREATE INDEX IF NOT EXISTS ix_native_sup_target ON native_supervision (target, ts_epoch);
+-- The idle sweep has no event to key on and passed event_id=0, so every one of its
+-- decisions — for every target — INSERT OR REPLACEd the SAME row. The whole table held
+-- one row for the entire idle path. `_recent_for_target` therefore counted 1 continue
+-- per hour forever, MAX_CONSECUTIVE could never be reached, and a parked agent was
+-- re-poked indefinitely: diamond-auction:0.0 took 32 pokes in three hours on
+-- 2026-09-13, answering "Нет." to each. The event path's PK is correct and unchanged —
+-- one decision per event is the point there — so the fix is to stop pretending an idle
+-- decision is event zero.
+CREATE TABLE IF NOT EXISTS native_supervision_idle (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ts_epoch REAL, target TEXT,
+    action TEXT, reason TEXT, ok INTEGER, detail TEXT);
+CREATE INDEX IF NOT EXISTS ix_native_sup_idle_target
+    ON native_supervision_idle (target, ts_epoch);
 """
 
 
@@ -729,24 +742,50 @@ def may_autosubmit_goal(text: str, safe_fn: Callable) -> dict:
 
 
 def _recent_for_target(conn, target: str, now: float) -> tuple:
+    """(last continue, continues in the last hour) across BOTH decision tables.
+
+    Counting only the event-keyed table made the idle sweep invisible to its own
+    anti-loop cap, which is how a parked agent was poked every five minutes for hours.
+    """
     row = conn.execute(
-        "SELECT MAX(ts_epoch) FROM native_supervision WHERE target=? AND action='continue'",
-        (target,)).fetchone()
+        "SELECT MAX(t) FROM ("
+        "  SELECT MAX(ts_epoch) t FROM native_supervision"
+        "   WHERE target=? AND action='continue'"
+        "  UNION ALL"
+        "  SELECT MAX(ts_epoch) t FROM native_supervision_idle"
+        "   WHERE target=? AND action='continue')", (target, target)).fetchone()
     last = float(row[0]) if row and row[0] else 0.0
     n = conn.execute(
-        "SELECT COUNT(*) FROM native_supervision WHERE target=? AND action='continue' "
-        "AND ok=1 AND ts_epoch > ?", (target, now - 3600)).fetchone()[0]
+        "SELECT ("
+        "  SELECT COUNT(*) FROM native_supervision WHERE target=? AND action='continue'"
+        "   AND ok=1 AND ts_epoch > ?) + ("
+        "  SELECT COUNT(*) FROM native_supervision_idle WHERE target=? AND action='continue'"
+        "   AND ok=1 AND ts_epoch > ?)", (target, now - 3600, target, now - 3600)).fetchone()[0]
     return last, int(n)
 
 
 def _record(conn, event_id: int, target: str, action: str, reason: str, ok: bool,
             detail=None) -> None:
+    """Append one supervision decision.
+
+    Keyed by event where there IS an event — one decision per event, so a re-scan
+    cannot duplicate it. The idle sweep has no event and used to pass 0, which made
+    every idle decision overwrite one shared row; those go to their own append-only
+    table instead. Never raises: the audit must not break the loop it records.
+    """
     try:
-        conn.execute(
-            "INSERT OR REPLACE INTO native_supervision "
-            "(event_id,ts,ts_epoch,target,action,reason,ok,detail) VALUES (?,?,?,?,?,?,?,?)",
-            (int(event_id), now_iso(), now_ts(), target, action, reason,
-             1 if ok else 0, json.dumps(detail or {}, default=str)[:800]))
+        payload = (now_iso(), now_ts(), target, action, reason,
+                   1 if ok else 0, json.dumps(detail or {}, default=str)[:800])
+        if int(event_id) > 0:
+            conn.execute(
+                "INSERT OR REPLACE INTO native_supervision "
+                "(event_id,ts,ts_epoch,target,action,reason,ok,detail) VALUES (?,?,?,?,?,?,?,?)",
+                (int(event_id),) + payload)
+        else:
+            conn.execute(
+                "INSERT INTO native_supervision_idle "
+                "(ts,ts_epoch,target,action,reason,ok,detail) VALUES (?,?,?,?,?,?,?)",
+                payload)
         conn.commit()
     except Exception:  # noqa: BLE001 — the audit must never break the loop
         pass

@@ -813,9 +813,12 @@ def test_the_idle_sweep_gate_writes_its_marker_fields(monkeypatch):
     _scan(conn, [_agent()], calls)                          # no hook event: sweep only
     assert calls == [], "no send once the cap is reached"
 
+    # the sweep has no event to key on, so its journal row lives in the append-only
+    # idle table — see `_record`: writing it as event zero made every idle decision
+    # overwrite one shared row.
     row = conn.execute(
-        "SELECT reason, detail FROM native_supervision WHERE target=? AND action='gate' "
-        "ORDER BY rowid DESC LIMIT 1", ("cp-canary:0.0",)).fetchone()
+        "SELECT reason, detail FROM native_supervision_idle WHERE target=? "
+        "AND action='gate' ORDER BY id DESC LIMIT 1", ("cp-canary:0.0",)).fetchone()
     assert row is not None, "the sweep must journal its gate"
     assert row[0] == "idle_sweep_cap_reached_without_progress"
     detail = json.loads(row[1])
@@ -976,3 +979,95 @@ def test_without_a_project_the_registry_still_decides(monkeypatch):
                  ("capacity-blockchain:0.0", "capacity", "/opt/capacity"))
     conn.commit()
     assert ns.is_supervised("capacity-blockchain:0.0", conn=conn) is False
+
+
+# ── the idle sweep's own anti-loop cap must be able to count ─────────────────
+# `native_supervision` is keyed `event_id INTEGER PRIMARY KEY`, and the idle sweep has
+# no event, so it passed 0. Every idle decision — for every target — INSERT OR REPLACEd
+# that one row, and the whole table held exactly ONE row for the entire idle path.
+# `_recent_for_target` therefore counted 1 continue per hour forever, MAX_CONSECUTIVE
+# could never be reached, and a parked agent was re-poked indefinitely.
+#
+# Measured on the live host 2026-09-13: diamond-auction:0.0 took 32 idle pokes in three
+# hours, one every ~5.6 minutes, answering "Нет." to each, while `native_supervision`
+# held a single event_id=0 row and the counter read 1.
+
+def _idle_ready(conn, target="cp-canary:0.0"):
+    _watch_state(conn, target, ns.IDLE_SWEEP_QUIET_SECS + 60)
+
+
+def test_each_idle_decision_is_recorded_separately(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    for _ in range(3):
+        _idle_ready(conn)
+        ns._record(conn, 0, "cp-canary:0.0", "continue", "continued_same_agent_idle_sweep", True)
+    n = conn.execute("SELECT COUNT(*) FROM native_supervision_idle "
+                     "WHERE target='cp-canary:0.0'").fetchone()[0]
+    assert n == 3, f"idle decisions collapsed into {n} row(s)"
+
+
+def test_the_hourly_counter_sees_idle_continuations():
+    """The counter the cap reads. It counted only the event-keyed table, which the idle
+    sweep never writes to."""
+    conn, _ = ns._conn()
+    now = time.time()
+    for _ in range(5):
+        ns._record(conn, 0, "t:0.0", "continue", "continued_same_agent_idle_sweep", True)
+    _, n_hour = ns._recent_for_target(conn, "t:0.0", now)
+    assert n_hour == 5, f"cap counter read {n_hour}, so MAX_CONSECUTIVE cannot trip"
+
+
+def test_the_counter_still_counts_event_path_continuations():
+    conn, _ = ns._conn()
+    ns._record(conn, 4242, "t:0.0", "continue", "continued_same_agent", True)
+    ns._record(conn, 0, "t:0.0", "continue", "continued_same_agent_idle_sweep", True)
+    _, n_hour = ns._recent_for_target(conn, "t:0.0", time.time())
+    assert n_hour == 2, "both doors into the same room must be counted"
+
+
+def test_one_decision_per_event_is_still_one_row():
+    """The event path's primary key is correct and must not become append-only: a
+    re-scan of the same event is the same decision, not a second one."""
+    conn, _ = ns._conn()
+    ns._record(conn, 77, "t:0.0", "continue", "continued_same_agent", True)
+    ns._record(conn, 77, "t:0.0", "continue", "continued_same_agent", True)
+    n = conn.execute("SELECT COUNT(*) FROM native_supervision WHERE event_id=77").fetchone()[0]
+    assert n == 1
+
+
+def test_last_continue_is_per_target_not_shared():
+    """With one shared row, `last` belonged to whichever agent wrote it most recently,
+    so MIN_INTERVAL_SECS was being applied against another agent's clock."""
+    conn, _ = ns._conn()
+    ns._record(conn, 0, "a:0.0", "continue", "continued_same_agent_idle_sweep", True)
+    ns._record(conn, 0, "b:0.0", "continue", "continued_same_agent_idle_sweep", True)
+    last_a, _ = ns._recent_for_target(conn, "a:0.0", time.time())
+    last_b, _ = ns._recent_for_target(conn, "b:0.0", time.time())
+    assert last_a > 0 and last_b > 0
+    assert conn.execute("SELECT COUNT(DISTINCT target) FROM native_supervision_idle"
+                        ).fetchone()[0] == 2
+
+
+def test_a_repeatedly_poked_agent_reaches_the_cap_and_is_gated(monkeypatch):
+    """The end state that was unreachable: after MAX_CONSECUTIVE continuations in an
+    hour the sweep stops poking and opens a gate instead."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    now = time.time()
+    for _ in range(ns.MAX_CONSECUTIVE):
+        ns._record(conn, 0, "cp-canary:0.0", "continue",
+                   "continued_same_agent_idle_sweep", True)
+    _idle_ready(conn)
+    # push `last` far enough back that MIN_INTERVAL does not mask the cap
+    conn.execute("UPDATE native_supervision_idle SET ts_epoch=? WHERE target='cp-canary:0.0'",
+                 (now - 3000,))
+    conn.commit()
+    calls = []
+    r = _scan(conn, [_agent()], calls)
+    assert calls == [], "the agent was poked again after the cap"
+    reasons = [s.get("reason") for s in r.get("skipped", [])]
+    row = conn.execute("SELECT action,reason FROM native_supervision_idle "
+                       "WHERE target='cp-canary:0.0' ORDER BY id DESC LIMIT 1").fetchone()
+    assert row[0] == "gate" or "cap_reached" in (row[1] or "") or reasons, \
+        f"expected a gate after the cap, got {row}"

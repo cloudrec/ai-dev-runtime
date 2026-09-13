@@ -3256,3 +3256,79 @@ all, and was answered that none is needed. That is the standing decision.
 
 **Holding on the gate.** Three local commits unpushed; the stale-row activation needs a
 restart. Both are owner calls and both were declined. Nothing else is actionable.
+
+---
+
+## Event 49818 — the idle sweep's anti-loop cap could not count (2026-09-14 00:15 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. Local
+commit only. `/opt/diamond` was not touched, no pane written to, nothing pushed or
+restarted, no live database mutated.
+
+### The symptom
+
+`diamond-auction:0.0` took **32 idle-sweep pokes in three hours** — one every ~5.6
+minutes, `actor=native_supervisor`, `source=idle_sweep`, keys
+`nativesup:idle:diamond-auction:0.0:5964430…5964461` — and answered each with "Нет.".
+
+### Two independent causes. One is code, one is configuration.
+
+**Code — the cap was structurally unreachable.** `native_supervision` is keyed
+`event_id INTEGER PRIMARY KEY`. The idle sweep has no event and passed `0`, and `_record`
+uses `INSERT OR REPLACE`. So every idle decision, for every target, overwrote the same
+row. Proof from the live table:
+
+```
+rows with event_id=0 : 1          (32 pokes in 3h had been written)
+_recent_for_target   : n_hour = 1   with MAX_CONSECUTIVE = 6
+```
+
+The counter could never exceed 1, so the cap that is supposed to stop poking and open a
+gate after six continuations in an hour could never fire. `last` was corrupted the same
+way: one shared row means `MIN_INTERVAL_SECS` was being measured against whichever agent
+wrote it most recently, not this one.
+
+Fixed by giving idle decisions their own append-only table, `native_supervision_idle`,
+and counting both. The event path's primary key is correct and unchanged — one decision
+per event is the point there, and a re-scan must not duplicate it. The change is that an
+idle decision stops pretending to be event zero.
+
+An existing test had to move with it: the idle-sweep gate journal now lands in the idle
+table, so `test_the_idle_sweep_gate_writes_its_marker_fields` reads it there.
+
+Four of the five new tests fail against the unfixed module; the fifth is the
+compatibility guard proving the event path still records one row per event.
+Suite 3281 passed.
+
+### Configuration — reported, NOT changed
+
+The project is parked under the name **auction**; the agent's project key is
+**diamond**:
+
+```
+agent diamond-auction:0.0   project_id = diamond   cwd = /opt/diamond
+AUTO_REGISTER_DENY_PROJECTS = ai-dev-runtime, auction, capacity, email,
+                              payment-orchestrator, payorch, xmrig
+'diamond' in deny : False        'auction' in deny : True
+is_supervised('diamond-auction:0.0') : True
+```
+
+So the denylist entry never matched, the agent was auto-registered, and it appears in
+`registered_targets()`. `NATIVE_SUPERVISOR_DENY_TARGETS` is empty, so nothing excluded it
+per-agent either. That is a name mismatch between the deny list and the registry key, not
+a policy failure — and it is a configuration change, which is the owner's, so it stands
+untouched.
+
+**What each half fixes.** The code fix stops the infinite poking of any agent that makes
+no progress: after six continuations in an hour the sweep gates instead. It does not make
+the parked project exempt. Only the configuration does that, and only the owner can set
+it. Both are needed for the intended behaviour; neither substitutes for the other.
+
+Also visible in `registered_targets()`: `hostsecure-clean:1.0`, the pane that died at
+09:37, is still registered for supervision. Same family as the false-live orchestrator
+record, and it is not re-poked only because the pane is gone.
+
+### Gate
+
+Unchanged. Five local commits unpushed; the fix is inert until the wake companion is
+restarted, since the sweep runs there. Both declined by the owner, so parked by decision.
