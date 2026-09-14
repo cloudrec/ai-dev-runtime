@@ -3803,3 +3803,72 @@ That is live automation semantics, so it waits.
 
 **The exact approval needed, one line:** *"правь скретчпад"* — authorising the local code
 change plus tests, still with no push and no restart.
+
+---
+
+## The scratchpad fix, built and proven OUTSIDE the live tree (2026-09-14 21:40 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. The live
+tree was **not** modified — `git status` clean throughout, and the live
+`core/wake_routes.py` still has no scratchpad handling. Everything below lives in the
+session scratchpad, which no hook can import.
+
+```
+candidate tree : <scratchpad>/candidate           (rsync of the repo, no .db/.git/venv)
+patch          : <scratchpad>/scratchpad-fix.patch    56 lines, 33 added
+tests          : <scratchpad>/test_scratchpad_not_a_project.py    8 cases
+```
+
+### Proven in both directions
+
+Against the **live** tree, three assertions fail:
+
+```
+is_scratchpad_path MISSING
+project_for_cwd('/tmp/claude-0/-opt-gaika-extension-ru/…/scratchpad') -> 'scratchpad'
+denial candidates for a payment scratchpad = [abc, claude-0, scratchpad, tmp]
+                                             — payment-orchestrator absent
+```
+
+Against the **candidate**, all 11 test cases pass, and the surrounding suites
+(`test_project_for_cwd`, `test_native_supervisor`, `test_owneros_hook`) stay green at 176
+passed. The single failure there is an artefact of the copy, not the change:
+`SELF_PROJECT` is derived from the module's own location, so in a directory named
+`candidate` the self-reference guard correctly protects `candidate`.
+
+### What the candidate does
+
+`project_for_cwd` returns `""` for `/tmp/claude-*/…/scratchpad`. It does not decode the
+encoded directory name, for the two reasons already on record: the name says where the
+session STARTED (that agent actually works in `/opt/gaika-worktrees/ru`, and neither
+reading of the encoded string exists on disk), and the encoding is lossy because `/`
+becomes `-` while `-` is legal in names.
+
+### The hole the tests found in my own candidate
+
+Returning `""` alone **reopens the escape hatch it was meant to close**. For
+`/tmp/claude-0/-opt-payment-orchestrator/abc/scratchpad` the denial candidates became
+`{tmp, claude-0, scratchpad, abc}` — the payment name is buried inside one encoded
+segment, so the denylist had nothing to match. A payment agent whose hook fired from its
+own scratchpad would have had no project AND no denied candidate.
+
+Resolved by using the lossy encoding for **denial only, never for naming**:
+`project_candidates` expands a leading-dash segment into every contiguous sub-name. Wrong
+as an identity, perfectly safe as a filter, because over-matching only ever widens denial.
+That asymmetry is the whole idea, and it was not in the plan an hour ago — the test wrote
+it.
+
+### Applying it
+
+`patch -p0 < scratchpad-fix.patch` against the two files, copy the test file into
+`tests/`, run `test_project_for_cwd`, `test_native_supervisor`, `test_owneros_hook` and
+the new file, then the full suite. Rollback is `git revert` of one commit — pure
+resolution logic, no stored state.
+
+**Live verification criterion:** the next hook event from a scratchpad cwd files with an
+empty project routing to the `owner-os` fallback, with the scratchpad cwd unchanged in the
+payload as evidence — the same way the `dns` correction was verified within minutes.
+
+**Still gated.** Applying it edits a module the hooks load live, changing which project
+live events file under and where unprovable cwds route. **One line to proceed:**
+*"правь скретчпад"*.
