@@ -1253,3 +1253,102 @@ def test_the_log_is_append_only_across_repeated_removals():
         _register(conn, f"v{i}:0.0", project="email")
         ns.purge_denied(conn=conn)
     assert len(ns.deregistrations(conn=conn)) == 3
+
+
+# ── a gate parks the target it names, and nothing else ──────────────────────
+# Policy: an unresolved owner gate parks only its own target and stays visible; it must
+# not stop unrelated safe work in the same pass. Only `send_fn` was guarded in the idle
+# sweep — `is_supervised`, `in_gate`, `_quiet_secs`, `gate_exemption`, `open_gate` and
+# `safe_fn` all ran unprotected, so a raise on ONE agent aborted the whole sweep and
+# every other agent silently lost its pass. `open_gate` is the sharp case: it writes an
+# event and a notification, and it runs precisely for a target that has hit its cap.
+
+def _sweepable(conn, target, cwd="/root/cp-canary-v2"):
+    _watch_state(conn, target, ns.IDLE_SWEEP_QUIET_SECS + 60)
+    return _agent(target=target, cwd=cwd)
+
+
+def test_a_gated_target_does_not_park_its_neighbours(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    conn, _ = ns._conn()
+    a = _sweepable(conn, "gated:0.0")
+    b = _sweepable(conn, "healthy:0.0")
+    ns.open_gate("gated:0.0", reason="owner gate", conn=conn,
+                 emit_fn=lambda *x, **k: {"event_id": 1})
+    calls = []
+    r = _scan(conn, [a, b], calls)
+    poked = {c["target"] for c in calls}
+    assert "gated:0.0" not in poked, "a gated target must stay parked"
+    assert "healthy:0.0" in poked, "the gate parked an unrelated agent too"
+
+
+def test_one_targets_failure_does_not_abort_the_sweep(monkeypatch):
+    """The isolation itself: anything raising for one agent must not cost the others."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    conn, _ = ns._conn()
+    bad = _sweepable(conn, "explodes:0.0")
+    good = _sweepable(conn, "healthy:0.0")
+    real = ns.in_gate
+
+    def _boom(target, **kw):
+        if target == "explodes:0.0":
+            raise RuntimeError("gate store unavailable")
+        return real(target, **kw)
+
+    monkeypatch.setattr(ns, "in_gate", _boom)
+    calls = []
+    r = _scan(conn, [bad, good], calls)
+    assert {c["target"] for c in calls} == {"healthy:0.0"}
+    whys = [s.get("why", "") for s in r["skipped"]]
+    assert any("idle_sweep_error:RuntimeError" in w for w in whys), whys
+
+
+def test_the_failure_is_journalled_against_the_target_that_caused_it(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    conn, _ = ns._conn()
+    bad = _sweepable(conn, "explodes:0.0")
+    monkeypatch.setattr(ns, "_quiet_secs",
+                        lambda c, t, n: (_ for _ in ()).throw(ValueError("bad row"))
+                        if t == "explodes:0.0" else 99999)
+    _scan(conn, [bad], [])
+    row = conn.execute("SELECT target, action, reason FROM native_supervision_idle "
+                       "ORDER BY id DESC LIMIT 1").fetchone()
+    assert row[0] == "explodes:0.0" and row[1] == "skip"
+    assert "idle_sweep_error:ValueError" in row[2]
+
+
+def test_a_failing_open_gate_still_leaves_the_others_running(monkeypatch):
+    """The sharp case: the most failure-prone call in the loop runs for a capped target."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    conn, _ = ns._conn()
+    capped = _sweepable(conn, "capped:0.0")
+    good = _sweepable(conn, "healthy:0.0")
+    # cap ONE of them for real. Lowering MAX_CONSECUTIVE globally would cap both, and
+    # then there is no unrelated agent left for the test to be about — which is what the
+    # first draft did and why it failed.
+    import time as _t
+    for _ in range(ns.MAX_CONSECUTIVE):
+        ns._record(conn, 0, "capped:0.0", "continue",
+                   "continued_same_agent_idle_sweep", True)
+    conn.execute("UPDATE native_supervision_idle SET ts_epoch=? WHERE target='capped:0.0'",
+                 (_t.time() - 3000,))
+    conn.commit()
+    monkeypatch.setattr(ns, "open_gate",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("emit down")))
+    calls = []
+    _scan(conn, [capped, good], calls)
+    assert "capped:0.0" not in {c["target"] for c in calls}, "the capped agent must not be poked"
+    assert "healthy:0.0" in {c["target"] for c in calls}, \
+        "a gate that could not be written stopped an unrelated agent"
+
+
+def test_a_failing_target_is_skipped_not_poked(monkeypatch):
+    """Fail-closed: an agent whose checks could not be evaluated is left alone."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    conn, _ = ns._conn()
+    bad = _sweepable(conn, "explodes:0.0")
+    monkeypatch.setattr(ns, "is_supervised",
+                        lambda t, **k: (_ for _ in ()).throw(RuntimeError("db")))
+    calls = []
+    _scan(conn, [bad], calls)
+    assert calls == [], "an unevaluable agent must never be continued"

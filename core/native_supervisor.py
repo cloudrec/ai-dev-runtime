@@ -1118,66 +1118,83 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
         if IDLE_SWEEP_ENABLED:
             acted_targets = {a.get("target") for a in acted}
             for a in agents:
-                target = a.get("target") or ""
-                if not target or target in acted_targets:
-                    continue
-                if (a.get("state") or "") not in _AT_REST or a.get("pending"):
-                    continue
-                if not is_supervised(target, conn=conn, project=_project_of(a)):
-                    continue
-                if in_external_wait(target, conn=conn, now=now) or in_gate(
-                        target, conn=conn, now=now):
-                    continue
-                quiet = _quiet_secs(conn, target, now)
-                if quiet is None or quiet < IDLE_SWEEP_QUIET_SECS:
-                    # No quiescence evidence, or not quiet long enough. The event path
-                    # owns everything before this point.
-                    continue
-                last, n_hour = _recent_for_target(conn, target, now)
-                if (now - last) < max(MIN_INTERVAL_SECS, IDLE_SWEEP_QUIET_SECS):
-                    continue
-                if n_hour >= MAX_CONSECUTIVE:
-                    # Same exemption as the event path. Without this the sweep was the
-                    # louder of the two doors into the same room: it defaulted to
-                    # owner_facing=True, so an agent with no assigned task would wake the
-                    # owner here even though the event path had just been taught not to.
-                    # Only the emit-level 6h dedup was hiding it (arbitrage2-fable,
-                    # gate_opened=true at 00:39:19Z, silent solely because event 15986 was
-                    # still inside the window).
-                    exempt = gate_exemption(conn, target, a.get("claude_cwd")
-                                            or a.get("cwd") or "", now)
-                    if exempt in ("intentional_external_wait",
-                                  "recent_intentional_external_wait"):
-                        _record(conn, 0, target, "skip", f"cap_reached_but_{exempt}", True)
-                        continue
-                    g = open_gate(target, reason="idle_sweep_cap_reached_without_progress",
-                                  conn=conn, now=now, owner_facing=not exempt)
-                    _record(conn, 0, target, "gate",
-                            "idle_sweep_cap_reached_without_progress", True,
-                            {"gate_opened": g.get("opened"),
-                             "gate_event_id": g.get("event_id"), "exempt": exempt})
-                    continue
-                if not safe_fn(step_text):
-                    _record(conn, 0, target, "refuse", "step_failed_safety_classifier", False)
-                    continue
-                idem = f"nativesup:idle:{target}:{int(now // IDLE_SWEEP_QUIET_SECS)}"
+                # ONE TARGET'S FAILURE IS NOT EVERY TARGET'S. Only `send_fn` was
+                # guarded here; `is_supervised`, `in_gate`, `_quiet_secs`,
+                # `gate_exemption`, `open_gate` and `safe_fn` all ran unprotected, so a
+                # raise on ONE agent aborted the whole sweep and every other agent
+                # silently lost its pass. `open_gate` is the sharp case: it writes an
+                # event and a notification, it is the most failure-prone call in the
+                # loop, and it runs precisely for a target that has hit its cap — so a
+                # gated target failing to gate could park unrelated safe work. A gate
+                # parks the target it names and nothing else.
                 try:
-                    res = send_fn(target, step_text, idempotency_key=idem,
-                                  actor="native_supervisor", source="idle_sweep")
-                except Exception as e:  # noqa: BLE001
+                    target = a.get("target") or ""
+                    if not target or target in acted_targets:
+                        continue
+                    if (a.get("state") or "") not in _AT_REST or a.get("pending"):
+                        continue
+                    if not is_supervised(target, conn=conn, project=_project_of(a)):
+                        continue
+                    if in_external_wait(target, conn=conn, now=now) or in_gate(
+                            target, conn=conn, now=now):
+                        continue
+                    quiet = _quiet_secs(conn, target, now)
+                    if quiet is None or quiet < IDLE_SWEEP_QUIET_SECS:
+                        # No quiescence evidence, or not quiet long enough. The event path
+                        # owns everything before this point.
+                        continue
+                    last, n_hour = _recent_for_target(conn, target, now)
+                    if (now - last) < max(MIN_INTERVAL_SECS, IDLE_SWEEP_QUIET_SECS):
+                        continue
+                    if n_hour >= MAX_CONSECUTIVE:
+                        # Same exemption as the event path. Without this the sweep was the
+                        # louder of the two doors into the same room: it defaulted to
+                        # owner_facing=True, so an agent with no assigned task would wake the
+                        # owner here even though the event path had just been taught not to.
+                        # Only the emit-level 6h dedup was hiding it (arbitrage2-fable,
+                        # gate_opened=true at 00:39:19Z, silent solely because event 15986 was
+                        # still inside the window).
+                        exempt = gate_exemption(conn, target, a.get("claude_cwd")
+                                                or a.get("cwd") or "", now)
+                        if exempt in ("intentional_external_wait",
+                                      "recent_intentional_external_wait"):
+                            _record(conn, 0, target, "skip", f"cap_reached_but_{exempt}", True)
+                            continue
+                        g = open_gate(target, reason="idle_sweep_cap_reached_without_progress",
+                                      conn=conn, now=now, owner_facing=not exempt)
+                        _record(conn, 0, target, "gate",
+                                "idle_sweep_cap_reached_without_progress", True,
+                                {"gate_opened": g.get("opened"),
+                                 "gate_event_id": g.get("event_id"), "exempt": exempt})
+                        continue
+                    if not safe_fn(step_text):
+                        _record(conn, 0, target, "refuse", "step_failed_safety_classifier", False)
+                        continue
+                    idem = f"nativesup:idle:{target}:{int(now // IDLE_SWEEP_QUIET_SECS)}"
+                    try:
+                        res = send_fn(target, step_text, idempotency_key=idem,
+                                      actor="native_supervisor", source="idle_sweep")
+                    except Exception as e:  # noqa: BLE001
+                        _record(conn, 0, target, "continue",
+                                f"send_failed:{type(e).__name__}", False,
+                                {"error": str(e)[:200]})
+                        continue
+                    ok = bool(res.get("delivered"))
                     _record(conn, 0, target, "continue",
-                            f"send_failed:{type(e).__name__}", False,
+                            "continued_same_agent_idle_sweep" if ok
+                            else f"not_delivered:{res.get('refused')}", ok,
+                            {k: res.get(k) for k in
+                             ("delivered", "submitted", "queued", "duplicate", "agent_created")})
+                    (acted if ok else skipped).append(
+                        {"event_id": 0, "target": target, "idempotency_key": idem,
+                         "delivered": ok, "via": "idle_sweep"})
+                except Exception as e:  # noqa: BLE001
+                    _record(conn, 0, a.get("target") or "", "skip",
+                            f"idle_sweep_error:{type(e).__name__}", False,
                             {"error": str(e)[:200]})
+                    skipped.append({"event_id": 0, "target": a.get("target") or "",
+                                    "why": f"idle_sweep_error:{type(e).__name__}"})
                     continue
-                ok = bool(res.get("delivered"))
-                _record(conn, 0, target, "continue",
-                        "continued_same_agent_idle_sweep" if ok
-                        else f"not_delivered:{res.get('refused')}", ok,
-                        {k: res.get(k) for k in
-                         ("delivered", "submitted", "queued", "duplicate", "agent_created")})
-                (acted if ok else skipped).append(
-                    {"event_id": 0, "target": target, "idempotency_key": idem,
-                     "delivered": ok, "via": "idle_sweep"})
         return {"acted": acted, "skipped": skipped}
     finally:
         if own:
