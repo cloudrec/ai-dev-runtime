@@ -3486,3 +3486,67 @@ Six new tests. Suite 3296 passed.
 Seven local commits unpushed. Stopping the Auction continuations needs the runtime env
 file or the companion environment changed, and a companion restart to pick it up — both
 owner calls.
+
+---
+
+## Event 50056 closed: the supervisor is silent because the pane is waiting, not because it escalated (2026-09-14 12:10 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. Read-only
+against the runtime plus this note. No code changed, nothing pushed or restarted.
+
+### Why the backups agent gets no continuation
+
+Not escalation, and not a broken supervisor path. The idle sweep's first test is
+
+```python
+if (a.get("state") or "") not in _AT_REST or a.get("pending"):
+    continue
+_AT_REST = {"idle", "completed", "unknown", ""}
+```
+
+`server-disk-cleanup-opus:0.0` is in state **`waiting_input`**, which is not at rest. A
+pane waiting for input has a standing question, and continuing it would talk over whoever
+is meant to answer. The sweep refuses, correctly, and has done so for the 5.9 days since
+its last continuation. Every other precondition passes — supervised, not gated, quiet for
+511k seconds, `n_hour` 0 of 6 — so the state test is the only thing holding it, and it is
+the right one.
+
+The doctor's `escalated=1` is also not a dead end: the flag is cleared whenever the shape
+or digest moves (`_retire_stale_escalation`), so a real change re-arms the alert. The
+once-per-day reminder the owner asked for on 2026-09-11 is untouched and stays as it is.
+
+### Which closes the diamond loop too
+
+`diamond-auction:0.0` is in `waiting_input` right now as well. When it was poked it was
+`idle`: the poke produced a reply, the reply moved it to `waiting_input`, the reply ended
+and it fell back to `idle`, and the sweep fired again — every ~5.6 minutes. The only
+mechanism that could have broken that cycle is `MAX_CONSECUTIVE`, and it was structurally
+unable to count, because every idle decision overwrote one shared row keyed `event_id=0`.
+That is fixed and committed (`08a7d6d`); the denylist half remains an env/owner gate.
+
+### No defect to fix here
+
+The one improvement still visible — having an owner-facing escalation hold the idle sweep
+as well — is **not** safe local engineering on this box. `core/native_supervisor.py` is
+imported by `tools/native_supervise_once.py`, which the hooks spawn on every turn
+boundary, so an edit there is a live change to every agent's automation with no deploy
+step and no review. Making the supervisor stop continuing agents is the restrictive
+direction, but it is still a behaviour change to live automation across all projects that
+nobody has asked for. That is an owner decision.
+
+### Delivery/accounting diagnosis, concluded
+
+Event 50550 was a transient Telegram transport failure ("Remote end closed connection
+without response") at 11:31:23 that correctly marked `owner_push` unhealthy; it healed at
+11:42:57 (`telegram:868`) and the posture is green. Not the old chat-id fault, not the
+reverse path, not CDP. Four of the five recent reds were `unverified` after a restart —
+by design, and two of those restarts were mine. `delivery_failed=0` in the MCP snapshot is
+correct, not a mismatch: all 260 notifications in the last 24h are `sent`, and the failure
+was seen by the capability probe rather than the notification queue. `state=unverified`
+with `verified=True` is also correct — the code defines `verified` as "has ever worked".
+No code defect.
+
+### Gate
+
+Seven local commits unpushed. The remaining items are all owner calls: the runtime env for
+`diamond`, and whether an escalation should hold the sweep.
