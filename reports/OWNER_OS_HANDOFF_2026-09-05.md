@@ -3639,3 +3639,74 @@ tests, all failing against HEAD.
 The payorch agent is alive and working — nothing to gate there. Nine local commits
 unpushed. The two standing owner decisions are unchanged: the `diamond` runtime env, and
 whether an escalation should hold the idle sweep.
+
+---
+
+## The second door: MCP `agent_send` is not covered by the project denylist (2026-09-14 18:00 UTC)
+
+Recorded because it keeps being rediscovered. **Nothing here is decided** — the owner
+stopped the session on this exact question ("стой пока я лично чего то не скажу") and has
+not answered. An automated instruction subsequently expressed a preference for leaving it
+as-is; that is not owner sign-off and is recorded only as an automated instruction.
+
+### The finding
+
+The project denylist constrains exactly one caller: Owner OS's own native supervisor.
+
+```
+payorch-ha-fresh:0.0   cwd=/opt/payment-orchestrator
+  project=payment-orchestrator   denied=True
+  supervised=False   send_block_reason=value_bearing_send_blocked
+```
+
+Zero native-supervisor deliveries, ever. But ten deliveries reached that pane on
+2026-09-14, every one `actor=api:bearer` — the external ChatGPT supervisor calling the MCP
+`agent_send` endpoint:
+
+```
+15:13  payorch-witness-udp-evidence-51210
+15:04  payorch-dismiss-bug-report-modal-20260914
+15:00  payorch-wait-udp-do-safe-readonly-51196
+14:41  payorch-wg1-rootcause-51112
+14:33  payorch-stage1-readonly-precheck-51094
+```
+
+Checked to the end rather than assumed: neither `api/v1.py`'s handler nor
+`agent_control.agent_send` consults `AUTO_REGISTER_DENY_PROJECTS`. The only actuation
+switch in the codebase, `stall_doctor._actuation_allowed`, governs the doctor and nothing
+else. So:
+
+| door | payment |
+|---|---|
+| native supervisor | closed — `value_bearing_send_blocked` |
+| MCP API (`api:bearer`) | **open** |
+
+### Why this is a real question and not a bug to "just fix"
+
+Two readings, and they lead to opposite code:
+
+1. The denylist means *no automation types into payment*, in which case the API path is a
+   hole and should enforce the same rule.
+2. The denylist means *Owner OS does not drive payment autonomously*, while the API is an
+   operator channel an authenticated principal uses deliberately — in which case enforcing
+   the denylist there would revoke operator access, not close a hole.
+
+Under reading 2 the current behaviour is correct. Under reading 1 it is fail-open on the
+one project whose gates are most expensive. The distinction is a policy call about who the
+API's bearer represents, and it cannot be settled from the code.
+
+### The smallest concrete choice
+
+- **Close it** — add the project check to `agent_send`. Payment stops accepting anything
+  from outside, including the ChatGPT supervisor currently working there.
+- **Leave it** — the API keeps operator access; the denylist covers autonomous
+  continuation only.
+
+Either way `turn_provenance` already ensures pane text cannot be mistaken for owner
+authority, and the payment-sensitive gates elsewhere stay fail-closed regardless.
+
+### State while this is open
+
+Ten local commits, tracked tree clean, HEAD `e705b64`, suite 3325 passed, no code changed
+since that run. Services active, reverse path `ok`, notifications green. No configuration,
+route, credential or service was touched.
