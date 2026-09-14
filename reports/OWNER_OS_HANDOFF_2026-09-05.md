@@ -3550,3 +3550,92 @@ No code defect.
 
 Seven local commits unpushed. The remaining items are all owner calls: the runtime env for
 `diamond`, and whether an escalation should hold the sweep.
+
+---
+
+## Event 51041 — a project is not the directory you are standing in (2026-09-14 15:05 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. Local
+commit only. No payment production, DNS, credential, route or service was touched, and
+nothing was pushed or restarted.
+
+### What the event actually was
+
+`session:6db4919a-460`, `StopFailure`, filed critical under project **`dns`**. Its payload
+settles both halves of the question:
+
+```
+cwd  = /opt/payment-orchestrator/deploy/infra/dns
+last_assistant_message = "You've hit your session limit · resets 4:10pm (Europe/Berlin)"
+```
+
+So the "process failure" was a Claude usage limit, not a crash — and the session is the
+one attached to `payorch-ha-fresh`, which is **alive and working right now**. No gate of
+its own.
+
+The `dns` project was the defect.
+
+### The defect
+
+Every project-mapping site took the LAST path segment of the cwd:
+
+```python
+project = cwd.rsplit("/", 1)[-1]
+```
+
+Correct only while an agent sits at its project root. The moment one works in a
+subdirectory it acquires a phantom project named after that directory. `discovery`
+already did this properly — it matches the cwd against configured session ROOTS with a
+prefix test — but five other sites each rolled their own basename version:
+`hooks/owneros_hook.py`, `native_supervisor._project_of`, `agent_watch`,
+`closed_loop_wake`, `runtime_events`.
+
+**The consequence is fail-open in the one place that must fail closed.**
+`payment-orchestrator` and `payorch` are both deny-listed; `dns` is not. So the denylist
+protecting payment lapsed exactly when the agent changed directory, and
+`_project_of` — the function the denylist reads — was one of the five.
+
+### The fix, and the trap inside it
+
+`wake_routes.project_for_cwd` resolves in order: configured session root (longest match
+wins, agreeing with `discovery`), then the first segment under a workspace root
+(`/opt`, `/root`, `/srv` — the same convention `SELF_PROJECT` already derives itself
+from), then the basename as before. All five sites now call it.
+
+The trap: correcting the name pointed the wrong way for Auction. An agent in
+`/opt/diamond/auction` used to resolve to `auction`, which IS on the running
+environment's denylist; resolved correctly it is `diamond`, which is not. The more
+accurate answer would have **removed** a protection. Three existing tests failed on
+exactly that, which is how it was caught before it shipped.
+
+So denial is now tested against the resolved project AND every path segment
+(`project_candidates`): if any name the directory could be filed under is deny-listed,
+the agent is excluded. Denial only ever widens. `send_block_reason` uses the same rule,
+so a better project name cannot downgrade a deliberate exclusion to "nobody registered
+it".
+
+### Verified live, not only green
+
+The hooks spawn a fresh process per event, so this took effect immediately. Before, every
+event from that session was filed `dns`; after:
+
+```
+ev51195 14:58:29  agent_subagent_stopped  project='payment-orchestrator'
+ev51201 15:01:17  agent_turn_stopped      project='payment-orchestrator'
+ev51202 15:01:19  agent_subagent_stopped  project='payment-orchestrator'
+                  cwd=/opt/payment-orchestrator/deploy/infra/dns
+```
+
+and the agent itself now reads `project=payment-orchestrator  denied=True
+supervised=False  block_reason=value_bearing_send_blocked` — a deliberate exclusion, in
+the journal's own words, where before a subdirectory would have read as an unknown
+project.
+
+Services active, reverse path `ok`, notifications green. Suite **3320 passed**; 24 new
+tests, all failing against HEAD.
+
+### Gate
+
+The payorch agent is alive and working — nothing to gate there. Nine local commits
+unpushed. The two standing owner decisions are unchanged: the `diamond` runtime env, and
+whether an escalation should hold the idle sweep.

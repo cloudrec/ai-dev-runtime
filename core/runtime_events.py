@@ -57,7 +57,7 @@ def route_key_for(job: dict) -> str:
         return ""
     if path == _CONTROL_REPO:
         return "owner-os"
-    return wake_routes.normalize_key(path.rsplit("/", 1)[-1])
+    return wake_routes.project_for_cwd(path)
 
 
 def _summary(job: dict, status: str) -> str:

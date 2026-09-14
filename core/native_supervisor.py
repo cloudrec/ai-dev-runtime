@@ -323,8 +323,43 @@ CREATE TABLE IF NOT EXISTS native_supervised_target (
 
 
 def _project_of(agent: dict) -> str:
+    """The project this agent belongs to — the value the DENYLIST is read against.
+
+    Taking the last path segment made an agent's project change whenever it changed
+    directory, and a phantom project is on no denylist: a pane in
+    /opt/payment-orchestrator/deploy/infra/dns filed as project `dns`, while both
+    `payment-orchestrator` and `payorch` are denied. Shared resolver now, so this and
+    discovery cannot drift apart again.
+    """
+    from core import wake_routes as _wr
     cwd = (agent.get("claude_cwd") or agent.get("cwd") or "").rstrip("/")
-    return cwd.rsplit("/", 1)[-1] if cwd else ""
+    return _wr.project_for_cwd(cwd) if cwd else ""
+
+
+def project_candidates(project: str, cwd: str) -> set:
+    """Every project name a path could reasonably be filed under.
+
+    Correcting the cwd->project mapping had a consequence that points the wrong way on
+    its own: an agent in /opt/diamond/auction used to resolve to `auction`, which IS
+    deny-listed, and now resolves to `diamond`, which is not in the running environment's
+    list. The more accurate answer would have REMOVED a protection.
+
+    So denial is tested against the resolved project AND every path segment. Denial only
+    ever widens: if any name the directory could be called is on the list, the agent is
+    excluded. Accuracy improves routing; it must not be allowed to open a gate.
+    """
+    from core import wake_routes as _wr
+    out = {(project or "").strip()} - {""}
+    for seg in (cwd or "").strip("/").split("/"):
+        k = _wr.normalize_key(seg)
+        if k:
+            out.add(k)
+    return out
+
+
+def _denied_for(project: str, cwd: str) -> bool:
+    """True when ANY candidate name for this agent is deny-listed."""
+    return bool(project_candidates(project, cwd) & AUTO_REGISTER_DENY_PROJECTS)
 
 
 def auto_register(agents: list, *, conn=None, now: Optional[float] = None,
@@ -358,7 +393,7 @@ def auto_register(agents: list, *, conn=None, now: Optional[float] = None,
                 skipped.append({"target": t, "why": "deny_listed_target"})
                 continue
             proj = _project_of(a)
-            if proj in AUTO_REGISTER_DENY_PROJECTS:
+            if _denied_for(proj, a.get("claude_cwd") or a.get("cwd") or ""):
                 skipped.append({"target": t, "project": proj, "why": "deny_listed_project"})
                 continue
             conn.execute(
@@ -510,8 +545,9 @@ def registered_targets(conn=None) -> set:
     conn, own = _conn(conn)
     try:
         return {r[0] for r in conn.execute(
-            "SELECT target, COALESCE(project,'') FROM native_supervised_target")
-            if r[1] not in AUTO_REGISTER_DENY_PROJECTS and not target_denied(r[0])}
+            "SELECT target, COALESCE(project,''), COALESCE(cwd,'') "
+            "FROM native_supervised_target")
+            if not _denied_for(r[1], r[2]) and not target_denied(r[0])}
     finally:
         if own:
             conn.close()
@@ -523,8 +559,9 @@ def purge_denied(conn=None) -> list:
     conn, own = _conn(conn)
     try:
         rows = [(r[0], r[1] or "") for r in conn.execute(
-            "SELECT target, COALESCE(project,'') FROM native_supervised_target")
-            if r[1] in AUTO_REGISTER_DENY_PROJECTS or target_denied(r[0])]
+            "SELECT target, COALESCE(project,''), COALESCE(cwd,'') "
+            "FROM native_supervised_target")
+            if _denied_for(r[1], r[2]) or target_denied(r[0])]
         for t, proj in rows:
             conn.execute("DELETE FROM native_supervised_target WHERE target=?", (t,))
             try:
@@ -599,7 +636,8 @@ def validate_config() -> dict:
     return {"ok": not problems, "problems": problems, "checked": checked}
 
 
-def send_block_reason(target: str, project: str = "", *, conn=None) -> str:
+def send_block_reason(target: str, project: str = "", *, cwd: str = "",
+                      conn=None) -> str:
     """WHY a target may not be sent to — the two reasons are not the same thing.
 
     Lifecycle OBSERVATION is already unconditional: hook events from every project are
@@ -621,8 +659,12 @@ def send_block_reason(target: str, project: str = "", *, conn=None) -> str:
     """
     if target_denied(target):
         return "target_excluded"
-    if project and project in AUTO_REGISTER_DENY_PROJECTS:
-        return ("supervisor_self_reference" if project == SELF_PROJECT
+    # Same candidate rule the registration path uses: a directory is blocked if ANY name
+    # it could be filed under is deny-listed, so a more accurate project name can never
+    # downgrade this answer from a deliberate exclusion to "nobody registered it".
+    denied = project_candidates(project, cwd) & AUTO_REGISTER_DENY_PROJECTS
+    if denied:
+        return ("supervisor_self_reference" if SELF_PROJECT in denied
                 else "value_bearing_send_blocked")
     return "not_registered"
 
@@ -987,7 +1029,8 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
             if not is_supervised(target, conn=conn,
                                  project=_project_of({"claude_cwd": payload.get("cwd", "")})):
                 why = send_block_reason(
-                    target, _project_of({"claude_cwd": payload.get("cwd", "")}), conn=conn)
+                    target, _project_of({"claude_cwd": payload.get("cwd", "")}),
+                    cwd=payload.get("cwd", "") or "", conn=conn)
                 _record(conn, eid, target, "skip", why, True)
                 skipped.append({"event_id": eid, "target": target, "why": why,
                                 "lifecycle_observed": True})

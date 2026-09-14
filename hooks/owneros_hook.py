@@ -173,7 +173,11 @@ def _map(ev: str, payload: dict):
 def _identity(payload: dict) -> dict:
     """Who this is about, in Owner OS's own terms."""
     cwd = (payload.get("cwd") or os.getcwd() or "").rstrip("/")
-    project = cwd.rsplit("/", 1)[-1] if cwd else ""
+    try:
+        from core import wake_routes as _wr
+        project = _wr.project_for_cwd(cwd)
+    except Exception:  # noqa: BLE001 — a hook must never fail on classification
+        project = cwd.rsplit("/", 1)[-1] if cwd else ""
     # A hook knows its SESSION; the tmux world knows targets. Carry both, and let the
     # registry resolve the route — routing stays centralized, no per-worker URLs.
     agent = (payload.get("teammate_name") or os.environ.get("OWNEROS_AGENT_TARGET")

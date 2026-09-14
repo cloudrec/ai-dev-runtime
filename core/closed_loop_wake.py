@@ -158,7 +158,8 @@ def _session_target_gone(conn, event_id: int, target: str, agents=None) -> bool:
     # it on the session-form target would never hit. The cwd is what the two namespaces
     # share. Bounded to a terminal event no older than the watched wake, so a crash from
     # last week cannot retire a watch opened today.
-    project = cwd.rstrip("/").rsplit("/", 1)[-1]
+    from core import wake_routes as _wr
+    project = _wr.project_for_cwd(cwd)
     try:
         term = conn.execute(
             "SELECT 1 FROM event WHERE type IN ('agent_dead','agent_process_failed') "

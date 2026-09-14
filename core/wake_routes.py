@@ -70,6 +70,65 @@ def normalize_key(key: str) -> str:
     return k if _KEY_RE.match(k) else ""
 
 
+# Directories that HOLD projects rather than being one. A project is the first segment
+# beneath one of these, so /opt/payment-orchestrator/deploy/infra/dns belongs to
+# payment-orchestrator, not to "dns".
+WORKSPACE_ROOTS = ("/opt", "/root", "/srv")
+
+
+def project_for_cwd(cwd: str, config: Optional[dict] = None) -> str:
+    """The project a working directory belongs to.
+
+    Every project-mapping site used to take the LAST path segment, which is only correct
+    while an agent sits at its project root. The moment one works in a subdirectory it
+    acquires a phantom project named after that directory — and a phantom project is not
+    on any denylist.
+
+    Live on 2026-09-14: `payorch-ha-fresh`, whose session is
+    `6db4919a-460a-4b62-9e0d-c9fff356a7be`, worked in
+    `/opt/payment-orchestrator/deploy/infra/dns` and every hook event it produced was
+    filed under project `dns`. Both `payment-orchestrator` and `payorch` are deny-listed;
+    `dns` is not. The denylist protecting payment lapses precisely when the agent changes
+    directory — fail-open, in the one place that must fail closed.
+
+    Resolution order, most authoritative first:
+
+      1. a configured session root, longest match wins — the same prefix rule
+         `discovery.classify_scope` already uses, so the two agree;
+      2. the first segment under a workspace root, which is how projects are laid out on
+         this host and how `native_supervisor.SELF_PROJECT` already derives its own name;
+      3. the basename, which is the previous behaviour and the answer for a path that
+         matches nothing.
+
+    Returns a normalized route key, or "" when the input cannot be one.
+    """
+    cwd = (cwd or "").rstrip("/")
+    if not cwd:
+        return ""
+    if config is None:
+        try:
+            from core.control_plane.discovery import _load_config
+            config = _load_config()
+        except Exception:  # noqa: BLE001 — an unreadable config must not break routing
+            config = {}
+    best_root, best_project = "", ""
+    for name, sc in (config.get("sessions") or {}).items():
+        root = (sc.get("root") or "").rstrip("/") if isinstance(sc, dict) else ""
+        if not root:
+            continue
+        if cwd == root or cwd.startswith(root + "/"):
+            if len(root) > len(best_root):
+                best_root, best_project = root, (sc.get("project") or name)
+    if best_project:
+        return normalize_key(best_project)
+    for ws in WORKSPACE_ROOTS:
+        if cwd.startswith(ws + "/"):
+            seg = cwd[len(ws) + 1:].split("/", 1)[0]
+            if seg:
+                return normalize_key(seg)
+    return normalize_key(cwd.rsplit("/", 1)[-1])
+
+
 def route_key_for_event(project_id: str = "", source: str = "", agent_id: str = "") -> str:
     """The stable routing identity of an event. Project first; everything projectless —
     runtime, infrastructure, delivery meta-traffic — is owner-os traffic by definition."""

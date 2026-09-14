@@ -484,7 +484,7 @@ def project_for(agent: dict, conn=None) -> str:
         except Exception:  # noqa: BLE001
             pass
         cwd = (agent.get("claude_cwd") or agent.get("cwd") or "").rstrip("/")
-        return wake_routes.normalize_key(cwd.rsplit("/", 1)[-1]) if cwd else ""
+        return wake_routes.project_for_cwd(cwd) if cwd else ""
     finally:
         if own:
             conn.close()

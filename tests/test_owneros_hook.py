@@ -142,7 +142,10 @@ def test_a_recognised_event_still_writes_nothing_to_stdout():
 def test_identity_derives_project_from_cwd_and_never_guesses_a_route():
     from hooks.owneros_hook import _identity
     i = _identity({"cwd": "/opt/diamond/auction", "session_id": "abc123def456789"})
-    assert i["project"] == "auction"
+    # the OWNING project, not the directory the agent happens to be standing in. Taking
+    # the last segment filed event 51041 under a project called `dns` because a payment
+    # agent had cd'd into /opt/payment-orchestrator/deploy/infra/dns.
+    assert i["project"] == "diamond"
     assert "conversation" not in i and "chatgpt" not in json.dumps(i).lower(), \
         "a worker must never carry a raw ChatGPT URL; routing stays central"
 
