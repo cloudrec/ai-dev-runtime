@@ -3710,3 +3710,96 @@ authority, and the payment-sensitive gates elsewhere stay fail-closed regardless
 Ten local commits, tracked tree clean, HEAD `e705b64`, suite 3325 passed, no code changed
 since that run. Services active, reverse path `ok`, notifications green. No configuration,
 route, credential or service was touched.
+
+---
+
+## Scratchpad paths are not project paths — diagnosed, NOT fixed (2026-09-14 21:00 UTC)
+
+An automated instruction was received via the Owner OS API. Not owner sign-off. This
+section is documentation only: no code was changed, nothing pushed or restarted, and the
+live-loaded routing module was not touched.
+
+### Root cause, measured
+
+Events **51561** and **51565** (`agent_process_failed`, critical, `owner_action_required=1`)
+both carry:
+
+```
+project = scratchpad
+cwd     = /tmp/claude-0/-opt-gaika-extension-ru/<session>/scratchpad
+hook    = StopFailure
+last_assistant_message = "You've hit your session limit · resets 9:10pm (Europe/Berlin)"
+```
+
+The failure itself is **quota, not a defect**: a Claude session limit on
+`gaika-ru-sonnet-v1`. No work was lost, and Owner OS handled it without manual
+intervention — classified, wake delivered (`delivered=1`), and deduplicated onto one key.
+
+The defect is the project. `wake_routes.project_for_cwd` resolves configured session
+roots, then the first segment under `/opt`, `/root`, `/srv`, then falls back to the
+basename. A scratchpad path is under `/tmp`, so it reaches the fallback and the project
+becomes the literal directory name, `scratchpad`.
+
+Measured: **8 events** filed under the phantom project, all from that one agent. No
+payment exposure observed. The mechanism is generic — every agent has a scratchpad — so a
+payment agent whose hook fires from its scratchpad would file the same way and miss the
+denylist.
+
+### Why the obvious fix is wrong, and why that matters
+
+Decoding `-opt-gaika-extension-ru` back to a path fails twice over.
+
+**It is not this agent's directory.** Its real cwd is `/opt/gaika-worktrees/ru`. Neither
+reading of the encoded name exists on disk:
+
+```
+absent  /opt/gaika-extension-ru
+absent  /opt/gaika/extension-ru
+```
+
+The scratchpad name records where the session STARTED; the agent has since moved to a
+worktree. Decoding would replace one wrong answer with a different wrong answer.
+
+**And the encoding is lossy.** `/` becomes `-`, but `-` is legal in names, so
+`/opt/gaika-extension-ru` and `/opt/gaika/extension-ru` encode identically. On this host
+**43 of 90 directories under `/opt` contain a hyphen**, so the ambiguity is the norm, not
+an edge case.
+
+An earlier estimate in this session ("twenty minutes to decode the string") was based on
+that wrong premise and is withdrawn.
+
+### The correct change
+
+Do not parse a scratchpad path for identity at all. When a reported cwd matches
+`/tmp/claude-*/…/scratchpad`, treat it as no evidence of project and resolve from the
+session's real working directory — the PID-backed value the inventory already exposes as
+`claude_cwd` (`/opt/gaika-worktrees/ru` for this agent). If the real cwd cannot be proven,
+return unknown and let routing fall back, rather than inventing a project from a temporary
+directory name.
+
+### Regression coverage to add
+
+- a scratchpad cwd resolves via the session's real cwd, not the path;
+- an unprovable cwd returns unknown — fail closed, no invented project;
+- a normal project cwd is unchanged (the existing 24 tests must stay green);
+- the hyphen ambiguity is pinned so nobody reintroduces decoding;
+- denial still only widens: `project_candidates` must not lose a deny-listed name when the
+  project becomes unknown.
+
+### Verification and rollback
+
+Verify live the same way the `dns` fix was verified: watch the next hook events from a
+scratchpad-cwd session and confirm the filed project changes, with the cwd unchanged in
+the payload as evidence. Rollback is `git revert` of the single commit — the module is
+pure resolution with no stored state, so nothing needs migrating.
+
+### Why this is gated
+
+`wake_routes.project_for_cwd` is loaded live by hook-spawned processes: proven earlier
+today, when the `dns` correction took effect within minutes and with no restart. The
+change alters which project live events file under, therefore which agents the denylist
+covers, and routes unprovable cwds to the `owner-os` fallback instead of a project chat.
+That is live automation semantics, so it waits.
+
+**The exact approval needed, one line:** *"правь скретчпад"* — authorising the local code
+change plus tests, still with no push and no restart.
