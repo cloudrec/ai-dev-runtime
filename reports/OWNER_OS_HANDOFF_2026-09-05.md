@@ -4122,3 +4122,88 @@ another name — which is how this session verifies every gated change. Now deri
 scratchpad. Applying them writes to two hot-loaded files and needs one directly
 owner-authored line. Rollback stays `git checkout -- core/`, and stays imperfect for the
 same reason the patch is gated: it restores the code, not the events decided in between.
+
+---
+
+## 2026-09-15 — exact impact, and a fix that has been inert in production since it shipped
+
+Read-only throughout. `core/` untouched, live state untouched; `auto_register` was
+reproduced against a **copy** of `control_plane.db`, never the live one.
+
+### The denylist in production is not the denylist in the code
+
+`AUTO_REGISTER_DENY_PROJECTS` reads `NATIVE_SUPERVISOR_DENY_PROJECTS` with the code list as
+a *default*, so any value in the environment **replaces** it. `configs/.env`, dated
+2026-09-11, carries:
+
+```
+NATIVE_SUPERVISOR_DENY_PROJECTS=capacity,auction,payment-orchestrator,payorch,email,xmrig,mess
+```
+
+`diamond` is absent. Commit `47243fc` (2026-09-14) added `diamond` to the code default for
+a precise reason recorded in its own comment — `diamond-auction:0.0` runs in `/opt/diamond`
+and registers under the key `diamond`, while `auction` is the name people use and matches
+nothing, so the agent auto-registered and was continued 32 times in three hours. **That fix
+has never been in effect.** The env file shadows it, and `diamond-auction:0.0` is in
+`native_supervised_target` right now, registered since 2026-09-06.
+
+Confirmed rather than inferred: `_denied_for('diamond', '/opt/diamond')` is True with the
+code default and False under the live environment, and replaying `auto_register` against a
+copy of the live database with the code default purges `diamond-auction:0.0` via
+`purge_denied` — which is why the live `native_supervision_dereg` table holds exactly one
+row, and it is a `purge_stale`, not a `purge_denied`.
+
+The module's own comment says "Env may WIDEN this; it can never narrow it past
+SELF_PROJECT". `os.getenv(NAME, default)` does not implement that sentence. Fixing it means
+editing a hot-loaded file AND changing denylist policy — two owner gates — so it is
+reported, not touched.
+
+### Exact impact of the gated patch, measured under the live environment
+
+The earlier 154-path measurement used the code default. Re-run with `configs/.env`'s actual
+values loaded, the shape is identical:
+
+```
+WIDENED (denied -> allowed):  0
+tightened (allowed -> denied): 8
+denied count: 12 -> 20
+```
+
+**Registered supervision targets affected: exactly one.** Each of the seven rows in
+`native_supervised_target` was re-resolved the way `refresh_known_projects` +
+`purge_denied` do it:
+
+| target | project | denied now | denied after |
+|---|---|---|---|
+| `main105-backup-repair:0.0` | `opt` | False | **True** |
+| the other six | `diamond`, `gaika-worktrees`, `gaika-extension`, `hostsecure`, `security-demo`, `backups` | False | False |
+
+This corrects an earlier statement in this report that "the two live `opt` agents stop
+being auto-registered". Only one of them is a registered supervision target;
+`session:f2c240aa-5a3` is a hook session that emits events under project `opt` and holds no
+registration, so nothing about it changes except the project its events are filed under.
+
+**Wake routes affected: none.** No route is bound for `opt`, `root`, `srv`, `scratchpad` or
+`pr`, so events from those paths already reach the `owner-os` fallback; after the patch they
+reach it by name instead of by absence.
+
+### The owner decision, and how to undo it
+
+One line, directly from the owner, is the whole gate. On it:
+
+```
+baseline   git rev-parse HEAD                       # 3f220e6, tree clean
+apply      patch -p0 < scratchpad/unidentified-fix.patch
+           cp scratchpad/test_unidentified_project_fails_closed.py tests/
+verify     pytest tests/test_unidentified_project_fails_closed.py \
+                  tests/test_project_for_cwd.py tests/test_native_supervisor.py \
+                  tests/test_native_supervisor_deny_targets.py \
+                  tests/test_scratchpad_not_a_project.py tests/test_owneros_hook.py \
+                  tests/test_project_supervisor.py          # 269 expected
+boundary   re-run the 154-path diff; anything other than 0 widened aborts
+rollback   git checkout -- core/
+```
+
+Rollback restores the code in one command and needs no restart, which is also precisely why
+this is gated: between the write and the rollback, every hook has already run the new code
+against real events. The rollback returns the behaviour, not the decisions.
