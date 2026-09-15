@@ -3929,3 +3929,93 @@ what the next person actually needs.
 Live tree clean, 13 local commits unpushed, the prepared scratchpad patch still sitting
 inert in the session scratchpad. Services untouched. The scratchpad gate is unchanged and
 still needs one directly owner-authored line.
+
+---
+
+## 2026-09-15 — read-only verification: the scratchpad phantom is one instance, not the bug
+
+An automated instruction (explicitly not owner-typed) confirmed the patch gate should hold
+and asked for read-only verification instead. That verification found the gated patch is
+aimed at a symptom, and that a larger instance of the same fail-open is live right now.
+
+### The wake set behind the delivery ratio
+
+Last 6h: 73 delivery rows, 62 delivered, 11 not. The 11 fall into three causes, none of
+them a code defect:
+
+| reason | n | class | outcome |
+|---|---|---|---|
+| `assistant_generating_wedged` | 5 | transient — pane busy, retried | 3 of 5 delivered on the next attempt |
+| `assistant_still_generating` | 3 | expected — deliberate back-off | 2 of 3 delivered on the next attempt |
+| `cdp_error:WebSocketTimeoutException` | 3 | transient infra — CDP socket | retried |
+
+Every retry that succeeded is a *later row for the same event_id*, so the ratio counts
+attempts, not events. By event, 5 of the 10 events behind those rows are still undelivered
+(52123, 52225, 52268, 52292, 52385) and all 5 are inside their window. Three carry
+`owner_action_required=1` and are legitimately waiting on the owner, not on a fix.
+
+Fail-closed invariant re-checked: submitted wakes with neither a delivered row, an
+abandonment, nor an expiry = **2** (52296 at 18 min, 52390 at 0.8 min). Both are inside
+`MAX_WAKE_AGE_SECS` (10800s), which is the window the sweep is required to leave alone.
+Nothing older than the window lacks a terminal verdict. The invariant holds.
+
+### The phantom project is not bounded by anything
+
+`scratchpad` stopped at 8 events on 2026-09-14T19:03. Nothing prevents it from growing —
+the agent simply changed directory. One session, `01bb4e35-209`, has been filed under
+**thirteen different project ids** in a week:
+
+```
+ru 561 | gaika-worktrees 599 | auction 14 | root 13 | sites-available 10
+seo-preserved-20260908 10 | scratchpad 8 | renewal 7 | memory 4 | deploy 4
+seo 2 | pr 1 | (empty) 29
+```
+
+Its real project is `gaika-extension-ru` throughout. `scratchpad` is one name out of
+thirteen. `auction` happened to be deny-listed; the other twelve are not. Its current cwd
+(`/root/.claude/projects/-opt-gaika-extension/memory`) resolves to the **empty string**,
+because `.claude` fails `normalize_key`. An empty project matches no denylist entry at all.
+
+### The bigger live instance the patch does not cover
+
+Project `opt` — cwd literally `/opt` — holds **370 events**, 73 in the last 24h, from two
+currently live agents (`main105-backup-repair:0.0`, `session:f2c240aa-5a3`), including 210
+`agent_prompt_needs_response` at severity high and one `agent_process_failed` (critical).
+
+Verified against the running code, not by reading it:
+
+```
+'/opt'                    -> 'opt'                 denied=False
+'/opt/gaika-extension-ru' -> 'gaika-extension-ru'  denied=False
+'/tmp/.../scratchpad'     -> 'scratchpad'          denied=False
+```
+
+`/opt` is the parent directory of `payment-orchestrator`, `diamond`, `capacity` and
+`email` — four of the eight deny-listed projects. An agent whose cwd is `/opt` is denied by
+none of them, and `_denied_for` cannot help: its path-segment rule sees only `opt`. This is
+the same fail-open shape as the original `dns` case, one level higher and currently active.
+
+The prepared patch adds `is_scratchpad_path` and returns `""` for scratchpad paths. It
+would fix 8 events out of this set and would give the scratchpad case the same
+empty-project hole that `01bb4e35` already sits in. It is not wrong, but it is not the fix.
+
+### The one real gate
+
+Unchanged, and now narrower than before: the patch touches `core/wake_routes.py` and
+`core/native_supervisor.py`, both loaded live by a fresh interpreter on every hook
+(`hooks/owneros_hook.py:185`). There is no deploy step and therefore no inert state — a
+local edit is a production change at the next hook event. That is why this cannot be done
+under an automated instruction, whatever the instruction says about not pushing.
+
+Minimal safe application, when and only when the owner says so directly:
+
+1. baseline — `git rev-parse HEAD` (`0232fa9`), tree already clean
+2. apply the patch, run `pytest tests/test_project_for_cwd.py tests/test_native_supervisor.py
+   tests/test_scratchpad_not_a_project.py` **before** any hook can fire
+3. verify the denial direction did not widen *or narrow*: `_denied_for` must stay True for
+   every currently denied project and must not become True for `gaika-worktrees`/`mess`
+4. rollback — `git checkout -- core/` restores live behaviour immediately, same mechanism,
+   no restart needed in either direction
+
+And the patch should be widened first: `/opt` and the empty-project case are live and
+larger than the one it was written for.
