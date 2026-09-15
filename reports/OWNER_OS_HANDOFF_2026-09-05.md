@@ -4100,6 +4100,15 @@ a confined cwd, over 90s without one. The test also spelled
 against another tree's environment. Both fixed; 9 passed in 0.79s in the repo and 0.90s in
 the copy, where it previously hung.
 
+**Full repo suite after both test fixes: 3325 passed, 0 failed, 19:11.**
+
+A note on method, because it cost two wrong statements here. A long suite's output file
+is not a progress indicator: reading its tail mid-run, or reading a file another process
+still holds a descriptor on, shows bytes that are neither current nor complete. Both times
+I read "the run died" out of a file whose run was in fact still going or already finished.
+The only honest signal is the summary line, waited for — `until grep -qE '[0-9]+ (passed|
+failed)'` — not a tail and not `pgrep`.
+
 ### Committed to this repo
 
 Only `tests/test_native_supervisor.py`: `test_the_supervisor_never_drives_its_own_session`
