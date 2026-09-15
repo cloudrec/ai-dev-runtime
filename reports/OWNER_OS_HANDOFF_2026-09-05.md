@@ -4019,3 +4019,86 @@ Minimal safe application, when and only when the owner says so directly:
 
 And the patch should be widened first: `/opt` and the empty-project case are live and
 larger than the one it was written for.
+
+---
+
+## 2026-09-15 — the widened fix, built and measured in the inert copy
+
+An automated instruction (not owner-typed) asked for this to be applied to `core/` directly
+with the argument that it would be "trivially reversible". It is not: both files are loaded
+by a fresh interpreter on every hook, so between an edit and its revert the new code has
+already decided real events. The work was done in the inert copy instead. **Nothing under
+`core/` in this repo was touched.**
+
+### What the widened patch does
+
+Two changes on top of the earlier scratchpad-only version:
+
+1. `wake_routes.project_for_cwd` — a bare workspace root (`/opt`, `/root`, `/srv`) returns
+   `""` instead of inventing a project called `opt`.
+2. `native_supervisor._identity_unknown` (new) — **unknown identity denies**. When neither
+   an explicit project nor the cwd names a project, `_denied_for` returns True and
+   `send_block_reason` answers `project_identity_unknown` rather than `not_registered`.
+
+The second is the actual fix. The first only stops one way of manufacturing a fake name;
+without the second, every other unnameable path stays allowed, because a name that matches
+nothing matches no denylist entry either.
+
+`send_block_reason`'s single caller (`native_supervisor.py:1031`) journals the string and
+does not branch on it, so the fourth reason is journal-only.
+
+### Measured, not argued: the boundary moved one way
+
+The denial decision was computed for **154 paths** — every distinct cwd in a week of
+events, every directory under `/opt`, the deny-listed roots, and the degenerate cases —
+under the repo's code and under the patched copy:
+
+```
+WIDENED (denied -> allowed):  0
+tightened (allowed -> denied): 8
+denied count: 11 -> 19
+```
+
+The eight: `/opt`, `/root`, `/srv`, `/opt/_quarantine`,
+`/root/.claude/projects/-opt-gaika-extension/memory`, and three scratchpad paths.
+
+The first run of this comparison **did report one widening** — `/root/ai-dev-runtime`,
+denied before and allowed after. That was an artefact of the measurement, not the patch:
+`SELF_PROJECT` is derived from the module's own location, so in a directory named
+`candidate` the supervisor's own project is spelled `candidate` and `ai-dev-runtime` is not
+on the list. Re-running the copy from a directory named `ai-dev-runtime` gives
+`SELF_PROJECT = ai-dev-runtime`, the full eight-entry denylist, and zero widenings. The
+artefact is recorded here because it is the exact shape that would let a real widening be
+waved away as "just the copy".
+
+### Tests
+
+`tests/test_unidentified_project_fails_closed.py`, 26 cases: no-project paths, denial for
+each, the cost (the two live `opt` agents stop being auto-registered), every deny-listed
+project still denied at its root and in subdirectories, four allowed projects still
+allowed, the denylist set itself unchanged, and the two failure shapes that would turn this
+into a host-wide shutdown or a no-op.
+
+Targeted suite in the copy: **269 passed** across `test_unidentified_project_fails_closed`,
+`test_scratchpad_not_a_project`, `test_project_for_cwd`, `test_native_supervisor`,
+`test_native_supervisor_deny_targets`, `test_owneros_hook`, `test_project_supervisor`.
+
+The **full** suite did not complete and is not claimed green. Four attempts died at
+different points (75%, 80%, 83%) with no pytest process left and no accessible OOM record;
+the host is at 9.0 of 11.9 GB RAM with 10 GB of swap in use. Different stop points with an
+unchanged tree points at external pressure rather than a test, but that is a diagnosis, not
+a proof, and it is the one open loose end here.
+
+### Committed to this repo
+
+Only `tests/test_native_supervisor.py`: `test_the_supervisor_never_drives_its_own_session`
+spelled `ai-dev-runtime` literally in both halves, so it failed in any checkout under
+another name — which is how this session verifies every gated change. Now derived from
+`ns.__file__`. 122 passed in the live repo.
+
+### The gate, unchanged
+
+`unidentified-fix.patch` (172 lines) and the new test file are staged inert in the session
+scratchpad. Applying them writes to two hot-loaded files and needs one directly
+owner-authored line. Rollback stays `git checkout -- core/`, and stays imperfect for the
+same reason the patch is gated: it restores the code, not the events decided in between.

@@ -178,9 +178,15 @@ def test_a_deny_listed_agent_is_never_touched(monkeypatch):
 def test_the_supervisor_never_drives_its_own_session():
     """ai-dev-runtime is deny-listed: a supervisor that answers its own turn boundaries
     would loop on itself."""
-    assert "ai-dev-runtime" in ns.AUTO_REGISTER_DENY_PROJECTS
-    r = ns.auto_register([_agent(target="owner-os-wake-policy-opus:0.0",
-                                 cwd="/root/ai-dev-runtime")])
+    # Both halves used to spell the supervisor's project literally, but it is DERIVED
+    # from the module's own location (SELF_PROJECT). A checkout under any other name —
+    # a worktree, or the inert copy this repo's own gated changes are verified in —
+    # therefore failed this test for a reason that had nothing to do with the rule, and
+    # a copy-based verification is exactly where a false red is most expensive.
+    import os
+    assert ns.SELF_PROJECT in ns.AUTO_REGISTER_DENY_PROJECTS
+    own_root = os.path.dirname(os.path.dirname(os.path.abspath(ns.__file__)))
+    r = ns.auto_register([_agent(target="owner-os-wake-policy-opus:0.0", cwd=own_root)])
     assert r["registered"] == []
 
 
