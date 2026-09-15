@@ -4083,11 +4083,22 @@ Targeted suite in the copy: **269 passed** across `test_unidentified_project_fai
 `test_scratchpad_not_a_project`, `test_project_for_cwd`, `test_native_supervisor`,
 `test_native_supervisor_deny_targets`, `test_owneros_hook`, `test_project_supervisor`.
 
-The **full** suite did not complete and is not claimed green. Four attempts died at
-different points (75%, 80%, 83%) with no pytest process left and no accessible OOM record;
-the host is at 9.0 of 11.9 GB RAM with 10 GB of swap in use. Different stop points with an
-unchanged tree points at external pressure rather than a test, but that is a diagnosis, not
-a proof, and it is the one open loose end here.
+**Correction, same day.** The paragraph that stood here said the full suite never
+completed and blamed memory pressure. That was wrong, and wrong in the direction that
+matters: a run HAD completed — **3361 passed, 1 failed, 19:06** — and I read a truncated
+output file from an earlier killed attempt instead of the finished one. The apparent
+"deaths at 75%, 80%, 83%" were three views of stale bytes in a file that a still-open file
+descriptor was overwriting at its own offset.
+
+The single real failure was `test_guarded_deploy.py::test_a_realistic_red_pytest_gate_refuses`,
+and it was not flakiness. Diagnosed with `faulthandler`: the test's gate runs
+`python3 -m pytest <tmpfile>` with an inherited cwd, and pytest builds directory nodes from
+the common ancestor of its rootdir and its arguments. Started from a tree under `/tmp` that
+ancestor is `/tmp`, so collecting it walks every session scratchpad on the box — 0.03s from
+a confined cwd, over 90s without one. The test also spelled
+`/root/ai-dev-runtime/tools/guarded_deploy.sh` literally, so it ran one tree's script
+against another tree's environment. Both fixed; 9 passed in 0.79s in the repo and 0.90s in
+the copy, where it previously hung.
 
 ### Committed to this repo
 

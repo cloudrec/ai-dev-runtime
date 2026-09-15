@@ -8,9 +8,14 @@ guard so the same shape cannot recur.
 from __future__ import annotations
 
 import os
+import pathlib
 import subprocess
 
-SCRIPT = "/root/ai-dev-runtime/tools/guarded_deploy.sh"
+# Derived, not spelled. A hardcoded absolute path made this file exercise the script in
+# /root/ai-dev-runtime no matter which tree pytest was started in — and every hot-loaded
+# change in this repo is verified in an inert copy first, so the test ran one tree's
+# script against another tree's environment.
+SCRIPT = str(pathlib.Path(__file__).resolve().parent.parent / "tools" / "guarded_deploy.sh")
 
 
 def _run(gate: str, deploy: str, *extra: str):
@@ -38,7 +43,13 @@ def test_a_realistic_red_pytest_gate_refuses(tmp_path):
     marker = tmp_path / "deployed"
     failing = tmp_path / "test_red.py"
     failing.write_text("def test_red():\n    assert False\n")
-    r = _run(f"python3 -m pytest {failing} -q", f"touch {marker}")
+    # The gate runs pytest on a file in a temp directory, and pytest collects from the
+    # common ancestor of its rootdir and its arguments. Inheriting this process's cwd
+    # therefore made that ancestor /tmp when the suite was started from a tree under
+    # /tmp — and collecting /tmp walks every session scratchpad on the box. The gate took
+    # 0.03s from a confined cwd and over 90s without one, so this test's runtime depended
+    # entirely on where the outer suite happened to be launched. Confine it.
+    r = _run(f"cd {tmp_path} && python3 -m pytest {failing.name} -q", f"touch {marker}")
     assert r.returncode == 1
     assert not marker.exists()
 
