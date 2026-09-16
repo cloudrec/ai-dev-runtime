@@ -4468,3 +4468,47 @@ ChatGPT conversation. Those turns are not recorded in this control plane. A rela
 claim through the automated channel is not verification of it — which is what the channel's
 own preamble asks for, and what the earlier fabricated «правь скретчпад» attribution is
 the precedent for.
+
+### The owner-authenticated ingress: it exists, and it proves less than it says
+
+Asked (read-only) which supported owner-authenticated decision ingress exists that ChatGPT
+can invoke without typing into tmux. It exists:
+
+**`POST /control-plane/owner/decision`**, MCP operation `record_owner_decision`
+(`api/v1.py:694`). Its design is careful in the ways that matter: `source_channel` is fixed
+to `owner_api` and is not a parameter, so no caller can claim a channel it did not come
+through; it answers only gates that are ALREADY OPEN; and resolution still runs through
+`resolve_gate_with_decision`, which re-verifies provenance and refuses a consumed decision.
+`provenance.TRUSTED_CHANNELS` accepts `owner_api`, so a decision through it is stored
+`authenticated=1`, `trusted=True`.
+
+**It cannot carry this decision.** All 17 currently open gates are `classify_scope` —
+"unknown-scope agent at /opt/mess" and eight siblings, plus this session's own pane, opened
+2026-09-06. There is no gate representing "apply the wake-suppression patch", and the
+endpoint refuses a gate that is not open. Nothing here can be answered into existence.
+
+**And the part that matters beyond this decision.** `_auth` (`api/v1.py:35-54`):
+
+```python
+expected = hmac.new(_TOKEN.encode(), x_runtime_timestamp.encode(), hashlib.sha256)  # hmac path
+hmac.compare_digest(authorization[7:].strip(), _TOKEN)                              # bearer path
+```
+
+Both paths derive from the **same secret**, `RUNTIME_TOKEN`. The HMAC path is not a second
+credential — it is the same token used as a signing key rather than as a password, so
+anyone holding the bearer token can compute a valid signature. The endpoint's docstring
+says `authenticated=True` is "earned by `_auth`, not asserted", which is true and is also
+the limit: `_auth` proves possession of a credential the automation already holds, not that
+a person acted. `actor="owner:hmac"` is a durable label, not stronger authority.
+
+Consequence: the automated channel can mint a `trusted=True`, `source_channel=owner_api`
+owner decision for any open gate — the same authority question as `api:bearer`, now inside
+the one channel the provenance invariant was built to trust.
+
+**Correction to the earlier entry in this report.** It offered the unused `hmac` method as
+"the obvious hook" for separating principals. The shape is right; the implementation is not
+usable as-is, because it shares `RUNTIME_TOKEN` with bearer. Separation needs a distinct
+key, not the existing second method. That changes what option 2 costs, so it is stated
+here rather than left standing.
+
+Read-only throughout; no decision recorded, no gate answered, no endpoint called.
