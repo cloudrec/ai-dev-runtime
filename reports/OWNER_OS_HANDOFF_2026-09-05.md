@@ -4512,3 +4512,36 @@ key, not the existing second method. That changes what option 2 costs, so it is 
 here rather than left standing.
 
 Read-only throughout; no decision recorded, no gate answered, no endpoint called.
+
+### Task 304: absent, and the endpoint that would create it refuses
+
+Verified in the stores, as asked. Task 304 does not exist, and neither does 303.
+
+**The plumbing gap, precisely.** There are two task stores and the API uses neither of the
+ones searched first:
+
+* `control_plane.db → os_task` — 11 rows, ids 1–11, all `cp-canary:0.0` continuations from
+  2026-08-06. Dormant for six weeks. This is what "task_id" was being looked up in.
+* `agent_control.db → orchestrator_task` — what `POST /agents/orchestrator/task` actually
+  writes, via `orchestrator_plan` (`core/orchestrator_plan.py:36`). **3 rows, ids 1, 2, 3**,
+  all `completed`, from the SEO and orchestrator builds. Ids here are small sequential
+  integers; 304 is not a value this table produces.
+
+**And the endpoint cannot create one right now.** `agents_add_task` calls
+`plan.get_active_goal()` first and raises `HTTP 400 "no active goal"` if there is none.
+`orchestrator_goal` holds exactly one row, status **`complete`** since 2026-08-08, and
+`get_active_goal()` returns `None`. So every call to that endpoint currently fails before
+writing anything. A task reported as created and approved could not have been.
+
+`approve_task` still does not exist anywhere in the codebase, and neither store has an
+`approved` or `ready` status in its vocabulary — `add_task` defaults to `pending`.
+
+**The gap that would remain after fixing all of that.** A task created through
+`/agents/orchestrator/task` and updated through `/agents/orchestrator/task-status` passes
+the same `_auth` bearer dependency as every other endpoint. A caller that can create a task
+can set its status, so an "approved task" is provenance the automated channel issues to
+itself. The only channel `provenance.TRUSTED_CHANNELS` accepts is `owner_api`, and
+`_auth` derives that from the same `RUNTIME_TOKEN` as bearer. Seeding a goal and wiring an
+approval state would produce a gate that looks stronger and is not.
+
+Read-only: nothing created, approved, or called.
