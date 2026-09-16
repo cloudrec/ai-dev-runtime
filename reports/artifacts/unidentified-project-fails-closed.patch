@@ -1,0 +1,397 @@
+diff --git a/core/wake_routes.py b/core/wake_routes.py
+index 8fd40da..1205e16 100644
+--- a/core/wake_routes.py
++++ b/core/wake_routes.py
+@@ -76,6 +76,14 @@ def normalize_key(key: str) -> str:
+ WORKSPACE_ROOTS = ("/opt", "/root", "/srv")
+ 
+ 
++_SCRATCHPAD_RE = re.compile(r"^/tmp/claude-[^/]+/.+/scratchpad(?:/|$)")
++
++
++def is_scratchpad_path(cwd: str) -> bool:
++    """True for an agent's per-session scratchpad, which carries no project identity."""
++    return bool(_SCRATCHPAD_RE.match((cwd or "").rstrip("/") + ""))
++
++
+ def project_for_cwd(cwd: str, config: Optional[dict] = None) -> str:
+     """The project a working directory belongs to.
+ 
+@@ -105,6 +113,25 @@ def project_for_cwd(cwd: str, config: Optional[dict] = None) -> str:
+     cwd = (cwd or "").rstrip("/")
+     if not cwd:
+         return ""
++    if cwd in WORKSPACE_ROOTS:
++        # A workspace root HOLDS projects; it is not one. An agent whose cwd is literally
++        # /opt sits in the parent of payment-orchestrator, diamond, capacity and email —
++        # four of the eight deny-listed projects — and filing it as project `opt` matched
++        # none of them. 370 events were filed that way, 73 of them in a single day, from
++        # two agents that were live when this was found. There is no project name to
++        # derive here, so none is invented: the caller gets "" and must treat an agent
++        # with no derivable project as unidentified rather than as a project called
++        # `opt`. See native_supervisor._identity_unknown, which fails that closed.
++        return ""
++    if is_scratchpad_path(cwd):
++        # A scratchpad is not a project. Its directory name encodes where the SESSION
++        # started, not where the agent is now — gaika-ru-sonnet-v1 reports
++        # /tmp/claude-0/-opt-gaika-extension-ru/<session>/scratchpad while actually
++        # working in /opt/gaika-worktrees/ru — and the encoding is lossy anyway, since
++        # "/" becomes "-" and "-" is legal in names (43 of 90 directories under /opt
++        # contain one). Decoding it would swap one wrong answer for another, so the path
++        # is treated as no evidence at all.
++        return ""
+     if config is None:
+         try:
+             from core.control_plane.discovery import _load_config
+diff --git a/core/native_supervisor.py b/core/native_supervisor.py
+index 139b001..c31ba47 100644
+--- a/core/native_supervisor.py
++++ b/core/native_supervisor.py
+@@ -354,11 +354,59 @@ def project_candidates(project: str, cwd: str) -> set:
+         k = _wr.normalize_key(seg)
+         if k:
+             out.add(k)
++        # A scratchpad segment encodes a path with "/" replaced by "-", and that encoding
++        # is lossy: "-opt-payment-orchestrator" could be /opt/payment-orchestrator or
++        # /opt/payment/orchestrator. Useless for NAMING — which is why project_for_cwd
++        # refuses to decode it — but perfectly safe here, because over-matching only ever
++        # widens denial. Without this a payment agent whose hook fired from its own
++        # scratchpad offered the denylist nothing to match: the candidates were
++        # {tmp, claude-0, scratchpad, <session>}. Its own regression test caught that.
++        if seg.startswith("-"):
++            parts = [x for x in seg.split("-") if x]
++            for i in range(len(parts)):
++                for j in range(i + 1, len(parts) + 1):
++                    cand = _wr.normalize_key("-".join(parts[i:j]))
++                    if cand:
++                        out.add(cand)
+     return out
+ 
+ 
++def _identity_unknown(project: str, cwd: str) -> bool:
++    """True when nothing about this agent names a project.
++
++    Three live shapes produce it, and until now all three were treated as `allowed`
++    because an unmatched name matches no denylist entry either:
++
++      /opt                                          -> a workspace root, not a project
++      /tmp/claude-0/<enc>/<session>/scratchpad       -> a scratchpad, deliberately no evidence
++      /root/.claude/projects/-opt-x/memory           -> first segment `.claude` fails normalize_key
++
++    The last one is not hypothetical: session 01bb4e35 has been filed under thirteen
++    different project ids in a week — `ru`, `gaika-worktrees`, `auction`, `root`,
++    `scratchpad`, `memory`, `pr`, the empty string and six more — while belonging to
++    `gaika-extension-ru` throughout. `auction` was denied by luck; the other twelve were
++    not. An identity this system cannot establish must not be read as an identity that
++    passed a check.
++    """
++    from core import wake_routes as _wr
++    if (project or "").strip():
++        return False
++    return not _wr.project_for_cwd(cwd or "")
++
++
+ def _denied_for(project: str, cwd: str) -> bool:
+-    """True when ANY candidate name for this agent is deny-listed."""
++    """True when ANY candidate name for this agent is deny-listed — or when there is no
++    identity to test at all.
++
++    Unknown identity denies. This only ever removes authority: an agent whose project
++    cannot be derived is not auto-registered and is not typed into. The cost is real and
++    should be read before this is shipped — the two agents currently filed under `opt`
++    stop being auto-registered — but the alternative is that the four deny-listed projects
++    living under /opt are protected only while their agents stay out of the parent
++    directory, which is the same fail-open that filed a payment agent as project `dns`.
++    """
++    if _identity_unknown(project, cwd):
++        return True
+     return bool(project_candidates(project, cwd) & AUTO_REGISTER_DENY_PROJECTS)
+ 
+ 
+@@ -659,6 +707,12 @@ def send_block_reason(target: str, project: str = "", *, cwd: str = "",
+     """
+     if target_denied(target):
+         return "target_excluded"
++    if _identity_unknown(project, cwd):
++        # Distinct from `not_registered`, which says a registration would fix it. Nothing
++        # about this agent names a project, so there is no project whose gates could be
++        # consulted — and the remedy is to find out where it actually works, not to
++        # register it.
++        return "project_identity_unknown"
+     # Same candidate rule the registration path uses: a directory is blocked if ANY name
+     # it could be filed under is deny-listed, so a more accurate project name can never
+     # downgrade this answer from a deliberate exclusion to "nobody registered it".
+diff --git a/tests/test_project_for_cwd.py b/tests/test_project_for_cwd.py
+index a17ac8b..63a37ce 100644
+--- a/tests/test_project_for_cwd.py
++++ b/tests/test_project_for_cwd.py
+@@ -95,7 +95,12 @@ def test_a_path_under_nothing_known_keeps_the_old_answer():
+ def test_empty_and_degenerate_inputs():
+     assert wr.project_for_cwd("", CFG) == ""
+     assert wr.project_for_cwd("/", CFG) == ""
+-    assert wr.project_for_cwd("/opt", CFG) == "opt"       # a workspace root is not a project
++    # A workspace root is not a project, and now says so. This line used to assert
++    # "opt" under a comment claiming the opposite, and that gap was live: 370 events
++    # were filed under project `opt` — the parent of payment-orchestrator, diamond,
++    # capacity and email — matching no denylist entry.
++    assert wr.project_for_cwd("/opt", CFG) == ""
++    assert wr.project_for_cwd("/srv", CFG) == ""
+ 
+ 
+ def test_a_trailing_slash_changes_nothing():
+diff --git a/tests/test_native_supervisor.py b/tests/test_native_supervisor.py
+index 5c622c3..1785627 100644
+--- a/tests/test_native_supervisor.py
++++ b/tests/test_native_supervisor.py
+@@ -178,15 +178,13 @@ def test_a_deny_listed_agent_is_never_touched(monkeypatch):
+ def test_the_supervisor_never_drives_its_own_session():
+     """ai-dev-runtime is deny-listed: a supervisor that answers its own turn boundaries
+     would loop on itself."""
+-    # Both halves used to spell the supervisor's project literally, but it is DERIVED
+-    # from the module's own location (SELF_PROJECT). A checkout under any other name —
+-    # a worktree, or the inert copy this repo's own gated changes are verified in —
+-    # therefore failed this test for a reason that had nothing to do with the rule, and
+-    # a copy-based verification is exactly where a false red is most expensive.
+-    import os
++    # Spelled from the module's own location, so a checkout under another name spells
++    # it differently; what must hold is that the supervisor's own project is denied.
+     assert ns.SELF_PROJECT in ns.AUTO_REGISTER_DENY_PROJECTS
+-    own_root = os.path.dirname(os.path.dirname(os.path.abspath(ns.__file__)))
+-    r = ns.auto_register([_agent(target="owner-os-wake-policy-opus:0.0", cwd=own_root)])
++    import os
++    r = ns.auto_register([_agent(target="owner-os-wake-policy-opus:0.0",
++                                 cwd=os.path.dirname(os.path.dirname(
++                                     os.path.abspath(ns.__file__))))])
+     assert r["registered"] == []
+ 
+ 
+@@ -771,7 +769,11 @@ def test_the_supervisors_own_project_is_a_distinct_reason():
+ 
+ def test_an_unregistered_project_is_merely_unregistered():
+     assert ns.send_block_reason("brand-new:0.0", "brandnew") == "not_registered"
+-    assert ns.send_block_reason("brand-new:0.0", "") == "not_registered"
++    assert ns.send_block_reason("brand-new:0.0", "", cwd="/opt/brandnew") == "not_registered"
++    # No project and no cwd is not an unregistered project — it is no project at all,
++    # and saying "not_registered" there would tell the owner that registering it is the
++    # remedy. Both answers block the send; only one of them is true.
++    assert ns.send_block_reason("brand-new:0.0", "") == "project_identity_unknown"
+ 
+ 
+ def test_the_scan_journal_records_the_specific_reason(monkeypatch):
+diff --git a/tmp/claude-0/-root-ai-dev-runtime/d86aaf21-dd80-4817-a8c5-8863526b3080/scratchpad/candidate/tests/test_unidentified_project_fails_closed.py b/tests/test_unidentified_project_fails_closed.py
+new file mode 100644
+index 0000000..e334a34
+--- /dev/null
++++ b/tests/test_unidentified_project_fails_closed.py
+@@ -0,0 +1,123 @@
++"""An identity this system cannot establish is not an identity that passed a check.
++
++Three live shapes resolve to no project at all, and every one of them was `allowed`,
++because a name that matches nothing matches no denylist entry either:
++
++    /opt                                     a workspace root, 370 events, 2 live agents
++    /tmp/claude-0/<enc>/<session>/scratchpad  a scratchpad, 8 events
++    /root/.claude/projects/-opt-x/memory      `.claude` fails normalize_key -> ""
++
++`/opt` is the worst of the three: it is the parent of payment-orchestrator, diamond,
++capacity and email — four of the eight deny-listed projects — so an agent that simply
++cd's up one level is denied by none of them. Session 01bb4e35 demonstrates the general
++case, having been filed under thirteen project ids in a week while belonging to
++`gaika-extension-ru` the whole time.
++
++These tests pin the fail-closed rule and, with equal weight, pin that it did not widen
++anything: every allowed path stays allowed and the denylist itself is untouched.
++"""
++from __future__ import annotations
++
++import pytest
++
++from core import native_supervisor as ns
++from core import wake_routes as wr
++
++SCRATCH = "/tmp/claude-0/-opt-gaika-extension-ru/01bb4e35-2097-44eb-94df-df5b48f2de7b/scratchpad"
++MEMORY = "/root/.claude/projects/-opt-gaika-extension/memory"
++
++
++# ── no project is derivable ─────────────────────────────────────────────────
++@pytest.mark.parametrize("cwd", ["/opt", "/opt/", "/root", "/srv", SCRATCH, MEMORY, "", "/"])
++def test_these_paths_name_no_project(cwd):
++    assert wr.project_for_cwd(cwd) == ""
++
++
++def test_a_workspace_root_no_longer_invents_a_project_called_opt():
++    """The exact live shape: cwd '/opt', filed as project 'opt', denied by nothing."""
++    assert wr.project_for_cwd("/opt") == ""
++    assert ns._project_of({"claude_cwd": "/opt"}) == ""
++
++
++# ── and therefore denies ────────────────────────────────────────────────────
++@pytest.mark.parametrize("cwd", ["/opt", "/root", "/srv", SCRATCH, MEMORY])
++def test_an_unidentified_agent_is_denied(cwd):
++    assert ns._identity_unknown("", cwd) is True
++    assert ns._denied_for("", cwd) is True
++
++
++def test_the_two_live_opt_agents_would_stop_being_auto_registered():
++    """Names the cost explicitly so it is a decision, not a surprise."""
++    agents = [{"target": "main105-backup-repair:0.0", "claude_cwd": "/opt"},
++              {"target": "session-f2c240aa:0.0", "claude_cwd": "/opt"}]
++    for a in agents:
++        assert ns._denied_for(ns._project_of(a), a["claude_cwd"]) is True
++
++
++def test_the_block_reason_says_unidentified_not_unregistered():
++    """`not_registered` would tell the owner that registering it is the remedy."""
++    assert ns.send_block_reason("x:0.0", "", cwd="/opt") == "project_identity_unknown"
++    assert ns.send_block_reason("x:0.0", "", cwd=SCRATCH) == "project_identity_unknown"
++
++
++# ── the denial boundary did not move ────────────────────────────────────────
++def test_every_deny_listed_project_is_still_denied_at_its_own_root():
++    for proj in sorted(ns.AUTO_REGISTER_DENY_PROJECTS):
++        cwd = f"/opt/{proj}"
++        assert ns._denied_for(wr.project_for_cwd(cwd), cwd) is True, proj
++
++
++def test_denied_projects_stay_denied_in_their_subdirectories():
++    for cwd in ("/opt/payment-orchestrator/deploy/infra/dns",
++                "/opt/diamond/auction",
++                "/opt/capacity/src/app"):
++        assert ns._denied_for(wr.project_for_cwd(cwd), cwd) is True, cwd
++
++
++@pytest.mark.parametrize("cwd,proj", [
++    ("/opt/hostsecure/src", "hostsecure"),
++    ("/opt/gaika-worktrees/ru", "gaika-worktrees"),
++    ("/opt/mess/app", "mess"),
++    ("/opt/security-demo", "security-demo"),
++])
++def test_an_allowed_project_is_still_allowed(cwd, proj):
++    """The half that proves this is a tightening and not a shutdown."""
++    assert wr.project_for_cwd(cwd) == proj
++    assert ns._identity_unknown(proj, cwd) is False
++    assert ns._denied_for(proj, cwd) is False
++
++
++def test_the_denylist_itself_is_unchanged():
++    """SELF_PROJECT is derived from the module's own location, so it is spelled
++    differently in a checkout under another name — which is exactly what caught this
++    assertion when it was first written against a copy. Everything else is fixed."""
++    assert ns.AUTO_REGISTER_DENY_PROJECTS - {ns.SELF_PROJECT} == {
++        "auction", "capacity", "diamond", "email",
++        "payment-orchestrator", "payorch", "xmrig"}
++    assert ns.SELF_PROJECT in ns.AUTO_REGISTER_DENY_PROJECTS
++
++
++def test_a_resolved_project_is_never_treated_as_unknown():
++    """The failure that would turn this into a global shutdown: reading any falsy
++    intermediate as 'no identity' and denying the whole host."""
++    allowed = 0
++    for cwd in ("/opt/a", "/opt/b/c", "/root/ai-dev-runtime/core", "/srv/thing/x"):
++        proj = wr.project_for_cwd(cwd)
++        assert proj, cwd
++        if not ns._denied_for(proj, cwd):
++            allowed += 1
++    assert allowed >= 3, "the rule denied paths that name a perfectly good project"
++
++
++def test_an_explicit_project_survives_an_unresolvable_cwd():
++    """A stored row may carry a project whose cwd has since gone. The name is evidence;
++    losing the directory must not retroactively unidentify it."""
++    assert ns._identity_unknown("hostsecure", "") is False
++    assert ns._denied_for("hostsecure", "") is False
++    assert ns._denied_for("payorch", "") is True
++
++
++def test_the_self_reference_reason_still_wins_over_the_new_one():
++    assert ns.send_block_reason("x:0.0", ns.SELF_PROJECT,
++                                cwd=f"/root/{ns.SELF_PROJECT}/core") == \
++        "supervisor_self_reference"
+diff --git a/tmp/claude-0/-root-ai-dev-runtime/d86aaf21-dd80-4817-a8c5-8863526b3080/scratchpad/candidate/tests/test_scratchpad_not_a_project.py b/tests/test_scratchpad_not_a_project.py
+new file mode 100644
+index 0000000..31cf87a
+--- /dev/null
++++ b/tests/test_scratchpad_not_a_project.py
+@@ -0,0 +1,82 @@
++"""A scratchpad directory carries no project identity.
++
++Events 51561 and 51565 (`agent_process_failed`, critical) were filed under a project
++literally called `scratchpad`:
++
++    cwd = /tmp/claude-0/-opt-gaika-extension-ru/<session>/scratchpad
++
++`project_for_cwd` resolves configured roots, then the first segment under /opt, /root,
++/srv, then falls back to the basename. A scratchpad lives under /tmp, so it reached the
++fallback and the temp directory's own name became the project. Eight events landed there.
++
++Decoding the encoded name is NOT the fix, and both reasons are pinned below: it names
++where the session STARTED rather than where the agent is (that agent actually works in
++/opt/gaika-worktrees/ru, and neither reading of the encoded string exists on disk), and
++the encoding is lossy because "/" becomes "-" while "-" is legal in names — 43 of the 90
++directories under /opt on this host contain one.
++"""
++from __future__ import annotations
++
++import pytest
++
++from core import wake_routes as wr
++
++SCRATCH = "/tmp/claude-0/-opt-gaika-extension-ru/01bb4e35-2097-44eb-94df-df5b48f2de7b/scratchpad"
++
++
++def test_the_live_event_path_yields_no_project():
++    assert wr.project_for_cwd(SCRATCH) == "", \
++        "events 51561/51565 were filed under a project called 'scratchpad'"
++
++
++def test_a_directory_inside_the_scratchpad_is_also_not_a_project():
++    assert wr.project_for_cwd(SCRATCH + "/notes/deep") == ""
++
++
++def test_it_is_recognised_as_a_scratchpad():
++    assert wr.is_scratchpad_path(SCRATCH) is True
++    assert wr.is_scratchpad_path(SCRATCH + "/") is True
++    assert wr.is_scratchpad_path("/opt/payment-orchestrator") is False
++
++
++def test_the_encoded_name_is_never_decoded():
++    """Both readings of the encoded name are wrong, and one of them is deny-listed-
++    adjacent. Returning either would be worse than returning nothing."""
++    got = wr.project_for_cwd(SCRATCH)
++    assert got not in ("gaika-extension-ru", "gaika", "extension-ru", "opt")
++    assert got == ""
++
++
++def test_a_scratchpad_for_a_payment_session_is_not_an_escape_hatch():
++    """The reason this matters beyond tidiness: every agent has a scratchpad, so a
++    payment agent whose hook fires from one must not acquire a fresh, undenied project."""
++    from core import native_supervisor as ns
++    cwd = "/tmp/claude-0/-opt-payment-orchestrator/abc/scratchpad"
++    assert wr.project_for_cwd(cwd) == ""
++    # unknown project + the path's own segments: denial must still see payment
++    assert "payment-orchestrator" in ns.project_candidates("", cwd) or \
++        ns._denied_for("", cwd), "a scratchpad must not walk an agent out of the denylist"
++
++
++# ── real project paths are untouched ────────────────────────────────────────
++@pytest.mark.parametrize("cwd,expected", [
++    ("/opt/payment-orchestrator/deploy/infra/dns", "payment-orchestrator"),
++    ("/opt/gaika-worktrees/ru", "gaika-worktrees"),
++    ("/root/ai-dev-runtime/core", "ai-dev-runtime"),
++    ("/tmp/other/thing", "thing"),          # an ordinary /tmp path keeps the old answer
++])
++def test_everything_that_is_not_a_scratchpad_is_unchanged(cwd, expected):
++    assert wr.project_for_cwd(cwd) == expected
++
++
++def test_only_the_claude_scratchpad_shape_matches():
++    """Narrow by construction — a project that merely ends in 'scratchpad' is a project."""
++    assert wr.project_for_cwd("/opt/scratchpad") == "scratchpad"
++    assert wr.is_scratchpad_path("/opt/myproj/scratchpad") is False
++    assert wr.is_scratchpad_path("/tmp/claude-0/x/scratchpad") is True
++
++
++def test_unknown_is_returned_not_invented():
++    """Fail closed: no project beats a plausible wrong one, because routing has a
++    fallback and the denylist reads the value."""
++    assert wr.project_for_cwd("/tmp/claude-9/-opt-anything/sess/scratchpad") == ""

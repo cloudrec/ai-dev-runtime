@@ -1,0 +1,298 @@
+diff --git a/core/wake_bridge.py b/core/wake_bridge.py
+index 15dcd84..bd7c272 100644
+--- a/core/wake_bridge.py
++++ b/core/wake_bridge.py
+@@ -27,6 +27,7 @@ import hashlib
+ import json
+ import os
+ import re
++import sqlite3
+ from typing import Optional
+ 
+ from core.control_plane.api import _c
+@@ -78,6 +79,80 @@ _CANDIDATE_SCAN_LIMIT = 200
+ # on current pane state. Selection excludes anything older than this ceiling instead of
+ # ever delivering it late; `expire_stale` retires it the same audited way coalescing does.
+ MAX_WAKE_AGE_SECS = int(os.getenv("WAKE_BRIDGE_MAX_AGE_SECS", "10800"))
++
++# ── agents that must never mint an actionable wake ──────────────────────────
++# A wake is what CAUSES an automated write: the companion delivers it into a ChatGPT
++# conversation, and that conversation calls back through /agents/send and /agents/answer.
++# Suppressing the wake removes the cause, which is the only lever available here — the API
++# cannot tell an automated continuation from the owner's own command, because both arrive
++# as `api:bearer` from one address over one credential, and the sole distinguishing field
++# is a header the caller sets about itself.
++#
++# UNION, never replacement. `AUTO_REGISTER_DENY_PROJECTS` reads its list with
++# `os.getenv(NAME, default)`, which lets an environment file silently DROP an entry the
++# code added — that is how `diamond` left the live denylist while the commit adding it sat
++# in the tree looking effective. Env may add here; it cannot remove.
++_SUPPRESS_RAW = os.getenv("WAKE_BRIDGE_SUPPRESS_AGENTS", "")
++WAKE_SUPPRESSED_AGENTS = {"payorch-ha-fresh:0.0"} | {
++    a.strip() for a in _SUPPRESS_RAW.split(",") if a.strip()}
++
++
++def _suppressed_conversation_ids(conn=None) -> set:
++    """The runtime session ids of the suppressed agents.
++
++    Events from one pane arrive under TWO identities: the tmux target
++    (`payorch-ha-fresh:0.0`, 398 events in a week) and a session ref
++    (`session:6db4919a-460`, 1031 events). A rule matching only the target string would
++    miss the larger half, so the identity sidecar is used to bridge them.
++
++    `source='runtime'` is required. The cwd fallback hands several panes in one directory
++    the SAME session id — `hostsecure-clean:0.0` demonstrably carries another pane's — so a
++    guessed id would silence a different agent's alerts entirely. Suppression is
++    fail-closed for automation and fail-OPEN for the owner's visibility, so it must never
++    rest on a guess.
++    """
++    if not WAKE_SUPPRESSED_AGENTS:
++        return set()
++    own = False
++    try:
++        # `_conn` runs the schema statements, so it raises on an unreadable store too —
++        # the first draft caught only the SELECT and let that escape into should_wake,
++        # which would have taken the whole wake bridge down with the sidecar.
++        conn, own = _conn(conn)
++        rows = conn.execute(
++            "SELECT conversation_id FROM agent_identity_source "
++            "WHERE source='runtime' AND conversation_id != '' AND target IN (%s)"
++            % ",".join("?" * len(WAKE_SUPPRESSED_AGENTS)),
++            tuple(sorted(WAKE_SUPPRESSED_AGENTS))).fetchall()
++        return {r[0] for r in rows if r[0]}
++    except sqlite3.Error:
++        # No sidecar yet, or unreadable. The target-string half of the rule still applies;
++        # this only narrows what the session-ref half can match.
++        return set()
++    finally:
++        if own:
++            try:
++                conn.close()
++            except sqlite3.Error:
++                pass
++
++
++def agent_wake_suppressed(agent_id: str = "", conn=None) -> bool:
++    """True when this event's agent may not produce a wake, under EITHER identity."""
++    ref = (agent_id or "").strip()
++    if not ref or not WAKE_SUPPRESSED_AGENTS:
++        return False
++    if ref in WAKE_SUPPRESSED_AGENTS:
++        return True
++    if ref.startswith("session:"):
++        sid = ref[len("session:"):]
++        if not sid:
++            return False
++        # The ref is truncated by `_sanitize_agent_ref`, so the stored id is matched by
++        # prefix — and only in that direction, so a short or empty ref cannot match
++        # everything.
++        return any(full.startswith(sid) for full in _suppressed_conversation_ids(conn))
++    return False
+ # Only these severities are ever worth a wake.
+ WAKE_SEVERITIES = {"critical", "high"}
+ 
+@@ -665,6 +740,12 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
+         return {"wake": False, "reason": "kill_switch_engaged"}
+     if not enabled:
+         return {"wake": False, "reason": "bridge_disabled"}
++    if agent_wake_suppressed(agent_id, conn=conn):
++        # Refused with its own reason, not folded into an existing one: `record()` writes
++        # every refusal to wake_audit, and a suppression that arrived as `not_significant`
++        # would be indistinguishable from an event nobody cared about.
++        return {"wake": False, "reason": "agent_wake_suppressed",
++                "actionable": is_actionable(event_type), "suppressed_agent": agent_id}
+     sig = is_significant(event_type=event_type, severity=severity,
+                          owner_action_required=owner_action_required)
+     if not sig["significant"]:
+diff --git a/tmp/claude-0/-root-ai-dev-runtime/d86aaf21-dd80-4817-a8c5-8863526b3080/scratchpad/candidate/tests/test_wake_suppressed_agents.py b/tests/test_wake_suppressed_agents.py
+new file mode 100644
+index 0000000..6f708de
+--- /dev/null
++++ b/tests/test_wake_suppressed_agents.py
+@@ -0,0 +1,186 @@
++"""An agent that must receive no automated writes must first stop causing wakes.
++
++A wake is the CAUSE of an automated write. The companion delivers it into a ChatGPT
++conversation; that conversation calls back through `/agents/send` and `/agents/answer`.
++Blocking the callback is impossible — 116 of 116 deliveries to `payorch-ha-fresh:0.0` are
++`actor=api:bearer` from one address over one credential, and the only field that could
++separate an automated continuation from the owner's own command is a header the caller sets
++about itself. So the lever is the wake, and the owner's manual path stays untouched because
++it never goes through here.
++
++The trap these tests exist for: one pane's events arrive under TWO identities. In a week
++`payorch-ha-fresh:0.0` produced 398 events under its tmux target and 1031 under
++`session:6db4919a-460`. A rule matching the target string alone would leave the larger half
++waking normally while the audit claimed the agent was suppressed.
++"""
++from __future__ import annotations
++
++import sqlite3
++
++import pytest
++
++from core import wake_bridge as wb
++from core.control_plane import api
++from core.control_plane.discovery import IDENTITY_CWD_FALLBACK, IDENTITY_RUNTIME
++
++TARGET = "payorch-ha-fresh:0.0"
++SID = "6db4919a-460a-4b62-9e0d-c9fff356a7be"
++SID_REF = "session:6db4919a-460"          # truncated exactly as _sanitize_agent_ref does
++
++
++@pytest.fixture(autouse=True)
++def _isolated(monkeypatch, tmp_path):
++    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
++    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "1")
++    monkeypatch.setattr(wb, "ENABLED", True)
++    monkeypatch.setattr(wb, "KILL_SWITCH", False)
++    yield
++
++
++def _decide(agent_id, event_id=1, event_type="agent_waiting_input", severity="high"):
++    return wb.should_wake(event_id=event_id, severity=severity, event_type=event_type,
++                          owner_action_required=True, project_id="payment-orchestrator",
++                          agent_id=agent_id)
++
++
++# ── (a) audited, but never an actionable wake ───────────────────────────────
++def test_the_suppressed_agent_gets_no_wake():
++    d = _decide(TARGET)
++    assert d["wake"] is False
++    assert d["reason"] == "agent_wake_suppressed"
++
++
++def test_the_refusal_is_recorded_with_its_own_reason_not_folded_into_another():
++    """Requirement (5). A suppression arriving as `not_significant` would be
++    indistinguishable in the audit from an event nobody cared about."""
++    d = _decide(TARGET, event_id=4242)
++    wb.record(d, event_id=4242, severity="high", event_type="agent_waiting_input",
++              project_id="payment-orchestrator", agent_id=TARGET)
++    import os
++    c = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
++    try:
++        row = c.execute("SELECT decision, reason, agent_id, actionable FROM wake_audit "
++                        "WHERE event_id=4242").fetchone()
++    finally:
++        c.close()
++    assert row is not None, "a suppressed event must still be audited, not dropped"
++    assert row[0] == "skip"
++    assert row[1] == "agent_wake_suppressed"
++    assert row[2] == TARGET, "the audit must name who was suppressed"
++    assert row[3] == 1, "its class is preserved — it WAS actionable, and was refused anyway"
++
++
++def test_suppression_is_not_reported_as_insignificance():
++    assert _decide(TARGET)["reason"] != "not_significant"
++
++
++# ── the second identity: the half a target-string rule would miss ───────────
++def test_the_same_pane_is_suppressed_under_its_session_ref():
++    api.record_identity_source(TARGET, conversation_id=SID, source=IDENTITY_RUNTIME)
++    assert wb.agent_wake_suppressed(SID_REF) is True
++    assert _decide(SID_REF)["reason"] == "agent_wake_suppressed"
++
++
++def test_without_the_sidecar_the_session_ref_is_not_suppressed():
++    """Honest failure mode: no runtime identity means no proven link, and the rule does
++    not guess one. The target-string half still holds."""
++    assert wb.agent_wake_suppressed(SID_REF) is False
++    assert wb.agent_wake_suppressed(TARGET) is True
++
++
++def test_a_guessed_identity_never_suppresses_anyone():
++    """The cwd fallback hands several panes in one directory the same session id —
++    `hostsecure-clean:0.0` demonstrably carries another pane's. Suppression is fail-closed
++    for automation but fail-OPEN for the owner's visibility, so it must not rest on a guess."""
++    api.record_identity_source(TARGET, conversation_id=SID, source=IDENTITY_CWD_FALLBACK)
++    assert wb.agent_wake_suppressed(SID_REF) is False
++
++
++def test_an_empty_or_tiny_session_ref_cannot_match_everything():
++    api.record_identity_source(TARGET, conversation_id=SID, source=IDENTITY_RUNTIME)
++    assert wb.agent_wake_suppressed("session:") is False
++    assert wb.agent_wake_suppressed("session:zzzz") is False
++
++
++# ── (b) every other agent wakes exactly as before ───────────────────────────
++@pytest.mark.parametrize("agent", [
++    "hostsecure-clean-resumed:0.0", "gaika-ru-sonnet-v1:0.0", "mess-ru-54582145-resumed:0.0",
++    "session:08c1a936-7785", "", "payorch-ha-fresh:0.1", "payorch-ha-fresh",
++])
++def test_other_agents_are_untouched(agent):
++    assert wb.agent_wake_suppressed(agent) is False
++
++
++def test_another_agent_in_the_same_project_still_wakes():
++    """The rule is exact-target, not project-wide: silencing the whole payment project
++    would also silence panes the owner still wants to hear about.
++
++    The route has to be bound for this to prove anything — the first draft asserted
++    `wake is True` against an empty routes table and was really only observing
++    `no_route_bound`, which would have passed just as happily with a project-wide block.
++    """
++    from core import wake_routes
++    wake_routes.bind_route("payment-orchestrator", "https://chatgpt.com/c/test",
++                           by="owner", note="test fixture")
++    d = _decide("payorch-other:0.0", event_id=7)
++    assert d["reason"] != "agent_wake_suppressed"
++    assert d["wake"] is True, d
++
++    # and the suppressed pane stays suppressed with the very same route bound
++    assert _decide(TARGET, event_id=8)["reason"] == "agent_wake_suppressed"
++
++
++# ── (c) the owner's manual path does not pass through here ──────────────────
++def test_the_send_path_never_consults_wake_suppression():
++    """Proven by reading the module rather than asserting it in prose: if agent_control
++    ever imports this rule, a manual MCP send to the payment agent starts failing."""
++    import inspect
++    from core import agent_control as ac
++    src = inspect.getsource(ac)
++    assert "agent_wake_suppressed" not in src
++    assert "WAKE_SUPPRESSED_AGENTS" not in src
++
++
++def test_suppression_blocks_the_cause_not_the_channel():
++    """agent_send/agent_answer remain callable for the suppressed target: what is removed
++    is the automated wake that would drive them, never the owner's ability to type."""
++    from core import agent_control as ac
++    assert callable(ac.agent_send) and callable(ac.agent_answer)
++    assert TARGET not in getattr(ac, "DENY_TARGETS", set())
++
++
++# ── the list itself ─────────────────────────────────────────────────────────
++def test_the_environment_may_add_but_never_remove(monkeypatch):
++    """`AUTO_REGISTER_DENY_PROJECTS` uses `os.getenv(NAME, default)`, which let an env file
++    silently DROP `diamond` while the commit adding it sat in the tree looking effective.
++    This list is a UNION so that cannot happen here."""
++    import importlib
++    monkeypatch.setenv("WAKE_BRIDGE_SUPPRESS_AGENTS", "other-agent:0.0")
++    mod = importlib.reload(wb)
++    try:
++        assert TARGET in mod.WAKE_SUPPRESSED_AGENTS, "env removed a code-declared entry"
++        assert "other-agent:0.0" in mod.WAKE_SUPPRESSED_AGENTS
++    finally:
++        monkeypatch.delenv("WAKE_BRIDGE_SUPPRESS_AGENTS", raising=False)
++        importlib.reload(wb)
++
++
++def test_an_unreadable_sidecar_does_not_raise_into_the_bridge():
++    class _Boom:
++        def execute(self, *a, **kw):
++            raise sqlite3.Error("gone")
++        def close(self):
++            pass
++    assert wb.agent_wake_suppressed(SID_REF, conn=_Boom()) is False
++    assert wb.agent_wake_suppressed(TARGET, conn=_Boom()) is True
++
++
++# ── ordering: the older refusals still answer first ─────────────────────────
++def test_the_kill_switch_and_disabled_bridge_still_answer_first(monkeypatch):
++    monkeypatch.setattr(wb, "KILL_SWITCH", True)
++    monkeypatch.setenv("WAKE_BRIDGE_KILL_SWITCH", "1")
++    assert _decide(TARGET)["reason"] == "kill_switch_engaged"
++    monkeypatch.setenv("WAKE_BRIDGE_KILL_SWITCH", "0")
++    monkeypatch.setattr(wb, "KILL_SWITCH", False)
++    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "0")
++    assert _decide(TARGET)["reason"] == "bridge_disabled"
