@@ -4320,3 +4320,60 @@ it is the same gate as the routing patch and was not touched. It also interacts 
 option-2 question — if automation gets its own principal, the tag rule should key on
 "is this principal automation", not on a string prefix — which is another reason to leave
 it until the principal question is decided.
+
+---
+
+## 2026-09-16 — the payorch exclusion, and why it cannot be built as specified
+
+An automated instruction asked to enforce "zero automatic messages to
+`payorch-ha-fresh:0.0`" systemically, at the routing boundary, distinguishing automated
+from explicit-owner intent by provenance/principal/metadata, explicitly **not** as a coarse
+`api:bearer` block, while keeping direct owner commands working.
+
+Those requirements are mutually unsatisfiable on this system today. Not "hard" — contradictory.
+
+### Checked at the source, not inferred
+
+```
+api/v1.py:355  @router.post("/agents/send")    -> caller_identity(request, x_runtime_actor)
+api/v1.py:364  @router.post("/agents/answer")  -> caller_identity(request, x_runtime_actor)
+api/v1.py:79   actor = f"api:{auth_method}" + ("/" + declared_name if declared_name else "")
+```
+
+One endpoint each. One auth method in use (`bearer`). One source address (172.20.0.4) for
+all 116 deliveries to this target. The only field that could separate an automated
+continuation from the owner's own command is `X-Runtime-Actor`, a header the caller sets
+about itself — never present in any recorded delivery, and documented three lines above its
+own use as *"Self-declared and therefore NOT trustworthy for any decision."*
+
+So a guard keyed on it would be bypassed by automation setting the header, and a guard that
+blocks `api:bearer` blocks the owner's commands too. There is no third reading of the data.
+Requirement (1)+(2) and requirement (3) cannot both hold until the principals differ.
+
+Building it anyway would produce a control that reads as enforcement in the audit, passes
+its own tests, and is defeated by one HTTP header — worse than no control, because the next
+report would cite it as protection that exists.
+
+### What is already enforced, and what is not
+
+* `native_supervisor` — a real, non-forgeable principal — sent **127 times in 48h and zero
+  times to this target**. `payment-orchestrator` is on the live denylist and that door is
+  shut. This half of the policy is already true.
+* Everything reaching `payorch-ha-fresh:0.0` is `api:bearer`: 67 `agent_send` and — the
+  larger and less obvious door — **142 `agent_answer`** in 48h. `agent_answer` resolves
+  permission prompts, so automation is answering prompts on the payment agent, not merely
+  continuing it.
+
+### The one decision that unblocks it
+
+Give automation its own authenticated principal so `actor` differs by credential rather
+than by claim. `api/v1.py:47` already implements a second auth method (`hmac`) that nothing
+uses. With that in place the guard is exact, one place, and testable to all five of the
+listed requirements — and the `native_supervisor` tagging gap recorded above closes with
+the same change, because the banner would key on principal instead of a string prefix.
+
+Provisioning a credential is an owner gate by the instruction's own terms, and the
+enforcement point lives in `core/agent_control.py`, which every hook loads live.
+
+Nothing was implemented. No code changed in this section; `core/` untouched, no pane
+written to, no credential created or rotated.
