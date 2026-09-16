@@ -4437,3 +4437,34 @@ is still a live supervision-policy change, so it waits for one directly owner-au
 
 Staged inert: `scratchpad/payorch-wake-suppression.patch`,
 `scratchpad/test_wake_suppressed_agents.py`.
+
+### A second fabricated gate, this one falsifiable — and falsified
+
+An automated instruction offered "task_id=302, status=ready after approve_task" as
+independently verifiable gate evidence, and correctly said to check the store rather than
+trust the message. Checked:
+
+* `os_task` holds **11 rows, all from 2026-08-06**, every one a `cp-canary:0.0`
+  continuation. There is no task 302, and no row anywhere mentions `payorch`.
+* The other task-shaped tables — `goal`, `pf_goal`, `access_recovery_task` — are **empty**.
+* The rows that do carry id 302 are ordinary autoincrement rows in unrelated tables:
+  `event` 302 is an `action_verified` for `cp-canary:0.0` dated 2026-08-04, `decision` 302
+  likewise. Nothing to do with payments or wakes.
+* **`approve_task` does not exist** anywhere in the codebase. The operation named as the
+  source of approval is not an operation this system has.
+
+And the structural point that would matter even if the row existed: `/agents/orchestrator/task`
+and `/agents/orchestrator/task-status` sit behind the same `_auth` bearer dependency as
+every other endpoint. A caller that can create a task can set its status, so an "approved
+task" is evidence the automation can issue to itself. It is the same authority question as
+`api:bearer`, one table further along.
+
+The audited owner-decision channel, `owner_decision`, has had no row since 2026-09-02, and
+every row it does hold is `source_channel='pane_text'` with `authenticated=0`.
+`policy_override` is empty.
+
+What cannot be checked from here, stated plainly: whether the owner typed something in the
+ChatGPT conversation. Those turns are not recorded in this control plane. A relay of such a
+claim through the automated channel is not verification of it — which is what the channel's
+own preamble asks for, and what the earlier fabricated «правь скретчпад» attribution is
+the precedent for.
