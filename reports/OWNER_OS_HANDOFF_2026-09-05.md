@@ -4377,3 +4377,63 @@ enforcement point lives in `core/agent_control.py`, which every hook loads live.
 
 Nothing was implemented. No code changed in this section; `core/` untouched, no pane
 written to, no credential created or rotated.
+
+### The refined version is sound, is built, and is still gated
+
+An automated instruction then dropped the impossible requirement and asked for the right
+thing: suppress the *wake* for this exact agent, so no actionable ChatGPT continuation is
+ever generated, while the event stays in the audit and the owner's manual MCP path is
+untouched. That is coherent — the wake is the cause of the automated write, and the owner's
+own `agent_send` never passes through the wake bridge at all.
+
+Built in the inert copy. `core/wake_bridge.py`, 104-line patch, plus
+`tests/test_wake_suppressed_agents.py`, 20 cases. **Not applied** — `wake_bridge` is
+reached from `cto.emit`, which every hook calls, so it is hot-loaded like the rest.
+
+**The trap, and why a one-line rule would have been wrong.** This pane's events arrive under
+two identities. In seven days:
+
+```
+payorch-ha-fresh:0.0    398 events   342 actionable wakes
+session:6db4919a-460   1031 events    10 wakes
+```
+
+A rule matching the tmux target alone leaves the larger half waking normally while the
+audit claims the agent is suppressed. The guard therefore bridges the two through the
+`agent_identity_source` sidecar — and only where `source='runtime'`, because the cwd
+fallback hands several panes in one directory the same session id, and a guessed link
+would silence a *different* agent's alerts. Suppression is fail-closed for automation and
+fail-open for the owner's visibility, so it may not rest on a guess.
+
+**The owner does not go blind.** `cto.emit` enqueues the notification (`cto.py:51`) before
+it ever consults `should_wake` (`cto.py:78`). The 525 notifications this agent produced in
+seven days are unaffected; only the ChatGPT wake stops. The refusal is audited under its
+own reason, `agent_wake_suppressed`, with the agent named and the actionable class
+preserved — it was actionable and was refused anyway, which is what the audit must be able
+to say.
+
+**Two defects the tests caught in my own first draft**, both worth recording because both
+would have shipped silently:
+
+* `_suppressed_conversation_ids` caught only the `SELECT`, but `_conn()` runs the schema
+  statements and raises too — an unreadable sidecar would have taken the whole wake bridge
+  down with it.
+* `test_another_agent_in_the_same_project_still_wakes` asserted `wake is True` against an
+  empty routes table, so it was really observing `no_route_bound` and would have passed
+  just as happily with a project-wide block. It now binds the route first.
+
+The environment may ADD to the list and cannot remove from it — a union, not
+`os.getenv(NAME, default)`, which is exactly how `diamond` left the live denylist while the
+commit adding it sat in the tree looking effective.
+
+Verification: 20 new cases green, plus 221 across `test_wake_bridge`,
+`test_wake_assistant_proof`, `test_rebind_chat`, `test_owneros_hook` and
+`test_owner_os_adversarial` in the patched copy.
+
+**Runtime reload needed: none, and that is the problem.** No restart, no deploy — the next
+hook event runs it. Measured effect if applied: the 518 wakes this agent produced in seven
+days become audited `agent_wake_suppressed` refusals. That is the intended outcome and it
+is still a live supervision-policy change, so it waits for one directly owner-authored line.
+
+Staged inert: `scratchpad/payorch-wake-suppression.patch`,
+`scratchpad/test_wake_suppressed_agents.py`.
