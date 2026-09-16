@@ -4272,3 +4272,51 @@ That is a genuine policy choice, and it is the owner's:
    the API, which is where the decision belongs anyway.
 
 No code was changed. `core/` untouched, live state untouched, nothing sent to any pane.
+
+### The invariant that holds under all three options — pinned
+
+An automated instruction selected option 2 (a separate authenticated automation principal).
+Choosing among the three is the owner's, and an automated message choosing is not the owner
+choosing, so no principal was designed and no credential touched. One rule is true under
+*every* option, commits to none of them, and was worth pinning now:
+
+**a caller-supplied `actor` string can never upgrade authority.**
+
+Two places in this repo decide on `actor`:
+
+* `policy_engine.grant_override` — admits only actors on `override.allowed_actors`,
+  which is `[owner]`. The API mints `api:{auth_method}` and appends any declared name
+  *after* it, so `api:bearer/owner` is not `owner` and no declaration makes it one.
+  `grant_override` also has **no production caller** — only tests — so the decision is not
+  wired to caller input at all.
+* `agent_control._tag_if_automated` — prefixes pane text with the automated-origin banner
+  when the actor starts with `api:`. The prefix comes from the auth method, which the
+  caller does not control, so no declared name strips it, and an unresolvable auth method
+  degrades to `api:unknown`, which is still tagged.
+
+`tests/test_actor_cannot_grant_authority.py`, 21 cases, green in the repo and in a copy
+under another name.
+
+### A real gap found while pinning it
+
+`_tag_if_automated` tags `api:*` and nothing else. `native_supervisor` sends are therefore
+**untagged** — 127 of them in the last 48 hours — and arrive in panes with nothing marking
+them automated. That is precisely the failure the function exists to prevent (its docstring
+cites a ChatGPT continuation being written up as an owner sign-off), reached through the
+other door: the supervisor types into panes on its own, and the receiving session cannot
+tell its text from a human's.
+
+Confirmed directly:
+
+```
+api:bearer            tagged=True
+api:bearer/chatgpt-mcp tagged=True
+api:unknown           tagged=True
+native_supervisor     tagged=False     <-- 127 sends in 48h
+```
+
+The fix is one line in `core/agent_control.py`. That file is hot-loaded by every hook, so
+it is the same gate as the routing patch and was not touched. It also interacts with the
+option-2 question — if automation gets its own principal, the tag rule should key on
+"is this principal automation", not on a string prefix — which is another reason to leave
+it until the principal question is decided.
