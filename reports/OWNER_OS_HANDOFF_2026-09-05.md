@@ -4207,3 +4207,68 @@ rollback   git checkout -- core/
 Rollback restores the code in one command and needs no restart, which is also precisely why
 this is gated: between the write and the rollback, every hook has already run the new code
 against real events. The rollback returns the behaviour, not the decisions.
+
+---
+
+## 2026-09-16 — who is actually typing into the payment agent, and why the requested guard cannot be built yet
+
+An automated instruction was received asking for a per-target exclusion so that automated
+Owner OS traffic cannot `agent_send` to `payorch-ha-fresh:0.0` while direct human control
+is preserved. It also asserted that the owner had made this decision in the chat; that
+assertion arrived through the automated channel and is not independently verified here, so
+it is recorded only as an automated instruction. The diagnosis below is read-only and holds
+regardless of who asked for it.
+
+### The source, from durable attribution
+
+Every delivery to `payorch-ha-fresh:0.0` in the record — **116 of 116** — is:
+
+```
+actor  = api:bearer
+source = 172.20.0.4  ua=python-httpx/0.27.0
+```
+
+Split by action over the last 48h across all targets:
+
+| actor | action | n |
+|---|---|---|
+| `api:bearer` | `agent_answer` | 142 |
+| `native_supervisor` | `agent_send` | 127 |
+| `api:bearer` | `agent_send` | 67 |
+| (none) | `agent_stop` | 5 |
+
+`native_supervisor` sent 127 times in 48 hours and **not once** to `payorch-ha-fresh` —
+`payment-orchestrator` is on the live denylist and that door is already shut. The
+supervisor is not the source. The API is, and `agent_answer` — the permission-prompt
+auto-answer path, 142 calls — is the larger of its two doors, not `agent_send`.
+
+### Why the narrow guard cannot be written
+
+`api/v1.py:79` mints the actor as `f"api:{auth_method}"` plus an optional caller-supplied
+name. Two auth methods exist (`hmac`, `bearer`); every delivery ever recorded used
+`bearer`, from one address, with no declared name — `SELECT DISTINCT actor` over the whole
+attribution table returns exactly `api:bearer` and `native_supervisor`.
+
+So an automated Owner OS continuation and an owner acting through the API are **the same
+principal, from the same address, over the same credential**. Nothing in the record
+separates them. The only field that could is the caller's self-declared name, and the code
+that accepts it says in its own comment: *"Self-declared and therefore NOT trustworthy for
+any decision."*
+
+A per-target block on automated `api:bearer` sends to `payorch-ha-fresh` would therefore
+block every API-borne instruction to that pane, the owner's included — the exact outcome
+the instruction said to avoid. Building it anyway would mean either trusting a field the
+system already documents as untrustworthy, or silently redefining "automated" as "all API
+traffic" and reporting it as the narrow guard that was asked for.
+
+That is a genuine policy choice, and it is the owner's:
+
+1. **Block all `api:bearer` sends to this target.** Satisfies "no automated tasks",
+   and also ends API-borne human control of that pane; direct tmux control still works.
+2. **Make the principals distinguishable first** — give automation its own credential (the
+   unused `hmac` method is the obvious hook) so `actor` differs, then the guard is exact.
+   This is a credentials change and a separate gate.
+3. **Change nothing.** The supervisor door is already shut; what remains is whatever drives
+   the API, which is where the decision belongs anyway.
+
+No code was changed. `core/` untouched, live state untouched, nothing sent to any pane.
