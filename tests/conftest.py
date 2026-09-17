@@ -35,6 +35,13 @@ os.environ["CONTROL_PLANE_DB"] = os.path.join(_TEST_DB_DIR, "control_plane_test.
 # tables must never be fixture data read from — or written into — the live file.
 os.environ["AGENT_CONTROL_DB"] = os.path.join(_TEST_DB_DIR, "agent_control_test.db")
 
+# And its append-only audit log. The database was isolated; the audit beside it was not,
+# so every record/ack a test exercised landed in the LIVE /var/log/ai-runtime/
+# agent_control.jsonl as `job:0.0` fixture rows (12 on 2026-09-18 from three suite runs)
+# — the very log the ack audit exists to make trustworthy. Tests that assert on the audit
+# still point it at their own tmp_path.
+os.environ["AGENT_CONTROL_AUDIT"] = os.path.join(_TEST_DB_DIR, "agent_control_test.jsonl")
+
 # Job worktrees likewise: a test-run executor must never materialize worktrees
 # under the live /var/lib/ai-runtime tree.
 os.environ["RUNTIME_WORKTREE_ROOT"] = os.path.join(_TEST_DB_DIR, "worktrees")

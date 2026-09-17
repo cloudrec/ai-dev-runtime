@@ -72,7 +72,13 @@ def test_rollout_is_an_allowlist_not_everything_that_appears(monkeypatch):
     assert ns.is_supervised("cp-canary:0.0") is True
     assert ns.is_supervised("mess-opus:0.0") is False
     monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
-    assert ns.is_supervised("anything:0.0") is True
+    # `*` means every REGISTERED target, not everything that appears: a target the
+    # registry has never seen has no known project, so the denylist (and SELF_PROJECT)
+    # could not be consulted — and it was not, until 2026-09-18, when this exact call
+    # answered True for the supervisor's own session. See
+    # test_the_wildcard_does_not_vouch_for_an_unregistered_target_of_unknown_project.
+    assert ns.is_supervised("anything:0.0") is False
+    assert ns.is_supervised("anything:0.0", project="mess") is True
 
 
 # ── the declared external wait: bounded, audited, not a mute button ──────────
@@ -985,6 +991,35 @@ def test_without_a_project_the_registry_still_decides(monkeypatch):
                  ("capacity-blockchain:0.0", "capacity", "/opt/capacity"))
     conn.commit()
     assert ns.is_supervised("capacity-blockchain:0.0", conn=conn) is False
+
+
+def test_the_wildcard_does_not_vouch_for_an_unregistered_target_of_unknown_project(monkeypatch):
+    """2026-09-18, live: NATIVE_SUPERVISOR_TARGETS=* and the bare call
+    `is_supervised("owner-os-opus-clean:0.0")` — the supervisor's own session, never
+    registered because SELF_PROJECT is denied — returned True. The registry fallback
+    found no row, "" is not in the denylist, and the wildcard branch said yes. The
+    scan paths pass the project and were safe; the public predicate was not."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    conn, _ = ns._conn()
+    conn.execute(ns._REG_SCHEMA)
+    # never registered, project unknown to the caller → not supervised
+    assert ns.is_supervised("owner-os-opus-clean:0.0", conn=conn) is False
+    # the same target with its project named is denied outright
+    assert ns.is_supervised("owner-os-opus-clean:0.0", conn=conn,
+                            project=ns.SELF_PROJECT) is False
+    # a registered target in an allowed project is still supervised by the wildcard
+    conn.execute("INSERT INTO native_supervised_target(target,project,cwd) VALUES(?,?,?)",
+                 ("mess-opus:0.0", "mess", "/opt/mess"))
+    conn.commit()
+    assert ns.is_supervised("mess-opus:0.0", conn=conn) is True
+
+
+def test_an_explicit_entry_still_counts_without_a_registry_row(monkeypatch):
+    """Naming a target is a positive record; the wildcard tightening must not undo it."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "gaika-opus:0.0")
+    conn, _ = ns._conn()
+    conn.execute(ns._REG_SCHEMA)
+    assert ns.is_supervised("gaika-opus:0.0", conn=conn) is True
 
 
 # ── the idle sweep's own anti-loop cap must be able to count ─────────────────

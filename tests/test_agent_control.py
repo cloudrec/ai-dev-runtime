@@ -1372,3 +1372,11 @@ def test_ack_commander_events_audits_what_was_consumed(monkeypatch, tmp_path):
             if '"commander_events_acked"' in l]
     assert acks[-1]["acked"] == 0 and acks[-1]["events"] == []
     assert ac.ack_commander_events([]) == 0
+
+
+def test_suite_audit_log_is_not_the_live_one():
+    # Guard for the conftest isolation: with no per-test override, the audit path must
+    # be the suite's own file, never /var/log/ai-runtime/agent_control.jsonl.
+    path = ac._audit_path()
+    assert not path.startswith("/var/log/"), path
+    assert os.environ.get("AGENT_CONTROL_AUDIT") == path

@@ -697,9 +697,19 @@ def is_supervised(target: str, *, conn=None, project: str = "") -> bool:
         if not project:
             # No project supplied: fall back to the registry, which filters the denylist.
             try:
-                if _project_for_target(target, conn=conn) in AUTO_REGISTER_DENY_PROJECTS:
-                    return False
+                registered_project = _project_for_target(target, conn=conn)
             except Exception:  # noqa: BLE001 — unknown is never "supervised"
+                return False
+            if registered_project in AUTO_REGISTER_DENY_PROJECTS:
+                return False
+            # Never registered AND only the wildcard vouches for it: its project is
+            # unknown, so the denylist could not be consulted at all — and the deny
+            # entry that matters most is SELF_PROJECT. 2026-09-18: with `*` live,
+            # `is_supervised("owner-os-opus-clean:0.0")` answered True for the
+            # supervisor's own, unregistered, session. Both scan paths pass the
+            # project and were not fooled; the bare call must not be either.
+            # Unknown is never "supervised", and `*` means every REGISTERED target.
+            if not registered_project and target not in a:
                 return False
         return True
     try:
