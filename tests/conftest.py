@@ -66,3 +66,18 @@ os.environ["OWNEROS_HOOK_DIAG"] = os.path.join(_TEST_DB_DIR, "owneros_hook_diag.
 # every live transcript on the machine, so a genuinely silent test agent looked busy.
 # Empty means off; the tests that cover this oracle point it at their own tmp_path.
 os.environ["OWNEROS_CLAUDE_PROJECTS"] = ""
+
+# Third door. `agent_continuation_watchdog.eligible_sessions` unions the orchestrator config
+# with the CONTINUATION_WATCHDOG_SESSIONS env allowlist. A test process launched from an
+# operator shell that carries the LIVE allowlist (2026-09-18: two real sessions) makes the
+# "watchdog enabled but nothing eligible" control report two eligible sessions and pass as
+# ok. Tests that cover the env allowlist set it themselves.
+os.environ.pop("CONTINUATION_WATCHDOG_SESSIONS", None)
+# Fourth door, same shape. `native_supervisor` reads NATIVE_SUPERVISOR_TARGETS at import; the
+# operator shell carries the live value (`*` since 2026-09-04), which turns the deny-list
+# controls inside out — every registered target is supervised, including the ones the test
+# just proved denied. The suite ran green on 2026-09-04 only because that shell did not
+# carry it yet. Tests that cover the allowlist set it themselves.
+for _k in ("NATIVE_SUPERVISOR_TARGETS", "NATIVE_SUPERVISOR_DENY_PROJECTS",
+           "NATIVE_SUPERVISOR_DENY_TARGETS"):
+    os.environ.pop(_k, None)

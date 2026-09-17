@@ -481,14 +481,30 @@ def latest_commander_event(agent: str, within_secs: float = 900) -> Optional[dic
 
 
 def ack_commander_events(ids: list) -> int:
+    """Mark delivered Commander events acknowledged. Returns the number of rows
+    that actually flipped 0→1 (already-acked / unknown ids count 0).
+
+    Audited as `commander_events_acked` with the ids and the (agent, event_type,
+    ts) of every row that flipped. The consumer that drains /agents/orchestrator
+    re-stamps everything with its own poll time, so without this row a triple
+    `agent_process_failed` shown at one identical timestamp (2026-09-17T21:34:55)
+    could not be traced back to the six distinct events it actually consumed.
+    """
     if not ids:
         return 0
     conn = _db()
     try:
+        marks = ",".join("?" for _ in ids)
+        flipped = conn.execute(
+            f"SELECT id,agent,event_type,ts FROM commander_events "
+            f"WHERE acknowledged=0 AND id IN ({marks}) ORDER BY id", list(ids)).fetchall()
         conn.executemany("UPDATE commander_events SET acknowledged=1 WHERE id=?",
                          [(i,) for i in ids])
         conn.commit()
-        return conn.total_changes
+        audit("commander_events_acked", "-", ids=list(ids), acked=len(flipped),
+              events=[{"id": r[0], "agent": r[1], "event_type": r[2], "ts": r[3]}
+                      for r in flipped])
+        return len(flipped)
     finally:
         conn.close()
 

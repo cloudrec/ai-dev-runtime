@@ -150,11 +150,30 @@ def test_the_named_canary_is_judged_once_active(monkeypatch):
     assert out["active"] is True and out["verdict"] == cv.VERIFIED
 
 
-def test_the_repo_ships_with_no_canary_selected():
-    """Shipping this armed would activate an owner-deferred decision."""
-    import os
-    assert not (os.getenv(cv.CANARY_ENV) or "").strip(), \
-        "NATIVE_CANARY_TARGET must be unset until the owner names one"
+def test_the_repo_ships_with_no_canary_selected(monkeypatch):
+    """Shipping this armed would activate an owner-deferred decision.
+
+    What ships is the tracked tree. This used to assert on os.environ, which judges the
+    host the suite happens to run on: since 2026-09-11 the deployed (git-ignored)
+    configs/.env names a canary, so a test process launched from the operator shell
+    inherited it and the control failed while the repo still shipped nothing armed.
+    """
+    import pytest
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    try:
+        r = subprocess.run(["git", "-C", str(root), "grep", "-n",
+                            f"^{cv.CANARY_ENV}=.", "--", ".", ":!tests", ":!*.md"],
+                           capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pytest.skip("git unavailable; cannot enumerate the tracked tree")
+    # rc 1 = no match (the ship-clean state); rc 0 = something tracked arms it.
+    assert r.returncode == 1, \
+        f"{cv.CANARY_ENV} must not be armed in any tracked file until the owner names one:\n{r.stdout}"
+    # And the module itself carries no default: unset means no canary.
+    monkeypatch.delenv(cv.CANARY_ENV, raising=False)
+    assert cv.canary_target() == ""
 
 
 def test_the_module_writes_nothing_and_opens_no_database():

@@ -7,6 +7,7 @@ recorded tmux output, and no test touches a live tmux server or a real agent.
 """
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import time
@@ -1334,3 +1335,40 @@ def test_the_stored_task_row_is_left_verbatim():
     from core import os_task_queue
     src = inspect.getsource(os_task_queue.enqueue)
     assert "_redact" not in src, "enqueue must store the task text as written"
+
+
+def test_ack_commander_events_audits_what_was_consumed(monkeypatch, tmp_path):
+    # 2026-09-17T21:34:55: the orchestrator-status consumer showed three
+    # `agent_process_failed` warnings at ONE identical timestamp (its own poll
+    # time). The store held six distinct events (six agents, six ts, six
+    # dedup keys) and the ack that drained them left no trace of which ids it
+    # took, so the duplication could not be settled from Owner OS logs. The
+    # ack now audits the ids and the (agent, event_type, ts) it flipped.
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    audit_path = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("AGENT_CONTROL_AUDIT", str(audit_path))
+    for agent in ("diamond-auction:0.0", "email:0.0", "gaika-sonnet-v11-clean:0.0"):
+        assert ac.record_commander_event(agent, "/opt/x", "agent_process_failed",
+                                         {"to_state": "vanished"},
+                                         dedup_key=f"dlc:interrupted:{agent}") is True
+    evs = ac.list_commander_events(unacked_only=True)
+    assert len(evs) == 3
+    # distinct events, not a dedupe defect: three agents, three dedup keys.
+    assert len({e["agent"] for e in evs}) == 3
+    ids = [e["id"] for e in evs]
+
+    assert ac.ack_commander_events(ids + [999_999]) == 3
+    rows = [json.loads(l) for l in audit_path.read_text().splitlines()]
+    acks = [r for r in rows if r["action"] == "commander_events_acked"]
+    assert len(acks) == 1
+    assert acks[0]["acked"] == 3 and acks[0]["ids"] == ids + [999_999]
+    consumed = acks[0]["events"]
+    assert sorted(e["agent"] for e in consumed) == sorted(e["agent"] for e in evs)
+    assert all(e["event_type"] == "agent_process_failed" and e["ts"] for e in consumed)
+
+    # re-acking flips nothing and says so — the count is rows changed, not ids sent.
+    assert ac.ack_commander_events(ids) == 0
+    acks = [json.loads(l) for l in audit_path.read_text().splitlines()
+            if '"commander_events_acked"' in l]
+    assert acks[-1]["acked"] == 0 and acks[-1]["events"] == []
+    assert ac.ack_commander_events([]) == 0
