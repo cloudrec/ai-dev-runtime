@@ -10,9 +10,13 @@ owner sign-off; the restart itself remains owner-typed only.
 systemctl restart ai-runtime
 ```
 
-Nothing else. The companion (`owner-os-wake-companion`, pid 3508, up since 22:51:10 CEST
-09-17) does not import `agent_control.ack_commander_events` or `native_supervisor.is_supervised`
-on a path changed here and does not need a restart for these commits.
+Nothing else is REQUIRED. The companion (`owner-os-wake-companion`, pid 3508, up since
+22:51:10 CEST 09-17) is the process that runs `native_supervisor.scan`
+(`tools/wake_companion.py:245`), so it holds the pre-2bf04dd `is_supervised`. That skew
+is behaviourally inert: every companion-side caller passes `project` (the two scan paths)
+or calls only `in_external_wait` / `_project_for_target` (closed_loop_wake, stall_doctor,
+wake_bridge) — none makes the bare call the fix tightened. Restarting the companion is
+therefore optional hygiene, a separate owner gate, and not needed for any proof below.
 
 ## What the restart loads (tracked-tree vs runtime skew)
 
