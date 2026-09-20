@@ -520,16 +520,21 @@ def purge_stale(agents: list, conn=None) -> list:
             conn.close()
 
 
-def _project_for_target(target: str, *, conn=None) -> str:
-    """The registered project for a target, or "" when it has never been registered."""
+def _registration_of(target: str, *, conn=None) -> tuple:
+    """(project, cwd) as registered for a target, or ("", "") when never registered."""
     conn, own = _conn(conn)
     try:
-        row = conn.execute("SELECT COALESCE(project,'') FROM native_supervised_target "
-                           "WHERE target=?", (target,)).fetchone()
-        return (row[0] or "") if row else ""
+        row = conn.execute("SELECT COALESCE(project,''), COALESCE(cwd,'') "
+                           "FROM native_supervised_target WHERE target=?", (target,)).fetchone()
+        return ((row[0] or ""), (row[1] or "")) if row else ("", "")
     finally:
         if own:
             conn.close()
+
+
+def _project_for_target(target: str, *, conn=None) -> str:
+    """The registered project for a target, or "" when it has never been registered."""
+    return _registration_of(target, conn=conn)[0]
 
 
 def registered_targets(conn=None) -> set:
@@ -669,7 +674,7 @@ def send_block_reason(target: str, project: str = "", *, cwd: str = "",
     return "not_registered"
 
 
-def is_supervised(target: str, *, conn=None, project: str = "") -> bool:
+def is_supervised(target: str, *, conn=None, project: str = "", cwd: str = "") -> bool:
     """Supervised if explicitly allow-listed OR auto-registered. Either way it is a
     positive record — nothing is supervised merely by existing.
 
@@ -682,6 +687,15 @@ def is_supervised(target: str, *, conn=None, project: str = "") -> bool:
 
     `project` is supplied by callers that know it (both scan paths do). Without it a
     registered target is still resolved through the registry, which carries its project.
+
+    `cwd` lets the denylist be read the same way registration reads it — against EVERY
+    name the directory could be filed under (`project_candidates`), not the resolved
+    project alone. 2026-09-20, event 55938: `diamond-auction:0.0` in /opt/diamond/auction
+    resolves to `diamond`; the running environment denies `auction`, so registration
+    refused it (candidates include the path segment) — but this predicate compared the
+    bare project, found nothing, took the wildcard branch, and the supervisor typed into
+    a deliberately parked auction agent eight times in seventy minutes until the cap
+    gated it. The exact hole `project_candidates` was written to close, one door over.
     """
     if not target:
         return False
@@ -690,17 +704,18 @@ def is_supervised(target: str, *, conn=None, project: str = "") -> bool:
     # a check at all.
     if target_denied(target):
         return False
-    if project and project in AUTO_REGISTER_DENY_PROJECTS:
+    if (project or cwd) and _denied_for(project, cwd):
         return False
     a = allowed_targets()
     if "*" in a or target in a:
         if not project:
-            # No project supplied: fall back to the registry, which filters the denylist.
+            # No project supplied: fall back to the registry, which filters the denylist
+            # the same way (`_denied_for` over project AND registered cwd).
             try:
-                registered_project = _project_for_target(target, conn=conn)
+                registered_project, registered_cwd = _registration_of(target, conn=conn)
             except Exception:  # noqa: BLE001 — unknown is never "supervised"
                 return False
-            if registered_project in AUTO_REGISTER_DENY_PROJECTS:
+            if _denied_for(registered_project, registered_cwd):
                 return False
             # Never registered AND only the wildcard vouches for it: its project is
             # unknown, so the denylist could not be consulted at all — and the deny
@@ -1037,7 +1052,8 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                 skipped.append({"event_id": eid, "why": "target_unresolved_or_ambiguous"})
                 continue
             if not is_supervised(target, conn=conn,
-                                 project=_project_of({"claude_cwd": payload.get("cwd", "")})):
+                                 project=_project_of({"claude_cwd": payload.get("cwd", "")}),
+                                 cwd=payload.get("cwd", "") or ""):
                 why = send_block_reason(
                     target, _project_of({"claude_cwd": payload.get("cwd", "")}),
                     cwd=payload.get("cwd", "") or "", conn=conn)
@@ -1143,7 +1159,8 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                         continue
                     if (a.get("state") or "") not in _AT_REST or a.get("pending"):
                         continue
-                    if not is_supervised(target, conn=conn, project=_project_of(a)):
+                    if not is_supervised(target, conn=conn, project=_project_of(a),
+                                         cwd=(a.get("claude_cwd") or a.get("cwd") or "")):
                         continue
                     if in_external_wait(target, conn=conn, now=now) or in_gate(
                             target, conn=conn, now=now):

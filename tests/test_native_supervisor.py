@@ -1022,6 +1022,56 @@ def test_an_explicit_entry_still_counts_without_a_registry_row(monkeypatch):
     assert ns.is_supervised("gaika-opus:0.0", conn=conn) is True
 
 
+# ── event 55938: the wildcard typed into a parked, deny-listed auction agent ──────────
+# 2026-09-20, live: NATIVE_SUPERVISOR_DENY_PROJECTS names `auction`; diamond-auction:0.0
+# sits in /opt/diamond/auction, which resolves to project `diamond`. Registration read the
+# denylist against every candidate name and refused it. `is_supervised` compared the bare
+# project, found `diamond` on no list, and — under `*`, with the project supplied — never
+# consulted the registry. Eight continuations in seventy minutes into an agent parked on
+# real owner/external gates, then `agent_continuation_exhausted`. Both scan paths.
+
+def test_the_predicate_reads_the_denylist_against_every_candidate_name(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {"auction"} | {ns.SELF_PROJECT})
+    conn, _ = ns._conn()
+    conn.execute(ns._REG_SCHEMA)
+    # the exact live call shape: resolved project `diamond`, cwd under /auction
+    assert ns.is_supervised("diamond-auction:0.0", conn=conn, project="diamond",
+                            cwd="/opt/diamond/auction") is False
+    # without the cwd the resolved project alone still says nothing — and that is the
+    # limit of what a caller without a path can know; both scan paths now pass it
+    assert ns.is_supervised("harmless:0.0", conn=conn, project="harmless",
+                            cwd="/opt/harmless") is True
+    # the registry fallback reads candidates from the REGISTERED cwd as well
+    conn.execute("INSERT INTO native_supervised_target(target,project,cwd) VALUES(?,?,?)",
+                 ("diamond-auction:0.0", "diamond", "/opt/diamond/auction"))
+    conn.commit()
+    assert ns.is_supervised("diamond-auction:0.0", conn=conn) is False
+
+
+def test_under_the_wildcard_the_event_path_never_types_into_the_auction(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {"auction"} | {ns.SELF_PROJECT})
+    conn, _ = ns._conn()
+    _hook_event(conn, cwd="/opt/diamond/auction")
+    calls = []
+    r = _scan(conn, [_agent(target="diamond-auction:0.0", cwd="/opt/diamond/auction")], calls)
+    assert calls == [], "a parked, deny-listed auction agent was continued under `*`"
+    assert r["skipped"][0]["why"] == "value_bearing_send_blocked"
+    assert r["skipped"][0]["lifecycle_observed"] is True
+
+
+def test_under_the_wildcard_the_idle_sweep_never_types_into_the_auction(monkeypatch):
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    monkeypatch.setattr(ns, "AUTO_REGISTER_DENY_PROJECTS", {"auction"} | {ns.SELF_PROJECT})
+    conn, _ = ns._conn()
+    _watch_state(conn, "diamond-auction:0.0", ns.IDLE_SWEEP_QUIET_SECS + 60)
+    calls = []
+    r = _scan(conn, [_agent(target="diamond-auction:0.0", cwd="/opt/diamond/auction")], calls)
+    assert calls == []
+    assert not [x for x in r["acted"] if x.get("via") == "idle_sweep"]
+
+
 # ── the idle sweep's own anti-loop cap must be able to count ─────────────────
 # `native_supervision` is keyed `event_id INTEGER PRIMARY KEY`, and the idle sweep has
 # no event, so it passed 0. Every idle decision — for every target — INSERT OR REPLACEd
