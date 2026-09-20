@@ -295,6 +295,29 @@ def test_commander_recent_ack_means_not_stalled_despite_unacked(tmp_path):
     assert r["unacked"] == 1 and r["drain_alive"] is True and r["status"] == "green"
 
 
+def test_commander_rows_outside_the_consumer_window_are_orphaned_not_stalled(tmp_path):
+    """2026-09-20 live: 394 unacked rows from 8–12 days earlier, every row inside the
+    consumer's 24 h listing window acked within seconds — and this report said STALLED for
+    eight days. The consumer can never list, so never ack, a row older than its window."""
+    p = str(tmp_path / "ac.db")
+    _commander_db(p, [(0, NOW - 10 * 86400), (0, NOW - 9 * 86400),   # unreachable orphans
+                      (1, NOW - 4000), (1, NOW - 3600)])             # reachable, all acked
+    r = diag.commander_delivery_report(now=NOW, stall_after_secs=1800, ac_db=p)
+    assert r["unacked"] == 2 and r["reachable_unacked"] == 0
+    assert r["orphaned_outside_consumer_window"] == 2
+    assert r["drain_alive"] is True and r["status"] == "green"
+    assert "orphaned" in r["note"]
+
+
+def test_commander_reachable_backlog_with_no_recent_ack_is_still_stalled(tmp_path):
+    p = str(tmp_path / "ac.db")
+    _commander_db(p, [(0, NOW - 10 * 86400),                          # orphan, ignored
+                      (1, NOW - 9000), (0, NOW - 7000)])              # reachable, unacked, old
+    r = diag.commander_delivery_report(now=NOW, stall_after_secs=1800, ac_db=p)
+    assert r["reachable_unacked"] == 1 and r["orphaned_outside_consumer_window"] == 1
+    assert r["drain_alive"] is False and r["status"] == "red"
+
+
 # ── loop liveness (heartbeat stall detection) ────────────────────────────────
 import os as _os
 

@@ -26,6 +26,10 @@ def _epoch(s: Optional[str]) -> Optional[float]:
     return None
 
 
+def _iso_utc(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).isoformat()
+
+
 def _split(timestamps, now: float, window: float) -> dict:
     """Split a list of ISO timestamps into active (within `window` of now) vs historical."""
     epochs = [e for e in (_epoch(t) for t in timestamps) if e is not None]
@@ -719,11 +723,23 @@ def _ac_db() -> str:
     return os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
 
 
+# The consumer reads `agent_orchestrator.status()`, which lists commander events with
+# `since_epoch = now - 86400`. An unacked event older than that is never listed, so it can
+# never be acked — it is orphaned, not "waiting". 2026-09-20: 394 such rows (09-08…09-12,
+# 343 of them `commander_event_retracted`) kept this report red for eight days while every
+# event the consumer could see was acked within seconds. A drain with nothing reachable to
+# drain is idle, not stalled.
+COMMANDER_CONSUMER_WINDOW_SECS = 86400
+
+
 def commander_delivery_report(*, now: Optional[float] = None, stall_after_secs: float = 1800,
-                              ac_db: str = None) -> dict:
+                              ac_db: str = None,
+                              consumer_window_secs: float = COMMANDER_CONSUMER_WINDOW_SECS) -> dict:
     """Same-chat delivery health: unacked commander_events (drained + acked by agent_notifier).
-    A growing unacked backlog with no recent ack = the drain stalled → the owner is silently
-    NOT getting same-chat messages = health error. Read-only (mode=ro)."""
+    A growing unacked backlog the consumer CAN see, with no recent ack = the drain stalled →
+    the owner is silently NOT getting same-chat messages = health error. Unacked rows older
+    than the consumer's listing window are counted as `orphaned_outside_consumer_window`
+    and do not make the drain "stalled". Read-only (mode=ro)."""
     now = now if now is not None else time.time()
     path = ac_db or _ac_db()
     try:
@@ -735,10 +751,17 @@ def commander_delivery_report(*, now: Optional[float] = None, stall_after_secs: 
     try:
         total = conn.execute("SELECT count(*) FROM commander_events").fetchone()[0]
         unacked = conn.execute("SELECT count(*) FROM commander_events WHERE acknowledged=0").fetchone()[0]
-        oldest_unacked = conn.execute(
-            "SELECT min(ts) FROM commander_events WHERE acknowledged=0").fetchone()[0]
         newest_acked = conn.execute(
             "SELECT max(ts) FROM commander_events WHERE acknowledged=1").fetchone()[0]
+        # Only rows the consumer can list are candidates for "stalled". Compared on `ts`
+        # (ISO, UTC, lexically ordered) because the test/fixture schema and the live
+        # table both carry it; `ts_epoch` is not guaranteed by the fixture.
+        window_start = _iso_utc(now - consumer_window_secs)
+        reachable_unacked = [r[0] for r in conn.execute(
+            "SELECT ts FROM commander_events WHERE acknowledged=0 AND ts >= ? ORDER BY ts",
+            (window_start,)).fetchall()]
+        oldest_unacked = reachable_unacked[0] if reachable_unacked else None
+        orphaned = unacked - len(reachable_unacked)
     except sqlite3.OperationalError:
         conn.close()
         return {"metric": "commander_same_chat_delivery", "total": 0, "unacked": 0,
@@ -748,18 +771,24 @@ def commander_delivery_report(*, now: Optional[float] = None, stall_after_secs: 
         conn.close()
     oldest_age = (now - _epoch(oldest_unacked)) if _epoch(oldest_unacked) is not None else None
     newest_ack_age = (now - _epoch(newest_acked)) if _epoch(newest_acked) is not None else None
-    stalled = (unacked > 0 and oldest_age is not None and oldest_age > stall_after_secs
+    stalled = (bool(reachable_unacked) and oldest_age is not None and oldest_age > stall_after_secs
                and (newest_ack_age is None or newest_ack_age > stall_after_secs))
     drain_alive = not stalled
     return {
         "metric": "commander_same_chat_delivery",
         "total": total,
         "unacked": unacked,
+        "reachable_unacked": len(reachable_unacked),
+        "orphaned_outside_consumer_window": orphaned,
         "oldest_unacked_age_secs": (round(oldest_age) if oldest_age is not None else None),
         "newest_ack_age_secs": (round(newest_ack_age) if newest_ack_age is not None else None),
         "drain_alive": drain_alive,
         "status": "green" if drain_alive else "red",
-        "note": ("agent_notifier drain keeping up (no stalled backlog)" if drain_alive
+        "note": (("agent_notifier drain keeping up (no stalled backlog)"
+                  + (f"; {orphaned} unacked row(s) older than the consumer's "
+                     f"{int(consumer_window_secs)}s listing window are orphaned, not pending"
+                     if orphaned else ""))
+                 if drain_alive
                  else "same-chat drain STALLED — unacked events not delivered; owner not notified"),
     }
 
