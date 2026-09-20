@@ -704,8 +704,13 @@ def is_supervised(target: str, *, conn=None, project: str = "", cwd: str = "") -
     # a check at all.
     if target_denied(target):
         return False
-    if (project or cwd) and _denied_for(project, cwd):
-        return False
+    if project or cwd:
+        try:
+            denied = _denied_for(project, cwd)
+        except Exception:  # noqa: BLE001 — a denylist that cannot be read denies
+            return False
+        if denied:
+            return False
     a = allowed_targets()
     if "*" in a or target in a:
         if not project:
@@ -715,7 +720,10 @@ def is_supervised(target: str, *, conn=None, project: str = "", cwd: str = "") -
                 registered_project, registered_cwd = _registration_of(target, conn=conn)
             except Exception:  # noqa: BLE001 — unknown is never "supervised"
                 return False
-            if _denied_for(registered_project, registered_cwd):
+            try:
+                if _denied_for(registered_project, registered_cwd):
+                    return False
+            except Exception:  # noqa: BLE001 — same rule: unreadable denylist denies
                 return False
             # Never registered AND only the wildcard vouches for it: its project is
             # unknown, so the denylist could not be consulted at all — and the deny

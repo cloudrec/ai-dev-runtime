@@ -69,3 +69,24 @@ and no further `continue` rows appear for it.
 - `configs/.env` denylist (adding `diamond` would also work but is a config gate; the code
   fix makes it unnecessary).
 - Diamond Auction pane, its external wait, its gate rows, all Auction state.
+
+## Addendum (2026-09-20, later): fail-closed + post-restart proof
+
+- `is_supervised` now returns False if the candidate/denylist check itself raises (both
+  the project-supplied branch and the registry fallback); before, it propagated — the
+  callers' per-row try blocks would have skipped rather than sent, but the predicate
+  itself now honours "unknown is never supervised". Test:
+  `test_a_denylist_that_cannot_be_read_denies`.
+- Pre-restart state (read-only, 16:14Z): gate row for `diamond-auction:0.0` open until
+  epoch 1789940595 (≈21:43Z), `cleared_ts` NULL; every row since 15:43Z is
+  `skip/continuation_gate_open`; target not registered; external wait expired 08-31.
+  Both scan paths check `in_gate` before any send, so nothing can be typed into the pane
+  before ≈21:43Z. After that, the PRE-FIX predicate resumes on the next idle pass until the
+  companion is restarted.
+- Proof tool: `venv/bin/python tools/verify_denied_target_not_continued.py`
+  (read-only; `--since` defaults to the companion's ActiveEnterTimestamp). Exit 0 =
+  confirmed: first non-cooldown row after the restart is `skip/value_bearing_send_blocked`
+  and there is no `continue` in either journal; 2 = no decision yet; 3 = contradicted.
+  Run now it says `contradicted` — correctly, because "since" is the 09-17 start and the
+  pre-fix continues are inside it. `tools/verify_gate_suppression.py` remains
+  `confirmed` (142 post-expiry gate events, all info/oar=0).

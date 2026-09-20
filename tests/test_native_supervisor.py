@@ -1072,6 +1072,27 @@ def test_under_the_wildcard_the_idle_sweep_never_types_into_the_auction(monkeypa
     assert not [x for x in r["acted"] if x.get("via") == "idle_sweep"]
 
 
+def test_a_denylist_that_cannot_be_read_denies(monkeypatch):
+    """Fail closed in the direction that matters: if the candidate/denylist check itself
+    raises (the resolver imports wake_routes), the answer is "not supervised", never an
+    exception the caller might swallow into a send. Checked on both the project-supplied
+    branch and the registry fallback."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "*")
+    conn, _ = ns._conn()
+    conn.execute(ns._REG_SCHEMA)
+    conn.execute("INSERT INTO native_supervised_target(target,project,cwd) VALUES(?,?,?)",
+                 ("mess-opus:0.0", "mess", "/opt/mess"))
+    conn.commit()
+    assert ns.is_supervised("mess-opus:0.0", conn=conn, project="mess", cwd="/opt/mess") is True
+    assert ns.is_supervised("mess-opus:0.0", conn=conn) is True
+
+    def _boom(project, cwd):
+        raise RuntimeError("resolver unavailable")
+    monkeypatch.setattr(ns, "_denied_for", _boom)
+    assert ns.is_supervised("mess-opus:0.0", conn=conn, project="mess", cwd="/opt/mess") is False
+    assert ns.is_supervised("mess-opus:0.0", conn=conn) is False
+
+
 # ── the idle sweep's own anti-loop cap must be able to count ─────────────────
 # `native_supervision` is keyed `event_id INTEGER PRIMARY KEY`, and the idle sweep has
 # no event, so it passed 0. Every idle decision — for every target — INSERT OR REPLACEd
