@@ -36,3 +36,30 @@ consistent; no self `agent_process_failed`). Companion restart optional.
   now prevented) — ignore when reading that log.
 - Event 54494 (`owner-os-opus-final` death) = orchestrator rotation; `live_in_same_cwd: []`
   was correct at scan time.
+
+## Update 2026-09-20 (automated instructions; no owner sign-off recorded)
+
+HEAD **76c8fa3**, branch ahead **33** of origin, tracked tree clean, 34 untracked reports
+untouched. Full suite **3361 passed**. Live processes unchanged: ai-runtime pid 6557 and
+companion pid 3508, both from 22:51 CEST 09-17 (code f713ac2).
+
+New local commits since 217af2f:
+- efae654 — `is_supervised` reads the denylist over `project_candidates` (project + every
+  cwd segment); both scan paths pass cwd. Root cause of events 55184/55938: 26 continuations
+  typed into the parked, deny-listed `diamond-auction:0.0`. Companion loads it.
+- 73c2ed1 — predicate fails closed if the denylist check raises; read-only proof tool
+  `tools/verify_denied_target_not_continued.py` (exit 0 = first post-restart decision is
+  `skip/value_bearing_send_blocked`, no `continue`).
+- 76c8fa3 — `commander_delivery_report` no longer calls 394 orphaned (pre-window, never
+  listable) rows a stalled drain; health summary loses a false `same_chat_drain_stalled`.
+  ai-runtime loads it.
+
+Reports: `OWNER_OS_EVENT_55938_AUCTION_CONTINUED_UNDER_WILDCARD_2026-09-20.md`,
+`OWNER_OS_CERTBOT_WALL_AND_DRAIN_FALSE_RED_2026-09-20.md`.
+
+Gates, unchanged in kind: (1) `systemctl restart owner-os-wake-companion`, then run the
+proof tool; (2) `systemctl restart ai-runtime`; (3) `git push` (33 commits); (4) certbot
+renewal conf for payment.clients.help (28 days to expiry) and the expired
+youtube.seoseo.cheap cert — other projects. Until (1), diamond-auction is protected only by
+the 6 h gate from 55938 (≈21:43Z 09-20); after it clears, pre-fix code resumes on the next
+idle pass.
