@@ -1178,6 +1178,29 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                         # No quiescence evidence, or not quiet long enough. The event path
                         # owns everything before this point.
                         continue
+                    # Waiting BY DESIGN is not idleness, whichever door finds it. The
+                    # event path already reads an armed background shell / monitor out
+                    # of the hook payload and skips as `intentional_external_wait`; that
+                    # skip was consulted here only once the cap was reached, so below
+                    # the cap this sweep kept poking the very pane the other path had
+                    # just recognised as deliberately waiting. 2026-09-21,
+                    # main105-backup-repair:0.0: 127 event-path intentional-wait skips
+                    # and 117 idle-sweep continuations in the same day, each poke
+                    # answered "scheduled_wait", each answer a new pane digest, each
+                    # digest a fresh work_stopped_incomplete (45 of them). Same evidence
+                    # as the cap exemption, consulted before the send instead of after.
+                    # Fail-closed for real stalls: the evidence expires with
+                    # GATE_WAIT_LOOKBACK_SECS and is renewed only by a turn boundary
+                    # whose payload still shows something armed — a shell that has died
+                    # renews nothing, and the sweep resumes.
+                    exempt = gate_exemption(conn, target, a.get("claude_cwd")
+                                            or a.get("cwd") or "", now)
+                    if exempt in ("intentional_external_wait",
+                                  "recent_intentional_external_wait"):
+                        _record(conn, 0, target, "skip", f"idle_sweep_{exempt}", True)
+                        skipped.append({"event_id": 0, "target": target,
+                                        "why": f"idle_sweep_{exempt}"})
+                        continue
                     last, n_hour = _recent_for_target(conn, target, now)
                     if (now - last) < max(MIN_INTERVAL_SECS, IDLE_SWEEP_QUIET_SECS):
                         continue

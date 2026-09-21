@@ -667,6 +667,45 @@ def test_the_idle_sweep_skips_entirely_on_an_intentional_wait(monkeypatch):
     assert opened == []                                    # no gate at all
 
 
+def test_the_idle_sweep_honours_the_event_paths_intentional_wait_below_the_cap(monkeypatch):
+    """2026-09-21, main105-backup-repair:0.0: the hook payload carried an armed background
+    shell, so the event path skipped `intentional_external_wait` 127 times in a day — and
+    the idle sweep, which only consulted that evidence once the cap was reached, continued
+    the same pane 117 times below it. Each poke was answered "scheduled_wait", each answer
+    changed the pane digest, each digest emitted a fresh work_stopped_incomplete (45)."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", ns.IDLE_SWEEP_QUIET_SECS + 60)
+    # the event path's own record of the intentional wait, keyed by the payload cwd,
+    # exactly as decide()->resolve_target ordering leaves it
+    ns._record(conn, 41, "/root/cp-canary-v2", "skip", "intentional_external_wait", True)
+    calls = []
+    r = _scan(conn, [_agent()], calls)          # no hook event pending; sweep only
+    assert calls == [], "a pane recognised as waiting by design was poked below the cap"
+    assert not [x for x in r["acted"] if x.get("via") == "idle_sweep"]
+    assert any(x.get("why") == "idle_sweep_recent_intentional_external_wait"
+               for x in r["skipped"])
+    row = conn.execute("SELECT reason FROM native_supervision_idle WHERE target=? "
+                       "ORDER BY id DESC LIMIT 1", ("cp-canary:0.0",)).fetchone()
+    assert row and row[0] == "idle_sweep_recent_intentional_external_wait"
+
+
+def test_the_idle_sweep_resumes_once_the_wait_evidence_has_expired(monkeypatch):
+    """Fail-closed for real stalls: the evidence is renewed only by a turn boundary whose
+    payload still shows something armed. A shell that died renews nothing."""
+    monkeypatch.setattr(ns, "_TARGETS_RAW", "cp-canary:0.0")
+    conn, _ = ns._conn()
+    _watch_state(conn, "cp-canary:0.0", ns.IDLE_SWEEP_QUIET_SECS + 60)
+    stale = time.time() - ns.GATE_WAIT_LOOKBACK_SECS - 60
+    conn.execute("INSERT INTO native_supervision(event_id,ts,ts_epoch,target,action,reason,ok,detail) "
+                 "VALUES(?,?,?,?,?,?,?,?)",
+                 (41, "t", stale, "/root/cp-canary-v2", "skip", "intentional_external_wait", 1, "{}"))
+    conn.commit()
+    calls = []
+    r = _scan(conn, [_agent()], calls)
+    assert len(calls) == 1 and r["acted"][0]["via"] == "idle_sweep"
+
+
 # ── deterministic proof of the suppression branch, without the dedup confound ─────────
 # Live, this branch is masked: every candidate target already had a gate event inside the
 # 6h `nativesup:gate:<target>` dedup window, so silence in production proves nothing. An
