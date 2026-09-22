@@ -1673,3 +1673,85 @@ def test_an_escalated_pane_still_has_its_wake_delivered(tmp_path, monkeypatch):
         "SELECT delivered FROM wake_delivery WHERE event_id=34527").fetchone()[0]
     assert delivered == 1, \
         "the suppression must not retract or contradict a delivery that already happened"
+
+
+# ── a dead pane nothing but the owner will revive (events 57008→57042→57057) ─
+
+def _dead_agent(conn, *, event_id: int, etype: str = "agent_dead", target=PANE):
+    from core.control_plane import api
+    _register_agent(conn, target=target)
+    api.set_lifecycle(target, "dead", project_id="capacity", conn=conn)
+    conn.execute("INSERT INTO event (id,ts,ts_epoch,source,type,agent_id,severity,payload) "
+                 "VALUES (?,?,?,?,?,?,?,?)",
+                 (event_id, "2026-09-22T04:22:19+00:00", NOW - 1, "discovery", etype,
+                  target, "high", '{"cwd": "/opt/capacity"}'))
+    conn.commit()
+
+
+def test_a_dead_pane_outside_the_recovery_registry_is_not_stalled(conn, monkeypatch):
+    from core import session_recovery as sr
+    monkeypatch.setattr(sr, "load_registry", lambda path=None: {"sessions": {}, "limits": {}})
+    _dead_agent(conn, event_id=57008)
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=57008, target=PANE, project_id="capacity",
+                          event_type="agent_dead", conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert calls == [], "the owner was told by the delivered wake; nothing else can move it"
+    assert any(x["reason"] == "dead_pane_awaiting_owner_resume"
+               for x in r["deregistered"]), r["deregistered"]
+
+
+def test_a_dead_pane_in_the_recovery_registry_still_escalates(conn, monkeypatch):
+    """Control: where automation WILL revive the pane, a revive that never lands is the
+    stall worth escalating, exactly as before."""
+    from core import session_recovery as sr
+    monkeypatch.setattr(sr, "load_registry",
+                        lambda path=None: {"sessions": {PANE: {"target": PANE}}, "limits": {}})
+    _dead_agent(conn, event_id=57009)
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=57009, target=PANE, project_id="capacity",
+                          event_type="agent_dead", conn=conn, now=NOW)
+    clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    clw.slo_scan(conn=conn, now=NOW + 2 * clw.WAKE_LOOP_SLO_SECS + 60, emit_fn=emit)
+    assert calls == ["wake_loop_no_progress", "wake_loop_stalled"]
+
+
+def test_only_a_terminal_wake_on_a_dead_row_qualifies(conn, monkeypatch):
+    """Positive evidence on both sides: a non-terminal wake on a dead row, and a terminal
+    wake on a row that is not dead, both keep waking."""
+    from core import session_recovery as sr
+    from core.control_plane import api
+    monkeypatch.setattr(sr, "load_registry", lambda path=None: {"sessions": {}, "limits": {}})
+    # terminal wake, but the row says the pane came back
+    _dead_agent(conn, event_id=57010)
+    api.set_lifecycle(PANE, "recovered", project_id="capacity", conn=conn)
+    assert clw._dead_pane_awaiting_owner(conn, 57010, PANE) is False
+    # dead row, but the watched wake was a prompt, not a death
+    api.set_lifecycle(PANE, "dead", project_id="capacity", conn=conn)
+    conn.execute("INSERT INTO event (id,ts,ts_epoch,source,type,agent_id,severity,payload) "
+                 "VALUES (?,?,?,?,?,?,?,?)",
+                 (57011, "2026-09-22T04:22:19+00:00", NOW - 1, "agent_watch",
+                  "agent_prompt_needs_response", PANE, "high", "{}"))
+    assert clw._dead_pane_awaiting_owner(conn, 57011, PANE) is False
+
+
+def test_dead_pane_check_fails_closed_when_the_registry_is_unreadable(conn, monkeypatch):
+    from core import session_recovery as sr
+
+    def boom(path=None):
+        raise OSError("registry unreadable")
+    monkeypatch.setattr(sr, "load_registry", boom)
+    _dead_agent(conn, event_id=57012)
+    assert clw._dead_pane_awaiting_owner(conn, 57012, PANE) is False
+
+
+def test_recovery_lifts_the_dead_pane_suppression_on_its_own(conn, monkeypatch):
+    """Self-limiting like the gate and doctor checks: discovery flips the row to
+    `recovered` when the conversation returns, and the check stops applying."""
+    from core import session_recovery as sr
+    from core.control_plane import api
+    monkeypatch.setattr(sr, "load_registry", lambda path=None: {"sessions": {}, "limits": {}})
+    _dead_agent(conn, event_id=57013, etype="agent_process_failed")
+    assert clw._dead_pane_awaiting_owner(conn, 57013, PANE) is True
+    api.set_lifecycle(PANE, "recovered", project_id="capacity", conn=conn)
+    assert clw._dead_pane_awaiting_owner(conn, 57013, PANE) is False

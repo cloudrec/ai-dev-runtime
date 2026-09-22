@@ -171,6 +171,50 @@ def _session_target_gone(conn, event_id: int, target: str, agents=None) -> bool:
     return bool(term)
 
 
+# The wakes whose premise is "this pane is gone". `agent_dead` is discovery's verdict,
+# `agent_process_failed` is agent_watch's (`pane vanished while …`).
+_TERMINAL_EVENT_TYPES = frozenset({"agent_dead", "agent_process_failed"})
+
+
+def _dead_pane_awaiting_owner(conn, event_id: int, target: str) -> bool:
+    """Is this watch about a pane that is recorded DEAD and that no automation will revive?
+
+    Event 57008→57042→57057 (2026-09-22): the tmux server died with every pane, discovery
+    marked `capacity-blockchain:0.0` dead (high, NOT owner-actionable: "conversation_id
+    preserved for recovery"), the wake was delivered — and then this watchdog measured
+    "progress" on a pane that no longer existed, re-woke at 15 min and escalated to
+    critical/owner-actionable at 30 min. The same chain ran on 2026-09-17 (54490→54557→
+    54582). Nothing could have moved: the project is not in the recovery registry, so
+    the only thing that ends the state is the owner resuming it, and the owner was told
+    by the delivered wake itself.
+
+    The pane-shaped twin of `_session_target_gone`, on POSITIVE evidence only:
+
+      * the watched wake is itself a terminal event (the owner has been told once);
+      * discovery's durable `lifecycle_state` for the target is `dead` — set only when
+        it saw the pane vanish, and flipped to `recovered` the moment the same
+        conversation returns, so this stops applying on its own;
+      * the target is NOT in `session_recovery`'s registry, where automation would
+        revive it and a revive that never lands is exactly the stall worth escalating.
+
+    Fail-closed: any unreadable input keeps the watch waking exactly as before.
+    """
+    try:
+        ev = conn.execute("SELECT type FROM event WHERE id=?", (int(event_id),)).fetchone()
+        if not ev or ev[0] not in _TERMINAL_EVENT_TYPES:
+            return False
+        row = conn.execute("SELECT lifecycle_state FROM agent WHERE target=?",
+                           (target,)).fetchone()
+        if not row or row[0] != "dead":
+            return False
+        from core import session_recovery as _sr
+        if target in (_sr.load_registry().get("sessions") or {}):
+            return False
+    except Exception:  # noqa: BLE001 — unknown never means "resolved"
+        return False
+    return True
+
+
 def _runtime_job_terminal(target: str) -> bool:
     """Is the job behind this `runtimejob:<8-hex-prefix>` target ALREADY terminal?
 
@@ -458,6 +502,11 @@ def _resolution_reason(conn, *, event_id: int, target: str,
             return "pane_escalated_by_stall_doctor"
     except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
         pass
+    # A pane that is recorded dead and that nothing but the owner will revive is waiting
+    # for the owner, not stalled — the failure-class twin of the two checks above. See
+    # `_dead_pane_awaiting_owner` for the evidence it requires and how it self-limits.
+    if _dead_pane_awaiting_owner(conn, event_id, target):
+        return "dead_pane_awaiting_owner_resume"
     # Asked BEFORE the scraped class, because it is the same question answered by
     # the runtime instead of by inference. A pane mid-turn reports `busy` here while
     # emitting no events at all, which is exactly the state that produced the
