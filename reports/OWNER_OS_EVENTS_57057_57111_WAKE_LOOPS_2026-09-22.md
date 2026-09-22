@@ -70,16 +70,92 @@ finish, still outranked by crash text or open work below it. Live pane now class
 tests/test_closed_loop*.py`: 431 passed before the new files; `test_closed_loop_wake.py`
 91 passed (86 + 5); `test_agent_watch_parked_agent.py` 11 passed. Full suite: see below.
 
-## What is live now vs. after restart
+## Addendum — event 57118 and the rest of the wake-loop audit
 
-* `hooks/owneros_hook.py` runs from the checkout per invocation — already live.
-* `agent_watch` scan and `closed_loop_wake.slo_scan` run inside `ai-runtime.service`;
-  both fixes take effect only after the daemon restarts. Until then the main105 loop
-  continues at its ~hourly cadence and any new death outside the registry still
-  produces its two escalations.
+An automated instruction was received (not owner sign-off) to finish the audit before
+deployment. 57118 was `quiescent` on the Owner OS pane itself: its report ended on the
+gate list with no stated finish, so the reader poked it — the 57111 shape on the self
+agent. The self-wake flow (`wake_bridge.SELF_WAKE_FLOW`) is by design; the fix is the
+same classifier fix plus a stated finish at the end of a report.
+
+Two further defects found and fixed in the path:
+
+* **`26d2286` — "incomplete" is not a finish.** `_FINISH_RE`'s `complet(?:e|ed)\b` had
+  no leading boundary; the harness's abort banner "The response above may be
+  incomplete." satisfied it. **48** `task_completed` events since 2026-09-01 (57114
+  among them) announced an aborted turn as a completion — each a lifecycle wake. Now
+  `\bcomplet…`; the banner at rest classifies `quiescent`.
+* **`7bb0769` — an inventory that could not be read marks nothing dead.** `agent_list`
+  states `control_unreachable` for a missing server, but `discovery.discover` read its
+  zero rows as "every registered agent is gone" (nine `agent_dead` at 04:22:19Z, each
+  opening an SLO watch that escalated twice), and `agent_watch`'s vanish path counted
+  the blind read as a miss toward a critical `agent_process_failed` per pane. Right by
+  luck on 2026-09-22; in the 2026-08-30 shape (socket deleted, server and panes alive)
+  it declares a live fleet dead. Both now return untouched on an unreachable inventory;
+  reachable-and-empty still marks dead (control tests). This is the origin of the
+  57057 chain, one layer above the watch fix.
+
+Reviewed and left alone: `slo_scan` bound (two emissions per watch), `register_delivery`
+refusing watchdog-class deliveries, `_progress_since`, the stall-doctor and owner-gate
+resolutions, `wake_bridge` dedup of `agentwatch:<target>:<cls>:<digest>`.
+
+## Where each fix runs (corrects the earlier statement)
+
+| Commit | Module | Runs in | Live when |
+|---|---|---|---|
+| 1656e17 | hooks/owneros_hook.py | per hook invocation from the checkout | **already live** |
+| 611dbc4 | core/tmux_launch.py, agent_control, session_recovery, tmux_control.health | `ai-runtime.service` | after daemon restart |
+| 7bb0769 (discovery half) | core/control_plane/discovery.py | `ai-runtime.service` engine | after daemon restart |
+| adb62a3, 26d2286, 7bb0769 (agent_watch half) | core/agent_watch.py | `owner-os-wake-companion.service` (`tools/wake_companion.py: watch_agents`) | after companion restart |
+| b90bac1 | core/closed_loop_wake.py | `owner-os-wake-companion.service` (`watch_closed_loop`) | after companion restart |
+
+The companion's cgroup holds only `wake_companion.py` (pid 3727389, verified read-only);
+the tmux server 3739055 is in `ai-runtime.service`'s cgroup. **Restarting the companion
+does not touch the fleet**; restarting the daemon does, until the server is re-scoped.
+
+## Post-restart verification plan
+
+Companion restart (lower risk, no fleet impact):
+1. `journalctl -u owner-os-wake-companion -n 20` — starts clean, `agent-watch:` lines resume.
+2. Within one agent_watch pass (≤20 s): `agent_watch_state` for `main105-backup-repair:0.0`
+   shows `cls='completed'` (was `quiescent`); no new `work_stopped_incomplete` for it
+   unless its pane text changes with failure evidence.
+3. Within one `slo_scan` (≤20 s): `wake_loop_watch` rows for 57008/57009/57015 gain
+   `resolved=1, resolved_reason='dead_pane_awaiting_owner_resume'` (the `escalated=1`
+   57008 row is already closed; the check matters for the next death).
+4. Grep the companion log for `control_unreachable` — must be absent while the server is up.
+
+Daemon restart (only after the tmux re-scope gate):
+1. `cat /proc/3739055/cgroup` still shows the transient scope, `tmux ls` lists all
+   sessions, `agent_list` shows `tmux_running=true`.
+2. `GET /api/v1/agents/tmux-control/health` (or `tmux_control.health()`) → `status=ok`,
+   `shared_cgroup=false`.
+3. First `agent_resume` after restart: `/proc/<new tmux client pid>/cgroup` for any NEW
+   server = `owner-os-tmux-<pid>-<uuid>.scope`; `systemctl list-units 'owner-os-tmux-*'`
+   shows it. If a server already exists, no scope remains (collected).
+4. Service log shows `control plane: discovered=N … dead=0` on the first tick (no
+   spurious deaths from the restart window).
+
+## Rollback conditions
+
+* Any restart-window burst of `agent_dead`/`agent_process_failed` for panes that are
+  visibly alive → `git revert 7bb0769` is NOT the fix (that commit prevents exactly this);
+  check `agent_list` reachability first.
+* A managed agent (registry: cp-canary, mess-qa-automation, arbitrage2-opus) dies and no
+  `wake_loop_no_progress` follows within 15 min → `b90bac1` mis-scoped; revert it.
+* A pane that genuinely stopped mid-work is classified `completed` → the culprit is
+  `adb62a3`'s park vocabulary or the `●` change; revert `adb62a3` (and `26d2286`, which
+  depends on the same regex) — both are pure classifier changes, no schema.
+* `agent_resume` fails with `systemd-run` in the error → `611dbc4`; setting
+  `PATH` without `systemd-run` or reverting the commit restores the plain `tmux` argv.
+  No schema or data migration in any of the seven commits; all revert cleanly.
 
 ## Remaining gates (privileged — not taken)
 
-1. Re-scope live tmux server 3739055 (`busctl … StartTransientUnit … PIDs au 1 3739055`).
-2. `systemctl restart ai-runtime.service` — only after 1; deploys 611dbc4, adb62a3, b90bac1.
-3. Push (local commits since a4604be: 611dbc4, 1656e17, b377093, 5dfc776, adb62a3, b90bac1, +this report).
+1. `systemctl restart owner-os-wake-companion.service` — deploys adb62a3, 26d2286,
+   b90bac1, agent_watch half of 7bb0769. Lower risk: no fleet impact.
+2. Re-scope live tmux server 3739055 (`busctl … StartTransientUnit … PIDs au 1 3739055`).
+3. `systemctl restart ai-runtime.service` — only after 2; deploys 611dbc4 and the
+   discovery half of 7bb0769.
+4. Push (local commits since a4604be: 611dbc4, 1656e17, b377093, 5dfc776, adb62a3,
+   b90bac1, a5054b3, 26d2286, 7bb0769, + this report).
