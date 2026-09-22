@@ -608,8 +608,18 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
     now = now if now is not None else now_ts()
     if agents is None:
         from core import agent_control
-        agents = [a for a in agent_control.agent_list().get("agents", [])
-                  if a.get("is_agent")]
+        inv = agent_control.agent_list()
+        if inv.get("control_unreachable"):
+            # Unknown is not empty. The vanish path below turns two consecutive absences
+            # into `agent_process_failed` (critical, owner-actionable) per tracked pane;
+            # fed an inventory nobody could read, it would crash the whole fleet on
+            # paper while every process ran (the 2026-08-30 shape). The outage is
+            # already reported by tmux_control's guard, so this pass neither counts a
+            # miss nor emits: presence is unknown, and the counters wait for a real read.
+            return {"emitted": [], "skipped": [{"target": "*", "why": "control_unreachable"}],
+                    "control_unreachable": True,
+                    "control_reason": inv.get("control_reason") or "unknown"}
+        agents = [a for a in inv.get("agents", []) if a.get("is_agent")]
     if read_fn is None:
         from core import agent_control
 

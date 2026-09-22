@@ -206,3 +206,28 @@ def test_an_agent_elsewhere_is_not_a_successor():
     disc.discover(_inv(_agent("mess:0.0", "/opt/mess", pid=3333)),
                   config=CONFIG, conversation_fn=_conv(convmap))
     assert _dead_payload("arb:0.0")["live_in_same_cwd"] == []
+
+
+# ── an inventory that could not be read is unknown, not empty (2026-09-22) ───
+def test_unreachable_inventory_marks_nothing_dead():
+    """The 2026-08-30 shape: socket gone, server and every pane alive. `agent_list`
+    returns zero rows and says so; the sweep must not read that as a fleet-wide death."""
+    inv = _inv(_agent("arbitrage2-opus:0.0", "/opt/arbitrage2"))
+    disc.discover(inv, config=CONFIG, conversation_fn=_conv({"/opt/arbitrage2": "convA"}))
+    blind = {"agents": [], "sessions": [], "duplicates": [], "tmux_running": False,
+             "control_unreachable": True, "control_reason": "no_tmux_server"}
+    res = disc.discover(blind, config=CONFIG, conversation_fn=_conv({}))
+    assert res["dead"] == 0 and res["control_unreachable"] is True
+    assert res["control_reason"] == "no_tmux_server"
+    assert cp.get_agent("arbitrage2-opus:0.0")["lifecycle_state"] == disc.MANAGED
+    assert not _dead_payload("arbitrage2-opus:0.0")
+
+
+def test_a_reachable_empty_inventory_still_marks_dead():
+    """Control: a live server with no panes IS a real inventory, and a registered agent
+    missing from it is dead, exactly as before."""
+    inv = _inv(_agent("arbitrage2-opus:0.0", "/opt/arbitrage2"))
+    disc.discover(inv, config=CONFIG, conversation_fn=_conv({"/opt/arbitrage2": "convA"}))
+    res = disc.discover({"agents": []}, config=CONFIG, conversation_fn=_conv({}))
+    assert res["dead"] == 1
+    assert cp.get_agent("arbitrage2-opus:0.0")["lifecycle_state"] == disc.DEAD

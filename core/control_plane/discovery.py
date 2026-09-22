@@ -159,6 +159,22 @@ def discover(inventory: Optional[dict] = None, *, config: Optional[dict] = None,
         from core import agent_control as ac
         inventory = ac.agent_list()
 
+    # An inventory that could not be READ is unknown, not empty. `agent_list` states the
+    # condition (`control_unreachable`, 2026-08-30: the socket was deleted under a live
+    # server and every pane kept running); before this check the sweep read those zero
+    # rows as "every registered agent is gone" and marked the whole registry dead — nine
+    # `agent_dead` wakes, each opening an SLO watch that escalated twice. On 2026-09-22 the
+    # server really was gone and the verdict happened to be right; the mechanism was not.
+    # The outage itself is already the owner's news (`agent_control_plane_unreachable`,
+    # critical, from tmux_control's guard), so this sweep records nothing and touches
+    # nothing. Reachable-and-empty (a live server with no panes) is still a real
+    # inventory and still marks dead, exactly as before.
+    if inventory.get("control_unreachable"):
+        return {"discovered": 0, "managed": 0, "observe_only": 0, "blocked": 0,
+                "duplicates": 0, "dead": 0, "recovered": 0, "events": [],
+                "control_unreachable": True,
+                "control_reason": inventory.get("control_reason") or "unknown"}
+
     live = [a for a in (inventory.get("agents") or []) if a.get("is_agent") and a.get("alive")]
     live_targets = {a["target"] for a in live}
     summary = {"discovered": 0, "managed": 0, "observe_only": 0, "blocked": 0,

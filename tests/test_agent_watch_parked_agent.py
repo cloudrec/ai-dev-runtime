@@ -158,3 +158,26 @@ def test_an_aborted_turn_at_rest_is_a_stop_not_a_completion():
     tail = "● Applying the second patch now\n" + ABORT_BANNER + "\n"
     r = aw.classify(tail, state="idle", prev_cls="working", quiet_secs=400)
     assert r["cls"] == "quiescent", r
+
+
+# ── an inventory that could not be read is unknown, not empty (2026-09-22) ───
+
+def test_scan_does_nothing_on_an_unreachable_inventory(monkeypatch, tmp_path):
+    """Two consecutive absences crash a tracked pane. Fed a blind inventory, that would
+    crash the whole fleet on paper while every process ran (the 2026-08-30 shape)."""
+    import sqlite3
+    from core import agent_control
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    blind = {"agents": [], "sessions": [], "duplicates": [], "tmux_running": False,
+             "control_unreachable": True, "control_reason": "no_tmux_server"}
+    monkeypatch.setattr(agent_control, "agent_list", lambda: blind)
+    calls = []
+    conn = sqlite3.connect(str(tmp_path / "cp.db"))
+    conn.executescript(aw._SCHEMA)
+    aw._migrate_state(conn)
+    conn.execute("INSERT INTO agent_watch_state (target, cls, digest, miss_count) "
+                 "VALUES ('x:0.0', 'working', 'd', 1)")   # one miss already: next = crash
+    conn.commit()
+    r = aw.scan(emit_fn=lambda *a, **k: calls.append(k) or {"event_id": 1}, conn=conn)
+    assert r["control_unreachable"] is True and r["emitted"] == [] and calls == []
+    assert conn.execute("SELECT miss_count FROM agent_watch_state").fetchone()[0] == 1
