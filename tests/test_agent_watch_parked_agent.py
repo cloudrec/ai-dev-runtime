@@ -138,3 +138,23 @@ def test_quiet_without_a_stated_finish_is_still_quiescent():
     tail = "❯ continue with the next safe\n  step\n● Looking at the second replica now.\n"
     r = aw.classify(tail, state="idle", prev_cls="working", quiet_secs=400)
     assert r["cls"] == "quiescent"
+
+
+# ── "incomplete" is not "complete" (event 57114) ────────────────────────────
+
+ABORT_BANNER = "API Error: Connection lost mid-response. The response above may be incomplete."
+
+
+def test_the_abort_banner_is_not_a_finish():
+    """48 task_completed events since 2026-09-01 were minted from this banner."""
+    assert not aw._FINISH_RE.search(ABORT_BANNER)
+    assert not aw._FINISH_RE.search("● the migration is still incomplete")
+    for real in ("● Migration complete.", "● Completed the run; all tests passed.",
+                 "● Finished. Final report in reports/X.md"):
+        assert aw._FINISH_RE.search(real), real
+
+
+def test_an_aborted_turn_at_rest_is_a_stop_not_a_completion():
+    tail = "● Applying the second patch now\n" + ABORT_BANNER + "\n"
+    r = aw.classify(tail, state="idle", prev_cls="working", quiet_secs=400)
+    assert r["cls"] == "quiescent", r

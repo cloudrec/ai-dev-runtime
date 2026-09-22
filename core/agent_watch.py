@@ -321,7 +321,10 @@ _MENU_RE = re.compile(
 # work with no finish statement stays un-announced (event 4086 was "idle" from UI
 # metadata while an internal task list sat half-open).
 _FINISH_RE = re.compile(
-    r"(finish(?:ed)?\b|complet(?:e|ed)\b|\ball done\b|\bdone[.!]|final report"
+    # `\bcomplet…`: "incomplete" is the opposite claim. 48 task_completed events since
+    # 2026-09-01 (57114 among them) were minted from the harness's own abort banner
+    # "The response above may be incomplete." — an aborted turn announced as a finish.
+    r"(finish(?:ed)?\b|\bcomplet(?:e|ed)\b|\ball done\b|\bdone[.!]|final report"
     r"|all (?:checks|tests) pass(?:ed)?|завершен[оа]?|готово"
     # An agent that SAYS it is parked has stated its rest — the opposite of stopping
     # without saying so. Event 57111: "Завершено и верифицировано … Припаркован." until
