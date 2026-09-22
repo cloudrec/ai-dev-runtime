@@ -79,10 +79,11 @@ def _confirmed_prev():
 
 
 def _d(agent, pending, state, prev=None, eligible=True, proactive=False, conv_count=0,
-       continuation="continue with the next safe step"):
+       continuation="continue with the next safe step", declared_wait=False):
     return cw.decide(agent=agent, cfg={}, pending=pending, state=state,
                      prev_target=prev or _confirmed_prev(), now_ts=NOW, eligible=eligible,
-                     continuation=continuation, proactive=proactive, conv_count=conv_count)
+                     continuation=continuation, proactive=proactive, conv_count=conv_count,
+                     declared_wait=declared_wait)
 
 
 def test_decide_submits_safe_typed_but_unsubmitted_text():
@@ -451,3 +452,34 @@ def test_without_an_injected_inventory_health_stays_hermetic(monkeypatch):
     h = cw.health(load_config=lambda: {})
     assert h["status"] == "ok"
     assert "coverage" not in h
+
+
+# ── a declared park stops the proactive poke, and nothing else (event 57311) ─
+
+def test_a_declared_wait_suppresses_the_proactive_continuation():
+    """The one action here that invents direction for an agent that asked for none."""
+    d = _d(_agent(tail="● Припаркован до 23 Sep 02:00."), "", "idle",
+           proactive=True, declared_wait=True)
+    assert d["action"] == "skip" and d["reason"] == "intentional_external_wait"
+
+
+def test_without_a_declaration_the_proactive_path_is_unchanged():
+    d = _d(_agent(tail="● at rest"), "", "idle", proactive=True)
+    assert d["action"] == "deliver" and d["step_text"] == "continue with the next safe step"
+
+
+def test_a_declared_wait_still_rescues_typed_but_unsubmitted_text():
+    """A park is no reason to strand an instruction someone already composed — rescuing
+    a stuck keystroke is this watchdog's whole purpose."""
+    d = _d(_agent(tail="● parked"), "continue with the next safe step", "idle",
+           proactive=True, declared_wait=True)
+    assert d["action"] == "submit"
+
+
+def test_a_declared_wait_never_answers_a_dialog_or_hides_a_blocker():
+    dialog = _d(_agent(tail="Do you want to proceed?\n ❯ 1. Yes\n   2. No"), "", "idle",
+                proactive=True, declared_wait=True)
+    assert dialog["action"] == "skip" and dialog["reason"] == "dialog_open_never_auto_answer"
+    unsafe = _d(_agent(tail="● parked"), "git push origin main", "idle",
+                proactive=True, declared_wait=True)
+    assert unsafe["action"] == "blocker" and unsafe["reason"] == "unsafe_pending_text"

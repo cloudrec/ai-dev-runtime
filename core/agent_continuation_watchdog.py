@@ -460,9 +460,17 @@ def eligible_sessions(load_config: Callable) -> set:
 
 def decide(*, agent: dict, cfg: dict, pending: str, state: str, prev_target: Optional[dict],
            now_ts: float, eligible: bool, continuation: str, proactive: bool,
-           conv_count: int) -> dict:
+           conv_count: int, declared_wait: bool = False) -> dict:
     """Pure: what should the watchdog do with this agent right now?
-    Returns {action: skip|submit|deliver|blocker, ...}."""
+    Returns {action: skip|submit|deliver|blocker, ...}.
+
+    `declared_wait` is the durable `native_external_wait` record — the same one the
+    supervisor's idle sweep, the stall doctor and the SLO watchdog already treat as
+    decisive. It suppresses ONLY the proactive `deliver` below, which is the one action
+    here that invents direction for an agent that asked for none; typed-but-unsubmitted
+    text is still submitted, because rescuing a stuck keystroke is this watchdog's whole
+    purpose and a park is no reason to strand an instruction someone already composed.
+    """
     if not (agent.get("alive") and agent.get("is_agent")):
         return {"action": "skip", "reason": "dead_or_not_agent"}
     if not eligible:
@@ -527,6 +535,12 @@ def decide(*, agent: dict, cfg: dict, pending: str, state: str, prev_target: Opt
     if proactive and is_safe_continuation(continuation) and conv_count < MAX_CONTINUATIONS:
         if blind:
             return {"action": "skip", "reason": "unobservable_pane"}
+        if declared_wait:
+            # Parked on purpose until a stated moment (event 57311). Inventing
+            # "continue with the next safe step" for it produces a reply, a new pane
+            # digest and another round of lifecycle events — the poke loop this record
+            # exists to end. Bounded by the declaration's own expiry.
+            return {"action": "skip", "reason": "intentional_external_wait"}
         return {"action": "deliver", "step_text": continuation}
     return {"action": "skip", "reason": "nothing_to_submit"}
 
@@ -865,9 +879,18 @@ def run_once(ctrl=None, *, now_ts: Optional[float] = None, sleep=time.sleep) -> 
                 conv_id = _conv_id(ctrl, cwd)
                 conv_count = _conv_count(conn, target, conv_id)
 
+                # Delegated, never a second reading of the table, so the four doors
+                # cannot drift apart on what "declared" means. Fail-open toward the
+                # previous behaviour: an unavailable lookup changes nothing.
+                try:
+                    from core import native_supervisor as _ns
+                    declared_wait = bool(_ns.in_external_wait(target, now=now_ts))
+                except Exception:  # noqa: BLE001 — unknown never means "suppress"
+                    declared_wait = False
                 d = decide(agent=a, cfg=cfg, pending=pending, state=state,
                            prev_target=prev_for_decide, now_ts=now_ts, eligible=is_elig,
-                           continuation=continuation, proactive=proactive, conv_count=conv_count)
+                           continuation=continuation, proactive=proactive,
+                           conv_count=conv_count, declared_wait=declared_wait)
                 if d["action"] == "skip":
                     # every refusal carries its reason into the audit trail
                     h["last_action"] = f"skip:{target}:{d.get('reason')}" + (
