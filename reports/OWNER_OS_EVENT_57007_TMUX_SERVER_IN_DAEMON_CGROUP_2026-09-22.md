@@ -82,3 +82,51 @@ Unresolved detail (does not change the verdict): pane %0 of server 131368 opened
    in `/etc/needrestart/conf.d/` so unattended upgrades never restart the daemon unasked.
 
 Nothing was pushed, no agent was created or messaged, capacity/ACAP/auction untouched.
+
+## Addendum — event 57024 (automated instruction received; not owner sign-off)
+
+**57024 is not a consequence of the cgroup kill.** It is a `claude_hook StopFailure`
+for session `f769eed8…` (this repo's own restored pane) at 04:28:26Z with
+"API Error: Connection lost mid-response", four seconds after the identical failure in
+the mess session (57023, 04:28:22Z). Both panes had been re-created minutes earlier
+(57021 04:24:54Z, 57022 04:28:00Z); journal 06:27:30–06:28:40 local shows no
+firewall/route/DNS change — two independent sessions losing the API within 4 s is an
+egress/upstream blip. Both sessions took their next instruction within 60 s
+(57029/57030 `agent_turn_stopped`).
+
+Accounting defect found and fixed (commit after 611dbc4): the StopFailure door mapped
+every non-limit failure to `agent_process_failed` critical, owner_action_required=1,
+without reading the message. Measured 2026-09-08..22: **63 of 130** such criticals were
+transport aborts (51 "Connection lost mid-response", 8 "Server error mid-response",
+4 "The response stopped arriving"); 50/51 connection-lost sessions emitted their next
+hook record within 30 min (p50 60 s = the harness's own idle notification; 27 were a
+normal `Stop`). Now `_TRANSPORT_ABORT_RE` (core/agent_watch.py, anchored on the
+"API Error:" banner, refusal banner excluded) maps them to `agent_turn_stopped`/info,
+which `native_supervisor.decide()` already reads as "continue". Fails closed. Six
+regression tests; the earlier control test had used that very banner as its "real
+crash" example and now uses a genuine 500.
+
+Reviewed and left alone (expected lifecycle, not defects):
+* 57018–57020 `agent_process_failed … pane vanished` and 57008–57016 `agent_dead` — correct
+  for a server kill; `agent_recovered` (57021/22/25/27/31/32/38) is emitted by discovery on
+  same-conversation return. `resolves` is written by three emitters and read by none: the
+  event table is a log, there is no open-ledger keyed on it, so nothing is "left open".
+* 57028→57031 security-demo-fresh dead/recovered flap = the automated caller's
+  `agent_stop` (`switch-to-latest-conversation-57014`) + resume with another conversation.
+* 57007 `no_server` with `repair=not_attempted`: by design — `tmux_control` never starts a
+  server; a missing server is an owner decision.
+* Still dead, untouched per instruction: capacity-blockchain, diamond-auction,
+  gaika-ru-sonnet-v1 (conversation ids preserved in 57008/57009/57015).
+
+Fix 611dbc4 re-verified: `tests/test_tmux_launch.py` 16/16; scoped `tmux list-sessions`
+round-trip proven live; `tmux_control.health()` on the live server reports
+`fleet_in_daemon_cgroup` for pid 3739055.
+
+## Remaining gates (privileged — not taken)
+
+1. Re-scope live server 3739055 (`busctl … StartTransientUnit … PIDs`) — protects the 6
+   live sessions before any restart.
+2. `systemctl restart ai-runtime.service` — deploys 611dbc4 + the hook fix (the hook
+   itself is read per invocation and is already live for new StopFailures; the daemon
+   side needs the restart).
+3. Push.
