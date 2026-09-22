@@ -1755,3 +1755,66 @@ def test_recovery_lifts_the_dead_pane_suppression_on_its_own(conn, monkeypatch):
     assert clw._dead_pane_awaiting_owner(conn, 57013, PANE) is True
     api.set_lifecycle(PANE, "recovered", project_id="capacity", conn=conn)
     assert clw._dead_pane_awaiting_owner(conn, 57013, PANE) is False
+
+
+# ── a declared park outranks a turn record that knows nothing of it (57311) ──
+
+def test_a_live_declaration_resolves_even_with_recent_turn_records(conn):
+    """Every poke a parked pane answers writes an `agent_turn_stopped` with no armed
+    background task — work parked on a HOST timer arms nothing inside the session. While
+    the declaration was only a fallback for "no turn record at all", that record always
+    won and the declaration was never read."""
+    from core import native_supervisor as ns
+    _register_agent(conn)
+    conn.execute("INSERT INTO event (ts,ts_epoch,source,type,agent_id,severity,payload) "
+                 "VALUES (?,?,?,?,?,?,?)",
+                 ("2026-09-22T15:41:00+00:00", NOW + 10, "claude_hook",
+                  "agent_turn_stopped", PANE, "info", '{"last_assistant_message": "Parked."}'))
+    conn.commit()
+    ns.mark_external_wait(PANE, reason="scheduled_park", by="agent_watch",
+                          ttl_secs=36000, conn=conn, now=NOW)
+    assert clw._armed_external_wait(conn, PANE, NOW + 20) is True
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=57311, target=PANE, project_id="opt", conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert calls == []
+    assert any(x["reason"] == "intentional_external_wait" for x in r["deregistered"])
+
+
+def test_an_expired_declaration_resolves_nothing(conn):
+    """Bounded by construction: past its stated moment the park is simply absent, and a
+    genuinely stalled pane escalates exactly as before."""
+    from core import native_supervisor as ns
+    _register_agent(conn)
+    ns.mark_external_wait(PANE, reason="scheduled_park", by="agent_watch",
+                          ttl_secs=60, conn=conn, now=NOW)
+    assert clw._armed_external_wait(conn, PANE, NOW + 3600) is False
+    calls, emit = _emit_calls()
+    clw.register_delivery(event_id=57312, target=PANE, project_id="opt", conn=conn, now=NOW)
+    clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert calls == ["wake_loop_no_progress"]
+
+
+def test_an_armed_monitor_still_resolves_without_any_declaration(conn):
+    """Control: the original signal is untouched."""
+    _register_agent(conn)
+    conn.execute("INSERT INTO event (ts,ts_epoch,source,type,agent_id,severity,payload) "
+                 "VALUES (?,?,?,?,?,?,?)",
+                 ("2026-09-22T15:41:00+00:00", NOW + 10, "claude_hook",
+                  "agent_turn_stopped", PANE, "info", '{"background_tasks": [{"id": "x"}]}'))
+    conn.commit()
+    assert clw._armed_external_wait(conn, PANE, NOW + 20) is True
+
+
+def test_the_wait_check_runs_on_the_scans_clock_not_the_wall_clock(conn):
+    """`_resolution_reason` asked `_armed_external_wait` about `now_ts()` while the sweep
+    ran at an injected `now`, so a declaration live for the sweep read as expired (and a
+    time-injected sweep could not be tested at all)."""
+    from core import native_supervisor as ns
+    _register_agent(conn)
+    ns.mark_external_wait(PANE, reason="scheduled_park", by="agent_watch",
+                          ttl_secs=36000, conn=conn, now=NOW)
+    assert clw._resolution_reason(conn, event_id=1, target=PANE, delivered_ts=NOW,
+                                  now=NOW + 60) == "intentional_external_wait"
+    assert clw._resolution_reason(conn, event_id=1, target=PANE, delivered_ts=NOW,
+                                  now=NOW + 40000) != "intentional_external_wait"

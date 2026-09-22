@@ -272,13 +272,32 @@ _INTENTIONAL_WAIT_LOOKBACK_SECS = int(
 
 
 def _armed_external_wait(conn, target: str, now: float) -> bool:
-    """Did this agent last stop with a monitor still armed?
+    """Is this agent waiting on something external ON PURPOSE?
 
-    Reads the durable `agent_turn_stopped` record the native Stop hook writes. Absent that
-    record — an older Claude, hooks disabled, a session started before install — this
-    returns False and the watchdog behaves exactly as it did before, which is the required
-    fallback: unproven means NOT resolved, never the reverse.
+    Two independent signals, either of which is sufficient:
+
+      * a LIVE declaration in `native_external_wait` — durable, authored, expiring, and
+        the record `stall_doctor.in_declared_external_wait` and the supervisor's idle
+        sweep already treat as decisive;
+      * the last `agent_turn_stopped` payload still shows an armed monitor
+        (`background_tasks` / `session_crons`).
+
+    The declaration is consulted FIRST and unconditionally. It used to be a fallback for
+    the case where no turn record existed at all, which made it unreachable for the agent
+    that needs it most: every poke a parked pane answers writes a fresh
+    `agent_turn_stopped` whose payload has no background task (work parked on a HOST
+    timer arms nothing inside the session), so the recent record always won and the
+    declaration was never read. Event 57311, `main105-backup-repair:0.0`: parked until a
+    stated time, poked all day, and any wake delivered to it would have escalated.
+
+    Fail-closed either way: unproven is NOT resolved.
     """
+    try:
+        from core import native_supervisor as _ns
+        if _ns.in_external_wait(target, conn=conn, now=now):
+            return True
+    except Exception:  # noqa: BLE001 — unknown never means "resolved"
+        pass
     try:
         row = conn.execute(
             "SELECT payload FROM event WHERE agent_id=? AND type='agent_turn_stopped' "
@@ -287,14 +306,9 @@ def _armed_external_wait(conn, target: str, now: float) -> bool:
     except Exception:  # noqa: BLE001 — a missing column or table never resolves a watch
         return False
     if not row or not row[0]:
-        # No native record yet — an agent that was already parked when hooks were
-        # installed emits nothing until it next moves. A DECLARED wait covers exactly that
-        # gap, and is bounded and audited so it cannot silence anything indefinitely.
-        try:
-            from core import native_supervisor as _ns
-            return _ns.in_external_wait(target, conn=conn, now=now)
-        except Exception:  # noqa: BLE001 — unknown never means "resolved"
-            return False
+        # No native record and no declaration: an older Claude, hooks disabled, or a
+        # session started before install. Unproven is not resolved.
+        return False
     try:
         p = json.loads(row[0])
     except Exception:  # noqa: BLE001
@@ -396,7 +410,8 @@ def _watch_state_cls(conn, target: str) -> str:
 
 
 def _resolution_reason(conn, *, event_id: int, target: str,
-                       agents=None, delivered_ts: Optional[float] = None) -> Optional[str]:
+                       agents=None, delivered_ts: Optional[float] = None,
+                       now: Optional[float] = None) -> Optional[str]:
     """Has the condition THIS watch exists for already resolved? Three independent
     signals, any one of which is sufficient:
 
@@ -442,7 +457,11 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     # A pane that parked with its own monitor armed is waiting, not stalled. Checked with
     # the other silent-resolution signals, so it deregisters the watch without emitting —
     # the owner is not told a second time about a state they already know is intentional.
-    if _armed_external_wait(conn, target, now_ts()):
+    # The SCAN's clock, not the wall clock: an expiring declaration answers "is this
+    # agent waiting on purpose RIGHT NOW", and asking it about a different instant than
+    # the sweep is running at makes the answer meaningless (and a time-injected sweep
+    # untestable).
+    if _armed_external_wait(conn, target, now if now is not None else now_ts()):
         return "intentional_external_wait"
     # The PANE-shaped twin of `runtime_job_awaiting_owner`. The comment at the top of
     # this module states the principle for jobs — "a job parked on an OWNER GATE is
@@ -586,7 +605,7 @@ def deregister_resolved(*, conn=None, now: Optional[float] = None, agents=None) 
         deregistered = []
         for event_id, target, delivered_ts in rows:
             reason = _resolution_reason(conn, event_id=event_id, target=target or "",
-                                        agents=agents, delivered_ts=delivered_ts)
+                                        agents=agents, delivered_ts=delivered_ts, now=now)
             if not reason:
                 continue
             conn.execute(
