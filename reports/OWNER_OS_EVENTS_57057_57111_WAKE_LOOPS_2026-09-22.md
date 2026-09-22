@@ -206,11 +206,44 @@ scan's clock is threaded through `_resolution_reason`. 4 tests (declaration beat
 turn records; expired declaration escalates as before; armed monitor still resolves
 without any declaration; the clock).
 
+## Addendum 3 — the last door, and a method note
+
+`agent_continuation_watchdog` was the fourth automated door onto a pane and read no wait
+record at all, so for the sessions it covers (`CONTINUATION_WATCHDOG_SESSIONS`) it would
+go on delivering "continue with the next safe step" to an agent parked until a stated
+moment. Fix `ba321a6` suppresses ONLY the proactive deliver: typed-but-unsubmitted text
+is still submitted (rescuing a stuck keystroke is the watchdog's whole purpose, and a
+park is no reason to strand an instruction someone already composed), the dialog
+fail-closed gate and the unsafe-text blocker are untouched, the lookup is delegated to
+`native_supervisor` and fails open. 4 tests.
+
+The five doors onto a parked pane now agree, and no suppression outlives the stated time:
+
+| Door | Reads the declaration | On a live park |
+|---|---|---|
+| `agent_watch` | writes it | `parked_scheduled`, nothing emitted |
+| `native_supervisor` idle sweep | pre-existing | skip |
+| `stall_doctor` | pre-existing | skip |
+| `closed_loop_wake` SLO watch | `5b493f8` | resolve `intentional_external_wait` |
+| `agent_continuation_watchdog` | `ba321a6` | skip the proactive poke only |
+
+None of them suppresses a crash, a live dialog, an owner gate or unsafe text.
+
+METHOD NOTE. The first run at `ba321a6` reported `1 failed, 3374 passed`:
+`test_every_worker_loop_offloads_its_tick[core.agent_continuation_watchdog-run_loop]`.
+Not a defect — that test `inspect.getsource`s an ALREADY-IMPORTED module, and the commit
+landed while the suite was at ~96%, so the source read by line number no longer matched
+the imported bytecode. `to_thread` is present (lines 1034, 1051); the test passes alone
+and its whole file passes (11). A full-suite result is only valid on a frozen tree, and
+the number below was produced with no edits in flight.
+
 ## Full suite results
 
 * at a5054b3 (adb62a3 + b90bac1): **3404 passed**, 1 warning, 989.72 s.
 * at 0220d4b (+26d2286, +7bb0769): **3409 passed**, 0 failed, 1 warning, 926.11 s.
 * at d9363d1 (+9b115aa scheduled park): **3434 passed**, 0 failed, 1 warning, 756.69 s.
+* at ba321a6 (+5b493f8, +9fcb648, +ba321a6), frozen tree: **3443 passed**, 0 failed,
+  1 warning, 776.63 s.
   `venv/bin/python -m pytest tests -q -x -p no:cacheprovider`, working tree = HEAD.
 
 ## Remaining gates (privileged — not taken)
