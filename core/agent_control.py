@@ -38,6 +38,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
+from core import tmux_launch
+
 # ── bounds ──────────────────────────────────────────────────────────────────
 MAX_CAPTURE_LINES = 2000
 DEFAULT_CAPTURE_LINES = 200
@@ -237,7 +239,11 @@ def _tmux(args: list[str], stdin: Optional[bytes] = None) -> tuple[int, str, str
     binary = _tmux_bin()
     if not binary:
         raise AgentControlError("tmux is not available on this host")
-    proc = subprocess.run([binary, *args], input=stdin, stdout=subprocess.PIPE,
+    # `new-session` may fork the tmux SERVER, and a server forked from inside
+    # ai-runtime.service dies with the service (2026-09-22: needrestart restarted the
+    # daemon and took every pane with it). tmux_launch moves it into its own scope.
+    argv = tmux_launch.wrap_argv([binary, *args])
+    proc = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, timeout=_TMUX_TIMEOUT)
     return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")
 

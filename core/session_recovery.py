@@ -30,6 +30,8 @@ import time
 from datetime import datetime, timezone
 from typing import Optional
 
+from core import tmux_launch
+
 CONFIG_PATH = os.getenv("MANAGED_SESSIONS_CONFIG",
                         "/root/ai-dev-runtime/config/managed_sessions.yaml")
 # A pane whose death was deliberate is never revived. The owner marks it by killing the
@@ -80,7 +82,10 @@ def load_registry(path: Optional[str] = None) -> dict:
 
 def _tmux(args: list) -> tuple:
     try:
-        p = subprocess.run(["tmux"] + args, capture_output=True, text=True, timeout=20)
+        # A server forked by `new-session` must not live in this daemon's cgroup
+        # (see core/tmux_launch.py); every other command passes through unchanged.
+        p = subprocess.run(tmux_launch.wrap_argv(["tmux"] + args),
+                           capture_output=True, text=True, timeout=20)
         return p.returncode, p.stdout, p.stderr
     except Exception as e:  # noqa: BLE001
         return 1, "", str(e)

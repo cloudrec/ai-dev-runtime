@@ -430,6 +430,33 @@ def _emit(st: dict, rep: Optional[dict], emit_fn: Optional[Callable] = None) -> 
     return (r or {}).get("event_id")
 
 
+def server_cgroup_risk(run: Optional[Callable] = None,
+                       unit_of_pid: Optional[Callable] = None,
+                       own_unit: Optional[Callable] = None) -> dict:
+    """Is the live tmux server inside THIS daemon's service cgroup?
+
+    If it is, the next restart of the daemon — a deploy, a crash, needrestart after an
+    unattended upgrade (2026-09-22, 06:20:47: 36 units restarted, every pane gone in
+    the same second) — SIGTERMs the server and the whole managed fleet with it. Read-
+    only: a warning, not a repair, because moving a running server is an owner action.
+    `server_pid` comes from a client round-trip (`#{pid}`), never from a /proc scan.
+    """
+    from core import tmux_launch
+    run = run or _tmux
+    rc, out, _err = run(["display-message", "-p", "#{pid}"])
+    try:
+        pid = int((out or "").strip()) if rc == 0 else None
+    except ValueError:
+        pid = None
+    if not pid:
+        return {"server_pid": None, "server_unit": None, "own_unit": None,
+                "shared_cgroup": False}
+    server_unit = (unit_of_pid or tmux_launch.unit_of_pid)(pid)
+    mine = (own_unit or tmux_launch.own_service_unit)()
+    return {"server_pid": pid, "server_unit": server_unit, "own_unit": mine,
+            "shared_cgroup": bool(server_unit and mine and server_unit == mine)}
+
+
 def health() -> dict:
     """Read-only surface for the API. `status` is GREEN only on a proven round-trip."""
     st = probe()
@@ -444,4 +471,14 @@ def health() -> dict:
         st["warning"] = (
             f"tmux control plane unreachable ({st.get('reason')}) — managed-agent health "
             "is UNKNOWN, not ok. An inventory that could not be read is not an empty one.")
+    else:
+        risk = server_cgroup_risk()
+        st.update(risk)
+        if risk["shared_cgroup"]:
+            st["status"] = "fleet_in_daemon_cgroup"
+            st["warning"] = (
+                f"tmux server pid {risk['server_pid']} runs inside {risk['own_unit']} — "
+                "the next restart of this daemon (deploy, crash, needrestart) SIGTERMs "
+                "the server and every managed agent with it. Move it into its own scope "
+                "before any restart; new servers started by Owner OS no longer land here.")
     return st
