@@ -247,10 +247,22 @@ _UI_LINE_RE = re.compile(
     r"|.*shift\+tab to cycle.*|.*new task\?\s*/clear.*|.*esc to interrupt.*"
     r"|[✻✽✶✳✢✣✤✥✦✧✨*]\s*\S+…\s*$|✻.*|✽.*|·.*"
     # the running-subagent widget rows and their token/duration counters (event 4255's
-    # entire "summary" was three of these)
-    r"|[◯●◉]\s.*|↓?\s*\d+(?:\.\d+)?k\b.*)\s*$", re.IGNORECASE)
+    # entire "summary" was three of these). `◯`/`◉` mark only widget rows; `●` is ALSO
+    # the CLI's marker for the agent's own prose ("● Parked.") — so a `●` row is chrome
+    # only when it carries the widget's counter, or is a tool-call header (`● Bash(…)`,
+    # `● Read(…)`), whose argument text is a command, not a statement. Event 57111
+    # (2026-09-22): stripping every `●` line deleted "● Завершено и верифицировано…" and
+    # "● Припаркован." from a parked agent, leaving the wrapped tail of the supervisor's
+    # own "continue with the next safe step" as the only "meaningful" lines, so the
+    # watcher read a finished, parked agent as `quiescent` and poked it — repeatedly.
+    r"|[◯◉]\s.*|●\s.*(?:·\s*↓|↓\s*\d+(?:\.\d+)?k\b).*|●\s+[A-Za-z][\w-]*\(.*"
+    r"|↓?\s*\d+(?:\.\d+)?k\b.*)\s*$", re.IGNORECASE)
 # NOTE: `❯` lines are chrome (the composer) EXCEPT `❯ 1.` — a selected menu option is
 # part of the question being asked.
+# The composer echo WRAPS: "❯ continue with the next safe" / "  step". The first line is
+# chrome by the rule above; its indented continuation lines are the same typed text and
+# must go with it, or the supervisor's own instruction becomes "agent output".
+_COMPOSER_ECHO_RE = re.compile(r"^\s*❯(?!\s*\d+\.)")
 # Evidence that work is NOT finished, whatever old checkmarks are on screen: running
 # shells, open/in-progress task counts, explicit continuation talk.
 _CONTINUATION_RE = re.compile(
@@ -310,7 +322,13 @@ _MENU_RE = re.compile(
 # metadata while an internal task list sat half-open).
 _FINISH_RE = re.compile(
     r"(finish(?:ed)?\b|complet(?:e|ed)\b|\ball done\b|\bdone[.!]|final report"
-    r"|all (?:checks|tests) pass(?:ed)?|завершен[оа]?|готово)", re.IGNORECASE)
+    r"|all (?:checks|tests) pass(?:ed)?|завершен[оа]?|готово"
+    # An agent that SAYS it is parked has stated its rest — the opposite of stopping
+    # without saying so. Event 57111: "Завершено и верифицировано … Припаркован." until
+    # the next scheduled run, poked as `quiescent` four times in an hour and answering
+    # "Припаркован." each time. A stated park is a finish for this watcher's purposes;
+    # new failure evidence still moves the class, exactly as for any other finish.
+    r"|\bparked\b|припаркован)", re.IGNORECASE)
 # TOOL/HARNESS telemetry wearing finish vocabulary. Event 5051: a live working
 # agent was announced task_completed because its pane showed `Background command
 # "…monitor output" completed (exit code 0)` — a SHELL exiting, not the agent
@@ -329,6 +347,7 @@ def _meaningful_lines(tail: str) -> list:
     """The CURRENT response region: strip tmux/CLI chrome, keep real output lines."""
     out = []
     in_harness = False
+    in_echo = False
     for ln in (tail or "").splitlines():
         s = ln.strip()
         # Harness blocks are dropped in their entirety, including any line between
@@ -341,6 +360,16 @@ def _meaningful_lines(tail: str) -> list:
             if _HARNESS_CLOSE_RE.search(s):
                 in_harness = False
             continue
+        # The typed line and its wrapped continuation are one echo. It ends at the first
+        # blank line or the first unindented line (the agent's `●` reply, a spinner, a
+        # border) — an indented line right after `❯` is the rest of what was typed.
+        if _COMPOSER_ECHO_RE.match(ln):
+            in_echo = True
+            continue
+        if in_echo:
+            if s and ln[:1].isspace():
+                continue
+            in_echo = False
         if not s or _UI_LINE_RE.match(s) or _HARNESS_LINE_RE.search(s):
             continue
         out.append(s)
