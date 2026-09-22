@@ -185,10 +185,32 @@ with nothing to reset. Verified against the live pane: `parked_until_2026-09-23T
 the stronger class; pinned to a fixed clock so they cannot drift). Backup schedule,
 timers and the agent itself untouched.
 
+## Addendum 2 — the declared park was unreachable for the agent that needed it
+
+Found while verifying 57311 end to end. `closed_loop_wake._armed_external_wait` read the
+durable `native_external_wait` declaration only when NO `agent_turn_stopped` record
+existed — a fallback for "hooks not installed yet". But every poke a parked pane answers
+writes a fresh turn record, and work parked on a HOST timer arms nothing inside the
+session, so that record always won and the declaration was never read. `stall_doctor`
+and the supervisor's idle sweep both treat the same record as decisive; only this path
+did not. Any wake delivered to 57311's pane would have escalated to
+`wake_loop_stalled` despite the park.
+
+Second defect in the same function: `_resolution_reason` asked the question about
+`now_ts()` while the sweep ran at an injected `now`, so a declaration live for the sweep
+read as expired — and a time-injected sweep could not be tested at all.
+
+Fix `5b493f8`: the declaration is checked first and unconditionally, the armed-monitor
+payload stays the second signal, an expired declaration still resolves nothing, and the
+scan's clock is threaded through `_resolution_reason`. 4 tests (declaration beats recent
+turn records; expired declaration escalates as before; armed monitor still resolves
+without any declaration; the clock).
+
 ## Full suite results
 
 * at a5054b3 (adb62a3 + b90bac1): **3404 passed**, 1 warning, 989.72 s.
 * at 0220d4b (+26d2286, +7bb0769): **3409 passed**, 0 failed, 1 warning, 926.11 s.
+* at d9363d1 (+9b115aa scheduled park): **3434 passed**, 0 failed, 1 warning, 756.69 s.
   `venv/bin/python -m pytest tests -q -x -p no:cacheprovider`, working tree = HEAD.
 
 ## Remaining gates (privileged — not taken)
