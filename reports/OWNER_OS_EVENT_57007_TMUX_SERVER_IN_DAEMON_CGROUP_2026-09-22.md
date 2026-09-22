@@ -122,6 +122,11 @@ Fix 611dbc4 re-verified: `tests/test_tmux_launch.py` 16/16; scoped `tmux list-se
 round-trip proven live; `tmux_control.health()` on the live server reports
 `fleet_in_daemon_cgroup` for pid 3739055.
 
+## Full suite result
+
+`venv/bin/python -m pytest tests -q -x -p no:cacheprovider` at b377093 (working tree = HEAD):
+**3388 passed, 0 failed, 1 warning in 870.99s (0:14:30)**.
+
 ## Remaining gates (privileged — not taken)
 
 1. Re-scope live server 3739055 (`busctl … StartTransientUnit … PIDs`) — protects the 6
