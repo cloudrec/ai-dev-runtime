@@ -200,6 +200,92 @@ _TRANSPORT_ABORT_RE = re.compile(
     r"|(?:[^\n]{0,120}?)\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|EPIPE"
     r"|socket hang up|fetch failed))", re.IGNORECASE)
 
+# An EXPLICIT SCHEDULED PARK: the agent states it is parked and names the future moment
+# it resumes. Event 57311 (2026-09-22): `main105-backup-repair:0.0` reported the backup
+# repair completed and verified, "Припаркован до 23 Sep 02:00" with a durable host timer
+# doing the actual work — and was poked "continue with the next safe step" and published
+# as `work_stopped_incomplete` THIRTEEN times between 06:02 and 15:41, each reply minting
+# a new digest and so a new event. The native supervisor exempts an intentional wait only
+# from the Stop hook's own `background_tasks`/`session_crons`; work parked on a HOST timer
+# has neither, so nothing in the loop knew the wait was deliberate.
+#
+# Parsed FAIL-CLOSED and narrowly: a park word must be followed, within a short window, by
+# a datetime that resolves to a moment in the FUTURE and no further away than
+# PARK_HORIZON_SECS. A park with no stated time, a time already past, an unparseable date
+# or a date beyond the horizon all yield nothing, and the pane classifies exactly as
+# before. That is what makes this bounded — it cannot silence an agent indefinitely, and
+# the moment the stated time arrives the class changes on its own.
+PARK_HORIZON_SECS = int(os.getenv("AGENT_WATCH_PARK_HORIZON_SECS", str(30 * 86400)))
+
+_PARK_WORD_RE = re.compile(
+    r"(припаркован\w*|парковк\w*|\bparked\b|следующий (?:прогон|запуск)"
+    r"|next (?:scheduled )?(?:run|backup|attempt))", re.IGNORECASE)
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+# "23 Sep 02:00" / "Sep 23 02:00" / "2026-09-23 02:00" (or with a T). Nothing looser: a
+# bare "02:00" names no day, and guessing one is how a park would outlive its window.
+_PARK_WHEN_RE = re.compile(
+    r"(?P<d1>\d{1,2})\s+(?P<m1>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+"
+    r"(?P<h1>\d{1,2}):(?P<min1>\d{2})"
+    r"|(?P<m2>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(?P<d2>\d{1,2})\s+"
+    r"(?P<h2>\d{1,2}):(?P<min2>\d{2})"
+    r"|(?P<y3>\d{4})-(?P<m3>\d{2})-(?P<d3>\d{2})[T ](?P<h3>\d{1,2}):(?P<min3>\d{2})",
+    re.IGNORECASE)
+# How far after a park word the time may sit ("Припаркован до 23 Sep 02:00", "parked;
+# next run Sep 23 02:00"). Long enough for a clause, short enough that an unrelated
+# timestamp elsewhere on screen cannot be adopted as a park deadline.
+_PARK_WINDOW_CHARS = 80
+
+
+def parse_park_until(text: str, now: Optional[float] = None) -> Optional[float]:
+    """Epoch of an explicitly stated FUTURE park deadline, or None.
+
+    Fail-closed in every direction: no park word, no time after it, a time already
+    past, an impossible date or one beyond PARK_HORIZON_SECS all return None.
+    Local time, because that is what the pane prints.
+    """
+    import calendar
+    import datetime as _dt
+    now = now if now is not None else now_ts()
+    body = text or ""
+    for kw in _PARK_WORD_RE.finditer(body):
+        window = body[kw.end():kw.end() + _PARK_WINDOW_CHARS]
+        m = _PARK_WHEN_RE.search(window)
+        if not m:
+            continue
+        g = m.groupdict()
+        try:
+            if g["y3"]:
+                cands = [(int(g["y3"]), int(g["m3"]), int(g["d3"]),
+                          int(g["h3"]), int(g["min3"]))]
+            else:
+                day = int(g["d1"] or g["d2"])
+                mon = _MONTHS[(g["m1"] or g["m2"]).lower()[:3]]
+                hh, mm = int(g["h1"] or g["h2"]), int(g["min1"] or g["min2"])
+                # No year on screen: the year that puts the date in the future wins, and
+                # the horizon below rejects it if neither does.
+                year = _dt.datetime.fromtimestamp(now).year
+                cands = [(year, mon, day, hh, mm), (year + 1, mon, day, hh, mm)]
+            for y, mo, d, hh, mm in cands:
+                try:
+                    when = _dt.datetime(y, mo, d, hh, mm)
+                except ValueError:      # 31 Feb and friends
+                    continue
+                ts = calendar.timegm(when.timetuple()) - _utc_offset_secs(when)
+                if now < ts <= now + PARK_HORIZON_SECS:
+                    return ts
+        except Exception:  # noqa: BLE001 — an unparseable park is simply not a park
+            continue
+    return None
+
+
+def _utc_offset_secs(when) -> int:
+    """Local UTC offset at `when`, so a printed wall-clock time means what it says."""
+    import time as _time
+    return -(_time.altzone if _time.localtime(_time.time()).tm_isdst and _time.daylight
+             else _time.timezone)
+
+
 _BLOCKER_RE = re.compile(
     r"(waiting for (instructions|input|migration|owner|your|approval|confirmation)"
     r"|awaiting (instructions|input|approval|confirmation)"
@@ -436,8 +522,14 @@ def excerpt_of(tail: str, limit: int = 300, cls: str = "") -> str:
     return " ".join(lines[-3:])[-limit:]
 
 
+def _iso_local(ts: float) -> str:
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%dT%H:%M")
+
+
 def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool = True,
-             prev_cls: str = "", quiet_secs: float = 0.0) -> dict:
+             prev_cls: str = "", quiet_secs: float = 0.0,
+             now: Optional[float] = None) -> dict:
     """(inventory state, current bottom region) -> one class.
 
     The structured `agent_list` state is trusted FIRST: an agent the inventory calls
@@ -447,6 +539,7 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
     at-rest states, and completion additionally demands the absence of continuation
     evidence: "4 shells still running" or "1 in progress, 4 open" is not done.
     """
+    _now = now if now is not None else now_ts()
     if not alive or not is_agent:
         return {"cls": "crashed", "reason": "process_gone"}
     st = (state or "").strip()
@@ -479,6 +572,16 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
         # Outranks both the blocker and the finish branches: the owner cannot unblock a
         # provider window, so this must not wake anyone, and it certainly is not a finish.
         return {"cls": "provider_limit", "reason": "provider_usage_window_exhausted"}
+    # Parked BY DESIGN until a stated future moment. Ranked below every branch that
+    # means a human is needed — a crash, a live menu, `waiting_owner`, an exhausted
+    # provider window all still win — and above the blocker/finish/quiescent branches,
+    # which is where an intentional wait was previously misread as a stall. Self-
+    # limiting: once the stated time passes, `parse_park_until` returns None and the
+    # pane classifies exactly as it would have.
+    park_ts = parse_park_until(region, now=_now)
+    if park_ts:
+        return {"cls": "parked_scheduled",
+                "reason": f"parked_until_{_iso_local(park_ts)}", "park_until_ts": park_ts}
     if _BLOCKER_RE.search(region):
         return {"cls": "blocker", "reason": "paused_waiting_text_at_bottom"}
     if prev_cls == "working":
@@ -659,8 +762,26 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                                                 and prev_digest == dg_now) else 0.0
             c = classify(tail, state=a.get("state", ""), alive=bool(a.get("alive")),
                          is_agent=bool(a.get("is_agent")), prev_cls=prev_cls,
-                         quiet_secs=quiet_secs)
+                         quiet_secs=quiet_secs, now=now)
             cls = c["cls"]
+            # A stated park is only half the fix: the pane stops being announced as
+            # stopped (no `_EVENT_FOR` entry, so nothing is emitted), but the native
+            # supervisor's idle sweep would go on typing "continue with the next safe
+            # step" at it, and each reply would mint a new digest. That sweep already
+            # honours one durable record — `native_external_wait` — and it expires, names
+            # its author and suppresses ONLY no-progress continuation, never a crash,
+            # a question or an owner gate. So a parsed park writes exactly that record,
+            # bounded to the stated moment: the poking stops, and at the due time the
+            # declaration lapses and the sweep resumes on its own.
+            if cls == "parked_scheduled" and c.get("park_until_ts"):
+                try:
+                    from core import native_supervisor as _ns
+                    _ns.mark_external_wait(
+                        target, reason="scheduled_park", by="agent_watch",
+                        evidence=c.get("reason", "")[:200],
+                        ttl_secs=int(c["park_until_ts"] - now), conn=conn, now=now)
+                except Exception:  # noqa: BLE001 — a failed declaration never breaks the sweep
+                    pass
             dg = dg_now if cls != "crashed" else "gone"
             # An unchanged digest KEEPS its original first-seen stamp; any change restarts
             # the clock. Overwriting it every sweep (as `ts` is) would make every pane look

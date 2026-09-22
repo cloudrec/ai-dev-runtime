@@ -14,10 +14,17 @@ things in the pane reader combined to produce that loop:
 These pin all three, and the control cases that keep them narrow.
 """
 import sys
+import time
 
 sys.path.insert(0, "/root/ai-dev-runtime")
 
 from core import agent_watch as aw  # noqa: E402
+
+# A fixed clock. MAIN105_PARKED names "23 Sep 02:00", and whether that moment is in the
+# future is the whole question for the scheduled-park class — a wall clock would change
+# the expected verdict overnight.
+BEFORE_DUE = time.mktime(time.strptime("2026-09-22 07:55", "%Y-%m-%d %H:%M"))
+AFTER_DUE = time.mktime(time.strptime("2026-09-23 03:00", "%Y-%m-%d %H:%M"))
 
 # Live pane shape, 2026-09-22 07:55 local (ANSI stripped). Two-space wrapping is the CLI's.
 MAIN105_PARKED = """  Блокеров нет; owner-side пункты
@@ -100,18 +107,26 @@ def test_a_selected_menu_option_is_still_part_of_the_question():
 
 # ── a stated park is a finish ───────────────────────────────────────────────
 
-def test_a_parked_agent_classifies_completed_not_quiescent():
-    r = aw.classify(MAIN105_PARKED, state="idle", prev_cls="working", quiet_secs=400)
-    assert r == {"cls": "completed", "reason": "stated_finish_at_rest"}
+def test_a_parked_agent_is_never_quiescent():
+    """This pane also NAMES its next run, so it is the stronger `parked_scheduled` class
+    (event 57311). Once that moment passes it falls back to the stated finish below."""
+    r = aw.classify(MAIN105_PARKED, state="idle", prev_cls="working", quiet_secs=400,
+                    now=BEFORE_DUE)
+    assert r["cls"] == "parked_scheduled"
+    late = aw.classify(MAIN105_PARKED, state="idle", prev_cls="working", quiet_secs=400,
+                       now=AFTER_DUE)
+    assert late == {"cls": "completed", "reason": "stated_finish_at_rest"}
 
 
-def test_a_repeated_parked_reply_stays_completed():
+def test_a_repeated_parked_reply_never_becomes_a_stop():
     tail = MAIN105_PARKED.replace("──────────────────────────────────\n❯ \n",
                                   "❯ continue with the next safe\n  step\n● Припаркован.\n"
                                   "✻ Churned for 5s · done 7:55 AM\n"
                                   "──────────────────────────────────\n❯ \n", 1)
-    r = aw.classify(tail, state="idle", prev_cls="working", quiet_secs=400)
-    assert r["cls"] == "completed"
+    assert aw.classify(tail, state="idle", prev_cls="working", quiet_secs=400,
+                       now=BEFORE_DUE)["cls"] == "parked_scheduled"
+    assert aw.classify(tail, state="idle", prev_cls="working", quiet_secs=400,
+                       now=AFTER_DUE)["cls"] == "completed"
 
 
 def test_parked_in_english_is_a_finish_too():
