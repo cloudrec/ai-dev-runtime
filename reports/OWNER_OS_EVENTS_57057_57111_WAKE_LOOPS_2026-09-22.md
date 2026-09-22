@@ -150,6 +150,41 @@ Daemon restart (only after the tmux re-scope gate):
   `PATH` without `systemd-run` or reverting the commit restores the plain `tmux` argv.
   No schema or data migration in any of the seven commits; all revert cleanly.
 
+## Addendum — event 57311: the park kept being poked anyway
+
+An automated instruction was received (not owner sign-off). The 57111 loop continued all
+day on the DEPLOYED (pre-fix) code: 13 `work_stopped_incomplete` for
+`main105-backup-repair:0.0` between 06:02 and 15:41Z, the pane reading "Припаркован до
+23 Sep 02:00", the work itself done by a durable host systemd timer.
+
+`adb62a3` alone would have ended the event storm (a stated park classifies `completed`)
+but not the poking: the pokes come from `native_supervisor`'s IDLE SWEEP, which exempts
+an intentional wait only when the Stop hook's payload carries `background_tasks` /
+`session_crons`. Work parked on a HOST timer has neither — the sweep's own comment
+records 117 continuations to this target in one day — and a `completed` pane is still
+idle, so the sweep would keep typing at it.
+
+Fix `9b115aa`, two halves:
+
+* `parse_park_until` — a park word (`припаркован`, `parked`, `следующий прогон`,
+  `next run`…) followed within 80 characters by a datetime ("23 Sep 02:00",
+  "Sep 23 02:00", "2026-09-23 02:00") that resolves to a FUTURE moment inside
+  `PARK_HORIZON_SECS` (30 d). Fail-closed: no time, no day ("parked until 02:00"), a
+  time already past, an impossible date or one past the horizon all parse to nothing.
+  New class `parked_scheduled`, ranked below crash / live menu / `waiting_owner` /
+  provider limit — a real question or failure still wins — with no `_EVENT_FOR` entry,
+  so it is recorded and never announced.
+* The pane also gets the supervisor's OWN durable record, `native_external_wait`,
+  bounded to the stated moment (`by='agent_watch'`, `reason='scheduled_park'`). That is
+  the record the idle sweep and `closed_loop_wake._armed_external_wait` already honour,
+  it expires by itself, and it suppresses only no-progress continuation.
+
+At the due time the parse stops matching and the declaration lapses, so the pane wakes
+with nothing to reset. Verified against the live pane: `parked_until_2026-09-23T02:00`.
+25 new tests plus two earlier fixtures updated (they name a future time, so they are now
+the stronger class; pinned to a fixed clock so they cannot drift). Backup schedule,
+timers and the agent itself untouched.
+
 ## Full suite results
 
 * at a5054b3 (adb62a3 + b90bac1): **3404 passed**, 1 warning, 989.72 s.
