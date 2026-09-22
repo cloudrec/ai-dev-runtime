@@ -150,6 +150,12 @@ Daemon restart (only after the tmux re-scope gate):
   `PATH` without `systemd-run` or reverting the commit restores the plain `tmux` argv.
   No schema or data migration in any of the seven commits; all revert cleanly.
 
+## Full suite results
+
+* at a5054b3 (adb62a3 + b90bac1): **3404 passed**, 1 warning, 989.72 s.
+* at 0220d4b (+26d2286, +7bb0769): **3409 passed**, 0 failed, 1 warning, 926.11 s.
+  `venv/bin/python -m pytest tests -q -x -p no:cacheprovider`, working tree = HEAD.
+
 ## Remaining gates (privileged — not taken)
 
 1. `systemctl restart owner-os-wake-companion.service` — deploys adb62a3, 26d2286,
