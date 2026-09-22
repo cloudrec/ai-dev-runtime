@@ -114,6 +114,17 @@ def _is_context_limit(payload: dict) -> bool:
     return _matches(payload, "_CONTEXT_LIMIT_RE")
 
 
+def _is_transport_abort(payload: dict) -> bool:
+    """Did the turn die on the wire, not in the process?
+
+    Event 57024 was this session: "API Error: Connection lost mid-response", severity
+    `critical`, owner_action_required — while the process was alive at the prompt and
+    took its next instruction 60 s later. Same shape as the provider-limit and context-
+    limit false alarms above, and the same fix: read the message before paging anyone.
+    """
+    return _matches(payload, "_TRANSPORT_ABORT_RE")
+
+
 # Event mapping. LEFT: what Claude Code tells us. RIGHT: the Owner OS class that already
 # has routing, a lane and a rate limit. Nothing invents a new wake class.
 #
@@ -139,6 +150,12 @@ def _map(ev: str, payload: dict):
         # resets on its own.
         if _is_provider_limit(payload) or _is_context_limit(payload):
             return ("agent_externally_blocked", "info", False)
+        if _is_transport_abort(payload):
+            # The wire dropped mid-turn; the process is alive at the prompt with an
+            # unfinished turn. That is a turn boundary — the supervisor's signal to
+            # continue a managed agent — recorded with `hook_event: StopFailure` and the
+            # banner in the payload so the abort stays visible. Not a crash, not a page.
+            return ("agent_turn_stopped", _ROUTINE, False)
         # The turn ended in an error the session could not recover from.
         return ("agent_process_failed", "critical", True)
     if ev == "TaskCompleted":

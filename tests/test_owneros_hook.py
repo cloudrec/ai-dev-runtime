@@ -275,9 +275,15 @@ def test_the_banner_does_not_wake_the_owner():
 
 
 def test_a_real_stop_failure_is_still_a_critical_crash():
-    """The cheap way to end false crash alarms is to stop reporting crashes."""
-    etype, sev, oar = _map("StopFailure", error_details={"code": 500},
-                           last_assistant_message="API Error: Connection lost mid-response.")
+    """The cheap way to end false crash alarms is to stop reporting crashes.
+
+    The example used to be "Connection lost mid-response" — which 2026-09-22 measured
+    as a live process at the prompt 50 times out of 51 (see the transport-abort block
+    below). The control case stands; it just needs a failure that IS one."""
+    etype, sev, oar = _map(
+        "StopFailure", error_details={"code": 500},
+        last_assistant_message='API Error: 500 {"type":"error","error":{"type":"api_error",'
+                               '"message":"Internal server error"}}')
     assert etype == "agent_process_failed" and sev == "critical" and oar is True
 
 
@@ -397,6 +403,84 @@ def test_context_limit_fails_closed_when_the_vocabulary_is_unreachable(monkeypat
     assert h._is_context_limit({"last_assistant_message": CONTEXT_MSG}) is False
     assert h._map("StopFailure",
                   {"last_assistant_message": CONTEXT_MSG})[0] == "agent_process_failed"
+
+
+# ── a turn that died on the wire is not a dead process (2026-09-22) ─────────
+# Event 57024 was the session running this repo: "API Error: Connection lost
+# mid-response", critical, owner_action_required — the process alive at the prompt and
+# taking its next instruction 60 s later. Measured 2026-09-08..22: 63 of 130 hook
+# criticals were transport aborts and 50 of 51 connection-lost sessions emitted their
+# next hook record within 30 min. Same false-critical family as the two above.
+
+TRANSPORT_MSGS = (
+    "API Error: Connection lost mid-response. The response above may be incomplete.",
+    "API Error: Server error mid-response. The response above may be incomplete.",
+    "API Error: The response stopped arriving. The response above may be incomplete.",
+    "API Error: fetch failed",
+    "API Error: request to https://api.anthropic.com/v1/messages failed, reason: ECONNRESET",
+    "API Error: socket hang up",
+)
+
+
+def test_a_transport_abort_is_a_turn_boundary_not_a_page():
+    from hooks import owneros_hook as h
+    for msg in TRANSPORT_MSGS:
+        etype, sev, oar = h._map("StopFailure", {"last_assistant_message": msg})
+        assert (etype, sev, oar) == ("agent_turn_stopped", "info", False), msg
+
+
+def test_a_transport_abort_is_a_turn_boundary_for_the_supervisor():
+    """The whole point of the class: the native supervisor may continue a managed agent
+    whose turn was cut off, instead of the owner being paged for it."""
+    from core import native_supervisor as ns
+    from hooks import owneros_hook as h
+    etype, _sev, _oar = h._map("StopFailure", {"last_assistant_message": TRANSPORT_MSGS[0]})
+    assert ns.decide(etype, {})["action"] == "continue"
+
+
+def test_only_the_harness_banner_counts_as_a_transport_abort():
+    """An agent TALKING about a lost connection has not suffered one, and the refusal
+    banner shares the `API Error:` prefix without being transport."""
+    from hooks import owneros_hook as h
+    for msg in ("I lost the connection to the database, ECONNREFUSED on 5432",
+                "the deploy failed: fetch failed while pulling the image",
+                "API Error: Opus 4.8 can't help with this. Start a new session to continue.",
+                "Your organization has disabled Claude subscription access for Claude Code"):
+        assert h._is_transport_abort({"last_assistant_message": msg}) is False, msg
+        assert h._map("StopFailure", {"last_assistant_message": msg})[1] == "critical", msg
+
+
+def test_transport_abort_is_read_from_every_reason_field():
+    from hooks import owneros_hook as h
+    assert h._is_transport_abort({"message": TRANSPORT_MSGS[0]}) is True
+    assert h._is_transport_abort({"error_details": {"error": TRANSPORT_MSGS[1]}}) is True
+    assert h._map("StopFailure", {"error_details": {"error": TRANSPORT_MSGS[1]}})[0] == \
+        "agent_turn_stopped"
+
+
+def test_transport_abort_stays_distinct_from_the_limit_classes():
+    from core import agent_watch as aw
+    from hooks import owneros_hook as h
+    for msg in TRANSPORT_MSGS:
+        assert not aw._PROVIDER_LIMIT_RE.search(msg) and not aw._CONTEXT_LIMIT_RE.search(msg)
+        assert not aw._CRASH_RE.search(msg)
+    assert h._is_transport_abort({"last_assistant_message": BANNER}) is False
+    assert h._is_transport_abort({"last_assistant_message": CONTEXT_MSG}) is False
+
+
+def test_transport_abort_fails_closed_when_the_vocabulary_is_unreachable(monkeypatch):
+    import builtins
+    from hooks import owneros_hook as h
+    real_import = builtins.__import__
+
+    def boom(name, *a, **kw):
+        if name == "core.agent_watch":
+            raise ImportError("no vocabulary today")
+        return real_import(name, *a, **kw)
+    monkeypatch.setattr(builtins, "__import__", boom)
+    assert h._is_transport_abort({"last_assistant_message": TRANSPORT_MSGS[0]}) is False
+    assert h._map("StopFailure",
+                  {"last_assistant_message": TRANSPORT_MSGS[0]})[0] == "agent_process_failed"
 
 
 # ── the fallback branches that have never fired (2026-09-01) ───────────────

@@ -182,6 +182,24 @@ _CONTEXT_LIMIT_RE = re.compile(
     r"|exceed(?:s|ed)? (?:the )?(?:maximum )?context (?:window|limit|length)"
     r"|context (?:window|length) (?:exceeded|exhausted|full))", re.IGNORECASE)
 
+# A TRANSPORT abort of one turn. Consumed by hooks/owneros_hook.py only: the pane-scrape
+# path never saw these as crashes (`_CRASH_RE` does not match them), but the native
+# `StopFailure` door mapped every one to a critical, owner-actionable `agent_process_failed`.
+# Measured 2026-09-08..22: 63 of 130 such criticals (51 "Connection lost mid-response",
+# 8 "Server error mid-response", 4 "The response stopped arriving"), and 50 of the 51
+# connection-lost sessions emitted their next hook record within 30 min (p50 60 s — the
+# harness's own idle notification). The process is alive and sitting at the prompt with
+# an unfinished turn: that is a turn boundary for the supervisor, not a page for an owner.
+# Anchored on the harness's "API Error:" banner so an agent merely TALKING about a lost
+# connection is not classed as having suffered one; the refusal banner ("can't help with
+# this") shares the prefix and is deliberately not listed here.
+_TRANSPORT_ABORT_RE = re.compile(
+    r"API Error:\s*(?:connection lost mid-response"
+    r"|server error mid-response"
+    r"|the response stopped arriving"
+    r"|(?:[^\n]{0,120}?)\b(?:ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|EPIPE"
+    r"|socket hang up|fetch failed))", re.IGNORECASE)
+
 _BLOCKER_RE = re.compile(
     r"(waiting for (instructions|input|migration|owner|your|approval|confirmation)"
     r"|awaiting (instructions|input|approval|confirmation)"
