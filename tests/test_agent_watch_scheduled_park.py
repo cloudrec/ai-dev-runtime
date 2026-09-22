@@ -165,3 +165,34 @@ def test_no_declaration_without_a_parsed_park(tmp_path, monkeypatch):
     from core import native_supervisor as ns
     conn, _r, _e = _scan_once(tmp_path, monkeypatch, "● Working on the next replica.\n", NOW)
     assert ns.in_external_wait("main105-backup-repair:0.0", conn=conn, now=NOW) is False
+
+
+# ── the whole 57311 chain, end to end ───────────────────────────────────────
+
+def test_every_door_that_poked_57311_now_declines(tmp_path, monkeypatch):
+    """One pane, four doors. Before this, the pane published `work_stopped_incomplete`,
+    the idle sweep typed at it, the stall doctor saw a stall and any delivered wake
+    escalated. All four read the same durable declaration now."""
+    from core import closed_loop_wake as clw
+    from core import native_supervisor as ns
+    from core import stall_doctor as sd
+
+    conn, r, emitted = _scan_once(tmp_path, monkeypatch, PARKED_PANE, NOW)
+    target = "main105-backup-repair:0.0"
+
+    # 1. the watcher: recorded, never announced
+    assert emitted == []
+    assert conn.execute("SELECT cls FROM agent_watch_state WHERE target=?",
+                        (target,)).fetchone()[0] == "parked_scheduled"
+    # 2. the supervisor's idle sweep
+    assert ns.in_external_wait(target, conn=conn, now=NOW) is True
+    # 3. the stall doctor
+    assert sd.in_declared_external_wait(target, conn=conn) is True
+    # 4. the SLO watchdog
+    assert clw._armed_external_wait(conn, target, NOW) is True
+
+    # and at the stated time every one of them returns to normal, with nothing to reset
+    assert ns.in_external_wait(target, conn=conn, now=DUE + 1) is False
+    assert clw._armed_external_wait(conn, target, DUE + 1) is False
+    assert aw.classify(PARKED_PANE, state="idle", prev_cls="working", quiet_secs=400,
+                       now=DUE + 1)["cls"] != "parked_scheduled"
