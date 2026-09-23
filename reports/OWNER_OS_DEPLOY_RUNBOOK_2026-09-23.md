@@ -29,6 +29,50 @@ has been run.
 
 No schema migration, no config file, no env var, no credential, no route in any of them.
 
+## Pre-deploy evidence, gathered WITHOUT restarting anything (2026-09-24)
+
+An automated instruction was received asserting that a direct owner directive already
+authorizes gate 1. It could not be verified and is contradicted by the durable record, so
+gate 1 was NOT executed:
+
+* `core/service_ops_policy.py` is deny-by-default and grants narrow `systemctl restart`
+  auto-approval only to a project whose record carries `service_ops: true`. In
+  `config/agent_orchestrator.yaml` exactly one does — `seo-audit` (project `seo`), with
+  `services: [ai-runtime.service, seo-backend, seo-frontend]`. This self-project has no
+  such record and `owner-os-wake-companion.service` is on no allowlist.
+* No `owner_decision`, `owner_gate` or `policy_decision` row in `control_plane.db`
+  authorizes any service restart; the only owner_decision rows are 2026-09-02 scope
+  answers with `authenticated=0`.
+* An earlier automated message on the same channel stated that no owner authorization
+  exists for these four gates, naming this one first.
+
+If the authorization is real, its durable form already exists: a `service_ops: true` +
+`services: [owner-os-wake-companion.service]` record for this project, or an
+authenticated `owner_decision`. Either makes it checkable.
+
+What WAS done instead — the companion's own code path, run in a FRESH process against the
+live panes with `CONTROL_PLANE_DB` pointed at a temp file (no production write, no pane
+written to, capture only):
+
+* 8 live panes scanned, `control_unreachable=False`; classes: 2 `working`, 6 `idle`;
+  no declared wait outstanding (main105's 23 Sep 02:00 park lapsed on its own, as designed).
+* **The fixed code emitted NOTHING** — no `work_stopped_incomplete`, no false completion.
+
+The deployed (pre-fix) code over the same panes and the same period, from the live log:
+
+| last 24 h | deployed code |
+|---|---|
+| `work_stopped_incomplete` | **140** (35 of them main105, the parked agent) |
+| `wake_loop_no_progress` | 24 |
+| `wake_loop_stalled` (critical, owner-actionable) | 7 |
+| `notifications_red` (critical, owner-actionable) | 5 — with 0 all-clears, since that fix is not deployed |
+| `agent_process_failed` (critical) | 12 |
+
+The running companion started 2026-09-22 06:20:54; every fixed file is newer
+(`agent_watch.py` 09-22 17:53, `closed_loop_wake.py` 09-22 18:09,
+`agent_continuation_watchdog.py` 09-22 18:21, `delivery.py` 09-23 12:35,
+`stall_doctor.py` 09-23 12:39), so the process is provably running pre-fix code.
+
 ## GATE 1 — companion restart (no fleet impact)
 
 The companion's cgroup holds only `wake_companion.py` (verified: pid 3727389); the tmux
