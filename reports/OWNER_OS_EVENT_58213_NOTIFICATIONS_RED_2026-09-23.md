@@ -85,6 +85,25 @@ tier, `same_chat_wake` does not exist on this platform, and the three fixes abov
 LOCAL — the daemon still runs the pre-fix code. Nothing here is proven live until the
 companion/daemon gates below are cleared by the owner.
 
+## A fifth defect, surfaced by the date rollover
+
+The frozen-tree suite then failed one test — `test_every_door_that_poked_57311_now_declines`,
+green on 22 Sep, red on 23 Sep. Not flake: `stall_doctor.in_declared_external_wait` took
+no clock and always asked the WALL clock, so it alone among the five doors could not be
+asked about a specific moment. The chain test pins a park deadline of 23 Sep 02:00; once
+that moment passed in real time, three doors answered about the fixture's clock and this
+one about today's. Same class as the `closed_loop_wake._resolution_reason` defect fixed in
+`5b493f8`. Fix `11f4a20`: the wrapper takes `now` and passes it through; production calls
+it with nothing and behaves exactly as before. The rollover also demonstrated live that a
+scheduled park is self-limiting — the deadline lapsed and the suppression ended by itself.
+
+## Verification
+
+`venv/bin/python -m pytest tests -q -x -p no:cacheprovider` at `11f4a20`, frozen tree,
+no edits in flight: **3452 passed**, 0 failed, 1 warning, 618.92 s.
+Live posture read read-only after the fixes: `status=green`, `owner_push` healthy,
+receipt `telegram:2519`.
+
 ## Remaining gates (privileged — not taken)
 
 1. `systemctl restart owner-os-wake-companion.service`
