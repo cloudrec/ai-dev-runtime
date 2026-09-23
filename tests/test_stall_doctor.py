@@ -710,3 +710,21 @@ def test_other_shapes_keep_per_digest_alerting(conn):
     # different owner-power wait on the same pane must not be swallowed by an earlier one.
     d3 = sd.decide(sd.OWNER_DECISION_WAIT, pending="", age_secs=sd.WAIT_SLO_SECS + 1)
     assert d3["action"] == "escalate"
+
+
+def test_the_declared_wait_wrapper_answers_about_the_callers_clock(tmp_path, monkeypatch):
+    """Every other door accepts an injected clock; this wrapper always asked the wall
+    clock, so it alone could not be asked about a specific moment — the asymmetry that
+    made `closed_loop_wake._resolution_reason` read a live declaration as expired."""
+    import sqlite3
+    from core import native_supervisor as ns
+    from core import stall_doctor as sd
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    conn = sqlite3.connect(str(tmp_path / "cp.db"))
+    now = 1_700_000_000.0
+    ns.mark_external_wait("x:0.0", reason="scheduled_park", ttl_secs=3600,
+                          conn=conn, now=now)
+    assert sd.in_declared_external_wait("x:0.0", conn=conn, now=now + 60) is True
+    assert sd.in_declared_external_wait("x:0.0", conn=conn, now=now + 7200) is False
+    # no clock given: the wall clock, exactly as production calls it
+    assert sd.in_declared_external_wait("x:0.0", conn=conn) is False

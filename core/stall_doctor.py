@@ -347,7 +347,7 @@ def resume_target(target: str, conn=None) -> bool:
             conn.close()
 
 
-def in_declared_external_wait(target: str, *, conn=None) -> bool:
+def in_declared_external_wait(target: str, *, conn=None, now: Optional[float] = None) -> bool:
     """Is this target under a LIVE external-wait declaration?
 
     Delegates to `native_supervisor`, deliberately rather than re-reading the table, so the
@@ -362,7 +362,11 @@ def in_declared_external_wait(target: str, *, conn=None) -> bool:
     """
     try:
         from core import native_supervisor as _ns
-        return bool(_ns.in_external_wait(target, conn=conn))
+        # `now` is the CALLER's clock. Without it this wrapper always asked the wall
+        # clock, so it alone among the doors could not be asked about a specific moment —
+        # the same asymmetry that made `closed_loop_wake._resolution_reason` read a live
+        # declaration as expired. Production passes nothing and behaves exactly as before.
+        return bool(_ns.in_external_wait(target, conn=conn, now=now))
     except Exception:  # noqa: BLE001 — unknown never means "suppress"
         return False
 

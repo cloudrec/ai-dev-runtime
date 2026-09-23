@@ -187,12 +187,13 @@ def test_every_door_that_poked_57311_now_declines(tmp_path, monkeypatch):
     # 2. the supervisor's idle sweep
     assert ns.in_external_wait(target, conn=conn, now=NOW) is True
     # 3. the stall doctor
-    assert sd.in_declared_external_wait(target, conn=conn) is True
+    assert sd.in_declared_external_wait(target, conn=conn, now=NOW) is True
     # 4. the SLO watchdog
     assert clw._armed_external_wait(conn, target, NOW) is True
 
     # and at the stated time every one of them returns to normal, with nothing to reset
     assert ns.in_external_wait(target, conn=conn, now=DUE + 1) is False
+    assert sd.in_declared_external_wait(target, conn=conn, now=DUE + 1) is False
     assert clw._armed_external_wait(conn, target, DUE + 1) is False
     assert aw.classify(PARKED_PANE, state="idle", prev_cls="working", quiet_secs=400,
                        now=DUE + 1)["cls"] != "parked_scheduled"
