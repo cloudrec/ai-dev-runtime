@@ -551,3 +551,19 @@ def test_repeats_inside_one_outage_still_collapse_to_one_alarm():
         delivery.refresh_channel_health()
     reds = [e for e in cto.cto_brief_since("t")["events"] if e["type"] == "notifications_red"]
     assert len(reds) == 1
+
+
+def test_the_recovery_helpers_fail_closed_on_an_unreadable_log(monkeypatch):
+    """An unreadable event log must not invent an all-clear, and must not suppress an
+    alarm by pretending the outage is old."""
+    import sqlite3
+
+    class _Boom:
+        def execute(self, *a, **k):
+            raise sqlite3.OperationalError("no such table: event")
+
+        def close(self):
+            pass
+    monkeypatch.setattr(api, "_c", lambda conn=None: (_Boom(), False))
+    assert delivery._open_red_event_id() is None      # no recovery invented
+    assert delivery._red_episode() == 0               # alarm still keyed, never dropped

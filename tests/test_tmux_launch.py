@@ -170,3 +170,12 @@ def test_unreachable_health_does_not_ask_the_server_for_its_pid(monkeypatch):
                                               "split_brain": False, "reason": "no_server"})
     monkeypatch.setattr(tc, "_tmux", lambda a: pytest.fail("round-trip attempted"))
     assert tc.health()["status"] == "unreachable"
+
+
+def test_unit_of_pid_reads_a_foreign_process_and_never_guesses():
+    """Used by `tmux_control.server_cgroup_risk` on the SERVER's pid, so it must read
+    another process's cgroup — and answer None rather than guess when it cannot."""
+    import os
+    assert tl.unit_of_pid(os.getpid()) == tl.own_service_unit()
+    assert tl.unit_of_pid(1) is None            # pid 1 is not in a .service
+    assert tl.unit_of_pid(999999) is None       # no such process
