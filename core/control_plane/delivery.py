@@ -158,8 +158,19 @@ def detect_capabilities(conn=None) -> dict:
         "state": tg_state,
         "configured": bool(tg and tg["enabled"]),
         "proven_this_runtime": bool((tg or {}).get("proven_this_runtime")),
-        "proven_at": (tg or {}).get("last_ok_at"),
-        "evidence": (tg or {}).get("last_proof"),
+        # EVIDENCE FOR THE CURRENT STATE, not for a state that has since ended. These two
+        # used to carry `last_ok_at` / `last_proof` unconditionally, so event 58213 — a
+        # transient "Remote end closed connection without response" — was published as
+        # `state: unhealthy` alongside `proven_at: 10:28:36` and `evidence: telegram:2517`,
+        # a timestamp and a receipt from a send that SUCCEEDED. A reader (or an automated
+        # consumer) sees proof standing next to a failure and cannot tell which send the
+        # evidence belongs to. The history is still reported, under names that say it is
+        # history.
+        "proven_at": (tg or {}).get("last_ok_at") if tg_state == "healthy" else None,
+        "evidence": (tg or {}).get("last_proof") if tg_state == "healthy" else None,
+        "last_success_at": (tg or {}).get("last_ok_at"),
+        "last_success_proof": (tg or {}).get("last_proof"),
+        "last_error": (tg or {}).get("last_error") if tg_state != "healthy" else "",
         "detail": _owner_push_detail(tg, tg_state),
     }
     # 3) scheduled ChatGPT hourly automation
@@ -245,13 +256,80 @@ def refresh_channel_health(conn=None) -> dict:
     api.upsert_channel("same_chat_wake", enabled=sc, kind="inbound_trigger", healthy=sc,
                        last_error="" if sc else "no inbound trigger configured", conn=conn)
     status = notifications_status(conn=conn)
+    from core.control_plane.cto import emit
     if status["status"] == "red":
-        # never silent: a red delivery posture is a durable owner-visible blocker
-        from core.control_plane.cto import emit
+        # never silent: a red delivery posture is a durable owner-visible blocker.
+        #
+        # Keyed per OUTAGE, not per type. With a fixed `notifications_red` key the hourly
+        # dedup could not tell one outage from the next: red -> green -> red inside the
+        # hour emitted nothing the second time, so once the all-clear below marked the
+        # first alarm resolved, a LIVE red posture had no open alarm at all. The episode
+        # counter advances only when a recovery is recorded, so repeats inside one outage
+        # still collapse to one alarm an hour, and a genuinely new outage is a new alarm.
         emit("delivery", "notifications_red", severity="critical", owner_action_required=True,
-             payload=status, dedup_key="notifications_red", dedup_window_secs=3600,
+             payload=status, dedup_key=f"notifications_red:{_red_episode(conn)}",
+             dedup_window_secs=3600,
              push=False, conn=conn)          # inbox-only: pushing a down-channel alert would recurse
+    else:
+        _emit_recovery(status, emit_fn=emit, conn=conn)
     return status
+
+
+def _red_episode(conn=None) -> int:
+    """How many outages have already ended. Identifies the CURRENT one."""
+    conn, own = api._c(conn)
+    try:
+        return int(conn.execute(
+            "SELECT count(*) FROM event WHERE type='notifications_recovered'").fetchone()[0])
+    except Exception:  # noqa: BLE001 — an unreadable log must not suppress an alarm
+        return 0
+    finally:
+        if own:
+            conn.close()
+
+
+def _open_red_event_id(conn=None) -> Optional[int]:
+    """The id of the newest `notifications_red` that no recovery has answered yet."""
+    conn, own = api._c(conn)
+    try:
+        row = conn.execute(
+            "SELECT id FROM event WHERE type='notifications_red' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        answered = conn.execute(
+            "SELECT 1 FROM event WHERE type='notifications_recovered' AND resolves=? LIMIT 1",
+            (int(row[0]),)).fetchone()
+        return None if answered else int(row[0])
+    except Exception:  # noqa: BLE001 — an unreadable log never invents a recovery
+        return None
+    finally:
+        if own:
+            conn.close()
+
+
+def _emit_recovery(status: dict, *, emit_fn, conn=None) -> Optional[int]:
+    """Record the all-clear for a red posture that has since cleared.
+
+    A red raises a CRITICAL, owner-action-required blocker; nothing ever recorded that
+    it ended. 936 of them stand open in this log, including 58213 — a Telegram blip at
+    10:29:08 whose channel was proven healthy again at 10:31:50, three minutes later, by
+    the ordinary next send. The owner's queue kept the alarm and never got the all-clear.
+
+    Same doctrine as `agent_control_plane_recovered`: info, never owner-actionable, never
+    pushed (the outage already had its say), carrying `resolves` so the alarm and its end
+    are one story. Emitted once per red — `_open_red_event_id` returns None as soon as a
+    recovery answers it, so a green that simply stays green is silent.
+    """
+    red_id = _open_red_event_id(conn)
+    if not red_id:
+        return None
+    r = emit_fn("delivery", "notifications_recovered", severity="info",
+                owner_action_required=False, payload=status,
+                action_taken=f"delivery posture back to {status.get('status')}",
+                resolves=red_id, dedup_key=f"notifications_recovered:{red_id}",
+                push=False, conn=conn)
+    return (r or {}).get("event_id")
 
 
 def _send_owner_push(message: str) -> tuple:

@@ -127,6 +127,10 @@ ROUTINE_EVENT_TYPES = frozenset({
     # the control plane came back (self-healed by the guard). Durable, never a wake:
     # the outage already woke the owner, and the recovery is the good news.
     "agent_control_plane_recovered",
+    # the delivery posture came back (the next real send proved it). Durable, never a
+    # wake, for the same reason: the red already woke the owner and the recovery is the
+    # good news — and it travels to a channel that was, by definition, just down.
+    "notifications_recovered",
     # Native Claude Code lifecycle records (2026-08-30). The `Stop` hook fires at the END
     # OF EVERY TURN, not when an agent finally goes idle, so these are structure for the
     # supervisor to read — never a doorbell. Routing them here means `is_significant`

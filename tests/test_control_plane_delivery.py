@@ -446,3 +446,108 @@ def test_a_missing_delivery_table_is_not_a_proactive_channel():
     caps = delivery.detect_capabilities()
     assert caps["cdp_same_chat"]["available"] is False
     assert delivery.notifications_status()["status"] == "red"
+
+
+# ── a red that clears must say so (event 58213) ─────────────────────────────
+# 58213: Telegram returned "Remote end closed connection without response" at 10:29:08,
+# the channel was proven healthy again at 10:31:50 by the ordinary next send, and the
+# owner's queue kept a CRITICAL owner-action-required blocker for a condition that had
+# ended three minutes earlier. 936 such reds stand open in the live log and not one
+# recovery event exists. Same doctrine as `agent_control_plane_recovered`.
+
+def _tg_env(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
+
+
+def _go_green(monkeypatch):
+    """A proven send is the only thing that makes owner_push green."""
+    _tg_env(monkeypatch)
+    api.upsert_channel("owner_push", enabled=True, kind="telegram", state="healthy",
+                       proof="telegram:1")
+    return delivery.refresh_channel_health()
+
+
+def test_a_cleared_red_emits_a_recovery_that_resolves_it(monkeypatch):
+    red = delivery.refresh_channel_health()
+    assert red["status"] == "red"
+    red_ev = [e for e in cto.cto_brief_since("t")["events"] if e["type"] == "notifications_red"]
+    assert red_ev
+    st = _go_green(monkeypatch)
+    assert st["status"] != "red"
+    rec = [e for e in cto.cto_brief_since("t")["events"]
+           if e["type"] == "notifications_recovered"]
+    assert len(rec) == 1
+    assert rec[0]["severity"] == "info" and not rec[0]["owner_action_required"]
+    assert rec[0]["resolves"] == red_ev[-1]["event_id"]
+
+
+def test_a_recovery_is_emitted_once_not_every_green_tick(monkeypatch):
+    delivery.refresh_channel_health()
+    _go_green(monkeypatch)
+    for _ in range(3):
+        delivery.refresh_channel_health()
+    rec = [e for e in cto.cto_brief_since("t")["events"]
+           if e["type"] == "notifications_recovered"]
+    assert len(rec) == 1
+
+
+def test_green_from_the_start_says_nothing(monkeypatch):
+    """No alarm, no all-clear: a recovery answers a red, it does not announce health."""
+    _go_green(monkeypatch)
+    assert not [e for e in cto.cto_brief_since("t")["events"]
+                if e["type"] == "notifications_recovered"]
+
+
+def test_a_second_outage_inside_the_dedup_hour_is_its_own_alarm(monkeypatch):
+    """With one fixed dedup key, red -> green -> red inside the hour emitted no second
+    alarm, so after the all-clear a LIVE red had nothing open against it."""
+    delivery.refresh_channel_health()
+    _go_green(monkeypatch)
+    api.upsert_channel("owner_push", enabled=True, kind="telegram", state="unhealthy",
+                       last_error="telegram send failed: Remote end closed connection")
+    assert delivery.refresh_channel_health()["status"] == "red"
+    _go_green(monkeypatch)
+    rec = [e for e in cto.cto_brief_since("t")["events"]
+           if e["type"] == "notifications_recovered"]
+    assert len(rec) == 2 and rec[0]["resolves"] != rec[1]["resolves"]
+
+
+def test_the_recovery_never_wakes_anyone():
+    from core import wake_bridge as wb
+    assert "notifications_recovered" in wb.ROUTINE_EVENT_TYPES
+
+
+# ── evidence belongs to the state it proves ─────────────────────────────────
+
+def test_an_unhealthy_channel_reports_no_proof_for_its_failure(monkeypatch):
+    _tg_env(monkeypatch)
+    api.upsert_channel("owner_push", enabled=True, kind="telegram", state="healthy",
+                       proof="telegram:2517")
+    api.upsert_channel("owner_push", enabled=True, kind="telegram", state="unhealthy",
+                       last_error="telegram send failed: Remote end closed connection "
+                                  "without response")
+    op = delivery.detect_capabilities()["owner_push"]
+    assert op["state"] == "unhealthy"
+    assert op["proven_at"] is None and op["evidence"] is None
+    # the history is still reported — under names that say it is history
+    assert op["last_success_proof"] == "telegram:2517" and op["last_success_at"]
+    assert "Remote end closed connection" in op["last_error"]
+
+
+def test_a_healthy_channel_still_carries_its_receipt(monkeypatch):
+    _tg_env(monkeypatch)
+    api.upsert_channel("owner_push", enabled=True, kind="telegram", state="healthy",
+                       proof="telegram:2518")
+    op = delivery.detect_capabilities()["owner_push"]
+    assert op["evidence"] == "telegram:2518" and op["proven_at"]
+    assert op["last_error"] == ""
+
+
+def test_repeats_inside_one_outage_still_collapse_to_one_alarm():
+    """The episode key must not become a per-tick alarm: while the same outage lasts the
+    hourly dedup is exactly as before."""
+    for _ in range(4):
+        delivery.refresh_channel_health()
+    reds = [e for e in cto.cto_brief_since("t")["events"] if e["type"] == "notifications_red"]
+    assert len(reds) == 1
