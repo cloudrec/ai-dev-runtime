@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Callable, Dict, List, Optional
@@ -83,6 +84,12 @@ class AuditRecord:
 Runner = Callable[[List[str]], str]
 
 
+# Shared with the buffer transport in `core.agent_control`: a submit keystroke must land
+# OUTSIDE the agent's paste-detection window, or it is read as part of the pasted/typed
+# block instead of as a submit.
+SUBMIT_SETTLE_SECS = float(os.getenv("AGENT_SEND_SUBMIT_SETTLE_SECS", "0.25"))
+
+
 class DirectPaneController:
     """Server-side direct control of a single explicitly targeted pane."""
 
@@ -90,9 +97,12 @@ class DirectPaneController:
         self,
         runner: Runner,
         audit_sink: Optional[Callable[[AuditRecord], None]] = None,
+        sleep: Optional[Callable[[float], None]] = None,
     ) -> None:
         self._runner = runner
         self._audit_sink = audit_sink or (lambda rec: None)
+        # Injected so the settle below is testable without a real wait.
+        self._sleep = sleep or time.sleep
         # idempotency ledger: op-key -> outcome
         self._done: Dict[str, str] = {}
 
@@ -262,6 +272,12 @@ class DirectPaneController:
         self._run(["tmux", "send-keys", "-t", snap.target_spec, "C-u"])
         self._run(["tmux", "send-keys", "-t", snap.target_spec, "-l", new_text])
         if submit:
+            # The same failure the buffer path had (2026-09-24): `-l` delivers the whole
+            # text in one burst, and a submit keystroke arriving inside the agent's
+            # paste-detection window is absorbed into that burst as a newline instead of
+            # submitting — leaving the text visible in the composer while every return
+            # code says success. Let the typing settle first.
+            self._sleep(SUBMIT_SETTLE_SECS)
             self._run(["tmux", "send-keys", "-t", snap.target_spec, "C-m"])
         self._done[op_key] = "replaced"
         return self._emit(

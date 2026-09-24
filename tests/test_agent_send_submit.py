@@ -169,3 +169,39 @@ def test_the_first_line_is_what_the_composer_can_show():
     assert ac._first_line("line one\nline two") == "line one"
     assert ac._first_line("  spaced   out  \nmore") == "spaced out"
     assert ac._first_line("") == ""
+
+
+# ── the same defect in the literal-typing path ─────────────────────────────
+
+def test_direct_pane_replace_lets_its_typing_settle_before_submitting():
+    """`send-keys -l` delivers the whole text in one burst exactly as a paste does, so a
+    submit keystroke sent immediately after is absorbed the same way. No production
+    caller passes submit=True today; the primitive must still be correct."""
+    from core import direct_pane_control as dpc
+    from tests.test_direct_pane_control import STALE_LINE, FakeTmux, _pane
+
+    fake = FakeTmux({"seo-audit:0.0": _pane(STALE_LINE)})
+    slept = []
+    ctrl = dpc.DirectPaneController(fake, sleep=slept.append)
+    ctrl.replace_pending("seo-audit:0.0", STALE_LINE, "new text", "test", submit=True)
+    keys = [k for _spec, k in fake.sent]
+    assert keys[-1] == ["C-m"], keys
+    assert slept == [dpc.SUBMIT_SETTLE_SECS], "no settle between the typing and the submit"
+
+
+def test_direct_pane_staging_without_submit_never_waits_or_presses_enter():
+    """The one shape with a production caller: stage text, never submit it."""
+    from core import direct_pane_control as dpc
+    from tests.test_direct_pane_control import STALE_LINE, FakeTmux, _pane
+
+    fake = FakeTmux({"seo-audit:0.0": _pane(STALE_LINE)})
+    slept = []
+    ctrl = dpc.DirectPaneController(fake, sleep=slept.append)
+    ctrl.replace_pending("seo-audit:0.0", STALE_LINE, "new text", "test", submit=False)
+    assert slept == []
+    assert all("C-m" not in k for _s, k in fake.sent)
+
+
+def test_both_transports_read_the_same_settle_setting():
+    from core import direct_pane_control as dpc
+    assert dpc.SUBMIT_SETTLE_SECS == ac._SUBMIT_SETTLE_SECS
