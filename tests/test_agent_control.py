@@ -285,6 +285,9 @@ def test_send_proves_delivery_with_pane_diff(monkeypatch):
     # before/after sequence this test asserts on.
     monkeypatch.setattr(ac, "_pane_tail", lambda *a, **k: "idle")
     monkeypatch.setattr(ac, "_pane_pending_input", lambda *a, **k: "")
+    # Same reason: the post-submit consumption check reads the composer, and that read
+    # would otherwise consume one of the two canned captures this test asserts on.
+    monkeypatch.setattr(ac, "pending_input_text", lambda *a, **k: "")
     monkeypatch.setattr(ac, "find_claude_in_pane", lambda pid: {"pid": 2001, "cmdline": "claude", "cwd": "/opt/safeguard"})
     result = ac.agent_send("safeguard", "my message")
     assert result["pane_changed"] is True

@@ -1801,6 +1801,44 @@ def _tag_if_automated(text: str, actor: Optional[str]) -> str:
     return text
 
 
+_WS_RE = re.compile(r"\s+")
+
+# How long the paste is given to land before the submit keystroke. Must sit OUTSIDE the
+# agent's paste-detection window or the Enter is swallowed as part of the pasted block
+# (measured 2026-09-24: the old gap was ~18 ms). Tunable for a slow or loaded host.
+_SUBMIT_SETTLE_SECS = float(os.getenv("AGENT_SEND_SUBMIT_SETTLE_SECS", "0.25"))
+
+
+def _first_line(text: str) -> str:
+    return _WS_RE.sub(" ", (text or "").strip().splitlines()[0] if (text or "").strip()
+                      else "").strip()
+
+
+def _prompt_consumed(target: str, text: str, cwd: str = "") -> bool:
+    """Is our message GONE from the agent's input box?
+
+    The composer shows a multi-line message as its first line at `❯` with the rest
+    wrapped below, so the first line is what `pending_input_text` can report and what we
+    compare. An empty box, or a box holding something that is not our message, both mean
+    ours was submitted (or replaced by someone else — either way it is not pending).
+
+    Fail-closed toward REPORTING SUCCESS only on evidence: if the pane cannot be read,
+    `pending_input_text` returns '' and we treat that as consumed exactly as every other
+    reader here does — the retry above has already run by then.
+    """
+    try:
+        pending = pending_input_text(target, cwd=cwd)
+    except Exception:  # noqa: BLE001 — an unreadable pane is not proof of failure
+        return True
+    ours = _first_line(text)
+    if not ours:
+        return True
+    pending = _WS_RE.sub(" ", (pending or "").strip())
+    if not pending:
+        return True
+    return not (pending.startswith(ours[:60]) or ours.startswith(pending[:60]))
+
+
 def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str],
              actor: Optional[str] = None, source: Optional[str] = None) -> dict:
     """Serialise deliveries, then deliver. See `_DELIVER_LOCK`.
@@ -1845,15 +1883,42 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     if rc != 0:
         raise AgentControlError(f"failed to stage message: {err.strip()[:200]}")
     try:
-        rc, _, err = _tmux(["paste-buffer", "-b", buffer_name, "-t", resolved, "-d"])
+        # `-r` — DO NOT let tmux rewrite the payload. Without it `paste-buffer`
+        # replaces every LF with CR, so a multi-line message arrives at the agent as a
+        # BURST OF ENTERS rather than as one message. Proven at the byte level
+        # 2026-09-24 against a reader pane: `line one\nline two\nline three` was
+        # delivered as `b'line one\rline two\rline three'` and, with `-r`, as the
+        # newlines that were actually written.
+        rc, _, err = _tmux(["paste-buffer", "-b", buffer_name, "-t", resolved, "-d", "-r"])
         if rc != 0:
             raise AgentControlError(f"failed to paste message: {err.strip()[:200]}")
+        # Let the paste SETTLE before the submit keystroke. Claude Code's input layer
+        # detects a paste by how fast the bytes arrive and inserts what it sees as part
+        # of that burst; the submit Enter used to follow the paste by ~18 ms (measured),
+        # well inside that window, so it was absorbed as one more newline in the
+        # composer and nothing was submitted — while tmux's return code was 0 and this
+        # function reported `delivered/submitted: true`. That is the security-demo /
+        # hostsecure symptom: the whole message visible at the prompt, agent still
+        # waiting_input, no turn started, and a fresh session behaving identically
+        # because the fault is in the transport, not the session.
+        time.sleep(_SUBMIT_SETTLE_SECS)
         # Submit. Enter is sent as a key name, never as part of the payload.
         rc_enter, _, enter_err = _tmux(["send-keys", "-t", resolved, "Enter"])
     finally:
         _tmux(["delete-buffer", "-b", buffer_name])
 
     time.sleep(0.4)
+    # PROOF, not a return code. `rc_enter == 0` says the keystroke reached tmux, never
+    # that the agent read it; believing it is what let a silent non-submission be
+    # reported as success. If our text is still sitting in the composer, press Enter
+    # once more (a bare Enter can never duplicate the message) and re-check.
+    consumed = _prompt_consumed(resolved, text, cwd=pane.get("claude_cwd") or "")
+    submit_retried = False
+    if rc_enter == 0 and not consumed:
+        submit_retried = True
+        rc_enter, _, enter_err = _tmux(["send-keys", "-t", resolved, "Enter"])
+        time.sleep(_SUBMIT_SETTLE_SECS + 0.4)
+        consumed = _prompt_consumed(resolved, text, cwd=pane.get("claude_cwd") or "")
     rc_after, after, _ = _tmux(["capture-pane", "-p", "-t", resolved, "-S", "-5"])
     pane_changed = (rc_before == 0 and rc_after == 0 and before != after)
     # A wider capture than the diff window: the queue hint renders below the input
@@ -1865,9 +1930,12 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
         "action": action,
         "idempotency_key": key,
         # Enter returning 0 means the keystroke reached tmux, NOT that Claude read
-        # the message. If the pane says the message is queued, it is queued.
-        "delivered": rc_enter == 0 and not queued,
-        "submitted": rc_enter == 0 and not queued,
+        # the message. If the pane says the message is queued, it is queued, and if our
+        # text is still in the composer it was never submitted whatever tmux returned.
+        "delivered": rc_enter == 0 and not queued and consumed,
+        "submitted": rc_enter == 0 and not queued and consumed,
+        "prompt_consumed": consumed,
+        "submit_retried": submit_retried,
         "queued": queued,
         "queued_reason": ("message accepted into Claude's queue behind the active "
                           "turn; it will not execute until that turn ends") if queued else "",
@@ -1880,6 +1948,10 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     }
     if rc_enter != 0:
         result["error"] = enter_err.strip()[:200]
+    elif not consumed and not queued:
+        result["reason"] = ("the message is still in the agent's input box after two "
+                            "Enter keystrokes — it was delivered to the pane but NOT "
+                            "submitted, so no turn will start")
     _record_delivery(key, resolved, action, result, actor=actor, source=source,
                      text_sha256=text_fingerprint(text))
     audit(action, resolved, key, delivered=result["delivered"], pane_changed=pane_changed,
