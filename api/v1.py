@@ -501,6 +501,26 @@ async def agents_direct_lifecycle_metrics(_: bool = Depends(_auth)):
     return {"enabled": _dal.ENABLED, "metrics": _dal.metrics()}
 
 
+@router.get("/agents/event-supervisor/status")
+async def agents_event_supervisor_status(target: str = "", limit: int = 100,
+                                         _: bool = Depends(_auth)):
+    """Agent event supervisor ledger: per agent target, project, state, last event,
+    last check / progress, last verified result + evidence, next action, owner-gate
+    reason, continuation count/window, pause, and the wake requested for the last event
+    (requested action + evidence). Read-only."""
+    from core import agent_event_supervisor as _aes
+    return _aes.status(target or None, limit=max(1, min(int(limit), 500)))
+
+
+@router.get("/agents/event-supervisor/history")
+async def agents_event_supervisor_history(target: str, limit: int = 50,
+                                          _: bool = Depends(_auth)):
+    """State transitions for one agent target, newest first. Read-only."""
+    from core import agent_event_supervisor as _aes
+    return {"target": target, "transitions": _aes.history(target,
+                                                          limit=max(1, min(int(limit), 500)))}
+
+
 @router.get("/agents/continuation-watchdog/health")
 async def agents_continuation_watchdog_health(_: bool = Depends(_auth)):
     """Continuation-watchdog health + last action (last run, agents checked,
