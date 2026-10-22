@@ -100,9 +100,12 @@ action + evidence per wake), `aes_continuation` (exactly-once latch), `aes_trans
 | `AGENT_EVENT_SUPERVISOR_EMIT` | `1` | emit owner-needed events |
 | `AGENT_EVENT_SUPERVISOR_MAX_EVENT_AGE_SECS` | `3600` | older events are history, not acted on |
 | `AGENT_EVENT_SUPERVISOR_SWEEP_LEASE_SECS` | `300` | cross-worker sweep lease TTL |
+| `AGENT_EVENT_SUPERVISOR_TARGETS` | _(empty)_ | canary scope: comma list of sessions / `session:w.p`; set → events outside it are ledgered `ignored_out_of_scope` (no wake/verify/owner-needed) and only these are eligible (replaces the watchdog allowlist) |
 
 Only sessions in the continuation-watchdog allowlist (orchestrator `mode: auto` sessions +
-`CONTINUATION_WATCHDOG_SESSIONS`) are ever continued; all others go OWNER_NEEDED.
+`CONTINUATION_WATCHDOG_SESSIONS`) are ever continued; all others go OWNER_NEEDED. When
+`AGENT_EVENT_SUPERVISOR_TARGETS` is set, it is the whole universe instead: nothing outside it
+is touched at all, and only its members are eligible.
 
 ## Deployment / enable — requires separate owner approval
 
@@ -120,11 +123,11 @@ These steps change the live service and are NOT performed by the implementing ta
 3. **Restart, still disabled** (picks up new code; supervisor tick is a no-op):
    `systemctl restart ai-runtime.service`; verify
    `GET /api/v1/agents/event-supervisor/status` → `{"enabled": false, ...}`.
-4. **Canary enable** — add to `configs/.env`, scoped to a single canary session through the
-   watchdog allowlist (`CONTINUATION_WATCHDOG_SESSIONS=<canary>` if the canary is not already
-   `mode: auto`), then:
+4. **Canary enable** — scoped to ONE disposable session (do NOT widen the watchdog allowlist,
+   which already continues live sessions):
    ```
    AGENT_EVENT_SUPERVISOR_ENABLED=1
+   AGENT_EVENT_SUPERVISOR_TARGETS=<canary-session>
    AGENT_EVENT_SUPERVISOR_MAX_CONTINUATIONS=1
    ```
    restart; first tick initialises the cursor to the current bus head (no history replay).

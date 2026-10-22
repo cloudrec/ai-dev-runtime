@@ -107,6 +107,20 @@ def enabled() -> bool:
     return os.getenv("AGENT_EVENT_SUPERVISOR_ENABLED", "0") not in ("0", "", "false", "no")
 
 
+def scope() -> set:
+    """Explicit owner scope (`AGENT_EVENT_SUPERVISOR_TARGETS`, comma list of tmux sessions
+    or `session:w.p` targets), read per call. Empty = whole fleet (watchdog allowlist decides
+    continuation). Set = canary: events outside it are ledgered and ignored — no wake, no
+    verify, no owner-needed — and only targets inside it are eligible to be continued."""
+    raw = os.getenv("AGENT_EVENT_SUPERVISOR_TARGETS", "")
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def in_scope(target: str) -> bool:
+    sc = scope()
+    return not sc or target in sc or target.split(":")[0] in sc
+
+
 # ── states / event kinds ─────────────────────────────────────────────────────
 WORKING, VERIFYING, DONE, CONTINUE = "WORKING", "VERIFYING", "DONE", "CONTINUE"
 OWNER_NEEDED, FAILED, PAUSED = "OWNER_NEEDED", "FAILED", "PAUSED"
@@ -603,9 +617,13 @@ class Ports:
             return {}
 
     def eligible(self, session: str) -> bool:
+        if not session:
+            return False
+        if scope():
+            return in_scope(session)     # explicit owner canary scope replaces the allowlist
         from core import agent_continuation_watchdog as cw
         from core import agent_orchestrator as orch
-        return bool(session) and session in cw.eligible_sessions(orch.load_config)
+        return session in cw.eligible_sessions(orch.load_config)
 
     def foreign_send_since(self, target: str, *, event_ts: float, guard_since: float) -> bool:
         """Did anyone else type into this pane since the event (the woken assistant via
@@ -731,6 +749,10 @@ def _handle_event(ports, conn, ev: dict, now: float, summary: dict) -> None:
         return
     if not target or target.startswith(_PANELESS_PREFIXES):
         _record_event(conn, key, ev, kind, "ignored_no_pane_target", episode_ts=None, now=now)
+        return
+    if not in_scope(target):
+        _record_event(conn, key, ev, kind, "ignored_out_of_scope", episode_ts=None, now=now)
+        summary["out_of_scope"] += 1
         return
     if ev.get("ts") and now - ev["ts"] > MAX_EVENT_AGE_SECS:
         # A backlog (supervisor was disabled, or down) is history, not a live request: the
@@ -1041,7 +1063,7 @@ def run_once(ports=None, *, now: Optional[float] = None, conn=None) -> dict:
     now = now if now is not None else now_ts()
     summary = {"enabled": enabled(), "accepted": 0, "deduped": 0, "paused_skipped": 0,
                "stale": 0, "wakes": 0, "verified": 0, "continued": 0, "owner_needed": 0,
-               "stalled": 0, "errors": 0}
+               "stalled": 0, "errors": 0, "out_of_scope": 0}
     if not summary["enabled"]:
         return summary
     from core.control_plane import api as cp
@@ -1066,6 +1088,8 @@ def run_once(ports=None, *, now: Optional[float] = None, conn=None) -> dict:
             for target, in conn.execute("SELECT target FROM aes_agent WHERE paused=0 AND "
                                         "state IN (?,?,?)",
                                         (VERIFYING, WORKING, CONTINUE)).fetchall():
+                if not in_scope(target):
+                    continue                 # scope narrowed since: leave the row untouched
                 row = _get_agent(conn, target)
                 try:
                     if row["state"] == VERIFYING:

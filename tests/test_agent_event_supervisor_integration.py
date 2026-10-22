@@ -53,6 +53,9 @@ def _iso(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_REPLAY", "0")
     monkeypatch.setattr(aes, "VERIFY_SETTLE_SECS", 0)
     monkeypatch.setattr(aes, "WAKE_CONFIRM_TIMEOUT_SECS", 3600)
+    # the bridge paces actionable wakes per route; a skipped event is re-decided later by
+    # the bridge itself (supervisor reads that as "pending"). Off here: two events, two wakes.
+    monkeypatch.setattr(wb, "ACTIONABLE_COOLDOWN_SECS", 0)
     wb.bind_chat("https://chatgpt.com/c/integration-test-chat")
     yield
 

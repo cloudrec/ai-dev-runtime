@@ -775,3 +775,50 @@ def test_sweep_write_of_a_stale_row_cannot_unpause():
     conn.commit()
     conn.close()
     assert state()["state"] == "PAUSED" and state()["paused"] == 1
+
+
+# ── canary scope (AGENT_EVENT_SUPERVISOR_TARGETS) ───────────────────────────
+def test_scope_ignores_out_of_scope_events_entirely(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_TARGETS", "canary")
+    p = FakePorts()
+    p.events = [ev(1, "work_stopped_incomplete"),
+                ev(2, "agent_waiting_input", payload="charge the card")]
+    out = drive(p, 1001, 1100, 1200)
+    assert p.wakes == [] and p.sends == [] and p.owner_emits == []
+    assert aes.status()["agents"] == []
+    assert aes.run_once(p, now=1300)["out_of_scope"] == 0      # ledgered once, not re-read
+    assert out is not None
+
+
+def test_scope_admits_in_scope_target(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_TARGETS", "canary,other:1.0")
+    assert aes.in_scope("canary:0.0") and aes.in_scope("other:1.0")
+    assert not aes.in_scope("other:0.0") and not aes.in_scope(T)
+    monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_TARGETS", "proj")
+    p = FakePorts()
+    p.events = [ev(1, "work_stopped_incomplete")]
+    drive(p, 1001, 1070, 1140)
+    assert p.wakes == [1] and len(p.sends) == 1
+
+
+def test_scope_replaces_watchdog_allowlist_for_eligibility(monkeypatch):
+    monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_TARGETS", "canary")
+    ports = aes.Ports()
+    assert ports.eligible("canary") is True
+    assert ports.eligible("owner-os-opus-windows") is False    # never falls back to allowlist
+    assert ports.eligible("") is False
+
+
+def test_scope_narrowed_later_leaves_existing_rows_untouched(monkeypatch):
+    p = FakePorts()
+    p.events = [ev(1, "work_stopped_incomplete")]
+    aes.run_once(p, now=1001)
+    assert state()["state"] == "VERIFYING"
+    monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_TARGETS", "canary")
+    drive(p, 1070, 1140, 1600)
+    assert p.sends == [] and state()["state"] == "VERIFYING"
+
+
+def test_unset_scope_keeps_fleet_behaviour(monkeypatch):
+    monkeypatch.delenv("AGENT_EVENT_SUPERVISOR_TARGETS", raising=False)
+    assert aes.scope() == set() and aes.in_scope("anything:0.0")
