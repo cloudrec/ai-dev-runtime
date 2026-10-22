@@ -158,6 +158,20 @@ async def _start_continuation_watchdog():
 
 
 @app.on_event("startup")
+async def _start_agent_event_supervisor():
+    # Event-driven lifecycle supervisor: agent events -> wake bridge -> verify from fresh
+    # pane/transcript/git evidence -> DONE / one same-session CONTINUE / OWNER_NEEDED /
+    # FAILED, with sticky owner PAUSE. Every tick is a no-op until
+    # AGENT_EVENT_SUPERVISOR_ENABLED=1 (read per tick, so no restart is needed to flip it).
+    import asyncio
+    try:
+        from core.agent_event_supervisor import run_loop as _aes_loop
+        asyncio.create_task(_aes_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"agent event supervisor not started: {e}")
+
+
+@app.on_event("startup")
 async def _start_wake_pipeline_watch():
     # Says out loud when the wake pipeline stops moving: a wake decided and never
     # delivered, or a companion process that died (its claim silence is the only
