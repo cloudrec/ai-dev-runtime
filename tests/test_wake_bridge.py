@@ -1237,3 +1237,49 @@ def test_every_submitted_wake_ends_somewhere():
     finally:
         c.close()
     assert stranded == [], f"submitted wakes with no terminal verdict: {stranded}"
+
+
+# ── temporary canary delivery filter (WAKE_BRIDGE_ONLY_AGENTS) ──────────────
+def _agent_wake(event_id, agent_id, now, event_type="work_stopped_incomplete"):
+    # actionable, as the real backlog is: generic wakes on one route are coalesced to the
+    # newest by design, which would hide what this filter does
+    d = wb.should_wake(event_id=event_id, severity="critical", agent_id=agent_id,
+                       event_type=event_type, now=now)
+    wb.record(d, event_id=event_id, severity="critical", agent_id=agent_id,
+              event_type=event_type, now=now)
+    assert d["wake"], d
+    return d
+
+
+def _backlog():
+    _agent_wake(701, "payorch-ha-fresh:0.0", 1000.0)
+    _agent_wake(702, "", 2000.0)                          # agentless (e.g. notifications_red)
+    _agent_wake(703, "aes-canary:0.0", 3000.0)
+
+
+def test_only_agents_offers_only_the_canary_and_leaves_backlog_untouched(monkeypatch):
+    _backlog()
+    monkeypatch.setenv("WAKE_BRIDGE_ONLY_AGENTS", "aes-canary")
+    p = wb.pending_wake(now=3001.0)
+    assert p["pending"] is True and p["event_id"] == 703 and p["agent_id"] == "aes-canary:0.0"
+    wb.acknowledge(703)
+    assert wb.pending_wake(now=3002.0)["pending"] is False   # nothing else is ever offered
+    monkeypatch.delenv("WAKE_BRIDGE_ONLY_AGENTS")
+    assert wb.pending_wake(now=3003.0)["event_id"] == 701    # passed over, never consumed
+
+
+def test_only_agents_unset_is_normal_oldest_first(monkeypatch):
+    monkeypatch.delenv("WAKE_BRIDGE_ONLY_AGENTS", raising=False)
+    _backlog()
+    assert wb.only_agents() == set()
+    assert wb.pending_wake(now=3001.0)["event_id"] == 701
+
+
+def test_only_agents_matching_is_exact_session_not_prefix(monkeypatch):
+    monkeypatch.setenv("WAKE_BRIDGE_ONLY_AGENTS", "aes-canary")
+    only = wb.only_agents()
+    assert wb._offer_allowed("aes-canary:0.0", only)
+    assert wb._offer_allowed("aes-canary", only)
+    assert not wb._offer_allowed("aes-canary-2:0.0", only)
+    assert not wb._offer_allowed("", only)
+    assert not wb._offer_allowed("payorch-ha-fresh:0.0", only)

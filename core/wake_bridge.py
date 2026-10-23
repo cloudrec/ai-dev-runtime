@@ -68,6 +68,23 @@ TRANSIENT_FAILURE_PREFIXES = ("composer_ambiguous_or_absent",)
 # line before giving up for this tick. Bounded so a large backlog of benched events
 # can never turn selection into an unbounded per-tick scan.
 _CANDIDATE_SCAN_LIMIT = 200
+
+
+def only_agents() -> set:
+    """TEMPORARY canary delivery filter (`WAKE_BRIDGE_ONLY_AGENTS`, comma list of tmux
+    sessions or `session:w.p` targets). Empty = normal delivery. Set = `pending_wake` offers
+    ONLY wakes whose agent is listed; every other wake is passed over, not consumed — its
+    rows stay exactly as they are, so removing the variable restores normal selection (and
+    `expire_stale` still retires anything that aged out meanwhile). Read per call."""
+    raw = os.getenv("WAKE_BRIDGE_ONLY_AGENTS", "")
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def _offer_allowed(agent_id: str, only: set) -> bool:
+    if not only:
+        return True
+    a = (agent_id or "").strip()
+    return bool(a) and (a in only or a.split(":", 1)[0] in only)
 # A decided-but-undelivered wake older than this is stale: "this agent is waiting NOW"
 # stops being true after hours of silence, and "read Owner OS" stops being useful once
 # the backlog it points at is ancient history. The 2026-08-15 incident this guards:
@@ -1763,8 +1780,11 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
             "LIMIT ?", (_CANDIDATE_SCAN_LIMIT,)).fetchall()
         r = None
         benched = None  # (event_id, retry_at, attempt, transient) for the head of line
+        only = only_agents()
         for cand in candidates:
             eid = int(cand[0])
+            if not _offer_allowed(cand[4], only):
+                continue                      # canary filter: passed over, never consumed
             last = conn.execute(
                 "SELECT ts, delivered FROM wake_delivery WHERE event_id=? "
                 "ORDER BY id DESC LIMIT 1", (eid,)).fetchone()
