@@ -143,6 +143,20 @@ async def _start_control_plane():
 
 
 @app.on_event("startup")
+async def _start_native_owner_os():
+    # Native Claude Code controller: `claude agents --json` state, explicit /goal policy
+    # reconcile, CTO reasoning events -> decision ledger -> outbox. Never sends routine
+    # "continue" (that lives inside Claude via /goal). Gated by NATIVE_OWNER_OS_ENABLED
+    # (default 0) — disabled, it returns immediately.
+    import asyncio
+    try:
+        from core.native_owner_os import run_loop as _native_loop
+        asyncio.create_task(_native_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"native owner os controller not started: {e}")
+
+
+@app.on_event("startup")
 async def _start_continuation_watchdog():
     # Server-side direct-agent continuation watchdog: submits a documented SAFE next
     # step for an approved idle agent and PROVES the submission (submitted + pane
