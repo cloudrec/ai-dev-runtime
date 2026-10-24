@@ -51,6 +51,9 @@ def _iso(tmp_path, monkeypatch):
     monkeypatch.setenv("WAKE_BRIDGE_KILL_SWITCH", "0")
     monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_ENABLED", "1")
     monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_REPLAY", "0")
+    # these tests cover the wake-gated path (the rollback mode); the direct path has its
+    # own suite in test_agent_event_supervisor_direct.py
+    monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_CONTINUE_PATH", "wake_gated")
     monkeypatch.setattr(aes, "VERIFY_SETTLE_SECS", 0)
     monkeypatch.setattr(aes, "WAKE_CONFIRM_TIMEOUT_SECS", 3600)
     # the bridge paces actionable wakes per route; a skipped event is re-decided later by

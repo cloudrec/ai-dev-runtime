@@ -91,6 +91,9 @@ def _iso(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
     monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_ENABLED", "1")
     monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_REPLAY", "1")
+    # these tests cover the wake-gated path (the rollback mode); the direct path has its
+    # own suite in test_agent_event_supervisor_direct.py
+    monkeypatch.setenv("AGENT_EVENT_SUPERVISOR_CONTINUE_PATH", "wake_gated")
     for name, val in (("VERIFY_SETTLE_SECS", 60), ("WAKE_CONFIRM_TIMEOUT_SECS", 600),
                       ("WAKE_COOLDOWN_SECS", 300), ("CONTINUE_COOLDOWN_SECS", 300),
                       ("MAX_CONTINUATIONS", 2), ("CONTINUATION_WINDOW_SECS", 3600),

@@ -59,6 +59,10 @@ Guarantees (each one a failure this codebase already produced somewhere else):
   * The woken assistant is asked to REVIEW continuable episodes (`aes_wake.requested_action`
     on the status API); the supervisor alone performs the one continuation. A wake that was
     never sent (bridge off, cooldown-suppressed) does not block the supervisor.
+  * Continuation path (`AGENT_EVENT_SUPERVISOR_CONTINUE_PATH`). `direct` (default): CONTINUE
+    never goes through the wake bridge / ChatGPT / browser — no wake is requested and wake
+    delivery state is not consulted; the continuation is delivered server-side into the pane.
+    OWNER_NEEDED stays notification-only. `wake_gated` restores the wake-first behaviour.
 
 The decision core (`activity`, `owner_gate_reason`, `decide`) is pure. All side effects go
 through an injected `ports` object (`Ports` is the live implementation), so the whole state
@@ -114,6 +118,17 @@ def scope() -> set:
     verify, no owner-needed — and only targets inside it are eligible to be continued."""
     raw = os.getenv("AGENT_EVENT_SUPERVISOR_TARGETS", "")
     return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def direct_mode() -> bool:
+    """Continuation path. `direct` (default): the ChatGPT/assistant wake is NOT in the
+    CONTINUE path — no wake is requested and its delivery state does not gate verification;
+    the one continuation goes straight into the pane via the watchdog's `deliver_and_verify`
+    (agent_control.agent_send). `wake_gated`: the previous behaviour, where every wake of the
+    episode must resolve first and an ambiguous wake fails closed. Any other value is read
+    as `wake_gated` (the stricter path). Read at call time: a flip needs no restart."""
+    v = os.getenv("AGENT_EVENT_SUPERVISOR_CONTINUE_PATH", "direct").strip().lower()
+    return v in ("", "direct")
 
 
 def in_scope(target: str) -> bool:
@@ -807,7 +822,12 @@ def _handle_event(ports, conn, ev: dict, now: float, summary: dict) -> None:
 
 def _request_wake(ports, conn, row: dict, ev: dict, kind: str, now: float,
                   summary: dict) -> None:
-    if row.get("last_wake_ts") and now - row["last_wake_ts"] < WAKE_COOLDOWN_SECS:
+    if direct_mode():
+        # Direct path: the supervisor needs nothing from the assistant to continue, so it asks
+        # for no wake. OWNER_NEEDED still notifies through `emit_owner_needed` (cto.emit →
+        # bridge). The row keeps the episode's requested action auditable on the status API.
+        decision = {"decision": "not_requested", "reason": "direct_continuation_path"}
+    elif row.get("last_wake_ts") and now - row["last_wake_ts"] < WAKE_COOLDOWN_SECS:
         decision = {"decision": "suppressed", "reason": "supervisor_wake_cooldown"}
     else:
         try:
@@ -826,7 +846,8 @@ def _request_wake(ports, conn, row: dict, ev: dict, kind: str, now: float,
                  (row["last_event_key"], ev["id"], row["target"], row.get("project"), ev["type"],
                   REQUESTED_ACTION[kind], _j(evidence), decision["decision"],
                   decision.get("reason", ""), now, now_iso()))
-    row.update(next_action="await_wake_then_verify")
+    row.update(next_action="verify_then_continue_direct" if direct_mode()
+               else "await_wake_then_verify")
     _put_agent(conn, row, prev_state=row["state"], now=now)
     conn.commit()
 
@@ -902,6 +923,13 @@ def _apply(ports, conn, row: dict, verdict: dict, now: float, summary: dict) -> 
 def _verify(ports, conn, row: dict, now: float, summary: dict) -> None:
     if now - (row.get("episode_start_ts") or now) < VERIFY_SETTLE_SECS:
         return
+    if direct_mode():
+        # The wake is not in the continuation path: no wake state can hold up or unlock a
+        # continuation. Someone acting on a wake anyway (the assistant typing into the pane)
+        # still shows up as a foreign send / advanced transcript in `_judge`, re-checked
+        # under the lease right before the send.
+        _judge_and_act(ports, conn, row, now, summary, "not_in_path")
+        return
     wake = _episode_wake(ports, conn, row, now)
     if wake != row.get("wake_status"):
         row.update(wake_status=wake, wake_resolved_ts=now)
@@ -916,6 +944,10 @@ def _verify(ports, conn, row: dict, now: float, summary: dict) -> None:
     # from when delivery was first observed, so the supervisor judges its outcome, not races it.
     if wake == "delivered" and now - (row.get("wake_resolved_ts") or now) < VERIFY_SETTLE_SECS:
         return
+    _judge_and_act(ports, conn, row, now, summary, wake)
+
+
+def _judge_and_act(ports, conn, row: dict, now: float, summary: dict, wake: str) -> None:
     verdict, snap = _judge(ports, conn, row, now)
     verdict["evidence"]["wake_status"] = wake
     row.update(last_check_at=now_iso(), last_check_ts=now,

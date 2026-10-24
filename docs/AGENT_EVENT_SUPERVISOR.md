@@ -17,6 +17,9 @@ agent event (control-plane `event` table)
    ▼
 VERIFYING  (episode opened; later events fold in, strongest kind wins)
    │  identity pinned: pane, tmux session, cwd, conversation id, transcript mtime
+   │  CONTINUE_PATH=direct (default): no wake requested, wake state NOT consulted —
+   │     skip straight to verify after the settle window (ChatGPT/browser off the path)
+   │  CONTINUE_PATH=wake_gated (rollback mode), as below:
    │  wake: bridge decision reused (cto.emit already decided it) — never a 2nd wake
    │  wake state aggregated over EVERY episode event from wake_audit/submitted/delivery:
    │     delivered (verified delivery row only) → settle window → verify
@@ -100,6 +103,7 @@ action + evidence per wake), `aes_continuation` (exactly-once latch), `aes_trans
 | `AGENT_EVENT_SUPERVISOR_EMIT` | `1` | emit owner-needed events |
 | `AGENT_EVENT_SUPERVISOR_MAX_EVENT_AGE_SECS` | `3600` | older events are history, not acted on |
 | `AGENT_EVENT_SUPERVISOR_SWEEP_LEASE_SECS` | `300` | cross-worker sweep lease TTL |
+| `AGENT_EVENT_SUPERVISOR_CONTINUE_PATH` | `direct` | `direct`: CONTINUE is delivered server-side (`deliver_and_verify` → `agent_control.agent_send`), no wake requested, wake delivery never gates it; OWNER_NEEDED still notifies via `cto.emit`. `wake_gated` (or any unknown value): every episode wake must resolve first, ambiguous → OWNER_NEEDED |
 | `AGENT_EVENT_SUPERVISOR_TARGETS` | _(empty)_ | canary scope: comma list of sessions / `session:w.p`; set → events outside it are ledgered `ignored_out_of_scope` (no wake/verify/owner-needed) and only these are eligible (replaces the watchdog allowlist) |
 
 Only sessions in the continuation-watchdog allowlist (orchestrator `mode: auto` sessions +
@@ -133,7 +137,7 @@ These steps change the live service and are NOT performed by the implementing ta
    restart; first tick initialises the cursor to the current bus head (no history replay).
 5. **Live verification** (required before claiming live): produce one
    `work_stopped_incomplete` on the canary; confirm on the status API the sequence
-   VERIFYING → (wake delivered) → WORKING with `last_verified_result=continuation_verified`
+   VERIFYING → (settle window; `wake.decision=not_requested` on the direct path) → WORKING with `last_verified_result=continuation_verified`
    and exactly one `aes_continuation` row; confirm a gated agent shows OWNER_NEEDED with no
    continuation row; `python tools/agent_event_supervisor.py history <target>`.
 6. **Rollback**: set `AGENT_EVENT_SUPERVISOR_ENABLED=0` (takes effect next tick, no restart);
