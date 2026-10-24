@@ -15,6 +15,7 @@ Wires the native primitives into the runtime. Each tick:
      controller Claude session (SendMessage); `off` delivers nothing.
 
 First start never replays history: with no cursor row the cursor is set to the bus head.
+`NATIVE_OWNER_OS_AGENTS` (canary scope) limits CTO event handling to the named agents.
 The loop never starts, restarts or creates an agent, and never sends routine "continue".
 """
 from __future__ import annotations
@@ -36,8 +37,23 @@ def enabled() -> bool:
     return os.getenv("NATIVE_OWNER_OS_ENABLED", "0").strip().lower() in ("1", "true", "yes")
 
 
+def agent_scope() -> set:
+    """NATIVE_OWNER_OS_AGENTS: comma list of tmux sessions / targets. Set = only events for
+    these agents reach the CTO bridge (others are acked and ignored). Empty = all agents."""
+    raw = os.getenv("NATIVE_OWNER_OS_AGENTS", "")
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def in_scope(agent: str) -> bool:
+    sc = agent_scope()
+    a = (agent or "").strip()
+    return not sc or a in sc or a.split(":", 1)[0] in sc
+
+
 def map_event(e: dict) -> Optional[str]:
     if e.get("source") in _OWN_SOURCES:
+        return None
+    if not in_scope(e.get("agent_id") or ""):
         return None
     if e.get("type") in cb.REASONING_EVENTS:
         return e["type"]

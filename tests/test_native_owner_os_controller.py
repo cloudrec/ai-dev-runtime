@@ -37,6 +37,7 @@ class P(cb.Provider):
 def _iso(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     for k in ("NATIVE_OWNER_OS_ENABLED", "NATIVE_GOALS_ENABLED", "OWNER_OS_CTO_PROVIDER",
+              "NATIVE_OWNER_OS_AGENTS",
               "OWNER_OS_CTO_MODEL", "OPENAI_API_KEY", "OWNER_OS_CTO_DELIVERY_MODE"):
         monkeypatch.delenv(k, raising=False)
     yield
@@ -175,3 +176,24 @@ def test_fallback_delivery_runs_only_in_agent_control_mode(monkeypatch):
     tick(provider=P())
     assert seen == ["native_controller"]              # called, and it no-ops in this mode
     assert cb.delivery_mode() == "native_controller"
+
+
+def test_agent_scope_limits_cto_events_to_named_agents(monkeypatch):
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
+    tick(provider=P())
+    real = emit("repeated_failure", agent="payorch-ha-fresh:1.1")
+    other = emit("agent_waiting_input", owner=True, agent="mess-5a:0.0")
+    mine = emit("repeated_failure", agent="aes-canary:0.0")
+    p = P()
+    out = tick(provider=p)
+    assert out["acked_to"] == mine and p.calls == ["repeated_failure"]
+    assert rows("SELECT event_key FROM cto_decision") == [(f"cp:{mine}",)]
+    assert real < other < mine
+
+
+def test_unset_scope_handles_all_agents():
+    tick(provider=P())
+    emit("repeated_failure", agent="anyone:0.0")
+    p = P()
+    tick(provider=p)
+    assert p.calls == ["repeated_failure"]
