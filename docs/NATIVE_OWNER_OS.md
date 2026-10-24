@@ -50,6 +50,11 @@ matches. Non-zero exit, invalid JSON, wrong shape or oversized output → fallba
   durable latch per (session, condition hash) before the send; replay → no resend; an
   unknown-outcome send is never retried automatically. Only into an `idle` session
   located through native state.
+* No settings change is needed. `idleCompaction` (Claude Code ≥ 2.1.290) is on by default and
+  only compacts an idle session over ~200K tokens before its prompt cache expires; the
+  "turn off with `"idleCompaction": false`" text is a hint on that notice, not a requirement.
+  Compaction keeps the session id and appends to the same transcript, so goal detection and
+  messaging are unaffected either way.
 
 ## Coordination — native messaging
 
