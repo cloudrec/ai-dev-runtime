@@ -5,16 +5,22 @@ shared_core_change, milestone_review, owner_needed. Routine continuation never d
 stays inside Claude via `/goal`, see core/native_goals.py).
 
 Flow, exactly once per event key:
-  1. latch a `cto_decision` row (PK event_key) BEFORE the provider call — a replayed event
-     finds the latch and does nothing (no second model call, no second message);
-  2. call the provider with a compact structured context (project, agent, goal, state,
-     question, git diff summary, recent decisions, affected agents — each bounded);
-  3. record the parsed output in `cto_decision` and in the control-plane `decision` ledger;
-  4. a message for the agent is ENQUEUED in `native_outbox` (PK msg_key) — delivered by the
-     controller Claude session through native cross-session messaging (SendMessage), never
-     through ChatGPT browser automation and never by typing into a pane;
-  5. `owner_needed: true` (or an owner_needed event) emits OWNER_NEEDED and is never
-     auto-approved: the provider's opinion is advice, not owner sign-off.
+  1. latch a `cto_decision` row (PK event_key) holding the compact context BEFORE the
+     provider call — a replayed event finds the latch and does nothing;
+  2. no provider configured (disabled / missing model / missing key) → the row stays
+     `waiting_provider` (durable, not lost) and `retry_waiting()` decides it once the
+     config exists; a provider error is retried up to MAX_ATTEMPTS, then `provider_failed`;
+  3. the provider runs in ONE durable conversation per Owner OS project (`cto_conversation`,
+     OpenAI Conversations API) so the CTO keeps context across events; instructions are
+     sent on every response;
+  4. the parsed output is recorded in `cto_decision` and the control-plane `decision` ledger;
+  5. a message for the agent is ENQUEUED in `native_outbox` (PK msg_key) — delivered by a
+     controller Claude session via SendMessage (default), or, only with
+     OWNER_OS_CTO_DELIVERY_MODE=agent_control, by `deliver_pending_agent_control()`; never
+     through ChatGPT browser automation;
+  6. `owner_needed` (event type, or the provider says so) is never auto-approved and the
+     advice is NOT forwarded to the agent; a provider escalation of a non-owner event emits
+     OWNER_NEEDED once (an owner_needed event already notified the owner itself).
 
 Provider config (no defaults for model or key; nothing hardcoded):
   OWNER_OS_CTO_PROVIDER = "" (disabled, default) | "openai"
@@ -30,7 +36,7 @@ import hashlib
 import json
 import os
 import urllib.request
-from typing import Optional
+from typing import Callable, Optional
 
 from core.control_plane.api import _c
 from core.control_plane.store import now_iso, now_ts
@@ -39,6 +45,8 @@ REASONING_EVENTS = frozenset({"architecture_conflict", "repeated_failure",
                               "shared_core_change", "milestone_review", "owner_needed"})
 HARD_DENY_AGENTS = frozenset({"payorch-ha-fresh"})
 SOURCE = "cto_bridge"
+MAX_ATTEMPTS = 3
+ADVICE_PREFIX = "[Owner OS CTO advice — automated, not owner approval] "
 _LIMITS = {"question": 2000, "goal": 600, "state": 200, "diff_summary": 4000,
            "decision": 300, "max_decisions": 5, "max_affected": 20}
 
@@ -51,7 +59,21 @@ CREATE TABLE IF NOT EXISTS cto_decision (
 CREATE TABLE IF NOT EXISTS native_outbox (
     msg_key TEXT PRIMARY KEY, event_key TEXT, to_agent TEXT, message TEXT,
     state TEXT DEFAULT 'pending', created_at TEXT, sent_at TEXT, receipt TEXT);
+CREATE TABLE IF NOT EXISTS cto_conversation (
+    project TEXT, provider TEXT, conversation_id TEXT, created_at TEXT,
+    PRIMARY KEY (project, provider));
 """
+# additive columns on cto_decision (older DBs get them on first use)
+_COLUMNS = {"context": "TEXT", "attempts": "INTEGER DEFAULT 0",
+            "owner_emitted": "INTEGER DEFAULT 0", "conversation_id": "TEXT"}
+
+
+def _schema(conn) -> None:
+    conn.executescript(_SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(cto_decision)")}
+    for col, decl in _COLUMNS.items():
+        if col not in have:
+            conn.execute(f"ALTER TABLE cto_decision ADD COLUMN {col} {decl}")
 
 
 class ProviderError(Exception):
@@ -62,20 +84,29 @@ class Provider:
     name = "none"
     model = ""
 
-    def decide(self, context: dict) -> dict:  # pragma: no cover — interface
-        raise NotImplementedError
+    def decide(self, context: dict, conversation_id: Optional[str] = None) -> dict:
+        raise NotImplementedError  # pragma: no cover — interface
+
+    def create_conversation(self, project: str) -> Optional[str]:
+        return None                  # providers without persistent threads stay stateless
 
 
 class OpenAIResponsesProvider(Provider):
-    """OpenAI Responses API (POST {base}/responses). Asks for one JSON object back."""
+    """OpenAI Responses API + Conversations API.
+
+    `create_conversation` → POST {base}/conversations, returns the conversation id;
+    `decide` → POST {base}/responses with `conversation` set, so every event for a project
+    lands in the same durable thread. `instructions` are sent on every response (they do not
+    carry over between responses). Asks for one JSON object back."""
     name = "openai"
     INSTRUCTIONS = (
         "You are the CTO reviewer for an autonomous engineering fleet. You receive one "
-        "structured event. Reply with ONLY a JSON object: {\"decision\": short imperative, "
-        "\"rationale\": <=3 sentences, \"owner_needed\": true|false, \"message_to_agent\": "
-        "text for the agent or \"\"}. Set owner_needed=true for anything involving "
-        "production release, money, credentials, CAPTCHA/anti-bot, paid proxy/VPN, "
-        "irreversible actions or product decisions; never approve those yourself.")
+        "structured event at a time for this project; earlier events and your earlier "
+        "decisions are in this conversation. Reply with ONLY a JSON object: {\"decision\": "
+        "short imperative, \"rationale\": <=3 sentences, \"owner_needed\": true|false, "
+        "\"message_to_agent\": text for the agent or \"\"}. Set owner_needed=true for "
+        "anything involving production release, money, credentials, CAPTCHA/anti-bot, paid "
+        "proxy/VPN, irreversible actions or product decisions; never approve those yourself.")
 
     def __init__(self, *, model: str, api_key: str, base_url: str = "", timeout: int = 60,
                  opener=None):
@@ -88,18 +119,30 @@ class OpenAIResponsesProvider(Provider):
     def __repr__(self):                       # never expose the key
         return f"OpenAIResponsesProvider(model={self.model!r})"
 
-    def decide(self, context: dict) -> dict:
-        body = json.dumps({"model": self.model, "instructions": self.INSTRUCTIONS,
-                           "input": json.dumps(context, sort_keys=True)}).encode()
-        req = urllib.request.Request(f"{self.base}/responses", data=body, method="POST",
+    def _post(self, path: str, payload: dict) -> dict:
+        req = urllib.request.Request(f"{self.base}/{path}", data=json.dumps(payload).encode(),
+                                     method="POST",
                                      headers={"Authorization": f"Bearer {self._key}",
                                               "Content-Type": "application/json"})
         try:
             with self._open(req, timeout=self.timeout) as r:
-                data = json.loads(r.read().decode("utf-8"))
+                return json.loads(r.read().decode("utf-8"))
         except Exception as e:  # noqa: BLE001 — never echo the request (it holds the key)
             raise ProviderError(f"request_failed:{type(e).__name__}") from None
-        return parse_output(_output_text(data))
+
+    def create_conversation(self, project: str) -> Optional[str]:
+        data = self._post("conversations", {"metadata": {"owner_os_project": project[:64]}})
+        cid = data.get("id")
+        if not isinstance(cid, str) or not cid:
+            raise ProviderError("conversation_create_returned_no_id")
+        return cid
+
+    def decide(self, context: dict, conversation_id: Optional[str] = None) -> dict:
+        body = {"model": self.model, "instructions": self.INSTRUCTIONS,
+                "input": json.dumps(context, sort_keys=True)}
+        if conversation_id:
+            body["conversation"] = conversation_id
+        return parse_output(_output_text(self._post("responses", body)))
 
 
 def _output_text(data: dict) -> str:
@@ -168,6 +211,77 @@ def agent_denied(agent: str) -> bool:
     return base in HARD_DENY_AGENTS or base in extra
 
 
+def conversation_for(project: str, provider: Provider, conn) -> Optional[str]:
+    """The project's durable conversation id, creating (and storing) it on first use."""
+    key = project or "_default"
+    r = conn.execute("SELECT conversation_id FROM cto_conversation WHERE project=? AND "
+                     "provider=?", (key, provider.name)).fetchone()
+    if r:
+        return r[0]
+    cid = provider.create_conversation(key)
+    if not cid:
+        return None
+    conn.execute("INSERT OR IGNORE INTO cto_conversation (project,provider,conversation_id,"
+                 "created_at) VALUES (?,?,?,?)", (key, provider.name, cid, now_iso()))
+    conn.commit()
+    # a concurrent creator may have won: everyone uses the stored one
+    return conn.execute("SELECT conversation_id FROM cto_conversation WHERE project=? AND "
+                        "provider=?", (key, provider.name)).fetchone()[0]
+
+
+def _decide_row(conn, key: str, provider: Optional[Provider], gate: str,
+                emit_owner: Optional[Callable]) -> dict:
+    row = conn.execute("SELECT event_type,context,attempts,owner_emitted FROM cto_decision "
+                       "WHERE event_key=?", (key,)).fetchone()
+    etype, ctx = row[0], json.loads(row[1] or "{}")
+    attempts, owner_emitted = row[2] or 0, row[3] or 0
+    owner_needed = etype == "owner_needed"
+    out, err, cid = None, None, None
+    if provider is None:
+        status, err = "waiting_provider", gate or "cto_provider_disabled"
+    else:
+        attempts += 1
+        try:
+            cid = conversation_for(ctx.get("project") or "", provider, conn)
+            out, status = provider.decide(ctx, conversation_id=cid), "decided"
+        except ProviderError as e:
+            err = str(e)[:200]
+            status = "provider_failed" if attempts >= MAX_ATTEMPTS else "provider_error"
+    if out:
+        owner_needed = owner_needed or out["owner_needed"]
+    msg = (out or {}).get("message_to_agent") or ""
+    conn.execute("UPDATE cto_decision SET status=?, decision=?, rationale=?, owner_needed=?, "
+                 "message_to_agent=?, error=?, finished_at=?, attempts=?, conversation_id=?, "
+                 "provider=?, model=? WHERE event_key=?",
+                 (status, (out or {}).get("decision"), (out or {}).get("rationale"),
+                  1 if owner_needed else 0, msg, err, now_iso(), attempts, cid,
+                  getattr(provider, "name", "none"), getattr(provider, "model", ""), key))
+    if out:
+        from core.control_plane import api as cp
+        cp.record_decision("agent", ctx.get("agent") or "", "cto_advice",
+                           out["decision"][:300], out["rationale"][:1000],
+                           model_tier=f"cto:{provider.model}", conn=conn)
+    queued = False
+    agent = ctx.get("agent") or ""
+    if msg and agent and not agent_denied(agent) and not owner_needed:
+        # owner-needed advice is NOT forwarded as an instruction: the owner decides first
+        queued = conn.execute(
+            "INSERT OR IGNORE INTO native_outbox (msg_key,event_key,to_agent,message,"
+            "created_at) VALUES (?,?,?,?,?)",
+            (f"cto:{key}", key, agent, msg, now_iso())).rowcount == 1
+    # An owner_needed EVENT already reached the owner through its own emission; the bridge
+    # notifies only when the provider escalates something that was not owner-flagged.
+    escalated = bool(out and out["owner_needed"]) and etype != "owner_needed"
+    emit_now = escalated and not owner_emitted and emit_owner is not None
+    if emit_now:
+        conn.execute("UPDATE cto_decision SET owner_emitted=1 WHERE event_key=?", (key,))
+    conn.commit()
+    if emit_now:
+        emit_owner(ctx, (out or {}).get("decision") or etype)
+    return {"handled": True, "status": status, "owner_needed": owner_needed,
+            "message_queued": queued, "error": err, "conversation_id": cid}
+
+
 def handle_event(ev: dict, *, provider: Optional[Provider] = None, gate: str = "",
                  emit_owner=None, conn=None) -> dict:
     """ev: {key, type, project, agent, goal, state, question, diff_summary, ...}."""
@@ -178,51 +292,41 @@ def handle_event(ev: dict, *, provider: Optional[Provider] = None, gate: str = "
     if provider is None and not gate:
         provider, gate = provider_from_env()
     ctx = build_context(ev)
-    ctx_hash = hashlib.sha256(json.dumps(ctx, sort_keys=True).encode()).hexdigest()[:16]
+    ctx_json = json.dumps(ctx, sort_keys=True)
     conn, own = _c(conn)
     try:
-        conn.executescript(_SCHEMA)
+        _schema(conn)
         cur = conn.execute(
-            "INSERT OR IGNORE INTO cto_decision (event_key,event_type,project,agent,provider,"
-            "model,context_hash,status,latched_ts,latched_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO cto_decision (event_key,event_type,project,agent,"
+            "context_hash,context,status,latched_ts,latched_at) VALUES (?,?,?,?,?,?,?,?,?)",
             (ev["key"], ev["type"], ctx["project"], ctx["agent"],
-             getattr(provider, "name", "none"), getattr(provider, "model", ""), ctx_hash,
-             "latched", now_ts(), now_iso()))
+             hashlib.sha256(ctx_json.encode()).hexdigest()[:16], ctx_json, "latched",
+             now_ts(), now_iso()))
         conn.commit()
         if cur.rowcount != 1:
             return {"handled": False, "reason": "duplicate_event_key"}
-        owner_needed = ev["type"] == "owner_needed"
-        if provider is None:
-            out, status, err = None, "skipped", gate or "cto_provider_disabled"
-        else:
-            try:
-                out, status, err = provider.decide(ctx), "decided", None
-            except ProviderError as e:
-                out, status, err = None, "provider_error", str(e)[:200]
-        if out:
-            owner_needed = owner_needed or out["owner_needed"]
-        msg = (out or {}).get("message_to_agent") or ""
-        conn.execute("UPDATE cto_decision SET status=?, decision=?, rationale=?, owner_needed=?,"
-                     " message_to_agent=?, error=?, finished_at=? WHERE event_key=?",
-                     (status, (out or {}).get("decision"), (out or {}).get("rationale"),
-                      1 if owner_needed else 0, msg, err, now_iso(), ev["key"]))
-        if out:
-            from core.control_plane import api as cp
-            cp.record_decision("agent", ctx["agent"], "cto_advice", out["decision"][:300],
-                               out["rationale"][:1000], model_tier=f"cto:{provider.model}",
-                               conn=conn)
-        queued = False
-        if msg and ctx["agent"] and not agent_denied(ctx["agent"]) and not owner_needed:
-            # owner-needed advice is NOT forwarded as an instruction: the owner decides first
-            queued = conn.execute(
-                "INSERT OR IGNORE INTO native_outbox (msg_key,event_key,to_agent,message,"
-                "created_at) VALUES (?,?,?,?,?)",
-                (f"cto:{ev['key']}", ev["key"], ctx["agent"], msg, now_iso())).rowcount == 1
-        conn.commit()
-        if owner_needed and emit_owner is not None:
-            emit_owner(ev, (out or {}).get("decision") or ev["type"])
-        return {"handled": True, "status": status, "owner_needed": owner_needed,
-                "message_queued": queued, "error": err}
+        return _decide_row(conn, ev["key"], provider, gate, emit_owner)
+    finally:
+        if own:
+            conn.close()
+
+
+def retry_waiting(*, provider: Optional[Provider] = None, gate: str = "", emit_owner=None,
+                  limit: int = 20, conn=None) -> list:
+    """Decide rows left `waiting_provider` / `provider_error` once a provider exists.
+    `latched` rows (a crash mid-call: outcome unknown) are never retried automatically."""
+    if provider is None and not gate:
+        provider, gate = provider_from_env()
+    if provider is None:
+        return []
+    conn, own = _c(conn)
+    try:
+        _schema(conn)
+        keys = [r[0] for r in conn.execute(
+            "SELECT event_key FROM cto_decision WHERE status IN ('waiting_provider',"
+            "'provider_error') ORDER BY latched_ts LIMIT ?", (int(limit),))]
+        return [dict(_decide_row(conn, k, provider, gate, emit_owner), event_key=k)
+                for k in keys]
     finally:
         if own:
             conn.close()
@@ -231,7 +335,7 @@ def handle_event(ev: dict, *, provider: Optional[Provider] = None, gate: str = "
 def pending_messages(conn=None) -> list:
     conn, own = _c(conn)
     try:
-        conn.executescript(_SCHEMA)
+        _schema(conn)
         return [dict(zip(("msg_key", "to_agent", "message", "created_at"), r)) for r in
                 conn.execute("SELECT msg_key,to_agent,message,created_at FROM native_outbox "
                              "WHERE state='pending' ORDER BY created_at")]
@@ -241,15 +345,75 @@ def pending_messages(conn=None) -> list:
 
 
 def mark_sent(msg_key: str, receipt: str, conn=None) -> bool:
-    """Called by the controller session after SendMessage. Only pending -> sent, once."""
+    """Called after a PROVEN delivery. Only pending -> sent, once."""
     conn, own = _c(conn)
     try:
-        conn.executescript(_SCHEMA)
+        _schema(conn)
         n = conn.execute("UPDATE native_outbox SET state='sent', sent_at=?, receipt=? WHERE "
                          "msg_key=? AND state='pending'",
                          (now_iso(), (receipt or "")[:500], msg_key)).rowcount
         conn.commit()
         return n == 1
+    finally:
+        if own:
+            conn.close()
+
+
+def _mark(conn, msg_key: str, state: str, receipt: str) -> None:
+    conn.execute("UPDATE native_outbox SET state=?, receipt=? WHERE msg_key=? AND "
+                 "state='pending'", (state, receipt[:500], msg_key))
+    conn.commit()
+
+
+def delivery_mode() -> str:
+    v = os.getenv("OWNER_OS_CTO_DELIVERY_MODE", "native_controller").strip().lower()
+    return v if v in ("native_controller", "agent_control", "off") else "off"
+
+
+def deliver_pending_agent_control(listing: dict, *, send: Optional[Callable] = None,
+                                  conn=None) -> list:
+    """Server-side fallback (OWNER_OS_CTO_DELIVERY_MODE=agent_control only): deliver pending
+    CTO advice with the proven `agent_control.agent_send`, only into an IDLE session located
+    through native state. Busy/unlocated → stays pending. Denied → `denied`, never sent.
+    Marked sent only when agent_send reports a submitted delivery."""
+    if delivery_mode() != "agent_control":
+        return []
+    from core import native_agents as na
+    if send is None:
+        from core import agent_control as ac
+
+        def send(target, text, key):
+            return ac.agent_send(target, text, idempotency_key=key, actor=SOURCE,
+                                 source=SOURCE)
+    conn, own = _c(conn)
+    out = []
+    try:
+        _schema(conn)
+        for m in pending_messages(conn=conn):
+            target = m["to_agent"]
+            if agent_denied(target):
+                _mark(conn, m["msg_key"], "denied", "hard_denied_agent")
+                out.append({"msg_key": m["msg_key"], "result": "denied"})
+                continue
+            s = na.find(target, listing) if listing.get("source") == na.SOURCE_NATIVE else None
+            if not s or s.get("tmux_target") != target:
+                out.append({"msg_key": m["msg_key"], "result": "pending_unlocated"})
+                continue
+            if s.get("state") != "idle":
+                out.append({"msg_key": m["msg_key"], "result": f"pending_{s.get('state')}"})
+                continue
+            try:
+                res = send(target, ADVICE_PREFIX + m["message"], m["msg_key"])
+            except Exception as e:  # noqa: BLE001 — unknown: agent_send dedupes the key
+                res = {"error": type(e).__name__}
+            if res.get("submitted") and res.get("delivered"):
+                mark_sent(m["msg_key"], f"agent_control:{res.get('idempotency_key', '')}",
+                          conn=conn)
+                out.append({"msg_key": m["msg_key"], "result": "sent"})
+            else:
+                out.append({"msg_key": m["msg_key"], "result": "pending_unproven",
+                            "reason": res.get("refused") or res.get("error") or ""})
+        return out
     finally:
         if own:
             conn.close()

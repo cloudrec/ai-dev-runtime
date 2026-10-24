@@ -37,6 +37,7 @@ def runner(rows=None, rc=0, raw=None):
 def _iso(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     for k in ("NATIVE_GOALS_ENABLED", "NATIVE_GOALS_DENY", "OWNER_OS_CTO_PROVIDER",
+              "OWNER_OS_CTO_DELIVERY_MODE", "NATIVE_OWNER_OS_ENABLED",
               "OWNER_OS_CTO_MODEL", "OPENAI_API_KEY", "OWNER_OS_CTO_DENY_AGENTS"):
         monkeypatch.delenv(k, raising=False)
     yield
@@ -238,11 +239,18 @@ def test_status_reports_policy_location_and_goal(monkeypatch):
 class FakeProvider(cb.Provider):
     name, model = "fake", "fake-model"
 
-    def __init__(self, out=None, err=None):
-        self.calls, self.out, self.err = [], out, err
+    def __init__(self, out=None, err=None, conversations=True):
+        self.calls, self.out, self.err, self.created = [], out, err, []
+        self.conversations = conversations
 
-    def decide(self, ctx):
-        self.calls.append(ctx)
+    def create_conversation(self, project):
+        if not self.conversations:
+            return None
+        self.created.append(project)
+        return f"conv_{project}_{len(self.created)}"
+
+    def decide(self, ctx, conversation_id=None):
+        self.calls.append((ctx, conversation_id))
         if self.err:
             raise cb.ProviderError(self.err)
         return dict(self.out or {"decision": "split the change", "rationale": "r",
@@ -255,11 +263,11 @@ def EV(**kw):
             "question": "tests keep failing", "diff_summary": "core/x.py +3 -1", **kw}
 
 
-def _rows(sql):
+def _rows(sql, args=()):
     conn, _ = _c(None)
-    conn.executescript(cb._SCHEMA)
+    cb._schema(conn)
     try:
-        return conn.execute(sql).fetchall()
+        return conn.execute(sql, args).fetchall()
     finally:
         conn.close()
 
@@ -286,26 +294,55 @@ def test_decision_recorded_and_message_queued_once_even_on_replay():
     assert cb.pending_messages() == []
 
 
+def test_one_durable_conversation_per_project():
+    p = FakeProvider()
+    a1 = cb.handle_event(EV(key="e1"), provider=p)
+    a2 = cb.handle_event(EV(key="e2"), provider=p)
+    b1 = cb.handle_event(EV(key="e3", project="payments-ui"), provider=p)
+    assert a1["conversation_id"] == a2["conversation_id"] == "conv_owner-os_1"
+    assert b1["conversation_id"] == "conv_payments-ui_2"
+    assert p.created == ["owner-os", "payments-ui"]
+    assert [c for _, c in p.calls] == ["conv_owner-os_1", "conv_owner-os_1",
+                                       "conv_payments-ui_2"]
+    # survives a fresh provider instance (restart): stored, not re-created
+    p2 = FakeProvider()
+    assert cb.handle_event(EV(key="e4"), provider=p2)["conversation_id"] == "conv_owner-os_1"
+    assert p2.created == []
+    assert _rows("SELECT project,conversation_id FROM cto_conversation ORDER BY project") == [
+        ("owner-os", "conv_owner-os_1"), ("payments-ui", "conv_payments-ui_2")]
+
+
+def test_provider_without_conversations_stays_stateless():
+    p = FakeProvider(conversations=False)
+    assert cb.handle_event(EV(), provider=p)["conversation_id"] is None
+    assert _rows("SELECT COUNT(*) FROM cto_conversation") == [(0,)]
+
+
 def test_context_is_compact_and_bounded():
     p = FakeProvider()
     cb.handle_event(EV(question="q" * 10000, recent_decisions=["d"] * 50), provider=p)
-    ctx = p.calls[0]
+    ctx = p.calls[0][0]
     assert len(ctx["question"]) == 2000 and len(ctx["recent_decisions"]) == 5
     assert set(ctx) == {"event_type", "project", "agent", "goal", "state", "question",
                         "git_diff_summary", "recent_decisions", "affected_agents"}
 
 
-@pytest.mark.parametrize("ev,out", [
-    (EV(type="owner_needed"), None),
-    (EV(), {"decision": "ship to prod", "rationale": "", "owner_needed": True,
-            "message_to_agent": "go ahead and deploy"}),
-])
-def test_owner_needed_is_never_auto_approved_or_forwarded(ev, out):
+def test_owner_needed_event_is_not_forwarded_and_not_re_notified():
     owner = []
-    r = cb.handle_event(ev, provider=FakeProvider(out),
-                        emit_owner=lambda e, why: owner.append(why))
+    r = cb.handle_event(EV(type="owner_needed"), provider=FakeProvider(),
+                        emit_owner=lambda c, why: owner.append(why))
     assert r["owner_needed"] is True and r["message_queued"] is False
-    assert len(owner) == 1 and cb.pending_messages() == []
+    assert owner == [] and cb.pending_messages() == []    # the event notified the owner
+
+
+def test_provider_escalation_is_owner_needed_once_never_forwarded():
+    owner = []
+    out = {"decision": "ship to prod", "rationale": "", "owner_needed": True,
+           "message_to_agent": "go ahead and deploy"}
+    r = cb.handle_event(EV(), provider=FakeProvider(out),
+                        emit_owner=lambda c, why: owner.append(why))
+    assert r["owner_needed"] is True and r["message_queued"] is False
+    assert owner == ["ship to prod"] and cb.pending_messages() == []
 
 
 def test_denied_agent_gets_no_message():
@@ -313,10 +350,35 @@ def test_denied_agent_gets_no_message():
     assert r["message_queued"] is False and cb.pending_messages() == []
 
 
-def test_disabled_provider_records_the_gate_and_calls_nothing():
-    r = cb.handle_event(EV())
-    assert r["status"] == "skipped" and r["error"] == "cto_provider_disabled"
+def test_missing_provider_waits_durably_then_is_decided_once_configured():
+    r = cb.handle_event(EV(), gate="missing_secret:OPENAI_API_KEY")
+    assert r["status"] == "waiting_provider" and r["error"] == "missing_secret:OPENAI_API_KEY"
+    assert cb.retry_waiting(gate="missing_secret:OPENAI_API_KEY") == []   # still no provider
+    p = FakeProvider()
+    done = cb.retry_waiting(provider=p)
+    assert [d["status"] for d in done] == ["decided"] and len(p.calls) == 1
+    assert cb.retry_waiting(provider=p) == [] and len(p.calls) == 1
+    assert _rows("SELECT COUNT(*) FROM native_outbox") == [(1,)]
+
+
+def test_provider_errors_retry_up_to_the_cap():
+    p = FakeProvider(err="request_failed:URLError")
+    assert cb.handle_event(EV(), provider=p)["status"] == "provider_error"
+    cb.retry_waiting(provider=p)
+    assert cb.retry_waiting(provider=p)[0]["status"] == "provider_failed"
+    assert cb.retry_waiting(provider=p) == [] and len(p.calls) == cb.MAX_ATTEMPTS
     assert cb.pending_messages() == []
+
+
+def test_crash_latched_row_is_never_retried_automatically():
+    conn, _ = _c(None)
+    cb._schema(conn)
+    conn.execute("INSERT INTO cto_decision (event_key,event_type,status,context) VALUES "
+                 "('evt:9','repeated_failure','latched','{}')")
+    conn.commit()
+    conn.close()
+    p = FakeProvider()
+    assert cb.retry_waiting(provider=p) == [] and p.calls == []
 
 
 @pytest.mark.parametrize("env,gate", [
@@ -330,11 +392,6 @@ def test_provider_config_gates(monkeypatch, env, gate):
     for k, v in env.items():
         monkeypatch.setenv(k, v)
     assert cb.provider_from_env() == (None, gate)
-
-
-def test_provider_error_is_recorded_without_message():
-    r = cb.handle_event(EV(), provider=FakeProvider(err="request_failed:URLError"))
-    assert r["status"] == "provider_error" and r["message_queued"] is False
 
 
 class _Resp:
@@ -351,26 +408,43 @@ class _Resp:
         return json.dumps(self.data).encode()
 
 
-def test_openai_adapter_calls_responses_api_and_parses_json(monkeypatch):
+def test_openai_adapter_uses_conversations_and_responses(monkeypatch):
     monkeypatch.setenv("OWNER_OS_CTO_PROVIDER", "openai")
     monkeypatch.setenv("OWNER_OS_CTO_MODEL", "configured-model")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-secret")
-    seen = {}
+    seen = []
 
     def opener(req, timeout):
-        seen.update(url=req.full_url, auth=req.get_header("Authorization"),
-                    body=json.loads(req.data))
+        body = json.loads(req.data)
+        seen.append((req.full_url, req.get_header("Authorization"), body))
+        if req.full_url.endswith("/conversations"):
+            return _Resp({"id": "conv_abc", "object": "conversation"})
         return _Resp({"output": [{"content": [{"type": "output_text", "text":
                      '```json\n{"decision": "pause", "rationale": "why", '
                      '"owner_needed": false, "message_to_agent": "pause"}\n```'}]}]})
     prov, gate = cb.provider_from_env()
     assert gate == "" and "sk-test-secret" not in repr(prov)
     prov._open = opener
-    out = prov.decide(cb.build_context(EV()))
-    assert seen["url"] == "https://api.openai.com/v1/responses"
-    assert seen["auth"] == "Bearer sk-test-secret" and seen["body"]["model"] == "configured-model"
-    assert out == {"decision": "pause", "rationale": "why", "owner_needed": False,
-                   "message_to_agent": "pause"}
+    r1 = cb.handle_event(EV(key="o1"), provider=prov)
+    r2 = cb.handle_event(EV(key="o2"), provider=prov)
+    urls = [u for u, _, _ in seen]
+    assert urls == ["https://api.openai.com/v1/conversations",
+                    "https://api.openai.com/v1/responses",
+                    "https://api.openai.com/v1/responses"]
+    assert all(a == "Bearer sk-test-secret" for _, a, _ in seen)
+    assert seen[0][2] == {"metadata": {"owner_os_project": "owner-os"}}
+    for _, _, body in seen[1:]:
+        assert body["conversation"] == "conv_abc" and body["model"] == "configured-model"
+        assert body["instructions"] == cb.OpenAIResponsesProvider.INSTRUCTIONS
+    assert r1["conversation_id"] == r2["conversation_id"] == "conv_abc"
+    assert r1["status"] == r2["status"] == "decided"
+
+
+def test_openai_conversation_without_id_is_a_provider_error():
+    prov = cb.OpenAIResponsesProvider(model="m", api_key="k",
+                                      opener=lambda req, timeout: _Resp({}))
+    assert cb.handle_event(EV(), provider=prov)["status"] == "provider_error"
+    assert _rows("SELECT COUNT(*) FROM cto_conversation") == [(0,)]
 
 
 def test_openai_adapter_failure_never_leaks_the_key():
@@ -380,9 +454,77 @@ def test_openai_adapter_failure_never_leaks_the_key():
     with pytest.raises(cb.ProviderError) as ei:
         prov.decide({})
     assert "sk-leak" not in str(ei.value) and ei.value.__cause__ is None
+    r = cb.handle_event(EV(), provider=prov)
+    assert "sk-leak" not in json.dumps(r) and "sk-leak" not in json.dumps(
+        _rows("SELECT * FROM cto_decision"))
 
 
 @pytest.mark.parametrize("text", ["", "no json here", '{"rationale": "x"}'])
 def test_unparseable_provider_output_is_an_error(text):
     with pytest.raises(cb.ProviderError):
         cb.parse_output(text)
+
+
+# ── fallback delivery (OWNER_OS_CTO_DELIVERY_MODE=agent_control) ─────────────
+def _queue(agent="aes-canary:0.0", key="d1"):
+    cb.handle_event(EV(key=key, agent=agent), provider=FakeProvider())
+
+
+@pytest.mark.parametrize("mode", [None, "native_controller", "off", "bogus"])
+def test_fallback_delivery_is_off_unless_explicitly_agent_control(monkeypatch, mode):
+    if mode:
+        monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", mode)
+    _queue()
+    sends = []
+    assert cb.deliver_pending_agent_control(listing(), send=lambda *a: sends.append(a)) == []
+    assert sends == [] and len(cb.pending_messages()) == 1
+
+
+def test_fallback_delivers_once_to_idle_target_and_marks_sent_only_on_proof(monkeypatch):
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    _queue()
+    sends = []
+
+    def send(target, text, key):
+        sends.append((target, text, key))
+        return {"submitted": True, "delivered": True, "idempotency_key": key}
+    out = cb.deliver_pending_agent_control(listing(), send=send)
+    assert [o["result"] for o in out] == ["sent"]
+    assert sends == [("aes-canary:0.0", cb.ADVICE_PREFIX + "do X", "cto:d1")]
+    assert cb.deliver_pending_agent_control(listing(), send=send) == [] and len(sends) == 1
+
+
+@pytest.mark.parametrize("res", [{"submitted": False, "refused": "working"},
+                                 {"submitted": True, "delivered": False}, "raise"])
+def test_fallback_unproven_delivery_stays_pending(monkeypatch, res):
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    _queue()
+
+    def send(*a):
+        if res == "raise":
+            raise RuntimeError("x")
+        return dict(res)
+    out = cb.deliver_pending_agent_control(listing(), send=send)
+    assert out[0]["result"] == "pending_unproven" and len(cb.pending_messages()) == 1
+
+
+def test_fallback_busy_target_is_left_pending(monkeypatch):
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    _queue()
+    sends = []
+    out = cb.deliver_pending_agent_control(listing("busy"), send=lambda *a: sends.append(a))
+    assert out[0]["result"] == "pending_busy" and sends == []
+
+
+def test_fallback_never_delivers_to_payorch(monkeypatch):
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    conn, _ = _c(None)
+    cb._schema(conn)          # a row that bypassed the queue-time deny must still be stopped
+    conn.execute("INSERT INTO native_outbox (msg_key,event_key,to_agent,message,created_at) "
+                 "VALUES ('cto:x','x','payorch-ha-fresh:1.1','do it','t')")
+    conn.commit()
+    conn.close()
+    sends = []
+    out = cb.deliver_pending_agent_control(listing(), send=lambda *a: sends.append(a))
+    assert out == [{"msg_key": "cto:x", "result": "denied"}] and sends == []
+    assert _rows("SELECT state FROM native_outbox") == [("denied",)]

@@ -11,6 +11,23 @@ ledger. Real-project actuation is OFF until the aes-canary passes (see "Canary")
 | Agent coordination | cross-session `ListAgents` / `SendMessage` from a controller Claude session | `core/cto_bridge.py` outbox (`native_outbox`) |
 | High-level reasoning | GPT CTO provider (OpenAI Responses API), disabled by default | `core/cto_bridge.py` |
 
+## Controller loop — `core/native_owner_os.py` (wired in `api/main.py` startup)
+
+Disabled by default (`NATIVE_OWNER_OS_ENABLED=0`: `run_loop` returns immediately).
+Interval `NATIVE_OWNER_OS_INTERVAL_SECS` (60). Each tick:
+
+1. state via `native_agents.list_sessions()`;
+2. only with `NATIVE_GOALS_ENABLED=1`: `native_goals.install` for each explicit config entry
+   (idempotent; already-active / latched / non-idle are no-ops);
+3. control-plane event deltas through the existing durable `cto_cursor` (consumer
+   `native_owner_os`; first start = bus head, no history replay). Explicit reasoning types map
+   directly, `owner_action_required` → `owner_needed`, the stack's own events are skipped.
+   The cursor is acked per event only AFTER `cto_bridge.handle_event` committed it; an event
+   whose handler throws is durably recorded `handler_error` and acked (no wedged bus); if even
+   that record cannot be written the tick stops without acking;
+4. `cto_bridge.retry_waiting()` once a provider is configured;
+5. `cto_bridge.deliver_pending_agent_control()` (no-op unless delivery mode `agent_control`).
+
 ## State — `core/native_agents.py`
 
 `list_sessions()` runs `claude agents --json` once (timeout `NATIVE_AGENTS_TIMEOUT_SECS`=30,
@@ -49,11 +66,26 @@ successful send means "reached the inbox", not "read".
 
 * Only `architecture_conflict`, `repeated_failure`, `shared_core_change`,
   `milestone_review`, `owner_needed` reach the provider.
-* Per event key: latch (`cto_decision`, PK) → provider call → record in `cto_decision` and
-  the control-plane `decision` ledger → enqueue at most one outbox message. Replay →
-  `duplicate_event_key`, no second call, no second message.
-* `owner_needed` (event type, or provider says so) → OWNER_NEEDED via `emit_owner`; the
-  advice is NOT forwarded to the agent; nothing is auto-approved.
+* Per event key: latch (`cto_decision`, PK, with the compact context) → provider call →
+  record in `cto_decision` and the control-plane `decision` ledger → enqueue at most one
+  outbox message. Replay → `duplicate_event_key`, no second call, no second message.
+* Multi-turn: one durable OpenAI conversation per Owner OS project (`cto_conversation`:
+  `POST /v1/conversations` on first use, then `"conversation": <id>` on every
+  `POST /v1/responses`; `instructions` are sent on every response). Survives restarts.
+* No provider / model / key → `waiting_provider` (durable, carries the gate reason) and is
+  decided by `retry_waiting()` once config exists. Provider errors retry up to 3 attempts,
+  then `provider_failed`. A `latched` row (crash mid-call) is never retried automatically.
+* `owner_needed` is never auto-approved and its advice is NOT forwarded to the agent. An
+  `owner_needed` event already notified the owner itself; a provider escalation of a
+  non-owner event emits `owner_needed_by_cto` once.
+
+Delivery (`OWNER_OS_CTO_DELIVERY_MODE`):
+
+| Mode | Behaviour |
+|---|---|
+| `native_controller` (default) | outbox left for a controller Claude session: `pending_messages()` → `SendMessage` → `mark_sent()` |
+| `agent_control` | server-side fallback for rare advice: `agent_control.agent_send` only into an `idle` session located via native state; busy/unlocated stay pending; payorch-ha-fresh → `denied`; `sent` only when agent_send reports submitted+delivered; text prefixed `[Owner OS CTO advice — automated, not owner approval]` |
+| `off` / unknown | nothing delivered |
 * Context is compact and bounded (project, agent, goal, state, question, git diff summary,
   ≤5 recent decisions, ≤20 affected agents) — never raw pane text.
 
@@ -64,6 +96,8 @@ successful send means "reached the inbox", not "read".
 | `OPENAI_API_KEY` | _(none)_ | read from the environment only; never logged/stored/returned |
 | `OWNER_OS_CTO_BASE_URL` | `https://api.openai.com/v1` | override endpoint |
 | `OWNER_OS_CTO_DENY_AGENTS` | _(empty)_ | extra agents that never receive a message (payorch-ha-fresh always denied) |
+| `OWNER_OS_CTO_DELIVERY_MODE` | `native_controller` | see Delivery |
+| `NATIVE_OWNER_OS_ENABLED` | `0` | controller loop on/off |
 
 Missing pieces surface as explicit gates: `missing_config:OWNER_OS_CTO_MODEL`,
 `missing_secret:OPENAI_API_KEY`.
