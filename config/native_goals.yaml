@@ -1,0 +1,16 @@
+# Native Claude Code /goal policies (core/native_goals.py). EXPLICIT allowlist only:
+# a session absent here never receives a goal. payorch-ha-fresh is hard-denied in code
+# and must never appear here. Installing also requires NATIVE_GOALS_ENABLED=1.
+#
+# Write conditions as checkable END STATE (files, tests, commits) plus the owner escape.
+# Do not put process rules ("no shell") in a goal: one past slip makes it unmeetable and
+# the evaluator spins until it gives up (seen live on aes-canary 2026-10-24). Process
+# rules belong in the task file / permissions.
+sessions:
+  aes-canary:
+    enabled: true
+    note: "disposable canary (/root/aes-canary-work); owner-approved canary scope"
+    condition: >-
+      /root/aes-canary-work/notes.txt ends with the line `step 6 done` after doing the
+      TASK.md steps in order, or you have stopped and reported OWNER_NEEDED because a step
+      needs an owner decision, credentials, money or anything irreversible.
