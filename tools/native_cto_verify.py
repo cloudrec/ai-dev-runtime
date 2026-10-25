@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Read-only canary verification for the native Owner OS GPT CTO bridge.
+
+Inspects the RUNNING ai-runtime service, not this shell: its environment is read from
+/proc/<MainPID>/environ (root only). Secret values are never printed, logged or returned —
+only whether OPENAI_API_KEY is present.
+
+  venv/bin/python tools/native_cto_verify.py --expect disabled         # no provider config
+  venv/bin/python tools/native_cto_verify.py --expect missing_secret   # config, no key
+  venv/bin/python tools/native_cto_verify.py --expect ready --key-check # after the key
+
+--key-check makes ONE GET {base}/models/{model} request (no tokens, no spend) to prove the
+key is accepted and the model is visible to it. Without it no network call is made.
+--since-rowid N fails if any agent_control delivery after row N made BY THIS STACK (keys
+`goal:` from native_goals, `cto:` from cto_bridge) went to a target outside
+NATIVE_OWNER_OS_AGENTS; other senders (e.g. `nativesup:`) are only counted. Exit 0 = pass.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+from unittest import mock
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+SERVICE = "ai-runtime.service"
+SECRET_KEYS = ("OPENAI_API_KEY",)
+CONFIG_KEYS = ("NATIVE_OWNER_OS_ENABLED", "NATIVE_GOALS_ENABLED", "NATIVE_OWNER_OS_AGENTS",
+               "OWNER_OS_CTO_PROVIDER", "OWNER_OS_CTO_MODEL", "OWNER_OS_CTO_BASE_URL",
+               "OWNER_OS_CTO_DELIVERY_MODE", "OWNER_OS_CTO_DENY_AGENTS")
+
+
+def service_pid(run=subprocess.run) -> int:
+    out = run(["systemctl", "show", SERVICE, "-p", "MainPID", "--value"],
+              capture_output=True, text=True, timeout=10).stdout.strip()
+    return int(out or 0)
+
+
+def read_environ(pid: int) -> dict:
+    with open(f"/proc/{pid}/environ", "rb") as f:
+        raw = f.read().split(b"\0")
+    env = {}
+    for item in raw:
+        k, sep, v = item.decode("utf-8", "replace").partition("=")
+        if sep:
+            env[k] = v
+    return env
+
+
+def config_report(env: dict) -> dict:
+    """Same gate logic the service runs (cto_bridge.provider_from_env), on its env."""
+    from core import cto_bridge as cb
+    with mock.patch.dict(os.environ, env, clear=True):
+        provider, gate = cb.provider_from_env()
+        mode = cb.delivery_mode()
+    rep = {k: env.get(k, "") for k in CONFIG_KEYS}
+    rep.update({k + "_present": bool(env.get(k, "").strip()) for k in SECRET_KEYS})
+    rep.update({"gate": gate, "delivery_mode": mode, "provider_ready": provider is not None})
+    return rep, provider
+
+
+def key_check(provider, opener=urllib.request.urlopen) -> dict:
+    """GET /models/{model}: authenticates the key and model access without generating."""
+    req = urllib.request.Request(f"{provider.base}/models/{provider.model}", method="GET",
+                                 headers={"Authorization": f"Bearer {provider._key}"})
+    try:
+        with opener(req, timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return {"ok": data.get("id") == provider.model, "status": 200}
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "status": e.code}
+    except Exception as e:  # noqa: BLE001 — never echo the request (it holds the key)
+        return {"ok": False, "status": None, "error": type(e).__name__}
+
+
+def ledger_report(conn, scope: set) -> dict:
+    from core import cto_bridge as cb
+    from core import native_owner_os as no
+    cb._schema(conn)
+    q = lambda s, a=(): conn.execute(s, a).fetchall()  # noqa: E731
+    cur = q("SELECT last_event_id FROM cto_cursor WHERE consumer=?", (no.CONSUMER,))
+    head = q("SELECT COALESCE(MAX(id),0) FROM event")[0][0]
+    agents = {r[0] for r in q("SELECT DISTINCT agent FROM cto_decision")}
+    outbox_to = {r[0] for r in q("SELECT DISTINCT to_agent FROM native_outbox")}
+    return {
+        "cursor": cur[0][0] if cur else None, "bus_head": head,
+        "decisions": dict(q("SELECT status,COUNT(*) FROM cto_decision GROUP BY status")),
+        "outbox": dict(q("SELECT state,COUNT(*) FROM native_outbox GROUP BY state")),
+        "conversations": q("SELECT COUNT(*) FROM cto_conversation")[0][0],
+        "out_of_scope_decisions": sorted(a for a in agents if scope and not _in(a, scope)),
+        "denied_outbox_pending": sorted(
+            a for a in outbox_to if cb.agent_denied(a) and
+            q("SELECT 1 FROM native_outbox WHERE to_agent=? AND state='pending'", (a,))),
+    }
+
+
+def _in(agent: str, scope: set) -> bool:
+    a = (agent or "").strip()
+    return a in scope or a.split(":", 1)[0] in scope
+
+
+OWN_KEY_PREFIXES = ("goal:", "cto:")
+
+
+def deliveries_since(path: str, rowid: int) -> dict:
+    """{"own": [targets of this stack's deliveries], "other": {key prefix: count}}."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute("SELECT target,idempotency_key FROM deliveries WHERE rowid>? "
+                            "ORDER BY rowid", (rowid,)).fetchall()
+    finally:
+        conn.close()
+    own, other = [], {}
+    for target, key in rows:
+        if (key or "").startswith(OWN_KEY_PREFIXES):
+            own.append(target)
+        else:
+            p = (key or "").split(":", 1)[0] if ":" in (key or "") else "(unprefixed)"
+            other[p] = other.get(p, 0) + 1
+    return {"own": own, "other": other}
+
+
+def verdict(cfg: dict, ledger: dict, *, expect: str, key: dict = None,
+            targets: list = None) -> list:
+    """List of failed checks (empty = pass)."""
+    fails = []
+    for k in ("NATIVE_OWNER_OS_ENABLED", "NATIVE_GOALS_ENABLED"):
+        if cfg.get(k) != "1":
+            fails.append(f"{k}!=1")
+    if not cfg.get("NATIVE_OWNER_OS_AGENTS"):
+        fails.append("NATIVE_OWNER_OS_AGENTS empty (not a canary)")
+    if cfg.get("OWNER_OS_CTO_DELIVERY_MODE") == "agent_control":
+        fails.append("delivery_mode agent_control (server-side delivery is not canary)")
+    want = {"disabled": "cto_provider_disabled", "missing_secret": "missing_secret:OPENAI_API_KEY",
+            "ready": ""}[expect]
+    if cfg["gate"] != want:
+        fails.append(f"gate={cfg['gate']!r} expected {want!r}")
+    if expect == "ready" and key is not None and not key.get("ok"):
+        fails.append(f"key_check failed status={key.get('status')}")
+    if ledger["cursor"] is None:
+        fails.append("controller cursor missing (loop not running?)")
+    if ledger["out_of_scope_decisions"]:
+        fails.append(f"out-of-scope decisions {ledger['out_of_scope_decisions']}")
+    if ledger["denied_outbox_pending"]:
+        fails.append(f"denied agents with pending advice {ledger['denied_outbox_pending']}")
+    if expect != "ready" and set(ledger["decisions"]) - {"waiting_provider"}:
+        fails.append(f"decisions other than waiting_provider {ledger['decisions']}")
+    scope = {s.strip() for s in cfg.get("NATIVE_OWNER_OS_AGENTS", "").split(",") if s.strip()}
+    bad = sorted({t for t in (targets or []) if not _in(t, scope)})
+    if bad:
+        fails.append(f"deliveries outside scope {bad}")
+    return fails
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--expect", choices=("disabled", "missing_secret", "ready"), required=True)
+    ap.add_argument("--key-check", action="store_true")
+    ap.add_argument("--since-rowid", type=int)
+    a = ap.parse_args(argv)
+    pid = service_pid()
+    if not pid:
+        print(json.dumps({"ok": False, "fails": [f"{SERVICE} not running"]}))
+        return 1
+    env = read_environ(pid)
+    cfg, provider = config_report(env)
+    key = key_check(provider) if a.key_check and provider is not None else None
+    cwd = os.readlink(f"/proc/{pid}/cwd")
+    os.environ["CONTROL_PLANE_DB"] = os.path.join(
+        cwd, env.get("CONTROL_PLANE_DB", "control_plane.db"))
+    from core.control_plane.api import _c
+    conn, _ = _c(None)
+    try:
+        scope = {s.strip() for s in cfg["NATIVE_OWNER_OS_AGENTS"].split(",") if s.strip()}
+        ledger = ledger_report(conn, scope)
+    finally:
+        conn.close()
+    targets = None
+    if a.since_rowid is not None:
+        targets = deliveries_since(env.get("AGENT_CONTROL_DB",
+                                           os.path.join(cwd, "agent_control.db")),
+                                   a.since_rowid)
+    fails = verdict(cfg, ledger, expect=a.expect, key=key,
+                    targets=targets["own"] if targets else None)
+    print(json.dumps({"ok": not fails, "pid": pid, "config": cfg, "key_check": key,
+                      "ledger": ledger, "deliveries_since": targets, "fails": fails},
+                     indent=2, default=str))
+    return 0 if not fails else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

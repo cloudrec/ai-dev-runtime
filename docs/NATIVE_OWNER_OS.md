@@ -112,6 +112,34 @@ Missing pieces surface as explicit gates: `missing_config:OWNER_OS_CTO_MODEL`,
 5. replayed event → no duplicate decision or message;
 6. no non-canary session changed.
 
+## Live canary service config (ai-runtime)
+
+| Drop-in (`/etc/systemd/system/ai-runtime.service.d/`) | Sets |
+|---|---|
+| `96-native-owner-os-canary.conf` | `NATIVE_OWNER_OS_ENABLED=1`, `NATIVE_GOALS_ENABLED=1`, `NATIVE_OWNER_OS_AGENTS=aes-canary`, `OWNER_OS_CTO_DELIVERY_MODE=off` |
+| `97-native-cto-provider.conf` (repo: `deploy/`) | `OWNER_OS_CTO_PROVIDER=openai`, `OWNER_OS_CTO_MODEL`, `OWNER_OS_CTO_DELIVERY_MODE=native_controller` (sorts after 96, so it wins), `EnvironmentFile=-/etc/ai-runtime/cto-openai.env` |
+| `/etc/ai-runtime/cto-openai.env` (root 0600, never in git) | `OPENAI_API_KEY` only |
+
+`native_controller` delivery keeps advice in `native_outbox` for a controller Claude session;
+the server never types it into an agent. Hard denies are unchanged (`payorch-ha-fresh` in
+code for goals, CTO events and delivery).
+
+All steps are owner-run as root via `tools/native_cto_key.sh`; each restarts
+`ai-runtime.service` only and then runs `tools/native_cto_verify.py` against the running
+process (env from `/proc/<MainPID>/environ`, key reported only as present/absent):
+
+| Step | Command | Verified state |
+|---|---|---|
+| stage provider, no key | `tools/native_cto_key.sh preconfig` | `--expect missing_secret`: gate `missing_secret:OPENAI_API_KEY`, decisions only `waiting_provider` |
+| add the key | `tools/native_cto_key.sh install` (prompts, echo off) | `--expect ready --key-check`: gate empty, `GET /models/<model>` accepted (no tokens) — on failure the key is removed again |
+| rollback | `tools/native_cto_key.sh remove` | `--expect disabled`: provider off; the 96 canary keeps running |
+
+Every check also fails on: canary scope empty, `agent_control` delivery mode, missing
+controller cursor, decisions for agents outside `NATIVE_OWNER_OS_AGENTS`, pending advice for a
+denied agent, or a delivery made by this stack (`goal:` / `cto:` keys) outside the scope.
+Other senders (e.g. `nativesup:`) are counted, not judged. Full rollback of the canary: also
+remove `96-native-owner-os-canary.conf`, `systemctl daemon-reload`, restart.
+
 ## Old custom supervisor
 
 `core/agent_event_supervisor.py` stays as rollback/reference, disabled by default
