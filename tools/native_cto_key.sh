@@ -14,14 +14,15 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNTIME=/root/ai-dev-runtime
-PY="$RUNTIME/venv/bin/python"
-DROPIN_DIR=/etc/systemd/system/ai-runtime.service.d
+# NATIVE_CTO_* overrides exist only so tests can run this script in a sandbox.
+RUNTIME="${NATIVE_CTO_RUNTIME:-/root/ai-dev-runtime}"
+PY="${NATIVE_CTO_PY:-$RUNTIME/venv/bin/python}"
+DROPIN_DIR="${NATIVE_CTO_DROPIN_DIR:-/etc/systemd/system/ai-runtime.service.d}"
 DROPIN="$DROPIN_DIR/97-native-cto-provider.conf"
-KEY_DIR=/etc/ai-runtime
+KEY_DIR="${NATIVE_CTO_KEY_DIR:-/etc/ai-runtime}"
 KEY_FILE="$KEY_DIR/cto-openai.env"
 SERVICE=ai-runtime.service
-HEALTH=http://172.17.0.1:8199/health
+HEALTH="${NATIVE_CTO_HEALTH:-http://172.17.0.1:8199/health}"
 
 die() { echo "native_cto_key: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root"
@@ -42,7 +43,7 @@ restart() {
 verify() { "$PY" "$HERE/tools/native_cto_verify.py" "$@"; }
 
 install_config() {
-  install -m 0644 -o root -g root "$HERE/deploy/97-native-cto-provider.conf" "$DROPIN"
+  install -m 0644 "$HERE/deploy/97-native-cto-provider.conf" "$DROPIN"
 }
 
 case "${1:-}" in
@@ -55,7 +56,7 @@ case "${1:-}" in
     if [ -t 0 ]; then read -rsp "OPENAI_API_KEY: " key; echo; else read -r key; fi
     [[ "$key" =~ ^[A-Za-z0-9_-]{20,}$ ]] || { unset key; die "key format rejected (not written)"; }
     install_config
-    install -d -m 0700 -o root -g root "$KEY_DIR"
+    install -d -m 0700 "$KEY_DIR"
     tmp=$(mktemp "$KEY_DIR/.cto-openai.XXXXXX")
     printf 'OPENAI_API_KEY=%s\n' "$key" > "$tmp"   # printf is a builtin: not in any argv
     unset key
