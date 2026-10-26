@@ -374,11 +374,13 @@ def deliver_pending_agent_control(listing: dict, *, send: Optional[Callable] = N
                                   conn=None) -> list:
     """Server-side fallback (OWNER_OS_CTO_DELIVERY_MODE=agent_control only): deliver pending
     CTO advice with the proven `agent_control.agent_send`, only into an IDLE session located
-    through native state. Busy/unlocated → stays pending. Denied → `denied`, never sent.
+    through native state. Busy/unlocated/outside NATIVE_OWNER_OS_AGENTS → stays pending.
+    Denied → `denied`, never sent.
     Marked sent only when agent_send reports a submitted delivery."""
     if delivery_mode() != "agent_control":
         return []
     from core import native_agents as na
+    from core import native_owner_os as no
     if send is None:
         from core import agent_control as ac
 
@@ -394,6 +396,9 @@ def deliver_pending_agent_control(listing: dict, *, send: Optional[Callable] = N
             if agent_denied(target):
                 _mark(conn, m["msg_key"], "denied", "hard_denied_agent")
                 out.append({"msg_key": m["msg_key"], "result": "denied"})
+                continue
+            if not no.in_scope(target):          # canary scope also binds delivery
+                out.append({"msg_key": m["msg_key"], "result": "pending_out_of_scope"})
                 continue
             s = na.find(target, listing) if listing.get("source") == na.SOURCE_NATIVE else None
             if not s or s.get("tmux_target") != target:

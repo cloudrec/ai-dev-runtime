@@ -137,7 +137,16 @@ process (env from `/proc/<MainPID>/environ`, key reported only as present/absent
 Every check also fails on: canary scope empty, `agent_control` delivery mode, missing
 controller cursor, decisions for agents outside `NATIVE_OWNER_OS_AGENTS`, pending advice for a
 denied agent, or a delivery made by this stack (`goal:` / `cto:` keys) outside the scope.
-Other senders (e.g. `nativesup:`) are counted, not judged. Full rollback of the canary: also
+Other senders (e.g. `nativesup:`) are counted, not judged. Watchdog: unread bus events while
+the controller cursor has not moved for 10 minutes fail every check (loop dead or wedged). The
+`deliveries` table is pruned by retention, so `--since-rowid` evidence covers only retained rows.
+`agent_control` fallback delivery also enforces `NATIVE_OWNER_OS_AGENTS` (out-of-scope advice
+stays `pending`), in addition to the event-level scope filter and the hard denies.
+
+Offline acceptance: `tests/test_native_owner_os_acceptance.py` chains event → decision → outbox
+→ delivery → verifier through the real controller tick (all delivery modes, busy, out-of-scope,
+payorch, owner_needed, provider outage, missing secret, replay) and runs `native_cto_key.sh`
+preconfig / install / failed install / rollback in a sandbox. Full rollback of the canary: also
 remove `96-native-owner-os-canary.conf`, `systemctl daemon-reload`, restart.
 
 ## Old custom supervisor
