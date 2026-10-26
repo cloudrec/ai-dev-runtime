@@ -16,6 +16,13 @@ import pytest
 
 from core import agent_control as ac
 
+@pytest.fixture(autouse=True)
+def _transport_tests_opt_out_of_automation_policy(monkeypatch):
+    """These tests exercise delivery mechanics with in-process callers; the automation
+    allowlist has its own suite (test_agent_automation_policy.py). Hard deny stays on."""
+    monkeypatch.setenv("AGENT_AUTOMATION_POLICY", "off")
+
+
 PANE_FIXTURE = (
     "safeguard\t0\t0\t%1\t1001\t/opt/safeguard\tnode\t0\tclaude\n"
     "email\t0\t0\t%2\t1002\t/opt/mess\tbash\t0\tshell\n"

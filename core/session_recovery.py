@@ -290,7 +290,12 @@ def choose_summary_if_offered(target: str, capture_fn=None, send_fn=None) -> dic
     number is read from the pane rather than assumed.
     """
     cap = capture_fn or (lambda: _capture(target, 30))
-    send = send_fn or (lambda keys: _tmux(["send-keys", "-t", target] + keys))
+    if send_fn is None:
+        from core import agent_control as _ac       # policy-checked keystrokes only
+
+        def send_fn(keys):
+            return _ac.send_control_keys(target, keys, source="session_recovery")
+    send = send_fn
     text = cap()
     if not _SUMMARY_CHOICE_RE.search(text or ""):
         return {"offered": False, "chosen": None}

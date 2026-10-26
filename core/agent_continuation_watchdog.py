@@ -692,8 +692,9 @@ class Controller:
         return self._ac.agent_send(target, text, idempotency_key=idem)
 
     def enter(self, target):
-        rc, _, _ = self._ac._tmux(["send-keys", "-t", target, "Enter"])
-        return rc
+        # policy-checked keystroke (automation allowlist + hard deny), never raw tmux
+        return self._ac.send_control_keys(target, ["Enter"],
+                                          source="continuation_watchdog")["rc"]
 
     def robust_submit(self, target, text):
         """Reliable submission for a line a bare Enter would not send (the live
@@ -701,7 +702,8 @@ class Controller:
         text via the proven multiline-safe buffer-paste + Enter path (agent_send).
         Same safety-classified text, so no new content is introduced."""
         try:
-            self._ac._tmux(["send-keys", "-t", target, "C-u"])       # clear partial line
+            self._ac.send_control_keys(target, ["C-u"],                # clear partial line
+                                       source="continuation_watchdog")
         except Exception:  # noqa: BLE001
             pass
         res = self._ac.agent_send(target, text)                      # fresh uuid → delivers
