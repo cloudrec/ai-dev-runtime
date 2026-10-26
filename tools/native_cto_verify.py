@@ -15,6 +15,9 @@ key is accepted and the model is visible to it. Without it no network call is ma
 `goal:` from native_goals, `cto:` from cto_bridge) went to a target outside
 NATIVE_OWNER_OS_AGENTS; other senders (e.g. `nativesup:`) are only counted. The deliveries
 table is pruned by retention, so N older than its oldest row only proves the retained window.
+Delivery: `agent_control` (server-side, canary-scoped) and `native_controller` both pass;
+advice still pending past its TTL in agent_control mode fails (delivery loop stuck);
+failed/expired advice is listed under ledger.delivery_failures.
 Watchdog: unread bus events while the controller cursor has not moved for STALL_SECS fail the
 check (loop dead or wedged). Exit 0 = pass.
 """
@@ -86,13 +89,20 @@ def key_check(provider, opener=urllib.request.urlopen) -> dict:
 
 
 def ledger_report(conn, scope: set) -> dict:
+    """Pure reads (main() opens the DB read-only): never creates or migrates a table."""
     from core import cto_bridge as cb
     from core import native_owner_os as no
-    cb._schema(conn)
-    q = lambda s, a=(): conn.execute(s, a).fetchall()  # noqa: E731
+
+    def q(sql, args=()):
+        try:
+            return conn.execute(sql, args).fetchall()
+        except sqlite3.OperationalError as e:      # table not created yet = nothing there
+            if "no such table" in str(e):
+                return []
+            raise
     cur = q("SELECT last_event_id,updated_at FROM cto_cursor WHERE consumer=?",
             (no.CONSUMER,))
-    head = q("SELECT COALESCE(MAX(id),0) FROM event")[0][0]
+    head = (q("SELECT COALESCE(MAX(id),0) FROM event") or [(0,)])[0][0]
     agents = {r[0] for r in q("SELECT DISTINCT agent FROM cto_decision")}
     outbox_to = {r[0] for r in q("SELECT DISTINCT to_agent FROM native_outbox")}
     return {
@@ -100,8 +110,14 @@ def ledger_report(conn, scope: set) -> dict:
         "cursor_age_secs": _age(cur[0][1]) if cur else None,
         "decisions": dict(q("SELECT status,COUNT(*) FROM cto_decision GROUP BY status")),
         "outbox": dict(q("SELECT state,COUNT(*) FROM native_outbox GROUP BY state")),
-        "conversations": q("SELECT COUNT(*) FROM cto_conversation")[0][0],
+        "conversations": (q("SELECT COUNT(*) FROM cto_conversation") or [(0,)])[0][0],
         "out_of_scope_decisions": sorted(a for a in agents if scope and not _in(a, scope)),
+        "stale_pending": [r[0] for r in q(
+            "SELECT msg_key,created_at FROM native_outbox WHERE state='pending'")
+            if (_age(r[1]) is None or _age(r[1]) > cb.ADVICE_TTL_SECS + STALL_SECS)],
+        "delivery_failures": [{"msg_key": r[0], "state": r[1], "receipt": r[2]} for r in q(
+            "SELECT msg_key,state,receipt FROM native_outbox WHERE state IN "
+            "('failed','expired') ORDER BY created_at DESC LIMIT 10")],
         "denied_outbox_pending": sorted(
             a for a in outbox_to if cb.agent_denied(a) and
             q("SELECT 1 FROM native_outbox WHERE to_agent=? AND state='pending'", (a,))),
@@ -154,8 +170,14 @@ def verdict(cfg: dict, ledger: dict, *, expect: str, key: dict = None,
             fails.append(f"{k}!=1")
     if not cfg.get("NATIVE_OWNER_OS_AGENTS"):
         fails.append("NATIVE_OWNER_OS_AGENTS empty (not a canary)")
-    if cfg.get("OWNER_OS_CTO_DELIVERY_MODE") == "agent_control":
-        fails.append("delivery_mode agent_control (server-side delivery is not canary)")
+    scope = {s.strip() for s in cfg.get("NATIVE_OWNER_OS_AGENTS", "").split(",") if s.strip()}
+    from core import cto_bridge as cb
+    denied_in_scope = sorted(a for a in scope if cb.agent_denied(a))
+    if denied_in_scope:
+        fails.append(f"hard-denied agents in NATIVE_OWNER_OS_AGENTS {denied_in_scope}")
+    if cfg.get("delivery_mode") == "agent_control" and ledger.get("stale_pending"):
+        fails.append(f"advice pending past TTL (delivery loop stuck) "
+                     f"{ledger['stale_pending']}")
     want = {"disabled": "cto_provider_disabled", "missing_secret": "missing_secret:OPENAI_API_KEY",
             "ready": ""}[expect]
     if cfg["gate"] != want:
@@ -174,7 +196,6 @@ def verdict(cfg: dict, ledger: dict, *, expect: str, key: dict = None,
         fails.append(f"denied agents with pending advice {ledger['denied_outbox_pending']}")
     if expect != "ready" and set(ledger["decisions"]) - {"waiting_provider"}:
         fails.append(f"decisions other than waiting_provider {ledger['decisions']}")
-    scope = {s.strip() for s in cfg.get("NATIVE_OWNER_OS_AGENTS", "").split(",") if s.strip()}
     bad = sorted({t for t in (targets or []) if not _in(t, scope)})
     if bad:
         fails.append(f"deliveries outside scope {bad}")
@@ -195,10 +216,8 @@ def main(argv=None) -> int:
     cfg, provider = config_report(env)
     key = key_check(provider) if a.key_check and provider is not None else None
     cwd = os.readlink(f"/proc/{pid}/cwd")
-    os.environ["CONTROL_PLANE_DB"] = os.path.join(
-        cwd, env.get("CONTROL_PLANE_DB", "control_plane.db"))
-    from core.control_plane.api import _c
-    conn, _ = _c(None)
+    db = os.path.join(cwd, env.get("CONTROL_PLANE_DB", "control_plane.db"))
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
     try:
         scope = {s.strip() for s in cfg["NATIVE_OWNER_OS_AGENTS"].split(",") if s.strip()}
         ledger = ledger_report(conn, scope)

@@ -99,8 +99,10 @@ def test_verdict_missing_secret_passes_with_only_waiting_provider():
     ({**CFG}, LEDGER, [], "missing_secret", "NATIVE_OWNER_OS_ENABLED!=1"),
     ({**BASE, **CFG, "NATIVE_OWNER_OS_AGENTS": ""}, LEDGER, [], "missing_secret",
      "not a canary"),
-    ({**BASE, **CFG, "OWNER_OS_CTO_DELIVERY_MODE": "agent_control"}, LEDGER, [],
-     "missing_secret", "agent_control"),
+    ({**BASE, **CFG, "NATIVE_OWNER_OS_AGENTS": "aes-canary,payorch-ha-fresh"}, LEDGER, [],
+     "missing_secret", "hard-denied agents in NATIVE_OWNER_OS_AGENTS"),
+    ({**BASE, **CFG, "OWNER_OS_CTO_DELIVERY_MODE": "agent_control"},
+     {**LEDGER, "stale_pending": ["cto:x"]}, [], "missing_secret", "pending past TTL"),
     ({**BASE, **CFG}, LEDGER, [], "ready", "gate="),
     ({**BASE, **CFG}, {**LEDGER, "cursor": None}, [], "missing_secret", "cursor missing"),
     ({**BASE, **CFG}, {**LEDGER, "decisions": {"decided": 1}}, [], "missing_secret",
@@ -115,6 +117,13 @@ def test_verdict_missing_secret_passes_with_only_waiting_provider():
 def test_verdict_failures(env, ledger, targets, expect, needle):
     fails = ncv.verdict(_cfg(env), ledger, expect=expect, targets=targets)
     assert any(needle in f for f in fails), fails
+
+
+def test_scoped_agent_control_delivery_is_an_accepted_canary_mode():
+    cfg = _cfg({**BASE, **CFG, "OWNER_OS_CTO_DELIVERY_MODE": "agent_control"})
+    assert cfg["delivery_mode"] == "agent_control"
+    assert ncv.verdict(cfg, {**LEDGER, "stale_pending": []}, expect="missing_secret",
+                       targets=["aes-canary:0.0"]) == []
 
 
 def test_verdict_ready_requires_a_passing_key_check():
@@ -153,6 +162,16 @@ def test_ledger_report_flags_out_of_scope_and_denied_pending():
     assert rep["out_of_scope_decisions"] == ["bitwhite:0.0"]
     assert rep["denied_outbox_pending"] == ["payorch-ha-fresh:0.0"]
     assert rep["decisions"] == {"waiting_provider": 1, "decided": 1}
+
+
+def test_ledger_report_is_read_only_and_tolerates_a_fresh_db(tmp_path):
+    db = tmp_path / "fresh.db"
+    sqlite3.connect(db).close()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    rep = ncv.ledger_report(conn, {"aes-canary"})
+    conn.close()
+    assert rep["cursor"] is None and rep["bus_head"] == 0 and rep["decisions"] == {}
+    assert sqlite3.connect(db).execute("SELECT COUNT(*) FROM sqlite_master").fetchone() == (0,)
 
 
 def test_provider_dropin_is_secret_free_and_overrides_the_96_canary():
