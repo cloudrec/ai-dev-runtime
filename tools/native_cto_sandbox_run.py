@@ -6,9 +6,13 @@ ai-runtime ledgers — every store is redirected into --state-dir before anythin
   CONTROL_PLANE_DB, AGENT_CONTROL_DB, AGENT_CONTROL_AUDIT -> state dir;
   NATIVE_OWNER_OS_AGENTS = the worker session only; OWNER_OS_CTO_CONTROLLER = controller;
   provider claude_session; delivery agent_control; goals OFF.
-Typing uses the real tmux server (the worker and the controller are real Claude panes),
-guarded three times: code scope, a session listing filtered to exactly those two panes, and
-a send wrapper that raises for any other target.
+With --worker-socket the worker lives on a PRIVATE tmux server (`tmux -S <socket>`) that no
+production service addresses (they all use the default server); the controller stays on the
+default server. tmux calls are routed per target session (buffers follow the server of the
+last targeted call); `list-panes -a` merges both servers. Preflight requires the private
+server to hold exactly the worker session and the default server NOT to have one of that
+name. Sends are guarded three times: code scope, a session listing filtered to exactly the
+two panes, and a send wrapper that raises for any other target.
 
 Flow: preflight (fail closed) -> emit one test event for the worker into the sandbox bus ->
 tick every --interval s: request -> controller (when idle) -> controller replies with
@@ -89,6 +93,44 @@ def guard_send(allowed: set, real_send):
     return send
 
 
+def route_tmux(real, worker_session: str, worker_sock: str):
+    """agent_control._tmux replacement: worker session -> private socket, rest -> default."""
+    current = {"sock": None}
+
+    def run(sock, args, stdin):
+        return real((["-S", sock] if sock else []) + list(args), stdin=stdin)
+
+    def _tmux(args, stdin=None):
+        args = list(args)
+        if args and args[0] == "list-panes" and "-a" in args:
+            r1, r2 = run(None, args, stdin), run(worker_sock, args, stdin)
+            ok = [r for r in (r1, r2) if r[0] == 0]
+            if not ok:
+                return r1
+            return 0, "".join(r[1] for r in ok), ""
+        if "-t" in args:
+            tgt = args[args.index("-t") + 1]
+            current["sock"] = worker_sock if session_of(tgt) == worker_session else None
+        return run(current["sock"], args, stdin)
+    return _tmux
+
+
+def private_sessions(sock: str, run=None) -> list:
+    import subprocess
+    run = run or subprocess.run
+    r = run(["tmux", "-S", sock, "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=10)
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+def default_sessions(run=None) -> list:
+    import subprocess
+    run = run or subprocess.run
+    r = run(["tmux", "list-sessions", "-F", "#{session_name}"], capture_output=True,
+            text=True, timeout=10)
+    return r.stdout.split() if r.returncode == 0 else []
+
+
 def live_deliveries_since(rowid: int, targets: set) -> list:
     """Read-only: who ELSE typed into the two panes during the run (live supervisors)."""
     try:
@@ -124,6 +166,8 @@ def main(argv=None) -> int:
     ap.add_argument("--max-secs", type=float, default=1800.0)
     ap.add_argument("--question", default="notes.txt has step 1 done. What is the next "
                     "single safe step from TASK.md?")
+    ap.add_argument("--worker-socket", default="",
+                    help="private tmux server socket holding ONLY the worker session")
     ap.add_argument("--preflight-only", action="store_true")
     a = ap.parse_args(argv)
     preflight_names(a.worker, a.controller)
@@ -142,6 +186,14 @@ def main(argv=None) -> int:
         with open(log_path, "a") as fh:
             fh.write(json.dumps(kw, default=str) + "\n")
 
+    if a.worker_socket:
+        wsess = session_of(a.worker)
+        priv = private_sessions(a.worker_socket)
+        if priv != [wsess]:
+            raise Refused(f"private server must hold exactly [{wsess}], has {priv}")
+        if wsess in default_sessions():
+            raise Refused(f"{wsess} also exists on the default tmux server")
+        ac._tmux = route_tmux(ac._tmux, wsess, a.worker_socket)
     provider, gate = cb.provider_from_env()
     if provider is None:
         raise Refused(f"provider gate: {gate}")
