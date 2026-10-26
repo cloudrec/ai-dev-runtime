@@ -244,7 +244,6 @@ def parse_park_until(text: str, now: Optional[float] = None) -> Optional[float]:
     past, an impossible date or one beyond PARK_HORIZON_SECS all return None.
     Local time, because that is what the pane prints.
     """
-    import calendar
     import datetime as _dt
     now = now if now is not None else now_ts()
     body = text or ""
@@ -271,19 +270,14 @@ def parse_park_until(text: str, now: Optional[float] = None) -> Optional[float]:
                     when = _dt.datetime(y, mo, d, hh, mm)
                 except ValueError:      # 31 Feb and friends
                     continue
-                ts = calendar.timegm(when.timetuple()) - _utc_offset_secs(when)
+                # naive datetime = local wall clock; .timestamp() applies the UTC offset
+                # in force AT `when` (DST-aware), not the offset of the current moment
+                ts = when.timestamp()
                 if now < ts <= now + PARK_HORIZON_SECS:
                     return ts
         except Exception:  # noqa: BLE001 — an unparseable park is simply not a park
             continue
     return None
-
-
-def _utc_offset_secs(when) -> int:
-    """Local UTC offset at `when`, so a printed wall-clock time means what it says."""
-    import time as _time
-    return -(_time.altzone if _time.localtime(_time.time()).tm_isdst and _time.daylight
-             else _time.timezone)
 
 
 _BLOCKER_RE = re.compile(
