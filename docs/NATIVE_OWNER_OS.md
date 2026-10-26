@@ -84,8 +84,19 @@ Delivery (`OWNER_OS_CTO_DELIVERY_MODE`):
 | Mode | Behaviour |
 |---|---|
 | `native_controller` (default) | outbox left for a controller Claude session: `pending_messages()` → `SendMessage` → `mark_sent()` |
-| `agent_control` | server-side fallback for rare advice: `agent_control.agent_send` only into an `idle` session located via native state; busy/unlocated stay pending; payorch-ha-fresh → `denied`; `sent` only when agent_send reports submitted+delivered; text prefixed `[Owner OS CTO advice — automated, not owner approval]` |
+| `agent_control` | autonomous server-side delivery: `agent_control.agent_send` only into an `idle` session located via native state, inside `NATIVE_OWNER_OS_AGENTS`, one message per agent per tick, oldest first; text prefixed `[Owner OS CTO advice — automated, not owner approval]`. Outbox states below |
 | `off` / unknown | nothing delivered |
+
+`native_outbox` states (agent_control): `pending` → `sent` (submitted and proven) · `queued`
+(accepted into Claude's own queue behind a turn; never resent) · `failed` (send proven not to
+land, or 3 errors) · `expired` (older than `OWNER_OS_CTO_ADVICE_TTL_SECS`, default 21600, or
+undated: stale advice is never typed) · `denied` (payorch-ha-fresh / deny list). Busy,
+unlocated, refused and out-of-scope stay `pending` without spending an attempt. agent_send
+records every real attempt under the idempotency key (`cto:<event key>`), so a resend after a
+crash returns `duplicate` and the row is settled from that attempt — never typed twice.
+`failed`/`expired` emit `cto_advice_failed` / `cto_advice_expired` (source `cto_bridge`, never
+fed back). Feedback loop: each new decision's context carries `previous_advice` — the
+agent's last 3 advice texts with their delivery state — inside the same CTO conversation.
 * Context is compact and bounded (project, agent, goal, state, question, git diff summary,
   ≤5 recent decisions, ≤20 affected agents) — never raw pane text.
 
@@ -134,7 +145,8 @@ process (env from `/proc/<MainPID>/environ`, key reported only as present/absent
 | add the key | `tools/native_cto_key.sh install` (prompts, echo off) | `--expect ready --key-check`: gate empty, `GET /models/<model>` accepted (no tokens) — on failure the key is removed again |
 | rollback | `tools/native_cto_key.sh remove` | `--expect disabled`: provider off; the 96 canary keeps running |
 
-Every check also fails on: canary scope empty, `agent_control` delivery mode, missing
+Every check also fails on: canary scope empty or containing a hard-denied agent, advice
+pending past its TTL in `agent_control` mode (delivery stuck), missing
 controller cursor, decisions for agents outside `NATIVE_OWNER_OS_AGENTS`, pending advice for a
 denied agent, or a delivery made by this stack (`goal:` / `cto:` keys) outside the scope.
 Other senders (e.g. `nativesup:`) are counted, not judged. Watchdog: unread bus events while

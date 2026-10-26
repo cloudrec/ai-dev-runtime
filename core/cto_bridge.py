@@ -32,6 +32,7 @@ Denied agents (payorch-ha-fresh, + OWNER_OS_CTO_DENY_AGENTS) never get an outbox
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 import os
@@ -46,9 +47,11 @@ REASONING_EVENTS = frozenset({"architecture_conflict", "repeated_failure",
 HARD_DENY_AGENTS = frozenset({"payorch-ha-fresh"})
 SOURCE = "cto_bridge"
 MAX_ATTEMPTS = 3
+MAX_DELIVERY_ATTEMPTS = 3
+ADVICE_TTL_SECS = int(os.getenv("OWNER_OS_CTO_ADVICE_TTL_SECS", "21600"))
 ADVICE_PREFIX = "[Owner OS CTO advice — automated, not owner approval] "
 _LIMITS = {"question": 2000, "goal": 600, "state": 200, "diff_summary": 4000,
-           "decision": 300, "max_decisions": 5, "max_affected": 20}
+           "decision": 300, "max_decisions": 5, "max_affected": 20, "max_previous": 3}
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS cto_decision (
@@ -63,7 +66,8 @@ CREATE TABLE IF NOT EXISTS cto_conversation (
     project TEXT, provider TEXT, conversation_id TEXT, created_at TEXT,
     PRIMARY KEY (project, provider));
 """
-# additive columns on cto_decision (older DBs get them on first use)
+# additive columns (older DBs get them on first use)
+_OUTBOX_COLUMNS = {"attempts": "INTEGER DEFAULT 0"}
 _COLUMNS = {"context": "TEXT", "attempts": "INTEGER DEFAULT 0",
             "owner_emitted": "INTEGER DEFAULT 0", "conversation_id": "TEXT"}
 
@@ -74,6 +78,10 @@ def _schema(conn) -> None:
     for col, decl in _COLUMNS.items():
         if col not in have:
             conn.execute(f"ALTER TABLE cto_decision ADD COLUMN {col} {decl}")
+    have = {r[1] for r in conn.execute("PRAGMA table_info(native_outbox)")}
+    for col, decl in _OUTBOX_COLUMNS.items():
+        if col not in have:
+            conn.execute(f"ALTER TABLE native_outbox ADD COLUMN {col} {decl}")
 
 
 class ProviderError(Exception):
@@ -201,7 +209,22 @@ def build_context(ev: dict) -> dict:
             "recent_decisions": [_cut(d, _LIMITS["decision"]) for d in
                                  (ev.get("recent_decisions") or [])[:_LIMITS["max_decisions"]]],
             "affected_agents": [_cut(a, 120) for a in
-                                (ev.get("affected_agents") or [])[:_LIMITS["max_affected"]]]}
+                                (ev.get("affected_agents") or [])[:_LIMITS["max_affected"]]],
+            # feedback loop: what happened to this agent's earlier advice
+            "previous_advice": [{"advice": _cut(p.get("advice"), _LIMITS["decision"]),
+                                 "delivery": _cut(p.get("delivery"), 20),
+                                 "at": _cut(p.get("at"), 40)}
+                                for p in (ev.get("previous_advice") or [])
+                                [:_LIMITS["max_previous"]]]}
+
+
+def previous_advice(agent: str, conn) -> list:
+    """Newest first: the agent's last advice and its delivery outcome (outbox state)."""
+    if not agent:
+        return []
+    return [{"advice": r[0], "delivery": r[1], "at": r[2]} for r in conn.execute(
+        "SELECT message,state,created_at FROM native_outbox WHERE to_agent=? "
+        "ORDER BY created_at DESC LIMIT ?", (agent, _LIMITS["max_previous"]))]
 
 
 def agent_denied(agent: str) -> bool:
@@ -291,11 +314,13 @@ def handle_event(ev: dict, *, provider: Optional[Provider] = None, gate: str = "
         return {"handled": False, "reason": "event_key_required"}
     if provider is None and not gate:
         provider, gate = provider_from_env()
-    ctx = build_context(ev)
-    ctx_json = json.dumps(ctx, sort_keys=True)
     conn, own = _c(conn)
     try:
         _schema(conn)
+        if "previous_advice" not in ev:
+            ev = {**ev, "previous_advice": previous_advice(ev.get("agent") or "", conn)}
+        ctx = build_context(ev)
+        ctx_json = json.dumps(ctx, sort_keys=True)
         cur = conn.execute(
             "INSERT OR IGNORE INTO cto_decision (event_key,event_type,project,agent,"
             "context_hash,context,status,latched_ts,latched_at) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -370,13 +395,49 @@ def delivery_mode() -> str:
     return v if v in ("native_controller", "agent_control", "off") else "off"
 
 
+def _age_secs(iso: str) -> Optional[float]:
+    try:
+        t = datetime.datetime.fromisoformat(str(iso))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    return (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+
+
+def _settle(conn, m: dict, state: str, receipt: str, out: list, emit=None) -> None:
+    """Terminal outbox state (pending -> sent|queued|failed|expired), once. failed/expired
+    also emit a control-plane event (own source: never fed back into the bridge)."""
+    n = conn.execute("UPDATE native_outbox SET state=?, receipt=?, sent_at=? WHERE msg_key=? "
+                     "AND state='pending'", (state, receipt[:500], now_iso(),
+                                             m["msg_key"])).rowcount
+    conn.commit()
+    out.append({"msg_key": m["msg_key"], "result": state, "reason": receipt[:200]})
+    if n == 1 and state in ("failed", "expired"):
+        (emit or _emit_delivery_event)(m, state, receipt)
+
+
+def _emit_delivery_event(m: dict, state: str, receipt: str) -> None:
+    from core.control_plane import cto
+    cto.emit(SOURCE, f"cto_advice_{state}", project_id="", agent_id=m["to_agent"],
+             severity="warning", owner_action_required=False,
+             payload={"msg_key": m["msg_key"], "reason": receipt[:300]},
+             dedup_key=f"cto:delivery:{m['msg_key']}", dedup_window_secs=86400)
+
+
 def deliver_pending_agent_control(listing: dict, *, send: Optional[Callable] = None,
-                                  conn=None) -> list:
-    """Server-side fallback (OWNER_OS_CTO_DELIVERY_MODE=agent_control only): deliver pending
-    CTO advice with the proven `agent_control.agent_send`, only into an IDLE session located
-    through native state. Busy/unlocated/outside NATIVE_OWNER_OS_AGENTS → stays pending.
-    Denied → `denied`, never sent.
-    Marked sent only when agent_send reports a submitted delivery."""
+                                  emit: Optional[Callable] = None, conn=None) -> list:
+    """Server-side delivery (OWNER_OS_CTO_DELIVERY_MODE=agent_control only) of queued CTO
+    advice through the proven `agent_control.agent_send`, into an IDLE session located
+    through native state, at most one message per agent per tick, oldest first.
+
+    Outbox states: `pending` -> `sent` (submitted and proven) | `queued` (accepted into
+    Claude's own queue behind a turn — never resent) | `failed` (send proven not to land,
+    or MAX_DELIVERY_ATTEMPTS errors) | `expired` (older than ADVICE_TTL_SECS or of unknown
+    age: stale advice is never typed) | `denied` (hard-denied agent). Busy / unlocated /
+    outside NATIVE_OWNER_OS_AGENTS stay `pending` without spending an attempt.
+    agent_send records every real attempt under the idempotency key, so a resend after a
+    crash returns `duplicate` and the row is settled from that recorded attempt."""
     if delivery_mode() != "agent_control":
         return []
     from core import native_agents as na
@@ -388,10 +449,13 @@ def deliver_pending_agent_control(listing: dict, *, send: Optional[Callable] = N
             return ac.agent_send(target, text, idempotency_key=key, actor=SOURCE,
                                  source=SOURCE)
     conn, own = _c(conn)
-    out = []
+    out, touched = [], set()
     try:
         _schema(conn)
-        for m in pending_messages(conn=conn):
+        rows = conn.execute("SELECT msg_key,to_agent,message,created_at,attempts FROM "
+                            "native_outbox WHERE state='pending' ORDER BY created_at")
+        for r in rows.fetchall():
+            m = dict(zip(("msg_key", "to_agent", "message", "created_at", "attempts"), r))
             target = m["to_agent"]
             if agent_denied(target):
                 _mark(conn, m["msg_key"], "denied", "hard_denied_agent")
@@ -400,6 +464,13 @@ def deliver_pending_agent_control(listing: dict, *, send: Optional[Callable] = N
             if not no.in_scope(target):          # canary scope also binds delivery
                 out.append({"msg_key": m["msg_key"], "result": "pending_out_of_scope"})
                 continue
+            age = _age_secs(m["created_at"])
+            if age is None or age > ADVICE_TTL_SECS:
+                _settle(conn, m, "expired", f"age={age}", out, emit)
+                continue
+            if target in touched:
+                out.append({"msg_key": m["msg_key"], "result": "pending_next_tick"})
+                continue
             s = na.find(target, listing) if listing.get("source") == na.SOURCE_NATIVE else None
             if not s or s.get("tmux_target") != target:
                 out.append({"msg_key": m["msg_key"], "result": "pending_unlocated"})
@@ -407,17 +478,39 @@ def deliver_pending_agent_control(listing: dict, *, send: Optional[Callable] = N
             if s.get("state") != "idle":
                 out.append({"msg_key": m["msg_key"], "result": f"pending_{s.get('state')}"})
                 continue
+            touched.add(target)
             try:
-                res = send(target, ADVICE_PREFIX + m["message"], m["msg_key"])
-            except Exception as e:  # noqa: BLE001 — unknown: agent_send dedupes the key
-                res = {"error": type(e).__name__}
-            if res.get("submitted") and res.get("delivered"):
-                mark_sent(m["msg_key"], f"agent_control:{res.get('idempotency_key', '')}",
-                          conn=conn)
-                out.append({"msg_key": m["msg_key"], "result": "sent"})
+                res = send(target, ADVICE_PREFIX + m["message"], m["msg_key"]) or {}
+            except Exception as e:  # noqa: BLE001 — nothing recorded: same key is safe again
+                attempts = (m["attempts"] or 0) + 1
+                conn.execute("UPDATE native_outbox SET attempts=?, receipt=? WHERE msg_key=?",
+                             (attempts, f"error:{type(e).__name__}", m["msg_key"]))
+                conn.commit()
+                if attempts >= MAX_DELIVERY_ATTEMPTS:
+                    _settle(conn, m, "failed", f"error:{type(e).__name__} x{attempts}", out,
+                            emit)
+                else:
+                    out.append({"msg_key": m["msg_key"], "result": "pending_retry",
+                                "reason": type(e).__name__})
+                continue
+            rcpt = f"agent_control:{res.get('idempotency_key', m['msg_key'])}"
+            if res.get("refused") and not res.get("duplicate"):
+                out.append({"msg_key": m["msg_key"], "result": "pending_refused",
+                            "reason": str(res.get("refused"))[:100]})
+            elif res.get("duplicate"):           # an earlier attempt exists: settle from it
+                if res.get("queued"):
+                    _settle(conn, m, "queued", rcpt + ":replayed", out, emit)
+                elif res.get("submitted"):
+                    _settle(conn, m, "sent", rcpt + ":replayed", out, emit)
+                else:
+                    _settle(conn, m, "failed", rcpt + ":earlier_attempt_unproven", out, emit)
+            elif res.get("submitted") and res.get("delivered"):
+                _settle(conn, m, "sent", rcpt, out, emit)
+            elif res.get("queued"):
+                _settle(conn, m, "queued", rcpt, out, emit)
             else:
-                out.append({"msg_key": m["msg_key"], "result": "pending_unproven",
-                            "reason": res.get("refused") or res.get("error") or ""})
+                _settle(conn, m, "failed", f"{rcpt}:unproven:{res.get('error', '')}", out,
+                        emit)
         return out
     finally:
         if own:
