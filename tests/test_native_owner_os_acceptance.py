@@ -343,3 +343,16 @@ def test_refuses_without_the_96_canary_dropin(sandbox):
     (sandbox["dropins"] / "96-native-owner-os-canary.conf").unlink()
     r = run(sandbox, "preconfig")
     assert r.returncode == 1 and "refusing" in r.stderr and calls(sandbox) == []
+
+
+def test_session_mode_installs_the_keyless_provider_and_expects_ready(sandbox):
+    (sandbox["dropins"] / "97-native-cto-provider.conf").write_text("[Service]\n")
+    r = run(sandbox, "session")
+    assert r.returncode == 0, r.stderr
+    assert not (sandbox["dropins"] / "97-native-cto-provider.conf").exists()
+    assert (sandbox["dropins"] / "97-native-cto-claude-session.conf").read_text() == \
+        (ROOT / "deploy" / "97-native-cto-claude-session.conf").read_text()
+    assert not sandbox["keys"].exists()
+    assert calls(sandbox)[-1].endswith("--expect ready --since-rowid 1")
+    assert run(sandbox, "remove").returncode == 0
+    assert not (sandbox["dropins"] / "97-native-cto-claude-session.conf").exists()

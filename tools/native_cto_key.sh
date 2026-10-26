@@ -3,7 +3,8 @@
 #
 #   tools/native_cto_key.sh preconfig  # provider config only, no key -> verify missing_secret
 #   tools/native_cto_key.sh install    # config + key (prompted, hidden) -> verify ready
-#   tools/native_cto_key.sh remove     # remove key AND config -> verify provider disabled
+#   tools/native_cto_key.sh session    # CTO = Claude Code session, NO key -> verify ready
+#   tools/native_cto_key.sh remove     # remove key AND both provider configs -> verify disabled
 #
 # The key is read from the terminal with echo off (or from stdin when piped), validated,
 # and written atomically to /etc/ai-runtime/cto-openai.env (root 0600). It is never passed
@@ -19,6 +20,7 @@ RUNTIME="${NATIVE_CTO_RUNTIME:-/root/ai-dev-runtime}"
 PY="${NATIVE_CTO_PY:-$RUNTIME/venv/bin/python}"
 DROPIN_DIR="${NATIVE_CTO_DROPIN_DIR:-/etc/systemd/system/ai-runtime.service.d}"
 DROPIN="$DROPIN_DIR/97-native-cto-provider.conf"
+SESSION_DROPIN="$DROPIN_DIR/97-native-cto-claude-session.conf"
 KEY_DIR="${NATIVE_CTO_KEY_DIR:-/etc/ai-runtime}"
 KEY_FILE="$KEY_DIR/cto-openai.env"
 SERVICE=ai-runtime.service
@@ -43,6 +45,7 @@ restart() {
 verify() { "$PY" "$HERE/tools/native_cto_verify.py" "$@"; }
 
 install_config() {
+  rm -f "$SESSION_DROPIN"          # one provider at a time
   install -m 0644 "$HERE/deploy/97-native-cto-provider.conf" "$DROPIN"
 }
 
@@ -69,10 +72,16 @@ case "${1:-}" in
       exit 1
     fi
     ;;
+  session)
+    rm -f "$DROPIN"
+    install -m 0644 "$HERE/deploy/97-native-cto-claude-session.conf" "$SESSION_DROPIN"
+    since=$(hwm); restart
+    verify --expect ready --since-rowid "$since"
+    ;;
   remove)
-    rm -f "$KEY_FILE" "$DROPIN"
+    rm -f "$KEY_FILE" "$DROPIN" "$SESSION_DROPIN"
     since=$(hwm); restart
     verify --expect disabled --since-rowid "$since"
     ;;
-  *) die "usage: $0 preconfig|install|remove" ;;
+  *) die "usage: $0 preconfig|install|session|remove" ;;
 esac
