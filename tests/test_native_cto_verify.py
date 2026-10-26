@@ -174,6 +174,22 @@ def test_ledger_report_is_read_only_and_tolerates_a_fresh_db(tmp_path):
     assert sqlite3.connect(db).execute("SELECT COUNT(*) FROM sqlite_master").fetchone() == (0,)
 
 
+def test_ledger_report_reads_an_older_schema_without_migrating_it(tmp_path):
+    db = tmp_path / "old.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE cto_decision (event_key TEXT PRIMARY KEY, agent TEXT, status TEXT)")
+    c.execute("CREATE TABLE native_outbox (msg_key TEXT, to_agent TEXT, state TEXT, "
+              "created_at TEXT, receipt TEXT)")
+    c.commit()
+    before = c.execute("PRAGMA schema_version").fetchone()
+    c.close()
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    rep = ncv.ledger_report(conn, {"aes-canary"})
+    conn.close()
+    assert rep["awaiting_controller_stale"] == [] and rep["decisions"] == {}
+    assert sqlite3.connect(db).execute("PRAGMA schema_version").fetchone() == before
+
+
 def test_provider_dropin_is_secret_free_and_overrides_the_96_canary():
     text = (ROOT / "deploy" / "97-native-cto-provider.conf").read_text()
     lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]

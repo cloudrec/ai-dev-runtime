@@ -12,7 +12,7 @@ only whether OPENAI_API_KEY is present.
 --key-check makes ONE GET {base}/models/{model} request (no tokens, no spend) to prove the
 key is accepted and the model is visible to it. Without it no network call is made.
 --since-rowid N fails if any agent_control delivery after row N made BY THIS STACK (keys
-`goal:` from native_goals, `cto:` from cto_bridge) went to a target outside
+`goal:` from native_goals, `cto:` / `ctoreq:` from cto_bridge) went to a target outside
 NATIVE_OWNER_OS_AGENTS; other senders (e.g. `nativesup:`) are only counted. The deliveries
 table is pruned by retention, so N older than its oldest row only proves the retained window.
 Delivery: `agent_control` (server-side, canary-scoped) and `native_controller` both pass;
@@ -42,7 +42,8 @@ STALL_SECS = 600
 SECRET_KEYS = ("OPENAI_API_KEY",)
 CONFIG_KEYS = ("NATIVE_OWNER_OS_ENABLED", "NATIVE_GOALS_ENABLED", "NATIVE_OWNER_OS_AGENTS",
                "OWNER_OS_CTO_PROVIDER", "OWNER_OS_CTO_MODEL", "OWNER_OS_CTO_BASE_URL",
-               "OWNER_OS_CTO_DELIVERY_MODE", "OWNER_OS_CTO_DENY_AGENTS")
+               "OWNER_OS_CTO_DELIVERY_MODE", "OWNER_OS_CTO_DENY_AGENTS",
+               "OWNER_OS_CTO_CONTROLLER")
 
 
 def service_pid(run=subprocess.run) -> int:
@@ -96,8 +97,9 @@ def ledger_report(conn, scope: set) -> dict:
     def q(sql, args=()):
         try:
             return conn.execute(sql, args).fetchall()
-        except sqlite3.OperationalError as e:      # table not created yet = nothing there
-            if "no such table" in str(e):
+        except sqlite3.OperationalError as e:
+            # table/column not created yet (older schema, feature unused) = nothing there
+            if "no such table" in str(e) or "no such column" in str(e):
                 return []
             raise
     cur = q("SELECT last_event_id,updated_at FROM cto_cursor WHERE consumer=?",
@@ -115,6 +117,10 @@ def ledger_report(conn, scope: set) -> dict:
         "stale_pending": [r[0] for r in q(
             "SELECT msg_key,created_at FROM native_outbox WHERE state='pending'")
             if (_age(r[1]) is None or _age(r[1]) > cb.ADVICE_TTL_SECS + STALL_SECS)],
+        "awaiting_controller_stale": [r[0] for r in q(
+            "SELECT event_key,requested_at FROM cto_decision WHERE "
+            "status='awaiting_controller'")
+            if (_age(r[1]) is None or _age(r[1]) > cb.CONTROLLER_TIMEOUT_SECS + STALL_SECS)],
         "delivery_failures": [{"msg_key": r[0], "state": r[1], "receipt": r[2]} for r in q(
             "SELECT msg_key,state,receipt FROM native_outbox WHERE state IN "
             "('failed','expired') ORDER BY created_at DESC LIMIT 10")],
@@ -140,7 +146,7 @@ def _in(agent: str, scope: set) -> bool:
     return a in scope or a.split(":", 1)[0] in scope
 
 
-OWN_KEY_PREFIXES = ("goal:", "cto:")
+OWN_KEY_PREFIXES = ("goal:", "cto:", "ctoreq:")
 
 
 def deliveries_since(path: str, rowid: int) -> dict:
@@ -184,6 +190,9 @@ def verdict(cfg: dict, ledger: dict, *, expect: str, key: dict = None,
         fails.append(f"gate={cfg['gate']!r} expected {want!r}")
     if expect == "ready" and key is not None and not key.get("ok"):
         fails.append(f"key_check failed status={key.get('status')}")
+    if ledger.get("awaiting_controller_stale"):
+        fails.append(f"controller requests unanswered past timeout (expiry not running) "
+                     f"{ledger['awaiting_controller_stale']}")
     if ledger["cursor"] is None:
         fails.append("controller cursor missing (loop not running?)")
     elif ledger["cursor"] < ledger["bus_head"] and (ledger.get("cursor_age_secs") is None or
