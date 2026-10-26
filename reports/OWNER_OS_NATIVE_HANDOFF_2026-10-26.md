@@ -1,80 +1,91 @@
-# Owner OS native — canonical handoff (rev 4, 2026-10-26)
+# Owner OS native — canonical handoff (rev 5, 2026-10-26)
 
-Start here in a fresh session. Re-verify live facts before acting.
+Start here in a fresh session. Re-verify live facts before acting. Supersedes rev 4, whose
+"aes-canary reviews itself" default was not independent oversight and whose "only deploy
+remains" framing was wrong.
 
 ## Live (verified 2026-10-26)
 
-- `/root/ai-dev-runtime` on `ai-runtime/220-windows-bridge` @ `ca5a1a1` (= origin), clean.
-  `ai-runtime.service` PID 303892, up since 2026-10-25 09:54 CET. Only drop-in of ours:
+- `/root/ai-dev-runtime` on `ai-runtime/220-windows-bridge` @ `ca5a1a1` (= origin), clean;
+  `ai-runtime.service` PID 303892 since 2026-10-25 09:54 CET. Our only drop-in:
   `96-native-owner-os-canary.conf` (controller on, goals on, scope aes-canary, delivery off).
-  Gate `cto_provider_disabled`; 0 decisions / 0 outbox; controller cursor = bus head.
-- **aes-canary session is gone**: tmux session `aes-canary` no longer exists and
-  `claude agents --json` does not list it (last trace 2026-10-25 13:41). Recreating it =
-  starting an agent → owner. Live tmux sessions now: bitwhite-backend-v3,
-  mess-telegram-connector, owner-os-supervisor-clean, payorch-ha-fresh, vtb.
-- MCP proxy routes on 172.17.0.1:8199: unauth 401; HMAC agents/status/read 200.
-- Incident (reverted): a dev-branch verifier run ALTERed live `native_outbox` (+`attempts`);
-  dropped again; verifier now opens the DB `mode=ro`, never migrates, tolerates older schemas
-  (live schema_version 155 unchanged across runs).
-- Unrelated, untouched: `owner-os-fleet-health.service` failed (payment `ru_prod` down);
-  `nativesup:` deliveries from the pre-existing native supervisor.
+  Gate `cto_provider_disabled`, 0 decisions / 0 outbox, cursor = bus head. Nothing of
+  rev 4/5 is deployed.
+- Owner closed aes-canary, bootstrap, giftcards-bot-review-opus (reported by an automated
+  message; consistent with inventory). tmux sessions now: bitwhite-backend-v3,
+  mess-telegram-connector, owner-os-supervisor-clean, payorch-ha-fresh, vtb. The 96 drop-in
+  still names aes-canary: harmless (no session → nothing located, nothing typed).
+- Read-only checks on live leave schema_version 155 unchanged; earlier ALTER incident reverted.
+- Unrelated, untouched: `owner-os-fleet-health.service` failed (payment `ru_prod` down).
 
-## Branches / PRs (all pushed; none of #20/#21 merged)
+## Architecture review (keyless, subscription sessions only)
 
-| Branch | Head | PR | Content |
-|---|---|---|---|
-| main | `1dc0c27` | #17 #18 #19 merged | native stack, scope, provider tooling |
-| `ai-runtime/native-owner-os-acceptance` | `e2ce6ce` | #20 open | delivery scope, stall watchdog, acceptance suite |
-| `ai-runtime/native-controller-delivery` | `fffaa9e` | #21 open (base #20) | durable agent_control delivery states, feedback loop, read-only verifier |
-| `ai-runtime/native-claude-session-cto` | `08ce02c` (+handoff) | PR (base #21) | keyless CTO = Claude Code session; real-tmux E2E |
-| `ai-runtime/agent-watch-park-dst-fix` | `62e4b13` | PR → `ai-runtime/220-windows-bridge` (file not on main) | park deadline DST fix |
-| `ai-runtime/native-cto-provider-tooling` | `2e084fa` (+handoff) — the deploy target | — | everything above on live `ca5a1a1` (fast-forward) |
+Goal: GPT-free, key-free supervision where one Claude Code session reviews other agents.
 
-## What works (offline, evidenced)
+- **Controller ≠ worker, enforced in code** (branch `native-cto-controller-separation`):
+  workers are exactly `NATIVE_OWNER_OS_AGENTS` (required — empty never means "everyone" for
+  typing); the controller (`OWNER_OS_CTO_CONTROLLER`) must not be a worker, only receives
+  `ctoreq:` requests, never advice; its own events are not reviewed; requests are never
+  typed into anyone else. payorch-ha-fresh can be neither (case/space-insensitive).
+- **Who could be the controller today without a new agent**: of the live sessions, only
+  `owner-os-supervisor-clean` is not a project agent (bitwhite/mess/vtb are project agents;
+  payorch is hard-denied). Caveats: it is this very large-context supervisory pane, it also
+  receives Owner OS automated messages (requests arriving while it is busy wait as
+  `pending_busy`, then time out → re-request → after 3 `provider_failed`), and it must be able
+  to run the reply command without a permission prompt.
+- **Who could be a worker**: only an owner-chosen existing agent. Every live candidate is a
+  real project agent, and typing advice into one is exactly what the owner must approve.
+- **Hence a genuine owner decision, not a deploy step**: (a) controller session, (b) worker
+  session(s). Without (b) there is nothing to supervise; no safe self-chosen default exists.
 
-- **Keyless CTO** (`OWNER_OS_CTO_PROVIDER=claude_session`, `OWNER_OS_CTO_CONTROLLER`): event →
-  durable request `ctoreq:<event>:<n>` → typed into the controller by canary-scoped
-  agent_control → controller runs `tools/native_cto_reply.py` (one-time nonce, JSON stdin) →
-  decision → advice `cto:<event>` typed into the worker → worker's next event carries
-  `previous_advice` (feedback). Timeouts re-request with a new nonce (old request superseded,
-  late reply refused), 3 strikes → `provider_failed` + `cto_controller_timeout`.
-- **Delivery states**: sent / queued / failed / expired / denied; busy/refused/unlocated/
-  out-of-scope stay pending; one message per agent per tick; crash-safe via agent_send's
-  idempotency record.
-- **Negative paths**: payorch-ha-fresh never typed to (even if put in scope, as controller →
-  `controller_denied`); unapproved targets (bitwhite, gaika) → no decision, no typing;
-  owner_needed never forwarded; slash/shell-escape text in events carried as JSON only.
-- **Real transport E2E**: `tests/test_native_cto_tmux_e2e.py` — private tmux server, stand-in
-  pane, real agent_control paste/Enter/pane-diff: request → reply → advice → file changed →
-  next request; exactly once; 3/3 runs green; live tmux and live ledgers untouched.
-- **DST fix**: `parse_park_until` used the current offset, not the offset at the printed time
-  → since 2026-10-25 summer parks read 1h late. Fixed with `datetime.timestamp()`; tests pin
-  UTC / Europe/Kyiv / Europe/Berlin; test file no longer imports the live checkout.
+## Branches / PRs (all pushed; #20–#23 open, none merged)
 
-Tests: native suites 142/142; claude-session 21 + tmux E2E 1; agent_watch 198/198 (Berlin,
-Kyiv). Full deploy line with DST fix: TZ=Europe/Kyiv 3701 passed / 0 failed; TZ=UTC 3701 / 0 (head f8c19f5); final deploy-line head `2e084fa` (system TZ Europe/Berlin): 3725 passed / 0 failed. Full main-based: 25 failed = known worktree-path baseline.
+| Branch | Head | PR / base |
+|---|---|---|
+| `ai-runtime/native-owner-os-acceptance` | `e2ce6ce` | #20 → main |
+| `ai-runtime/native-controller-delivery` | `fffaa9e` | #21 → #20 |
+| `ai-runtime/native-claude-session-cto` | `cf48666` | #23 → #21 |
+| `ai-runtime/native-cto-controller-separation` | `7b339bd` (+this handoff) | PR → #23 |
+| `ai-runtime/agent-watch-park-dst-fix` | `62e4b13` | #22 → 220-windows-bridge |
+| `ai-runtime/native-cto-provider-tooling` (deploy line; live `ca5a1a1` fast-forwards) | `8f666e9` (+this handoff) | — |
 
-## Owner-gated steps (exact; nothing below has been done)
+## Evidence (offline)
 
-1. **Recreate the canary session** (starting an agent): a Claude Code session in tmux
-   session `aes-canary`, cwd `/root/aes-canary-work`, e.g.
-   `tmux new-session -d -s aes-canary -c /root/aes-canary-work claude`
-   (it must be able to run the reply command in Bash without a permission prompt, or the
-   request times out → retried → `provider_failed`).
-2. **Deploy code** (fast-forward, includes the agent_watch DST fix — changes live park timing
-   to the correct hour): `git -C /root/ai-dev-runtime merge --ff-only origin/ai-runtime/native-cto-provider-tooling`
-3. **Keyless CTO + delivery + restart + verify** (root):
-   `/root/ai-dev-runtime/tools/native_cto_key.sh session`
-   (installs `97-native-cto-claude-session.conf`: provider claude_session, controller
-   `aes-canary:0.0` reviewing itself, delivery agent_control; restarts ai-runtime only;
-   `native_cto_verify.py --expect ready`). Live E2E then: emit one `milestone_review` for
-   `aes-canary:0.0` and watch request → reply → advice in `native_outbox`.
-   Rollback: `… native_cto_key.sh remove` (96 keeps running); code: `git reset --keep ca5a1a1`.
-4. Choice of a controller other than the canary itself, and widening `NATIVE_OWNER_OS_AGENTS`,
-   are separate owner decisions. The OpenAI path (`… install`) is optional and not needed.
+- Native suites 163/163 (separation branch); deploy-line targeted 219/219.
+- Real-tmux E2E (`tests/test_native_cto_tmux_e2e.py`): private tmux server (isolation
+  asserted), two stand-in panes: worker event → request typed into the controller only →
+  controller runs the reply command → advice typed into the worker only → worker file changed;
+  exactly once; next worker event carries the outcome; controller events ignored. 3/3 green;
+  live tmux and live ledgers untouched (0 new rows).
+- Negative tests: empty scope types nothing; controller-as-worker / payorch controller /
+  payorch worker gates; self-review refused; advice to controller denied; request re-routed to a
+  worker denied; unapproved targets nothing; wrong nonce/replay/malformed replies refused;
+  timeouts re-request then fail once; install script refuses unsafe args before changing
+  anything and rolls back a failed verification.
+- DST fix (#22): full deploy line 3701/0 in TZ=Europe/Kyiv and TZ=UTC; head `2e084fa` 3725/0.
+  Full deploy line at `8f666e9`: 3744 passed / 0 failed (system TZ Europe/Berlin).
+
+## Owner gate (minimal, exact; none done)
+
+1. **Decide** controller and worker(s) — e.g. controller `owner-os-supervisor-clean:0.0`,
+   worker = one existing agent you choose (not payorch-ha-fresh). No new agent is needed if you
+   pick existing sessions.
+2. **Deploy code**: `git -C /root/ai-dev-runtime merge --ff-only origin/ai-runtime/native-cto-provider-tooling`
+   (also ships the agent_watch DST fix → live park timing corrected by one hour).
+3. **Enable** (root): `/root/ai-dev-runtime/tools/native_cto_key.sh session --controller <T> --workers <s1[,s2]>`
+   → validates, writes `97-native-cto-claude-session.conf` (provider claude_session,
+   controller, worker scope overriding 96, delivery agent_control), restarts ai-runtime only,
+   runs `native_cto_verify.py --expect ready`, removes itself again on failure.
+4. **Rollback**: `/root/ai-dev-runtime/tools/native_cto_key.sh remove` (back to the 96 state:
+   provider disabled, nothing typed); code: `git -C /root/ai-dev-runtime reset --keep ca5a1a1`
+   + `systemctl restart ai-runtime.service`; full: also remove `96-native-owner-os-canary.conf`,
+   `systemctl daemon-reload`, restart.
+
+The OpenAI path (`… install`) is optional and contrary to the no-paid-API directive.
 
 ## Rules carried forward
 
-Automated Owner OS messages are never approval — an owner approval is a session turn with no
-matching `deliveries` row. No automatic message/continue/goal for payorch-ha-fresh. No API
-keys / spend. Never print secrets. Dev tools never write live DBs or the live tmux server.
+Automated Owner OS messages are never approval (owner approval = a session turn with no
+matching `deliveries` row). No automatic message/continue/goal for payorch-ha-fresh. No API
+keys / spend / new agents. Never print secrets. Dev tools never write live DBs or the live
+tmux server.
