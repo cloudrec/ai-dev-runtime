@@ -138,11 +138,13 @@ def test_only_this_stacks_deliveries_are_judged(tmp_path):
     c.execute("CREATE TABLE deliveries (idempotency_key TEXT, target TEXT)")
     c.executemany("INSERT INTO deliveries VALUES (?,?)", [
         ("old", "x:0.0"), ("goal:aes-canary:h", "aes-canary:0.0"),
-        ("cto:cp:5", "aes-canary:0.0"), ("nativesup:7", "bitwhite:0.0"), ("adhoc", "me:0.0")])
+        ("cto:cp:5", "aes-canary:0.0"), ("ctoreq:cp:5:1", "cto-controller:0.0"),
+        ("nativesup:7", "bitwhite:0.0"), ("adhoc", "me:0.0")])
     c.commit()
     c.close()
     assert ncv.deliveries_since(str(db), 1) == {
-        "own": ["aes-canary:0.0", "aes-canary:0.0"], "other": {"nativesup": 1,
+        "own": ["aes-canary:0.0", "aes-canary:0.0"], "requests": ["cto-controller:0.0"],
+        "other": {"nativesup": 1,
                                                               "(unprefixed)": 1}}
 
 

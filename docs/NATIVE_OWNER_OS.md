@@ -118,9 +118,13 @@ Missing pieces surface as explicit gates: `missing_config:OWNER_OS_CTO_MODEL`,
 
 `OWNER_OS_CTO_PROVIDER=claude_session` + `OWNER_OS_CTO_CONTROLLER=<tmux target>` makes an
 already-authenticated Claude Code session (the owner's subscription) the CTO: no API key, no
-metered spend, no new agent. Gates: `missing_config:OWNER_OS_CTO_CONTROLLER`,
-`controller_denied` (payorch-ha-fresh / deny list), `controller_out_of_scope` (must be inside
-`NATIVE_OWNER_OS_AGENTS`), `controller_needs_delivery_mode:agent_control`.
+metered spend, no new agent. **Independent oversight**: workers are exactly
+`NATIVE_OWNER_OS_AGENTS`; the controller is a different session that only ever receives CTO
+requests (`ctoreq:`), workers only ever receive advice (`cto:`); the controller's own events
+are never reviewed and advice to it is `denied`. Gates: `missing_config:OWNER_OS_CTO_CONTROLLER`,
+`controller_denied` (payorch-ha-fresh / deny list, case/space-insensitive),
+`worker_scope_required` (empty scope never means "everyone" for typing),
+`controller_is_worker` (no self-review), `controller_needs_delivery_mode:agent_control`.
 
 1. a reasoning event latches a `cto_decision` and queues ONE request
    `ctoreq:<event>:<attempt>` for the controller in `native_outbox` (`awaiting_controller`);
@@ -137,9 +141,10 @@ metered spend, no new agent. Gates: `missing_config:OWNER_OS_CTO_CONTROLLER`,
    `superseded`, never typed; late replies `bad_nonce`); after 3 → `provider_failed` +
    `cto_controller_timeout` event. owner_needed replies are never forwarded.
 
-Install (owner, root): `tools/native_cto_key.sh session` (installs
+Install (owner, root): `tools/native_cto_key.sh session --controller <tmux target>
+--workers <session,…>` (validates the choices, renders
 `deploy/97-native-cto-claude-session.conf`, removes the OpenAI 97, restarts, verifies
-`--expect ready`). `tests/test_native_cto_tmux_e2e.py` runs the whole loop over the real
+`--expect ready`, removes itself again if verification fails). `tests/test_native_cto_tmux_e2e.py` runs the whole loop over the real
 agent_control tmux transport against a stand-in pane on a private tmux server.
 
 ## Canary (aes-canary only)
@@ -181,7 +186,9 @@ Other senders (e.g. `nativesup:`) are counted, not judged. Watchdog: unread bus 
 the controller cursor has not moved for 10 minutes fail every check (loop dead or wedged). The
 `deliveries` table is pruned by retention, so `--since-rowid` evidence covers only retained rows.
 `agent_control` fallback delivery also enforces `NATIVE_OWNER_OS_AGENTS` (out-of-scope advice
-stays `pending`), in addition to the event-level scope filter and the hard denies.
+stays `pending`; with NO scope configured nothing is typed: `pending_no_scope`), in addition to
+the event-level scope filter and the hard denies. The verifier also fails on a controller that
+is a worker, advice typed into the controller, and requests typed anywhere but the controller.
 
 Offline acceptance: `tests/test_native_owner_os_acceptance.py` chains event → decision → outbox
 → delivery → verifier through the real controller tick (all delivery modes, busy, out-of-scope,

@@ -31,12 +31,12 @@ def _load(name):
 reply_tool = _load("native_cto_reply")
 ncv = _load("native_cto_verify")
 
-CTL = "aes-canary:0.0"          # canary reviewing itself: controller == worker
-WORKER = "aes-canary:0.0"
+CTL = "cto-controller:0.0"      # independent reviewer session, NOT a worker
+WORKER = "worker-a:0.0"
 
 
 def listing(*rows):
-    rows = rows or (("aes-canary", CTL, "idle"),)
+    rows = rows or (("cto-controller", CTL, "idle"), ("worker-a", WORKER, "idle"))
     return {"source": "claude_agents_json", "sessions": [
         {"name": n, "kind": "interactive", "cwd": f"/w/{n}", "session_id": n, "state": st,
          "pid": i + 1, "tmux_target": t} for i, (n, t, st) in enumerate(rows)]}
@@ -48,7 +48,7 @@ def _iso(tmp_path, monkeypatch):
     for k in ("NATIVE_GOALS_ENABLED", "OPENAI_API_KEY", "OWNER_OS_CTO_MODEL",
               "OWNER_OS_CTO_DENY_AGENTS"):
         monkeypatch.delenv(k, raising=False)
-    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "worker-a")
     monkeypatch.setenv("OWNER_OS_CTO_PROVIDER", "claude_session")
     monkeypatch.setenv("OWNER_OS_CTO_CONTROLLER", CTL)
     monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
@@ -110,8 +110,11 @@ def reply(key, nonce, **over):
 @pytest.mark.parametrize("env,gate", [
     ({"OWNER_OS_CTO_CONTROLLER": ""}, "missing_config:OWNER_OS_CTO_CONTROLLER"),
     ({"OWNER_OS_CTO_CONTROLLER": "payorch-ha-fresh:0.0",
-      "NATIVE_OWNER_OS_AGENTS": "aes-canary,payorch-ha-fresh"}, "controller_denied"),
-    ({"OWNER_OS_CTO_CONTROLLER": "bitwhite-backend-v3:0.0"}, "controller_out_of_scope"),
+      "NATIVE_OWNER_OS_AGENTS": "worker-a,payorch-ha-fresh"}, "controller_denied"),
+    ({"OWNER_OS_CTO_CONTROLLER": " PAYORCH-HA-FRESH:1.1"}, "controller_denied"),
+    ({"NATIVE_OWNER_OS_AGENTS": ""}, "worker_scope_required"),
+    ({"NATIVE_OWNER_OS_AGENTS": "worker-a,cto-controller"}, "controller_is_worker"),
+    ({"NATIVE_OWNER_OS_AGENTS": "cto-controller:1.0"}, "controller_is_worker"),
     ({"OWNER_OS_CTO_DELIVERY_MODE": "native_controller"},
      "controller_needs_delivery_mode:agent_control"),
     ({}, ""),
@@ -168,20 +171,26 @@ def test_event_request_reply_advice_then_next_event_carries_the_outcome(pane):
     assert ctx["previous_advice"][0]["advice"] == "split the migration into two steps"
     # verifier reads the same state as healthy
     cfg, _ = ncv.config_report({"NATIVE_OWNER_OS_ENABLED": "1", "NATIVE_GOALS_ENABLED": "1",
-                                "NATIVE_OWNER_OS_AGENTS": "aes-canary",
+                                "NATIVE_OWNER_OS_AGENTS": "worker-a",
                                 "OWNER_OS_CTO_PROVIDER": "claude_session",
                                 "OWNER_OS_CTO_CONTROLLER": CTL,
                                 "OWNER_OS_CTO_DELIVERY_MODE": "agent_control"})
     conn, _ = _c(None)
-    led = ncv.ledger_report(conn, {"aes-canary"})
+    led = ncv.ledger_report(conn, {"worker-a"})
     conn.close()
-    assert ncv.verdict(cfg, led, expect="ready", targets=[t["target"] for t in pane]) == []
+    assert ncv.verdict(cfg, led, expect="ready",
+                       targets=[x["target"] for x in pane if not x["key"].startswith("ctoreq:")],
+                       request_targets=[x["target"] for x in pane
+                                        if x["key"].startswith("ctoreq:")]) == []
+    # and the verifier would catch the two crossing failures
+    assert ncv.verdict(cfg, led, expect="ready", targets=[CTL])
+    assert ncv.verdict(cfg, led, expect="ready", request_targets=[WORKER])
 
 
 def test_request_waits_while_the_controller_is_busy(pane):
     tick()
     emit("repeated_failure")
-    out = tick(listing(("aes-canary", CTL, "busy")))
+    out = tick(listing(("cto-controller", CTL, "busy")))
     assert pane == [] and [d["result"] for d in out["delivered"]] == ["pending_busy"]
     tick()
     assert len(pane) == 1
@@ -279,7 +288,7 @@ def test_failed_request_delivery_retries_without_waiting_for_the_timeout(monkeyp
 def test_superseded_request_is_never_typed(pane):
     tick()
     emit("repeated_failure")
-    tick(listing(("aes-canary", CTL, "busy")))   # request 1 queued, not typed
+    tick(listing(("cto-controller", CTL, "busy")))   # request 1 queued, not typed
     _age_request(cb.CONTROLLER_TIMEOUT_SECS + 5)
     tick()                                       # expire -> request 2; request 1 superseded
     keys = [t["key"] for t in pane]
@@ -290,8 +299,8 @@ def test_superseded_request_is_never_typed(pane):
 # ── scope / hard deny ─────────────────────────────────────────────────────────
 
 def test_payorch_never_receives_a_request_or_advice_even_in_scope(pane, monkeypatch):
-    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary,payorch-ha-fresh")
-    lst = listing(("aes-canary", CTL, "idle"), ("payorch", "payorch-ha-fresh:0.0", "idle"))
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "worker-a,payorch-ha-fresh")
+    lst = listing(("cto-controller", CTL, "idle"), ("payorch", "payorch-ha-fresh:0.0", "idle"))
     tick(lst)
     emit("architecture_conflict", agent="payorch-ha-fresh:0.0")
     tick(lst)
@@ -306,7 +315,7 @@ def test_payorch_never_receives_a_request_or_advice_even_in_scope(pane, monkeypa
 
 
 def test_unapproved_targets_get_nothing(pane):
-    lst = listing(("aes-canary", CTL, "idle"), ("bitwhite", "bitwhite-backend-v3:0.0", "idle"),
+    lst = listing(("cto-controller", CTL, "idle"), ("bitwhite", "bitwhite-backend-v3:0.0", "idle"),
                   ("gaika", "gaika:0.0", "idle"))
     tick(lst)
     emit("architecture_conflict", agent="bitwhite-backend-v3:0.0")
@@ -331,3 +340,43 @@ def test_reply_command_targets_the_requesting_ledger(pane, tmp_path):
     emit("repeated_failure")
     tick()
     assert f"CONTROL_PLANE_DB={tmp_path / 'cp.db'} " in pane[0]["text"]
+
+
+def test_controller_events_are_never_reviewed_and_it_never_gets_advice(pane, monkeypatch):
+    tick()
+    emit("architecture_conflict", agent=CTL)          # the controller's own event
+    tick()
+    assert pane == [] and q("SELECT COUNT(*) FROM cto_decision") == [(0,)]
+    # a decision row naming the controller as agent (defence in depth) is refused
+    r = cb.handle_event({"key": "manual:1", "type": "repeated_failure", "agent": CTL,
+                         "project": "p"}, provider=cb.ClaudeSessionProvider(controller=CTL))
+    assert r["status"] == "provider_failed" and r["error"] == "self_review_refused"
+    # advice addressed to the controller is denied, never typed
+    conn, _ = _c(None)
+    cb._schema(conn)
+    conn.execute("INSERT INTO native_outbox (msg_key,event_key,to_agent,message,created_at) "
+                 "VALUES ('cto:z','z',?,'m',?)", (CTL, "2099-01-01T00:00:00+00:00"))
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "worker-a")
+    out = cb.deliver_pending_agent_control(listing())
+    assert {"msg_key": "cto:z", "result": "denied"} in out and pane == []
+
+
+def test_a_request_is_never_typed_into_anyone_but_the_controller(pane, monkeypatch):
+    tick()
+    emit("repeated_failure")
+    # controller re-configured before delivery: the queued request must not follow it
+    monkeypatch.setenv("OWNER_OS_CTO_CONTROLLER", "other-controller:0.0")
+    no.run_once(listing=listing(), provider=cb.ClaudeSessionProvider(controller=CTL))
+    assert all(x["target"] != CTL for x in pane)
+    conn, _ = _c(None)
+    cb._schema(conn)
+    conn.execute("INSERT INTO native_outbox (msg_key,event_key,to_agent,message,created_at) "
+                 "VALUES ('ctoreq:x:1','x',?,'m',?)", (WORKER, "2099-01-01T00:00:00+00:00"))
+    conn.commit()
+    conn.close()
+    monkeypatch.setenv("OWNER_OS_CTO_CONTROLLER", CTL)
+    out = cb.deliver_pending_agent_control(listing())
+    assert {"msg_key": "ctoreq:x:1", "result": "denied"} in out
+    assert all(x["target"] != WORKER or not x["key"].startswith("ctoreq:") for x in pane)
