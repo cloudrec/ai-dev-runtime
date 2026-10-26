@@ -241,13 +241,17 @@ def provider_from_env() -> tuple:
         return None, "cto_provider_disabled"
     if kind == "claude_session":
         from core import native_owner_os as no
-        ctl = os.getenv("OWNER_OS_CTO_CONTROLLER", "").strip()
+        ctl = controller_target()
         if not ctl:
             return None, "missing_config:OWNER_OS_CTO_CONTROLLER"
         if agent_denied(ctl):
             return None, "controller_denied"
-        if not no.in_scope(ctl):
-            return None, "controller_out_of_scope"
+        # independent oversight: workers are NATIVE_OWNER_OS_AGENTS, the controller is not
+        # one of them (no self-review), and an empty worker scope (= "all") is refused
+        if not no.agent_scope():
+            return None, "worker_scope_required"
+        if any(is_controller(a) for a in no.agent_scope()):
+            return None, "controller_is_worker"
         if delivery_mode() != "agent_control":
             return None, "controller_needs_delivery_mode:agent_control"
         return ClaudeSessionProvider(controller=ctl), ""
@@ -297,8 +301,19 @@ def previous_advice(agent: str, conn) -> list:
 def agent_denied(agent: str) -> bool:
     extra = {s.strip() for s in os.getenv("OWNER_OS_CTO_DENY_AGENTS", "").split(",")
              if s.strip()}
-    base = (agent or "").split(":")[0]
-    return base in HARD_DENY_AGENTS or base in extra
+    base = (agent or "").strip().split(":")[0].lower()
+    return base in HARD_DENY_AGENTS or base in {e.lower() for e in extra}
+
+
+def controller_target() -> str:
+    """OWNER_OS_CTO_CONTROLLER (claude_session provider), "" when unset."""
+    return os.getenv("OWNER_OS_CTO_CONTROLLER", "").strip()
+
+
+def is_controller(agent: str) -> bool:
+    """Same tmux session as the configured controller (any window/pane of it)."""
+    ctl = controller_target()
+    return bool(ctl) and (agent or "").strip().split(":")[0] == ctl.split(":")[0]
 
 
 def conversation_for(project: str, provider: Provider, conn) -> Optional[str]:
@@ -363,7 +378,8 @@ def _finish(conn, key, etype, ctx, out, status, err, attempts, cid, provider, ow
                            model_tier=f"cto:{provider.model}", conn=conn)
     queued = False
     agent = ctx.get("agent") or ""
-    if msg and agent and not agent_denied(agent) and not owner_needed:
+    if msg and agent and not agent_denied(agent) and not is_controller(agent) \
+            and not owner_needed:
         # owner-needed advice is NOT forwarded as an instruction: the owner decides first
         queued = conn.execute(
             "INSERT OR IGNORE INTO native_outbox (msg_key,event_key,to_agent,message,"
@@ -383,6 +399,14 @@ def _finish(conn, key, etype, ctx, out, status, err, attempts, cid, provider, ow
 
 
 def _request_controller(conn, key: str, ctx: dict, attempts: int, provider) -> dict:
+    if is_controller(ctx.get("agent") or ""):
+        # defensive (events from the controller are filtered upstream): never self-review
+        conn.execute("UPDATE cto_decision SET status='provider_failed', "
+                     "error='self_review_refused' WHERE event_key=?", (key,))
+        conn.commit()
+        return {"handled": True, "status": "provider_failed", "owner_needed": False,
+                "message_queued": False, "error": "self_review_refused",
+                "conversation_id": None}
     attempts += 1
     nonce = secrets.token_hex(12)
     # an older, still-undelivered request for this event must never be typed any more
@@ -643,9 +667,25 @@ def deliver_pending_agent_control(listing: dict, *, send: Optional[Callable] = N
                 _mark(conn, m["msg_key"], "denied", "hard_denied_agent")
                 out.append({"msg_key": m["msg_key"], "result": "denied"})
                 continue
-            if not no.in_scope(target):          # canary scope also binds delivery
-                out.append({"msg_key": m["msg_key"], "result": "pending_out_of_scope"})
-                continue
+            if m["msg_key"].startswith(REQUEST_KEY):
+                # CTO requests go to the configured controller and nowhere else
+                if not is_controller(target):
+                    _mark(conn, m["msg_key"], "denied", "request_not_for_controller")
+                    out.append({"msg_key": m["msg_key"], "result": "denied"})
+                    continue
+            else:
+                # advice goes only to explicitly scoped workers, never to the controller;
+                # no scope configured = nobody (autonomous typing never means "everyone")
+                if not no.agent_scope():
+                    out.append({"msg_key": m["msg_key"], "result": "pending_no_scope"})
+                    continue
+                if is_controller(target):
+                    _mark(conn, m["msg_key"], "denied", "advice_to_controller")
+                    out.append({"msg_key": m["msg_key"], "result": "denied"})
+                    continue
+                if not no.in_scope(target):
+                    out.append({"msg_key": m["msg_key"], "result": "pending_out_of_scope"})
+                    continue
             age = _age_secs(m["created_at"])
             if age is None or age > ADVICE_TTL_SECS:
                 _settle(conn, m, "expired", f"age={age}", out, emit)

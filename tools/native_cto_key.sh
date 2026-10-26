@@ -3,7 +3,9 @@
 #
 #   tools/native_cto_key.sh preconfig  # provider config only, no key -> verify missing_secret
 #   tools/native_cto_key.sh install    # config + key (prompted, hidden) -> verify ready
-#   tools/native_cto_key.sh session    # CTO = Claude Code session, NO key -> verify ready
+#   tools/native_cto_key.sh session --controller T --workers a,b
+#                                      # CTO = Claude Code session T, NO key; workers a,b
+#                                      # (validated, independent) -> verify ready
 #   tools/native_cto_key.sh remove     # remove key AND both provider configs -> verify disabled
 #
 # The key is read from the terminal with echo off (or from stdin when piped), validated,
@@ -49,6 +51,9 @@ install_config() {
   install -m 0644 "$HERE/deploy/97-native-cto-provider.conf" "$DROPIN"
 }
 
+valid_session() { [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]]; }
+denied() { [ "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" = "payorch-ha-fresh" ]; }
+
 case "${1:-}" in
   preconfig)
     install_config
@@ -73,10 +78,34 @@ case "${1:-}" in
     fi
     ;;
   session)
+    shift; ctl=""; workers=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --controller) ctl="${2:-}"; shift 2 ;;
+        --workers) workers="${2:-}"; shift 2 ;;
+        *) die "unknown argument $1" ;;
+      esac
+    done
+    [[ "$ctl" =~ ^[A-Za-z0-9_.-]+(:[0-9]+(\.[0-9]+)?)?$ ]] || die "--controller tmux target required"
+    ctl_session="${ctl%%:*}"
+    denied "$ctl_session" && die "controller may not be payorch-ha-fresh"
+    [ -n "$workers" ] || die "--workers required (at least one explicit worker session)"
+    IFS=, read -ra ws <<< "$workers"
+    for w in "${ws[@]}"; do
+      valid_session "$w" || die "worker '$w' is not a tmux session name"
+      denied "$w" && die "payorch-ha-fresh may not be a worker"
+      [ "$w" = "$ctl_session" ] && die "controller may not also be a worker (no self-review)"
+    done
     rm -f "$DROPIN"
-    install -m 0644 "$HERE/deploy/97-native-cto-claude-session.conf" "$SESSION_DROPIN"
+    sed -e "s|__CONTROLLER__|$ctl|" -e "s|__WORKERS__|$workers|" \
+      "$HERE/deploy/97-native-cto-claude-session.conf" > "$SESSION_DROPIN"
+    chmod 0644 "$SESSION_DROPIN"
     since=$(hwm); restart
-    verify --expect ready --since-rowid "$since"
+    if ! verify --expect ready --since-rowid "$since"; then
+      echo "native_cto_key: verification FAILED -> removing the session provider" >&2
+      rm -f "$SESSION_DROPIN"; restart
+      exit 1
+    fi
     ;;
   remove)
     rm -f "$KEY_FILE" "$DROPIN" "$SESSION_DROPIN"

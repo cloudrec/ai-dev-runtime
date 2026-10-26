@@ -55,6 +55,8 @@ def map_event(e: dict) -> Optional[str]:
         return None
     if not in_scope(e.get("agent_id") or ""):
         return None
+    if cb.is_controller(e.get("agent_id") or ""):
+        return None              # the CTO's own session is never reviewed by itself
     if e.get("type") in cb.REASONING_EVENTS:
         return e["type"]
     if e.get("owner_action_required"):
