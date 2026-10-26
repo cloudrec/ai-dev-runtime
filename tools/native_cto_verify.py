@@ -13,11 +13,15 @@ only whether OPENAI_API_KEY is present.
 key is accepted and the model is visible to it. Without it no network call is made.
 --since-rowid N fails if any agent_control delivery after row N made BY THIS STACK (keys
 `goal:` from native_goals, `cto:` from cto_bridge) went to a target outside
-NATIVE_OWNER_OS_AGENTS; other senders (e.g. `nativesup:`) are only counted. Exit 0 = pass.
+NATIVE_OWNER_OS_AGENTS; other senders (e.g. `nativesup:`) are only counted. The deliveries
+table is pruned by retention, so N older than its oldest row only proves the retained window.
+Watchdog: unread bus events while the controller cursor has not moved for STALL_SECS fail the
+check (loop dead or wedged). Exit 0 = pass.
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import sqlite3
@@ -31,6 +35,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 SERVICE = "ai-runtime.service"
+STALL_SECS = 600
 SECRET_KEYS = ("OPENAI_API_KEY",)
 CONFIG_KEYS = ("NATIVE_OWNER_OS_ENABLED", "NATIVE_GOALS_ENABLED", "NATIVE_OWNER_OS_AGENTS",
                "OWNER_OS_CTO_PROVIDER", "OWNER_OS_CTO_MODEL", "OWNER_OS_CTO_BASE_URL",
@@ -85,12 +90,14 @@ def ledger_report(conn, scope: set) -> dict:
     from core import native_owner_os as no
     cb._schema(conn)
     q = lambda s, a=(): conn.execute(s, a).fetchall()  # noqa: E731
-    cur = q("SELECT last_event_id FROM cto_cursor WHERE consumer=?", (no.CONSUMER,))
+    cur = q("SELECT last_event_id,updated_at FROM cto_cursor WHERE consumer=?",
+            (no.CONSUMER,))
     head = q("SELECT COALESCE(MAX(id),0) FROM event")[0][0]
     agents = {r[0] for r in q("SELECT DISTINCT agent FROM cto_decision")}
     outbox_to = {r[0] for r in q("SELECT DISTINCT to_agent FROM native_outbox")}
     return {
         "cursor": cur[0][0] if cur else None, "bus_head": head,
+        "cursor_age_secs": _age(cur[0][1]) if cur else None,
         "decisions": dict(q("SELECT status,COUNT(*) FROM cto_decision GROUP BY status")),
         "outbox": dict(q("SELECT state,COUNT(*) FROM native_outbox GROUP BY state")),
         "conversations": q("SELECT COUNT(*) FROM cto_conversation")[0][0],
@@ -99,6 +106,17 @@ def ledger_report(conn, scope: set) -> dict:
             a for a in outbox_to if cb.agent_denied(a) and
             q("SELECT 1 FROM native_outbox WHERE to_agent=? AND state='pending'", (a,))),
     }
+
+
+def _age(iso, now=None):
+    try:
+        t = datetime.datetime.fromisoformat(str(iso))
+    except ValueError:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=datetime.timezone.utc)
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    return round((now - t).total_seconds())
 
 
 def _in(agent: str, scope: set) -> bool:
@@ -146,6 +164,10 @@ def verdict(cfg: dict, ledger: dict, *, expect: str, key: dict = None,
         fails.append(f"key_check failed status={key.get('status')}")
     if ledger["cursor"] is None:
         fails.append("controller cursor missing (loop not running?)")
+    elif ledger["cursor"] < ledger["bus_head"] and (ledger.get("cursor_age_secs") is None or
+                                                    ledger["cursor_age_secs"] > STALL_SECS):
+        fails.append(f"controller stalled: cursor {ledger['cursor']} < head "
+                     f"{ledger['bus_head']}, unmoved {ledger.get('cursor_age_secs')}s")
     if ledger["out_of_scope_decisions"]:
         fails.append(f"out-of-scope decisions {ledger['out_of_scope_decisions']}")
     if ledger["denied_outbox_pending"]:
