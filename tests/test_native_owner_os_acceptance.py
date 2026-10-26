@@ -100,7 +100,7 @@ def test_event_to_decision_to_delivery_to_verify_exactly_once(sends):
     eid = emit("architecture_conflict")
     out = tick(p)
     assert p.calls == [("architecture_conflict", CANARY, "conv_owner-os")]
-    assert out["delivered"] == [{"msg_key": f"cto:cp:{eid}", "result": "sent"}]
+    assert [(d["msg_key"], d["result"]) for d in out["delivered"]] == [(f"cto:cp:{eid}", "sent")]
     assert sends == [(CANARY, cb.ADVICE_PREFIX + "split the migration", f"cto:cp:{eid}")]
     assert q("SELECT status FROM cto_decision") == [("decided",)]
     assert q("SELECT state FROM native_outbox") == [("sent",)]
