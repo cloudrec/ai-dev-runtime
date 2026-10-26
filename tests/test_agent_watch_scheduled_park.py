@@ -12,12 +12,17 @@ These pin the parse (fail-closed in every direction), the class ranking (a real 
 a crash or an owner gate still wins), the durable declaration that stops the poking, and
 the wake at the stated time.
 """
+import datetime
+import os
+import pathlib
 import sys
 import time
+from zoneinfo import ZoneInfo
 
 import pytest
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+# the repo this file lives in — never a hard-coded live checkout
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from core import agent_watch as aw  # noqa: E402
 
@@ -197,3 +202,53 @@ def test_every_door_that_poked_57311_now_declines(tmp_path, monkeypatch):
     assert clw._armed_external_wait(conn, target, DUE + 1) is False
     assert aw.classify(PARKED_PANE, state="idle", prev_cls="working", quiet_secs=400,
                        now=DUE + 1)["cls"] != "parked_scheduled"
+
+
+# ── wall-clock -> epoch across DST (2026-10-25: EEST->EET in Kyiv, CEST->CET in Berlin) ──
+
+@pytest.fixture(params=["UTC", "Europe/Kyiv", "Europe/Berlin"])
+def local_tz(request):
+    """Pin the process timezone for one test, restore it afterwards."""
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = request.param
+    time.tzset()
+    try:
+        yield ZoneInfo(request.param)
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+
+
+def _epoch(tz, y, mo, d, hh, mm, fold=0):
+    return datetime.datetime(y, mo, d, hh, mm, fold=fold, tzinfo=tz).timestamp()
+
+
+@pytest.mark.parametrize("when,text", [
+    ((2026, 9, 23, 2, 0), "Припаркован до 23 Sep 02:00"),     # summer time
+    ((2026, 10, 24, 23, 0), "Parked until 24 Oct 23:00"),      # last summer evening
+    ((2026, 10, 25, 5, 0), "Parked until 25 Oct 05:00"),       # first winter morning
+    ((2026, 12, 1, 10, 0), "Parked until 1 Dec 10:00"),        # winter
+])
+@pytest.mark.parametrize("now_offset", [-3600, -2 * 86400])
+def test_park_time_uses_the_offset_in_force_at_that_time(local_tz, when, text, now_offset):
+    due = _epoch(local_tz, *when)
+    assert aw.parse_park_until(text, now=due + now_offset) == due
+
+
+def test_park_time_does_not_depend_on_the_current_offset(local_tz, monkeypatch):
+    """The 2026-10-25 regression: a summer-time park read while the clock is in winter."""
+    due = _epoch(local_tz, 2026, 9, 23, 2, 0)
+    winter = _epoch(local_tz, 2026, 10, 26, 12, 0)
+    monkeypatch.setattr(time, "time", lambda: winter)
+    assert aw.parse_park_until("Parked until 23 Sep 02:00", now=due - 3600) == due
+
+
+def test_ambiguous_fall_back_time_resolves_to_the_first_occurrence(local_tz):
+    # Kyiv repeats 03:00-04:00 and Berlin 02:00-03:00 on 2026-10-25; UTC repeats nothing.
+    hh = {"Europe/Kyiv": 3, "Europe/Berlin": 2}.get(str(local_tz), 3)
+    first = _epoch(local_tz, 2026, 10, 25, hh, 30, fold=0)
+    assert aw.parse_park_until(f"Parked until 25 Oct {hh:02d}:30",
+                               now=first - 3600) == first
