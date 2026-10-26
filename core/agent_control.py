@@ -1839,6 +1839,68 @@ def _prompt_consumed(target: str, text: str, cwd: str = "") -> bool:
     return not (pending.startswith(ours[:60]) or ours.startswith(pending[:60]))
 
 
+# ── automation policy (2026-10-27) ──────────────────────────────────────────
+# Every automatic keystroke into an agent (native supervisor, continuation watchdog,
+# orchestrator, context budget, phase advance, agent fabric, /goal, CTO bridge) reaches a
+# pane through `_deliver`. Policy, checked on the RESOLVED pane's session:
+#   * AUTOMATION_HARD_DENY sessions (the payment agent) receive nothing from anyone, the
+#     API included; reads are unaffected;
+#   * an in-process caller (actor not "api:…") may type only into sessions listed in
+#     AGENT_AUTOMATION_TARGETS (comma list of sessions or targets). Empty = none. "*" is
+#     never a wildcard — "all agents" cannot be expressed;
+#   * AGENT_AUTOMATION_POLICY=off restores the previous unrestricted behaviour (owner-gated
+#     escape hatch); the hard deny stays on even then.
+AUTOMATION_HARD_DENY = frozenset({"payorch-ha-fresh"})
+
+
+def automation_targets() -> set:
+    raw = os.getenv("AGENT_AUTOMATION_TARGETS", "")
+    return {t.strip() for t in raw.split(",") if t.strip() and t.strip() != "*"}
+
+
+def automation_refusal(session: str, target: str, actor: Optional[str]) -> str:
+    """"" when allowed, else the refusal reason."""
+    sess = (session or "").strip()
+    if sess.lower() in AUTOMATION_HARD_DENY or \
+            (target or "").strip().split(":")[0].lower() in AUTOMATION_HARD_DENY:
+        return "hard_denied_target"
+    if (actor or "").startswith(_AUTOMATED_ACTOR_PREFIX):
+        return ""                                   # authenticated API caller
+    if os.getenv("AGENT_AUTOMATION_POLICY", "enforce").strip().lower() == "off":
+        return ""
+    allowed = automation_targets()
+    if sess in allowed or (target or "").strip() in allowed:
+        return ""
+    return "automation_target_not_allowlisted"
+
+
+_CONTROL_KEYS_RE = re.compile(r"^(Enter|C-u|C-m|Escape|[0-9])$")
+
+
+def send_control_keys(target: str, keys: list, actor: Optional[str] = None,
+                      source: Optional[str] = None) -> dict:
+    """The ONLY way to press bare keys in an agent pane (submit, clear line, pick a menu
+    number). Same automation policy as `_deliver`; key names from a fixed set only, so no
+    text can be typed through here. Returns {sent, rc, refused?}."""
+    validate_target(target)
+    for k in keys:
+        if not isinstance(k, str) or not _CONTROL_KEYS_RE.match(k):
+            raise AgentControlError(f"control key not allowed: {k!r}")
+    pane = _pane_is_live_agent(target)
+    resolved = pane["target"]
+    refusal = automation_refusal(pane.get("session") or resolved.split(":")[0], resolved,
+                                 actor)
+    if refusal:
+        audit("control_keys", resolved, None, delivered=False, refused=refusal,
+              actor=actor, source=source)
+        return {"sent": False, "rc": 1, "refused": refusal, "target": resolved}
+    with _DELIVER_LOCK:
+        rc, _, err = _tmux(["send-keys", "-t", resolved, *keys])
+    audit("control_keys", resolved, None, delivered=rc == 0, keys=list(keys), actor=actor,
+          source=source)
+    return {"sent": rc == 0, "rc": rc, "target": resolved}
+
+
 def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str],
              actor: Optional[str] = None, source: Optional[str] = None) -> dict:
     """Serialise deliveries, then deliver. See `_DELIVER_LOCK`.
@@ -1865,6 +1927,15 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     pane = _pane_is_live_agent(target)
     resolved = pane["target"]
     key = idempotency_key or str(uuid.uuid4())
+    refusal = automation_refusal(pane.get("session") or resolved.split(":")[0], resolved,
+                                 actor)
+    if refusal:
+        audit(action, resolved, key, delivered=False, refused=refusal, actor=actor,
+              source=source)
+        return {"target": resolved, "action": action, "idempotency_key": key,
+                "delivered": False, "submitted": False, "queued": False,
+                "refused": refusal, "duplicate": False,
+                "reason": "automation policy: target not allowed for this caller"}
 
     prior = _seen_delivery(key)
     if prior is not None:
