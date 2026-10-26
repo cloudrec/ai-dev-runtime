@@ -114,6 +114,34 @@ agent's last 3 advice texts with their delivery state — inside the same CTO co
 Missing pieces surface as explicit gates: `missing_config:OWNER_OS_CTO_MODEL`,
 `missing_secret:OPENAI_API_KEY`.
 
+## CTO without an API key — `claude_session` provider
+
+`OWNER_OS_CTO_PROVIDER=claude_session` + `OWNER_OS_CTO_CONTROLLER=<tmux target>` makes an
+already-authenticated Claude Code session (the owner's subscription) the CTO: no API key, no
+metered spend, no new agent. Gates: `missing_config:OWNER_OS_CTO_CONTROLLER`,
+`controller_denied` (payorch-ha-fresh / deny list), `controller_out_of_scope` (must be inside
+`NATIVE_OWNER_OS_AGENTS`), `controller_needs_delivery_mode:agent_control`.
+
+1. a reasoning event latches a `cto_decision` and queues ONE request
+   `ctoreq:<event>:<attempt>` for the controller in `native_outbox` (`awaiting_controller`);
+2. the canary-scoped agent_control delivery types it (idle only, idempotent, durable states);
+   the text starts with `[Owner OS CTO request — automated, not owner approval]`, carries the
+   event as JSON data and the exact reply command (pinned to the requesting ledger);
+3. the controller runs `tools/native_cto_reply.py --key … --nonce …` with a JSON object on
+   stdin; accepted once, only for the current request's nonce → decision recorded, advice
+   queued for the worker (same path as a synchronous provider);
+4. the worker receives the advice through the same delivery; its next event carries
+   `previous_advice` with the delivery outcome → next request (feedback loop);
+5. no answer within `OWNER_OS_CTO_CONTROLLER_TIMEOUT_SECS` (default 1800) or a request that
+   ends failed/expired/denied → re-request with a new nonce (older pending request
+   `superseded`, never typed; late replies `bad_nonce`); after 3 → `provider_failed` +
+   `cto_controller_timeout` event. owner_needed replies are never forwarded.
+
+Install (owner, root): `tools/native_cto_key.sh session` (installs
+`deploy/97-native-cto-claude-session.conf`, removes the OpenAI 97, restarts, verifies
+`--expect ready`). `tests/test_native_cto_tmux_e2e.py` runs the whole loop over the real
+agent_control tmux transport against a stand-in pane on a private tmux server.
+
 ## Canary (aes-canary only)
 
 1. state from `claude agents --json` (`source: claude_agents_json`, pane joined by pid);

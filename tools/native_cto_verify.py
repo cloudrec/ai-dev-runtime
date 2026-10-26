@@ -223,7 +223,8 @@ def main(argv=None) -> int:
         return 1
     env = read_environ(pid)
     cfg, provider = config_report(env)
-    key = key_check(provider) if a.key_check and provider is not None else None
+    key = key_check(provider) if (a.key_check and provider is not None
+                                  and provider.name == "openai") else None
     cwd = os.readlink(f"/proc/{pid}/cwd")
     db = os.path.join(cwd, env.get("CONTROL_PLANE_DB", "control_plane.db"))
     conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=10)
