@@ -345,14 +345,46 @@ def test_refuses_without_the_96_canary_dropin(sandbox):
     assert r.returncode == 1 and "refusing" in r.stderr and calls(sandbox) == []
 
 
-def test_session_mode_installs_the_keyless_provider_and_expects_ready(sandbox):
+def test_session_mode_renders_an_independent_controller_and_expects_ready(sandbox):
     (sandbox["dropins"] / "97-native-cto-provider.conf").write_text("[Service]\n")
-    r = run(sandbox, "session")
+    r = run_args(sandbox, "session", "--controller", "cto-controller:0.0",
+                 "--workers", "worker-a,worker-b")
     assert r.returncode == 0, r.stderr
     assert not (sandbox["dropins"] / "97-native-cto-provider.conf").exists()
-    assert (sandbox["dropins"] / "97-native-cto-claude-session.conf").read_text() == \
-        (ROOT / "deploy" / "97-native-cto-claude-session.conf").read_text()
-    assert not sandbox["keys"].exists()
+    text = (sandbox["dropins"] / "97-native-cto-claude-session.conf").read_text()
+    assert "Environment=OWNER_OS_CTO_CONTROLLER=cto-controller:0.0" in text
+    assert "Environment=NATIVE_OWNER_OS_AGENTS=worker-a,worker-b" in text
+    assert "__" not in text and not sandbox["keys"].exists()
     assert calls(sandbox)[-1].endswith("--expect ready --since-rowid 1")
     assert run(sandbox, "remove").returncode == 0
     assert not (sandbox["dropins"] / "97-native-cto-claude-session.conf").exists()
+
+
+@pytest.mark.parametrize("args,needle", [
+    ([], "--controller"),
+    (["--controller", "cto-controller:0.0"], "--workers"),
+    (["--controller", "payorch-ha-fresh:0.0", "--workers", "w"], "payorch"),
+    (["--controller", "PAYORCH-HA-FRESH", "--workers", "w"], "payorch"),
+    (["--controller", "c:0.0", "--workers", "w,payorch-ha-fresh"], "payorch"),
+    (["--controller", "c:0.0", "--workers", "w,c"], "self-review"),
+    (["--controller", "c:0.0", "--workers", "w;rm -rf /"], "not a tmux session"),
+    (["--controller", "c|x", "--workers", "w"], "--controller"),
+])
+def test_session_mode_refuses_unsafe_choices_before_changing_anything(sandbox, args, needle):
+    r = run_args(sandbox, "session", *args)
+    assert r.returncode == 1 and needle in r.stderr, r.stderr
+    assert not (sandbox["dropins"] / "97-native-cto-claude-session.conf").exists()
+    assert calls(sandbox) == []
+
+
+def test_session_mode_rolls_back_when_verification_fails(sandbox):
+    r = run_args(sandbox, "session", "--controller", "c:0.0", "--workers", "w",
+                 FAIL_READY="1")
+    assert r.returncode == 1
+    assert not (sandbox["dropins"] / "97-native-cto-claude-session.conf").exists()
+    assert calls(sandbox).count("systemctl restart ai-runtime.service") == 2
+
+
+def run_args(sb, *args, **extra):
+    return subprocess.run(["bash", str(SCRIPT), *args], input="", text=True,
+                          capture_output=True, env={**sb["env"], **extra}, timeout=60)

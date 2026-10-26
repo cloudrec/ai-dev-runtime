@@ -147,28 +147,32 @@ def _in(agent: str, scope: set) -> bool:
 
 
 OWN_KEY_PREFIXES = ("goal:", "cto:", "ctoreq:")
+REQUEST_PREFIX = "ctoreq:"
 
 
 def deliveries_since(path: str, rowid: int) -> dict:
-    """{"own": [targets of this stack's deliveries], "other": {key prefix: count}}."""
+    """{"own": [worker targets (goal:/cto:)], "requests": [controller targets (ctoreq:)],
+    "other": {key prefix: count}} for deliveries after `rowid`."""
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         rows = conn.execute("SELECT target,idempotency_key FROM deliveries WHERE rowid>? "
                             "ORDER BY rowid", (rowid,)).fetchall()
     finally:
         conn.close()
-    own, other = [], {}
+    own, requests, other = [], [], {}
     for target, key in rows:
-        if (key or "").startswith(OWN_KEY_PREFIXES):
+        if (key or "").startswith(REQUEST_PREFIX):
+            requests.append(target)
+        elif (key or "").startswith(OWN_KEY_PREFIXES):
             own.append(target)
         else:
             p = (key or "").split(":", 1)[0] if ":" in (key or "") else "(unprefixed)"
             other[p] = other.get(p, 0) + 1
-    return {"own": own, "other": other}
+    return {"own": own, "requests": requests, "other": other}
 
 
 def verdict(cfg: dict, ledger: dict, *, expect: str, key: dict = None,
-            targets: list = None) -> list:
+            targets: list = None, request_targets: list = None) -> list:
     """List of failed checks (empty = pass)."""
     fails = []
     for k in ("NATIVE_OWNER_OS_ENABLED", "NATIVE_GOALS_ENABLED"):
@@ -205,9 +209,18 @@ def verdict(cfg: dict, ledger: dict, *, expect: str, key: dict = None,
         fails.append(f"denied agents with pending advice {ledger['denied_outbox_pending']}")
     if expect != "ready" and set(ledger["decisions"]) - {"waiting_provider"}:
         fails.append(f"decisions other than waiting_provider {ledger['decisions']}")
+    ctl = (cfg.get("OWNER_OS_CTO_CONTROLLER") or "").strip()
+    ctl_session = ctl.split(":")[0]
+    if ctl and any(a.split(":")[0] == ctl_session for a in scope):
+        fails.append(f"controller {ctl} is also a worker in NATIVE_OWNER_OS_AGENTS")
     bad = sorted({t for t in (targets or []) if not _in(t, scope)})
     if bad:
         fails.append(f"deliveries outside scope {bad}")
+    if ctl and any(t.split(":")[0] == ctl_session for t in (targets or [])):
+        fails.append("worker advice/goal typed into the controller")
+    stray = sorted({t for t in (request_targets or []) if t.split(":")[0] != ctl_session})
+    if stray:
+        fails.append(f"CTO requests typed outside the controller {stray}")
     return fails
 
 
@@ -239,7 +252,8 @@ def main(argv=None) -> int:
                                            os.path.join(cwd, "agent_control.db")),
                                    a.since_rowid)
     fails = verdict(cfg, ledger, expect=a.expect, key=key,
-                    targets=targets["own"] if targets else None)
+                    targets=targets["own"] if targets else None,
+                    request_targets=targets["requests"] if targets else None)
     print(json.dumps({"ok": not fails, "pid": pid, "config": cfg, "key_check": key,
                       "ledger": ledger, "deliveries_since": targets, "fails": fails},
                      indent=2, default=str))
