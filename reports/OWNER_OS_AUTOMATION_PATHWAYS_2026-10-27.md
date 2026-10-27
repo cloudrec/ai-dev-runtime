@@ -39,7 +39,8 @@ tests already fixed by PR #22 (independent file).
 ## Owner gate (on deploy, behaviour changes)
 
 Deploying this with no `AGENT_AUTOMATION_TARGETS` stops ALL automatic typing into agents
-(fail closed); API/MCP sends keep working, payorch-ha-fresh refused for everyone. To keep any
+(fail closed); payorch-ha-fresh refused for everyone. [Superseded by the follow-up below: API/MCP
+sends are held to the same allowlist unless owner-proven.] To keep any
 automation, list exactly the sessions it may touch, e.g. in an ai-runtime drop-in:
 `Environment=AGENT_AUTOMATION_TARGETS=owner-os-opus-windows,gaika-server,cp-canary`
 (the owner decides the list; the hook-spawned `native_supervise_once.py` reads the runtime
