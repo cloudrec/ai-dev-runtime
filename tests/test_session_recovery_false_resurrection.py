@@ -23,6 +23,15 @@ import pytest
 
 from core import session_recovery as sr
 
+@pytest.fixture(autouse=True)
+def _mechanics_tests_opt_out_of_creation_policy(monkeypatch, tmp_path):
+    """These tests exercise resume/recovery mechanics; the fail-closed creation gate has its
+    own suite (test_agent_creation_policy.py). The payment-agent hard deny stays on, and the
+    creation lock/reservations live in a per-test directory."""
+    monkeypatch.setenv("AGENT_CREATION_POLICY", "off")
+    monkeypatch.setenv("AGENT_CREATION_STATE", str(tmp_path / "creation"))
+
+
 
 @pytest.fixture(autouse=True)
 def _reachable_control_plane(monkeypatch):

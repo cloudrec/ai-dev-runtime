@@ -5,6 +5,15 @@ import pytest
 from core import agent_fabric as af
 from core import job_store
 
+@pytest.fixture(autouse=True)
+def _mechanics_tests_opt_out_of_creation_policy(monkeypatch, tmp_path):
+    """These tests exercise resume/recovery mechanics; the fail-closed creation gate has its
+    own suite (test_agent_creation_policy.py). The payment-agent hard deny stays on, and the
+    creation lock/reservations live in a per-test directory."""
+    monkeypatch.setenv("AGENT_CREATION_POLICY", "off")
+    monkeypatch.setenv("AGENT_CREATION_STATE", str(tmp_path / "creation"))
+
+
 
 @pytest.fixture(autouse=True)
 def _iso(tmp_path, monkeypatch):
@@ -98,10 +107,13 @@ def test_start_or_resume_refuses_duplicate(monkeypatch):
 def test_start_or_resume_delegates_when_no_duplicate(monkeypatch):
     from core import agent_control
     monkeypatch.setattr(agent_control, "find_live_agent_for_dir", lambda d: None)
+    seen = {}
     monkeypatch.setattr(agent_control, "agent_resume",
-                        lambda d, conversation_id=None: {"ok": True, "target": "t:0.0"})
+                        lambda d, conversation_id=None, **kw: seen.update(kw)
+                        or {"ok": True, "target": "t:0.0"})
     out = af.start_or_resume("/opt/seo")
     assert out["ok"] and out["resumed"] and not out["duplicate_prevented"]
+    assert seen == {"actor": "fabric", "owner_proof": None}     # caller reaches the gate
 
 
 def test_send_refuses_runtime_workers():

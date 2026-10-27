@@ -201,7 +201,8 @@ def status(ref: str) -> dict:
 
 
 def start_or_resume(project_dir: str, *, conversation_id: Optional[str] = None,
-                    by: str = "fabric") -> dict:
+                    by: str = "fabric", actor: Optional[str] = None,
+                    owner_proof: Optional[dict] = None) -> dict:
     """Start-or-resume with fail-closed no-duplicate semantics: delegates to
     agent_control.agent_resume, whose duplicate proof (one live Claude per cwd)
     and session-liveness checks already hold. Never starts a second agent for
@@ -212,7 +213,8 @@ def start_or_resume(project_dir: str, *, conversation_id: Optional[str] = None,
         return {"ok": True, "resumed": False, "duplicate_prevented": True,
                 "ref": f"tmux:{live.get('target')}",
                 "reason": "live agent already exists for this cwd"}
-    r = agent_control.agent_resume(project_dir, conversation_id=conversation_id)
+    r = agent_control.agent_resume(project_dir, conversation_id=conversation_id,
+                                   actor=actor or by, owner_proof=owner_proof)
     ok = bool(r.get("ok", r.get("started") or r.get("resumed")))
     return {"ok": ok, "resumed": True, "duplicate_prevented": False, **r}
 

@@ -1,0 +1,13 @@
+# Test-only fixture: three GAIKA country worktrees under a temporary {root}. Not a live config.
+max_live_agents: 12
+hard_deny_dirs:
+  - /opt/payment-orchestrator
+scopes:
+  gaika:
+    callers: [owneros_controller]   # local controller only; API/MCP cannot create
+    session_prefix: gaika-
+    max_concurrent: 2               # two countries at a time; the third waits
+    worktrees:
+      ru: "{root}/gaika-worktrees/ru"
+      kz: "{root}/gaika-worktrees/kz"
+      uz: "{root}/gaika-worktrees/uz"

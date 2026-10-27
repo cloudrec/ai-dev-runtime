@@ -17,6 +17,15 @@ import pytest
 from core import agent_control as ac
 
 @pytest.fixture(autouse=True)
+def _mechanics_tests_opt_out_of_creation_policy(monkeypatch, tmp_path):
+    """These tests exercise resume/recovery mechanics; the fail-closed creation gate has its
+    own suite (test_agent_creation_policy.py). The payment-agent hard deny stays on, and the
+    creation lock/reservations live in a per-test directory."""
+    monkeypatch.setenv("AGENT_CREATION_POLICY", "off")
+    monkeypatch.setenv("AGENT_CREATION_STATE", str(tmp_path / "creation"))
+
+
+@pytest.fixture(autouse=True)
 def _transport_tests_opt_out_of_automation_policy(monkeypatch):
     """These tests exercise delivery mechanics with in-process callers; the automation
     allowlist has its own suite (test_agent_automation_policy.py). Hard deny stays on."""
