@@ -13,10 +13,10 @@ index 07f0b2a..935f92e 100644
          while True:
              if await request.is_disconnected():
 diff --git a/backend/services/mcp_server.py b/backend/services/mcp_server.py
-index bdd8bf6..cfabb6e 100644
+index bdd8bf6..a51e482 100644
 --- a/backend/services/mcp_server.py
 +++ b/backend/services/mcp_server.py
-@@ -982,6 +982,25 @@ async def read_resource(db: AsyncSession, token: McpToken, uri: str, ip: str | N
+@@ -982,6 +982,52 @@ async def read_resource(db: AsyncSession, token: McpToken, uri: str, ip: str | N
      return {"contents": [{"uri": uri, "mimeType": mime, "text": text}]}
  
  
@@ -24,9 +24,36 @@ index bdd8bf6..cfabb6e 100644
 +# The catalog changes when this backend is deployed with new tools. MCP clients cache it, so
 +# the server advertises `tools.listChanged` and, on a connector's server stream, sends
 +# `notifications/tools/list_changed` when the catalog this token last listed differs from the
-+# one being served now (process memory: a restart after a deploy counts as changed).
++# one being served now. The record is a small file in the container's temp dir so every
++# gunicorn worker sees it (a rebuilt/recreated container starts empty = changed).
 +LIST_CHANGED_NOTIFICATION = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
-+_LISTED_CATALOG: dict = {}
++
++
++def _listed_path() -> str:
++    return os.getenv("MCP_LISTED_CATALOG_FILE", "/tmp/owner-os-mcp-listed-catalog.json")
++
++
++def _read_listed() -> dict:
++    import json as _json
++    try:
++        with open(_listed_path(), encoding="utf-8") as fh:
++            d = _json.load(fh)
++        return d if isinstance(d, dict) else {}
++    except (OSError, ValueError):
++        return {}
++
++
++def _mark_listed(token) -> None:
++    import json as _json
++    d = _read_listed()
++    d[str(getattr(token, "id", None))] = tool_catalog_fingerprint()
++    tmp = f"{_listed_path()}.{os.getpid()}.tmp"
++    try:
++        with open(tmp, "w", encoding="utf-8") as fh:
++            _json.dump(d, fh)
++        os.replace(tmp, _listed_path())
++    except OSError:
++        pass                      # worst case: one extra list_changed notification
 +
 +
 +def tool_catalog_fingerprint() -> str:
@@ -36,13 +63,13 @@ index bdd8bf6..cfabb6e 100644
 +
 +
 +def catalog_changed_for(token) -> bool:
-+    return _LISTED_CATALOG.get(getattr(token, "id", None)) != tool_catalog_fingerprint()
++    return _read_listed().get(str(getattr(token, "id", None))) != tool_catalog_fingerprint()
 +
 +
  # ══════════════════════════════ JSON-RPC (MCP protocol) ══════════════════════════════
  SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
  
-@@ -993,7 +1012,7 @@ async def dispatch_rpc(db: AsyncSession, token: McpToken, method: str, params: d
+@@ -993,7 +1039,7 @@ async def dispatch_rpc(db: AsyncSession, token: McpToken, method: str, params: d
          want = params.get("protocolVersion")
          proto = want if want in SUPPORTED_PROTOCOLS else MCP_PROTOCOL_VERSION
          return {"protocolVersion": proto,
@@ -51,20 +78,20 @@ index bdd8bf6..cfabb6e 100644
                  "serverInfo": SERVER_INFO}
      # notifications (no id) — accept and return nothing meaningful; the route sends no response
      if method.startswith("notifications/"):
-@@ -1001,6 +1020,7 @@ async def dispatch_rpc(db: AsyncSession, token: McpToken, method: str, params: d
+@@ -1001,6 +1047,7 @@ async def dispatch_rpc(db: AsyncSession, token: McpToken, method: str, params: d
      if method in ("ping",):
          return {}
      if method == "tools/list":
-+        _LISTED_CATALOG[getattr(token, "id", None)] = tool_catalog_fingerprint()
++        _mark_listed(token)
          return {"tools": tool_schemas()}
      if method == "tools/call":
          name = params.get("name")
 diff --git a/backend/tests/test_mcp_list_changed.py b/backend/tests/test_mcp_list_changed.py
 new file mode 100644
-index 0000000..8dee92f
+index 0000000..6d2b78a
 --- /dev/null
 +++ b/backend/tests/test_mcp_list_changed.py
-@@ -0,0 +1,77 @@
+@@ -0,0 +1,94 @@
 +"""Tool catalog change notification (MCP tools.listChanged)."""
 +import asyncio
 +import json
@@ -77,8 +104,8 @@ index 0000000..8dee92f
 +
 +
 +@pytest.fixture(autouse=True)
-+def _fresh(monkeypatch):
-+    monkeypatch.setattr(mcp, "_LISTED_CATALOG", {})
++def _fresh(monkeypatch, tmp_path):
++    monkeypatch.setenv("MCP_LISTED_CATALOG_FILE", str(tmp_path / "listed.json"))
 +
 +
 +@pytest.mark.asyncio
@@ -142,3 +169,20 @@ index 0000000..8dee92f
 +    await mcp.dispatch_rpc(MagicMock(), tok, "tools/list", {})
 +    chunks = await asyncio.to_thread(_stream, monkeypatch, tok)
 +    assert not any("list_changed" in c for c in chunks)
++
++
++@pytest.mark.asyncio
++async def test_the_record_is_shared_across_workers(tmp_path, monkeypatch):
++    """gunicorn runs several workers: what one worker listed, another must see."""
++    tok = SimpleNamespace(id=3, scopes=["read"])
++    await mcp.dispatch_rpc(MagicMock(), tok, "tools/list", {})
++    import importlib.util
++    spec = importlib.util.spec_from_file_location("mcp_worker2", mcp.__file__)
++    other = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(other)                      # a second, independent module copy
++    assert not other.catalog_changed_for(tok)
++
++
++def test_unreadable_record_means_changed(tmp_path, monkeypatch):
++    (tmp_path / "listed.json").write_text("not json")
++    assert mcp.catalog_changed_for(SimpleNamespace(id=3))

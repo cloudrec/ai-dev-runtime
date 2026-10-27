@@ -34,15 +34,19 @@ a client its tools changed. ChatGPT (token id 3) opened 5 GET streams and initia
 sessions after the deploy and still showed the old catalog, i.e. it caches the catalog
 beyond a session.
 
-Fix: `listChanged: true`; `tools/list` records the catalog fingerprint served per token
-(process memory); a new GET server stream sends the JSON-RPC
+Fix: `listChanged: true`; `tools/list` records the catalog fingerprint served per token in a
+small file in the container's temp dir (`MCP_LISTED_CATALOG_FILE`), shared by all gunicorn
+workers (prod runs 2); a new GET server stream sends the JSON-RPC
 `notifications/tools/list_changed` (SSE `event: message`) when that token's last-listed
-catalog differs from the current one — so after every deploy/restart, the first stream
-announces it once. Existing `ready`/`change` events unchanged.
+catalog differs from the current one — after every deploy (new container), the first stream
+announces it once. Existing `ready`/`change` events unchanged; conforming MCP clients only
+parse `message` events, so those stay ignored.
 
-Tests (`backend/tests/test_mcp_list_changed.py`, in the patch): 5; MCP suites 69/69; full
-seo suite in an offline throwaway container 925 passed (920 + 5 new) with the identical set
-of 68 pre-existing failures as the original; reverting `listChanged` fails a test.
+Tests (`backend/tests/test_mcp_list_changed.py`, in the patch): 7 (incl. cross-worker record,
+unreadable record = changed); MCP suites 71/71; full seo suite in an offline throwaway
+container 927 passed (920 + 7) with the identical set of 68 pre-existing failures; disabling
+the record fails 3 tests, reverting `listChanged` fails 1. Rollback = the same procedure as
+`owner-os-grants.patch` (revert the commit, retag the pre-deploy image, `up -d --no-build backend`).
 
 Unverified: whether ChatGPT acts on `notifications/tools/list_changed`. If it does not, only
 the user-side connector refresh helps.
