@@ -394,9 +394,14 @@ class AgentResumeReq(BaseModel):
 
 
 @router.post("/agents/resume")
-async def agents_resume(req: AgentResumeReq, _: bool = Depends(_auth)):
+async def agents_resume(req: AgentResumeReq, request: Request,
+                        x_runtime_actor: Optional[str] = Header(None),
+                        x_owner_proof: Optional[str] = Header(None),
+                        _: bool = Depends(_auth)):
+    actor, _source = caller_identity(request, x_runtime_actor)
     return _agent_call(agent_control.agent_resume, req.project_dir,
-                       req.conversation_id, req.session_name)
+                       req.conversation_id, req.session_name, actor=actor,
+                       owner_proof=owner_proof_from_header(x_owner_proof))
 
 
 @router.get("/agents/report")
@@ -932,7 +937,10 @@ async def fabric_result(ref: str, _: bool = Depends(_auth)):
 
 
 @router.post("/fabric/start-or-resume")
-async def fabric_start(req: FabricStart, _: bool = Depends(_auth)):
+async def fabric_start(req: FabricStart, request: Request,
+                       x_runtime_actor: Optional[str] = Header(None),
+                       x_owner_proof: Optional[str] = Header(None),
+                       _: bool = Depends(_auth)):
     from core import agent_fabric
     if req.ref:
         # Windows refs skip _validate_project_path deliberately: RUNTIME_ALLOWED_ROOTS
@@ -943,8 +951,10 @@ async def fabric_start(req: FabricStart, _: bool = Depends(_auth)):
     if not req.project_dir:
         raise HTTPException(status_code=422, detail="project_dir or ref is required")
     pp = _validate_project_path(req.project_dir)
+    actor, _source = caller_identity(request, x_runtime_actor)
     return _fabric_call(agent_fabric.start_or_resume, pp,
-                        conversation_id=req.conversation_id)
+                        conversation_id=req.conversation_id, actor=actor,
+                        owner_proof=owner_proof_from_header(x_owner_proof))
 
 
 @router.get("/fabric/contracts")

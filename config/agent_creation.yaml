@@ -1,0 +1,19 @@
+# Agent creation / resume scopes (core/agent_creation_policy.py). FAIL CLOSED:
+# no scope here = no automatic creation or resume by anyone (API/MCP included).
+# Explicit human action uses an owner proof (tools/owner_proof.py sign --action agent_resume
+# --target <resolved project dir> with the session name as text).
+#
+# Adding a scope is an owner decision. Shape (example, NOT active):
+#
+# scopes:
+#   gaika:
+#     callers: [api]                 # api | <in-process actor> | unattributed
+#     session_prefix: gaika-         # session must be <prefix><worktree key>
+#     max_concurrent: 2              # live agents across this scope's worktrees
+#     worktrees:                     # key (e.g. country) -> exact directory
+#       ru: /opt/gaika-worktrees/ru
+#       kz: /opt/gaika-worktrees/kz
+hard_deny_dirs:                      # never created into automatically (payment agent; also denied by
+                                     # session name); only a valid owner proof overrides
+  - /opt/payment-orchestrator
+scopes: {}

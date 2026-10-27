@@ -327,7 +327,8 @@ def verify_recovered(target: str, cwd: str) -> dict:
 
 def recover(target: str, *, registry: Optional[dict] = None, conn=None,
             run_fn=None, sleep=time.sleep, now: Optional[float] = None,
-            explicit: bool = False, probe_fn=None) -> dict:
+            explicit: bool = False, probe_fn=None, actor: Optional[str] = None,
+            owner_proof: Optional[dict] = None, live_cwds: Optional[list] = None) -> dict:
     """Revive one registered dead session. Every refusal is explained and logged.
 
     `explicit=True` is an owner/MCP-initiated resume: it still requires a real project
@@ -339,7 +340,8 @@ def recover(target: str, *, registry: Optional[dict] = None, conn=None,
     conn = conn or _db()
     try:
         return _recover_inner(target, registry=registry, conn=conn, run_fn=run_fn,
-                              sleep=sleep, now=now, explicit=explicit, probe_fn=probe_fn)
+                              sleep=sleep, now=now, explicit=explicit, probe_fn=probe_fn,
+                              actor=actor, owner_proof=owner_proof, live_cwds=live_cwds)
     except TmuxControlUnreachable as e:
         # The plane went down mid-flight, between the precondition and a later read.
         # Same rule: refuse, explain, change nothing.
@@ -352,7 +354,9 @@ def recover(target: str, *, registry: Optional[dict] = None, conn=None,
 
 
 def _recover_inner(target: str, *, registry, conn, run_fn, sleep, now, explicit,
-                   probe_fn) -> dict:
+                   probe_fn,
+                   actor: Optional[str] = None, owner_proof: Optional[dict] = None,
+                   live_cwds: Optional[list] = None) -> dict:
     reg = registry if registry is not None else load_registry()
     entry = (reg.get("sessions") or {}).get(target)
     if not entry:
@@ -446,6 +450,28 @@ def _recover_inner(target: str, *, registry, conn, run_fn, sleep, now, explicit,
                     "detail": work,
                     "note": "recovery restores interrupted work; it does not reopen "
                             "work that finished"}
+
+    # creation gate (core/agent_creation_policy.py) before any tmux mutation. `explicit`
+    # is NOT owner authority (MCP sets it); only a scope or an owner proof is.
+    from core import agent_creation_policy as acp
+    from core import agent_control as _ac
+    session_name = entry.get("session") or target.split(":")[0]
+    if live_cwds is None:
+        try:
+            live_cwds = [a.get("claude_cwd") for a in _ac.agent_list().get("agents", [])
+                         if a.get("is_agent") and a.get("alive")]
+        except Exception:  # noqa: BLE001 — unknown population: refuse below (fail closed)
+            live_cwds = None
+    if live_cwds is None:
+        gate = {"ok": False, "reason": "creation_population_unknown"}
+    else:
+        gate = acp.authorize(cwd, session_name,
+                             caller=_ac.caller_class(actor) if actor else "session_recovery",
+                             owner_proof=owner_proof, live_cwds=[c for c in live_cwds if c])
+    if not gate["ok"]:
+        _log(conn, target, "refuse", False, f"creation_policy:{gate['reason']}", gate)
+        return {"recovered": False, "reason": f"creation_policy:{gate['reason']}",
+                "owner_blocker": True}
 
     # exponential backoff on repeated attempts within the window
     base = float(limits.get("backoff_base_secs") or 60)

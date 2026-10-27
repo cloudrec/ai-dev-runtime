@@ -2242,7 +2242,8 @@ def _session_liveness(name: str) -> dict:
 
 
 def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
-                 session_name: Optional[str] = None) -> dict:
+                 session_name: Optional[str] = None, actor: Optional[str] = None,
+                 owner_proof: Optional[dict] = None) -> dict:
     """Resume a Claude agent — but only when no matching live one exists.
 
     Returns `duplicate_created: False` in every path: either an existing agent
@@ -2266,6 +2267,18 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
         }
 
     name = validate_session(session_name or f"agent-{os.path.basename(resolved)[:40]}")
+    # creation gate BEFORE any tmux mutation (incl. the zombie-session cleanup below)
+    from core import agent_creation_policy as acp
+    live_cwds = [a.get("claude_cwd") for a in agent_list().get("agents", [])
+                 if a.get("is_agent") and a.get("alive")]
+    gate = acp.authorize(resolved, name, caller=caller_class(actor), owner_proof=owner_proof,
+                         live_cwds=[c for c in live_cwds if c])
+    if not gate["ok"]:
+        audit("agent_resume", name, resumed=False, refused=gate["reason"], actor=actor,
+              cwd=resolved)
+        return {"resumed": False, "refused": gate["reason"], "scope": gate.get("scope"),
+                "reason": "agent creation policy: not authorized",
+                "duplicate_created": False, "agent_created": False}
     rc, _, _ = _tmux(["has-session", "-t", name])
     if rc == 0:
         # The session NAME exists — but it may be a ZOMBIE whose panes are all dead
@@ -2299,7 +2312,8 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
         audit("agent_resume", name, resumed=False, error=err.strip()[:120])
         raise AgentControlError(f"failed to start session {name!r}: {err.strip()[:200]}")
 
-    audit("agent_resume", name, resumed=True, conversation_id=conversation_id, cwd=resolved)
+    audit("agent_resume", name, resumed=True, conversation_id=conversation_id, cwd=resolved,
+          actor=actor, authorized_by=gate["reason"], scope=gate.get("scope"))
     return {
         "resumed": True,
         "session": name,

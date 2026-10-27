@@ -32,6 +32,13 @@ def _reachable_control_plane(monkeypatch):
 
 from core import commander_autopilot as ap
 
+@pytest.fixture(autouse=True)
+def _mechanics_tests_opt_out_of_creation_policy(monkeypatch):
+    """These tests exercise resume/recovery mechanics; the fail-closed creation gate has its
+    own suite (test_agent_creation_policy.py). The payment-agent hard deny stays on."""
+    monkeypatch.setenv("AGENT_CREATION_POLICY", "off")
+
+
 
 @pytest.fixture(autouse=True)
 def _isolated(tmp_path, monkeypatch):

@@ -12,6 +12,13 @@ import pytest
 
 from core import agent_control as ac
 
+@pytest.fixture(autouse=True)
+def _mechanics_tests_opt_out_of_creation_policy(monkeypatch):
+    """These tests exercise resume/recovery mechanics; the fail-closed creation gate has its
+    own suite (test_agent_creation_policy.py). The payment-agent hard deny stays on."""
+    monkeypatch.setenv("AGENT_CREATION_POLICY", "off")
+
+
 
 class FakeTmux:
     """Scriptable tmux: `panes` is a list of (dead, pid) for the target session."""
