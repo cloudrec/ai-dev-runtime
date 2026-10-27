@@ -26,6 +26,7 @@ from core import automation_grants as ag  # noqa: E402
 from core import owner_telegram as ot  # noqa: E402
 
 API = "api:hmac/chatgpt-mcp"
+PASS = "correct horse battery staple"
 WORKER = "owneros-sandbox-worker-20261027"
 OWNER_TG = 424242
 
@@ -53,8 +54,12 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_AUTOMATION_POLICY", "enforce")
     monkeypatch.setenv("AGENT_AUTOMATION_TARGETS", "owner-os-supervisor-clean@api")
     monkeypatch.delenv("AGENT_CREATION_POLICY", raising=False)
-    for k in ("OWNER_GRANT_TELEGRAM_BOT_TOKEN", "OWNER_GRANT_TELEGRAM_USER_ID"):
+    for k in ("OWNER_GRANT_TELEGRAM_BOT_TOKEN", "OWNER_GRANT_TELEGRAM_USER_ID",
+              "GRANT_REQUIRE_AUTHENTICATED_CLIENT"):
         monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("RUNTIME_CLIENT_TOKENS_FILE", str(tmp_path / "no-client-tokens.json"))
+    monkeypatch.setenv("OWNER_GRANT_PASSPHRASE_FILE", str(tmp_path / "etc" / "pass.json"))
+    ag.set_passphrase(PASS)
     # grants require /opt paths; map the test worktree under a fake /opt prefix check
     real_validate = ag.validate_spec
 
@@ -70,14 +75,17 @@ def env(tmp_path, monkeypatch):
             out["create"]["worktrees"] = mapped
         return out
     monkeypatch.setattr(ag, "validate_spec", validate)
-    calls, live = [], []
+    calls, live, cwd_of = [], [], {}
 
     def tmux(args, stdin=None):
         calls.append(list(args))
+        if args[0] == "new-session":
+            cwd_of[args[3]] = args[5]
         return (1 if args[0] == "has-session" else 0), "", ""
     monkeypatch.setattr(ac, "_tmux", tmux)
     pane = lambda t: {"target": t if ":" in t else f"{t}:0.0",  # noqa: E731
-                      "session": t.split(":")[0], "alive": True}
+                      "session": t.split(":")[0], "alive": True,
+                      "claude_cwd": cwd_of.get(t.split(":")[0], "/opt/unrelated")}
     monkeypatch.setattr(ac, "_pane_is_live_agent", pane)
     monkeypatch.setattr(ac, "agent_list", lambda: {"agents": [
         {"is_agent": True, "alive": True, "claude_cwd": c} for c in live]})
@@ -85,7 +93,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(ac, "validate_project_dir", lambda d: os.path.realpath(d))
     monkeypatch.setattr(ac, "_busy_for_send", lambda t: "")
     monkeypatch.setattr(ac.time, "sleep", lambda s: None)
-    return {"tmp": tmp_path, "wt": str(wt), "calls": calls, "live": live}
+    return {"tmp": tmp_path, "wt": str(wt), "calls": calls, "live": live, "cwd_of": cwd_of}
 
 
 def typed(calls):
@@ -102,11 +110,11 @@ SPEC = {"project": "owneros-sandbox", "actions": ["send", "answer", "create"],
         "ttl_secs": 3600}
 
 
-def cli_approve(gid, retype=None, isatty=True):
+def cli_approve(gid, passphrase=PASS, isatty=True):
     cli = _load("owner_grant_cli", "tools/owner_grant.py")
     out = io.StringIO()
-    rc = cli.main(["approve", gid], stdin=io.StringIO((retype or gid) + "\n"), stdout=out,
-                  isatty=isatty)
+    rc = cli.main(["approve", gid], stdout=out, isatty=isatty,
+                  getpass=lambda prompt: passphrase)
     return rc, out.getvalue()
 
 
@@ -157,11 +165,12 @@ def test_the_api_exposes_request_list_revoke_but_no_approval(env, monkeypatch):
     assert c.post(f"/api/v1/grants/{r['id']}/revoke").json() == {"revoked": True}
 
 
-@pytest.mark.parametrize("isatty,retype,expect", [(False, None, "interactive terminal"),
-                                                   (True, "gWRONG", "declined")])
-def test_cli_refuses_non_interactive_or_wrong_retype(env, isatty, retype, expect):
+@pytest.mark.parametrize("isatty,pw,expect", [(False, PASS, "interactive terminal"),
+                                               (True, "wrong passphrase!!", "wrong owner passphrase"),
+                                               (True, "", "declined")])
+def test_cli_refuses_non_interactive_or_wrong_passphrase(env, isatty, pw, expect):
     g = ag.request(SPEC, requested_by=API)
-    rc, out = cli_approve(g["id"], retype=retype, isatty=isatty)
+    rc, out = cli_approve(g["id"], passphrase=pw, isatty=isatty)
     assert rc == 1 and expect in out and ag.get(g["id"])["status"] == "pending"
 
 
@@ -230,8 +239,8 @@ def test_creation_outside_the_granted_worktree_or_name_is_refused(env):
 def test_expired_grant_denies(env, monkeypatch):
     gid = granted(env)
     later = ag.get(gid)["expires_at"] + 1
-    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API) == gid
-    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API, now=later) is None
+    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API, cwd=env["wt"]) == gid
+    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API, now=later, cwd=env["wt"]) is None
     assert ag.effective_status(ag.get(gid), later) == "expired"
 
 
@@ -247,7 +256,7 @@ def test_pending_request_lapses(env):
     g = ag.request(SPEC, requested_by=API, now=1000.0)
     with pytest.raises(ag.GrantError):
         ag.approve(g["id"], via="owner_cli", expected_hash=ag.get(g["id"])["spec_hash"],
-                   now=1000.0 + ag.PENDING_TTL_SECS + 1)
+                   passphrase=PASS, now=1000.0 + ag.PENDING_TTL_SECS + 1)
 
 
 def test_tampering_with_a_stored_grant_voids_it(env):
@@ -260,13 +269,13 @@ def test_tampering_with_a_stored_grant_voids_it(env):
     c.commit()
     c.close()
     assert ag.allows_send("bitwhite-backend-v3", "agent_send", API) is None
-    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API) is None
+    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API, cwd=env["wt"]) is None
 
 
 def test_content_changed_after_showing_is_refused(env):
     g = ag.request(SPEC, requested_by=API)
     with pytest.raises(ag.GrantError, match="content changed"):
-        ag.approve(g["id"], via="owner_cli", expected_hash="0" * 64)
+        ag.approve(g["id"], via="owner_cli", expected_hash="0" * 64, passphrase=PASS)
 
 
 # ── spec validation: nothing wider than explicit ───────────────────────────────
@@ -345,7 +354,7 @@ def tg(env, monkeypatch):
 def _code_from(sent, gid):
     import re
     msg = [m for m in sent if gid in m.get("text", "")][-1]
-    return re.search(rf"/approve {gid} (\d{{6}})", msg["text"]).group(1), msg
+    return re.search(rf"/approve {gid} ([A-Za-z0-9_-]{{12}})", msg["text"]).group(1), msg
 
 
 def upd(text, uid=OWNER_TG, chat=None, ctype="private", **extra):
@@ -374,7 +383,7 @@ def test_telegram_non_owner_or_indirect_messages_never_approve(env, tg, kind):
          "edited": {"update_id": 1, "edited_message": upd(text)["message"]},
          "bot": {"update_id": 1, "message": {**upd(text)["message"],
                                              "from": {"id": OWNER_TG, "is_bot": True}}},
-         "wrong_code": upd(f"/approve {g['id']} {'1' if code[0] != '1' else '2'}{code[1:]}"),
+         "wrong_code": upd(f"/approve {g['id']} {'A' if code[0] != 'A' else 'B'}{code[1:]}"),
          "no_code": upd(f"/approve {g['id']}")}[kind]
     ot.handle_update(u)
     assert ag.get(g["id"])["status"] == "pending"
@@ -402,7 +411,7 @@ def test_telegram_errors_never_leak_the_token(env, tg, monkeypatch):
                                    "api:hmac", "api:client/chatgpt-mcp", "api:hmac/chatgpt-mcp2"])
 def test_a_grant_is_usable_only_by_the_exact_requesting_actor(env, other):
     gid = granted(env)
-    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API) == gid
+    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API, cwd=env["wt"]) == gid
     r = ac.agent_send("owneros-sandbox-w1:0.0", "x", idempotency_key=f"k-{other}", actor=other)
     assert r["refused"] == "automation_target_not_allowlisted"
     r = ac.agent_resume(env["wt"], session_name="owneros-sandbox-w1", actor=other)
@@ -605,3 +614,107 @@ def test_mcp_without_write_scope_cannot_request(mcp):
                                         "targets": ["vtb"], "ttl_secs": 600})
     assert "write" in r.get("exception", "")
     assert "grants" in call(mcp, ro, "grant_list", {})
+
+
+
+# ── independent review fixes: no self-approval, rename-proof deny, cwd-bound sessions ──
+
+def test_in_process_callers_cannot_self_approve_without_the_owner_secret(env):
+    """An agent (or a tool ChatGPT can make an agent run) calling the Python API directly."""
+    g = ag.request(SPEC, requested_by=API)
+    h = ag.get(g["id"])["spec_hash"]
+    for kw in ({}, {"passphrase": ""}, {"passphrase": "guess-guess-guess"},
+               {"code": "000000"}):
+        with pytest.raises(ag.GrantError):
+            ag.approve(g["id"], via="owner_cli", expected_hash=h, **kw)
+    with pytest.raises(ag.GrantError):
+        ag.approve(g["id"], via="telegram_verified", expected_hash=h, code="x" * 12)
+    assert ag.get(g["id"])["status"] == "pending"
+
+
+def test_repeated_failures_lock_approvals_even_for_the_right_secret(env):
+    g = ag.request(SPEC, requested_by=API)
+    h = ag.get(g["id"])["spec_hash"]
+    for _ in range(ag.MAX_FAILED_APPROVALS):
+        with pytest.raises(ag.GrantError, match="wrong"):
+            ag.approve(g["id"], via="owner_cli", expected_hash=h, passphrase="nope-nope-nope")
+    with pytest.raises(ag.GrantError, match="locked"):
+        ag.approve(g["id"], via="owner_cli", expected_hash=h, passphrase=PASS)
+
+
+@pytest.mark.parametrize("setup", ["missing", "world_readable", "symlink"])
+def test_cli_approval_fails_closed_without_a_safe_passphrase_file(env, setup):
+    f = pathlib.Path(os.environ["OWNER_GRANT_PASSPHRASE_FILE"])
+    if setup == "missing":
+        f.unlink()
+    elif setup == "world_readable":
+        f.chmod(0o644)
+    else:
+        real = f.with_name("real.json")
+        f.rename(real)
+        f.symlink_to(real)
+    g = ag.request(SPEC, requested_by=API)
+    with pytest.raises(ag.GrantError, match="no owner passphrase"):
+        ag.approve(g["id"], via="owner_cli", expected_hash=ag.get(g["id"])["spec_hash"],
+                   passphrase=PASS)
+
+
+def test_passphrase_is_never_overwritten_and_must_be_long(env):
+    with pytest.raises(ag.GrantError, match="exists"):
+        ag.set_passphrase("another long passphrase")
+    os.unlink(os.environ["OWNER_GRANT_PASSPHRASE_FILE"])
+    with pytest.raises(ag.GrantError, match="12 characters"):
+        ag.set_passphrase("short")
+
+
+def test_telegram_code_is_high_entropy_and_not_sha256_guessable(env, monkeypatch):
+    import hashlib
+    sent = []
+    monkeypatch.setattr(ag, "_notify_owner", lambda gid, spec, code: sent.append(code))
+    g = ag.request(SPEC, requested_by=API)
+    code = sent[0]
+    assert len(code) == 12
+    stored = ag.get(g["id"])["code_hash"]
+    assert stored != hashlib.sha256(f"{g['id']}:{code}".encode()).hexdigest()
+    assert stored == ag._scrypt(code, g["id"])
+
+
+@pytest.mark.parametrize("session", ["owneros-sandbox-w1", "owner-os-supervisor-clean"])
+def test_a_renamed_session_in_the_payment_directory_stays_denied(env, session, monkeypatch):
+    granted(env)
+    env["cwd_of"][session] = "/opt/payment-orchestrator"        # rename trick
+    r = ac.agent_send(f"{session}:0.0", "x", idempotency_key=f"k{session}", actor=API)
+    assert r["refused"] == "hard_denied_target" and typed(env["calls"]) == []
+    assert ac.send_control_keys(f"{session}:0.0", ["Enter"], actor=API)["refused"] == \
+        "hard_denied_target"
+
+
+def test_a_granted_name_outside_its_worktree_is_not_covered(env):
+    granted(env)
+    env["cwd_of"]["owneros-sandbox-w1"] = "/opt/somewhere-else"   # same name, other place
+    r = ac.agent_send("owneros-sandbox-w1:0.0", "x", idempotency_key="k", actor=API)
+    assert r["refused"] == "automation_target_not_allowlisted"
+
+
+def test_explicit_targets_still_work_by_name(env):
+    g = ag.request({"project": "p", "actions": ["send"], "targets": ["vtb"], "ttl_secs": 600},
+                   requested_by=API)
+    assert cli_approve(g["id"])[0] == 0
+    r = ac.agent_send("vtb:0.0", "status?", idempotency_key="k", actor=API)
+    assert r["delivered"] and r["authorized_by"] == f"grant:{g['id']}"
+
+
+
+def test_sandbox_request_spec_validates_and_verifier_reports_covered_actions(env, capsys):
+    spec = json.loads((ROOT / "integrations" / "sandbox-grant" / "request.json").read_text())
+    assert spec["create"]["max_sessions"] == 1 and spec["ttl_secs"] == 3600
+    assert spec["create"]["worktrees"] == {"worker-20261027":
+                                           "/opt/owneros-sandbox-worker-20261027"}
+    gid = granted(env)
+    assert ac.agent_resume(env["wt"], session_name="owneros-sandbox-w1", actor=API)["agent_created"]
+    assert ac.agent_send("owneros-sandbox-w1:0.0", "go", idempotency_key="v1", actor=API)["delivered"]
+    v = _load("grant_verify", "tools/grant_verify.py")
+    assert v.main([gid]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert {r["action"] for r in out["covered_actions"]} == {"agent_resume", "agent_send"}
+    assert out["unexpected"] == [] and out["binding"] == "declared"

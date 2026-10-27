@@ -48,6 +48,8 @@ import time
 from typing import Optional
 
 ACTIONS = frozenset({"send", "answer", "create"})
+MAX_FAILED_APPROVALS = 5               # per 15 min, then approvals lock (brute force)
+_SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "maxmem": 64 * 1024 * 1024, "dklen": 32}
 HARD_DENY_SESSIONS = frozenset({"payorch-ha-fresh"})
 MAX_TTL_SECS = int(os.getenv("GRANT_MAX_TTL_SECS", str(7 * 86400)))
 PENDING_TTL_SECS = 900
@@ -58,9 +60,50 @@ class GrantError(ValueError):
     pass
 
 
+def _scrypt(secret: str, salt: str) -> str:
+    return hashlib.scrypt(secret.encode(), salt=salt.encode(), **_SCRYPT).hex()
+
+
+def passphrase_file() -> str:
+    return os.getenv("OWNER_GRANT_PASSPHRASE_FILE", "/etc/ai-runtime/owner-grant-passphrase.json")
+
+
+def _load_passphrase() -> Optional[dict]:
+    """{salt, hash} from a regular root-owned 0600/0400 file, else None (fail closed)."""
+    import stat as _stat
+    path = passphrase_file()
+    try:
+        st = os.stat(path, follow_symlinks=False)
+        if not _stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o077):
+            return None
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    ok = isinstance(d, dict) and re.fullmatch(r"[0-9a-f]{32}", str(d.get("salt", ""))) \
+        and re.fullmatch(r"[0-9a-f]{64}", str(d.get("hash", "")))
+    return d if ok else None
+
+
+def set_passphrase(passphrase: str) -> None:
+    """Owner-only (tools/owner_grant.py set-passphrase). Never overwrites."""
+    if len(passphrase or "") < 12:
+        raise GrantError("passphrase must be at least 12 characters")
+    path = passphrase_file()
+    if os.path.lexists(path):
+        raise GrantError(f"{path} exists; not overwritten")
+    salt = secrets.token_hex(16)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as fh:
+        json.dump({"salt": salt, "hash": _scrypt(passphrase, salt)}, fh)
+
+
 def _db():
     from core import agent_control as ac
     conn = ac._db()
+    conn.execute("CREATE TABLE IF NOT EXISTS automation_grant_attempts (ts REAL, via TEXT, "
+                 "grant_id TEXT, ok INTEGER)")
     conn.execute("""CREATE TABLE IF NOT EXISTS automation_grants (
         id TEXT PRIMARY KEY, status TEXT, spec TEXT, spec_hash TEXT, requested_by TEXT,
         requested_at REAL, expires_at REAL, approved_via TEXT, approved_at REAL,
@@ -162,14 +205,15 @@ def request(spec: dict, requested_by: str, now: Optional[float] = None) -> dict:
     norm["bound_to"] = requested_by
     norm["binding"] = binding
     gid = "g" + secrets.token_hex(6)
-    code = f"{secrets.randbelow(10**6):06d}"
+    # ~72 bits, stored as scrypt: not brute-forceable from the stored hash
+    code = secrets.token_urlsafe(9)
     conn = _db()
     try:
         conn.execute("INSERT INTO automation_grants (id,status,spec,spec_hash,requested_by,"
                      "requested_at,code_hash) VALUES (?,?,?,?,?,?,?)",
                      (gid, "pending", json.dumps(norm, sort_keys=True), _hash(norm),
                       (requested_by or "")[:120], now,
-                      hashlib.sha256(f"{gid}:{code}".encode()).hexdigest()))
+                      _scrypt(code, gid)))
         conn.commit()
     finally:
         conn.close()
@@ -235,22 +279,55 @@ def effective_status(g: dict, now: Optional[float] = None) -> str:
     return g["status"]
 
 
+def _attempts_locked(conn, now: float) -> bool:
+    n = conn.execute("SELECT COUNT(*) FROM automation_grant_attempts WHERE ok=0 AND ts>?",
+                     (now - 900,)).fetchone()[0]
+    return n >= MAX_FAILED_APPROVALS
+
+
+def _record_attempt(via: str, gid: str, ok: bool, now: float) -> None:
+    conn = _db()
+    try:
+        conn.execute("INSERT INTO automation_grant_attempts VALUES (?,?,?,?)",
+                     (now, via, gid, 1 if ok else 0))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def approve(gid: str, *, via: str, expected_hash: str, code: Optional[str] = None,
-            now: Optional[float] = None) -> dict:
-    """Activate a pending grant. Called ONLY by the owner channels, with the hash of the
-    content the owner was shown. Telegram must also carry the one-time code the server sent
-    to the owner chat; the host CLI does its own interactive confirmation instead."""
+            passphrase: Optional[str] = None, now: Optional[float] = None) -> dict:
+    """Activate a pending grant. Requires an OWNER SECRET verified here — the `via` string
+    alone authorizes nothing, so in-process callers (agents, tools) cannot self-approve:
+      owner_cli          → the owner passphrase (scrypt, root-only file);
+      telegram_verified  → the one-time code the server sent to the owner's Telegram chat.
+    Plus the hash of the content the owner was shown. 5 failures / 15 min lock approvals."""
     if via not in ("owner_cli", "telegram_verified"):
         raise GrantError("approval is only possible through an owner channel")
     now = time.time() if now is None else now
+    conn = _db()
+    try:
+        locked = _attempts_locked(conn, now)
+    finally:
+        conn.close()
+    if locked:
+        raise GrantError("approvals locked after repeated failures; retry later")
+    if via == "owner_cli":
+        rec = _load_passphrase()
+        if rec is None:
+            raise GrantError("no owner passphrase configured (tools/owner_grant.py set-passphrase)")
+        if not passphrase or not hmac.compare_digest(_scrypt(passphrase, rec["salt"]),
+                                                     rec["hash"]):
+            _record_attempt(via, gid, False, now)
+            raise GrantError("wrong owner passphrase")
     g = get(gid)
     if g is None:
         raise GrantError("unknown grant")
     if effective_status(g, now) != "pending":
         raise GrantError(f"grant is {effective_status(g, now)}, not pending")
     if via == "telegram_verified":
-        want = hashlib.sha256(f"{gid}:{code or ''}".encode()).hexdigest()
-        if not hmac.compare_digest(want, g["code_hash"] or ""):
+        if not code or not hmac.compare_digest(_scrypt(code, gid), g["code_hash"] or ""):
+            _record_attempt(via, gid, False, now)
             raise GrantError("wrong confirmation code")
     if not hmac.compare_digest(expected_hash, g["spec_hash"]) or _hash(g["spec"]) != g["spec_hash"]:
         raise GrantError("grant content changed since it was shown")
@@ -264,6 +341,7 @@ def approve(gid: str, *, via: str, expected_hash: str, code: Optional[str] = Non
         conn.close()
     if n != 1:
         raise GrantError("grant changed concurrently")
+    _record_attempt(via, gid, True, now)
     _audit("grant_approved", gid, via=via)
     return get(gid)
 
@@ -301,9 +379,11 @@ def _granted_sessions(spec: dict) -> set:
     return s
 
 
-def allows_send(session: str, action: str, actor: str,
-                now: Optional[float] = None) -> Optional[str]:
-    """Grant id that lets exactly `actor` (an api caller) do `action` on `session`."""
+def allows_send(session: str, action: str, actor: str, now: Optional[float] = None,
+                cwd: Optional[str] = None) -> Optional[str]:
+    """Grant id that lets exactly `actor` (an api caller) do `action` on `session`. A session
+    granted through `create` must be running IN its granted worktree (`cwd`), so a renamed
+    or reused session name elsewhere is not covered."""
     if not (actor or "").startswith("api:"):
         return None
     act = {"agent_send": "send", "agent_answer": "answer"}.get(action)
@@ -311,9 +391,16 @@ def allows_send(session: str, action: str, actor: str,
     if not act or sess.lower() in HARD_DENY_SESSIONS:
         return None
     for g in _active(time.time() if now is None else now):
-        if g["spec"].get("bound_to") == actor and act in g["spec"]["actions"] \
-                and sess in _granted_sessions(g["spec"]):
+        spec = g["spec"]
+        if spec.get("bound_to") != actor or act not in spec["actions"]:
+            continue
+        if sess in set(spec.get("targets") or []):
             return g["id"]
+        c = spec.get("create")
+        if c:
+            for key, wt in c["worktrees"].items():
+                if sess == c["session_prefix"] + key and cwd and _real(cwd) == _real(wt):
+                    return g["id"]
     return None
 
 

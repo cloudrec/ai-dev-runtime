@@ -18,7 +18,7 @@ import re
 import urllib.request
 from typing import Callable, Optional
 
-_CMD = re.compile(r"^/(approve|revoke)\s+(g[0-9a-f]{12})(?:\s+(\d{6}))?\s*$")
+_CMD = re.compile(r"^/(approve|revoke)\s+(g[0-9a-f]{12})(?:\s+([A-Za-z0-9_-]{12}))?\s*$")
 
 
 def _cfg():

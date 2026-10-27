@@ -1965,13 +1965,15 @@ def _allowlisted(session: str, target: str, caller: str) -> bool:
 
 
 def automation_refusal(session: str, target: str, actor: Optional[str],
-                       owner_proven: bool = False, action: Optional[str] = None) -> str:
+                       owner_proven: bool = False, action: Optional[str] = None,
+                       cwd: Optional[str] = None) -> str:
     """"" when allowed, else the refusal reason. `actor` never grants anything."""
-    return automation_decision(session, target, actor, owner_proven, action)[0]
+    return automation_decision(session, target, actor, owner_proven, action, cwd)[0]
 
 
 def automation_decision(session: str, target: str, actor: Optional[str],
-                        owner_proven: bool = False, action: Optional[str] = None) -> tuple:
+                        owner_proven: bool = False, action: Optional[str] = None,
+                        cwd: Optional[str] = None) -> tuple:
     """(refusal, authorized_by): refusal "" = allowed; authorized_by names the authority
     (owner_proof | policy_off | allowlist | grant:<id>) for the audit trail."""
     if owner_proven:
@@ -1980,13 +1982,22 @@ def automation_decision(session: str, target: str, actor: Optional[str],
     if sess.lower() in AUTOMATION_HARD_DENY or \
             (target or "").strip().split(":")[0].lower() in AUTOMATION_HARD_DENY:
         return "hard_denied_target", ""
+    if cwd:
+        # by WHERE the pane runs, not only its name: a renamed session in the payment
+        # agent's directory stays denied for every caller
+        try:
+            from core import agent_creation_policy as _acp
+            if _acp.hard_denied(cwd, "", _acp.load_config()):
+                return "hard_denied_target", ""
+        except Exception:  # noqa: BLE001 — unreadable policy: fail closed
+            return "hard_denied_target", ""
     if os.getenv("AGENT_AUTOMATION_POLICY", "enforce").strip().lower() == "off":
         return "", "policy_off"
     if _allowlisted(sess, (target or "").strip(), caller_class(actor)):
         return "", "allowlist"
     if action in ("agent_send", "agent_answer"):
         from core import automation_grants as _ag
-        gid = _ag.allows_send(sess, action, actor or "")
+        gid = _ag.allows_send(sess, action, actor or "", cwd=cwd)
         if gid:
             return "", f"grant:{gid}"
     return "automation_target_not_allowlisted", ""
@@ -2011,7 +2022,8 @@ def send_control_keys(target: str, keys: list, actor: Optional[str] = None,
         refusal = verify_owner_proof(owner_proof, "control_keys", target, " ".join(keys))
     if not refusal:
         refusal = automation_refusal(pane.get("session") or resolved.split(":")[0],
-                                     resolved, actor, owner_proven=owner_proof is not None)
+                                     resolved, actor, owner_proven=owner_proof is not None,
+                                     cwd=pane.get("claude_cwd") or pane.get("cwd"))
     if refusal:
         audit("control_keys", resolved, None, delivered=False, refused=refusal,
               actor=actor, source=source)
@@ -2072,7 +2084,8 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     if not refusal:
         refusal, authorized_by = automation_decision(
             pane.get("session") or resolved.split(":")[0], resolved, actor,
-            owner_proven=owner_proof is not None, action=action)
+            owner_proven=owner_proof is not None, action=action,
+            cwd=pane.get("claude_cwd") or pane.get("cwd"))
     else:
         authorized_by = ""
     if refusal:
