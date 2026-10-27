@@ -168,7 +168,8 @@ def scope_population(sc: dict, live_cwds: list) -> int:
 
 def authorize(project_dir: str, session: str, *, caller: str,
               owner_proof: Optional[dict] = None, live_cwds: Optional[list] = None,
-              verify_proof: Optional[Callable] = None, cfg: Optional[dict] = None) -> dict:
+              verify_proof: Optional[Callable] = None, cfg: Optional[dict] = None,
+              actor: Optional[str] = None) -> dict:
     """{"ok": bool, "reason": str, "scope": name|None}. Pure apart from proof consumption."""
     cfg = load_config() if cfg is None else cfg
     # one session per worktree holds on EVERY allow path, owner proof and policy off too:
@@ -189,7 +190,7 @@ def authorize(project_dir: str, session: str, *, caller: str,
     if hit is None:
         # no static scope: an ACTIVE owner delegation grant may cover this exact worktree
         from core import automation_grants as ag
-        g = ag.allows_create(project_dir, session, caller,
+        g = ag.allows_create(project_dir, session, actor or "",
                              list(live_cwds or []) + reserved_cwds())
         if g["ok"]:
             return {"ok": True, "reason": f"grant:{g['grant']}", "scope": None}

@@ -85,3 +85,55 @@ check fails 5 / 7 / 5 tests. Full suite: 3953 passed / 0 failed.
 3. Optional: owner creates a Telegram bot (free) and sets `OWNER_GRANT_TELEGRAM_BOT_TOKEN`
    and `OWNER_GRANT_TELEGRAM_USER_ID`, plus a timer for `telegram-poll-once`.
 4. Rollback: `git reset --keep ee3f523`, restart both; or revoke all grants.
+
+
+## Follow-up: working ChatGPT path + client binding (same branch)
+
+Requested by an automated instruction; nothing deployed, `/opt/seo` untouched (`git apply
+--check` only).
+
+**Where the connector lives.** The ChatGPT "owner-os" MCP connector is the SEO project's
+backend: `/opt/seo/backend/services/mcp_server.py` (container `seo-backend-1` at
+172.20.0.4 → runtime `http://172.17.0.1:8199/api/v1`). Tools are a hand-written `TOOLS`
+registry + `_FULL_SCHEMAS`; each connector authenticates with its own hashed `mcp_…`
+token (`McpToken`, scopes read/write). The connector called the runtime with the shared
+bearer only and no `X-Runtime-Actor`, so every MCP call arrived as plain `api:bearer`.
+
+**Patch for the connector** (`integrations/seo-mcp/owner-os-grants.patch`, base seo
+`f3eb765`, applies cleanly): `call_tool` sets `runtime_client.CURRENT_ACTOR =
+mcp-token-<id>` from the verified token (reset after the call) and `runtime_client` sends it
+as `X-Runtime-Actor`; new tools `grant_request` (write), `grant_list` (read),
+`grant_revoke` (write). No approve tool.
+
+**Binding (runtime).** A grant belongs to the exact requesting actor and only that actor
+can use it (send/answer/create). Unnamed callers (`api:bearer` with no name) cannot request.
+Bindings are labelled honestly:
+- `declared` — shared runtime token + a name set by its holder. The MCP server names the
+  verified MCP token, so one connector cannot use another connector's grant; any other
+  holder of the shared runtime token could still declare the same name.
+- `authenticated` — optional per-client runtime token (`/etc/ai-runtime/runtime-clients.json`,
+  root 0600, `{client_id: sha256(token)}`): `_auth` resolves the client, the actor becomes
+  `api:client/<id>` and declared names are ignored; once that file exists, only
+  authenticated clients may request grants (`GRANT_REQUIRE_AUTHENTICATED_CLIENT` overrides).
+
+**E2E tests** (`tests/test_automation_grants.py::test_mcp_*`): the real seo `mcp_server.py`
+and `runtime_client.py` copied to a temp dir, patched, DB models stubbed, HTTP routed by
+ASGI into this branch's real runtime API (real `_auth`, routes, agent_control on mocked
+tmux): MCP token 7 requests → pending, nothing allowed → owner CLI approves → token 7
+creates exactly one worker in the granted /opt worktree and sends (audited
+`grant:<id>`) → token 8, other agents and payorch refused → list → revoke → refused; actor
+taken from the verified token, not params; read-only tokens cannot request. Binding tests:
+other actors, unidentified requesters, authenticated client overrides declared names,
+shared token cannot impersonate `api:client/…`, unsafe client-token files ignored.
+Full suite: 3972 passed / 0 failed.
+
+### Remaining owner gates (exact)
+
+1. Deploy this branch to the runtime (fast-forward from `ee3f523`; restart ai-runtime +
+   wake companion). With no grants, behaviour is unchanged.
+2. Apply `integrations/seo-mcp/owner-os-grants.patch` in `/opt/seo`, commit on its deployed
+   branch, rebuild and restart `seo-backend` (SEO project; baked image).
+3. Optional, recommended: per-client runtime token for the connector (file above + the seo
+   backend's `RUNTIME_TOKEN`) to turn `declared` into `authenticated`.
+4. First grant: ChatGPT calls `grant_request` for the single `/opt/owneros-sandbox-worker-20261027`
+   worktree (`max_sessions: 1`, 1 h); owner runs `tools/owner_grant.py approve <id>` over SSH.

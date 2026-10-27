@@ -230,7 +230,8 @@ def test_creation_outside_the_granted_worktree_or_name_is_refused(env):
 def test_expired_grant_denies(env, monkeypatch):
     gid = granted(env)
     later = ag.get(gid)["expires_at"] + 1
-    assert ag.allows_send("owneros-sandbox-w1", "agent_send", "api", now=later) is None
+    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API) == gid
+    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API, now=later) is None
     assert ag.effective_status(ag.get(gid), later) == "expired"
 
 
@@ -258,8 +259,8 @@ def test_tampering_with_a_stored_grant_voids_it(env):
     c.execute("UPDATE automation_grants SET spec=? WHERE id=?", (json.dumps(spec), gid))
     c.commit()
     c.close()
-    assert ag.allows_send("bitwhite-backend-v3", "agent_send", "api") is None
-    assert ag.allows_send("owneros-sandbox-w1", "agent_send", "api") is None
+    assert ag.allows_send("bitwhite-backend-v3", "agent_send", API) is None
+    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API) is None
 
 
 def test_content_changed_after_showing_is_refused(env):
@@ -392,3 +393,215 @@ def test_telegram_errors_never_leak_the_token(env, tg, monkeypatch):
     monkeypatch.setattr(ot.urllib.request, "urlopen", boom)
     r = ot._call("getUpdates", {})
     assert "SECRET-TOKEN" not in json.dumps(r)
+
+
+
+# ── binding to the requesting client ───────────────────────────────────────────
+
+@pytest.mark.parametrize("other", ["api:hmac/other-mcp-client", "api:bearer/chatgpt-mcp",
+                                   "api:hmac", "api:client/chatgpt-mcp", "api:hmac/chatgpt-mcp2"])
+def test_a_grant_is_usable_only_by_the_exact_requesting_actor(env, other):
+    gid = granted(env)
+    assert ag.allows_send("owneros-sandbox-w1", "agent_send", API) == gid
+    r = ac.agent_send("owneros-sandbox-w1:0.0", "x", idempotency_key=f"k-{other}", actor=other)
+    assert r["refused"] == "automation_target_not_allowlisted"
+    r = ac.agent_resume(env["wt"], session_name="owneros-sandbox-w1", actor=other)
+    assert r["refused"] == "creation_not_in_any_scope" and created(env["calls"]) == []
+
+
+@pytest.mark.parametrize("who", ["api:bearer", "api:hmac", "", "owner", "native_supervisor"])
+def test_unidentified_callers_cannot_request(env, who):
+    with pytest.raises(ag.GrantError, match="identified client"):
+        ag.request(SPEC, requested_by=who)
+
+
+def test_binding_is_recorded_and_shown(env):
+    g = ag.request(SPEC, requested_by=API)
+    spec = ag.get(g["id"])["spec"]
+    assert spec["bound_to"] == API and spec["binding"] == "declared"
+    assert f"only for {API} (declared)" in g["summary"]
+    g2 = ag.request(SPEC, requested_by="api:client/chatgpt-connector")
+    assert ag.get(g2["id"])["spec"]["binding"] == "authenticated"
+
+
+def test_require_authenticated_client_fails_closed(env, monkeypatch):
+    monkeypatch.setenv("GRANT_REQUIRE_AUTHENTICATED_CLIENT", "1")
+    with pytest.raises(ag.GrantError, match="authenticated client"):
+        ag.request(SPEC, requested_by=API)
+    assert ag.request(SPEC, requested_by="api:client/chatgpt-connector")["status"] == "pending"
+
+
+@pytest.fixture
+def client_tokens(tmp_path, monkeypatch):
+    import hashlib
+    f = tmp_path / "runtime-clients.json"
+    f.write_text(json.dumps({"chatgpt-connector": hashlib.sha256(b"tok-A").hexdigest()}))
+    f.chmod(0o600)
+    monkeypatch.setenv("RUNTIME_CLIENT_TOKENS_FILE", str(f))
+    return f
+
+
+def _v1():
+    return _load("api_v1_client_test", "api/v1.py")
+
+
+def test_client_token_authenticates_and_overrides_the_declared_name(env, client_tokens,
+                                                                    monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    v1 = _v1()
+    monkeypatch.setattr(v1, "_TOKEN", "shared-runtime-token")
+    monkeypatch.setattr(v1, "agent_control", ac)
+    monkeypatch.delenv("GRANT_REQUIRE_AUTHENTICATED_CLIENT", raising=False)
+    app = FastAPI()
+    app.include_router(v1.router)
+    c = TestClient(app)
+    hdr = lambda t, name: {"Authorization": f"Bearer {t}", "X-Runtime-Actor": name}  # noqa: E731
+    # client token: identity comes from the token, the declared name is ignored
+    r = c.post("/api/v1/grants/request", json=SPEC, headers=hdr("tok-A", "owner")).json()
+    g = ag.get(r["id"])
+    assert g["requested_by"] == "api:client/chatgpt-connector"
+    assert g["spec"]["binding"] == "authenticated"
+    # with a client-token file present, the shared token can no longer request grants
+    r2 = c.post("/api/v1/grants/request", json=SPEC,
+                headers=hdr("shared-runtime-token", "chatgpt-connector"))
+    assert r2.status_code == 400 and "authenticated client" in r2.json()["detail"]
+    # the shared token cannot impersonate the client id by declaring it
+    assert v1.caller_identity(type("R", (), {"state": type("S", (), {
+        "auth_method": "bearer"})(), "client": None})(), "client/chatgpt-connector")[0] == \
+        "api:bearer/client/chatgpt-connector"
+    # wrong token -> 401
+    assert c.get("/api/v1/grants", headers=hdr("tok-B", "x")).status_code == 401
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o640])
+def test_unsafe_client_token_file_is_ignored(env, client_tokens, mode):
+    client_tokens.chmod(mode)
+    assert _v1().client_for_bearer("tok-A") is None
+
+
+# ── end to end through the REAL seo MCP server code, patched (not the live repo) ──
+
+SEO = pathlib.Path("/opt/seo/backend/services")
+PATCH = ROOT / "integrations" / "seo-mcp" / "owner-os-grants.patch"
+
+
+@pytest.fixture
+def mcp(env, tmp_path, monkeypatch):
+    import subprocess
+    import types
+    if not (SEO / "mcp_server.py").exists():
+        pytest.skip("seo MCP server source not present")
+    root = tmp_path / "seo"
+    (root / "backend" / "services").mkdir(parents=True)
+    for f in ("mcp_server.py", "runtime_client.py"):
+        (root / "backend" / "services" / f).write_text((SEO / f).read_text())
+    (root / "backend" / "services" / "__init__.py").write_text("")
+    r = subprocess.run(["git", "apply", "-p1", str(PATCH)], cwd=root, capture_output=True,
+                       text=True)
+    if r.returncode != 0:
+        pytest.skip(f"patch no longer applies to /opt/seo: {r.stderr[:200]}")
+
+    class _Row:
+        def __init__(self, **kw):
+            self.__dict__.update(kw)
+    models = types.ModuleType("models")
+    models.McpAudit, models.McpToken = _Row, _Row
+    monkeypatch.setitem(sys.modules, "models", models)
+    for m in [k for k in sys.modules if k == "services" or k.startswith("services.")]:
+        monkeypatch.delitem(sys.modules, m)
+    monkeypatch.syspath_prepend(str(root / "backend"))
+    import httpx
+    from fastapi import FastAPI
+    v1 = _load("api_v1_mcp_e2e", "api/v1.py")
+    monkeypatch.setattr(v1, "_TOKEN", "shared-runtime-token")
+    monkeypatch.setattr(v1, "agent_control", ac)
+    app = FastAPI()
+    app.include_router(v1.router)
+    import services.runtime_client as rc
+    import services.mcp_server as ms
+    monkeypatch.setattr(rc, "RUNTIME_URL", "http://runtime/api/v1")
+    monkeypatch.setattr(rc, "RUNTIME_TOKEN", "shared-runtime-token")
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(rc.httpx, "AsyncClient", lambda **kw: real_client(
+        transport=httpx.ASGITransport(app=app), base_url="http://runtime", **kw))
+
+    class DB:
+        audits = []
+
+        def add(self, row):
+            self.audits.append(row)
+
+        async def commit(self):
+            pass
+    tok = lambda i: models.McpToken(id=i, label=f"conn{i}", scopes=["read", "write"])  # noqa: E731
+    return {"ms": ms, "rc": rc, "db": DB(), "A": tok(7), "B": tok(8)}
+
+
+def call(m, tok, name, params):
+    import asyncio
+    try:
+        return asyncio.run(m["ms"].call_tool(m["db"], tok, name, params))
+    except Exception as e:  # noqa: BLE001
+        return {"exception": f"{type(e).__name__}: {e}"}
+
+
+def test_mcp_tools_are_listed_and_there_is_no_approve_tool(mcp):
+    names = set(mcp["ms"].TOOLS)
+    assert {"grant_request", "grant_list", "grant_revoke"} <= names
+    assert not any("approve" in n and "grant" in n for n in names)
+
+
+def test_mcp_request_owner_approval_then_scoped_control_end_to_end(mcp, env):
+    spec = {"project": "owneros-sandbox", "actions": ["send", "answer", "create"],
+            "create": {"worktrees": {"w1": "/opt/sandbox"}, "session_prefix": "owneros-sandbox-",
+                       "max_sessions": 1}, "ttl_secs": 3600}
+    req = call(mcp, mcp["A"], "grant_request", spec)
+    assert req["status"] == "pending", req
+    g = ag.get(req["id"])
+    assert g["requested_by"] == "api:bearer/mcp-token-7" and g["spec"]["binding"] == "declared"
+    # before the owner acts: nothing
+    assert "error" in call(mcp, mcp["A"], "agent_resume",
+                           {"project_dir": env["wt"], "session_name": "owneros-sandbox-w1"}) \
+        or not created(env["calls"])
+    # owner approves out of band (host CLI on a TTY)
+    assert cli_approve(req["id"])[0] == 0
+    r = call(mcp, mcp["A"], "agent_resume",
+             {"project_dir": env["wt"], "session_name": "owneros-sandbox-w1"})
+    assert r.get("agent_created") and len(created(env["calls"])) == 1, r
+    r = call(mcp, mcp["A"], "agent_send", {"target": "owneros-sandbox-w1:0.0", "text": "go"})
+    assert r.get("delivered") and r.get("authorized_by") == f"grant:{req['id']}", r
+    # another MCP connector, other agents, the payment agent: refused
+    r = call(mcp, mcp["B"], "agent_send", {"target": "owneros-sandbox-w1:0.0", "text": "x"})
+    assert r.get("refused") == "automation_target_not_allowlisted", r
+    for target in ("bitwhite-backend-v3:0.0", "payorch-ha-fresh:0.0"):
+        r = call(mcp, mcp["A"], "agent_send", {"target": target, "text": "x"})
+        assert r.get("refused") in ("automation_target_not_allowlisted", "hard_denied_target"), r
+    r = call(mcp, mcp["B"], "agent_resume",
+             {"project_dir": env["wt"], "session_name": "owneros-sandbox-w1"})
+    assert not r.get("agent_created") and len(created(env["calls"])) == 1
+    # list, revoke, then denied
+    assert any(x["id"] == req["id"] and x["effective"] == "active"
+               for x in call(mcp, mcp["A"], "grant_list", {})["grants"])
+    assert call(mcp, mcp["A"], "grant_revoke", {"grant_id": req["id"]}) == {"revoked": True}
+    r = call(mcp, mcp["A"], "agent_send", {"target": "owneros-sandbox-w1:0.0", "text": "again"})
+    assert r.get("refused") == "automation_target_not_allowlisted", r
+    sends = [c for c in env["calls"] if c and c[0] == "paste-buffer"]
+    assert len(sends) == 1
+
+
+def test_mcp_actor_comes_from_the_verified_token_not_from_params(mcp):
+    req = call(mcp, mcp["B"], "grant_request",
+               {"project": "p", "actions": ["send"], "targets": ["vtb"], "ttl_secs": 600,
+                "actor": "mcp-token-7"})
+    assert "exception" in req or ag.get(req["id"])["requested_by"] == "api:bearer/mcp-token-8"
+    assert mcp["rc"].CURRENT_ACTOR.get() == ""            # reset after the call
+
+
+def test_mcp_without_write_scope_cannot_request(mcp):
+    import types
+    ro = types.SimpleNamespace(id=9, label="ro", scopes=["read"])
+    r = call(mcp, ro, "grant_request", {"project": "p", "actions": ["send"],
+                                        "targets": ["vtb"], "ttl_secs": 600})
+    assert "write" in r.get("exception", "")
+    assert "grants" in call(mcp, ro, "grant_list", {})

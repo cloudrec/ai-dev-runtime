@@ -48,10 +48,49 @@ async def _auth(request: Request,
         return True
     # Bearer path
     if authorization and authorization.startswith("Bearer "):
+        cid = client_for_bearer(authorization[7:].strip())
+        if cid:                          # per-client token: an AUTHENTICATED identity
+            request.state.auth_method = "client"
+            request.state.client_id = cid
+            return True
         if hmac.compare_digest(authorization[7:].strip(), _TOKEN):
             request.state.auth_method = "bearer"
             return True
     raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def client_tokens_file() -> str:
+    return os.getenv("RUNTIME_CLIENT_TOKENS_FILE", "/etc/ai-runtime/runtime-clients.json")
+
+
+def _client_tokens() -> dict:
+    """{client_id: sha256(token)} from a root-only file; {} when absent or unsafe."""
+    import json as _json
+    import stat as _stat
+    path = client_tokens_file()
+    try:
+        st = os.stat(path, follow_symlinks=False)
+        if not _stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o077):
+            return {}
+        with open(path, encoding="utf-8") as fh:
+            data = _json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items()
+            if re.fullmatch(r"[A-Za-z0-9._-]{1,48}", str(k)) and re.fullmatch(r"[0-9a-f]{64}", str(v))}
+
+
+def client_for_bearer(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    hit = None
+    for cid, h in _client_tokens().items():
+        if hmac.compare_digest(digest, h):
+            hit = cid
+    return hit
 
 
 # ── caller attribution (observability only — no gate reads these) ───────────
@@ -90,6 +129,12 @@ def caller_identity(request: Optional[Request], declared: Optional[str] = None) 
         method = "unknown"
     name = _ACTOR_SAFE_RE.sub("", (declared or "").strip())[:64]
     actor = f"api:{method}" + (f"/{name}" if name else "")
+    try:
+        cid = getattr(request.state, "client_id", None)
+    except Exception:  # noqa: BLE001
+        cid = None
+    if cid:                              # authenticated client: the declared name is ignored
+        actor = f"api:client/{cid}"
     host = port = agent = ""
     try:
         client = getattr(request, "client", None)

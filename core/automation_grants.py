@@ -18,9 +18,18 @@ Lifecycle (table `automation_grants` in the agent_control DB):
   expired  — implicitly, once `expires_at` passes; pending requests lapse after
              PENDING_TTL_SECS.
 
+Binding: a grant belongs to the EXACT actor that requested it (`requested_by`) and only
+that actor can use it. `api:client/<id>` actors come from a per-client runtime token and are
+AUTHENTICATED (binding `authenticated`); `api:bearer/<name>` / `api:hmac/<name>` carry a
+name declared by a shared-token holder (binding `declared`) — e.g. the MCP server naming
+the verified MCP token it serves — which separates MCP connectors but not other holders of
+the shared runtime token. Requests from an unnamed caller are refused; once a client-token
+file is configured (or GRANT_REQUIRE_AUTHENTICATED_CLIENT=1) only authenticated clients
+may request.
+
 Checks used by the enforcement points:
-  `allows_send(session, action, caller)` → grant id or None (agent_control._deliver)
-  `allows_create(dir, session, caller, live_cwds)` → {ok, reason, grant} (creation gate)
+  `allows_send(session, action, actor)` → grant id or None (agent_control._deliver)
+  `allows_create(dir, session, actor, live_cwds)` → {ok, reason, grant} (creation gate)
 
 Not a defence against a malicious ROOT process on this host (it could write this table
 directly) — like every local gate here. It defends against remote API/MCP callers,
@@ -121,10 +130,37 @@ def validate_spec(spec: dict) -> dict:
             "ttl_secs": ttl}
 
 
+def binding_of(actor: str) -> str:
+    a = actor or ""
+    if re.fullmatch(r"api:client/[A-Za-z0-9._-]{1,48}", a):
+        return "authenticated"
+    if re.fullmatch(r"api:[a-z]+/[A-Za-z0-9 ._:@/+-]{1,64}", a):
+        return "declared"
+    return "unidentified"
+
+
+def require_authenticated() -> bool:
+    flag = os.getenv("GRANT_REQUIRE_AUTHENTICATED_CLIENT", "").strip()
+    if flag:
+        return flag == "1"
+    try:
+        from api import v1 as _v1            # client tokens configured => fail closed
+        return bool(_v1._client_tokens())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def request(spec: dict, requested_by: str, now: Optional[float] = None) -> dict:
     """Create a PENDING grant. Returns {id, status, summary}. Never activates anything."""
     now = time.time() if now is None else now
+    binding = binding_of(requested_by)
+    if binding == "unidentified":
+        raise GrantError("a grant needs an identified client (X-Runtime-Actor or a client token)")
+    if require_authenticated() and binding != "authenticated":
+        raise GrantError("this runtime requires an authenticated client token for grants")
     norm = validate_spec(spec)
+    norm["bound_to"] = requested_by
+    norm["binding"] = binding
     gid = "g" + secrets.token_hex(6)
     code = f"{secrets.randbelow(10**6):06d}"
     conn = _db()
@@ -144,6 +180,8 @@ def request(spec: dict, requested_by: str, now: Optional[float] = None) -> dict:
 
 def summary(spec: dict) -> str:
     parts = [f"project {spec['project']}", f"actions {','.join(spec['actions'])}"]
+    if spec.get("bound_to"):
+        parts.append(f"only for {spec['bound_to']} ({spec.get('binding')})")
     if spec.get("targets"):
         parts.append(f"agents {','.join(spec['targets'])}")
     if spec.get("create"):
@@ -263,29 +301,30 @@ def _granted_sessions(spec: dict) -> set:
     return s
 
 
-def allows_send(session: str, action: str, caller: str,
+def allows_send(session: str, action: str, actor: str,
                 now: Optional[float] = None) -> Optional[str]:
-    """Grant id that lets `caller` (only `api`) do `action` on `session`, else None."""
-    if caller != "api":
+    """Grant id that lets exactly `actor` (an api caller) do `action` on `session`."""
+    if not (actor or "").startswith("api:"):
         return None
     act = {"agent_send": "send", "agent_answer": "answer"}.get(action)
     sess = (session or "").strip()
     if not act or sess.lower() in HARD_DENY_SESSIONS:
         return None
     for g in _active(time.time() if now is None else now):
-        if act in g["spec"]["actions"] and sess in _granted_sessions(g["spec"]):
+        if g["spec"].get("bound_to") == actor and act in g["spec"]["actions"] \
+                and sess in _granted_sessions(g["spec"]):
             return g["id"]
     return None
 
 
-def allows_create(project_dir: str, session: str, caller: str, live_cwds: list,
+def allows_create(project_dir: str, session: str, actor: str, live_cwds: list,
                   now: Optional[float] = None) -> dict:
-    if caller != "api":
+    if not (actor or "").startswith("api:"):
         return {"ok": False, "reason": "grant_caller_not_api"}
     real = _real(project_dir)
     for g in _active(time.time() if now is None else now):
         c = g["spec"].get("create")
-        if not c or "create" not in g["spec"]["actions"]:
+        if not c or "create" not in g["spec"]["actions"] or g["spec"].get("bound_to") != actor:
             continue
         for key, wt in c["worktrees"].items():
             if _real(wt) != real:

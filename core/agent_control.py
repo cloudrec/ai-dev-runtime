@@ -1986,7 +1986,7 @@ def automation_decision(session: str, target: str, actor: Optional[str],
         return "", "allowlist"
     if action in ("agent_send", "agent_answer"):
         from core import automation_grants as _ag
-        gid = _ag.allows_send(sess, action, caller_class(actor))
+        gid = _ag.allows_send(sess, action, actor or "")
         if gid:
             return "", f"grant:{gid}"
     return "automation_target_not_allowlisted", ""
@@ -2290,7 +2290,7 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
         live_cwds = [a.get("claude_cwd") for a in agent_list().get("agents", [])
                      if a.get("is_agent") and a.get("alive")]
         gate = acp.authorize(resolved, name, caller=caller_class(actor), owner_proof=owner_proof,
-                             live_cwds=[c for c in live_cwds if c])
+                             live_cwds=[c for c in live_cwds if c], actor=actor)
         if not gate["ok"]:
             audit("agent_resume", name, resumed=False, refused=gate["reason"], actor=actor,
                   cwd=resolved)
