@@ -324,7 +324,8 @@ def test_context_is_compact_and_bounded():
     ctx = p.calls[0][0]
     assert len(ctx["question"]) == 2000 and len(ctx["recent_decisions"]) == 5
     assert set(ctx) == {"event_type", "project", "agent", "goal", "state", "question",
-                        "git_diff_summary", "recent_decisions", "affected_agents"}
+                        "git_diff_summary", "recent_decisions", "affected_agents",
+                        "previous_advice"}
 
 
 def test_owner_needed_event_is_not_forwarded_and_not_re_notified():
@@ -482,6 +483,7 @@ def test_fallback_delivery_is_off_unless_explicitly_agent_control(monkeypatch, m
 
 def test_fallback_delivers_once_to_idle_target_and_marks_sent_only_on_proof(monkeypatch):
     monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
     _queue()
     sends = []
 
@@ -494,22 +496,119 @@ def test_fallback_delivers_once_to_idle_target_and_marks_sent_only_on_proof(monk
     assert cb.deliver_pending_agent_control(listing(), send=send) == [] and len(sends) == 1
 
 
-@pytest.mark.parametrize("res", [{"submitted": False, "refused": "working"},
-                                 {"submitted": True, "delivered": False}, "raise"])
-def test_fallback_unproven_delivery_stays_pending(monkeypatch, res):
+@pytest.mark.parametrize("res,state", [
+    ({"submitted": True, "delivered": False, "error": "enter"}, "failed"),
+    ({"submitted": False, "delivered": False, "queued": True}, "queued"),
+    ({"duplicate": True, "submitted": True, "delivered": False}, "sent"),
+    ({"duplicate": True, "submitted": False, "queued": True, "delivered": False}, "queued"),
+    ({"duplicate": True, "submitted": False, "delivered": False}, "failed"),
+])
+def test_fallback_real_attempt_is_settled_and_never_resent(monkeypatch, res, state):
     monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
     _queue()
+    sends, events = [], []
 
     def send(*a):
-        if res == "raise":
-            raise RuntimeError("x")
+        sends.append(a)
         return dict(res)
-    out = cb.deliver_pending_agent_control(listing(), send=send)
-    assert out[0]["result"] == "pending_unproven" and len(cb.pending_messages()) == 1
+    out = cb.deliver_pending_agent_control(listing(), send=send,
+                                           emit=lambda m, st, r: events.append(st))
+    assert out[0]["result"] == state and cb.pending_messages() == []
+    assert _rows("SELECT state FROM native_outbox") == [(state,)]
+    assert cb.deliver_pending_agent_control(listing(), send=send) == [] and len(sends) == 1
+    assert events == (["failed"] if state == "failed" else [])
+
+
+def test_fallback_busy_refusal_spends_no_attempt(monkeypatch):
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
+    _queue()
+    out = cb.deliver_pending_agent_control(
+        listing(), send=lambda *a: {"submitted": False, "delivered": False,
+                                    "refused": "working"})
+    assert out[0]["result"] == "pending_refused"
+    assert _rows("SELECT state,attempts FROM native_outbox") == [("pending", 0)]
+
+
+def test_fallback_errors_retry_with_the_same_key_then_fail_once(monkeypatch):
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
+    _queue()
+    keys, events = [], []
+
+    def send(target, text, key):
+        keys.append(key)
+        raise RuntimeError("tmux")
+    results = [cb.deliver_pending_agent_control(
+        listing(), send=send, emit=lambda m, st, r: events.append(st))
+        for _ in range(cb.MAX_DELIVERY_ATTEMPTS + 2)]
+    assert [r[0]["result"] for r in results if r] == \
+        ["pending_retry"] * (cb.MAX_DELIVERY_ATTEMPTS - 1) + ["failed"]
+    assert keys == ["cto:d1"] * cb.MAX_DELIVERY_ATTEMPTS and events == ["failed"]
+
+
+def test_fallback_stale_or_undated_advice_expires_untyped(monkeypatch):
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
+    conn, _ = _c(None)
+    cb._schema(conn)
+    conn.execute("INSERT INTO native_outbox (msg_key,event_key,to_agent,message,created_at) "
+                 "VALUES ('cto:old','o','aes-canary:0.0','m','2020-01-01T00:00:00+00:00'),"
+                 "('cto:bad','b','aes-canary:0.0','m','not-a-time')")
+    conn.commit()
+    conn.close()
+    sends, events = [], []
+    out = cb.deliver_pending_agent_control(listing(), send=lambda *a: sends.append(a),
+                                           emit=lambda m, st, r: events.append(m["msg_key"]))
+    assert sorted(o["result"] for o in out) == ["expired", "expired"] and sends == []
+    assert sorted(events) == ["cto:bad", "cto:old"]
+
+
+def test_fallback_one_message_per_agent_per_tick_oldest_first(monkeypatch):
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
+    _queue(key="d1")
+    _queue(key="d2")
+    sends = []
+
+    def send(target, text, key):
+        sends.append(key)
+        return {"submitted": True, "delivered": True, "idempotency_key": key}
+    first = cb.deliver_pending_agent_control(listing(), send=send)
+    assert [o["result"] for o in first] == ["sent", "pending_next_tick"] and sends == ["cto:d1"]
+    cb.deliver_pending_agent_control(listing(), send=send)
+    assert sends == ["cto:d1", "cto:d2"]
+
+
+def test_failure_events_come_from_the_bridge_and_are_never_fed_back(monkeypatch):
+    from core import native_owner_os as no
+    from core.control_plane import cto
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
+    _queue()
+    cb.deliver_pending_agent_control(listing(), send=lambda *a: {"submitted": True,
+                                                                 "delivered": False})
+    ev = [e for e in cto.cto_brief_since("t", limit=50)["events"]
+          if e["type"] == "cto_advice_failed"]
+    assert len(ev) == 1 and ev[0]["source"] == cb.SOURCE and no.map_event(ev[0]) is None
+
+
+def test_previous_advice_outcome_feeds_the_next_decision(monkeypatch):
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
+    p = FakeProvider()
+    cb.handle_event(EV(key="d1"), provider=p)
+    cb.deliver_pending_agent_control(listing(), send=lambda *a: {"queued": True})
+    cb.handle_event(EV(key="d2"), provider=p)
+    assert p.calls[0][0]["previous_advice"] == []
+    prev = p.calls[1][0]["previous_advice"]
+    assert [(x["advice"], x["delivery"]) for x in prev] == [("do X", "queued")]
 
 
 def test_fallback_busy_target_is_left_pending(monkeypatch):
     monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
     _queue()
     sends = []
     out = cb.deliver_pending_agent_control(listing("busy"), send=lambda *a: sends.append(a))
@@ -518,6 +617,7 @@ def test_fallback_busy_target_is_left_pending(monkeypatch):
 
 def test_fallback_never_delivers_to_payorch(monkeypatch):
     monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.setenv("NATIVE_OWNER_OS_AGENTS", "aes-canary")
     conn, _ = _c(None)
     cb._schema(conn)          # a row that bypassed the queue-time deny must still be stopped
     conn.execute("INSERT INTO native_outbox (msg_key,event_key,to_agent,message,created_at) "
@@ -528,3 +628,19 @@ def test_fallback_never_delivers_to_payorch(monkeypatch):
     out = cb.deliver_pending_agent_control(listing(), send=lambda *a: sends.append(a))
     assert out == [{"msg_key": "cto:x", "result": "denied"}] and sends == []
     assert _rows("SELECT state FROM native_outbox") == [("denied",)]
+
+
+def test_fallback_with_no_worker_scope_types_nothing(monkeypatch):
+    """Empty NATIVE_OWNER_OS_AGENTS means 'all' for reading events, never for typing."""
+    monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    monkeypatch.delenv("NATIVE_OWNER_OS_AGENTS", raising=False)
+    _queue()
+    sends = []
+    out = cb.deliver_pending_agent_control(listing(), send=lambda *a: sends.append(a))
+    assert [o["result"] for o in out] == ["pending_no_scope"] and sends == []
+
+
+@pytest.mark.parametrize("target", ["payorch-ha-fresh:0.0", " payorch-ha-fresh:0.0",
+                                    "PAYORCH-HA-FRESH:0.0", "payorch-ha-fresh"])
+def test_hard_deny_ignores_whitespace_and_case(target):
+    assert cb.agent_denied(target)
