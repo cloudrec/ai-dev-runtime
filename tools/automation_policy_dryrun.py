@@ -69,6 +69,30 @@ def events(paths):
                 yield e
 
 
+def ledger_events(path: str):
+    """Rows of the live `deliveries` ledger (+ attribution), opened read-only."""
+    import sqlite3
+    c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    try:
+        has_attr = bool(c.execute("SELECT 1 FROM sqlite_master WHERE name="
+                                  "'delivery_attribution'").fetchone())
+        sql = ("SELECT d.idempotency_key,d.target,d.action,d.result,d.created_at,"
+               + ("a.actor" if has_attr else "NULL") + " FROM deliveries d"
+               + (" LEFT JOIN delivery_attribution a ON a.idempotency_key=d.idempotency_key"
+                  if has_attr else "") + " ORDER BY d.rowid")
+        for key, target, action, result, created, actor in c.execute(sql):
+            try:
+                res = json.loads(result or "{}")
+            except ValueError:
+                res = {}
+            ok = res.get("stopped") if action == "agent_stop" else res.get("delivered")
+            if action in ACTS and ok:
+                yield {"action": action, "target": target, "idempotency_key": key,
+                       "actor": actor, "ts": created, "delivered": True, "stopped": True}
+    finally:
+        c.close()
+
+
 def judge(e: dict, ac) -> str:
     act, tgt = e.get("action"), str(e.get("target") or "")
     sess = tgt.split(":")[0]
@@ -85,6 +109,9 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--targets", required=True, help="proposed AGENT_AUTOMATION_TARGETS")
     ap.add_argument("--log-glob", default="/var/log/ai-runtime/agent_control.jsonl*")
+    ap.add_argument("--ledger", default="",
+                    help="read the agent_control `deliveries` ledger (read-only) "
+                         "instead of the audit logs")
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     os.environ["AGENT_AUTOMATION_TARGETS"] = a.targets
@@ -96,14 +123,15 @@ def main(argv=None) -> int:
     paths = sorted(glob.glob(a.log_glob), key=rotation)
     rows = collections.Counter()
     first = last = None
-    for e in events(paths):
+    source = ledger_events(a.ledger) if a.ledger else events(paths)
+    for e in source:
         ts = e.get("ts") or ""
         first, last = first or ts, ts
         actor = str(e.get("actor") or "")
         rows[(family(str(e.get("idempotency_key") or ""), actor, str(e.get("target") or "")),
               ac.caller_class(actor), e.get("action"), str(e.get("target") or ""),
               judge(e, ac))] += 1
-    out = {"targets": a.targets, "window": [first, last],
+    out = {"targets": a.targets, "source": a.ledger or a.log_glob, "window": [first, last],
            "rows": [{"sender": s, "caller": c, "action": act, "target": t, "verdict": v,
                      "count": n} for (s, c, act, t, v), n in rows.most_common()],
            "blocked": sum(n for k, n in rows.items() if k[4].startswith("BLOCKED")),
