@@ -42,11 +42,19 @@ catalog differs from the current one — after every deploy (new container), the
 announces it once. Existing `ready`/`change` events unchanged; conforming MCP clients only
 parse `message` events, so those stay ignored.
 
-Tests (`backend/tests/test_mcp_list_changed.py`, in the patch): 7 (incl. cross-worker record,
-unreadable record = changed); MCP suites 71/71; full seo suite in an offline throwaway
-container 927 passed (920 + 7) with the identical set of 68 pre-existing failures; disabling
-the record fails 3 tests, reverting `listChanged` fails 1. Rollback = the same procedure as
-`owner-os-grants.patch` (revert the commit, retag the pre-deploy image, `up -d --no-build backend`).
+Temp-file hardening (CTO review): the record is read with `O_NOFOLLOW`; updates take an
+`flock` on a no-follow `0600` lock file, write a `mkstemp` file (`O_EXCL`, `0600`, random
+name) in the same directory and `os.replace` it over the record (a rename replaces a planted
+symlink instead of following it). Any refusal only costs one extra notification.
+
+Tests (`backend/tests/test_mcp_list_changed.py`, in the patch): 11 — incl. planted symlink at
+the record path (not followed on read or write, replaced), planted symlink lock file
+(refused), 0600 modes and no leaked temp files, 4 concurrent processes × 20 tokens (none
+lost). MCP suites 75/75; full seo suite in an offline throwaway container 931 passed
+(920 + 11) with the identical set of 68 pre-existing failures. Sabotage: read without
+O_NOFOLLOW, direct open() write, no flock each fail tests. Rollback = the same procedure as
+`owner-os-grants.patch` (revert the commit, retag the pre-deploy image,
+`up -d --no-build backend`).
 
 Unverified: whether ChatGPT acts on `notifications/tools/list_changed`. If it does not, only
 the user-side connector refresh helps.

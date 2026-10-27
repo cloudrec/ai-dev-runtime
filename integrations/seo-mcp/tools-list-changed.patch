@@ -13,10 +13,10 @@ index 07f0b2a..935f92e 100644
          while True:
              if await request.is_disconnected():
 diff --git a/backend/services/mcp_server.py b/backend/services/mcp_server.py
-index bdd8bf6..a51e482 100644
+index bdd8bf6..957bf6e 100644
 --- a/backend/services/mcp_server.py
 +++ b/backend/services/mcp_server.py
-@@ -982,6 +982,52 @@ async def read_resource(db: AsyncSession, token: McpToken, uri: str, ip: str | N
+@@ -982,6 +982,78 @@ async def read_resource(db: AsyncSession, token: McpToken, uri: str, ip: str | N
      return {"contents": [{"uri": uri, "mimeType": mime, "text": text}]}
  
  
@@ -34,9 +34,14 @@ index bdd8bf6..a51e482 100644
 +
 +
 +def _read_listed() -> dict:
++    """Never follows a symlink at the record path; anything odd reads as empty (= changed)."""
 +    import json as _json
 +    try:
-+        with open(_listed_path(), encoding="utf-8") as fh:
++        fd = os.open(_listed_path(), os.O_RDONLY | os.O_NOFOLLOW)
++    except OSError:
++        return {}
++    try:
++        with os.fdopen(fd, encoding="utf-8") as fh:
 +            d = _json.load(fh)
 +        return d if isinstance(d, dict) else {}
 +    except (OSError, ValueError):
@@ -44,16 +49,37 @@ index bdd8bf6..a51e482 100644
 +
 +
 +def _mark_listed(token) -> None:
++    """Record this token's catalog atomically and safely in a shared temp dir:
++    flock on a no-follow lock file serialises workers; the new record is written to a
++    mkstemp file (O_EXCL, 0600, random name) and renamed over the path (a rename replaces
++    a planted symlink instead of following it). Any refusal only costs one extra
++    list_changed notification."""
++    import fcntl
 +    import json as _json
-+    d = _read_listed()
-+    d[str(getattr(token, "id", None))] = tool_catalog_fingerprint()
-+    tmp = f"{_listed_path()}.{os.getpid()}.tmp"
++    import tempfile
++    path = _listed_path()
 +    try:
-+        with open(tmp, "w", encoding="utf-8") as fh:
-+            _json.dump(d, fh)
-+        os.replace(tmp, _listed_path())
++        lock = os.open(path + ".lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
 +    except OSError:
-+        pass                      # worst case: one extra list_changed notification
++        return
++    try:
++        fcntl.flock(lock, fcntl.LOCK_EX)
++        d = _read_listed()
++        d[str(getattr(token, "id", None))] = tool_catalog_fingerprint()
++        fd, tmp = tempfile.mkstemp(prefix=".owner-os-mcp-listed.", dir=os.path.dirname(path))
++        try:
++            with os.fdopen(fd, "w", encoding="utf-8") as fh:
++                _json.dump(d, fh)
++            os.replace(tmp, path)
++        except OSError:
++            try:
++                os.unlink(tmp)
++            except OSError:
++                pass
++    except OSError:
++        pass
++    finally:
++        os.close(lock)
 +
 +
 +def tool_catalog_fingerprint() -> str:
@@ -69,7 +95,7 @@ index bdd8bf6..a51e482 100644
  # ══════════════════════════════ JSON-RPC (MCP protocol) ══════════════════════════════
  SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
  
-@@ -993,7 +1039,7 @@ async def dispatch_rpc(db: AsyncSession, token: McpToken, method: str, params: d
+@@ -993,7 +1065,7 @@ async def dispatch_rpc(db: AsyncSession, token: McpToken, method: str, params: d
          want = params.get("protocolVersion")
          proto = want if want in SUPPORTED_PROTOCOLS else MCP_PROTOCOL_VERSION
          return {"protocolVersion": proto,
@@ -78,7 +104,7 @@ index bdd8bf6..a51e482 100644
                  "serverInfo": SERVER_INFO}
      # notifications (no id) — accept and return nothing meaningful; the route sends no response
      if method.startswith("notifications/"):
-@@ -1001,6 +1047,7 @@ async def dispatch_rpc(db: AsyncSession, token: McpToken, method: str, params: d
+@@ -1001,6 +1073,7 @@ async def dispatch_rpc(db: AsyncSession, token: McpToken, method: str, params: d
      if method in ("ping",):
          return {}
      if method == "tools/list":
@@ -88,13 +114,14 @@ index bdd8bf6..a51e482 100644
          name = params.get("name")
 diff --git a/backend/tests/test_mcp_list_changed.py b/backend/tests/test_mcp_list_changed.py
 new file mode 100644
-index 0000000..6d2b78a
+index 0000000..fe36a27
 --- /dev/null
 +++ b/backend/tests/test_mcp_list_changed.py
-@@ -0,0 +1,94 @@
+@@ -0,0 +1,149 @@
 +"""Tool catalog change notification (MCP tools.listChanged)."""
 +import asyncio
 +import json
++import os
 +from types import SimpleNamespace
 +from unittest.mock import AsyncMock, MagicMock
 +
@@ -186,3 +213,57 @@ index 0000000..6d2b78a
 +def test_unreadable_record_means_changed(tmp_path, monkeypatch):
 +    (tmp_path / "listed.json").write_text("not json")
 +    assert mcp.catalog_changed_for(SimpleNamespace(id=3))
++
++
++# ── temp-file hardening (shared /tmp, possibly root) ───────────────────────────
++
++@pytest.mark.asyncio
++async def test_a_planted_symlink_at_the_record_path_is_replaced_not_followed(tmp_path):
++    victim = tmp_path / "victim"
++    planted = json.dumps({"3": mcp.tool_catalog_fingerprint()})   # would say "up to date"
++    victim.write_text(planted)
++    rec = tmp_path / "listed.json"
++    rec.symlink_to(victim)
++    assert mcp.catalog_changed_for(SimpleNamespace(id=3))          # read did not follow
++    await mcp.dispatch_rpc(MagicMock(), SimpleNamespace(id=4, scopes=["read"]), "tools/list", {})
++    assert victim.read_text() == planted                           # write did not follow
++    assert not rec.is_symlink() and not mcp.catalog_changed_for(SimpleNamespace(id=4))
++    assert mcp.catalog_changed_for(SimpleNamespace(id=3))          # planted entry not imported
++
++
++@pytest.mark.asyncio
++async def test_a_planted_symlink_lock_file_is_refused(tmp_path):
++    victim = tmp_path / "victim"
++    victim.write_text("precious")
++    (tmp_path / "listed.json.lock").symlink_to(victim)
++    await mcp.dispatch_rpc(MagicMock(), SimpleNamespace(id=3, scopes=["read"]), "tools/list", {})
++    assert victim.read_text() == "precious"
++    assert mcp.catalog_changed_for(SimpleNamespace(id=3))          # skipped, not unsafe
++
++
++@pytest.mark.asyncio
++async def test_record_files_are_private_and_no_temp_files_leak(tmp_path):
++    await mcp.dispatch_rpc(MagicMock(), SimpleNamespace(id=3, scopes=["read"]), "tools/list", {})
++    import stat
++    assert stat.S_IMODE((tmp_path / "listed.json").stat().st_mode) == 0o600
++    assert stat.S_IMODE((tmp_path / "listed.json.lock").stat().st_mode) == 0o600
++    assert sorted(p.name for p in tmp_path.iterdir()) == ["listed.json", "listed.json.lock"]
++
++
++def test_concurrent_workers_lose_no_token(tmp_path):
++    """Separate processes (like gunicorn workers) marking different tokens at once."""
++    import subprocess
++    import sys
++    import time
++    start = time.time() + 1.0
++    code = ("import sys,time,os;sys.path.insert(0,os.getcwd());"
++            "from types import SimpleNamespace;from services import mcp_server as m;"
++            f"t=float({start!r})\n"
++            "while time.time()<t: time.sleep(0.001)\n"
++            "[m._mark_listed(SimpleNamespace(id=int(sys.argv[1])*100+i)) for i in range(20)]")
++    env = {**os.environ, "MCP_LISTED_CATALOG_FILE": str(tmp_path / "listed.json")}
++    procs = [subprocess.Popen([sys.executable, "-c", code, str(w)], env=env)
++             for w in range(4)]
++    assert all(p.wait(60) == 0 for p in procs)
++    rec = json.loads((tmp_path / "listed.json").read_text())
++    assert len(rec) == 80
