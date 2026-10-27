@@ -135,3 +135,29 @@ def test_dryrun_replays_rotated_logs_oldest_first_and_writes_nothing(tmp_path, c
     assert v[("owner_os_api_to_controller", "owner-os-supervisor-clean:0.0")] == "allowed"
     assert v[("stop", "payorch-ha-fresh:0.0")].startswith("BLOCKED hard_denied")
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before   # read-only
+
+
+def test_dryrun_reads_the_delivery_ledger_read_only(tmp_path, capsys, monkeypatch):
+    import sqlite3
+    db = tmp_path / "ac.db"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE deliveries (idempotency_key TEXT, target TEXT, action TEXT, "
+              "result TEXT, created_at TEXT, created_ts REAL)")
+    c.execute("CREATE TABLE delivery_attribution (idempotency_key TEXT, actor TEXT, "
+              "source TEXT, recorded_at TEXT, recorded_ts REAL)")
+    rows = [("nativesup:1", "bitwhite:0.0", "agent_send", '{"delivered": true}', "t1", 0),
+            ("owneros-1", "owner-os-supervisor-clean:0.0", "agent_send",
+             '{"delivered": true}', "t2", 0),
+            ("x", "vtb:0.0", "agent_send", '{"delivered": false}', "t3", 0)]
+    c.executemany("INSERT INTO deliveries VALUES (?,?,?,?,?,?)", rows)
+    c.executemany("INSERT INTO delivery_attribution VALUES (?,?,?,?,?)",
+                  [("nativesup:1", "native_supervisor", "", "", 0),
+                   ("owneros-1", "api:bearer", "", "", 0)])
+    c.commit()
+    c.close()
+    before = db.read_bytes()
+    monkeypatch.setenv("AGENT_AUTOMATION_TARGETS", "")
+    _tool().main(["--targets", "owner-os-supervisor-clean@api", "--ledger", str(db), "--json"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["total"] == 2 and out["blocked"] == 1
+    assert db.read_bytes() == before

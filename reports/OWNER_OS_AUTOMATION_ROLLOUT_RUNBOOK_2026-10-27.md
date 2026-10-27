@@ -52,16 +52,54 @@ owner proof + rollout audit + DST fix) — fast-forward from live. Full suite: s
 | Stage | Change | Precondition | Verify | Rollback |
 |---|---|---|---|---|
 | 0 | none — dry-run | — | `venv/bin/python tools/automation_policy_dryrun.py --targets '<proposed>'` on the latest logs | — |
-| 1 | deploy code with `AGENT_AUTOMATION_POLICY=off` (drop-in) | owner OK to fast-forward + restart | only payorch is affected (0 observed); `grep -c hard_denied_target /var/log/ai-runtime/agent_control.jsonl` | `git reset --keep ca5a1a1`, restart |
-| 2 | `AGENT_AUTOMATION_POLICY=enforce`, `AGENT_AUTOMATION_TARGETS=owner-os-supervisor-clean@api` (drop-in **and** runtime `.env`, the hook-spawned supervisor reads `.env`) | owner chooses list | Owner OS messages still reach the controller; `grep -c automation_target_not_allowlisted …` rises only for the blocked families | set `AGENT_AUTOMATION_POLICY=off` (drop-in + `.env`), restart |
-| 3 | add scoped entries one agent at a time (`<session>@<caller>`) | owner names agent + caller | dry-run first, then the same grep | remove the entry, restart |
+| 1 | fast-forward code; `AGENT_AUTOMATION_POLICY=off` in all three contexts (below) | owner OK to fast-forward + restart **both** services | only payorch is affected (0 observed); `grep -c hard_denied_target /var/log/ai-runtime/agent_control.jsonl` | `git reset --keep ca5a1a1`, restart **both** services |
+| 2 | `AGENT_AUTOMATION_POLICY=enforce`, `AGENT_AUTOMATION_TARGETS=owner-os-supervisor-clean@api` in all three contexts | owner chooses list | Owner OS messages still reach the controller; `grep -c automation_target_not_allowlisted …` rises only for the blocked families | `AGENT_AUTOMATION_POLICY=off` in all three contexts, restart both |
+| 3 | add scoped entries one agent at a time (`<session>@<caller>`) | owner names agent + caller | dry-run first, then the same grep | remove the entry, restart both |
 
-Drop-in (owner writes it; example for stage 2):
+**Three process contexts run automatic senders** (verified 2026-10-27 from live process
+environments): `ai-runtime.service` (API, native controller, orchestrators),
+`owner-os-wake-companion.service` (`native_supervisor.scan`, `agent_watch.scan`; has its own
+`NATIVE_SUPERVISOR_TARGETS=*`), and the hook-spawned `tools/native_supervise_once.py` (reads
+`/root/ai-dev-runtime/configs/.env`). A setting missing from any one leaves that context on
+the fail-closed default (enforce, empty list) — safe, but it blocks that context entirely.
+The code fast-forward and its rollback need both services restarted (each imports
+`agent_control` at start); hook-spawned passes pick up new code on their next start.
+
+Drop-ins (owner writes them; stage 2 example — same content in both):
 ```
 # /etc/systemd/system/ai-runtime.service.d/94-agent-automation-policy.conf
+# /etc/systemd/system/owner-os-wake-companion.service.d/94-agent-automation-policy.conf
 [Service]
 Environment=AGENT_AUTOMATION_POLICY=enforce
 Environment=AGENT_AUTOMATION_TARGETS=owner-os-supervisor-clean@api
 ```
+plus the same two `KEY=value` lines in `/root/ai-dev-runtime/configs/.env`; then
+`systemctl daemon-reload && systemctl restart ai-runtime.service owner-os-wake-companion.service`.
 Owner proofs (optional, a secret): `tools/owner_proof.py init-key` as root; without it no
 owner-proven overrides exist and payorch stays untouchable by every caller.
+
+
+## 5. Stage 0 result (executed 2026-10-27, read-only)
+
+Live env (from `/proc/<pid>/environ`): no `AGENT_AUTOMATION_*` anywhere (policy code not
+deployed); `NATIVE_SUPERVISOR_TARGETS=*` in ai-runtime, wake companion and `configs/.env`;
+no owner key. Dry-run with this branch's policy code:
+
+| Source | Window (UTC) | Empty list | `owner-os-supervisor-clean@api` |
+|---|---|---|---|
+| live `deliveries` ledger | 2026-10-26 05:37 → 2026-10-27 02:41 | 52/55 blocked | 38/55 blocked; 14 Owner OS→controller allowed |
+| audit logs (current + rotated) | 2026-10-19 22:37 → 2026-10-27 02:41 | 516/575 blocked | 452/575 blocked; 64 Owner OS→controller allowed |
+
+Blocked under the minimal scope (audit window): native supervisor → giftcards 156 (closed),
+bitwhite-backend-v3 130, gaika-ru-sonnet-v1 101, gaika-release-0563 4, serverwarden-livefire 4,
+aes-canary 2; API/MCP → gaika-ru-sonnet-v1 28, owner-os-gaika-watchdog 18, serverwarden-livefire
+2, aes-canary 2, gaika-release-0563 1, mess-telegram-connector 1; native goals → aes-canary 3.
+Unaffected: agent_stop (confirm-gated) and agent_resume. payorch-ha-fresh: 0 events.
+No writes: ledger schema_version 31 → 31; rotated audit log sha256 unchanged.
+
+**Smallest scope preserving Owner OS control: `owner-os-supervisor-clean@api`.**
+
+Owner approval needed for Stage 1 (exact): fast-forward `/root/ai-dev-runtime` to
+`origin/ai-runtime/candidate-combined`, add `AGENT_AUTOMATION_POLICY=off` to the two
+drop-ins and `configs/.env`, `systemctl daemon-reload`, restart `ai-runtime.service` and
+`owner-os-wake-companion.service`. Stage 2 is a separate approval of the list above.
