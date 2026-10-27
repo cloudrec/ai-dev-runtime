@@ -456,6 +456,7 @@ def _recover_inner(target: str, *, registry, conn, run_fn, sleep, now, explicit,
     from core import agent_creation_policy as acp
     from core import agent_control as _ac
     session_name = entry.get("session") or target.split(":")[0]
+    injected_cwds = live_cwds          # tests inject an inventory; production reads tmux
     if live_cwds is None:
         try:
             live_cwds = [a.get("claude_cwd") for a in _ac.agent_list().get("agents", [])
@@ -486,12 +487,34 @@ def _recover_inner(target: str, *, registry, conn, run_fn, sleep, now, explicit,
 
     # Revive the EXACT pane. respawn-pane reuses the existing window; only if the
     # whole session is gone do we recreate it under the same name.
-    if p.get("missing"):
-        rc, _, err = run(["new-session", "-d", "-s", session, "-c", cwd, cmd])
-        how = "new-session"
-    else:
-        rc, _, err = run(["respawn-pane", "-k", "-t", target, "-c", cwd, cmd])
-        how = "respawn-pane"
+    # Re-check under the host-wide creation lock right before the tmux call: the backoff
+    # sleep above leaves time for another creation into this worktree (no TOCTOU).
+    with acp.creation_guard():
+        if gate["reason"] != "owner_proof":       # a verified proof was single-use: keep it
+            cwds_now = injected_cwds
+            if cwds_now is None:
+                try:
+                    cwds_now = [a.get("claude_cwd") for a in _ac.agent_list().get("agents", [])
+                                if a.get("is_agent") and a.get("alive")]
+                except Exception:  # noqa: BLE001 — unknown population: refuse (fail closed)
+                    cwds_now = None
+            gate = {"ok": False, "reason": "creation_population_unknown"} \
+                if cwds_now is None else acp.authorize(
+                    cwd, session_name,
+                    caller=_ac.caller_class(actor) if actor else "session_recovery",
+                    live_cwds=[c for c in cwds_now if c])
+        if not gate["ok"]:
+            _log(conn, target, "refuse", False, f"creation_policy:{gate['reason']}", gate)
+            return {"recovered": False, "reason": f"creation_policy:{gate['reason']}",
+                    "owner_blocker": True}
+        if p.get("missing"):
+            rc, _, err = run(["new-session", "-d", "-s", session, "-c", cwd, cmd])
+            how = "new-session"
+        else:
+            rc, _, err = run(["respawn-pane", "-k", "-t", target, "-c", cwd, cmd])
+            how = "respawn-pane"
+        if rc == 0:
+            acp.reserve(cwd, session)
     if rc != 0:
         _log(conn, target, "revive", False, f"tmux_failed:{how}", {"err": err[:200]})
         return {"recovered": False, "reason": f"tmux_failed:{how}", "error": err[:200]}
@@ -510,6 +533,10 @@ def _recover_inner(target: str, *, registry, conn, run_fn, sleep, now, explicit,
         # A recovery that cannot prove itself cleans up after itself.
         run(["kill-session", "-t", session])
         torn_down = True
+    # unknown liveness counts as gone: verify_recovered always reports both keys
+    if not v["ok"] and (torn_down or not v["checks"].get("pane_alive", False)
+                        or not v["checks"].get("is_claude", False)):
+        acp.release(cwd)       # nothing live holds the worktree: do not block a retry
     _log(conn, target, "revive", bool(v["ok"]), "verified" if v["ok"] else "verify_failed",
          {"how": how, "checks": v["checks"], "summary_choice": choice, "pid": v.get("pid"),
           "torn_down": torn_down, "cwd_resolution": loc})

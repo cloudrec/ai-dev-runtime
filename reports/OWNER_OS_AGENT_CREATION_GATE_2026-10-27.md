@@ -52,3 +52,57 @@ out with `AGENT_CREATION_POLICY=off`. Full suite: 3875 passed / 0 failed.
    recovery refused until scoped; restart ai-runtime + wake companion).
 2. Scopes, e.g. GAIKA per country: `callers`, `session_prefix`, `worktrees` map, `max_concurrent`.
 3. Whether arbitrage2 / mess / serverwarden / Owner OS sessions get scopes or owner-proof-only.
+
+## Adversarial review (follow-up, same branch)
+
+Requested by an automated instruction; no agents started, no live changes.
+
+| Attack / gap | Finding | Fix + test |
+|---|---|---|
+| Direct tmux / Popen bypass | only `agent_control.agent_resume` and `session_recovery.recover` create panes; `claude` spawned only by `ai_planner` (`-p` jobs) and `native_sessions` (`agents --json`) | invariant test pins this and that both sites create under the lock |
+| TOCTOU: simultaneous launches | **real**: no lock between check and `new-session`; a new Claude is invisible to the inventory for a moment | `creation_guard()` (host-wide `flock`) around check→create; `reserve()` counts the worktree live for 180 s; 8 parallel launches → exactly 1; 9 across 3 countries → exactly 2 (cap). Removing the lock or reservations makes these tests fail |
+| Recovery race | backoff sleep (≤900 s) between the check and tmux | fast pre-check kept; locked re-check with a fresh inventory right before tmux; reservation released when the revived process is gone |
+| Symlink rename / retarget | **real**: a country path re-pointed at another country made the match order-dependent | two worktrees resolving to one dir → `creation_scope_ambiguous`; a configured worktree that is a symlink → `creation_scope_worktree_is_symlink`; renamed-away worktree → out of scope |
+| Caller spoofing | every API caller is `api` whatever `X-Runtime-Actor` says | local `tools/agent_create.py` is the only `owneros_controller`; API spoof of that name refused |
+| Policy-off / owner-proof duplicates | reservations ignored on those paths | reservation check on every allow path, before a proof is consumed |
+| Deny boundaries | `/opt/payment-orchestrator-evil` not under the deny dir; subdirs are | boundary tests; payorch name denied for the controller too |
+| Host overload | no global cap | optional `max_live_agents` |
+
+Not fixed (documented): any LOCAL process (including a running agent) can execute
+`tools/agent_create.py`; the scope still bounds what it can create (names, worktrees, caps).
+A per-caller secret would be needed to tell the controller from other local processes —
+the owner-proof path exists for that if wanted.
+
+## GAIKA readiness (fixture only)
+
+`tests/fixtures/agent_creation_gaika_3_countries.yaml`: ru / kz / uz worktrees, callers
+`[owneros_controller]`, `session_prefix: gaika-`, `max_concurrent: 2`, `max_live_agents: 12`.
+Host today: 16 cores, 62 GB (46 GB free), 8 live Claude processes at ~330 MB each → memory is
+not the limit; subscription rate limits and supervision are. Recommendation: start at
+`max_concurrent: 2` per scope and `max_live_agents: 12`; raise only after the first two
+countries run cleanly.
+
+## Compatibility with the live send policy
+
+Live: `AGENT_AUTOMATION_POLICY=enforce`, `AGENT_AUTOMATION_TARGETS=owner-os-supervisor-clean@api`.
+Created country agents are NOT reachable by any automatic sender until the owner adds scoped
+send entries, e.g. `gaika-ru@cto_bridge` (keyless CTO advice) — tested. The controller
+creates locally (`tools/agent_create.py`, caller `owneros_controller`); ChatGPT/MCP cannot
+create or message country agents under these settings.
+
+## Deployment checklist (owner-gated)
+
+1. Approve deploying this branch (merge into the live line, fast-forward from `ac76919`).
+2. Config `config/agent_creation.yaml` stays `scopes: {}` at first (deny all automatic
+   creation; owner-proof only) — or the owner supplies the GAIKA scope with real worktrees.
+3. Back up HEAD, `config/agent_creation.yaml`; restart `ai-runtime.service` and
+   `owner-os-wake-companion.service`.
+4. Verify: `/health` 200; `agent_resume` via API → `creation_not_in_any_scope` (audit
+   `refused=`); `session_recovery` refusals `creation_policy:*` for unscoped targets; no
+   creations in `agent_control.jsonl` since restart.
+5. Rollback: `git reset --keep ac76919`, restart both services (or `AGENT_CREATION_POLICY=off`
+   in both drop-ins + `.env` as the escape hatch). New state files
+   `agent_control.db.creation.{lock,json}` are inert to older code.
+
+Owner gates: deploy; scope contents (countries, worktrees, cap); which caller may create
+(`owneros_controller` recommended); send entries for created agents; optional owner key.
