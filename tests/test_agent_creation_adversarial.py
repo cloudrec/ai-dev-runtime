@@ -225,3 +225,42 @@ def test_only_gated_sites_create_panes_or_spawn_claude():
     sr = (ROOT / "core" / "session_recovery.py").read_text()
     j = sr.index('run(["new-session"')
     assert sr.rfind("with acp.creation_guard():", 0, j) > sr.rfind("def _recover_inner", 0, j)
+
+
+_CHILD = r'''
+import os, sys, time
+sys.path.insert(0, sys.argv[1])
+from core import agent_control as ac
+created = sys.argv[3]
+def tmux(args, stdin=None):
+    if args[0] == "has-session":
+        return 1, "", ""                     # names never collide: only the lock/reservation can stop a duplicate
+    if args[0] == "new-session":
+        time.sleep(0.05)
+        with open(created, "a") as fh:
+            fh.write(args[3] + "\n")
+    return 0, "", ""
+ac._tmux = tmux
+ac.agent_list = lambda: {"agents": []}       # the new Claude is never visible
+ac.find_live_agent_for_dir = lambda d: None
+ac.validate_project_dir = lambda d: os.path.realpath(d)
+while time.time() < float(sys.argv[4]):      # start together
+    time.sleep(0.001)
+r = ac.agent_resume(sys.argv[2], session_name="gaika-ru", actor="owneros_controller")
+print("created" if r.get("agent_created") else r.get("refused"))
+'''
+
+
+def test_separate_processes_racing_create_exactly_one(gaika, tmp_path):
+    import subprocess
+    created = tmp_path / "created.txt"
+    start = time.time() + 1.5
+    env = {**os.environ}
+    procs = [subprocess.Popen([sys.executable, "-c", _CHILD, str(ROOT), gaika["wt"]["ru"],
+                               str(created), str(start)], env=env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) for _ in range(6)]
+    outs = [p.communicate(timeout=60) for p in procs]
+    results = [o.strip() for o, _ in outs]
+    assert results.count("created") == 1, (results, [e[-300:] for _, e in outs])
+    assert created.read_text().splitlines() == ["gaika-ru"]
+    assert set(results) - {"created"} == {"worktree_reserved_by_recent_creation"}

@@ -106,3 +106,29 @@ create or message country agents under these settings.
 
 Owner gates: deploy; scope contents (countries, worktrees, cap); which caller may create
 (`owneros_controller` recommended); send entries for created agents; optional owner key.
+
+## Offline validation report (2026-10-27, after the adversarial fixes)
+
+Requested by an automated instruction. Code under test: `7e477d8` + the cross-process race
+test committed with this report (no production code change). Nothing deployed or started.
+
+| Check | Result |
+|---|---|
+| Full suite, TZ=Europe/Berlin (system) | 3898 passed, 0 failed (6 m 34 s) |
+| Full suite, TZ=Europe/Kyiv | 3898 passed, 0 failed (6 m 32 s) |
+| Thread races (`-k "simultaneous or reservation"`), 25 repeated runs | 25/25 green |
+| NEW cross-process race: 6 Python processes, real `flock`, Claude never visible, session names never colliding | 1 created, 5 `worktree_reserved_by_recent_creation`; 5/5 runs green |
+| Sabotage, threads: lock removed / reservations removed | 1 / 3 race tests fail (both mechanisms load-bearing) |
+| Sabotage, processes: lock AND reservations removed | 6 of 6 processes create a session (the duplicate the gate prevents) |
+| Live directory | no `agent_control.db.creation.*` files written by tests |
+
+Known limitations:
+1. Any local process (including a running agent) can run `tools/agent_create.py`; the scope
+   bounds what it can create, but it is not distinguishable from the controller without a
+   per-caller secret (owner proofs are the existing alternative).
+2. Reservations last 180 s; a Claude process that takes longer to appear in the inventory
+   could permit a second creation after that window (one-per-worktree via session name and
+   `find_live_agent_for_dir` still apply once it is visible).
+3. The lock is host-local (`flock`); creation from another host is out of scope (none exists).
+4. `ai_planner` `claude -p` job subprocesses and Windows-ref starts are not gated here.
+5. The fixture is test-only; real GAIKA worktrees/scopes do not exist yet.
