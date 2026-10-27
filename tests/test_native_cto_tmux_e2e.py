@@ -53,6 +53,9 @@ def stub_pane(tmp_path, monkeypatch):
     monkeypatch.setenv("OWNER_OS_CTO_PROVIDER", "claude_session")
     monkeypatch.setenv("OWNER_OS_CTO_CONTROLLER", CTL)
     monkeypatch.setenv("OWNER_OS_CTO_DELIVERY_MODE", "agent_control")
+    # with the agent_control automation policy present: CTO requests may reach only the
+    # controller and advice only the worker, and only for the cto_bridge caller
+    monkeypatch.setenv("AGENT_AUTOMATION_TARGETS", "cto-controller@cto_bridge,worker-a@cto_bridge")
     panes = {}
     for name in ("cto-controller", "worker-a"):
         d = tmp_path / name
