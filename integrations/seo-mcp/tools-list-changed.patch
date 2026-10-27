@@ -1,0 +1,144 @@
+diff --git a/backend/routes_mcp.py b/backend/routes_mcp.py
+index 07f0b2a..935f92e 100644
+--- a/backend/routes_mcp.py
++++ b/backend/routes_mcp.py
+@@ -279,6 +279,9 @@ async def connector_sse(ptok: str, request: Request, db: AsyncSession = Depends(
+     async def stream():
+         cursor = last_id
+         yield f"event: ready\ndata: {json.dumps({'server': mcp.SERVER_INFO})}\n\n"
++        if mcp.catalog_changed_for(tok):
++            # JSON-RPC message on the Streamable HTTP server stream: the client should re-list
++            yield f"event: message\ndata: {json.dumps(mcp.LIST_CHANGED_NOTIFICATION)}\n\n"
+         ticks = 0
+         while True:
+             if await request.is_disconnected():
+diff --git a/backend/services/mcp_server.py b/backend/services/mcp_server.py
+index bdd8bf6..cfabb6e 100644
+--- a/backend/services/mcp_server.py
++++ b/backend/services/mcp_server.py
+@@ -982,6 +982,25 @@ async def read_resource(db: AsyncSession, token: McpToken, uri: str, ip: str | N
+     return {"contents": [{"uri": uri, "mimeType": mime, "text": text}]}
+ 
+ 
++# ── tool catalog change notification ─────────────────────────────────────────
++# The catalog changes when this backend is deployed with new tools. MCP clients cache it, so
++# the server advertises `tools.listChanged` and, on a connector's server stream, sends
++# `notifications/tools/list_changed` when the catalog this token last listed differs from the
++# one being served now (process memory: a restart after a deploy counts as changed).
++LIST_CHANGED_NOTIFICATION = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
++_LISTED_CATALOG: dict = {}
++
++
++def tool_catalog_fingerprint() -> str:
++    import json as _json
++    return hashlib.sha256(_json.dumps(tool_schemas(), sort_keys=True, default=str)
++                          .encode()).hexdigest()[:16]
++
++
++def catalog_changed_for(token) -> bool:
++    return _LISTED_CATALOG.get(getattr(token, "id", None)) != tool_catalog_fingerprint()
++
++
+ # ══════════════════════════════ JSON-RPC (MCP protocol) ══════════════════════════════
+ SUPPORTED_PROTOCOLS = {"2025-06-18", "2025-03-26", "2024-11-05"}
+ 
+@@ -993,7 +1012,7 @@ async def dispatch_rpc(db: AsyncSession, token: McpToken, method: str, params: d
+         want = params.get("protocolVersion")
+         proto = want if want in SUPPORTED_PROTOCOLS else MCP_PROTOCOL_VERSION
+         return {"protocolVersion": proto,
+-                "capabilities": {"tools": {"listChanged": False}, "resources": {"subscribe": False}},
++                "capabilities": {"tools": {"listChanged": True}, "resources": {"subscribe": False}},
+                 "serverInfo": SERVER_INFO}
+     # notifications (no id) — accept and return nothing meaningful; the route sends no response
+     if method.startswith("notifications/"):
+@@ -1001,6 +1020,7 @@ async def dispatch_rpc(db: AsyncSession, token: McpToken, method: str, params: d
+     if method in ("ping",):
+         return {}
+     if method == "tools/list":
++        _LISTED_CATALOG[getattr(token, "id", None)] = tool_catalog_fingerprint()
+         return {"tools": tool_schemas()}
+     if method == "tools/call":
+         name = params.get("name")
+diff --git a/backend/tests/test_mcp_list_changed.py b/backend/tests/test_mcp_list_changed.py
+new file mode 100644
+index 0000000..8dee92f
+--- /dev/null
++++ b/backend/tests/test_mcp_list_changed.py
+@@ -0,0 +1,77 @@
++"""Tool catalog change notification (MCP tools.listChanged)."""
++import asyncio
++import json
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from services import mcp_server as mcp
++
++
++@pytest.fixture(autouse=True)
++def _fresh(monkeypatch):
++    monkeypatch.setattr(mcp, "_LISTED_CATALOG", {})
++
++
++@pytest.mark.asyncio
++async def test_initialize_advertises_list_changed():
++    out = await mcp.dispatch_rpc(MagicMock(), SimpleNamespace(id=3, scopes=["read"]),
++                                 "initialize", {})
++    assert out["capabilities"]["tools"]["listChanged"] is True
++
++
++def test_fingerprint_is_stable_and_tracks_the_catalog(monkeypatch):
++    a = mcp.tool_catalog_fingerprint()
++    assert a == mcp.tool_catalog_fingerprint()
++    monkeypatch.setitem(mcp.TOOLS, "zz_new_tool", {"scope": "read", "fn": None, "desc": "x"})
++    assert mcp.tool_catalog_fingerprint() != a
++
++
++@pytest.mark.asyncio
++async def test_tools_list_marks_the_token_current_until_the_catalog_changes(monkeypatch):
++    tok = SimpleNamespace(id=3, scopes=["read"])
++    assert mcp.catalog_changed_for(tok)
++    await mcp.dispatch_rpc(MagicMock(), tok, "tools/list", {})
++    assert not mcp.catalog_changed_for(tok)
++    assert mcp.catalog_changed_for(SimpleNamespace(id=4))           # per token
++    monkeypatch.setitem(mcp.TOOLS, "zz_new_tool", {"scope": "read", "fn": None, "desc": "x"})
++    assert mcp.catalog_changed_for(tok)
++
++
++def _stream(monkeypatch, tok):
++    import routes_mcp as r
++    monkeypatch.setattr(r, "_enforce_https", lambda req: None)
++    monkeypatch.setattr(r.mcp, "verify_token", AsyncMock(return_value=tok))
++    db = MagicMock()
++    res = MagicMock()
++    res.scalar.return_value = 0
++    db.execute = AsyncMock(return_value=res)
++    req = MagicMock()
++    req.is_disconnected = AsyncMock(return_value=True)
++    resp = asyncio.run(r.connector_sse("ptok", req, db))
++
++    async def first(n):
++        out = []
++        async for chunk in resp.body_iterator:
++            out.append(chunk if isinstance(chunk, str) else chunk.decode())
++            if len(out) >= n:
++                break
++        return out
++    return asyncio.run(first(2))
++
++
++def test_server_stream_announces_a_changed_catalog_as_json_rpc(monkeypatch):
++    chunks = _stream(monkeypatch, SimpleNamespace(id=3, scopes=["read"]))
++    assert chunks[0].startswith("event: ready")
++    assert chunks[1].startswith("event: message\ndata: ")
++    msg = json.loads(chunks[1].split("data: ", 1)[1])
++    assert msg == {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
++
++
++@pytest.mark.asyncio
++async def test_server_stream_is_quiet_when_the_token_has_the_current_catalog(monkeypatch):
++    tok = SimpleNamespace(id=3, scopes=["read"])
++    await mcp.dispatch_rpc(MagicMock(), tok, "tools/list", {})
++    chunks = await asyncio.to_thread(_stream, monkeypatch, tok)
++    assert not any("list_changed" in c for c in chunks)

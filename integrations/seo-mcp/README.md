@@ -23,3 +23,26 @@ Stronger identity (optional): give the connector its own runtime token — add
 0600) and set the seo backend's `RUNTIME_TOKEN` to that token. The runtime then
 authenticates the caller as `api:client/<client-id>` (binding `authenticated`), ignores
 declared names, and requires authenticated clients for all new grants.
+
+## `tools-list-changed.patch` (base seo `af712d2`, NOT applied)
+
+Why ChatGPT kept the old catalog after `owner-os-grants.patch` was deployed (verified
+2026-10-27): the backend served 46 tools (incl. grant_*), but `initialize` advertised
+`tools.listChanged: false`, and the connector's GET server stream (`/api/mcp/c/{ptok}`)
+only emits custom `event: ready` / `event: change` SSE events — the server could never tell
+a client its tools changed. ChatGPT (token id 3) opened 5 GET streams and initialized new
+sessions after the deploy and still showed the old catalog, i.e. it caches the catalog
+beyond a session.
+
+Fix: `listChanged: true`; `tools/list` records the catalog fingerprint served per token
+(process memory); a new GET server stream sends the JSON-RPC
+`notifications/tools/list_changed` (SSE `event: message`) when that token's last-listed
+catalog differs from the current one — so after every deploy/restart, the first stream
+announces it once. Existing `ready`/`change` events unchanged.
+
+Tests (`backend/tests/test_mcp_list_changed.py`, in the patch): 5; MCP suites 69/69; full
+seo suite in an offline throwaway container 925 passed (920 + 5 new) with the identical set
+of 68 pre-existing failures as the original; reverting `listChanged` fails a test.
+
+Unverified: whether ChatGPT acts on `notifications/tools/list_changed`. If it does not, only
+the user-side connector refresh helps.
