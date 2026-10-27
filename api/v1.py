@@ -8,7 +8,7 @@ import json
 import os
 import re
 import time
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -733,6 +733,44 @@ class OwnerDecisionReq(BaseModel):
     """One owner answer, for one or more gates that share it."""
     gate_ids: list[str]
     answer: str
+
+
+class GrantRequest(BaseModel):
+    project: str
+    actions: List[str]
+    targets: List[str] = []
+    create: Optional[dict] = None
+    ttl_secs: int = 3600
+
+
+@router.post("/grants/request", operation_id="request_delegation_grant")
+def grants_request(req: GrantRequest, request: Request,
+                   x_runtime_actor: Optional[str] = Header(None),
+                   _: bool = Depends(_auth)):
+    """Ask the owner for a delegation grant. Creates a PENDING grant only: it is activated
+    exclusively through an owner channel (host CLI / verified Telegram), never via the API."""
+    from core import automation_grants as ag
+    actor, _source = caller_identity(request, x_runtime_actor)
+    try:
+        return ag.request(req.dict(), requested_by=actor)
+    except ag.GrantError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/grants", operation_id="list_delegation_grants")
+def grants_list(_: bool = Depends(_auth)):
+    from core import automation_grants as ag
+    return {"grants": ag.list_grants()}
+
+
+@router.post("/grants/{grant_id}/revoke", operation_id="revoke_delegation_grant")
+def grants_revoke(grant_id: str, request: Request,
+                  x_runtime_actor: Optional[str] = Header(None),
+                  _: bool = Depends(_auth)):
+    """Revocation only narrows access, so the API may do it."""
+    from core import automation_grants as ag
+    actor, _source = caller_identity(request, x_runtime_actor)
+    return {"revoked": ag.revoke(grant_id, by=actor)}
 
 
 @router.post("/control-plane/owner/decision", operation_id="record_owner_decision")

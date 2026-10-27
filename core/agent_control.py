@@ -1965,19 +1965,31 @@ def _allowlisted(session: str, target: str, caller: str) -> bool:
 
 
 def automation_refusal(session: str, target: str, actor: Optional[str],
-                       owner_proven: bool = False) -> str:
+                       owner_proven: bool = False, action: Optional[str] = None) -> str:
     """"" when allowed, else the refusal reason. `actor` never grants anything."""
+    return automation_decision(session, target, actor, owner_proven, action)[0]
+
+
+def automation_decision(session: str, target: str, actor: Optional[str],
+                        owner_proven: bool = False, action: Optional[str] = None) -> tuple:
+    """(refusal, authorized_by): refusal "" = allowed; authorized_by names the authority
+    (owner_proof | policy_off | allowlist | grant:<id>) for the audit trail."""
     if owner_proven:
-        return ""                     # this exact command carries a verified owner proof
+        return "", "owner_proof"      # this exact command carries a verified owner proof
     sess = (session or "").strip()
     if sess.lower() in AUTOMATION_HARD_DENY or \
             (target or "").strip().split(":")[0].lower() in AUTOMATION_HARD_DENY:
-        return "hard_denied_target"
+        return "hard_denied_target", ""
     if os.getenv("AGENT_AUTOMATION_POLICY", "enforce").strip().lower() == "off":
-        return ""
+        return "", "policy_off"
     if _allowlisted(sess, (target or "").strip(), caller_class(actor)):
-        return ""
-    return "automation_target_not_allowlisted"
+        return "", "allowlist"
+    if action in ("agent_send", "agent_answer"):
+        from core import automation_grants as _ag
+        gid = _ag.allows_send(sess, action, caller_class(actor))
+        if gid:
+            return "", f"grant:{gid}"
+    return "automation_target_not_allowlisted", ""
 
 
 _CONTROL_KEYS_RE = re.compile(r"^(Enter|C-u|C-m|Escape|[0-9])$")
@@ -2058,8 +2070,11 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     if owner_proof is not None:       # a supplied proof must be valid; never a silent fallback
         refusal = verify_owner_proof(owner_proof, action, target, raw_text)
     if not refusal:
-        refusal = automation_refusal(pane.get("session") or resolved.split(":")[0],
-                                     resolved, actor, owner_proven=owner_proof is not None)
+        refusal, authorized_by = automation_decision(
+            pane.get("session") or resolved.split(":")[0], resolved, actor,
+            owner_proven=owner_proof is not None, action=action)
+    else:
+        authorized_by = ""
     if refusal:
         audit(action, resolved, key, delivered=False, refused=refusal, actor=actor,
               source=source)
@@ -2143,10 +2158,11 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
         result["reason"] = ("the message is still in the agent's input box after two "
                             "Enter keystrokes — it was delivered to the pane but NOT "
                             "submitted, so no turn will start")
+    result["authorized_by"] = authorized_by
     _record_delivery(key, resolved, action, result, actor=actor, source=source,
                      text_sha256=text_fingerprint(text))
     audit(action, resolved, key, delivered=result["delivered"], pane_changed=pane_changed,
-          bytes=result["bytes"], actor=actor, source=source)
+          bytes=result["bytes"], actor=actor, source=source, authorized_by=authorized_by)
     return result
 
 
