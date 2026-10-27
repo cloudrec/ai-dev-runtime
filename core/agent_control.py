@@ -1845,12 +1845,99 @@ def _prompt_consumed(target: str, text: str, cwd: str = "") -> bool:
 # pane through `_deliver`. Policy, checked on the RESOLVED pane's session:
 #   * AUTOMATION_HARD_DENY sessions (the payment agent) receive nothing from anyone, the
 #     API included; reads are unaffected;
-#   * an in-process caller (actor not "api:…") may type only into sessions listed in
-#     AGENT_AUTOMATION_TARGETS (comma list of sessions or targets). Empty = none. "*" is
-#     never a wildcard — "all agents" cannot be expressed;
+#   * EVERY caller — in-process automation AND authenticated API/MCP callers ("api:…") —
+#     may type only into sessions listed in AGENT_AUTOMATION_TARGETS (comma list of
+#     sessions or targets). Empty = none. "*" is never a wildcard. HMAC proves only that
+#     the caller holds the shared runtime token, which ChatGPT/MCP and wake paths hold too,
+#     so it is NOT owner authority;
+#   * the one exception is an OWNER PROOF: an HMAC over exactly (action, target, sha256 of
+#     the text, timestamp, nonce) made with a separate owner key that no automation holds
+#     (root-only file, AGENT_OWNER_PROOF_KEY_FILE). Valid for OWNER_PROOF_TTL_SECS, single
+#     use. It authorises that one command, including into a hard-denied session; anything
+#     altered (target, text, action), stale, replayed or signed with another key is refused.
+#     No key file → no owner proofs at all (fail closed);
 #   * AGENT_AUTOMATION_POLICY=off restores the previous unrestricted behaviour (owner-gated
 #     escape hatch); the hard deny stays on even then.
 AUTOMATION_HARD_DENY = frozenset({"payorch-ha-fresh"})
+OWNER_PROOF_TTL_SECS = 300
+_NONCE_RE = re.compile(r"^[0-9a-f]{16,64}$")
+
+
+def _owner_key_path() -> str:
+    return os.getenv("AGENT_OWNER_PROOF_KEY_FILE", "/etc/ai-runtime/owner-proof.key")
+
+
+def _owner_key() -> Optional[bytes]:
+    """The owner key, or None. Refused unless a regular root-owned file, mode 0600/0400."""
+    path = _owner_key_path()
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return None
+    import stat as _stat
+    if not _stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o077):
+        return None
+    try:
+        with open(path, "rb") as fh:
+            key = fh.read().strip()
+    except OSError:
+        return None
+    return key if len(key) >= 32 else None
+
+
+def owner_proof_message(action: str, target: str, text: str, ts: int, nonce: str) -> bytes:
+    digest = hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+    return f"owner-proof-v1\n{action}\n{(target or '').strip()}\n{digest}\n{int(ts)}\n" \
+           f"{nonce}".encode()
+
+
+def sign_owner_proof(key: bytes, action: str, target: str, text: str,
+                     ts: Optional[int] = None, nonce: Optional[str] = None) -> dict:
+    import hmac as _hmac
+    ts = int(ts if ts is not None else time.time())
+    nonce = nonce or uuid.uuid4().hex
+    sig = _hmac.new(key, owner_proof_message(action, target, text, ts, nonce),
+                    hashlib.sha256).hexdigest()
+    return {"ts": ts, "nonce": nonce, "sig": sig}
+
+
+def verify_owner_proof(proof: Optional[dict], action: str, target: str, text: str,
+                       now: Optional[float] = None) -> str:
+    """"" when the proof authorises exactly this command (and consumes it), else why not."""
+    import hmac as _hmac
+    if not isinstance(proof, dict):
+        return "owner_proof_malformed"
+    key = _owner_key()
+    if key is None:
+        return "owner_proof_unconfigured"
+    try:
+        ts = int(proof.get("ts"))
+        nonce = str(proof.get("nonce") or "")
+        sig = str(proof.get("sig") or "")
+    except (TypeError, ValueError):
+        return "owner_proof_malformed"
+    if not _NONCE_RE.match(nonce) or not re.fullmatch(r"[0-9a-f]{64}", sig):
+        return "owner_proof_malformed"
+    now = time.time() if now is None else now
+    if abs(now - ts) > OWNER_PROOF_TTL_SECS:
+        return "owner_proof_expired"
+    want = _hmac.new(key, owner_proof_message(action, target, text, ts, nonce),
+                     hashlib.sha256).hexdigest()
+    if not _hmac.compare_digest(want, sig):
+        return "owner_proof_bad_signature"
+    conn = _db()
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS owner_proof_used (nonce TEXT PRIMARY KEY, "
+                     "action TEXT, target TEXT, used_at TEXT)")
+        try:
+            conn.execute("INSERT INTO owner_proof_used VALUES (?,?,?,?)",
+                         (nonce, action, (target or "").strip(), _now()))
+            conn.commit()
+        except sqlite3.IntegrityError:
+            return "owner_proof_replayed"
+    finally:
+        conn.close()
+    return ""
 
 
 def automation_targets() -> set:
@@ -1858,14 +1945,15 @@ def automation_targets() -> set:
     return {t.strip() for t in raw.split(",") if t.strip() and t.strip() != "*"}
 
 
-def automation_refusal(session: str, target: str, actor: Optional[str]) -> str:
-    """"" when allowed, else the refusal reason."""
+def automation_refusal(session: str, target: str, actor: Optional[str],
+                       owner_proven: bool = False) -> str:
+    """"" when allowed, else the refusal reason. `actor` never grants anything."""
+    if owner_proven:
+        return ""                     # this exact command carries a verified owner proof
     sess = (session or "").strip()
     if sess.lower() in AUTOMATION_HARD_DENY or \
             (target or "").strip().split(":")[0].lower() in AUTOMATION_HARD_DENY:
         return "hard_denied_target"
-    if (actor or "").startswith(_AUTOMATED_ACTOR_PREFIX):
-        return ""                                   # authenticated API caller
     if os.getenv("AGENT_AUTOMATION_POLICY", "enforce").strip().lower() == "off":
         return ""
     allowed = automation_targets()
@@ -1878,7 +1966,7 @@ _CONTROL_KEYS_RE = re.compile(r"^(Enter|C-u|C-m|Escape|[0-9])$")
 
 
 def send_control_keys(target: str, keys: list, actor: Optional[str] = None,
-                      source: Optional[str] = None) -> dict:
+                      source: Optional[str] = None, owner_proof: Optional[dict] = None) -> dict:
     """The ONLY way to press bare keys in an agent pane (submit, clear line, pick a menu
     number). Same automation policy as `_deliver`; key names from a fixed set only, so no
     text can be typed through here. Returns {sent, rc, refused?}."""
@@ -1888,8 +1976,12 @@ def send_control_keys(target: str, keys: list, actor: Optional[str] = None,
             raise AgentControlError(f"control key not allowed: {k!r}")
     pane = _pane_is_live_agent(target)
     resolved = pane["target"]
-    refusal = automation_refusal(pane.get("session") or resolved.split(":")[0], resolved,
-                                 actor)
+    refusal = ""
+    if owner_proof is not None:
+        refusal = verify_owner_proof(owner_proof, "control_keys", target, " ".join(keys))
+    if not refusal:
+        refusal = automation_refusal(pane.get("session") or resolved.split(":")[0],
+                                     resolved, actor, owner_proven=owner_proof is not None)
     if refusal:
         audit("control_keys", resolved, None, delivered=False, refused=refusal,
               actor=actor, source=source)
@@ -1902,7 +1994,8 @@ def send_control_keys(target: str, keys: list, actor: Optional[str] = None,
 
 
 def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str],
-             actor: Optional[str] = None, source: Optional[str] = None) -> dict:
+             actor: Optional[str] = None, source: Optional[str] = None,
+             owner_proof: Optional[dict] = None) -> dict:
     """Serialise deliveries, then deliver. See `_DELIVER_LOCK`.
 
     Held across the whole delivery, not just the idempotency read: the paste
@@ -1910,11 +2003,12 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
     """
     with _DELIVER_LOCK:
         return _deliver_locked(target, text, action, idempotency_key,
-                               actor=actor, source=source)
+                               actor=actor, source=source, owner_proof=owner_proof)
 
 
 def _deliver_locked(target: str, text: str, action: str, idempotency_key: Optional[str],
-                    actor: Optional[str] = None, source: Optional[str] = None) -> dict:
+                    actor: Optional[str] = None, source: Optional[str] = None,
+                    owner_proof: Optional[dict] = None) -> dict:
     """Deliver multiline text to a pane through a tmux buffer.
 
     A tmux buffer is used rather than `send-keys` because send-keys would
@@ -1923,19 +2017,11 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     Delivery is *proven* by diffing the pane capture before and after.
     """
     _check_message(text)
+    raw_text = text
     text = _tag_if_automated(text, actor)
     pane = _pane_is_live_agent(target)
     resolved = pane["target"]
     key = idempotency_key or str(uuid.uuid4())
-    refusal = automation_refusal(pane.get("session") or resolved.split(":")[0], resolved,
-                                 actor)
-    if refusal:
-        audit(action, resolved, key, delivered=False, refused=refusal, actor=actor,
-              source=source)
-        return {"target": resolved, "action": action, "idempotency_key": key,
-                "delivered": False, "submitted": False, "queued": False,
-                "refused": refusal, "duplicate": False,
-                "reason": "automation policy: target not allowed for this caller"}
 
     prior = _seen_delivery(key)
     if prior is not None:
@@ -1947,6 +2033,22 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
               actor=actor, source=source)
         return {**prior, "duplicate": True, "delivered": False,
                 "note": "idempotency key already used — not delivered again"}
+
+    # policy AFTER the duplicate branch (which never touches the pane, and must keep
+    # attributing replays) and BEFORE the first tmux call
+    refusal = ""
+    if owner_proof is not None:       # a supplied proof must be valid; never a silent fallback
+        refusal = verify_owner_proof(owner_proof, action, target, raw_text)
+    if not refusal:
+        refusal = automation_refusal(pane.get("session") or resolved.split(":")[0],
+                                     resolved, actor, owner_proven=owner_proof is not None)
+    if refusal:
+        audit(action, resolved, key, delivered=False, refused=refusal, actor=actor,
+              source=source)
+        return {"target": resolved, "action": action, "idempotency_key": key,
+                "delivered": False, "submitted": False, "queued": False,
+                "refused": refusal, "duplicate": False,
+                "reason": "automation policy: target not allowed for this caller"}
 
     rc_before, before, _ = _tmux(["capture-pane", "-p", "-t", resolved, "-S", "-5"])
     buffer_name = f"agentctl-{key[:24]}"
@@ -2032,7 +2134,7 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
 
 def agent_send(target: str, text: str, idempotency_key: Optional[str] = None,
                actor: Optional[str] = None, source: Optional[str] = None,
-               allow_queue: bool = False) -> dict:
+               allow_queue: bool = False, owner_proof: Optional[dict] = None) -> dict:
     """Send a message to an existing agent. Never creates one.
 
     REFUSES while the agent is mid-turn, because Claude Code does not reject a
@@ -2062,17 +2164,19 @@ def agent_send(target: str, text: str, idempotency_key: Optional[str] = None,
                                   f"behind the active turn instead of executed — retry "
                                   f"when it is idle or waiting"}
         return _deliver(text=text, target=target, action="agent_send",
-                        idempotency_key=idempotency_key, actor=actor, source=source)
+                        idempotency_key=idempotency_key, actor=actor, source=source,
+                        owner_proof=owner_proof)
 
 
 def agent_answer(target: str, text: str, idempotency_key: Optional[str] = None,
-                 actor: Optional[str] = None, source: Optional[str] = None) -> dict:
+                 actor: Optional[str] = None, source: Optional[str] = None,
+                 owner_proof: Optional[dict] = None) -> dict:
     """Answer a prompt an existing agent is waiting on. Never creates one.
 
     `actor`/`source` are recorded for attribution only (who asked, from where)."""
     validate_target(target)
     return _deliver(target, text, "agent_answer", idempotency_key,
-                    actor=actor, source=source)
+                    actor=actor, source=source, owner_proof=owner_proof)
 
 
 def find_live_agent_for_dir(project_dir: str) -> Optional[dict]:

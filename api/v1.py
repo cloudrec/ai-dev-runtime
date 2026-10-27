@@ -67,6 +67,19 @@ _SOURCE_MAX = 160
 _ACTOR_SAFE_RE = re.compile(r"[^A-Za-z0-9 ._:@/+-]")
 
 
+def owner_proof_from_header(raw: Optional[str]) -> Optional[dict]:
+    """X-Owner-Proof: the JSON {ts, nonce, sig} printed by tools/owner_proof.py. Parsing
+    only — agent_control verifies it against the owner key; a malformed header becomes a
+    proof that fails verification (never silently ignored)."""
+    if raw is None or not raw.strip():
+        return None
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return {"malformed": True}
+    return obj if isinstance(obj, dict) else {"malformed": True}
+
+
 def caller_identity(request: Optional[Request], declared: Optional[str] = None) -> tuple:
     """(actor, source) for a delivery record. Never raises: attribution must not be able
     to break a delivery, so every field degrades to "unknown" rather than failing."""
@@ -355,19 +368,23 @@ class AgentSendReq(BaseModel):
 @router.post("/agents/send")
 def agents_send(req: AgentSendReq, request: Request,
                 x_runtime_actor: Optional[str] = Header(None),
+                x_owner_proof: Optional[str] = Header(None),
                 _: bool = Depends(_auth)):
     actor, source = caller_identity(request, x_runtime_actor)
     return _agent_call(agent_control.agent_send, req.target, req.text, req.idempotency_key,
-                       actor=actor, source=source)
+                       actor=actor, source=source,
+                       owner_proof=owner_proof_from_header(x_owner_proof))
 
 
 @router.post("/agents/answer")
 def agents_answer(req: AgentSendReq, request: Request,
                   x_runtime_actor: Optional[str] = Header(None),
+                  x_owner_proof: Optional[str] = Header(None),
                   _: bool = Depends(_auth)):
     actor, source = caller_identity(request, x_runtime_actor)
     return _agent_call(agent_control.agent_answer, req.target, req.text, req.idempotency_key,
-                       actor=actor, source=source)
+                       actor=actor, source=source,
+                       owner_proof=owner_proof_from_header(x_owner_proof))
 
 
 class AgentResumeReq(BaseModel):

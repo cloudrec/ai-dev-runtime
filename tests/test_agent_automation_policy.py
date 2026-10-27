@@ -79,9 +79,10 @@ def test_payment_agent_is_hard_denied_for_everyone(panes, monkeypatch, target, a
     assert typed(panes) == []
 
 
-def test_api_callers_keep_working_without_the_allowlist(panes):
+def test_api_callers_are_held_to_the_allowlist_too(panes):
+    """HMAC auth proves the shared runtime token, not the owner (see owner proof tests)."""
     r = ac.agent_send("vtb:0.0", "status?", idempotency_key="k", actor="api:hmac/chatgpt-mcp")
-    assert not r.get("refused") and typed(panes)
+    assert r["refused"] == "automation_target_not_allowlisted" and typed(panes) == []
 
 
 def test_policy_off_is_an_explicit_escape_hatch(panes, monkeypatch):

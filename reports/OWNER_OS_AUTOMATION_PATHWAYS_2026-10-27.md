@@ -39,9 +39,46 @@ tests already fixed by PR #22 (independent file).
 ## Owner gate (on deploy, behaviour changes)
 
 Deploying this with no `AGENT_AUTOMATION_TARGETS` stops ALL automatic typing into agents
-(fail closed); API/MCP sends keep working, payorch-ha-fresh refused for everyone. To keep any
+(fail closed); payorch-ha-fresh refused for everyone. [Superseded by the follow-up below: API/MCP
+sends are held to the same allowlist unless owner-proven.] To keep any
 automation, list exactly the sessions it may touch, e.g. in an ai-runtime drop-in:
 `Environment=AGENT_AUTOMATION_TARGETS=owner-os-opus-windows,gaika-server,cp-canary`
 (the owner decides the list; the hook-spawned `native_supervise_once.py` reads the runtime
 `.env`, so the same key belongs there too). Rollback: `AGENT_AUTOMATION_POLICY=off` or
 revert the commit.
+
+
+## Follow-up: provenance (branch `ai-runtime/agent-owner-proof`)
+
+Requested by an automated instruction; nothing here grants or records any authorization.
+
+- **`api:` is no longer a bypass.** HMAC proves only the shared runtime token, which
+  ChatGPT/MCP and wake paths hold. Every caller is held to `AGENT_AUTOMATION_TARGETS`.
+  Changes live behaviour once deployed: MCP control outside the allowlist needs an owner proof.
+- **Owner proof** (`verify_owner_proof`): HMAC-SHA256 with a SEPARATE owner key
+  (`/etc/ai-runtime/owner-proof.key`, regular file, root, 0600/0400, ≥32 bytes, no symlink)
+  over `owner-proof-v1 | action | target | sha256(text) | ts | nonce`; ±300 s; nonce single
+  use (`owner_proof_used`). Authorises that one command, incl. into payorch-ha-fresh. A
+  supplied proof that fails is a refusal — never a silent fallback to the allowlist. No key
+  file → no proofs (fail closed). Message text and actor names never grant anything.
+- **Owner CLI** `tools/owner_proof.py`: `init-key` (once, refuses to overwrite),
+  `sign --action --target [--text-file]` → prints `{ts, nonce, sig}` only. API header
+  `X-Owner-Proof: <json>` on `/agents/send` and `/agents/answer`; ChatGPT may relay a proof
+  but cannot retarget, edit or reuse it.
+- **Keypress bypass re-check**: `send-keys`/`paste-buffer`/`xdotool`/`wtype`/`ydotool`
+  across core, tools, api, hooks, deploy → none outside agent_control (watchdog and session
+  recovery fixed in #25); wake companion/CDP type into the ChatGPT browser only.
+
+Tests: `tests/test_agent_owner_proof.py` (api/automated actors denied outside allowlist;
+claims in message text ignored; valid proof works for send/answer/control keys and payorch;
+forgeries — random sig, runtime-token key, other text/target/action, expired, future, bad
+nonce, malformed, empty — refused with and without allowlist; replay refused; unsafe key
+files disable proofs; API header passthrough; CLI never prints the key).
+
+### True remaining owner gates
+
+1. Deploy decision (PR #25 + this branch; candidate below) — behaviour change: automatic
+   AND MCP typing outside the allowlist stops.
+2. `AGENT_AUTOMATION_TARGETS` list (ai-runtime drop-in + runtime `.env`).
+3. Owner key provisioning: `tools/owner_proof.py init-key` as root (a secret; optional —
+   without it no owner-proven overrides exist).
