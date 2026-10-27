@@ -414,8 +414,10 @@ class AgentStopReq(BaseModel):
 
 
 @router.post("/agents/stop")
-async def agents_stop(req: AgentStopReq, _: bool = Depends(_auth)):
-    return _agent_call(agent_control.agent_stop, req.target, req.confirm, req.idempotency_key)
+async def agents_stop(req: AgentStopReq, x_owner_proof: Optional[str] = Header(None),
+                      _: bool = Depends(_auth)):
+    return _agent_call(agent_control.agent_stop, req.target, req.confirm, req.idempotency_key,
+                       owner_proof=owner_proof_from_header(x_owner_proof))
 
 
 # ── Agent Supervisor: auto-resolve provably-safe permission prompts ─────────

@@ -7,6 +7,7 @@ must not be able to read the key. Prints the proof JSON only; the key is never p
   tools/owner_proof.py init-key                     # once: 32 random bytes, root 0600
   tools/owner_proof.py sign --action agent_send --target vtb:0.0 --text-file msg.txt
   printf 'status?' | tools/owner_proof.py sign --action agent_send --target vtb:0.0
+  tools/owner_proof.py sign --action agent_stop --target T --text-file /dev/null
 
 Send the command with header `X-Owner-Proof: <printed JSON>` (or `owner_proof=` in
 process). The proof binds action, target, the exact text (sha256), a timestamp (valid
@@ -31,7 +32,7 @@ def main(argv=None, stdin=None) -> int:
     sub.add_parser("init-key")
     s = sub.add_parser("sign")
     s.add_argument("--action", required=True,
-                   choices=("agent_send", "agent_answer", "control_keys"))
+                   choices=("agent_send", "agent_answer", "control_keys", "agent_stop"))
     s.add_argument("--target", required=True)
     s.add_argument("--text-file")
     a = ap.parse_args(argv)

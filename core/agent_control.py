@@ -1941,8 +1941,27 @@ def verify_owner_proof(proof: Optional[dict], action: str, target: str, text: st
 
 
 def automation_targets() -> set:
+    """Entries `target` (any caller) or `target@caller` (that caller class only). Callers:
+    `api` (any api:… actor), the in-process actor name (native_supervisor, native_goals,
+    cto_bridge, …), or `unattributed` for senders that pass no actor. `*` never matches."""
     raw = os.getenv("AGENT_AUTOMATION_TARGETS", "")
-    return {t.strip() for t in raw.split(",") if t.strip() and t.strip() != "*"}
+    return {t.strip() for t in raw.split(",")
+            if t.strip() and t.strip().split("@", 1)[0] not in ("*", "")}
+
+
+def caller_class(actor: Optional[str], source: Optional[str] = None) -> str:
+    a = (actor or "").strip()
+    if a.startswith(_AUTOMATED_ACTOR_PREFIX):
+        return "api"
+    return a or "unattributed"
+
+
+def _allowlisted(session: str, target: str, caller: str) -> bool:
+    for entry in automation_targets():
+        tgt, _, who = entry.partition("@")
+        if tgt in (session, target) and (not who or who == caller):
+            return True
+    return False
 
 
 def automation_refusal(session: str, target: str, actor: Optional[str],
@@ -1956,8 +1975,7 @@ def automation_refusal(session: str, target: str, actor: Optional[str],
         return "hard_denied_target"
     if os.getenv("AGENT_AUTOMATION_POLICY", "enforce").strip().lower() == "off":
         return ""
-    allowed = automation_targets()
-    if sess in allowed or (target or "").strip() in allowed:
+    if _allowlisted(sess, (target or "").strip(), caller_class(actor)):
         return ""
     return "automation_target_not_allowlisted"
 
@@ -2355,9 +2373,11 @@ def agent_report_read(project_dir: str, path: str) -> dict:
             "content": redact(content[:MAX_REPORT_BYTES])}
 
 
-def agent_stop(target: str, confirm: bool = False, idempotency_key: Optional[str] = None) -> dict:
+def agent_stop(target: str, confirm: bool = False, idempotency_key: Optional[str] = None,
+               owner_proof: Optional[dict] = None) -> dict:
     """Stop an agent. Destructive: requires explicit confirmation and an
-    unambiguous target, and only ever kills the resolved pane."""
+    unambiguous target, and only ever kills the resolved pane. A hard-denied session (the
+    payment agent) is never stopped without a valid owner proof for exactly this stop."""
     validate_target(target)
     if confirm is not True:
         audit("agent_stop", target, stopped=False, reason="not confirmed")
@@ -2378,6 +2398,14 @@ def agent_stop(target: str, confirm: bool = False, idempotency_key: Optional[str
     prior = _seen_delivery(key)
     if prior is not None:
         return {**prior, "duplicate": True, "stopped": False}
+
+    if (pane.get("session") or "").strip().lower() in AUTOMATION_HARD_DENY:
+        why = verify_owner_proof(owner_proof, "agent_stop", target, "") \
+            if owner_proof is not None else "hard_denied_target"
+        if why:
+            audit("agent_stop", pane["target"], key, stopped=False, refused=why)
+            return {"target": pane["target"], "stopped": False, "refused": why,
+                    "idempotency_key": key, "duplicate": False}
 
     # kill-pane, never kill-session: only the resolved target dies, and any
     # unrelated pane sharing the session survives.
