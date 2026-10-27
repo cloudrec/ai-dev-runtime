@@ -165,9 +165,15 @@ def test_payment_agent_without_proof_stays_denied_even_if_allowlisted(env, monke
 # ── API wiring and the owner CLI ───────────────────────────────────────────────
 
 def test_api_route_passes_the_header_through_unchanged(env, monkeypatch):
+    import importlib.util
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
-    from api import v1
+    # load THIS repo's api/v1.py (other suites import the live checkout's copy by path)
+    spec = importlib.util.spec_from_file_location("api_v1_under_test", ROOT / "api" / "v1.py")
+    v1 = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "api_v1_under_test", v1)   # pydantic forward refs
+    spec.loader.exec_module(v1)
+    monkeypatch.setattr(v1, "agent_control", ac)
     seen = {}
     monkeypatch.setattr(ac, "agent_send", lambda *a, **k: seen.update(k) or {"ok": True})
     app = FastAPI()

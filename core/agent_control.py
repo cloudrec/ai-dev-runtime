@@ -2022,6 +2022,20 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     pane = _pane_is_live_agent(target)
     resolved = pane["target"]
     key = idempotency_key or str(uuid.uuid4())
+
+    prior = _seen_delivery(key)
+    if prior is not None:
+        # 2026-08-04 review gap: a duplicate was recorded as "not delivered" and nothing
+        # else, so a SECOND caller replaying someone else's idempotency key left no trace
+        # at all. Attribute the replay without ever overwriting the original attribution.
+        _note_duplicate_attribution(key, resolved, actor, source)
+        audit(action, resolved, key, duplicate=True, delivered=False,
+              actor=actor, source=source)
+        return {**prior, "duplicate": True, "delivered": False,
+                "note": "idempotency key already used — not delivered again"}
+
+    # policy AFTER the duplicate branch (which never touches the pane, and must keep
+    # attributing replays) and BEFORE the first tmux call
     refusal = ""
     if owner_proof is not None:       # a supplied proof must be valid; never a silent fallback
         refusal = verify_owner_proof(owner_proof, action, target, raw_text)
@@ -2035,17 +2049,6 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
                 "delivered": False, "submitted": False, "queued": False,
                 "refused": refusal, "duplicate": False,
                 "reason": "automation policy: target not allowed for this caller"}
-
-    prior = _seen_delivery(key)
-    if prior is not None:
-        # 2026-08-04 review gap: a duplicate was recorded as "not delivered" and nothing
-        # else, so a SECOND caller replaying someone else's idempotency key left no trace
-        # at all. Attribute the replay without ever overwriting the original attribution.
-        _note_duplicate_attribution(key, resolved, actor, source)
-        audit(action, resolved, key, duplicate=True, delivered=False,
-              actor=actor, source=source)
-        return {**prior, "duplicate": True, "delivered": False,
-                "note": "idempotency key already used — not delivered again"}
 
     rc_before, before, _ = _tmux(["capture-pane", "-p", "-t", resolved, "-S", "-5"])
     buffer_name = f"agentctl-{key[:24]}"
