@@ -1,0 +1,11 @@
+{
+  "project": "owneros-sandbox",
+  "actions": ["send", "answer", "create"],
+  "targets": [],
+  "create": {
+    "worktrees": {"worker-20261027": "/opt/owneros-sandbox-worker-20261027"},
+    "session_prefix": "owneros-sandbox-",
+    "max_sessions": 1
+  },
+  "ttl_secs": 3600
+}

@@ -8,7 +8,7 @@ import json
 import os
 import re
 import time
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -48,10 +48,49 @@ async def _auth(request: Request,
         return True
     # Bearer path
     if authorization and authorization.startswith("Bearer "):
+        cid = client_for_bearer(authorization[7:].strip())
+        if cid:                          # per-client token: an AUTHENTICATED identity
+            request.state.auth_method = "client"
+            request.state.client_id = cid
+            return True
         if hmac.compare_digest(authorization[7:].strip(), _TOKEN):
             request.state.auth_method = "bearer"
             return True
     raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def client_tokens_file() -> str:
+    return os.getenv("RUNTIME_CLIENT_TOKENS_FILE", "/etc/ai-runtime/runtime-clients.json")
+
+
+def _client_tokens() -> dict:
+    """{client_id: sha256(token)} from a root-only file; {} when absent or unsafe."""
+    import json as _json
+    import stat as _stat
+    path = client_tokens_file()
+    try:
+        st = os.stat(path, follow_symlinks=False)
+        if not _stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o077):
+            return {}
+        with open(path, encoding="utf-8") as fh:
+            data = _json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items()
+            if re.fullmatch(r"[A-Za-z0-9._-]{1,48}", str(k)) and re.fullmatch(r"[0-9a-f]{64}", str(v))}
+
+
+def client_for_bearer(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    hit = None
+    for cid, h in _client_tokens().items():
+        if hmac.compare_digest(digest, h):
+            hit = cid
+    return hit
 
 
 # ── caller attribution (observability only — no gate reads these) ───────────
@@ -90,6 +129,12 @@ def caller_identity(request: Optional[Request], declared: Optional[str] = None) 
         method = "unknown"
     name = _ACTOR_SAFE_RE.sub("", (declared or "").strip())[:64]
     actor = f"api:{method}" + (f"/{name}" if name else "")
+    try:
+        cid = getattr(request.state, "client_id", None)
+    except Exception:  # noqa: BLE001
+        cid = None
+    if cid:                              # authenticated client: the declared name is ignored
+        actor = f"api:client/{cid}"
     host = port = agent = ""
     try:
         client = getattr(request, "client", None)
@@ -733,6 +778,44 @@ class OwnerDecisionReq(BaseModel):
     """One owner answer, for one or more gates that share it."""
     gate_ids: list[str]
     answer: str
+
+
+class GrantRequest(BaseModel):
+    project: str
+    actions: List[str]
+    targets: List[str] = []
+    create: Optional[dict] = None
+    ttl_secs: int = 3600
+
+
+@router.post("/grants/request", operation_id="request_delegation_grant")
+def grants_request(req: GrantRequest, request: Request,
+                   x_runtime_actor: Optional[str] = Header(None),
+                   _: bool = Depends(_auth)):
+    """Ask the owner for a delegation grant. Creates a PENDING grant only: it is activated
+    exclusively through an owner channel (host CLI / verified Telegram), never via the API."""
+    from core import automation_grants as ag
+    actor, _source = caller_identity(request, x_runtime_actor)
+    try:
+        return ag.request(req.dict(), requested_by=actor)
+    except ag.GrantError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/grants", operation_id="list_delegation_grants")
+def grants_list(_: bool = Depends(_auth)):
+    from core import automation_grants as ag
+    return {"grants": ag.list_grants()}
+
+
+@router.post("/grants/{grant_id}/revoke", operation_id="revoke_delegation_grant")
+def grants_revoke(grant_id: str, request: Request,
+                  x_runtime_actor: Optional[str] = Header(None),
+                  _: bool = Depends(_auth)):
+    """Revocation only narrows access, so the API may do it."""
+    from core import automation_grants as ag
+    actor, _source = caller_identity(request, x_runtime_actor)
+    return {"revoked": ag.revoke(grant_id, by=actor)}
 
 
 @router.post("/control-plane/owner/decision", operation_id="record_owner_decision")

@@ -1,0 +1,160 @@
+Only in b/backend/services: __pycache__
+diff -ru a/backend/services/mcp_server.py b/backend/services/mcp_server.py
+--- a/backend/services/mcp_server.py	2026-10-27 06:04:21.765286790 +0100
++++ b/backend/services/mcp_server.py	2026-10-27 06:05:01.674125735 +0100
+@@ -477,6 +477,30 @@
+         "target": target, "confirm": True, "idempotency_key": p.get("idempotency_key")})
+ 
+ 
++# ── Owner delegation grants (runtime /api/v1/grants) ────────────────────────
++# ChatGPT may REQUEST a grant and list/revoke grants; only the owner can approve it, out of
++# band (host CLI `tools/owner_grant.py approve <id>` or the verified owner Telegram chat).
++# Once active, the existing agent_* tools work on the granted agents for THIS token only.
++async def _t_grant_request(db, p):
++    from services import runtime_client
++    body = {k: p.get(k) for k in ("project", "actions", "targets", "create", "ttl_secs")
++            if p.get(k) is not None}
++    return await runtime_client.grant_post("/request", body)
++
++
++async def _t_grant_list(db, p):
++    from services import runtime_client
++    return await runtime_client.grant_get("")
++
++
++async def _t_grant_revoke(db, p):
++    from services import runtime_client
++    gid = (p.get("grant_id") or "").strip()
++    if not gid:
++        return {"error": "grant_id required"}
++    return await runtime_client.grant_post(f"/{gid}/revoke", {})
++
++
+ # ── Owner project-priority controls ─────────────────────────────────────────
+ # Direct owner directives on EXISTING projects. These mutate project rows only —
+ # they never start/message an agent and never approve/dispatch a Runtime job.
+@@ -653,6 +677,19 @@
+                            "ambiguous targets and kills only the resolved pane. Params: target, confirm, "
+                            "idempotency_key."},
+ 
++    "grant_request": {"scope": "write", "fn": _t_grant_request,
++                      "desc": "Ask the owner for a time-limited delegation grant: exact agent sessions "
++                              "(targets) and/or one /opt worktree set to create workers in, with actions "
++                              "send/answer/create. Returns a PENDING grant id; it does nothing until the "
++                              "OWNER approves it out of band (host CLI or verified owner Telegram). "
++                              "Params: project, actions, targets, create{worktrees,session_prefix,"
++                              "max_sessions}, ttl_secs."},
++    "grant_list": {"scope": "read", "fn": _t_grant_list,
++                   "desc": "List delegation grants and their effective status (pending/active/expired/"
++                           "revoked/lapsed). Read-only."},
++    "grant_revoke": {"scope": "write", "fn": _t_grant_revoke,
++                     "desc": "Revoke a delegation grant (narrowing access is always allowed). Params: grant_id."},
++
+     # Owner project-priority controls.
+     "project_controls": {"scope": "read", "fn": _t_project_controls,
+                          "desc": "Read an existing project's owner controls: status, goal, mode, priority, "
+@@ -766,6 +803,26 @@
+                        "idempotency_key": {"type": ["string", "null"]}},
+         "required": ["target", "confirm"], "additionalProperties": False,
+     },
++    "grant_request": {
++        "type": "object",
++        "properties": {
++            "project": {"type": "string"},
++            "actions": {"type": "array", "items": {"type": "string",
++                                                    "enum": ["send", "answer", "create"]}},
++            "targets": {"type": "array", "items": {"type": "string"}},
++            "create": {"type": ["object", "null"], "properties": {
++                "worktrees": {"type": "object", "additionalProperties": {"type": "string"}},
++                "session_prefix": {"type": "string"},
++                "max_sessions": {"type": "integer", "minimum": 1, "maximum": 10}}},
++            "ttl_secs": {"type": "integer", "minimum": 60, "default": 3600}},
++        "required": ["project", "actions"], "additionalProperties": False,
++    },
++    "grant_list": {"type": "object", "properties": {}, "additionalProperties": False},
++    "grant_revoke": {
++        "type": "object",
++        "properties": {"grant_id": {"type": "string"}},
++        "required": ["grant_id"], "additionalProperties": False,
++    },
+     "project_controls": {
+         "type": "object",
+         "properties": {"project": {"type": "string"}},
+@@ -849,6 +906,9 @@
+     if meta["scope"] == "write" and not has_scope(token, "write"):
+         await audit(db, token, "tool", name, params, "denied", 0, ip, "write scope required")
+         raise PermissionError("this token lacks the 'write' scope")
++    from services import runtime_client as _rc
++    # bind every runtime call made by this tool to the VERIFIED MCP token (not to params)
++    _actor_tok = _rc.CURRENT_ACTOR.set(f"mcp-token-{token.id}" if token is not None else "")
+     try:
+         result = await meta["fn"](db, params or {})
+         ms = int((time.time() - t0) * 1000)
+@@ -860,6 +920,8 @@
+         ms = int((time.time() - t0) * 1000)
+         await audit(db, token, "tool", name, params, "error", ms, ip, str(e)[:280])
+         raise
++    finally:
++        _rc.CURRENT_ACTOR.reset(_actor_tok)
+ 
+ 
+ # ══════════════════════════════ RESOURCES ══════════════════════════════
+diff -ru a/backend/services/runtime_client.py b/backend/services/runtime_client.py
+--- a/backend/services/runtime_client.py	2026-10-27 06:04:21.765286790 +0100
++++ b/backend/services/runtime_client.py	2026-10-27 06:05:01.674125735 +0100
+@@ -8,6 +8,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import contextvars
+ import os
+ import re
+ from datetime import datetime, timezone
+@@ -38,8 +39,20 @@
+     return re.sub(r"(://)[^@/\s]+@", r"\1***@", url or "")
+ 
+ 
++# The MCP caller this request serves, set per tool call by mcp_server.call_tool from the
++# VERIFIED McpToken (never from tool params). Sent as X-Runtime-Actor so the runtime binds
++# owner delegation grants to this connector; the runtime labels it `declared` unless a
++# per-client runtime token is used.
++CURRENT_ACTOR: contextvars.ContextVar[str] = contextvars.ContextVar("owner_os_mcp_actor",
++                                                                    default="")
++
++
+ def _headers() -> dict[str, str]:
+-    return {"Authorization": f"Bearer {RUNTIME_TOKEN}"} if RUNTIME_TOKEN else {}
++    h = {"Authorization": f"Bearer {RUNTIME_TOKEN}"} if RUNTIME_TOKEN else {}
++    actor = CURRENT_ACTOR.get()
++    if actor:
++        h["X-Runtime-Actor"] = actor
++    return h
+ 
+ 
+ async def status() -> dict[str, Any]:
+@@ -212,6 +225,25 @@
+         return _agent_result(r)
+ 
+ 
++async def grant_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
++    """Owner delegation grants (runtime /api/v1/grants*). Request/list/revoke only — the
++    runtime has no approval route; the owner approves out of band."""
++    if not configured():
++        raise RuntimeError("runtime not configured (RUNTIME_URL unset)")
++    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
++        r = await client.get(f"{RUNTIME_URL}/grants{path}", params=params or {},
++                             headers=_headers())
++        return _agent_result(r)
++
++
++async def grant_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
++    if not configured():
++        raise RuntimeError("runtime not configured (RUNTIME_URL unset)")
++    async with httpx.AsyncClient(timeout=TIMEOUT) as client:
++        r = await client.post(f"{RUNTIME_URL}/grants{path}", json=payload, headers=_headers())
++        return _agent_result(r)
++
++
+ async def cp_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+     """GET a runtime control-plane endpoint (same base, auth and refusal semantics as the
+     agent_* helpers — the control plane also answers 400 with a named reason)."""
