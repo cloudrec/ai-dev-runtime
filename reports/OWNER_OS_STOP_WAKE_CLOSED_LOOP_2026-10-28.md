@@ -352,3 +352,32 @@ was not acted on.
 - **Defect search:** none found in the changed code. Pre-existing and unchanged:
   `composer_did_not_clear_after_send` / `composer_ambiguous_or_absent` send failures,
   and some native rows keyed by cwd rather than pane (e.g. `/root/ai-dev-runtime`).
+
+### After the 09:15Z cutoff (an automated instruction was received)
+
+- **Escalations after 09:15Z:** exactly one closed-loop event, `wake_loop_no_progress` 74133
+  (dedup `wakeloop:74112:no_progress`, 09:17:25Z), re-waking ChatGPT about vtb event 74112
+  as designed. There was no escalation and no other non-routine event in 09:15-09:17Z.
+  The self-project watches 74114/74126/74129/74132 all resolved on progress.
+- **Expected input already satisfied?** No. The vtb prompt asks owner-gated questions
+  (the 10 000 RUB order, disabling demo products, release). No open decision gate or
+  recorded owner decision covers them, so the re-wake, and at most one later
+  `wake_loop_stalled`, is the correct path. No one acted on the vtb questions.
+- **Composer clear/absent failures (pre-existing):**
+  - 06:16-08:58Z the owner-os route alternated `composer_did_not_clear_after_send` and
+    `composer_ambiguous_or_absent:0`, mostly with no navigation. Every attempt since
+    08:59Z has succeeded (6/6).
+  - After a `did_not_clear` (whose handler runs `innerHTML=''` on the ProseMirror
+    composer), the next attempt on the same chat was `absent:0` in 26/65 cases, against
+    32/149 after any other result.
+  - That is a correlation. It is not proof that the wipe breaks the editor, so the wipe
+    is NOT changed.
+  - Concrete defect fixed in `d629f07` (local, not deployed): tab recovery and its retry
+    outcome were never recorded. Each recovery now writes a journal line, so the next
+    occurrence can be diagnosed. Full suite 4020 passed / 0 failed / 4 skipped.
+- **Native rows keyed by cwd:** this is by design for decisions taken before the pane is
+  resolved, and `_cap_exemption` reads them back by cwd. It would leak only if panes
+  shared a cwd, and the live check shows 8 agent panes with 8 distinct cwds. Not a
+  defect today; not changed.
+- **To take effect,** `d629f07` needs the companion restarted on it. That is
+  owner-gated and was not done.
