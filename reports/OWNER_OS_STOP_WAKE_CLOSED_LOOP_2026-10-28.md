@@ -218,3 +218,62 @@ Full suite: **4013 passed / 0 failed / 4 skipped**. Base `cc38238` was 3985; thi
 
 All three changes run in the companion process (`native_supervisor.scan`, `cdp_composer`,
 `closed_loop_wake`). `ai-runtime.service` does not need a restart.
+
+## Independent audit and deploy gate (2026-10-28, later)
+
+Trigger: an automated instruction was received via the Owner OS API (a relay that
+claims an owner YES in ChatGPT). Per its own text this relay is **not** CLI owner proof.
+Nothing in this section records owner approval.
+
+| | |
+|---|---|
+| Base (live) | `cc38238`, live `/root/ai-dev-runtime` (branch `ai-runtime/220-windows-bridge`), 0 tracked changes |
+| Audited | `cc38238..0d98fd8` (dfe9174, 1c4a102, 5aad66a, 0d98fd8) |
+| Review fixes | `94194e6` |
+| Frozen code SHA | `94194e6`, fast-forward from cc38238 verified (`merge-base --is-ancestor`) |
+| Reviewer | one fresh-context Claude Opus subagent, read-only, no prior context, separate from the author |
+| Verdict | round 1: **GO** (0 blockers, 3 minor, 2 nits). Round 2 (on 94194e6): **GO** |
+| Tests | focused suites 127/127. Full suite **4017 passed / 0 failed / 4 skipped** (cc38238 baseline: 3985) |
+
+Findings and how each was resolved:
+
+- MINOR, composer: assistant count/id evidence could be a false positive after a
+  post-navigation re-mount. Fixed: that evidence now counts only when `gen_before is False`.
+  - Residual: a re-mount while nothing was generating can still produce a false
+    positive. This is bounded, because a verified delivery also registers an SLO watch.
+- MINOR, native supervisor precheck: its inputs could differ from `_deliver`'s resolved
+  pane. Fixed: it refuses nothing unless the live pane gives both session and cwd.
+- MINOR, wake_companion: about 27 a day of unverified wakes now get watches and can
+  escalate (at most once per event, never resent). Not changed. Monitor escalation
+  volume for 24 h after deploy.
+- NIT, closed_loop_wake: a failed import of `DIAGNOSTIC_GATE_KINDS` used to drop the
+  whole gate check. Fixed: it falls back to the old rule, where every open gate counts
+  (sentinel checked against NULL kinds).
+- NIT, composer: a failed attempt can now take up to 10 s longer (USER_TURN_SECS=20).
+  Accepted.
+- Each fix has a regression test, and each test fails with its fix reverted.
+
+Reviewer's deploy-safety notes:
+- `slo_scan`, `register_delivery`, `native_supervisor.scan` and `submit_phrase` run only
+  in the companion. `ai-runtime.service` imports these modules read-only and none are on
+  its skew list, so restarting only the companion is consistent.
+- The migration is a single additive `ALTER TABLE ADD COLUMN delivery_verified DEFAULT 1`.
+  No `SELECT *` or positional read of the table exists.
+- Rolling back to cc38238 is safe: old code ignores the column and the `policy_refused`
+  rows.
+
+**Deploy NOT performed.** Blocker: no host-verified owner proof.
+- The only standing owner instruction is to deploy or restart only with explicitly
+  authenticated approval, and in this session only an owner turn typed directly at the
+  CLI counts. The relay disclaims being that proof.
+- No fast-forward, restart or live evidence was produced. The companion was observed
+  already restarted by someone else at 06:44 CET (PID 393675) on cc38238.
+
+Exact step once host owner proof is given:
+1. `git -C /root/ai-dev-runtime merge --ff-only 94194e6` (after re-checking 0 tracked changes)
+2. `systemctl restart owner-os-wake-companion.service`. Leave `ai-runtime.service` alone.
+3. Verify live: an actionable stop event leads to a `wake_delivery` delivered, then ACK,
+   then a new ChatGPT command reaching the agent. Watch escalation volume for 24 h.
+
+Rollback: `git -C /root/ai-dev-runtime reset --keep cc38238`, then restart only the
+companion.
