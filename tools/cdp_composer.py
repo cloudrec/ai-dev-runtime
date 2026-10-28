@@ -908,6 +908,53 @@ def dismiss_focus_trap(s) -> str:
     return v if isinstance(v, str) else "unknown"
 
 
+# 2026-10-28: the owner-os and payment-orchestrator conversations hit ChatGPT's length
+# cap. The page keeps an editable composer, but shows an `aside[role=alert]` with "You've
+# reached the maximum length for this conversation ... Start new chat", and the chat can
+# no longer take a turn. Nothing here noticed: wakes kept being typed into a dead chat
+# and the routes went silent. The notice is UI chrome, like a dialog title — read only
+# inside a role=alert container, never from conversation content.
+_CONVERSATION_FULL_JS = (
+    "(function(){var re=/maximum length for this conversation|"
+    "\u043c\u0430\u043a\u0441\u0438\u043c\u0430\u043b\u044c\u043d\u043e\u0439 "
+    "\u0434\u043b\u0438\u043d\u044b/i;"
+    "var a=document.querySelectorAll('[role=alert]');"
+    "for(var i=0;i<a.length;i++){if(re.test(a[i].textContent||''))return true;}"
+    "return false;})()")
+
+
+def conversation_is_full(s) -> Optional[bool]:
+    """True when ChatGPT says this conversation reached its maximum length. None when
+    the page cannot answer; the caller then runs its ordinary path unchanged."""
+    return s.boolean(_CONVERSATION_FULL_JS)
+
+
+# Post-send failures that a full conversation explains. Pre-send reasons are never
+# rewritten: `submit_phrase` and `chat_registry` match several of them exactly.
+_FULL_EXPLAINS_PREFIXES = ("user_turn_", "assistant_started_")
+
+
+def _full_verdict(s, res: dict, full_before: bool) -> dict:
+    """Mark a post-send verdict reached on a conversation showing the length-cap notice,
+    before or after the send. Never changes `ok`: a success met the ordinary delivery
+    proof and stays one, but says the chat is at cap; a failure names the cap as its
+    likely cause. A page that cannot answer (or raises) counts only what was seen before,
+    so this can never turn a proven delivery into a `cdp_error`."""
+    try:
+        full = full_before or conversation_is_full(s) is True
+    except Exception:  # noqa: BLE001
+        full = full_before
+    if not full:
+        return res
+    res = dict(res, conversation_full=True)
+    reason = str(res.get("reason", ""))
+    if res.get("ok"):
+        res["reason"] = f"{reason}+conversation_full_notice"
+    elif reason.startswith(_FULL_EXPLAINS_PREFIXES):
+        res["reason"] = f"conversation_full:{reason}"
+    return res
+
+
 def focus_failure_reason(s) -> str:
     """Name WHY the composer could not be focused, and name the dialog when there is one.
 
@@ -1301,6 +1348,13 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                     s.count(COMPOSER_SEL) == 1:
                 break
             _t.sleep(2)
+        # OBSERVED, not refused. 2026-10-28 the owner-os and payment-orchestrator chats
+        # showed the length-cap notice (it comes and goes) while taking 33 and 27 wakes
+        # and answering them, so the notice alone does not prove the chat dead and
+        # refusing on it would silence working routes. Success still needs the full proof
+        # below; the notice is carried into every post-send verdict (`_full_verdict`) so a
+        # failure on a capped chat names its cause and a success says the chat is at cap.
+        full_before = conversation_is_full(s) is True
         n = s.count(COMPOSER_SEL)
         if n != 1:
             return {"ok": False, "reason": f"composer_ambiguous_or_absent:{n}"}
@@ -1472,13 +1526,15 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                 # `user_turn_not_observed_after_send`, all on the two chats the single
                 # tab is navigated between, 9 of them right after a navigation; the
                 # user-turn proof missed while the assistant side is a separate signal.
-                return _await_assistant(s, asst_before, asst_id_before)
+                return _full_verdict(s, _await_assistant(s, asst_before, asst_id_before),
+                                     full_before)
             if user_turn_seen:
                 # The message is in the page. Now the question that actually matters:
                 # did the assistant START? Until it does, the wake has delivered
                 # nothing the reviewer will act on, and saying otherwise is the false
                 # positive that let two agents sit stopped.
-                return _await_assistant(s, asst_before, asst_id_before)
+                return _full_verdict(s, _await_assistant(s, asst_before, asst_id_before),
+                                     full_before)
         if not cleared:
             # The phrase is still SITTING IN THE COMPOSER — provably not sent (event
             # 4214: a settling page refused the click and the old pre-fire latch then
@@ -1493,7 +1549,8 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # The composer emptied and nothing arrived. This is the exact shape of the silent
         # failure this check exists for: it must NOT be acknowledged, so the wake stays
         # pending and is retried after the cooldown.
-        return {"ok": False, "reason": "user_turn_not_observed_after_send"}
+        return _full_verdict(s, {"ok": False, "reason": "user_turn_not_observed_after_send"},
+                             full_before)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": f"cdp_error:{type(e).__name__}"}
     finally:

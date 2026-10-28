@@ -67,6 +67,13 @@ class _S:
             # default "same element every look" so no other test's queue shifts.
             script = getattr(self, "composer_stable", None)
             return script.pop(0) if script else True
+        if "maximum length for this conversation" in expression:
+            # Length-cap notice probe (2026-10-28). Structural, same reason as above.
+            # A list scripts successive answers (notice appearing mid-delivery).
+            full = getattr(self, "conversation_full", False)
+            if isinstance(full, list):
+                return full.pop(0) if len(full) > 1 else full[0]
+            return full
         if "stop-button" in expression:
             # Back-pressure probe. Answered STRUCTURALLY, like readyState, so it does not
             # consume the scripted queue below — otherwise adding an infrastructure check
