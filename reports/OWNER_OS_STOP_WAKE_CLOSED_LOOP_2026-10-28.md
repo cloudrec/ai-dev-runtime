@@ -415,3 +415,72 @@ was not acted on.
   conversation URL.
 - **Deploy:** local only. Live stays at 94194e6. Taking `360992c` live (together with
   d629f07) needs owner approval for a fast-forward plus a companion-only restart.
+
+## Owner task "full autonomous loop" — deploy cd7ee22 and live proof (2026-10-28, 09:54-10:16Z)
+
+**Approval.** An owner message was typed directly in the supervisor session at about
+09:54Z. No `deliveries` row matches it; the last API delivery was at 09:35:17Z. It
+authorised, after an audit and a green full suite, a fast-forward up to 323d900 and a
+restart of only the companion, with rollback to 94194e6.
+
+**Audit.** A fresh-context Opus reviewer (read-only) audited 94194e6..323d900.
+- Verdict: GO, with one MAJOR finding. `360992c` trusts `class_reason=inventory_waiting_owner`,
+  which `_STATE_WAIT_OWNER_RE` also matches on FINISHED panes ("do you want me to…").
+  Examples: payorch 72722, gaika-ru 73627, bitwhite 72620. On a looped GAIKA agent it would
+  disable the 15-min re-wake and delay the loop by up to 1 h.
+- Because the owner's goal is the autonomous loop, **360992c was NOT deployed** and is
+  reverted on the branch (3660c31).
+- Deployed instead: **cd7ee22**. It is an ancestor of 323d900, so a strict subset of the
+  approval. It adds the composer recovery logging `d629f07` plus report changes.
+- Full suite at 323d900: green. At cd7ee22 (= d629f07): 4020/0/4.
+
+**Deploy (10:01Z).**
+- Live 94194e6 → cd7ee22 with `merge --ff-only`; 0 tracked changes before and after.
+- 37 untracked files hashed before the fast-forward
+  (`backups/stop-wake-deploy-2026-10-28/untracked_sha256_before_cd7ee22.txt`); all
+  unchanged afterwards.
+- Companion restarted (PID 2106593 → 2761085, NRestarts 0). `ai-runtime.service` untouched
+  (PID 1084446).
+- Rollback: `git reset --keep 94194e6` plus a companion restart.
+
+**Root cause of the owner-os wake outages (06:16-08:58Z, 09:45-10:03Z), seen live:**
+- A structural probe at 09:56Z showed ChatGPT mid-generation (Stop visible). Wakes then
+  ended `did_not_clear`, and the following `absent:0` replaced the tab.
+- The fresh tab rendered ChatGPT's own error, "Could not load this ChatGPT conversation /
+  Try again": no turns and no composer. Further attempts failed as `absent:0` until the
+  conversation loaded again.
+- With d629f07 live, the first recovery logged at 10:03:17Z:
+  `composer_ambiguous_or_absent:0 -> tab_replaced retry=submitted_and_assistant_started_generating`.
+  74151 was delivered.
+
+**Live chains (UTC):**
+
+| chain | event (trigger) | wake delivered + ACK | ChatGPT next command | executed |
+|---|---|---|---|---|
+| self-project | 74114 work_stopped_incomplete 08:49 | 09:01:09 / 09:01:09 | 09:01:42 `wake74114-close-loop-proof-20261028` | yes (this pane ran it) |
+| self-project | 74126 agent_waiting_input 09:04:14 | 09:04:48 / 09:04:48 | 09:05:21 `wake-74126-safe-postdeploy-verify-20261028` | yes |
+| self-project | 74132 work_stopped_incomplete 09:12:38 | 09:13:51 / 09:13:51 | 09:14:29 `self-project-safe-continue-74132-escalations-20261028` | yes |
+| GAIKA via self | 74141 work_stopped_incomplete 09:34:11 | 09:35:36 / 09:35:36 | 09:36:58 `gaika-pl-20261028-1137-verify-7ee6947e-v1` → gaika-country-pl | yes: pl turns 09:37:24, 09:38:25, then stop 74150 09:42:59 |
+| GAIKA | 74150 work_stopped_incomplete 09:42:59 | 09:44:13 / 09:44:13 | none: ChatGPT checked and judged further PL work owner-gated | — |
+| GAIKA re-wake | 74164 wake_loop_no_progress 10:03:19 | 10:06:04 / 10:06:04 | none, same reason (ChatGPT reply in the pl chat, 1m14s of work) | — |
+
+All triggers are agent events (Stop hook → agent_watch quiescence / waiting_transitions)
+or the watchdog. None is an hourly timer or an owner message. Every ChatGPT command
+landed 32-81 s after its wake, sent as `api:bearer/mcp-token-3`, with
+delivered/submitted/prompt_consumed=true.
+
+**Where the loop stops today is an owner gate, not a defect.** ChatGPT's own verdict on
+74164 (pl chat): gaika-country-pl is idle and healthy, 7ee6947e has 2405 tests passed,
+and "further PL development requires a test release and a decision on the Frisco data".
+
+**Further local fix (not deployed): `358281d`.** `detect_owner_intervention` counted
+ChatGPT's own API sends as the owner acting. Example: 74142 for gaika-pl, where the task
+was actually sent at 09:34:48Z by `api:bearer/mcp-token-3`. 12 of 175 such rows in 7
+days. It now checks for a delivered `api:` send first, failing to the old attribution on
+any error. 4 new tests; full suite 4024/0/4. It is outside the approved 323d900 scope and
+needs its own audit and owner approval to deploy.
+
+**Isolated end-to-end test.** I used the self-project pane `owner-os-supervisor-clean:0.0`.
+It is not a product project, and it is the only allowlisted automation target. A new
+dedicated test agent would need the creation gate and a new delegation grant, both owner
+gates, so none was created.
