@@ -326,3 +326,29 @@ was not acted on.
 - Native pre-check: 3 idle `policy_refused` rows (one per target), then backed off.
   - No refused continuation attempts.
   - 7 event-path skips.
+
+### Post-deploy verification at 09:05Z (an automated instruction was received for event 74126)
+
+- **At-most-once (all live data):** there are 614 `closed_loop_wake` `wakeloop:*` events,
+  with 614 distinct dedup keys. Across 8 254 `wake_loop_watch` rows, none has rewoken>1 or
+  escalated>1. Since the deploy there are 0 re-wake and 0 escalation events.
+  - Every post-deploy watch is still inside its 900 s SLO; 74112 falls due at 09:14:54Z.
+    The escalation rate after the deploy cannot be measured yet.
+  - In the 7 days before the deploy, the only `closed_loop_wake` events were 175
+    `owner_intervention`.
+- **Idle backoff:** in the hour before the deploy there were 31 idle rows, all refused
+  `continue` (bitwhite 11, gaika-pl 9, serverwarden 11).
+  - Since the deploy there are 3 rows, one `policy_refused` per target at 08:54/08:56Z,
+    and nothing after that: the backoff holds.
+  - The event path made 0 continue attempts against 3 refused in the prior hour. All 11
+    event rows are skips (external wait, not a turn boundary, self-reference,
+    value-bearing send blocked).
+- **Self-project exclusion:** native_supervisor skipped `owner-os-supervisor-clean:0.0`
+  as `supervisor_self_reference` (events 74117, 74123), so it never sent to the pane.
+  ChatGPT handled the self-project by wake instead:
+  - 74114 was delivered at 09:01:09Z and answered with a GPT command at 09:01:42Z.
+  - 74126 (`agent_waiting_input`, 09:04:14Z) was delivered at 09:04:48Z, verified, and
+    has a watch open; this turn is its handling.
+- **Defect search:** none found in the changed code. Pre-existing and unchanged:
+  `composer_did_not_clear_after_send` / `composer_ambiguous_or_absent` send failures,
+  and some native rows keyed by cwd rather than pane (e.g. `/root/ai-dev-runtime`).
