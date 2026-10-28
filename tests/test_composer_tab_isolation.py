@@ -199,20 +199,46 @@ def test_a_changing_page_restarts_the_clock(monkeypatch):
 
 def test_an_idle_observation_forgets_the_conversation():
     cdp._generating_for(OWNER_OS, 10, now=0.0)
-    assert cdp._generating_for(OWNER_OS, 10, now=5000.0) == 5000.0
+    assert cdp._generating_for(OWNER_OS, 10, now=5000.0)[0] == 5000.0
     cdp._GENERATING_SINCE.pop(OWNER_OS, None)                # what gen_before False does
-    assert cdp._generating_for(OWNER_OS, 10, now=6000.0) == 0.0
+    assert cdp._generating_for(OWNER_OS, 10, now=6000.0)[0] == 0.0
 
 
 def test_the_clock_is_per_conversation():
     cdp._generating_for(OWNER_OS, 10, now=0.0)
-    assert cdp._generating_for(PL, 10, now=5000.0) == 0.0
+    assert cdp._generating_for(PL, 10, now=5000.0)[0] == 0.0
 
 
 def test_an_unreadable_length_neither_proves_life_nor_wedge():
     cdp._generating_for(OWNER_OS, None, now=0.0)
-    assert cdp._generating_for(OWNER_OS, None, now=100.0) == 100.0
-    assert cdp._generating_for(OWNER_OS, 77, now=200.0) == 200.0   # first real length
+    assert cdp._generating_for(OWNER_OS, None, now=100.0)[0] == 100.0
+    assert cdp._generating_for(OWNER_OS, 77, now=200.0)[0] == 200.0   # first real length
+
+
+def test_a_new_tab_never_inherits_an_old_observation():
+    """Review: a stale entry must not make a fresh sighting count as aged at once."""
+    cdp._generating_for(OWNER_OS, 10, now=0.0, tab_id="OLD")
+    assert cdp._generating_for(OWNER_OS, 10, now=5000.0, tab_id="NEW") == (0.0, 0.0)
+
+
+def test_life_signs_cannot_postpone_recovery_past_the_ceiling(monkeypatch):
+    """Review: a ticking timer changes the length forever; a stuck turn must still be
+    recovered once the ceiling is reached."""
+    recovered = []
+    _wire(monkeypatch, Busy(list(range(5000, 5100))), recovered)
+    t = [1000.0]
+    monkeypatch.setattr(cdp.time, "time", lambda: t[0])
+    for _ in range(3):
+        cdp.submit_phrase(OWNER_OS, "P", claim=False)
+        assert recovered == []
+        t[0] += cdp.WEDGE_MIN_SECS + 1                     # length changed every time
+    cdp.submit_phrase(OWNER_OS, "P", claim=False)          # past 3x since first sighting
+    assert recovered == [OWNER_OS]
+
+
+def test_a_malformed_tab_cap_falls_back_instead_of_crashing(monkeypatch):
+    monkeypatch.setenv("CDP_CONVERSATION_TABS", "six")
+    assert cdp._int_env("CDP_CONVERSATION_TABS", 6) == 6
 
 
 def test_page_text_len_reads_a_length_never_text():

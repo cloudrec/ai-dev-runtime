@@ -111,8 +111,14 @@ BROWSER_SLOW_SECS = float(os.getenv("CDP_SLOW_SECS", "2.0"))
 # it while ChatGPT was still answering there (09:45, 10:20, 10:44Z); a conversation
 # reloaded mid-generation rendered "Could not load this ChatGPT conversation".
 # Kept well under BROWSER_MAX_PAGES so `browser_degraded` never trips on our own tabs.
-CONVERSATION_TABS = max(1, min(int(os.getenv("CDP_CONVERSATION_TABS", "6")),
-                               BROWSER_MAX_PAGES - 2))
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+CONVERSATION_TABS = max(1, min(_int_env("CDP_CONVERSATION_TABS", 6), BROWSER_MAX_PAGES - 2))
 
 
 def browser_degraded(list_fn=None, clock=None) -> dict:
@@ -778,6 +784,9 @@ def assistant_is_generating(s) -> Optional[bool]:
 # How long the stop control must have been up, with the page not changing, before a turn
 # may be called wedged and its tab replaced. Observed across attempts, in this process.
 WEDGE_MIN_SECS = float(os.getenv("CDP_WEDGE_MIN_SECS", "900"))
+# A stop control up this long counts toward a wedge however the page changes — a ticking
+# timer or a sidebar update must not postpone recovery of a stuck turn forever.
+WEDGE_CEILING_SECS = 3 * WEDGE_MIN_SECS
 _GENERATING_SINCE: dict = {}
 
 
@@ -794,22 +803,26 @@ def _page_text_len(s) -> Optional[int]:
 
 
 def _generating_for(conversation_url: str, text_len: Optional[int],
-                    now: Optional[float] = None) -> float:
-    """Seconds this conversation has been seen generating with the page UNCHANGED.
+                    now: Optional[float] = None, tab_id: Optional[str] = None) -> tuple:
+    """(seconds generating with the page UNCHANGED, seconds generating at all) for this
+    conversation, as observed by this process.
 
-    Any change in the rendered length is a sign of life and restarts the clock; an
-    attempt that finds nothing generating forgets the conversation. An unreadable length
-    neither restarts nor proves anything. A fresh process starts at zero, which only
-    ever delays a recovery — it never causes one."""
+    Any change in the rendered length is a sign of life and restarts the first clock; the
+    second keeps running and bounds how long life signs can postpone a recovery. An
+    attempt that finds nothing generating forgets the conversation, and a different tab
+    (a recovery, a reload) starts over — an old observation never ages a new one. An
+    unreadable length neither restarts nor proves anything. A fresh process starts at
+    zero, which only ever delays a recovery — it never causes one."""
     now = time.time() if now is None else now
     st = _GENERATING_SINCE.get(conversation_url)
-    if st is None or (text_len is not None and st["len"] is not None
-                      and text_len != st["len"]):
-        st = {"since": now, "len": text_len}
+    if st is None or st.get("tab") != tab_id:
+        st = {"since": now, "first": now, "len": text_len, "tab": tab_id}
         _GENERATING_SINCE[conversation_url] = st
+    elif text_len is not None and st["len"] is not None and text_len != st["len"]:
+        st["since"], st["len"] = now, text_len
     elif st["len"] is None and text_len is not None:
         st["len"] = text_len
-    return now - st["since"]
+    return now - st["since"], now - st["first"]
 
 
 def generating_is_wedged(s, samples: int = 3, interval: float = 2.0, sleep=None) -> bool:
@@ -1331,8 +1344,10 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
             # 10:47:47Z the owner-os tab was replaced as "wedged" and 22 s later ChatGPT,
             # from that very chat, sent its next command. The replacement then rendered
             # "Could not load this ChatGPT conversation". See `_generating_for`.
-            age = _generating_for(conversation_url, _page_text_len(s))
-            if age >= WEDGE_MIN_SECS and generating_is_wedged(s):
+            age, total = _generating_for(conversation_url, _page_text_len(s),
+                                         tab_id=target.get("id"))
+            if (age >= WEDGE_MIN_SECS or total >= WEDGE_CEILING_SECS) and \
+                    generating_is_wedged(s):
                 return {"ok": False, "reason": "assistant_generating_wedged"}
             return {"ok": False, "reason": "assistant_still_generating"}
         if gen_before is False:
