@@ -521,3 +521,58 @@ gates, so none was created.
   - Watchdog: 74198 deregistered as `pane_escalated_by_stall_doctor`.
   - 74200 (bitwhite) was held by the per-agent cooldown and claimed at 10:42:22Z; this
     is normal coalescing.
+
+## Per-conversation tabs and the false-wedge fix: local, not deployed (automated instructions received)
+
+**Evidence (live, read-only, since the 94194e6 deploy):**
+- 7 ChatGPT commands arrived 32-81 s after a delivered wake, so they are wake-driven.
+  3 arrived 5-21 min later (10:25 and 10:27 to gaika-pl, 10:48 to this pane), so they
+  are not wake-driven: an owner/ChatGPT session.
+- Before the composer fix (the night of 10-27/28) almost every wake failed, so commands
+  then came from direct sessions. Minutes of the hour are uniform, so there is no hourly
+  timer.
+- **Every failure stretch on the owner-os chat began when the single shared tab was
+  navigated back to it while ChatGPT was still answering** (09:45, 10:20, 10:44Z).
+  - A fresh load mid-answer renders "Could not load this ChatGPT conversation", which
+    reads as `composer_ambiguous_or_absent:0` and leads to another tab replacement.
+- 10:47:47Z: `assistant_generating_wedged -> tab_replaced` on a live turn. 22 s later,
+  ChatGPT sent its 10:48:09Z command from that chat.
+  - In the 2026-10 UI a thinking or tool-calling turn has no streaming class and no
+    message ids, so the 4 s sample calls it wedged.
+
+**Fix (tools/cdp_composer.py), commits e505602, dd43316, 355aad3, 3e5f79e:**
+- `find_chatgpt_page(conversation_url)` reclaims a root page first. Otherwise the caller
+  opens a tab of its own while there are fewer than `CDP_CONVERSATION_TABS` (6, capped at
+  ≤ CDP_MAX_PAGES-2).
+  - At the cap, only a tab provably NOT generating is reused.
+  - With every tab busy, the attempt returns `all_conversation_tabs_busy` before
+    anything is typed or latched.
+- A wedge now needs both:
+  - the 4 s sample to agree;
+  - the stop control continuously up with the page length unchanged for
+    `CDP_WEDGE_MIN_SECS` (900), or for 3x that since first sighting regardless of length.
+- The observation is per conversation and per tab, and is forgotten after a 1800 s
+  sighting gap (more than the 900 s cooldown plus the 300 s backoff).
+- Unchanged: the phrase is typed only into the tab whose URL is the bound conversation,
+  and the latch and dedup are untouched.
+
+**Tests:**
+- `tests/test_composer_tab_isolation.py`: 22 tests. Sabotage of isolation, the wedge
+  gate, the busy refusal and the gap each fails tests.
+- The legacy composer suite against the worktree module: 115/115.
+- Full suite at 3e5f79e: **4046 passed / 0 failed / 4 skipped**.
+
+**Independent critical audit** (fresh Opus, read-only, 4 rounds): final **GO** for
+358281d..3e5f79e. Fixed along the way: stale-observation ageing, a missing ceiling, the
+gap shorter than the retry cadence (a liveness MAJOR), and an unguarded env parse.
+Open, non-blocking:
+- a thinking turn longer than 15 min can still be reloaded;
+- dead tabs at the cap give `all_conversation_tabs_busy` until the 3 h expiry;
+- probing at the cap costs up to about 23 s per tab.
+
+**Deploy (owner-gated, not done):**
+- Fast-forward live 358281d → 3e5f79e and restart only owner-os-wake-companion.service.
+  `ai-runtime.service` does not use the changed code.
+- After deploy, ChatGPT tabs grow from 1 to one per active route (up to 6). Watch
+  `browser_tab_health` headroom and the `all_conversation_tabs_busy` lines.
+- Rollback: `git reset --keep 358281d` plus a companion restart.
