@@ -478,7 +478,10 @@ def test_slo_watchdog_stays_quiet_when_progress_is_observed(conn):
 def test_a_pane_with_an_open_owner_gate_is_not_stalled(conn):
     from core.control_plane import api
     _register_agent(conn)
-    api.open_gate(agent_id=PANE, kind="classify_scope", reason="unknown scope", conn=conn)
+    # a DECISION gate; diagnostic kinds such as classify_scope do not count — see
+    # tests/test_stop_wake_closed_loop.py::test_diagnostic_gates_do_not_suppress
+    api.open_gate(agent_id=PANE, kind="owner_approval_required",
+                  reason="deploy needs approval", conn=conn)
     calls, emit = _emit_calls()
     clw.register_delivery(event_id=81, target=PANE, project_id="gaika-extension",
                           conn=conn, now=NOW)
@@ -506,8 +509,8 @@ def test_answering_the_gate_restores_normal_stall_detection(conn):
     suppression stops applying on its own, with no separate reset logic."""
     from core.control_plane import api
     _register_agent(conn)
-    g = api.open_gate(agent_id=PANE, kind="classify_scope", reason="unknown scope",
-                      conn=conn)
+    g = api.open_gate(agent_id=PANE, kind="owner_approval_required",
+                      reason="deploy needs approval", conn=conn)
     gid = g["id"] if isinstance(g, dict) else g
     api.answer_gate(gid, "observe_only", conn=conn)
     calls, emit = _emit_calls()
@@ -522,8 +525,8 @@ def test_another_agents_gate_does_not_shield_this_pane(conn):
     """Gates are per-agent. One agent's pending decision must not silence another's."""
     from core.control_plane import api
     _register_agent(conn)
-    api.open_gate(agent_id="someone-else:0.0", kind="classify_scope", reason="x",
-                  conn=conn)
+    api.open_gate(agent_id="someone-else:0.0", kind="owner_approval_required",
+                  reason="x", conn=conn)
     calls, emit = _emit_calls()
     clw.register_delivery(event_id=84, target=PANE, project_id="gaika-extension",
                           conn=conn, now=NOW)

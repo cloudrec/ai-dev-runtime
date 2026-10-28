@@ -55,6 +55,9 @@ _WATCH_COLUMNS = (
     # the originating project, so every SLO alarm about a /opt/seo agent was filed under
     # `owner-os` — the chat it was delivered to (events 16068, 16102).
     ("route_key", "TEXT"),
+    # 0 = the page took the phrase (latched) but the user turn / assistant start was never
+    # observed. Watched all the same — see `register_delivery`.
+    ("delivery_verified", "INTEGER DEFAULT 1"),
 )
 
 
@@ -479,11 +482,24 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     #
     # Grants nothing. It suppresses a re-wake and an escalation; it changes no lifecycle,
     # actuates nothing, and cannot move an agent's scope.
+    #
+    # DECISION gates only. `discovery` opens a `classify_scope` gate ("unknown-scope agent
+    # at /opt/x") for every agent it finds outside the static scope map, and nobody
+    # answers those — 45 were open on 2026-10-28. That is a mapping gap, not a question on
+    # the pane (`owner_status.DIAGNOSTIC_GATE_KINDS` already says so), but counting it
+    # here resolved EVERY watch for those agents within a second as
+    # `pane_awaiting_owner`: 18 of 34 watches in a week, every gaika-country-ru one among
+    # them. Stops at 02:25, 03:26 and 04:45 sat 60, 79 and 35+ minutes with no re-wake,
+    # and the owner poked the chat by hand (owner_intervention 02:25, 03:21).
     try:
+        from core.owner_status import DIAGNOSTIC_GATE_KINDS
         idents = _identities(conn, target)
+        kinds = sorted(DIAGNOSTIC_GATE_KINDS)
         row = conn.execute(
-            "SELECT id FROM owner_gate WHERE state='open' AND agent_id IN (%s) LIMIT 1"
-            % ",".join("?" * len(idents)), idents).fetchone()
+            "SELECT id FROM owner_gate WHERE state='open' AND agent_id IN (%s) "
+            "AND COALESCE(kind,'') NOT IN (%s) LIMIT 1"
+            % (",".join("?" * len(idents)), ",".join("?" * len(kinds))),
+            (*idents, *kinds)).fetchone()
         if row:
             return "pane_awaiting_owner"
     except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
@@ -639,8 +655,8 @@ def _target_from_event(conn, event_id: int) -> str:
 
 
 def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
-                      event_type: str = "", route_key: str = "", conn=None,
-                      now: Optional[float] = None) -> None:
+                      event_type: str = "", route_key: str = "", verified: bool = True,
+                      conn=None, now: Optional[float] = None) -> None:
     """Start SLO tracking for a wake that a companion delivery just confirmed landed
     (a real ChatGPT user turn). Idempotent — a re-delivery of the same event id (which
     should never happen past the submission latch, but this must never crash if it
@@ -653,6 +669,11 @@ def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
     (2026-08-15: 5548 -> rewake 5563 -> rewake 5595 -> ...). `event_type` is the one
     piece of context that answers "is this delivery ITSELF a watchdog artifact" —
     trigger class is a closed lookup, so this can never be tricked by pane content.
+
+    `verified=False` is a wake the page TOOK (submission latched) whose user turn was
+    never observed. It is watched exactly like a verified one: the latch forbids
+    re-sending the event, so the watchdog's single re-wake is the only way an
+    undelivered stop is ever heard. The column keeps the two apart in the audit.
     """
     from core import wake_bridge as wb
     now = now if now is not None else now_ts()
@@ -675,9 +696,9 @@ def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
             return
         conn.execute(
             "INSERT OR IGNORE INTO wake_loop_watch (event_id,target,project_id,route_key,"
-            "delivered_ts,delivered_at) VALUES (?,?,?,?,?,?)",
+            "delivered_ts,delivered_at,delivery_verified) VALUES (?,?,?,?,?,?,?)",
             (int(event_id), target, project_id or "", route_key or "",
-             now, now_iso()))
+             now, now_iso(), 1 if verified else 0))
         conn.commit()
     finally:
         if own:

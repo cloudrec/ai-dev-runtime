@@ -80,6 +80,15 @@ def discover_chats() -> dict:
             "sidebar": sidebar.get("ok"), "sidebar_reason": sidebar.get("reason")}
 
 
+def _latched(wb, event_id) -> bool:
+    """Did the page take this event's phrase? False on any doubt (fail closed: an
+    unlatched failure stays pending and is retried, exactly as before)."""
+    try:
+        return bool(wb.was_submitted(event_id))
+    except Exception:  # noqa: BLE001 — includes a bridge without the latch API
+        return False
+
+
 def tick(wb) -> dict:
     """One poll: ask the bridge, deliver if told to, acknowledge ONLY on verified delivery.
 
@@ -129,6 +138,30 @@ def tick(wb) -> dict:
         print(f"delivered wake for event {p['event_id']} "
               f"[route {p.get('route_key', '?')}] to {p['conversation']}: "
               f"{res.get('reason')}", flush=True)
+    elif p.get("actionable") and _latched(wb, p["event_id"]):
+        # The page TOOK the phrase (the composer cleared, so `wake_submitted` latched) but
+        # the user turn or the assistant start was never observed. The latch rightly
+        # forbids sending this event again — and nothing else was watching it, so it sat
+        # dead until `record_abandoned_wakes` retired it three hours later. Event 73945
+        # (gaika-country-ru, work_stopped_incomplete, 2026-10-28 04:54
+        # `user_turn_not_observed_after_send`) is that shape, 27 times in a day.
+        #
+        # Watching it changes nothing about the event itself: if ChatGPT did get the turn,
+        # the agent moves and the watch resolves `progress_observed`; if not, the SLO
+        # watchdog emits ONE new `wake_loop_no_progress` event (its own id, its own
+        # dedup key), then at most one escalation. Never acknowledged here — the
+        # delivery stays unproven in every ledger.
+        try:
+            from core import closed_loop_wake
+            closed_loop_wake.register_delivery(
+                event_id=p["event_id"], target=p.get("agent_id", ""),
+                project_id=p.get("project_id", ""),
+                route_key=p.get("route_key", ""),
+                event_type=p.get("event_type", ""), verified=False)
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"submitted but unverified for event {p['event_id']} "
+              f"({res.get('reason')}); latched, watched for progress", flush=True)
     else:
         print(f"not delivered for event {p['event_id']}; stays pending "
               f"({res.get('reason')})", flush=True)
