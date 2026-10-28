@@ -122,7 +122,6 @@ _SESSION_TARGET_PREFIX = "session:"
 # agent_watch mints these from its `owner_prompt` and `blocker` classes.
 _PROMPT_EVENT_TYPES = frozenset({
     "agent_prompt_needs_response", "agent_waiting_input", "agent_needs_response",
-    "agent_prompt_needs_response",
 })
 # agent_watch classes that positively contradict "a prompt is on screen". `owner_prompt`
 # and `blocker` are the prompting classes; `crashed` is a failure and must keep waking.
@@ -455,15 +454,28 @@ def _prompt_episode_already_escalated(conn, event_id: int, target: str) -> bool:
                 break
         if not st or st[0] not in _PROMPTING_CLASSES or st[1] != digest:
             return False
+        # `escalated_event_id IS NOT NULL`: only an escalation that was actually
+        # emitted counts — a NULL id means the owner may never have received it.
         prior = conn.execute(
-            "SELECT w.event_id, e.payload FROM wake_loop_watch w "
+            "SELECT w.escalated_ts, e.payload FROM wake_loop_watch w "
             "JOIN event e ON e.id = w.event_id "
             "WHERE w.target=? AND w.event_id<? AND w.escalated=1 "
+            "AND w.escalated_event_id IS NOT NULL "
             "AND COALESCE(w.escalated_ts, 0) >= ? AND e.type IN (%s)"
             % ",".join("?" * len(_PROMPT_EVENT_TYPES)),
             (target, event_id, float(st[2]), *sorted(_PROMPT_EVENT_TYPES))).fetchall()
-        return any((json.loads(p or "{}") or {}).get("digest") == digest
-                   for _, p in prior)
+        for esc_ts, p in prior:
+            if (json.loads(p or "{}") or {}).get("digest") != digest:
+                continue
+            # The digest is sampled per sweep, so an agent that worked and came back to
+            # an identical screen between two sweeps keeps the old `digest_since`. Its
+            # transcript does not lie: written since that escalation means it moved,
+            # and this is a fresh stall the owner has not been told about.
+            # (`_progress_since` cannot answer this: the reminder itself is an event.)
+            if _transcript_advanced(conn, target, float(esc_ts or 0)):
+                return False
+            return True
+        return False
     except Exception:  # noqa: BLE001 — fail closed: keep alerting
         return False
 

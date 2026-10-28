@@ -1978,3 +1978,42 @@ def test_another_targets_escalation_does_not_suppress():
     _run(conn, 1901.0); _run(conn, 2802.0)
     _remind(conn, 74518, ts=4600.0)
     assert not clw._prompt_episode_already_escalated(conn, 74518, "vtb:0.0")
+
+
+def test_an_escalation_that_was_never_emitted_does_not_count():
+    """escalated=1 with no escalated_event_id: the owner may never have got it."""
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    _run(conn, 1901.0); _run(conn, 2802.0)
+    conn.execute("UPDATE wake_loop_watch SET escalated_event_id=NULL WHERE event_id=74479")
+    conn.commit()
+    _remind(conn, 74518, ts=4600.0)
+    assert _run(conn, 5501.0) == ["wake_loop_no_progress"]
+
+
+def test_work_since_the_escalation_makes_the_same_screen_a_new_stall(monkeypatch):
+    """The digest is sampled per sweep; an agent that worked and came back to an
+    identical screen keeps the old digest_since. Its transcript moving says it worked."""
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    _run(conn, 1901.0); _run(conn, 2802.0)
+    _remind(conn, 74518, ts=4600.0)
+    seen = []
+    monkeypatch.setattr(clw, "_transcript_advanced",
+                        lambda c, t, since: seen.append(since) or True)
+    assert not clw._prompt_episode_already_escalated(conn, 74518, "vtb:0.0")
+    assert seen and seen[0] == 2802.0          # measured from the prior escalation
+
+
+def test_an_error_in_the_rule_keeps_alerting(monkeypatch):
+    """FAIL CLOSED end to end: the rule raising must leave the reminder escalating."""
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    _run(conn, 1901.0); _run(conn, 2802.0)
+    _remind(conn, 74518, ts=4600.0)
+
+    class _Boom:
+        def __contains__(self, item):
+            raise RuntimeError("boom")
+    monkeypatch.setattr(clw, "_PROMPTING_CLASSES", _Boom())
+    assert _run(conn, 5501.0) == ["wake_loop_no_progress"]

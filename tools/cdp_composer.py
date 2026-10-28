@@ -925,8 +925,12 @@ _CONVERSATION_FULL_JS = (
 
 def conversation_is_full(s) -> Optional[bool]:
     """True when ChatGPT says this conversation reached its maximum length. None when
-    the page cannot answer; the caller then runs its ordinary path unchanged."""
-    return s.boolean(_CONVERSATION_FULL_JS)
+    the page cannot answer OR the probe raises; the caller then runs its ordinary path
+    unchanged — an observation must never be what aborts a send."""
+    try:
+        return s.boolean(_CONVERSATION_FULL_JS)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # Post-send failures that a full conversation explains. Pre-send reasons are never

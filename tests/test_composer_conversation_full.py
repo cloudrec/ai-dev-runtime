@@ -106,12 +106,31 @@ def test_a_failed_send_on_a_capped_chat_names_the_cap(page):
     assert r["reason"] == "conversation_full:user_turn_not_observed_after_send"
 
 
-def test_pre_send_reasons_are_never_rewritten(page):
-    """submit_phrase's recovery and chat_registry match these exactly."""
-    page(full=True, bools=[False] * 10)          # focus never confirmed
+def test_pre_send_reasons_are_never_rewritten(page, monkeypatch):
+    """submit_phrase's recovery and chat_registry match these exactly. Reaches the
+    composer check AFTER the notice probe has answered True."""
+    s = page(full=True)
+    s.counts["n"] = 0                            # composer absent
+    monkeypatch.setattr(cdp, "recover_wedged_tab", lambda *a, **k: None)
     r = cdp.submit_phrase(URL, "PHRASE", claim=False)
-    assert r["ok"] is False
-    assert not r["reason"].startswith("conversation_full"), r
+    assert any("maximum length for this conversation" in e for e in s.exprs), \
+        "the probe must have run, or this test proves nothing"
+    assert r == {"ok": False, "reason": "composer_ambiguous_or_absent:0"}
+
+
+def test_a_probe_that_raises_before_send_does_not_abort_the_send(page):
+    """An observation must never be what aborts a delivery."""
+    s = page(full=False)
+    real = s.boolean
+
+    def boolean(expr):
+        if "maximum length for this conversation" in expr:
+            raise RuntimeError("socket closed")
+        return real(expr)
+    s.boolean = boolean
+    r = cdp.submit_phrase(URL, "PHRASE", claim=False)
+    assert r["ok"] is True, r
+    assert r["reason"] == "submitted_and_assistant_started_generating"
 
 
 def test_an_unreadable_notice_probe_changes_nothing(page):
