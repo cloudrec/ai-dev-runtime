@@ -484,3 +484,22 @@ needs its own audit and owner approval to deploy.
 It is not a product project, and it is the only allowlisted automation target. A new
 dedicated test agent would need the creation gate and a new delegation grant, both owner
 gates, so none was created.
+
+### Deploy of 358281d (10:35Z, owner approval typed in the CLI)
+
+- **Audit:** a fresh-context Opus reviewer (read-only) gave GO.
+  - It verified JSON `delivered` reads back as 1, that the target and epoch formats match,
+    and that the only caller is agent_watch in the companion.
+  - Live dry run: 5 runtime-equivalent API-driven resumes in 24 h.
+- **Minor findings, accepted:**
+  - The window is "any `api:` send since the notification", so a later owner action
+    could be under-counted (the safe direction for this metric).
+  - The read has a 5 s ro timeout inside agent_watch's write transaction (about 1 ms in
+    practice).
+- **Deploy:**
+  - Live cd7ee22 → 358281d with `merge --ff-only`; 0 tracked changes; 37 untracked files
+    verified unchanged by hash.
+  - Companion restarted (PID 3072856, NRestarts 0). `ai-runtime.service` untouched
+    (PID 1084446).
+  - Heartbeat advancing, 0 errors.
+- **Rollback:** `git reset --keep cd7ee22` plus a companion restart.
