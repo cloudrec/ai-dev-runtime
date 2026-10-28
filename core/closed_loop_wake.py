@@ -412,36 +412,6 @@ def _watch_state_cls(conn, target: str) -> str:
     return ""
 
 
-def _declared_owner_wait(conn, event_id: int, target: str) -> bool:
-    """True only while the SAME owner-wait episode the original event reported is still
-    on the pane. All of these must hold:
-
-      * the original event is a prompt event, owner_action_required=1 (the owner was
-        told), and its payload records `class_reason == "inventory_waiting_owner"`;
-      * agent_watch still classifies the agent `owner_prompt`, with the event's digest.
-
-    A changed digest is a new episode (agent_watch emits a fresh event, which gets its
-    own watch), so this cannot outlive the wait it describes. Any missing field or read
-    error claims nothing."""
-    try:
-        ev = conn.execute("SELECT type, owner_action_required, payload FROM event "
-                          "WHERE id=?", (event_id,)).fetchone()
-        if not ev or ev[0] not in _PROMPT_EVENT_TYPES or not ev[1]:
-            return False
-        payload = json.loads(ev[2] or "{}")
-        digest = payload.get("digest") or ""
-        if payload.get("class_reason") != "inventory_waiting_owner" or not digest:
-            return False
-        for ident in _identities(conn, target):
-            row = conn.execute("SELECT cls, digest FROM agent_watch_state WHERE target=?",
-                               (ident,)).fetchone()
-            if row and row[0]:
-                return row[0] == "owner_prompt" and row[1] == digest
-        return False
-    except Exception:  # noqa: BLE001 — unknown never suppresses
-        return False
-
-
 def _resolution_reason(conn, *, event_id: int, target: str,
                        agents=None, delivered_ts: Optional[float] = None,
                        now: Optional[float] = None) -> Optional[str]:
@@ -570,19 +540,6 @@ def _resolution_reason(conn, *, event_id: int, target: str,
             return "pane_escalated_by_stall_doctor"
     except Exception:  # noqa: BLE001 — table may not exist yet in a fresh DB
         pass
-    # The agent's OWN declaration that it waits on the owner, already put to the owner.
-    # Event 74112 -> 74133 -> 74139 (2026-10-28): vtb:0.0 sat in inventory state
-    # `waiting_owner` with four owner decisions on screen; agent_watch had raised it with
-    # owner_action_required=1 and re-reminds the owner hourly on its own (REMINDER_SECS).
-    # The watchdog still re-woke ChatGPT — which may not answer owner decisions — and then
-    # escalated to CRITICAL as a "stall". That had been masked by the vtb `classify_scope`
-    # gate until diagnostic gates stopped counting above.
-    #
-    # Deliberately narrow, POSITIVE evidence only; see `_declared_owner_wait`. A decision
-    # menu (`decision_prompt_at_bottom`), which automation may be able to answer, and an
-    # event without the recorded inventory reason keep escalating exactly as before.
-    if _declared_owner_wait(conn, event_id, target):
-        return "pane_declared_waiting_owner"
     # A pane that is recorded dead and that nothing but the owner will revive is waiting
     # for the owner, not stalled — the failure-class twin of the two checks above. See
     # `_dead_pane_awaiting_owner` for the evidence it requires and how it self-limits.
