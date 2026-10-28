@@ -617,3 +617,118 @@ Open, non-blocking:
 - **Companion:** PID 3909219, NRestarts 0, heartbeat 4 s.
 - **Still pending:** 74279 (vtb re-wake) and 74293 wait on ChatGPT's current owner-os
   turn. Only time-based observation remains.
+
+## 2b49d15 + 8e9db95: code ready, NOT installed (automated instructions were received)
+
+Both commits were made on automated instructions. Neither is owner approval, and
+neither is installed. A visible unsent draft in the owner pane is not authority either.
+
+### 2b49d15: one escalation per unchanged owner prompt (event 74523)
+
+- **Cause:**
+  - `vtb:0.0` has had one four-question owner prompt on screen, with digest
+    `a3f420d6b8b74117`, unchanged for 9 days.
+  - agent_watch re-notifies it hourly (`REMINDER_SECS`). Every reminder opened a new
+    watch, which re-woke at +15 min and escalated at +30 min.
+  - Result: 3 ChatGPT turns per hour in the owner-os chat, and 8 escalations in a week.
+- **Why the existing gate check missed it:** vtb's only open gate is `classify_scope`,
+  which is diagnostic by design. The rejected 360992c rule (`inventory_waiting_owner`)
+  was not reused.
+- **Fix:** a watch resolves silently as `prompt_already_escalated_unchanged` only if
+  all of the following hold:
+  - the event is a prompt wake with a digest;
+  - agent_watch still shows `owner_prompt`/`blocker` with that same digest;
+  - an earlier prompt watch for the same target and digest has already escalated after
+    `digest_since`.
+- **What it does not change:**
+  - The first watch of every episode still escalates.
+  - Stop, crash and quiescent watches are untouched.
+  - Any change on the pane starts a new, fully alerting episode.
+  - Read errors fail closed.
+  - The reminder itself is still delivered.
+- **Replay on a copy of the live DB:** the rule matches all 5 vtb watches of the day.
+  Of the watches open at that time, only 74518 (vtb) matched.
+
+### 8e9db95: a capped ChatGPT chat is never a plain delivery
+
+- **Observation:**
+  - The owner-os and payment-orchestrator chats intermittently show "You've reached the
+    maximum length for this conversation … Start new chat" in an `aside[role=alert]`.
+  - The composer stays editable.
+  - Both chats kept answering: 33 and 27 delivered wakes in 6 h.
+  - **Consequence: the notice is observed, not used as a refusal.** Refusing on it would
+    silence working routes.
+- **Fix:**
+  - `conversation_is_full()` reads only `[role=alert]` and returns a boolean.
+  - Success keeps `ok=True`, but its reason gains `+conversation_full_notice` and the
+    result carries `conversation_full=True`.
+  - Post-send failures (`user_turn_*`, `assistant_started_*`) become
+    `conversation_full:<reason>`.
+  - Pre-send reasons are never rewritten, because `submit_phrase` recovery and
+    `chat_registry` match them exactly.
+  - An unreadable or raising probe changes nothing.
+- **Control:** 4 of the 9 new tests fail on 3e5f79e.
+
+### Pre-install verification
+
+- **Branch** `ai-runtime/stop-wake-closed-loop`, HEAD 8e9db95. On top of the live 3e5f79e:
+  - 2 code commits: 2b49d15, 8e9db95;
+  - 3 report-only commits;
+  - no tracked changes left in the worktree.
+- **Files changed vs 3e5f79e:**
+  - code: `core/closed_loop_wake.py`, `tools/cdp_composer.py`;
+  - tests: `tests/test_closed_loop_wake.py`, `tests/test_cdp_composer.py` (a structural
+    probe answer in the fake page only), new `tests/test_composer_conversation_full.py`;
+  - this report.
+- **Live checkout:** `/root/ai-dev-runtime` is on branch `ai-runtime/220-windows-bridge`
+  at 3e5f79e, with no tracked changes. 3e5f79e is an ancestor of 8e9db95, so this is a
+  fast-forward.
+- **Tests:**
+  - Earlier full suite on 3e5f79e: 4044 passed, 0 failed.
+  - Full suite on 8e9db95: 4064 passed, 4 skipped, 0 failed (11:47).
+  - Legacy `test_cdp_composer` against the worktree module (temp copy), plus tab
+    isolation, conversation-full and closed-loop tests: 254 passed.
+  - Related subset (wake, watch, stall, owner, loop, supervisor, cdp, composer,
+    companion): 1734 passed, 0 failed.
+
+### What the single install would change
+
+- **Not loaded yet:** both changed modules are imported only by the companion process
+  (PID 3909219, started 13:04:24 CET, NRestarts 0). It still runs 3e5f79e code.
+- **Skew detection:** both files are on `_WORKER_WATCHED_FILES["wake_companion"]`. A
+  fast-forward without a restart would raise deploy skew, so the two steps go together.
+- **ai-runtime.service:** none of its orchestrator files change, so it needs no restart.
+  `diagnostics.py` imports `cdp_composer`/`closed_loop_wake` lazily and read-only.
+- **Install** (only on an owner turn typed in the CLI):
+  1. `git -C /root/ai-dev-runtime merge --ff-only 8e9db95`
+  2. `systemctl restart owner-os-wake-companion.service`
+  - Back up the untracked-file manifest first, the same way as for earlier installs.
+  - No migration, no config, route or secret change.
+- **Rollback:**
+  1. `git -C /root/ai-dev-runtime reset --keep 3e5f79e`
+  2. `systemctl restart owner-os-wake-companion.service`
+- **Proof required after activation:**
+  - The next hourly vtb reminder must produce no `wake_loop_no_progress`; the watch must
+    resolve as `prompt_already_escalated_unchanged`.
+  - A delivery to a capped chat must show `+conversation_full_notice` in
+    `wake_delivery`.
+  - Non-vtb watches must still re-wake and escalate.
+  - **Not complete until this is observed live.**
+
+### classify_scope backlog: owner decision, not engineering work
+
+- 45 open gates. Closing one needs either:
+  - a verified owner decision via `/control-plane/owner/decision`, or
+  - a scope entry in the orchestrator config, where `mode: auto` grants autonomy.
+- Both are owner authority. No gate was touched.
+- **38 belong to agents recorded `dead`.** One owner decision ("dead, close") would
+  retire them.
+- **7 are live, `observe_only`:**
+  - `bitwhite-backend-v3`, `/opt/bitwhite`
+  - `gaika-country-pl`, `/opt/gaika-worktrees/pl`
+  - `gaika-country-ru`, `/opt/gaika-worktrees/ru`
+  - `serverwarden-livefire`, `/opt/hostsecure`
+  - `mess-telegram-connector`, `/opt/mess`
+  - `vtb`, `/opt/vtb`
+  - `owner-os-supervisor-clean`, `/root/ai-dev-runtime`
+  - Each needs a project mapping and a mode decision from the owner.
