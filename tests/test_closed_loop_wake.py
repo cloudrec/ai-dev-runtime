@@ -1857,3 +1857,124 @@ def test_the_wait_check_runs_on_the_scans_clock_not_the_wall_clock(conn):
                                   now=NOW + 60) == "intentional_external_wait"
     assert clw._resolution_reason(conn, event_id=1, target=PANE, delivered_ts=NOW,
                                   now=NOW + 40000) != "intentional_external_wait"
+
+
+# ── an hourly reminder of an already-escalated, unchanged prompt (event 74523) ─────────
+# 2026-10-28: `vtb:0.0` sat on one unchanged four-question owner prompt (digest
+# a3f420d6b8b74117, unchanged for nine days). agent_watch re-notified it every hour with
+# the same digest; each reminder opened a fresh watch that re-woke and escalated again —
+# three ChatGPT turns an hour, eight escalations in a week, for the same screen.
+
+_DIG = "a3f420d6b8b74117"
+
+
+def _remind(conn, event_id, *, target="vtb:0.0", digest=_DIG, ts=1000.0,
+            etype="agent_prompt_needs_response", cls="owner_prompt", state_digest=None,
+            digest_since=0.0):
+    import json as _json
+    conn.execute("INSERT INTO event (id,ts,ts_epoch,source,type,agent_id,severity,payload) "
+                 "VALUES (?,?,?,?,?,?,?,?)",
+                 (event_id, "t", ts, "agent_watch", etype, target, "high",
+                  _json.dumps({"target": target, "digest": digest} if digest else {})))
+    conn.execute("CREATE TABLE IF NOT EXISTS agent_watch_state ("
+                 "target TEXT PRIMARY KEY, cls TEXT, digest TEXT, at TEXT, ts REAL,"
+                 "notified_cls TEXT, notified_digest TEXT, notified_at TEXT,"
+                 "notified_ts REAL, emissions INTEGER DEFAULT 0, miss_count INTEGER,"
+                 "digest_since REAL)")
+    conn.execute("INSERT OR REPLACE INTO agent_watch_state(target,cls,digest,digest_since) "
+                 "VALUES(?,?,?,?)",
+                 (target, cls, state_digest if state_digest is not None else digest,
+                  digest_since))
+    conn.commit()
+    clw.register_delivery(event_id=event_id, target=target, project_id="vtb_old",
+                          conn=conn, now=ts)
+
+
+def _run(conn, now):
+    emitted = []
+    clw.slo_scan(conn=conn, now=now,
+                 emit_fn=lambda *a, **k: emitted.append(a[1]) or {"event_id": len(emitted) + 90000})
+    return emitted
+
+
+def test_first_prompt_episode_still_rewakes_and_escalates():
+    """The owner must still be told once: no prior escalation, nothing suppressed."""
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    assert _run(conn, 1000.0 + 901) == ["wake_loop_no_progress"]
+    assert _run(conn, 1000.0 + 901 + 901) == ["wake_loop_stalled"]
+
+
+def test_reminder_of_escalated_unchanged_prompt_goes_quiet():
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    _run(conn, 1901.0); _run(conn, 2802.0)                     # escalated once
+    _remind(conn, 74518, ts=4600.0)                            # the hourly reminder
+    assert _run(conn, 4600.0 + 901) == []
+    assert _run(conn, 4600.0 + 2000) == []
+    row = conn.execute("SELECT resolved, resolved_reason FROM wake_loop_watch "
+                       "WHERE event_id=74518").fetchone()
+    assert tuple(row) == (1, "prompt_already_escalated_unchanged")
+
+
+def test_a_changed_digest_is_a_new_episode_and_alerts_again():
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    _run(conn, 1901.0); _run(conn, 2802.0)
+    _remind(conn, 74518, ts=4600.0, digest="ffff0000ffff0000", digest_since=4500.0)
+    assert _run(conn, 5501.0) == ["wake_loop_no_progress"]
+
+
+def test_pane_no_longer_on_that_prompt_is_not_suppressed_by_this_rule():
+    """State digest moved on (but class still prompting): not the same question."""
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    _run(conn, 1901.0); _run(conn, 2802.0)
+    _remind(conn, 74518, ts=4600.0, state_digest="0123456789abcdef")
+    assert not clw._prompt_episode_already_escalated(conn, 74518, "vtb:0.0")
+
+
+def test_escalation_before_the_digest_last_changed_does_not_count():
+    """An old escalation of the same digest from a PREVIOUS episode (screen changed and
+    came back) claims nothing about the current one."""
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    _run(conn, 1901.0); _run(conn, 2802.0)
+    _remind(conn, 74518, ts=9000.0, digest_since=8000.0)
+    assert _run(conn, 9901.0) == ["wake_loop_no_progress"]
+
+
+def test_rewoken_but_not_escalated_prior_does_not_suppress():
+    """Only a completed escalation means the owner already has it."""
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    _run(conn, 1901.0)                                         # re-woken only
+    _remind(conn, 74518, ts=2000.0)
+    assert not clw._prompt_episode_already_escalated(conn, 74518, "vtb:0.0")
+
+
+def test_ungated_stall_watches_are_untouched():
+    """A stop/quiescent watch (non-prompt event) keeps alerting even with a prior
+    escalated prompt watch on the same target."""
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    _run(conn, 1901.0); _run(conn, 2802.0)
+    _remind(conn, 74518, ts=4600.0, etype="agent_turn_stopped")
+    assert not clw._prompt_episode_already_escalated(conn, 74518, "vtb:0.0")
+    assert _run(conn, 5501.0) == ["wake_loop_no_progress"]
+
+
+def test_a_prompt_event_without_digest_claims_nothing():
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0)
+    _run(conn, 1901.0); _run(conn, 2802.0)
+    _remind(conn, 74518, ts=4600.0, digest="", state_digest=_DIG)
+    assert not clw._prompt_episode_already_escalated(conn, 74518, "vtb:0.0")
+
+
+def test_another_targets_escalation_does_not_suppress():
+    conn, _ = clw._conn()
+    _remind(conn, 74479, ts=1000.0, target="other:0.0")
+    _run(conn, 1901.0); _run(conn, 2802.0)
+    _remind(conn, 74518, ts=4600.0)
+    assert not clw._prompt_episode_already_escalated(conn, 74518, "vtb:0.0")

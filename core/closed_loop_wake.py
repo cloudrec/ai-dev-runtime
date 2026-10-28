@@ -127,6 +127,7 @@ _PROMPT_EVENT_TYPES = frozenset({
 # agent_watch classes that positively contradict "a prompt is on screen". `owner_prompt`
 # and `blocker` are the prompting classes; `crashed` is a failure and must keep waking.
 _NOT_PROMPTING_CLASSES = frozenset({"idle"})
+_PROMPTING_CLASSES = frozenset({"owner_prompt", "blocker"})
 
 
 def _session_target_gone(conn, event_id: int, target: str, agents=None) -> bool:
@@ -412,6 +413,61 @@ def _watch_state_cls(conn, target: str) -> str:
     return ""
 
 
+def _prompt_episode_already_escalated(conn, event_id: int, target: str) -> bool:
+    """Is THIS watch an hourly reminder of a prompt the owner was already escalated
+    about, with nothing on the pane changed since?
+
+    agent_watch re-notifies an unanswered `owner_prompt`/`blocker` every
+    REMINDER_SECS with the SAME digest, and every reminder opened a fresh watch that
+    re-woke and escalated again. Event 74523, 2026-10-28: `vtb:0.0` sat on one
+    unchanged four-question owner prompt (digest a3f420d6b8b74117, unchanged for nine
+    days) and each hour produced reminder -> wake -> wake_loop_no_progress ->
+    wake_loop_stalled: three ChatGPT turns an hour about a decision only the owner can
+    make, eight escalations in a week for the same screen.
+
+    POSITIVE evidence only, all of it required:
+      * this watch's event is a prompt wake carrying a digest;
+      * agent_watch still classifies the pane `owner_prompt`/`blocker` with that same
+        digest, so the question is still the one on screen;
+      * an EARLIER watch for this target, opened by a prompt event with the same
+        digest, already escalated, and did so after the digest last changed.
+
+    So the first watch of an episode always re-wakes and escalates exactly as before;
+    only the repeats of an already-escalated, unchanged prompt go quiet. Stop, crash
+    and quiescent watches are untouched (no prompt event type), and any change on the
+    pane moves the digest and starts a fully alerting episode. Fail closed on any
+    read error. Suppresses the watchdog only: the reminder itself is still delivered.
+    """
+    try:
+        ev = conn.execute("SELECT type, payload FROM event WHERE id=?",
+                          (event_id,)).fetchone()
+        if not ev or ev[0] not in _PROMPT_EVENT_TYPES:
+            return False
+        digest = (json.loads(ev[1] or "{}") or {}).get("digest") or ""
+        if not digest:
+            return False
+        st = None
+        for ident in _identities(conn, target):
+            st = conn.execute(
+                "SELECT cls, digest, COALESCE(digest_since, 0) FROM agent_watch_state "
+                "WHERE target=?", (ident,)).fetchone()
+            if st:
+                break
+        if not st or st[0] not in _PROMPTING_CLASSES or st[1] != digest:
+            return False
+        prior = conn.execute(
+            "SELECT w.event_id, e.payload FROM wake_loop_watch w "
+            "JOIN event e ON e.id = w.event_id "
+            "WHERE w.target=? AND w.event_id<? AND w.escalated=1 "
+            "AND COALESCE(w.escalated_ts, 0) >= ? AND e.type IN (%s)"
+            % ",".join("?" * len(_PROMPT_EVENT_TYPES)),
+            (target, event_id, float(st[2]), *sorted(_PROMPT_EVENT_TYPES))).fetchall()
+        return any((json.loads(p or "{}") or {}).get("digest") == digest
+                   for _, p in prior)
+    except Exception:  # noqa: BLE001 — fail closed: keep alerting
+        return False
+
+
 def _resolution_reason(conn, *, event_id: int, target: str,
                        agents=None, delivered_ts: Optional[float] = None,
                        now: Optional[float] = None) -> Optional[str]:
@@ -545,6 +601,10 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     # `_dead_pane_awaiting_owner` for the evidence it requires and how it self-limits.
     if _dead_pane_awaiting_owner(conn, event_id, target):
         return "dead_pane_awaiting_owner_resume"
+    # An unchanged prompt the owner was already escalated about is waiting, not stalled.
+    # See `_prompt_episode_already_escalated` for the evidence and how it self-limits.
+    if _prompt_episode_already_escalated(conn, event_id, target):
+        return "prompt_already_escalated_unchanged"
     # Asked BEFORE the scraped class, because it is the same question answered by
     # the runtime instead of by inference. A pane mid-turn reports `busy` here while
     # emitting no events at all, which is exactly the state that produced the
