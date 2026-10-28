@@ -576,3 +576,23 @@ Open, non-blocking:
 - After deploy, ChatGPT tabs grow from 1 to one per active route (up to 6). Watch
   `browser_tab_health` headroom and the `all_conversation_tabs_busy` lines.
 - Rollback: `git reset --keep 358281d` plus a companion restart.
+
+### Deploy of 3e5f79e (12:05Z, owner turn typed in the CLI)
+
+- **Approval:** the owner turn "установи 3e5f79e" was submitted at the terminal.
+  - The last API delivery to the pane was 12:02:14Z, so this was not an API delivery.
+  - No stall-doctor or governor submission was made.
+- **Deploy:** live 358281d → 3e5f79e with `merge --ff-only`.
+  - 0 tracked changes; 37 untracked files verified unchanged by hash.
+  - Companion restarted (PID 3909219, NRestarts 0). `ai-runtime.service` untouched
+    (PID 1084446).
+- **Tabs:** 1 → 2, owner-os (…d4ac17) and gaika (…8355c8). Neither was navigated away.
+- **Owner-os chat busy at 12:09-12:15Z:** the result was `assistant_still_generating`
+  three times, with no tab replacement. Before the fix this path was false `wedged`,
+  then a replacement, then "Could not load".
+- **GAIKA chain:**
+  - 74272 was delivered and ACKed at 12:06:54Z.
+  - ChatGPT sent `gaika-pl-20261028T1210Z-offline-gap-v1` at 12:09:02Z.
+  - gaika-pl worked; its next stop, 74287, was delivered and ACKed at 12:12:29Z, and the
+    watch resolved as `pane_alive_and_working`.
+- **Rollback:** `git reset --keep 358281d` plus a companion restart.
