@@ -277,3 +277,52 @@ Exact step once host owner proof is given:
 
 Rollback: `git -C /root/ai-dev-runtime reset --keep cc38238`, then restart only the
 companion.
+
+## Deploy and live closed-loop evidence (2026-10-28)
+
+**Approval.** An owner turn was typed directly in the supervisor CLI session at about
+08:51Z, with no automated header. No `deliveries` row matches its text, and there was no
+delivery to the pane after 08:28Z. It approved a fast-forward to `94194e6` and a restart
+of only `owner-os-wake-companion.service`, with rollback to cc38238.
+
+**Deploy (08:52:02Z).**
+- `git merge --ff-only 94194e6` on live `/root/ai-dev-runtime`, with 0 tracked changes
+  before and after.
+- Companion restarted: PID 393675 → 2106593, NRestarts 0. `ai-runtime.service` was left
+  alone (PID 1084446 unchanged).
+- The `wake_loop_watch` table was backed up first to
+  `backups/stop-wake-deploy-2026-10-28/wake_loop_watch.sql`.
+- The migration added `delivery_verified` live. The first heartbeat advanced at
+  08:52:52Z, and there are 0 errors or tracebacks in the companion journal.
+
+**Live chain** (all timestamps UTC, from control_plane.db / agent_control.db):
+
+| step | evidence |
+|---|---|
+| event | 74114 `agent_watch/work_stopped_incomplete` on `owner-os-supervisor-clean:0.0`, 08:49:16 |
+| attempts | 08:54:10 `composer_did_not_clear_after_send` (not sent, not latched, retried; a pre-existing mode, 67 in the prior 24 h) |
+| delivery | `wake_delivery` 44670, 09:01:09.927, delivered=1, `submitted_and_assistant_started_generating`, route owner-os, chat …de5162d4ac17 |
+| ack | `wake_audit` acknowledged at 09:01:09.935 (8 ms after the verified delivery) |
+| watch | `wake_loop_watch` 74114 delivery_verified=1, resolved `runtime_reports_agent_working`, no re-wake |
+| GPT → agent | `deliveries` `wake74114-close-loop-proof-20261028`, 09:01:42, actor `api:bearer/mcp-token-3`, target `owner-os-supervisor-clean:0.0`, delivered/submitted/prompt_consumed=true |
+| executed | the supervisor pane acted on that command in the next turn: it ran these checks and wrote this section |
+
+A second event, 74112 (vtb prompt-needs-response), was delivered at 08:59:54.753 and
+acknowledged at .765, and has a watch row with verified=1. Its VTB owner-gated content
+was not acted on.
+
+**Regression checks since the deploy:**
+- Duplicate wake: exactly 1 delivered row and 1 `wake_submitted` latch per event (74112,
+  74114). Failed attempts did not latch.
+- Duplicate tab: 1 CDP page (the owner-os chat).
+- False success: both delivered rows rest on the assistant starting to generate.
+  - No delivery came only from the new evidence fallback.
+- Stale ack: every ack since the deploy follows its verified delivery within 12 ms, with
+  one exception, 73984.
+  - 73984 (a gaika-pl stop latched at 06:02 on the old code) was retired by
+    `record_abandoned_wakes` after 10 823 s as `submitted_delivery_unproven`. That is the
+    existing, expected path.
+- Watchdog: 0 `closed_loop_wake` re-wake or escalation events.
+- Native pre-check: 3 idle `policy_refused` rows (one per target), then backed off.
+  - No refused continuation attempts.
+  - 7 event-path skips.
