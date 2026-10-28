@@ -503,3 +503,21 @@ gates, so none was created.
     (PID 1084446).
   - Heartbeat advancing, 0 errors.
 - **Rollback:** `git reset --keep cd7ee22` plus a companion restart.
+
+### Live chain on 358281d (10:42Z, an automated instruction was received)
+
+- **Chain:**
+  - Event 74204 `agent_waiting_input` on owner-os-supervisor-clean:0.0, 10:37:03Z.
+  - Wake delivered and ACKed 10:41:29Z, through a logged recovery:
+    `assistant_generating_wedged -> tab_replaced retry=submitted_and_assistant_started_generating`.
+  - ChatGPT command `event-74204-live-chain-358281d` at 10:42:10Z, sent as
+    `api:bearer/mcp-token-3`, with delivered=1 and prompt_consumed=1.
+  - The pane resumed: agent_watch shows `working`, and this turn executed the command.
+  - `_automation_sent_since(74204)` = True, so this resume will not be logged as an
+    owner intervention. There are 0 owner_intervention rows since the restart.
+- **Companion health since the restart:**
+  - 6 of 6 delivery attempts succeeded (74183, 74178, 74197, 74198, 74199, 74204).
+  - Heartbeat 28 s old, NRestarts 0, 0 errors.
+  - Watchdog: 74198 deregistered as `pane_escalated_by_stall_doctor`.
+  - 74200 (bitwhite) was held by the per-agent cooldown and claimed at 10:42:22Z; this
+    is normal coalescing.
