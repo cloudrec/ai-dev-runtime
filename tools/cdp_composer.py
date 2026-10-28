@@ -789,7 +789,10 @@ WEDGE_MIN_SECS = float(os.getenv("CDP_WEDGE_MIN_SECS", "900"))
 WEDGE_CEILING_SECS = 3 * WEDGE_MIN_SECS
 # An observation not refreshed for this long is forgotten: attempts that never reached the
 # generating check (a focus trap, an unstable composer) prove nothing about continuity.
-WEDGE_GAP_SECS = float(os.getenv("CDP_WEDGE_GAP_SECS", "600"))
+# Must exceed the SLOWEST normal retry cadence, or a stuck chat is never recovered: a
+# non-actionable wake is re-claimed only after the bridge's 900 s cooldown (+ 300 s
+# backoff), so 1800 s — every live cadence keeps the clock running.
+WEDGE_GAP_SECS = float(os.getenv("CDP_WEDGE_GAP_SECS", "1800"))
 _GENERATING_SINCE: dict = {}
 
 

@@ -273,3 +273,25 @@ def test_regular_sightings_keep_the_clock_running():
         age, total = cdp._generating_for(OWNER_OS, 10, now=t, tab_id="T")
         t += cdp.WEDGE_GAP_SECS - 1
     assert age == total and total >= 4 * (cdp.WEDGE_GAP_SECS - 1)
+
+
+def test_the_gap_outlasts_the_slowest_retry_cadence():
+    """Review: a non-actionable wake is re-claimed only every COOLDOWN + backoff; a gap
+    shorter than that would reset the clocks forever and a stuck chat never recovers."""
+    from core import wake_bridge
+    assert cdp.WEDGE_GAP_SECS > wake_bridge.COOLDOWN_SECS + wake_bridge.RETRY_BACKOFF_SECS
+
+
+def test_a_stuck_chat_with_only_slow_retries_still_reaches_the_ceiling(monkeypatch):
+    recovered = []
+    _wire(monkeypatch, Busy(list(range(5000, 5100))), recovered)   # length always changes
+    t = [1000.0]
+    monkeypatch.setattr(cdp.time, "time", lambda: t[0])
+    from core import wake_bridge
+    step = wake_bridge.COOLDOWN_SECS + wake_bridge.RETRY_BACKOFF_SECS   # 1200 s apart
+    while t[0] - 1000.0 < cdp.WEDGE_CEILING_SECS:
+        cdp.submit_phrase(OWNER_OS, "P", claim=False)
+        assert recovered == []
+        t[0] += step
+    cdp.submit_phrase(OWNER_OS, "P", claim=False)
+    assert recovered == [OWNER_OS]
