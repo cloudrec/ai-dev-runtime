@@ -133,3 +133,88 @@ Suggested owner sentence:
   - after 900 s without progress there is one `wake_loop_no_progress` delivered to the
     route chat;
   - no `pane_awaiting_owner` resolutions for agents that have only `classify_scope` gates.
+
+## Follow-up (same branch): the two findings above, fixed locally
+
+Requested by an automated instruction. Not approval. Local commits only; nothing deployed.
+
+### Native supervisor send-policy pre-check — `1c4a102`
+
+Before calling `send_fn`, `native_supervisor.scan` now asks `agent_control.automation_decision`.
+It passes the same session, target, actor (`native_supervisor`), action (`agent_send`) and
+pane cwd that `_deliver` uses.
+
+- **Refuse-only.** The pre-check can only refuse. If it answers "", or raises, the real
+  send runs, and `_deliver` remains the single enforcing point.
+- **Audit.** A refusal is recorded with action `policy_refused`, the same reason
+  `not_delivered:<refusal>`, ok=0 and `{"precheck": true}`.
+  - It never counts as a continuation, so it cannot trip `MAX_CONSECUTIVE`.
+  - The event is consumed exactly as a refused send consumed it.
+- **Backoff.**
+  - The idle sweep re-asks a refused target only after
+    `NATIVE_SUPERVISOR_POLICY_REFUSED_BACKOFF_SECS` (3600).
+  - The event path is never backed off, so an allowlist edit or a grant takes effect on
+    the next turn.
+- **Wiring.** By default the pre-check sits only in front of the real
+  `agent_control.agent_send`. A caller that injects its own `send_fn` passes its own
+  `policy_fn`.
+- **Expected effect** at today's rates:
+  - about 230 idle-sweep sends a day become about 2 recorded refusals per target per day;
+  - the about 74 event-path sends become recorded refusals without the pane lookup and
+    audit line of a pretend send.
+- **Tests:** `tests/test_native_supervisor_policy_precheck.py`, 9 tests.
+  - Covers the refusal before any send, the unchanged audit reason, event consumption,
+    allowlisted targets still sending, and a policy change applying on the next turn.
+  - Covers the payment cwd hard deny, errors never authorizing, the grant lookup
+    happening as the in-process actor, idle-sweep backoff, and the cap not being counted.
+  - Sabotage: removing the event-path or the idle-path pre-check fails 2 tests each.
+
+### `user_turn_not_observed_after_send` — `5aad66a`
+
+**Diagnosis.** Since the companion restart (01:57 UTC), 15 of 48 attempts ended this way.
+
+- They occurred only on the payment-orchestrator chat (`…6a97e63a`, 8 failures and 4
+  successes) and the GAIKA chat (`…6ae0f469`, 7 failures and 3 successes).
+- The owner-os chat had 15 successes and 0 failures.
+- 9 of 21 attempts made right after the single browser tab was navigated to another chat
+  failed this way, against 6 of 27 attempts in the same chat.
+- The GAIKA chat is new (38 attempts in total), so chat length or virtualization alone
+  does not explain it.
+- The live DOM could not be inspected read-only: the browser has one tab, sitting on
+  `chatgpt.com/`, and reaching a chat would mean navigating the owner's browser. The exact
+  markup cause is therefore **not proven**.
+
+**Local defect fixed.** When the user-turn proof missed, the verifier ignored the
+assistant side. The assistant side is independent evidence: the back-pressure check
+already establishes that nothing was generating before the send. Now any of the following
+proves the message landed, and the attempt continues to the existing
+`_await_assistant`/`_settled` checks:
+
+- the stop control appears (it was known to be absent before the send);
+- a new assistant turn appears;
+- the newest assistant id changes.
+
+An unreadable value, or an unknown pre-send state, is not evidence. The post-click window
+is `WAKE_USER_TURN_SECS`, default 20 (previously a fixed 10). The longer wait applies only
+on the failure path. The latch and the no-resend behaviour are unchanged.
+
+**Tests:** `tests/test_composer_assistant_evidence.py`, 8 tests. Sabotage: removing the
+evidence branch fails 3; restoring the 10 s window fails 1. The older composer, delivery,
+companion and closed-loop suites hard-code the live path, so they were also run against
+this checkout: 273/273.
+
+**Residual.** If the user turn and the assistant both genuinely fail to appear, the
+outcome stays `user_turn_not_observed_after_send`. Commit `dfe9174` covers that case with
+the watchdog's single re-wake. Live confirmation needs the companion running this code.
+
+### Test counts (head of this follow-up)
+
+Full suite: **4013 passed / 0 failed / 4 skipped**. Base `cc38238` was 3985; this adds
+11 + 9 + 8 new tests.
+
+### Owner-gated step (unchanged scope; new head)
+
+"I approve fast-forwarding /root/ai-dev-runtime to ai-runtime/stop-wake-closed-loop <head> and restarting only owner-os-wake-companion.service, with rollback to cc38238 on failure."
+
+All three changes run in the companion process (`native_supervisor.scan`, `cdp_composer`,
+`closed_loop_wake`). `ai-runtime.service` does not need a restart.
