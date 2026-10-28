@@ -732,3 +732,23 @@ neither is installed. A visible unsent draft in the owner pane is not authority 
   - `vtb`, `/opt/vtb`
   - `owner-os-supervisor-clean`, `/root/ai-dev-runtime`
   - Each needs a project mapping and a mode decision from the owner.
+
+### Self-project chain, event 74581 (live 3e5f79e; an automated instruction was received)
+
+- **Timeline:**
+  - 18:15:19Z: agent_watch reported `work_stopped_incomplete` for
+    `owner-os-supervisor-clean:0.0` (quiescent, `at_rest_unchanged_for_348s`).
+  - 18:16:41Z: the wake was delivered to the owner-os chat
+    (`submitted_and_assistant_started_generating`).
+  - 18:17:47Z: ChatGPT sent `agent_send` via `api:bearer/mcp-token-3`, 66 s after the
+    delivery.
+  - The watch resolved as `runtime_reports_agent_working`.
+  - No owner action was involved.
+- **Native supervisor:** it is correctly excluded. `SELF_PROJECT` is `ai-dev-runtime`
+  and is in `AUTO_REGISTER_DENY_PROJECTS`. `native_supervised_target` has no row for
+  this pane or cwd. ChatGPT continuation is the only path.
+- **Stall-doctor `escalate … LOST_CONTINUATION` lines for this pane:** these are the
+  unsent human draft in the pane's input line. That draft is never submitted by
+  automation. Notifications are deduplicated to 1 per pane per day (owner decision of
+  2026-09-11), and the watch closes as `pane_escalated_by_stall_doctor`. This is by
+  design and not a defect.
