@@ -752,3 +752,58 @@ neither is installed. A visible unsent draft in the owner pane is not authority 
   automation. Notifications are deduplicated to 1 per pane per day (owner decision of
   2026-09-11), and the watch closes as `pane_escalated_by_stall_doctor`. This is by
   design and not a defect.
+
+### Independent review → 9adfb41; install reduced to one command (automated instructions were received)
+
+An independent reviewer agent read 2b49d15 and 8e9db95. All of the following
+findings were fixed in 9adfb41:
+
+- **🔴 Pre-send banner probe could abort the send.** The probe was unguarded and ran
+  inside `_attempt`'s `try`, so a CDP error became `cdp_error`.
+  `conversation_is_full()` now returns None on any exception.
+- **🟡 A never-emitted escalation counted.** It now requires
+  `escalated_event_id IS NOT NULL`.
+- **🟡 The rule was blind to work done between digest sweeps.** If the agent's
+  transcript was written after the prior escalation, the rule no longer suppresses.
+  `_progress_since` cannot be used here, because the reminder is itself an event.
+- **🟡 Vacuous or missing tests:**
+  - the pre-send-reason test now reaches the composer check after the probe answered
+    True;
+  - added tests for a raising pre-send probe, a NULL escalation id, transcript
+    progress, and an end-to-end fail-closed run.
+- **Control:** 3 of the new tests fail without 9adfb41.
+- **Tests:**
+  - full suite on 9adfb41: 4068 passed, 4 skipped, 0 failed;
+  - legacy `test_cdp_composer` against the worktree module plus tab isolation: 137
+    passed.
+- **Replay on a copy of the live DB with 9adfb41:**
+  - the vtb reminders 74560, 74518, 74479 and 74418 are still suppressed;
+  - 0 other open watches are affected.
+
+**Deployment state:**
+- Live HEAD is 3e5f79e, with no tracked changes.
+- The running companion (PID 3909219) has fingerprint `fedd8a5741c5…`, which is
+  exactly 3e5f79e's code.
+- 9adfb41's companion fingerprint is `53d05ff45798…`.
+- The `agent_orchestrator` fingerprint (`05ff7dc1a866…`) is unchanged, so
+  ai-runtime.service is unaffected.
+
+**Owner gate — one command:**
+
+    bash /root/ai-dev-runtime/backups/stop-wake-deploy-2026-10-28/install_9adfb41.sh
+
+The script (untracked, under `backups/`; `--dry-run` passes as of 2026-10-28 ~18:55Z)
+does the following:
+
+1. Aborts before any change unless all of these hold:
+   - HEAD is 3e5f79e and clean;
+   - a fast-forward to 9adfb41 is possible;
+   - the on-disk and running fingerprints equal 3e5f79e's;
+   - the unit is active.
+2. Records an untracked-file sha256 manifest.
+3. Runs `merge --ff-only 9adfb41` and checks the new on-disk fingerprint.
+4. Restarts only `owner-os-wake-companion.service`.
+5. Waits until a new PID registers fingerprint `53d05ff45798…`.
+6. Verifies the untracked files are unchanged.
+7. Prints the live checks and the rollback:
+   `git -C /root/ai-dev-runtime reset --keep 3e5f79e && systemctl restart owner-os-wake-companion.service`
