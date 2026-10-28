@@ -402,6 +402,42 @@ def test_owner_intervention_recorded_when_pane_resumes_without_a_delivered_wake(
     assert row is not None
 
 
+def _api_delivery(target, actor, delivered=True, key="k1"):
+    """A row exactly as agent_control writes it for an API-driven agent_send."""
+    import json as _json, time as _time
+    from core import agent_control as ac
+    db = ac._db()
+    ts = _time.time() + 60
+    db.execute("INSERT INTO deliveries (idempotency_key,target,action,result,created_at,"
+               "created_ts) VALUES (?,?,?,?,?,?)",
+               (key, target, "agent_send", _json.dumps({"delivered": delivered}), "t", ts))
+    db.execute("INSERT INTO delivery_attribution (idempotency_key,actor,source,"
+               "recorded_at,recorded_ts) VALUES (?,?,?,?,?)", (key, actor, "test", "t", ts))
+    db.commit()
+    db.close()
+
+
+@pytest.mark.parametrize("actor, delivered, counted", [
+    ("api:bearer/mcp-token-3", True, 0),     # ChatGPT drove it: not the owner (74142)
+    ("api:bearer/mcp-token-3", False, 1),    # refused send moved nothing
+    ("owner_cli", True, 1),                  # a non-API sender: attribution unchanged
+])
+def test_owner_intervention_ignores_chatgpt_api_sends(conn, actor, delivered, counted):
+    agents = [_watch_agent("ip-seal:0.0", "/opt/clients-help-landing", state="waiting_owner")]
+    aw.scan(agents=agents, read_fn=lambda t: PROMPT_TAIL, emit_fn=cto.emit,
+            conn=conn, now=NOW)
+    _api_delivery("ip-seal:0.0", actor, delivered)
+    aw.scan(agents=agents, read_fn=lambda t: "✻ Compacting… (esc to interrupt)",
+            emit_fn=cto.emit, conn=conn, now=NOW + 30)
+    n = conn.execute("SELECT COUNT(*) FROM owner_intervention_log").fetchone()[0]
+    assert n == counted
+
+
+def test_owner_intervention_api_check_fails_to_old_attribution(conn, monkeypatch):
+    monkeypatch.setenv("AGENT_CONTROL_DB", "/nonexistent/dir/ac.db")
+    assert clw._automation_sent_since("ip-seal:0.0", 1, conn) is False
+
+
 def test_owner_intervention_not_recorded_when_the_companion_delivered(conn):
     _bind("clients-help-landing", "https://chatgpt.com/c/landing-chat")
     agents = [_watch_agent("ip-seal:0.0", "/opt/clients-help-landing", state="waiting_owner")]

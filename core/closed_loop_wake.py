@@ -845,6 +845,37 @@ def slo_scan(*, conn=None, now: Optional[float] = None,
 
 
 # ── owner_intervention metric ───────────────────────────────────────────────
+def _automation_sent_since(target: str, notified_event_id: int, conn) -> bool:
+    """Did an `api:` caller (ChatGPT via the Owner OS API / MCP grant) deliver to this
+    pane after the notification? 2026-10-28, event 74142: gaika-country-pl's wake for
+    74110 latched unproven, ChatGPT then sent the next task itself at 09:34:48Z as
+    `api:bearer/mcp-token-3`, and the pane's resumption was logged as the OWNER acting
+    directly — the exact metric that is supposed to show the owner is out of the loop.
+
+    Read-only, from agent_control's own audit (`deliveries` + `delivery_attribution`).
+    Any error answers False: the previous attribution stands."""
+    try:
+        import sqlite3 as _sq
+        row = conn.execute("SELECT ts_epoch FROM event WHERE id=?",
+                           (notified_event_id,)).fetchone()
+        if not row or row[0] is None:
+            return False
+        path = os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+        ac = _sq.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            hit = ac.execute(
+                "SELECT 1 FROM deliveries d JOIN delivery_attribution a "
+                "USING(idempotency_key) WHERE d.target=? AND d.created_ts>=? "
+                "AND a.actor LIKE 'api:%' "
+                "AND json_extract(d.result,'$.delivered') IN (1,'true') LIMIT 1",
+                (target, float(row[0]))).fetchone()
+        finally:
+            ac.close()
+        return bool(hit)
+    except Exception:  # noqa: BLE001 — unknown: keep the previous attribution
+        return False
+
+
 def detect_owner_intervention(*, target: str, prev_notified_cls: str, project_id: str = "",
                               conn=None, now: Optional[float] = None,
                               emit_fn: Optional[Callable] = None) -> Optional[int]:
@@ -877,6 +908,8 @@ def detect_owner_intervention(*, target: str, prev_notified_cls: str, project_id
             (notified_event_id,)).fetchone()
         if delivered:
             return None  # the companion handled it — not an intervention
+        if _automation_sent_since(target, notified_event_id, conn):
+            return None  # ChatGPT drove it through the API — not the owner either
         already = conn.execute(
             "SELECT 1 FROM owner_intervention_log WHERE notified_event_id=?",
             (notified_event_id,)).fetchone()
