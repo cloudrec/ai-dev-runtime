@@ -596,3 +596,24 @@ Open, non-blocking:
   - gaika-pl worked; its next stop, 74287, was delivered and ACKed at 12:12:29Z, and the
     watch resolved as `pane_alive_and_working`.
 - **Rollback:** `git reset --keep 358281d` plus a companion restart.
+
+### Post-install baseline on 3e5f79e, 12:20Z (an automated instruction was received)
+
+- **74278 (owner-os):**
+  - 12:08 `did_not_clear` (fresh owner-os tab), then 12:13 `assistant_still_generating`.
+  - 12:19:19Z delivered and ACKed once ChatGPT's turn ended.
+  - ChatGPT command `selfwake-74278-postinstall-verify-20261028` followed at 12:20:28Z.
+- **Non-self chain (GAIKA):**
+  - 74272 was delivered and ACKed at 12:06:54Z.
+  - Command `gaika-pl-20261028T1210Z-offline-gap-v1` at 12:09:02Z.
+  - gaika-pl worked; stops 74287 and 74289 were delivered and ACKed at 12:12:29Z and
+    12:17:59Z.
+- **Since the restart:**
+  - 9 attempts: 5 delivered, 3 `assistant_still_generating` (back-pressure, no tab
+    replaced), 1 `did_not_clear`.
+  - 1 recovery: 74272 `absent:0` → tab replaced → delivered.
+  - 0 `all_conversation_tabs_busy`, 0 errors.
+- **Tabs:** 2 and stable (owner-os, gaika).
+- **Companion:** PID 3909219, NRestarts 0, heartbeat 4 s.
+- **Still pending:** 74279 (vtb re-wake) and 74293 wait on ChatGPT's current owner-os
+  turn. Only time-based observation remains.
