@@ -63,7 +63,7 @@ TRANSIENT_RETRY_BACKOFF_SECS = int(os.getenv("WAKE_BRIDGE_TRANSIENT_RETRY_BACKOF
 TRANSIENT_RETRY_MAX_ATTEMPTS = int(os.getenv("WAKE_BRIDGE_TRANSIENT_RETRY_MAX_ATTEMPTS", "6"))
 # Matched by prefix: cdp_composer.py appends the observed composer count
 # (`composer_ambiguous_or_absent:0`, `:2`, …), never the bare string.
-TRANSIENT_FAILURE_PREFIXES = ("composer_ambiguous_or_absent",)
+TRANSIENT_FAILURE_PREFIXES = ("composer_ambiguous_or_absent", "composer_unstable")
 # How many oldest-eligible candidates `pending_wake` will walk past a benched head of
 # line before giving up for this tick. Bounded so a large backlog of benched events
 # can never turn selection into an unbounded per-tick scan.

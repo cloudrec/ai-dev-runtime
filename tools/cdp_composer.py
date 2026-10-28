@@ -28,7 +28,11 @@ CDP_HOST = "127.0.0.1"
 CDP_PORT = 9222
 
 # Structural selectors: element identity and ARIA attributes only. No text, no message nodes.
-COMPOSER_SEL = "#prompt-textarea, div[contenteditable='true'][id='prompt-textarea']"
+# 2026-10-28: ChatGPT's composer lost its id — it is now a ProseMirror div with
+# role="textbox" and no #prompt-textarea, so every route failed with
+# composer_ambiguous_or_absent:0. Structural match only (class/role/contenteditable).
+COMPOSER_SEL = ("#prompt-textarea, div[contenteditable='true'][id='prompt-textarea'], "
+                "div.ProseMirror[contenteditable='true'][role='textbox']")
 # ChatGPT renders the send control only once the composer is non-empty, so it is looked for
 # AFTER the phrase is inserted, never before. Structural attributes only — no label text
 # matching, which would break the moment the UI is in another language.
@@ -39,14 +43,16 @@ SEND_SEL = ("button[data-testid='send-button'], form button[type='submit'], "
 # earlier "deliveries" cleared the composer and left no message behind. The turn node is the
 # first structure that exists only once the conversation actually gained the message, so
 # delivery is judged by its COUNT rising, never by the composer emptying.
-USER_TURN_SEL = "[data-message-author-role='user']"
+# 2026-10-28 UI: turns are marked data-conversation-role, not data-message-author-role.
+USER_TURN_SEL = "[data-message-author-role='user'], [data-conversation-role='user']"
 # A user turn element appearing is CLIENT-SIDE evidence: the page rendered our text.
 # It does not prove the backend accepted the message, that it persisted, or that the
 # assistant ever ran. Three deliveries were reported successful into a conversation
 # that ended up holding two user turns, and the owner had to type manually because no
 # assistant turn had started. The wake exists to make the reviewer RUN, so the proof
 # has to be the assistant running.
-ASSISTANT_TURN_SEL = "[data-message-author-role='assistant']"
+ASSISTANT_TURN_SEL = ("[data-message-author-role='assistant'], "
+                      "[data-conversation-role='assistant']")
 # ChatGPT shows a stop control only while a response is generating; its presence is
 # the earliest positive evidence that generation actually began.
 STREAMING_SEL = ("button[data-testid='stop-button'], button[aria-label*='Stop'], "
@@ -800,6 +806,36 @@ def focus_failure_reason(s) -> str:
     return f"composer_focus_trapped_by_dialog:{slug}" if slug         else "composer_focus_trapped_by_dialog"
 
 
+# 2026-10-28: on a freshly navigated conversation ChatGPT REPLACES the composer
+# element shortly after `readyState` is complete (hydration). Typing into the first one
+# lost the phrase: `composer_did_not_clear_after_send`, then `composer_ambiguous_or_absent:0`
+# on the next pass. Measured in this browser: a composer found once was gone right after
+# one inserted character. So the composer must be the SAME element for several
+# consecutive looks before anything is typed. Identity is held in a page-side variable;
+# nothing is read from the composer's content.
+COMPOSER_STABLE_LOOKS = int(os.getenv("COMPOSER_STABLE_LOOKS", "3"))
+COMPOSER_STABLE_MAX_LOOKS = int(os.getenv("COMPOSER_STABLE_MAX_LOOKS", "15"))
+
+
+def composer_is_stable(s, looks: int = None, max_looks: int = None, sleep=None) -> bool:
+    """True once the composer is the same element `looks` times in a row."""
+    import time as _t
+    sleep = sleep or _t.sleep
+    looks = COMPOSER_STABLE_LOOKS if looks is None else looks
+    max_looks = COMPOSER_STABLE_MAX_LOOKS if max_looks is None else max_looks
+    probe = ("(function(){const c=document.querySelector(%s);if(!c)return false;"
+             "if(window.__owComposer===c)return true;window.__owComposer=c;return false;})()"
+             % json.dumps(COMPOSER_SEL))
+    streak = 1 if s.boolean(probe) is not None else 0  # the first look only records
+    for _ in range(max_looks):
+        if streak >= looks:
+            return True
+        sleep(1.0)
+        same = s.boolean(probe)
+        streak = streak + 1 if same is True else 1
+    return streak >= looks
+
+
 def focus_composer(s, attempts: int = 3, sleep=None) -> Optional[bool]:
     """Focus the composer, dismissing a focus-trapping dialog if one is in the way.
 
@@ -1106,6 +1142,8 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         n = s.count(COMPOSER_SEL)
         if n != 1:
             return {"ok": False, "reason": f"composer_ambiguous_or_absent:{n}"}
+        if not composer_is_stable(s):
+            return {"ok": False, "reason": "composer_unstable"}
         # The baseline the delivery proof is measured against. Taken BEFORE anything is
         # typed, so a turn that was already on screen can never be mistaken for ours.
         turns_before = s.count(USER_TURN_SEL)

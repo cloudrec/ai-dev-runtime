@@ -62,6 +62,11 @@ class _S:
             # "is the box exactly our OWN phrase" - one bit, about a string this
             # module already knows. Structural, same reason as the probes above.
             return getattr(self, "composer_is_ours", False)
+        if "__owComposer" in expression:
+            # Composer-stability probe (2026-10-28). Structural, like the probes above:
+            # default "same element every look" so no other test's queue shifts.
+            script = getattr(self, "composer_stable", None)
+            return script.pop(0) if script else True
         if "stop-button" in expression:
             # Back-pressure probe. Answered STRUCTURALLY, like readyState, so it does not
             # consume the scripted queue below — otherwise adding an infrastructure check
@@ -382,6 +387,8 @@ def test_no_expression_ever_extracts_page_text(wired):
 def test_selectors_are_structural_not_textual():
     """Matching on message text or chat titles would make this a content reader."""
     assert "prompt-textarea" in cdp.COMPOSER_SEL
+    # 2026-10-28 UI: no #prompt-textarea, a ProseMirror textbox instead.
+    assert "div.ProseMirror[contenteditable='true'][role='textbox']" in cdp.COMPOSER_SEL
     assert "data-testid" in cdp.SEND_SEL or "aria-label" in cdp.SEND_SEL
     assert "data-message-author-role" in cdp.USER_TURN_SEL
     for sel in (cdp.COMPOSER_SEL, cdp.SEND_SEL, cdp.USER_TURN_SEL):
@@ -1828,3 +1835,37 @@ def test_the_new_tab_call_gets_a_bigger_budget_than_a_lookup(monkeypatch):
     monkeypatch.setattr(cc, "_http", fake_http)
     assert cc._create_tab("https://chatgpt.com/c/a") == {"id": "FRESH"}
     assert seen["timeout"] == cc.CDP_NEW_TAB_SECS > cc.CDP_HTTP_SECS
+
+
+# ── composer stability (2026-10-28) ─────────────────────────────────────────────────
+# ChatGPT re-renders the composer right after a navigation; typing into the first one
+# lost the phrase. The composer must be the same element several looks in a row.
+
+def test_it_waits_for_a_replaced_composer_and_types_into_the_settled_one(wired):
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    # first look records, the element is then replaced once, then it holds
+    s.composer_stable = [False, False, True, True]
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert s.inserted == ["PHRASE"], r
+    assert r.get("reason") != "composer_unstable"
+
+
+def test_it_types_nothing_into_a_composer_that_never_settles(wired):
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.composer_stable = [False] * 40
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r.get("reason") == "composer_unstable"
+    assert s.inserted == []
+
+
+def test_an_unreadable_stability_probe_fails_closed(wired):
+    s = wired({"n": 1}, bools=[True, True, True, True])
+    s.composer_stable = [None] * 40
+    r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
+    assert r.get("reason") == "composer_unstable"
+    assert s.inserted == []
+
+
+def test_composer_unstable_is_a_transient_still_loading_failure():
+    from core import wake_bridge as wb
+    assert wb._is_transient_failure("composer_unstable")

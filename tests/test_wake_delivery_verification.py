@@ -74,6 +74,9 @@ class _S:
         e = expression or ""
         if "readyState" in e:
             return True
+        if "__owComposer" in e:
+            # Composer-stability probe (2026-10-28): the same element on every look.
+            return True
         if _STOP_BUTTON_SEL_TXT in e:
             return getattr(self, "generating", False)
         if cdp.STREAMING_CONTENT_SEL in e:
