@@ -959,6 +959,55 @@ def may_autosubmit_goal(text: str, safe_fn: Callable) -> dict:
     return {"ok": True, "reason": "allowed"}
 
 
+# ── send-policy pre-check ────────────────────────────────────────────────────────────
+# Under `AGENT_AUTOMATION_POLICY=enforce` the send allowlist names only the controller, so
+# every continuation this supervisor attempted was refused inside `agent_control._deliver`:
+# 304 in the 24 h to 2026-10-28 (event path 74, idle sweep 230), each one a pane lookup,
+# an audit line and a `not_delivered:automation_target_not_allowlisted` row — re-tried
+# every IDLE_SWEEP_QUIET_SECS per target, forever, for an answer that could not change.
+#
+# The pre-check asks the SAME function `_deliver` asks (`automation_decision`, same
+# session / target / actor / action / cwd) before calling `send_fn`. It can only REFUSE:
+# an empty answer, any error, or a missing input falls through to the real send, and
+# `_deliver` stays the one place that enforces. So it removes no protection and adds no
+# authority. The decision is still recorded — action `policy_refused`, the same refusal
+# reason, ok=0 — so the audit says what it said before, minus the pretend send.
+POLICY_REFUSED_ACTION = "policy_refused"
+# After a pre-check refusal the IDLE sweep re-asks this rarely. The event path is not
+# backed off: a real turn boundary is always re-evaluated, so a policy change (an owner
+# allowlist edit, a grant) is honoured on the very next turn.
+POLICY_REFUSED_BACKOFF_SECS = int(
+    os.getenv("NATIVE_SUPERVISOR_POLICY_REFUSED_BACKOFF_SECS", "3600"))
+
+
+def policy_precheck(target: str, live: Optional[dict] = None) -> str:
+    """The refusal the send policy WILL give this supervisor for `target`, or "".
+
+    "" means allowed OR undetermined; either way the real send runs and decides.
+    """
+    try:
+        from core import agent_control as ac
+        live = live or {}
+        session = (live.get("session") or (target or "").split(":")[0]).strip()
+        cwd = live.get("claude_cwd") or live.get("cwd") or None
+        refusal, _ = ac.automation_decision(session, target, "native_supervisor",
+                                            action="agent_send", cwd=cwd)
+        return refusal or ""
+    except Exception:  # noqa: BLE001 — undetermined: let `_deliver` decide
+        return ""
+
+
+def _recent_policy_refusal(conn, target: str, now: float) -> bool:
+    """Did the idle sweep get a pre-check refusal for this target within the backoff?"""
+    try:
+        row = conn.execute(
+            "SELECT MAX(ts_epoch) FROM native_supervision_idle WHERE target=? AND action=?",
+            (target, POLICY_REFUSED_ACTION)).fetchone()
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(row and row[0] and (now - float(row[0])) < POLICY_REFUSED_BACKOFF_SECS)
+
+
 def _recent_for_target(conn, target: str, now: float) -> tuple:
     """(last continue, continues in the last hour) across BOTH decision tables.
 
@@ -1011,8 +1060,13 @@ def _record(conn, event_id: int, target: str, action: str, reason: str, ok: bool
 
 def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = None,
          send_fn: Optional[Callable] = None, safe_fn: Optional[Callable] = None,
-         step_text: Optional[str] = None) -> dict:
-    """One supervision pass over native lifecycle events not yet acted on."""
+         step_text: Optional[str] = None,
+         policy_fn: Optional[Callable] = None) -> dict:
+    """One supervision pass over native lifecycle events not yet acted on.
+
+    `policy_fn(target, agent) -> refusal` defaults to `policy_precheck` exactly when the
+    real `agent_control.agent_send` is used: it mirrors that send's policy, so it is only
+    meaningful in front of it. A caller injecting its own `send_fn` passes its own."""
     now = now if now is not None else time.time()
     conn, own = _conn(conn)
     try:
@@ -1024,6 +1078,8 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
         if send_fn is None:
             from core import agent_control as ac
             send_fn = ac.agent_send
+            if policy_fn is None:
+                policy_fn = policy_precheck
         if safe_fn is None:
             from core.agent_continuation_watchdog import is_safe_continuation as safe_fn
         if step_text is None:
@@ -1133,6 +1189,13 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                                 "why": "step_failed_safety_classifier"})
                 continue
             idem = f"nativesup:{eid}"
+            refusal = policy_fn(target, live) if policy_fn else ""
+            if refusal:
+                _record(conn, eid, target, POLICY_REFUSED_ACTION,
+                        f"not_delivered:{refusal}", False, {"precheck": True})
+                skipped.append({"event_id": eid, "target": target,
+                                "why": f"policy_refused:{refusal}"})
+                continue
             try:
                 res = send_fn(target, step_text, idempotency_key=idem,
                               actor="native_supervisor", source="claude_hook")
@@ -1227,6 +1290,16 @@ def scan(*, conn=None, now: Optional[float] = None, agents: Optional[list] = Non
                         continue
                     if not safe_fn(step_text):
                         _record(conn, 0, target, "refuse", "step_failed_safety_classifier", False)
+                        continue
+                    if policy_fn and _recent_policy_refusal(conn, target, now):
+                        continue
+                    refusal = policy_fn(target, a) if policy_fn else ""
+                    if refusal:
+                        _record(conn, 0, target, POLICY_REFUSED_ACTION,
+                                f"not_delivered:{refusal}", False, {"precheck": True})
+                        skipped.append({"event_id": 0, "target": target,
+                                        "why": f"policy_refused:{refusal}",
+                                        "via": "idle_sweep"})
                         continue
                     idem = f"nativesup:idle:{target}:{int(now // IDLE_SWEEP_QUIET_SECS)}"
                     try:
