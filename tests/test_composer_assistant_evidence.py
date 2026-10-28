@@ -203,3 +203,32 @@ def test_unknown_pre_send_state_voids_count_and_id_evidence_too(monkeypatch):
     _wire(monkeypatch, Page(stream=[-1], asst=[5, 6], asst_ids=["a1", "a2"]))
     r = _send(309)
     assert r == {"ok": False, "reason": "user_turn_not_observed_after_send"}
+
+
+@pytest.mark.parametrize("fresh, retry, expect", [
+    (None, None, "tab_not_replaced"),
+    ({"id": "FRESH"}, {"ok": False, "reason": "composer_ambiguous_or_absent:0"},
+     "tab_replaced retry=composer_ambiguous_or_absent:0"),
+    ({"id": "FRESH"}, {"ok": True, "reason": "submitted_and_assistant_started_generating"},
+     "tab_replaced retry=submitted_and_assistant_started_generating"),
+])
+def test_absent_composer_recovery_outcome_is_logged(monkeypatch, capsys, fresh, retry, expect):
+    """2026-10-28: only the final reason reaches wake_delivery, so a failed tab
+    replacement and an absent composer on the FRESH tab were indistinguishable."""
+    calls = []
+
+    def attempt(*a, **k):
+        calls.append(1)
+        return ({"ok": False, "reason": "composer_ambiguous_or_absent:0"} if len(calls) == 1
+                else dict(retry))
+    monkeypatch.setattr(cdp, "_attempt", attempt)
+    monkeypatch.setattr(cdp, "find_target", lambda u: {"id": "OLD"})
+    monkeypatch.setattr(cdp, "recover_wedged_tab", lambda t, u: fresh)
+    monkeypatch.setattr(cdp, "_record_delivery", lambda *a, **k: a[2])
+    out = cdp.submit_phrase(CHAT, "P", claim=False, event_id=310)
+    line = capsys.readouterr().out
+    assert f"composer recovery for event 310: composer_ambiguous_or_absent:0 -> {expect}" in line
+    assert "old=OLD" in line
+    assert len(calls) == (2 if fresh else 1), "still exactly one retry"
+    if fresh:
+        assert out.get("after_composer_absent_recovery") is True

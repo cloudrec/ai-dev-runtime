@@ -973,18 +973,38 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
     # renderer lost the input entirely and will never regain it for this tab; more than
     # one means we cannot tell which is real, and replacing a tab to resolve our own
     # uncertainty is how a phrase lands somewhere unintended.
-    if res.get("reason") == "composer_ambiguous_or_absent:0":
+    #
+    # Each recovery and its retry are printed (the companion's journal). Only the final
+    # reason reaches `wake_delivery`, so without this "the tab could not be replaced" and
+    # "absent AGAIN on a fresh tab" were the same row: 2026-10-28, 06:16-08:58Z, the
+    # owner-os route alternated `composer_did_not_clear_after_send` /
+    # `composer_ambiguous_or_absent:0` for 2.7 h and the record could not say which.
+    for trigger, flag in (("composer_ambiguous_or_absent:0", "after_composer_absent_recovery"),
+                          ("assistant_generating_wedged", "after_wedge_recovery")):
+        if res.get("reason") != trigger:
+            continue
         target = find_target(conversation_url)
-        if target and recover_wedged_tab(target, conversation_url):
+        fresh = recover_wedged_tab(target, conversation_url) if target else None
+        if fresh:
             res = _attempt(conversation_url, phrase, source=source, event_id=event_id)
-            res["after_composer_absent_recovery"] = True
-    if res.get("reason") == "assistant_generating_wedged":
-        target = find_target(conversation_url)
-        if target and recover_wedged_tab(target, conversation_url):
-            res = _attempt(conversation_url, phrase, source=source, event_id=event_id)
-            res["after_wedge_recovery"] = True
+            res[flag] = True
+        _log_recovery(event_id, trigger, target, fresh, res)
     return _record_delivery(source, event_id, res,
                             conversation=conversation_url, route_key=route_key)
+
+
+def _log_recovery(event_id, trigger: str, target, fresh, res: dict) -> None:
+    """One journal line per tab recovery: what triggered it, whether a fresh tab was
+    obtained, and what the single retry returned. Tab ids are CDP handles, not content."""
+    if not target:
+        outcome = "no_target"
+    elif not fresh:
+        outcome = "tab_not_replaced"
+    else:
+        outcome = f"tab_replaced retry={res.get('reason', '')}"
+    print(f"composer recovery for event {event_id}: {trigger} -> {outcome} "
+          f"(old={(target or {}).get('id', '')} new={(fresh or {}).get('id', '')})",
+          flush=True)
 
 
 def _latch_submitted(source: str, event_id: Optional[int]) -> None:
