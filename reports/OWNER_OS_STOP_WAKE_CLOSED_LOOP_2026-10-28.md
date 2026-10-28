@@ -381,3 +381,37 @@ was not acted on.
   defect today; not changed.
 - **To take effect,** `d629f07` needs the companion restarted on it. That is
   owner-gated and was not done.
+
+### Event 74139 `wake_loop_stalled` on vtb:0.0, a defect fixed in `360992c` (an automated instruction was received)
+
+- **Chain:**
+  - 74112 `agent_prompt_needs_response`, payload `state=waiting_owner`,
+    `class_reason=inventory_waiting_owner`, owner_action_required=1, 08:42Z.
+  - It was delivered and acknowledged 08:59:54Z.
+  - 74133 `wake_loop_no_progress` followed at 09:17Z, then 74139 `wake_loop_stalled`
+    (critical) at 09:32Z. Once each, so dedup held.
+- **Why:**
+  - `_resolution_reason` had no rule for "the agent itself declares it waits on the
+    owner".
+  - Before dfe9174 the only open vtb gate, `classify_scope` (a diagnostic gate),
+    resolved the watch as `pane_awaiting_owner` by accident. dfe9174 correctly stopped
+    counting diagnostic gates, which exposed the gap.
+  - The owner had already been told by 74112 and is re-reminded hourly by agent_watch
+    (`REMINDER_SECS=3600`). The re-wake asked ChatGPT for decisions it may not make, and
+    the stall alarm duplicated the owner's own queue.
+- **Fix (fail-closed, positive evidence only):** the watch resolves silently as
+  `pane_declared_waiting_owner` only when all of these hold:
+  - the original prompt event has owner_action_required=1 and `class_reason=inventory_waiting_owner`;
+  - agent_watch still classifies the pane `owner_prompt` with the SAME digest.
+- **Still escalating:** decision menus (`decision_prompt_at_bottom`), events without the
+  recorded reason, a new digest (a new episode), and any read error keep escalating as
+  before.
+- **Invariant:** the watchdog never re-wakes or escalates an unchanged, already-notified
+  owner-wait episode. A real stall or a new question still escalates once.
+- **Tests:** 7 new; removing the check fails 1. A read-only dry run on the live DB:
+  `_declared_owner_wait(74112)=True`. Full suite 4027 passed / 0 failed / 4 skipped.
+- **Not touched:** the VTB decisions, routes, and messages to vtb. vtb_old still resolves
+  via the `unmapped_route` fallback to owner-os; binding a route needs an owner-supplied
+  conversation URL.
+- **Deploy:** local only. Live stays at 94194e6. Taking `360992c` live (together with
+  d629f07) needs owner approval for a fast-forward plus a companion-only restart.
