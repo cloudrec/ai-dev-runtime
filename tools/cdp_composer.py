@@ -1040,6 +1040,27 @@ def _settled(s, started_reason: str, settle_secs: Optional[float] = None) -> dic
 
 
 
+# How long, after the click, the user turn (or the assistant starting) may take to show.
+# Was a fixed 10 s; a freshly navigated conversation can still be re-rendering its turn
+# list then. Only the FAILURE path waits longer: a seen turn returns at once.
+USER_TURN_SECS = int(os.getenv("WAKE_USER_TURN_SECS", "20"))
+
+
+def _assistant_advanced(s, asst_before: int, asst_id_before, gen_before) -> bool:
+    """Positive evidence the assistant began a NEW turn since the pre-send baselines.
+    Any unreadable value (-1 / None) counts as no evidence."""
+    try:
+        if gen_before is False and assistant_is_generating(s) is True:
+            return True
+        asst_now = s.count(ASSISTANT_TURN_SEL)
+        if asst_before >= 0 and asst_now > asst_before:
+            return True
+        asst_id_now = s.last_attr(ASSISTANT_TURN_SEL, "data-message-id")
+        return bool(asst_id_before and asst_id_now and asst_id_now != asst_id_before)
+    except Exception:  # noqa: BLE001 — no evidence, the old verdict stands
+        return False
+
+
 def _await_assistant(s, asst_before: int, asst_id_before) -> dict:
     """Did the assistant actually start after our message landed?
 
@@ -1176,7 +1197,10 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # latched and nothing is typed: the event stays pending and the ordinary backoff
         # brings it around again once the assistant is free. Fail-open — if the page cannot
         # answer the question (None), the previous path runs unchanged.
-        if assistant_is_generating(s) is True:
+        # Kept: the stop control's state BEFORE our send, so its later APPEARANCE can be
+        # told from mere presence (see `_assistant_advanced`).
+        gen_before = assistant_is_generating(s)
+        if gen_before is True:
             # Two different worlds behind one appearance. A turn genuinely in flight is
             # back-pressure and resolves itself; a stop control that is up while nothing
             # streams never resolves, and blocks the route forever.
@@ -1268,7 +1292,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # a flat count (virtualized long chat) — says the conversation kept the message.
         import time
         cleared = False
-        for _ in range(10):
+        for _ in range(max(1, USER_TURN_SECS)):
             time.sleep(1)
             if not cleared:
                 cleared = s.boolean(
@@ -1286,6 +1310,16 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                 last_id_now = s.last_attr(USER_TURN_SEL, "data-message-id")
                 user_turn_seen = bool(last_id_before is not None and last_id_now
                                       and last_id_now != last_id_before)
+            if not user_turn_seen and _assistant_advanced(
+                    s, asst_before, asst_id_before, gen_before):
+                # The user turn was not SEEN, but the assistant started answering — which
+                # it does only for a message the backend accepted (back-pressure above
+                # guarantees nothing was generating before our send). 2026-10-28: after
+                # the UI change 15 of 48 attempts since the companion restart ended
+                # `user_turn_not_observed_after_send`, all on the two chats the single
+                # tab is navigated between, 9 of them right after a navigation; the
+                # user-turn proof missed while the assistant side is a separate signal.
+                return _await_assistant(s, asst_before, asst_id_before)
             if user_turn_seen:
                 # The message is in the page. Now the question that actually matters:
                 # did the assistant START? Until it does, the wake has delivered
