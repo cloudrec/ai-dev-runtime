@@ -1048,9 +1048,13 @@ USER_TURN_SECS = int(os.getenv("WAKE_USER_TURN_SECS", "20"))
 
 def _assistant_advanced(s, asst_before: int, asst_id_before, gen_before) -> bool:
     """Positive evidence the assistant began a NEW turn since the pre-send baselines.
-    Any unreadable value (-1 / None) counts as no evidence."""
+    Any unreadable value (-1 / None) counts as no evidence, and so does everything when
+    the pre-send stop state is unknown: only `gen_before is False` (page readable, nothing
+    generating) makes a later assistant change attributable to our message."""
     try:
-        if gen_before is False and assistant_is_generating(s) is True:
+        if gen_before is not False:
+            return False
+        if assistant_is_generating(s) is True:
             return True
         asst_now = s.count(ASSISTANT_TURN_SEL)
         if asst_before >= 0 and asst_now > asst_before:

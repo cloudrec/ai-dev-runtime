@@ -988,8 +988,12 @@ def policy_precheck(target: str, live: Optional[dict] = None) -> str:
     try:
         from core import agent_control as ac
         live = live or {}
-        session = (live.get("session") or (target or "").split(":")[0]).strip()
+        session = (live.get("session") or "").strip()
         cwd = live.get("claude_cwd") or live.get("cwd") or None
+        if not session or not cwd:
+            # `_deliver` resolves both from the live pane; without them our answer could
+            # differ from its answer, so refuse nothing and let it decide.
+            return ""
         refusal, _ = ac.automation_decision(session, target, "native_supervisor",
                                             action="agent_send", cwd=cwd)
         return refusal or ""

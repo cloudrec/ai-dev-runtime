@@ -493,8 +493,11 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     # and the owner poked the chat by hand (owner_intervention 02:25, 03:21).
     try:
         from core.owner_status import DIAGNOSTIC_GATE_KINDS
-        idents = _identities(conn, target)
         kinds = sorted(DIAGNOSTIC_GATE_KINDS)
+    except Exception:  # noqa: BLE001 — unknown kinds: every open gate counts (old rule)
+        kinds = ["\x00no-diagnostic-kinds"]   # excludes nothing
+    try:
+        idents = _identities(conn, target)
         row = conn.execute(
             "SELECT id FROM owner_gate WHERE state='open' AND agent_id IN (%s) "
             "AND COALESCE(kind,'') NOT IN (%s) LIMIT 1"

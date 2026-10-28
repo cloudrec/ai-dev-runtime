@@ -270,3 +270,26 @@ def test_latched_helper_fails_closed():
             raise RuntimeError("db gone")
     assert wc._latched(NoLatch(), 1) is False
     assert wc._latched(Boom(), 1) is False
+
+
+
+def test_gate_filter_falls_back_to_every_gate_when_kinds_unavailable(conn, page,
+                                                                     monkeypatch):
+    """Review 2026-10-28: if the diagnostic kind list cannot be imported, the old rule
+    applies (every open gate suppresses) rather than no gate suppressing."""
+    import builtins
+    real_import = builtins.__import__
+
+    def no_owner_status(name, *a, **k):
+        if name == "core.owner_status":
+            raise ImportError("simulated")
+        return real_import(name, *a, **k)
+    _setup(conn, gate_kind="classify_scope")
+    stop_eid = _stop(conn)
+    page.mode = "ok"
+    wc.tick(wb)
+    monkeypatch.setattr(builtins, "__import__", no_owner_status)
+    s = clw.slo_scan(conn=conn, now=clw.now_ts() + clw.WAKE_LOOP_SLO_SECS + 5)
+    monkeypatch.undo()
+    assert not s["rewoken"]
+    assert _watch(conn, stop_eid)[5] == "pane_awaiting_owner"

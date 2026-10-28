@@ -194,3 +194,12 @@ def test_evidence_never_resends(monkeypatch):
     _wire(monkeypatch, page)
     _send(308)
     assert inserted == ["P"]
+
+
+def test_unknown_pre_send_state_voids_count_and_id_evidence_too(monkeypatch):
+    """Review 2026-10-28: right after a navigation the turn list can still be mounting, so
+    a risen assistant count or a re-keyed newest id is not ours unless the page could
+    first say nothing was generating."""
+    _wire(monkeypatch, Page(stream=[-1], asst=[5, 6], asst_ids=["a1", "a2"]))
+    r = _send(309)
+    assert r == {"ok": False, "reason": "user_turn_not_observed_after_send"}

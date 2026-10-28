@@ -213,3 +213,15 @@ def test_policy_refusal_is_not_a_continue_for_the_anti_loop_cap(real_send):
     last, n = ns._recent_for_target(conn, TARGET, time.time())
     assert n == 0
     assert conn.execute("SELECT COUNT(*) FROM native_supervision_gate").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("missing", ["session", "cwd"])
+def test_precheck_refuses_nothing_without_the_resolved_pane(missing):
+    """Review 2026-10-28: `_deliver` resolves session and cwd from the live pane; without
+    them the pre-check cannot know it would agree, so it leaves the decision to `_deliver`."""
+    a = _agent()
+    if missing == "session":
+        a["session"] = ""
+    else:
+        a["claude_cwd"] = a["cwd"] = None
+    assert ns.policy_precheck(TARGET, a) == ""
