@@ -787,6 +787,9 @@ WEDGE_MIN_SECS = float(os.getenv("CDP_WEDGE_MIN_SECS", "900"))
 # A stop control up this long counts toward a wedge however the page changes — a ticking
 # timer or a sidebar update must not postpone recovery of a stuck turn forever.
 WEDGE_CEILING_SECS = 3 * WEDGE_MIN_SECS
+# An observation not refreshed for this long is forgotten: attempts that never reached the
+# generating check (a focus trap, an unstable composer) prove nothing about continuity.
+WEDGE_GAP_SECS = float(os.getenv("CDP_WEDGE_GAP_SECS", "600"))
 _GENERATING_SINCE: dict = {}
 
 
@@ -810,18 +813,20 @@ def _generating_for(conversation_url: str, text_len: Optional[int],
     Any change in the rendered length is a sign of life and restarts the first clock; the
     second keeps running and bounds how long life signs can postpone a recovery. An
     attempt that finds nothing generating forgets the conversation, and a different tab
-    (a recovery, a reload) starts over — an old observation never ages a new one. An
+    (a recovery, a reload) or a gap longer than WEDGE_GAP_SECS starts over — an old
+    observation never ages a new one. An
     unreadable length neither restarts nor proves anything. A fresh process starts at
     zero, which only ever delays a recovery — it never causes one."""
     now = time.time() if now is None else now
     st = _GENERATING_SINCE.get(conversation_url)
-    if st is None or st.get("tab") != tab_id:
-        st = {"since": now, "first": now, "len": text_len, "tab": tab_id}
+    if st is None or st.get("tab") != tab_id or now - st["seen"] > WEDGE_GAP_SECS:
+        st = {"since": now, "first": now, "len": text_len, "tab": tab_id, "seen": now}
         _GENERATING_SINCE[conversation_url] = st
     elif text_len is not None and st["len"] is not None and text_len != st["len"]:
         st["since"], st["len"] = now, text_len
     elif st["len"] is None and text_len is not None:
         st["len"] = text_len
+    st["seen"] = now
     return now - st["since"], now - st["first"]
 
 

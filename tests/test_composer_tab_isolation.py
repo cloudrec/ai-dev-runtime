@@ -175,6 +175,8 @@ def test_an_unchanged_turn_past_the_threshold_is_recovered_once(monkeypatch):
     _wire(monkeypatch, Busy([5000]), recovered)
     t = [1000.0]
     monkeypatch.setattr(cdp.time, "time", lambda: t[0])
+    # These steps jump a whole threshold at once; live retries come every few minutes.
+    monkeypatch.setattr(cdp, "WEDGE_GAP_SECS", 10 * cdp.WEDGE_CEILING_SECS)
     cdp.submit_phrase(OWNER_OS, "P", claim=False)          # first seen
     t[0] += cdp.WEDGE_MIN_SECS + 1
     r = cdp.submit_phrase(OWNER_OS, "P", claim=False)      # same length, past threshold
@@ -188,6 +190,8 @@ def test_a_changing_page_restarts_the_clock(monkeypatch):
     _wire(monkeypatch, Busy([5000, 5000, 5212]), recovered)
     t = [1000.0]
     monkeypatch.setattr(cdp.time, "time", lambda: t[0])
+    # These steps jump a whole threshold at once; live retries come every few minutes.
+    monkeypatch.setattr(cdp, "WEDGE_GAP_SECS", 10 * cdp.WEDGE_CEILING_SECS)
     cdp.submit_phrase(OWNER_OS, "P", claim=False)
     t[0] += cdp.WEDGE_MIN_SECS + 1
     cdp.submit_phrase(OWNER_OS, "P", claim=False)          # still 5000 -> wedged once
@@ -199,9 +203,9 @@ def test_a_changing_page_restarts_the_clock(monkeypatch):
 
 def test_an_idle_observation_forgets_the_conversation():
     cdp._generating_for(OWNER_OS, 10, now=0.0)
-    assert cdp._generating_for(OWNER_OS, 10, now=5000.0)[0] == 5000.0
+    assert cdp._generating_for(OWNER_OS, 10, now=500.0)[0] == 500.0
     cdp._GENERATING_SINCE.pop(OWNER_OS, None)                # what gen_before False does
-    assert cdp._generating_for(OWNER_OS, 10, now=6000.0)[0] == 0.0
+    assert cdp._generating_for(OWNER_OS, 10, now=600.0)[0] == 0.0
 
 
 def test_the_clock_is_per_conversation():
@@ -228,6 +232,8 @@ def test_life_signs_cannot_postpone_recovery_past_the_ceiling(monkeypatch):
     _wire(monkeypatch, Busy(list(range(5000, 5100))), recovered)
     t = [1000.0]
     monkeypatch.setattr(cdp.time, "time", lambda: t[0])
+    # These steps jump a whole threshold at once; live retries come every few minutes.
+    monkeypatch.setattr(cdp, "WEDGE_GAP_SECS", 10 * cdp.WEDGE_CEILING_SECS)
     for _ in range(3):
         cdp.submit_phrase(OWNER_OS, "P", claim=False)
         assert recovered == []
@@ -250,3 +256,20 @@ def test_page_text_len_reads_a_length_never_text():
             return {"result": {"value": 42}}
     assert cdp._page_text_len(S()) == 42
     assert seen["e"].endswith(".length")
+
+
+def test_a_gap_between_sightings_starts_over():
+    """Review: hours of attempts that never reached the generating check (a focus trap)
+    must not make the next sighting count as already aged."""
+    cdp._generating_for(OWNER_OS, 10, now=0.0, tab_id="T")
+    assert cdp._generating_for(OWNER_OS, 10, now=cdp.WEDGE_GAP_SECS / 2, tab_id="T")[0] > 0
+    later = cdp.WEDGE_GAP_SECS / 2 + cdp.WEDGE_GAP_SECS + 1
+    assert cdp._generating_for(OWNER_OS, 10, now=later, tab_id="T") == (0.0, 0.0)
+
+
+def test_regular_sightings_keep_the_clock_running():
+    t = 0.0
+    for _ in range(5):
+        age, total = cdp._generating_for(OWNER_OS, 10, now=t, tab_id="T")
+        t += cdp.WEDGE_GAP_SECS - 1
+    assert age == total and total >= 4 * (cdp.WEDGE_GAP_SECS - 1)
