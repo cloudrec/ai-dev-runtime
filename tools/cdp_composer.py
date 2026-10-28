@@ -105,6 +105,14 @@ def _http(path: str, method: str = "GET", timeout: Optional[float] = None):
 # is degraded, so that case must refuse instead.
 BROWSER_MAX_PAGES = int(os.getenv("CDP_MAX_PAGES", "12"))
 BROWSER_SLOW_SECS = float(os.getenv("CDP_SLOW_SECS", "2.0"))
+# One tab PER CONVERSATION, up to this many ChatGPT tabs, instead of navigating one shared
+# tab between chats. 2026-10-28: the owner-os chat failed every wake for 2.7 h and again
+# three times in an hour, each stretch starting when the single tab was navigated back to
+# it while ChatGPT was still answering there (09:45, 10:20, 10:44Z); a conversation
+# reloaded mid-generation rendered "Could not load this ChatGPT conversation".
+# Kept well under BROWSER_MAX_PAGES so `browser_degraded` never trips on our own tabs.
+CONVERSATION_TABS = max(1, min(int(os.getenv("CDP_CONVERSATION_TABS", "6")),
+                               BROWSER_MAX_PAGES - 2))
 
 
 def browser_degraded(list_fn=None, clock=None) -> dict:
@@ -518,7 +526,7 @@ def open_chatgpt_page(conversation_url: str) -> Optional[dict]:
         return None
 
 
-def find_chatgpt_page() -> Optional[dict]:
+def find_chatgpt_page(conversation_url: Optional[str] = None) -> Optional[dict]:
     """Any open ChatGPT page whose renderer ANSWERS, matched on host only — never on
     title or content.
 
@@ -545,15 +553,63 @@ def find_chatgpt_page() -> Optional[dict]:
     caller then opens a fresh tab through `open_chatgpt_page`, which carries the
     `browser_degraded` guard and closes what it cannot verify.
     """
-    for t in _http("/json/list"):
-        if t.get("type") != "page":
-            continue
-        u = t.get("url") or ""
-        if not (u.startswith("https://chatgpt.com") or u.startswith("https://chat.openai.com")):
-            continue
-        if page_responsive(t):
+    if not conversation_url:
+        # Any ChatGPT page will do (the sidebar scan reads, it never types).
+        for t in _http("/json/list"):
+            if t.get("type") != "page":
+                continue
+            u = t.get("url") or ""
+            if not (u.startswith("https://chatgpt.com") or u.startswith("https://chat.openai.com")):
+                continue
+            if page_responsive(t):
+                return t
+        return None
+    return _tab_to_reuse(conversation_url)
+
+
+# Returned by `find_chatgpt_page` when every conversation tab is mid-answer and the cap is
+# reached: nothing may be navigated away, so the attempt is refused and retried later.
+ALL_TABS_BUSY = {"all_conversation_tabs_busy": True}
+
+
+def _is_chatgpt(u: str) -> bool:
+    return u.startswith("https://chatgpt.com") or u.startswith("https://chat.openai.com")
+
+
+def _page_generating(t: dict) -> Optional[bool]:
+    """Is ChatGPT answering in this tab right now? None when the tab cannot say."""
+    s = None
+    try:
+        s = _Session(t["webSocketDebuggerUrl"])
+        return assistant_is_generating(s)
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        if s:
+            s.close()
+
+
+def _tab_to_reuse(conversation_url: str) -> Optional[dict]:
+    """Which tab may be pointed at `conversation_url`, which has no tab of its own.
+
+    In order: a ChatGPT page that is not on a conversation (the root a restart lands on,
+    an abandoned new-chat placeholder) — reclaiming it costs nothing; else None while
+    fewer than CONVERSATION_TABS ChatGPT tabs exist, so the caller opens a fresh tab and
+    every other conversation keeps its own; else, at the cap, a conversation tab where
+    ChatGPT is provably NOT answering (`_page_generating(...) is False`). A tab that is
+    answering, or cannot say, is never navigated away: that is the reload that broke the
+    owner-os chat. If no tab qualifies, ALL_TABS_BUSY."""
+    pages = [t for t in _http("/json/list")
+             if t.get("type") == "page" and _is_chatgpt(t.get("url") or "")]
+    for t in pages:
+        if "/c/" not in (t.get("url") or "") and page_responsive(t):
             return t
-    return None
+    if len(pages) < CONVERSATION_TABS:
+        return None
+    for t in pages:
+        if page_responsive(t) and _page_generating(t) is False:
+            return t
+    return ALL_TABS_BUSY
 
 
 class _Session:
@@ -717,6 +773,43 @@ STREAMING_CONTENT_SEL = ".result-streaming, [data-message-streaming='true']"
 def assistant_is_generating(s) -> Optional[bool]:
     """Is a turn being generated right now? None when the page cannot answer."""
     return s.boolean(f"!!document.querySelector({_STOP_BUTTON_SEL!r})")
+
+
+# How long the stop control must have been up, with the page not changing, before a turn
+# may be called wedged and its tab replaced. Observed across attempts, in this process.
+WEDGE_MIN_SECS = float(os.getenv("CDP_WEDGE_MIN_SECS", "900"))
+_GENERATING_SINCE: dict = {}
+
+
+def _page_text_len(s) -> Optional[int]:
+    """How many characters the page renders — a LENGTH, never the text. A turn that is
+    alive (tokens, a "Thinking"/"Worked for" timer, a tool step) changes it."""
+    try:
+        r = s.call("Runtime.evaluate", {"expression": "document.body.innerText.length",
+                                        "returnByValue": True})
+        v = ((r.get("result") or {}).get("value"))
+        return int(v) if isinstance(v, (int, float)) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _generating_for(conversation_url: str, text_len: Optional[int],
+                    now: Optional[float] = None) -> float:
+    """Seconds this conversation has been seen generating with the page UNCHANGED.
+
+    Any change in the rendered length is a sign of life and restarts the clock; an
+    attempt that finds nothing generating forgets the conversation. An unreadable length
+    neither restarts nor proves anything. A fresh process starts at zero, which only
+    ever delays a recovery — it never causes one."""
+    now = time.time() if now is None else now
+    st = _GENERATING_SINCE.get(conversation_url)
+    if st is None or (text_len is not None and st["len"] is not None
+                      and text_len != st["len"]):
+        st = {"since": now, "len": text_len}
+        _GENERATING_SINCE[conversation_url] = st
+    elif st["len"] is None and text_len is not None:
+        st["len"] = text_len
+    return now - st["since"]
 
 
 def generating_is_wedged(s, samples: int = 3, interval: float = 2.0, sleep=None) -> bool:
@@ -1136,9 +1229,12 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # the ChatGPT tab and navigate it to the BOUND conversation. The URL is the owner's
         # pointer, not content, and navigating is what guarantees the phrase cannot land in
         # some other chat.
-        target = find_chatgpt_page()
+        target = find_chatgpt_page(conversation_url)
+        if target is ALL_TABS_BUSY:
+            return {"ok": False, "reason": "all_conversation_tabs_busy"}
         if not target:
-            # No ChatGPT tab exists anywhere in this browser — nothing to navigate.
+            # No tab may be reused (none exists, or each one belongs to another
+            # conversation and the cap is not reached) — open one on this conversation.
             # Open one directly on the bound conversation at the browser level, exactly
             # as the wedged-renderer recovery path already does.
             target = open_chatgpt_page(conversation_url)
@@ -1228,9 +1324,19 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
             # Two different worlds behind one appearance. A turn genuinely in flight is
             # back-pressure and resolves itself; a stop control that is up while nothing
             # streams never resolves, and blocks the route forever.
-            if generating_is_wedged(s):
+            #
+            # Wedged needs DURATION, not a 4-second sample. In the 2026-10 UI a turn that
+            # is thinking or calling tools shows no streaming class and its turns carry
+            # no message id, so `generating_is_wedged` reads every such turn as wedged:
+            # 10:47:47Z the owner-os tab was replaced as "wedged" and 22 s later ChatGPT,
+            # from that very chat, sent its next command. The replacement then rendered
+            # "Could not load this ChatGPT conversation". See `_generating_for`.
+            age = _generating_for(conversation_url, _page_text_len(s))
+            if age >= WEDGE_MIN_SECS and generating_is_wedged(s):
                 return {"ok": False, "reason": "assistant_generating_wedged"}
             return {"ok": False, "reason": "assistant_still_generating"}
+        if gen_before is False:
+            _GENERATING_SINCE.pop(conversation_url, None)
 
         # REFUSE if the composer already holds text. `Input.insertText` APPENDS; it does
         # not replace. Without this check a wake typed into a box that already contained

@@ -331,7 +331,8 @@ def _no_browser_degradation(monkeypatch):
 def test_it_refuses_when_no_chatgpt_page_exists(monkeypatch):
     _no_browser_degradation(monkeypatch)
     monkeypatch.setattr(cdp, "find_target", lambda url: None)
-    monkeypatch.setattr(cdp, "find_chatgpt_page", lambda: None)
+    monkeypatch.setattr(cdp, "find_chatgpt_page", lambda *a, **k: None)
+    monkeypatch.setattr(cdp, "open_chatgpt_page", lambda url: None)
     r = cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
     assert r["ok"] is False and r["reason"] == "no_chatgpt_page_open"
 
@@ -356,7 +357,8 @@ def test_it_navigates_to_the_bound_conversation_when_the_tab_is_elsewhere(monkey
     nav = _Nav({"n": 1}, bools=[True, True, True, True])
     monkeypatch.setattr(cdp, "page_responsive", lambda t, timeout=8.0: True)
     monkeypatch.setattr(cdp, "find_target", _ft)
-    monkeypatch.setattr(cdp, "find_chatgpt_page", lambda: {"webSocketDebuggerUrl": "ws://x"})
+    monkeypatch.setattr(cdp, "find_chatgpt_page",
+                        lambda *a, **k: {"webSocketDebuggerUrl": "ws://x"})
     monkeypatch.setattr(cdp, "_Session", lambda ws: nav)
     r = cdp.submit_phrase("https://chatgpt.com/c/bound-target", "PHRASE", claim=False)
     assert seen.get("url") == "https://chatgpt.com/c/bound-target"
@@ -736,6 +738,8 @@ def test_a_wedged_conversation_does_earn_one_tab_recovery(wired, monkeypatch):
     s = wired({"n": 1}, bools=[True, True, True, True])
     s.generating = True
     monkeypatch.setattr(cdp, "generating_is_wedged", lambda *a, **k: True)
+    # The stop control has already been up, unchanged, for longer than the threshold.
+    monkeypatch.setattr(cdp, "WEDGE_MIN_SECS", 0, raising=False)
     cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
     assert calls == ["https://chatgpt.com/c/a"], "a wedge must be recovered exactly once"
 
