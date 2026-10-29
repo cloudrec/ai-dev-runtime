@@ -109,3 +109,21 @@ a3f420d6b8b74117) -> delivered 06:55:05 -> watch deregistered 06:55:59
 `prompt_already_escalated_unchanged`, rewoken=0, escalated=0. Before (74889): re-wake
 74902 at +18 min and escalation 74914 at +34 min. The reminder wake itself remains until
 f146d9d is installed.
+
+## Pre-install check of b808632 (read-only, 2026-10-29 ~08:10Z)
+
+An automated instruction was received asking to finish the read-only validation of b808632.
+
+Full suite at b808632 (worktree): 4088 passed, 4 skipped, EXIT=0 (527.85 s), the same as
+the 4088 reported for f146d9d. b808632 changes only this report.
+
+Live (9adfb41) is still the expected pre-f146d9d behaviour: the next vtb reminder, 74950
+`agent_prompt_needs_response` 07:54:43 (digest a3f420d6b8b74117), was woken
+(`actionable_waiting_transition`, delivered 07:56:12), then its watch resolved at 07:58:00
+`prompt_already_escalated_unchanged`, rewoken=0, escalated=0. That was the second
+consecutive hour with no re-wake or escalation, so no new code mutation is needed.
+
+Replay of f146d9d's `should_wake` on a copy of control_plane.db, with each event's own
+audit, delivery and watch rows removed: 74924 -> skip `owner_gate_unchanged_already_delivered`
+(first 74889); 74950 -> the same skip (first 74924). Not installed. Installing remains owner-run:
+`backups/stop-wake-deploy-2026-10-28/install_b808632.sh`.
