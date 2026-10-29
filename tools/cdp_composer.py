@@ -1282,6 +1282,63 @@ def _await_assistant(s, asst_before: int, asst_id_before) -> dict:
             "reason": f"user_turn_landed_but_assistant_never_started_in_{ASSISTANT_START_SECS}s"}
 
 
+# How long a FRESH session may look for proof after the attempt's own session failed
+# mid-verification. Bounded so a still-hung page costs one window, not a stalled loop.
+POSTHOC_VERIFY_SECS = int(os.getenv("WAKE_POSTHOC_VERIFY_SECS", "20"))
+
+
+def _verify_after_cdp_error(target: dict, reason: str, *, source: str, event_id,
+                            turns_before: int, last_id_before, asst_before: int,
+                            asst_id_before, gen_before) -> dict:
+    """The send was dispatched, then the CDP session died. Did the phrase land?
+
+    A busy renderer right after a send is ChatGPT starting to answer: the page stops
+    answering CDP for a moment and the 15 s socket timeout fires. 2026-10-28/29, route
+    `pl`: events 74724, 74760, 74872 and 74896 all ended
+    `cdp_error:WebSocketTimeoutException`, yet ChatGPT then sent agent commands whose
+    idempotency keys name 74760, 74872 and 74896, 61-102 s later (and one unnamed
+    command 21 s after 74724) — the wakes had landed. Recorded as failures, they went
+    unacknowledged (74724 was retired `submitted_delivery_unproven` three hours later),
+    and 74760, whose exception came before the composer-cleared latch, was offered again
+    and reached the chat a second time after ChatGPT had already acted on it.
+
+    So a fresh session asks the same questions the attempt was asking, against the
+    baselines taken before anything was typed. A new user turn latches the event (it is
+    in the chat; it must never be sent again). The assistant starting is the same proof
+    of delivery the ordinary path requires, and goes through the same settle check.
+    No evidence, or a page that still does not answer: the original verdict stands,
+    unchanged, and the latch is left exactly as the attempt left it.
+    """
+    s2 = None
+    try:
+        s2 = _Session(target["webSocketDebuggerUrl"])
+        s2.call("Runtime.enable")
+        deadline = time.time() + POSTHOC_VERIFY_SECS
+        while True:
+            user_seen = s2.count(USER_TURN_SEL) > turns_before
+            if not user_seen:
+                lid = s2.last_attr(USER_TURN_SEL, "data-message-id")
+                user_seen = bool(last_id_before is not None and lid
+                                 and lid != last_id_before)
+            started = _assistant_advanced(s2, asst_before, asst_id_before, gen_before)
+            if user_seen or started:
+                _latch_submitted(source, event_id)
+            if started:
+                return _settled(s2, f"submitted_and_assistant_started_after_{reason}")
+            if time.time() >= deadline:
+                break
+            time.sleep(2)
+    except Exception:  # noqa: BLE001 — still unreachable: the attempt's verdict stands
+        pass
+    finally:
+        if s2:
+            try:
+                s2.close()
+            except Exception:  # noqa: BLE001
+                pass
+    return {"ok": False, "reason": reason}
+
+
 def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
              event_id: Optional[int] = None) -> dict:
     """The submission itself, once the slot is claimed. Split out so that every exit path
@@ -1342,6 +1399,9 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         if not target:
             return {"ok": False, "reason": "renderer_unresponsive"}
     s = None
+    # Set the instant the send control is pressed, and never before: from then on the
+    # phrase may be in the chat, so an exception can no longer be read as "not sent".
+    dispatched = False
     try:
         s = _Session(target["webSocketDebuggerUrl"])
         s.call("Runtime.enable")
@@ -1486,6 +1546,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         enabled = s.boolean(
             f"(function(){{const b=document.querySelector({SEND_SEL!r});"
             f"return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';}})()")
+        dispatched = True
         if enabled is True:
             s.call("Runtime.evaluate",
                    {"expression": f"document.querySelector({SEND_SEL!r}).click()"})
@@ -1556,7 +1617,14 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         return _full_verdict(s, {"ok": False, "reason": "user_turn_not_observed_after_send"},
                              full_before)
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "reason": f"cdp_error:{type(e).__name__}"}
+        reason = f"cdp_error:{type(e).__name__}"
+        if dispatched:
+            return _verify_after_cdp_error(
+                target, reason, source=source, event_id=event_id,
+                turns_before=turns_before, last_id_before=last_id_before,
+                asst_before=asst_before, asst_id_before=asst_id_before,
+                gen_before=gen_before)
+        return {"ok": False, "reason": reason}
     finally:
         if s:
             s.close()
