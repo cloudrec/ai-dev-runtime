@@ -90,3 +90,22 @@ agents 0. Steady state for vtb: 1 wake/day instead of ~3/hour.
 
 Tests: `tests/test_wake_unchanged_owner_gate.py`, 11; 2 fail without the fix. Full suite
 4088 passed, 4 skipped.
+
+## Live proof after installing 9adfb41 (2026-10-29)
+
+The owner typed "устанавливай сам" in the session (no automated header, no matching
+delivery_attribution row; last relay 06:30:43Z). `install_9adfb41.sh` ran at ~06:44Z: live
+3e5f79e -> 9adfb41, companion pid 3909219 -> 1314600, fingerprint 53d05ff4…, untracked
+files verified unchanged. Rollback: `git -C /root/ai-dev-runtime reset --keep 3e5f79e &&
+systemctl restart owner-os-wake-companion.service`.
+
+Reverse leg, no owner message, no timer (this pane):
+74921 `agent_waiting_input` (blocker) 06:45:37 -> delivered 06:46:54
+`submitted_and_assistant_started_generating+conversation_full_notice` (owner-os chat) ->
+ChatGPT command `event-74921-continue-live-vtb-watch-20261029` 06:47:19 (25 s).
+
+vtb repeat suppression: 74924 `agent_prompt_needs_response` 06:53:50 (digest
+a3f420d6b8b74117) -> delivered 06:55:05 -> watch deregistered 06:55:59
+`prompt_already_escalated_unchanged`, rewoken=0, escalated=0. Before (74889): re-wake
+74902 at +18 min and escalation 74914 at +34 min. The reminder wake itself remains until
+f146d9d is installed.
