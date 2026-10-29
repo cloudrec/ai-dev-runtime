@@ -127,3 +127,17 @@ Replay of f146d9d's `should_wake` on a copy of control_plane.db, with each event
 audit, delivery and watch rows removed: 74924 -> skip `owner_gate_unchanged_already_delivered`
 (first 74889); 74950 -> the same skip (first 74924). Not installed. Installing remains owner-run:
 `backups/stop-wake-deploy-2026-10-28/install_b808632.sh`.
+
+Reverse leg on live 9adfb41 for this pane, with no owner message and no timer
+(event -> delivered -> ChatGPT command whose key names the event):
+74950 (vtb reminder) delivered 07:56:12 -> `wake-74950-safe-suite-check-20261029` 07:57:28;
+74953 `agent_waiting_input` 07:58:59 -> 08:00:19 -> `event-74953-safe-suite-followup-20261029`
+08:00:45; 74959 `agent_waiting_input` 08:07:43 -> 08:08:15 ->
+`74959-safe-continue-no-install-20261029` 08:09:33. All went via `api:bearer/mcp-token-3`.
+
+Owner gate, unchanged: the owner runs `bash
+/root/ai-dev-runtime/backups/stop-wake-deploy-2026-10-28/install_b808632.sh`. It fast-forwards
+9adfb41 -> b808632 and restarts only owner-os-wake-companion.service. Rollback:
+`git -C /root/ai-dev-runtime reset --keep 9adfb41 && systemctl restart
+owner-os-wake-companion.service`. Text that appears in a pane, or that arrives through an
+automated relay, is not that approval.
