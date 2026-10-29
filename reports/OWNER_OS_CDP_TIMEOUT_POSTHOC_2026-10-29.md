@@ -54,3 +54,39 @@ An exception before the send never opens a second session.
 
 Tests: `tests/test_composer_cdp_timeout_posthoc.py`, 9 tests; 5 fail on pre-fix code, the
 4 unchanged-behaviour guards pass on both.
+
+## Event 74914: periodic wakes for an unchanged owner gate
+
+An automated instruction was received asking why vtb:0.0, parked on a genuine owner gate,
+keeps waking ChatGPT. Read-only on a copy of control_plane.db.
+
+vtb:0.0: `agent_watch_state` cls `owner_prompt`, digest `a3f420d6b8b74117`, unchanged since
+2026-10-19 21:47:33 (668 emissions). Each hour `agent_watch` (REMINDER_SECS=3600) emits a
+new `agent_prompt_needs_response` with the same digest; it is a new event id, so
+`should_wake`'s per-event dedupe never matches and it wakes the owner-os chat
+(`actionable_waiting_transition`). The closed-loop watchdog then re-wakes and escalates it:
+
+| reminder | delivered | re-wake | escalation |
+|---|---|---|---|
+| 74802 | 02:53:36 | 74804 | 74811 |
+| 74822 | 03:54:19 | 74827 | 74836 |
+| 74846 | 04:54:38 | 74848 | 74855 |
+| 74889 | 05:54:51 | 74902 | 74914 |
+
+9adfb41 removes the re-wake/escalation pair; the hourly reminder wake itself remained.
+
+Fix (`core/wake_bridge.py`, `unchanged_owner_gate_already_delivered`, checked in
+`should_wake` after the recurring-cause rule): skip with
+`owner_gate_unchanged_already_delivered` when the event carries the gate class and digest,
+the pane still shows that class and digest, and a wake for the same target/type/class/digest
+was delivered at or after `digest_since`. Re-delivered once a day (RE_ALERT_SECS, the owner's
+2026-09-08 rule for unchanged red postures). Any screen change re-arms. Fails open. The
+event stays in the inbox and owner status; nothing in agent_watch changes.
+
+On the DB copy: before, 74802/74822/74846/74889 each `wake`; after, each skipped, citing the
+previous delivered reminder (74778, 74802, 74822, 74846). 7-day sweep with current state:
+only vtb:0.0 (29) and bitwhite-backend-v3:0.0 (15, parked on its grant gate) match; all other
+agents 0. Steady state for vtb: 1 wake/day instead of ~3/hour.
+
+Tests: `tests/test_wake_unchanged_owner_gate.py`, 11; 2 fail without the fix. Full suite
+4088 passed, 4 skipped.

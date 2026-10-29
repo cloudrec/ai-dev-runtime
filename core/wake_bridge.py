@@ -675,6 +675,65 @@ def recurring_cause_already_signalled(conn, *, event_id: int, event_type: str,
     return None
 
 
+# The owner-gated classes `agent_watch` publishes, keyed by the event type each becomes.
+_GATE_EVENT_CLASSES = {"agent_prompt_needs_response": "owner_prompt",
+                       "agent_waiting_input": "blocker"}
+
+
+def unchanged_owner_gate_already_delivered(conn, *, event_id: int, event_type: str,
+                                           agent_id: str,
+                                           now: Optional[float] = None) -> Optional[dict]:
+    """The delivered wake for this SAME, still-unchanged owner gate, or None.
+
+    `agent_watch` re-publishes an unanswered `owner_prompt`/`blocker` every
+    REMINDER_SECS with the same digest, each time as a new event, so
+    `already_woke_for_this_event` never matches and the chat was woken hourly about a
+    question only the owner can answer. vtb:0.0 has shown one owner prompt (digest
+    a3f420d6b8b74117, state waiting_owner) since 2026-10-19 21:47; on 2026-10-29 it
+    produced 74802, 74822, 74846 and 74889, each delivered to the owner-os chat, each
+    then re-woken and escalated (74914 is 74889's escalation).
+
+    Suppressed only when ALL hold: the event carries the gate class and a digest; the
+    pane STILL shows that class with that digest; and a wake for the same target, type,
+    class and digest was DELIVERED (wake_delivery.delivered=1) at or after the moment the
+    pane began showing it (`digest_since`). Any change on screen restarts `digest_since`,
+    so a changed or re-asked gate wakes again. Once a day the gate is re-delivered, the
+    same rule an unchanged red posture follows (owner decision 2026-09-08, RE_ALERT_SECS).
+    The event itself is untouched and stays in the durable inbox and owner status.
+
+    Fails OPEN: anything unreadable returns None and the wake proceeds as before.
+    """
+    cls = _GATE_EVENT_CLASSES.get(event_type)
+    if not cls or not agent_id:
+        return None
+    try:
+        row = conn.execute("SELECT payload FROM event WHERE id=?", (int(event_id),)).fetchone()
+        pl = json.loads(row[0]) if row and row[0] else {}
+        digest = str(pl.get("digest") or "")
+        if not digest or pl.get("class") != cls:
+            return None
+        st = conn.execute("SELECT cls,digest,digest_since FROM agent_watch_state "
+                          "WHERE target=?", (agent_id,)).fetchone()
+        if not st or st[0] != cls or st[1] != digest or st[2] is None:
+            return None
+        prior = conn.execute(
+            "SELECT e.id, d.ts FROM event e JOIN wake_delivery d "
+            "ON d.event_id=e.id AND d.delivered=1 "
+            "WHERE e.agent_id=? AND e.type=? AND e.id<? AND d.ts>=? "
+            "AND json_extract(e.payload,'$.digest')=? "
+            "AND json_extract(e.payload,'$.class')=? "
+            "ORDER BY d.ts DESC LIMIT 1",
+            (agent_id, event_type, int(event_id), float(st[2]), digest, cls)).fetchone()
+        if not prior:
+            return None
+        if now is not None and RE_ALERT_SECS > 0 and \
+                (float(now) - float(prior[1])) >= RE_ALERT_SECS:
+            return None
+        return {"event_id": int(prior[0]), "delivered_ts": float(prior[1])}
+    except Exception:  # noqa: BLE001 — never silence a gate because of a read error
+        return None
+
+
 def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
                 owner_action_required: bool = False, event_type: str = "",
                 project_id: str = "", agent_id: str = "", conn=None,
@@ -722,6 +781,12 @@ def should_wake(*, event_id: int, severity: str, correlation_id: str = "",
                         "actionable": actionable,
                         "first_signalled_event_id": seen["event_id"],
                         "first_signalled_at": seen["at"]}
+        gate = unchanged_owner_gate_already_delivered(
+            conn, event_id=int(event_id), event_type=event_type, agent_id=agent_id, now=now)
+        if gate:
+            return {"wake": False, "reason": "owner_gate_unchanged_already_delivered",
+                    "actionable": actionable,
+                    "first_signalled_event_id": gate["event_id"]}
         if actionable:
             # The generic floor is deliberately NOT consulted. A blocked pane waiting out a
             # cooldown earned by a two-day-old backlog entry is the exact stall this fixes.
