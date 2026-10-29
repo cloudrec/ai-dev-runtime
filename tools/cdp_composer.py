@@ -618,6 +618,13 @@ def _tab_to_reuse(conversation_url: str) -> Optional[dict]:
     return ALL_TABS_BUSY
 
 
+# A role match that is the turn's hidden heading (`<h4 data-conversation-role>`) stands for
+# the turn DIV that holds it; `u` is that DIV, or null when the match is the turn itself.
+_TURN_UNIT_JS = ("const u=(/^H[1-6]$/.test(e.tagName||'')&&e.hasAttribute('data-conversation-role')"
+                 "&&e.parentElement)?e.parentElement:null;")
+_TURN_IDS_ATTR = "data-chatgpt-search-message-ids"
+
+
 class _Session:
     """Minimal CDP client. Sends commands, returns only what the caller asks for."""
 
@@ -655,10 +662,18 @@ class _Session:
         """How many characters the LAST matching element renders. A length, never the
         text — the same discipline `last_attr` keeps by reading an opaque id. Used to
         tell a real answer from a turn that started and produced nothing. None when
-        unreadable, which fails closed at the caller."""
+        unreadable, which fails closed at the caller.
+
+        When the match is the turn's screen-reader heading, the length is that of the turn
+        around it without the heading. Measured live on 2026-10-29: ChatGPT renders no
+        `data-message-author-role` nodes at all. The role is now carried only by a
+        visually hidden `<h4 data-conversation-role>` ("ChatGPT said:"), so every
+        assistant turn read as 20 characters and an empty answer could never fail."""
         expr = (f"(function(){{const n=document.querySelectorAll({selector!r});"
-                f"if(!n.length)return -1;"
-                f"return (n[n.length-1].textContent||'').trim().length;}})()")
+                f"if(!n.length)return -1;const e=n[n.length-1];{_TURN_UNIT_JS}"
+                f"const own=(e.textContent||'').trim().length;"
+                f"if(!u)return own;"
+                f"return Math.max(0,(u.textContent||'').trim().length-own);}})()")
         r = self.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
         v = ((r.get("result") or {}).get("value"))
         if not isinstance(v, (int, float)):
@@ -668,10 +683,18 @@ class _Session:
     def last_attr(self, selector: str, attr: str) -> Optional[str]:
         """The named ATTRIBUTE of the last element matching the selector — an opaque id,
         never text. Returns None when unreadable, "" when absent; both fail closed at the
-        caller, which must then rely on the count alone."""
+        caller, which must then rely on the count alone.
+
+        `data-message-id` on a turn heading (see `last_len`) is read from the turn around
+        it, which now holds the turn's message UUIDs as `data-chatgpt-search-message-ids`.
+        That is still opaque ids, not content. Only assistant turns carry it; a user turn
+        reads "" as before."""
+        fallback = (f"if(!v&&{attr!r}==='data-message-id'&&u)"
+                    f"v=u.getAttribute({_TURN_IDS_ATTR!r})||'';")
         expr = (f"(function(){{const n=document.querySelectorAll({selector!r});"
-                f"if(!n.length)return '';"
-                f"return n[n.length-1].getAttribute({attr!r})||'';}})()")
+                f"if(!n.length)return '';const e=n[n.length-1];{_TURN_UNIT_JS}"
+                f"let v=e.getAttribute({attr!r})||'';{fallback}"
+                f"return v;}})()")
         r = self.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
         v = ((r.get("result") or {}).get("value"))
         return v if isinstance(v, str) else None

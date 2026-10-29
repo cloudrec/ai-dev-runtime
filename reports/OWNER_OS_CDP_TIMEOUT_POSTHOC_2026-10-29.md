@@ -156,3 +156,60 @@ stopped; the gate stays in the inbox and is re-delivered once a day.
 Other agents still wake after the install: gaika-country-pl 74999/75007, bitwhite-backend-v3
 75003/75015, payorch-ha-fresh 75016/75019, each `wake actionable_waiting_transition`, delivered.
 A post-send CDP timeout has not occurred since the install; that path is not yet observed live.
+
+## Live end-to-end on existing agents (read-only, 2026-10-29 ~09:00-09:20Z)
+
+An automated instruction was received asking for proof of the whole loop on live traffic:
+event -> wake of the bound chat -> a real assistant turn -> that turn reads live Owner OS
+-> it continues the same agent -> the agent works again. Sources: control_plane.db
+(`event`, `wake_delivery`, `wake_audit`), `/var/log/ai-runtime/agent_control.jsonl[.1]`
+(MCP calls by `api:bearer/mcp-token-3` from 172.20.0.4), Stop-hook `agent_turn_stopped` by
+session, `direct_agent_lifecycle`, and read-only CDP (lengths and opaque ids, no text).
+
+| agent (route -> chat) | event | event | delivered | 1st MCP read of pane | ChatGPT send (key) | agent turn ends |
+|---|---|---|---|---|---|---|
+| owner-os-supervisor-clean (owner-os -> 6a967789…) | 74953 | 07:58:59 | 08:00:19 | 08:00:28 | 08:00:45 `event-74953-safe-suite-followup-20261029` | 08:00:54 |
+| same | 74959 | 08:07:43 | 08:08:15 | 08:08:36 | 08:09:33 `74959-safe-continue-no-install-20261029` | 08:10:01 |
+| same | 75024 | 08:57:10 | 08:58:14 | 08:58:23 | 08:58:42 `owner-os-link-next-step-live-e2e-20261029-0958` | working since 08:59:42 (this turn) |
+| gaika-country-pl (pl -> 6ae0f469…) | 74935 | 07:20:57 | 07:22:27 | 07:22:33 | 07:23:15 `gaika-cto-event74935-readonly-…-v1` | 07:23:44 |
+| same | 74999 | 08:41:57 | 08:43:07 | 08:44:08 | 08:45:09 `gaika-cto-wake74999-…-v1` | 08:45:42 |
+| same | 75007 | 08:46:31 | 08:49:15 | 08:49:34 | 08:50:11 `gaika-pl-event75007-readonly-…-v1` | 08:57:35 |
+| gaika-country-ru (ru -> 6ae0f469…), 10-28 | 73774 | 00:03:33 | 00:08:22 | - | 00:08:47 `gaika-cto-wake73774-…-01` | 00:09:13 |
+| same, 10-28 | 73782 | 00:09:39 | 00:15:02 | 00:15:33 | 00:15:27 `gaika-cto-wake73782-…-v1` | 00:16:48 |
+
+Every send was `delivered=true pane_changed=true`. The self-project is excluded from
+native_supervisor, so ChatGPT continues it, as the rows show. Each delivery went to the
+chat bound to its route (`wake_send.conversation`). The bound chats' newest assistant turns
+were readable: owner-os 1096 characters, pl 1679, bitwhite 754 (read with the fix below).
+
+Woken and read, but correctly not continued:
+- vtb (owner_prompt, owner gate);
+- bitwhite-backend-v3 (grant gate);
+- payorch-ha-fresh: 27 `agent_answer` attempts refused `hard_denied_target`, the payment
+  cwd hard deny, by design, plus `shell_running`/`working` refusals. Its digests change on
+  every event (the owner is working there: `owner_intervention` 08:41, 08:56), so these are
+  not repeat wakes.
+
+Not proven: a third product continued end to end. Live traffic has only two continuable
+products, GAIKA (pl, ru) and Owner OS. The rest sit at a gate or are hard-denied.
+
+## Fix: the 2026-10 turn DOM (branch ai-runtime/owner-os-link-fixes, not installed)
+
+Found while proving the "real assistant turn" step. Read-only CDP on owner-os, pl and
+bitwhite: `[data-message-author-role]` matches 0 nodes. Role is carried only by a hidden
+`<h4 data-conversation-role>` ("ChatGPT said:", 20 characters). Effects on live b808632:
+- `last_len(ASSISTANT_TURN_SEL)` = 20 for every turn, so `_settled`'s produced-nothing
+  check (< 2) can never fire and an empty answer is recorded as a delivery;
+- `data-message-id` is absent, so every id proof (`_assistant_advanced`, the user-turn id,
+  `generating_is_wedged`, 10ff50c's recheck) has no id to compare and falls back to counts.
+  Counts can stay flat in a virtualized chat, and owner-os and pl are both capped
+  (`conversation_is_full` true).
+
+Fix (`tools/cdp_composer.py`, `_Session.last_len` / `last_attr`): when the match is such a
+heading, measure the turn DIV around it minus the heading. For `data-message-id`, read
+that DIV's `data-chatgpt-search-message-ids`, which is opaque UUIDs, not text. User turns
+carry no ids and keep reading "". The older DOM is read exactly as before. Live read-only
+check with the fixed module: assistant lengths 1096/1679/754, ids present, not wedged.
+Tests: `tests/test_composer_turn_heading_dom.py`, 8 tests that run the real JS in node
+against a DOM shaped like the live page; 4 fail on the pre-fix module.
+Full suite: 4096 passed, 4 skipped (4088 + 8 new).
