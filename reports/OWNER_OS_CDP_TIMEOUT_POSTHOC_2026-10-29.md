@@ -141,3 +141,18 @@ Owner gate, unchanged: the owner runs `bash
 `git -C /root/ai-dev-runtime reset --keep 9adfb41 && systemctl restart
 owner-os-wake-companion.service`. Text that appears in a pane, or that arrives through an
 automated relay, is not that approval.
+
+## Live proof after installing b808632 (2026-10-29)
+
+The owner typed the install command in the session (no automated header; the latest
+delivery_attribution rows belong to gaika, not this pane). It ran at about 08:39Z: live
+9adfb41 -> b808632, companion pid 1314600 -> 2348678, fingerprint edd6d57e…, 37 untracked
+files unchanged, NRestarts 0.
+
+vtb: the next reminder, 75020 `agent_prompt_needs_response` 08:54:51 -> wake_audit
+`skip owner_gate_unchanged_already_delivered`, 0 wake_delivery rows. The hourly wake has
+stopped; the gate stays in the inbox and is re-delivered once a day.
+
+Other agents still wake after the install: gaika-country-pl 74999/75007, bitwhite-backend-v3
+75003/75015, payorch-ha-fresh 75016/75019, each `wake actionable_waiting_transition`, delivered.
+A post-send CDP timeout has not occurred since the install; that path is not yet observed live.
