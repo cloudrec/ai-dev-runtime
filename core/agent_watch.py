@@ -655,6 +655,18 @@ _EVENT_FOR = {
 }
 
 
+# At-rest classes that a settled Full Cycle project explains (see _fullcycle_settled).
+_SETTLED_QUIET_CLASSES = frozenset({"quiescent", "completed"})
+
+
+def _fullcycle_settled(target: str, conn) -> bool:
+    try:
+        from core.fullcycle import engine as _fc
+        return bool(_fc.settled_project_for_agent(target, conn=conn))
+    except Exception:  # noqa: BLE001 — unknown: keep detecting
+        return False
+
+
 def _conn(conn=None):
     conn, own = _c(conn)
     for stmt in _SCHEMA.strip().split(";"):
@@ -831,6 +843,13 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 _reconcile_recovered_crash(conn, target, now)
             if cls not in _EVENT_FOR:
                 skipped.append({"target": target, "why": f"class_{cls}"})
+                continue
+            # At rest is the END STATE of an agent whose Full Cycle project is done: the
+            # engine's verified, reviewer-approved record outranks the pane's wording.
+            # Only the at-rest classes — a question, a blocker or a crash still emits.
+            if cls in _SETTLED_QUIET_CLASSES and _fullcycle_settled(target, conn):
+                skipped.append({"target": target, "why": "fullcycle_project_settled"})
+                conn.commit()
                 continue
             n_cls, n_dg, n_ts = (row[2], row[3], row[4]) if row else ("", "", 0)
             # Completed and crashed dedupe on CLASS alone: one rest period is one

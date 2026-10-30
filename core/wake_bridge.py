@@ -1701,6 +1701,25 @@ def abandoned_wakes(conn=None, limit: int = 50) -> list:
             conn.close()
 
 
+# Wakes about an agent STOPPING (never a question, a blocker or a failure), and the loop
+# watchdog's re-wakes of them. Retired undelivered once the agent's Full Cycle project is
+# settled (core.fullcycle.engine.settled_project_for_agent). The engine's own events —
+# the review request, project_completed — are always delivered.
+_SETTLED_STOP_TYPES = frozenset({"work_stopped_incomplete", "task_completed",
+                                 "agent_turn_stopped", "wake_loop_no_progress",
+                                 "wake_loop_stalled"})
+
+
+def _settled_stop_wake(conn, etype: str, esource: str, agent_id: str) -> bool:
+    if etype not in _SETTLED_STOP_TYPES or esource == "fullcycle" or not agent_id:
+        return False
+    try:
+        from core.fullcycle import engine as _fc
+        return bool(_fc.settled_project_for_agent(agent_id, conn=conn))
+    except Exception:  # noqa: BLE001 — unknown: deliver as before
+        return False
+
+
 def expire_stale(conn=None, now: Optional[float] = None) -> list:
     """Retire (acknowledge) every decided-but-undelivered wake that is either past
     `MAX_WAKE_AGE_SECS` or has since been marked invalid by agent_watch/stall_doctor's
@@ -1729,7 +1748,8 @@ def expire_stale(conn=None, now: Optional[float] = None) -> list:
         conn.execute(_EXPIRE_SCHEMA)
         conn.execute(_SUBMIT_SCHEMA)
         rows = conn.execute(
-            "SELECT a.event_id, a.ts, e.ts_epoch FROM wake_audit a "
+            "SELECT a.event_id, a.ts, e.ts_epoch, COALESCE(e.type,''), "
+            "COALESCE(e.source,''), COALESCE(e.agent_id,'') FROM wake_audit a "
             "LEFT JOIN event e ON e.id = a.event_id "
             "WHERE a.decision='wake' AND a.acknowledged=0 "
             "AND a.superseded_by IS NULL AND NOT EXISTS "
@@ -1744,7 +1764,7 @@ def expire_stale(conn=None, now: Optional[float] = None) -> list:
         event_ids = [int(r[0]) for r in rows]
         invalid_ids = _invalid_event_ids(conn, event_ids)
         expired = []
-        for event_id, decision_ts, event_ts_epoch in rows:
+        for event_id, decision_ts, event_ts_epoch, etype, esource, eagent in rows:
             decision_age = now - float(decision_ts or 0)
             # A missing event row (should not happen — the event log is append-only
             # and never deletes) means the event-age signal is UNKNOWN, not old: the
@@ -1758,6 +1778,10 @@ def expire_stale(conn=None, now: Optional[float] = None) -> list:
                 reason = "event_older_than_max_age"
             elif decision_age > MAX_WAKE_AGE_SECS:
                 reason = "stale_past_max_age"
+            elif _settled_stop_wake(conn, etype, esource, eagent):
+                # decided before (or racing) the project's completion; delivering it now
+                # would tell the tech lead a finished agent stopped
+                reason = "fullcycle_project_settled"
             else:
                 continue
             age_for_audit = event_age if event_age is not None else decision_age

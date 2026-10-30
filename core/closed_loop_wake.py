@@ -623,6 +623,14 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     # escalations Part 53 could not account for.
     if _natively_working(conn, target):
         return "runtime_reports_agent_working"
+    # The agent's Full Cycle project is DONE and nothing reached the agent since: no
+    # pane movement is the expected end state, not a stall (TaskBoard 76022 → 76047 →
+    # 76065). Only for watches about an agent STOPPING — a question, a blocker or a
+    # failure keeps its watch. Self-limiting: new work on the agent (a delivery, a turn,
+    # a reviewer task) makes settled_project_for_agent answer None again.
+    if _event_type(conn, event_id) in _SETTLED_RESOLVABLE_TYPES and _fullcycle_settled(
+            conn, target):
+        return "fullcycle_project_settled"
     try:
         cls = _watch_state_cls(conn, target)
         if cls == "working":
@@ -679,6 +687,26 @@ def _resolution_reason(conn, *, event_id: int, target: str,
     if delivered_ts is not None and target and _progress_since(conn, target, delivered_ts):
         return "progress_observed"
     return None
+
+
+_SETTLED_RESOLVABLE_TYPES = frozenset({"task_completed", "work_stopped_incomplete",
+                                       "agent_turn_stopped"})
+
+
+def _event_type(conn, event_id: int) -> str:
+    try:
+        r = conn.execute("SELECT type FROM event WHERE id=?", (int(event_id),)).fetchone()
+        return (r[0] if r else "") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _fullcycle_settled(conn, target: str) -> bool:
+    try:
+        from core.fullcycle import engine as _fc
+        return bool(_fc.settled_project_for_agent(target, conn=conn))
+    except Exception:  # noqa: BLE001 — unknown: keep the watch
+        return False
 
 
 def deregister_resolved(*, conn=None, now: Optional[float] = None, agents=None) -> list:

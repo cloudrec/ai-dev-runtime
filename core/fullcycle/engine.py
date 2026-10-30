@@ -933,3 +933,119 @@ def project_status(project_id: str, conn=None) -> dict:
     finally:
         if own:
             conn.close()
+
+
+# ── "this agent's work is finished" — for the watchers ──────────────────────────
+# agent_watch and the closed-loop wake watchdog judge an agent by its pane: at rest without
+# finish wording is `work_stopped_incomplete`, and a delivered wake with no pane movement
+# afterwards is `wake_loop_no_progress` → `wake_loop_stalled`. For an agent whose Full Cycle
+# project is DONE that is false: the engine's verified, reviewer-approved record says the
+# work finished, and idleness is the expected end state (TaskBoard 2026-10-30, events
+# 76026/76047/76065 after project_completed 76022).
+SETTLE_GRACE_SECS = 300   # the agent's own closing turn may end just after the approval
+
+
+def settled_project_for_agent(target: str, conn=None,
+                              now: Optional[float] = None) -> Optional[str]:
+    """The Full Cycle project `target` worked for, when nothing is left for that agent:
+
+      * every project that dispatched to its session has a `fc_project_done` row,
+      * every task of those projects is terminal and no review is pending or decided
+        but not yet applied,
+      * nothing happened on the agent after completion (past a short grace for its own
+        closing turn): no Owner OS delivery to it, no new turn of its own
+        (`agent_turn_stopped`, idle notifications excluded) and no movement of its pane
+        (agent_watch's `digest_since`) — the last also covers the owner typing into it.
+
+    None otherwise — an agent unknown to Full Cycle, an active or failed project, new
+    reviewer tasks, or any later work on the agent — so every other detection stays
+    exactly as it was. Read-only; any error answers None (detection preserved)."""
+    session = (target or "").strip().split(":", 1)[0]
+    if not session or session.startswith("session"):
+        return None
+    conn, own = cp._c(conn)
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                            "name='fc_project_done'").fetchone():
+            return None
+        if not conn.execute("SELECT 1 FROM fc_project_done LIMIT 1").fetchone():
+            return None                   # the cheap common answer for the hot paths
+        projects = set()
+        for pid, handle in conn.execute(
+                "SELECT project_id, handle FROM fc_task WHERE COALESCE(handle,'')<>''"):
+            try:
+                h = json.loads(handle)
+            except ValueError:
+                continue
+            if str(h.get("target") or "").split(":", 1)[0] == session:
+                projects.add(pid)
+        if not projects:
+            return None
+        done_ts, keys = 0.0, set()
+        for pid in sorted(projects):
+            done = conn.execute("SELECT ts FROM fc_project_done WHERE project_id=?",
+                                (pid,)).fetchone()
+            if not done:
+                return None
+            for (cid,) in conn.execute("SELECT contract_id FROM fc_task WHERE project_id=?",
+                                       (pid,)):
+                c = tc.get(cid, conn=conn)
+                if not c or c["state"] not in tc.TERMINAL:
+                    return None
+            if conn.execute("SELECT 1 FROM fc_review WHERE project_id=? AND (status="
+                            "'pending' OR (status='decided' AND COALESCE(applied,0)=0))",
+                            (pid,)).fetchone():
+                return None
+            done_ts = max(done_ts, float(done[0] or 0))
+            keys.add(pid)
+            p = specs.get_project(pid, conn=conn)
+            if p and p.get("root"):
+                from core import wake_routes
+                keys.add(wake_routes.normalize_key(os.path.basename(p["root"].rstrip("/"))))
+        since = done_ts + SETTLE_GRACE_SECS
+        keys.discard("")
+        # idle_prompt notifications are recorded as agent_turn_stopped too, and fire
+        # whenever a pane merely sits at the prompt: not new work
+        if conn.execute(
+                "SELECT 1 FROM event WHERE type='agent_turn_stopped' AND ts_epoch>? AND "
+                "COALESCE(json_extract(payload,'$.notification_type'),'')<>'idle_prompt' "
+                "AND project_id IN (%s) LIMIT 1" % ",".join("?" * len(keys)),
+                (since, *sorted(keys))).fetchone():
+            return None
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                        "name='agent_watch_state'").fetchone() and conn.execute(
+                "SELECT 1 FROM agent_watch_state WHERE (target=? OR substr(target,1,?)=?) "
+                "AND digest_since>? LIMIT 1",
+                (session, len(session) + 1, session + ":", since)).fetchone():
+            return None
+        if _delivered_to_since(session, done_ts):      # deliberate: no grace
+            return None
+        return sorted(projects)[0]
+    except Exception:  # noqa: BLE001 — unknown: never suppress a detection
+        return None
+    finally:
+        if own:
+            conn.close()
+
+
+def _delivered_to_since(session: str, since: float) -> bool:
+    """Did Owner OS type anything into this agent after `since` (agent_control's
+    delivery record)? Unreadable counts as yes: it must never hide later work."""
+    import sqlite3
+    path = os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+    if not os.path.exists(path):
+        return False                      # no delivery record exists at all
+    try:
+        c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        try:
+            if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                             "name='deliveries'").fetchone():
+                return False
+            return bool(c.execute(
+                "SELECT 1 FROM deliveries WHERE (target=? OR substr(target,1,?)=?) AND "
+                "created_ts>? LIMIT 1",
+                (session, len(session) + 1, session + ":", since)).fetchone())
+        finally:
+            c.close()
+    except Exception:  # noqa: BLE001
+        return True
