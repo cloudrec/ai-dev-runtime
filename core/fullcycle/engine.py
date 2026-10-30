@@ -1,7 +1,8 @@
 """The full-cycle engine: one persisted, restart-safe loop per project.
 
     spec ──seed──▶ task (contract CREATED)
-                    │  gates.check_dispatch      refused ─▶ OWNER_DECISION (owner gate)
+                    │  gates.check_dispatch (EVERY dispatch)   refused ─▶ OWNER_DECISION
+                    │  first attempt: clean git tree           dirty   ─▶ OWNER_DECISION
                     ▼
                   WORKING ── adapter.poll ──┬─ crashed ─▶ restart + redispatch (attempt+1)
                     │                       ├─ permission prompt ─▶ OWNER_DECISION
@@ -17,13 +18,24 @@
             VERIFIED_DONE ─▶ local commit ─▶ next task ─▶ … ─▶ spec checks ─▶ project done
 
 Persistence: the task's lifecycle is its `core.task_contract` (fail-closed transitions,
-immutable history); this module adds the per-attempt dispatch latch, the review inbox
-and the project latch, all in the control-plane DB. Every step can be re-run after a
-crash: the dispatch latch is written before the send and the adapter's submit is
-idempotent per key; a review row is unique per (task, attempt, kind) and its event is
-emitted only when the row is first inserted; a recorded decision is applied by the next
-tick, and applying is a no-op when the contract has already moved. One engine at a time
-per project, by a fenced lease.
+immutable history); this module adds the dispatch intent (`redispatch`), the per-attempt
+dispatch latch, the review inbox, the commit latch and the project latch, all in the
+control-plane DB. Every step can be re-run after a crash:
+  * a (re)dispatch is first recorded as an intent with its attempt and handle; the send
+    is retried from the intent until it succeeds, is refused for good (owner gate) or
+    fails too often (owner gate) — no path leaves a task waiting on nothing;
+  * the adapter's submit is idempotent per key (at-least-once on a crash mid-send);
+  * a verification records its attempt, and only a passing verification of the CURRENT
+    attempt is ever sent for review;
+  * a review row is unique per (task, attempt, kind); its event is emitted once;
+  * a recorded decision is applied by the next tick, and applying is a no-op when the
+    contract has already moved;
+  * an approved task is committed by the next tick if the process died before it;
+  * one engine per project, by a lease renewed before every step.
+
+Checks are commands the ENGINE runs: those of tasks the spec author wrote run as
+written; those of tasks the reviewer added must pass gates.check_argv (a test runner
+over project files only), so a review decision cannot make the engine run anything.
 
 What this engine never does: answer an agent's permission dialog, push, deploy, answer
 an owner gate, or bind a ChatGPT route.
@@ -32,6 +44,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from typing import Callable, Optional
 
 from core import task_contract as tc
@@ -50,6 +63,10 @@ MAX_ATTEMPTS = int(os.getenv("FULLCYCLE_MAX_ATTEMPTS", "3"))
 MAX_DISPATCH_FAILURES = 5
 CHECK_TIMEOUT = int(os.getenv("FULLCYCLE_CHECK_TIMEOUT", "300"))
 CHECK_ENV = {"PYTHONDONTWRITEBYTECODE": "1"}
+# longer than the worst tick (every check of a task at CHECK_TIMEOUT), renewed per step
+LEASE_TTL = int(os.getenv("FULLCYCLE_LEASE_TTL", "900"))
+OWNER_RESUME = ("resume", "retry", "approve")
+OWNER_CANCEL = ("cancel", "stop")
 
 # refusals that will not change by retrying: they need the owner
 _PERMANENT_REFUSALS = ("hard_denied", "not_allowlisted", "denied", "owner_proof",
@@ -61,7 +78,8 @@ CREATE TABLE IF NOT EXISTS fc_task (
     body TEXT, contract_id TEXT, attempt INTEGER DEFAULT 0, handle TEXT DEFAULT '',
     feedback TEXT DEFAULT '', verification TEXT DEFAULT '', gate_id TEXT DEFAULT '',
     dispatch_failures INTEGER DEFAULT 0, last_reason TEXT DEFAULT '',
-    origin TEXT DEFAULT 'spec', created_ts REAL, updated_ts REAL,
+    origin TEXT DEFAULT 'spec', redispatch INTEGER DEFAULT 0, committed INTEGER DEFAULT 0,
+    created_ts REAL, updated_ts REAL,
     UNIQUE (project_id, key)
 );
 CREATE TABLE IF NOT EXISTS fc_dispatch (
@@ -188,15 +206,27 @@ def submit_decision(review_id: int, decision: str, *, key: str, by: str,
 
 
 # ── engine ──────────────────────────────────────────────────────────────────
+class LeaseLost(RuntimeError):
+    pass
+
+
+_TASK_COLS = ("id", "key", "seq", "spec_version", "body", "contract_id", "attempt", "handle",
+              "feedback", "verification", "gate_id", "dispatch_failures", "last_reason",
+              "origin", "redispatch", "committed")
+
+
 class Engine:
     def __init__(self, project_id: str, adapter: ExecutorAdapter, *,
-                 host: Optional[ExecutionHost] = None, holder: str = "fullcycle-engine",
-                 lease_ttl: int = 120, max_attempts: int = MAX_ATTEMPTS,
+                 host: Optional[ExecutionHost] = None, holder: Optional[str] = None,
+                 lease_ttl: int = LEASE_TTL, max_attempts: int = MAX_ATTEMPTS,
                  commit_on_approve: bool = True, conn=None,
                  clock: Callable[[], float] = now_ts):
         self.project_id, self.adapter = project_id, adapter
         self.host = host or getattr(adapter, "host", None) or LocalHost()
-        self.holder, self.lease_ttl, self.max_attempts = holder, lease_ttl, max_attempts
+        # unique per process unless the caller names one: two engines started with the
+        # defaults must NOT share a lease
+        self.holder = holder or f"fullcycle-engine:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        self.lease_ttl, self.max_attempts = lease_ttl, max_attempts
         self.commit_on_approve, self.clock = commit_on_approve, clock
         self.conn, _ = connect(conn)
         p = specs.get_project(project_id, conn=self.conn)
@@ -205,6 +235,7 @@ class Engine:
         self.project = p
         self.root = p["root"]
         self.log: list = []
+        self._fence = 0
 
     # -- small helpers --------------------------------------------------------
     def _note(self, what: str, **kw) -> None:
@@ -216,19 +247,25 @@ class Engine:
                                entity_id=entity_id, payload=payload,
                                project_id=self.project_id, severity=severity,
                                owner_action_required=owner, dedup_key=dedup_key,
+                               dedup_window_secs=10 ** 9 if dedup_key else 0,
                                correlation_id=f"fullcycle:{self.project_id}",
                                conn=self.conn)
 
+    def _lead(self) -> None:
+        """Renew the lease; raise if another engine holds it."""
+        lease = cp.acquire_lease(f"fullcycle:{self.project_id}", self.holder,
+                                 ttl_secs=self.lease_ttl, now=self.clock(), conn=self.conn)
+        if not lease:
+            raise LeaseLost(self.holder)
+        self._fence = lease["fence_token"]
+
     def _tasks(self) -> list:
         rows = self.conn.execute(
-            "SELECT id, key, seq, spec_version, body, contract_id, attempt, handle, feedback,"
-            " verification, gate_id, dispatch_failures, last_reason, origin"
-            " FROM fc_task WHERE project_id=? ORDER BY seq", (self.project_id,)).fetchall()
+            f"SELECT {', '.join(_TASK_COLS)} FROM fc_task WHERE project_id=? ORDER BY seq",
+            (self.project_id,)).fetchall()
         out = []
         for r in rows:
-            t = dict(zip(("id", "key", "seq", "spec_version", "body", "contract_id", "attempt",
-                          "handle", "feedback", "verification", "gate_id",
-                          "dispatch_failures", "last_reason", "origin"), r))
+            t = dict(zip(_TASK_COLS, r))
             t["body"] = json.loads(t["body"])
             t["handle"] = json.loads(t["handle"]) if t["handle"] else {}
             t["verification"] = json.loads(t["verification"]) if t["verification"] else {}
@@ -236,10 +273,14 @@ class Engine:
             out.append(t)
         return out
 
-    def _set(self, task_id: str, **cols) -> None:
-        cols["updated_ts"] = self.clock()
-        sets = ", ".join(f"{k}=?" for k in cols)
-        self.conn.execute(f"UPDATE fc_task SET {sets} WHERE id=?", (*cols.values(), task_id))
+    def _set(self, task: dict, **cols) -> None:
+        """Persist and mirror into the in-memory task (the two must never drift)."""
+        task.update({k: v for k, v in cols.items()})
+        db = {k: (_j(v) if k in ("handle", "verification") and not isinstance(v, str) else v)
+              for k, v in cols.items()}
+        db["updated_ts"] = self.clock()
+        sets = ", ".join(f"{k}=?" for k in db)
+        self.conn.execute(f"UPDATE fc_task SET {sets} WHERE id=?", (*db.values(), task["id"]))
         self.conn.commit()
 
     def _move(self, task: dict, to: str, evidence: Optional[dict] = None) -> None:
@@ -248,6 +289,9 @@ class Engine:
         tc.transition(task["contract_id"], to, by=SOURCE, evidence=evidence, conn=self.conn)
         self._note("transition", task=task["key"], frm=task["state"], to=to)
         task["state"] = to
+
+    def _trusted(self, task: dict) -> bool:
+        return task["origin"] == "spec"
 
     # -- seeding --------------------------------------------------------------
     def add_task(self, t: dict, *, spec_version: int, origin: str) -> Optional[str]:
@@ -276,31 +320,79 @@ class Engine:
         return tid
 
     def _seed(self) -> None:
-        s = specs.get_spec(self.project_id, conn=self.conn)
-        if not s:
+        """Tasks of the latest spec. A task's origin is WHO first put its key into the
+        spec — so a reviewer-added task re-seeded after a crash stays untrusted."""
+        versions = self.conn.execute(
+            "SELECT version, body, by FROM fc_spec WHERE project_id=? ORDER BY version",
+            (self.project_id,)).fetchall()
+        if not versions:
             raise EngineError("project has no spec")
-        for t in s["body"]["tasks"]:
-            self.add_task(t, spec_version=s["version"], origin="spec")
+        first_by: dict = {}
+        for _, body, by in versions:
+            for t in json.loads(body)["tasks"]:
+                first_by.setdefault(t["key"], by)
+        latest_v, latest_body, _ = versions[-1]
+        for t in json.loads(latest_body)["tasks"]:
+            by = first_by[t["key"]]
+            self.add_task(t, spec_version=latest_v,
+                          origin=by if by.startswith("review:") else "spec")
 
     # -- dispatch -------------------------------------------------------------
     def _envelope(self, task: dict, attempt: int) -> TaskEnvelope:
         c = tc.get(task["contract_id"], conn=self.conn)["contract"]
         base = os.path.join(self.root, ".fullcycle")
-        safe = task["key"].replace("/", "_")
         return TaskEnvelope(
             task_id=task["id"], attempt=attempt, project_id=self.project_id,
             workdir=self.root, goal=c["goal"],
             acceptance_criteria=tuple(c["acceptance_criteria"]), scope=tuple(c["scope"]),
             do_not_touch=tuple(c["do_not_touch"]), feedback=task["feedback"] or "",
-            envelope_path=os.path.join(base, "tasks", f"{safe}-{attempt}.json"),
-            result_path=os.path.join(base, "results", f"{safe}-{attempt}.json"))
+            envelope_path=os.path.join(base, "tasks", f"{task['key']}-{attempt}.json"),
+            result_path=os.path.join(base, "results", f"{task['key']}-{attempt}.json"))
 
-    def _dispatch(self, task: dict, attempt: int) -> dict:
+    def _request_dispatch(self, task: dict, attempt: int, *, feedback: Optional[str] = None) -> None:
+        """Record the intent first; `_try_dispatch` carries it out now or on a later tick."""
+        cols = {"redispatch": attempt, "dispatch_failures": 0}
+        if feedback is not None:
+            cols["feedback"] = feedback[:4000]
+        self._set(task, **cols)
+        self._try_dispatch(task)
+
+    def _refusal(self, task: dict, attempt: int) -> Optional[str]:
+        c = tc.get(task["contract_id"], conn=self.conn)["contract"]
+        r = gates.check_dispatch(root=self.root, executor=self.project["executor"],
+                                 contract=c, checks=task["body"]["checks"],
+                                 trusted_checks=self._trusted(task))
+        if r:
+            return f"permission_denied:{r}"
+        never_sent = not self.conn.execute(
+            "SELECT 1 FROM fc_dispatch WHERE idem_key=?",
+            (f"fullcycle:{task['id']}:{attempt}",)).fetchone()
+        if attempt == 1 and never_sent:
+            # (once the first send may have gone out, changes can be the agent's own)
+            dirty = self._changed_files()
+            if dirty:
+                # the first attempt must start from a clean tree: everything changed
+                # afterwards is then provably the agent's, and nothing of anyone else's
+                # can be verified as its work or restored away
+                return "dirty_worktree:" + ",".join(dirty[:5])
+        return None
+
+    def _try_dispatch(self, task: dict) -> bool:
+        attempt = task["redispatch"]
+        refusal = self._refusal(task, attempt)
+        if refusal:
+            self._set(task, redispatch=0)
+            self._owner(task, refusal)
+            return False
         key = f"fullcycle:{task['id']}:{attempt}"
+        env = self._envelope(task, attempt)
         self.conn.execute("INSERT OR IGNORE INTO fc_dispatch VALUES (?,?,?,?,?,?)",
                           (key, task["id"], attempt, "sending", "", self.clock()))
         self.conn.commit()
-        env = self._envelope(task, attempt)
+        # attempt + handle BEFORE the send: a crash after it then polls the right result
+        self._set(task, attempt=attempt, verification="",
+                  handle={"task_id": task["id"], "attempt": attempt, "key": key,
+                          "envelope": env.envelope_path, "result": env.result_path})
         r = self.adapter.submit(env, key)
         if not r["ok"] and r["reason"] == "agent_not_running" and self.adapter.owns_agent:
             self._note("agent_restart", task=task["key"], why="not_running_at_dispatch",
@@ -310,59 +402,44 @@ class Engine:
                           ("sent" if r["ok"] else "failed", r["reason"], self.clock(), key))
         self.conn.commit()
         if r["ok"]:
-            self._set(task["id"], attempt=attempt, handle=_j(r["handle"]), dispatch_failures=0,
-                      last_reason=r["reason"])
-            task.update(attempt=attempt, handle=r["handle"])
-            self._note("dispatched", task=task["key"], attempt=attempt, already=r["already"])
-        return r
-
-    def _dispatch_or_hold(self, task: dict, attempt: int) -> bool:
-        """True when the task is now with the agent."""
-        r = self._dispatch(task, attempt)
-        if r["ok"]:
             self._move(task, tc.WORKING)
+            self._set(task, handle=r["handle"], redispatch=0, dispatch_failures=0,
+                      last_reason=r["reason"])
+            self._note("dispatched", task=task["key"], attempt=attempt, already=r["already"])
             return True
         reason = r["reason"]
         if any(p in reason for p in _PERMANENT_REFUSALS):
+            self._set(task, redispatch=0)
             self._owner(task, f"dispatch_refused:{reason}")
             return False
         n = task["dispatch_failures"] + 1
-        self._set(task["id"], dispatch_failures=n, last_reason=reason)
-        task["dispatch_failures"] = n
+        self._set(task, dispatch_failures=n, last_reason=reason)
         self._note("dispatch_deferred", task=task["key"], reason=reason, failures=n)
         if n >= MAX_DISPATCH_FAILURES:
+            self._set(task, redispatch=0)
             self._block_for_owner(task, f"dispatch_failed_{n}x:{reason}")
         return False
 
     # -- owner / gpt hand-offs ------------------------------------------------
+    def _open_gate(self, task: dict, reason: str, extra: Optional[dict] = None) -> None:
+        g = cp.open_gate(work_item_id=task["id"], agent_id=self.adapter.name,
+                         reason=reason, kind="fullcycle", conn=self.conn)
+        self._set(task, gate_id=g["id"], last_reason=reason)
+        self._event(OWNER_EVENT, task["id"], {"reason": reason, "gate_id": g["id"],
+                                              "task": task["key"], **(extra or {})},
+                    owner=True, dedup_key=f"fullcycle:owner:{g['id']}")
+
     def _owner(self, task: dict, reason: str, extra: Optional[dict] = None) -> None:
         """Only the owner can lift this: a gate in the control plane + an owner event."""
-        if task["state"] not in (tc.OWNER_DECISION,):
-            self._move(task, tc.OWNER_DECISION)
+        self._move(task, tc.OWNER_DECISION)
         if not task["gate_id"]:
-            g = cp.open_gate(work_item_id=task["id"], agent_id=self.adapter.name,
-                             reason=reason, kind="fullcycle", conn=self.conn)
-            self._set(task["id"], gate_id=g["id"], last_reason=reason)
-            task["gate_id"] = g["id"]
-            self._event(OWNER_EVENT, task["id"], {"reason": reason, "gate_id": g["id"],
-                                                  "task": task["key"], **(extra or {})},
-                        owner=True, dedup_key=f"fullcycle:owner:{g['id']}")
+            self._open_gate(task, reason, extra)
         self._note("owner_gate", task=task["key"], reason=reason)
 
     def _block_for_owner(self, task: dict, reason: str) -> None:
-        if task["state"] != tc.BLOCKED:
-            self._move(task, tc.BLOCKED)
-        self._owner_gate_only(task, reason)
-
-    def _owner_gate_only(self, task: dict, reason: str) -> None:
+        self._move(task, tc.BLOCKED)
         if not task["gate_id"]:
-            g = cp.open_gate(work_item_id=task["id"], agent_id=self.adapter.name,
-                             reason=reason, kind="fullcycle", conn=self.conn)
-            self._set(task["id"], gate_id=g["id"], last_reason=reason)
-            task["gate_id"] = g["id"]
-            self._event(OWNER_EVENT, task["id"], {"reason": reason, "gate_id": g["id"],
-                                                  "task": task["key"]},
-                        owner=True, dedup_key=f"fullcycle:owner:{g['id']}")
+            self._open_gate(task, reason)
         self._note("blocked_for_owner", task=task["key"], reason=reason)
 
     def _request_review(self, task: dict, kind: str, payload: dict) -> int:
@@ -387,25 +464,39 @@ class Engine:
                        event_id=eid)
         return rid
 
+    def _review_for(self, task: dict, kind: str) -> Optional[int]:
+        r = self.conn.execute("SELECT id FROM fc_review WHERE project_id=? AND task_id=? AND"
+                              " attempt=? AND kind=?",
+                              (self.project_id, task["id"], task["attempt"], kind)).fetchone()
+        return r[0] if r else None
+
     # -- verification ---------------------------------------------------------
     def _git(self, *args) -> tuple:
         return self.host.run(["git", "-C", self.root, *args], timeout=60)
 
     def _changed_files(self) -> Optional[list]:
-        rc, out, _ = self._git("status", "--porcelain=v1", "-uall")
+        """Paths changed against HEAD, both sides of every move (renames are not
+        detected, so a moved protected file shows as its deletion), NUL-separated so no
+        name is ever mis-parsed. None when the workdir is not a git repo. Gitignored
+        files are not seen — a stated limit."""
+        rc, out, _ = self._git("status", "--porcelain=v1", "-z", "--no-renames", "-uall")
         if rc != 0:
             return None
         files = []
-        for line in out.splitlines():
-            path = line[3:]
-            if " -> " in path:
-                path = path.split(" -> ", 1)[1]
-            files.append(path.strip().strip('"'))
+        for entry in out.split("\0"):
+            if len(entry) > 3:
+                path = entry[3:]
+                if path != ".fullcycle" and not path.startswith(".fullcycle/"):
+                    files.append(path)
         return files
 
-    def _run_checks(self, checks: list) -> list:
+    def _run_checks(self, checks: list, *, trusted: bool) -> list:
         out = []
         for argv in checks:
+            refused = gates.check_argv(argv, root=self.root, trusted=trusted)
+            if refused:
+                out.append({"argv": argv, "rc": None, "passed": False, "output": refused})
+                continue
             # no bytecode cache: a rewrite of the same size within the same second
             # otherwise runs the STALE .pyc and fails a correct fix (seen in testing)
             rc, so, se = self.host.run(argv, cwd=self.root, timeout=CHECK_TIMEOUT,
@@ -423,115 +514,22 @@ class Engine:
             source = "git"
         violations = gates.check_changes(changed, scope=c["scope"],
                                          do_not_touch=c["do_not_touch"])
-        checks = self._run_checks(task["body"]["checks"])
-        passed = not violations and all(x["passed"] for x in checks) and bool(checks)
+        checks = self._run_checks(task["body"]["checks"], trusted=self._trusted(task))
+        passed = not violations and bool(checks) and all(x["passed"] for x in checks)
         reasons = violations + [f"check_failed:{' '.join(x['argv'])}"
                                 for x in checks if not x["passed"]]
         if not checks:
             reasons.append("task_has_no_checks")
-        return {"passed": passed, "changed_files": changed, "changed_source": source,
-                "violations": violations, "checks": checks, "reasons": reasons,
-                "summary": result.get("summary", "")}
-
-    # -- one task step --------------------------------------------------------
-    def _step(self, task: dict) -> None:
-        st = task["state"]
-        if st == tc.CREATED:
-            c = tc.get(task["contract_id"], conn=self.conn)["contract"]
-            refusal = gates.check_dispatch(root=self.root, executor=self.project["executor"],
-                                           contract=c)
-            if refusal:
-                self._owner(task, f"permission_denied:{refusal}")
-                return
-            self._dispatch_or_hold(task, max(task["attempt"], 0) + 1
-                                   if not self._sent(task) else task["attempt"])
-        elif st == tc.WORKING:
-            self._step_working(task)
-        elif st == tc.AGENT_DONE:
-            self._step_agent_done(task)
-        elif st == tc.VERIFYING:
-            if not self._review_for(task, "review") and task["verification"]:
-                self._request_review(task, "review", self._review_payload(task))
-            elif not task["verification"]:
-                # crashed between AGENT_DONE->VERIFYING and recording the verification
-                result = self.adapter.collect(task["handle"]) or {}
-                self._finish_verification(task, self._verify(task, result))
-        elif st == tc.VERIFICATION_FAILED:
-            self._retry(task, why="verification_failed")
-
-    def _sent(self, task: dict) -> bool:
-        """The current attempt's dispatch already went out (crash after the send)."""
-        if not task["attempt"]:
-            return False
-        r = self.conn.execute("SELECT status FROM fc_dispatch WHERE idem_key=?",
-                              (f"fullcycle:{task['id']}:{task['attempt']}",)).fetchone()
-        return bool(r and r[0] in ("sent", "sending"))
-
-    def _step_working(self, task: dict) -> None:
-        if not task["handle"]:
-            # crash between latch and recording the handle: resend the same key
-            self._dispatch_or_hold(task, task["attempt"] or 1)
-            return
-        obs = self.adapter.poll(task["handle"])
-        if obs.state == DONE:
-            result = self.adapter.collect(task["handle"]) or {}
-            if result.get("status") == "blocked":
-                self._move(task, tc.BLOCKED)
-                self._request_review(task, "blocked", {
-                    "question": str(result.get("question") or result.get("summary"))[:4000]})
-                return
-            self._move(task, tc.AGENT_DONE)
-            self._step_agent_done(task, result)
-        elif obs.state == CRASHED:
-            self._note("agent_crashed", task=task["key"], attempt=task["attempt"],
-                       detail=obs.detail)
-            if not self.adapter.owns_agent:
-                self._block_for_owner(task, "agent_crashed_not_owned")
-                return
-            if task["attempt"] >= self.max_attempts:
-                self._block_for_owner(task, f"max_attempts_{self.max_attempts}_after_crash")
-                return
-            rs = self.adapter.restart(task["handle"])
-            self._note("agent_restart", task=task["key"], result=rs)
-            if rs.get("ok"):
-                fb = ("The previous attempt ended because the agent process exited. "
-                      "Continue from the current state of the workdir.")
-                self._set(task["id"], feedback=fb)
-                task["feedback"] = fb
-                self._dispatch_or_hold(task, task["attempt"] + 1)
-        elif obs.state == WAITING_PERMISSION:
-            gate = gates.check_permission_prompt(obs.detail.get("command", ""), root=self.root)
-            self._owner(task, "agent_permission_prompt", {"permission": gate})
-
-    def _step_agent_done(self, task: dict, result: Optional[dict] = None) -> None:
-        if result is None:
-            result = self.adapter.collect(task["handle"]) or {}
-        self._move(task, tc.VERIFYING)
-        self._finish_verification(task, self._verify(task, result))
-
-    def _finish_verification(self, task: dict, v: dict) -> None:
-        self._set(task["id"], verification=_j(v))
-        task["verification"] = v
-        if not v["passed"]:
-            self._move(task, tc.VERIFICATION_FAILED, evidence={"verification": v})
-            feedback = "Automatic verification failed: " + "; ".join(v["reasons"])
-            restored = self._restore_violations(v)
-            if restored:
-                feedback += ("\nOwner OS restored these files from HEAD because they are "
-                             "outside your scope: " + ", ".join(restored))
-            for x in v["checks"]:
-                if not x["passed"]:
-                    feedback += f"\n$ {' '.join(x['argv'])} (rc={x['rc']})\n{x['output'][-800:]}"
-            self._set(task["id"], feedback=feedback[:4000])
-            task["feedback"] = feedback[:4000]
-            self._retry(task, why="verification_failed")
-            return
-        self._request_review(task, "review", self._review_payload(task))
+        return {"attempt": task["attempt"], "passed": passed, "changed_files": changed,
+                "changed_source": source, "violations": violations, "checks": checks,
+                "reasons": reasons, "summary": result.get("summary", "")}
 
     def _restore_violations(self, v: dict) -> list:
         """A tracked file the task may not touch is put back as it was at HEAD; left in
-        place it would fail every later attempt. Untracked files are not deleted —
-        the agent is told to remove them."""
+        place it would fail every later attempt. Safe only because the first attempt
+        starts from a clean tree (`_refusal`) and approved work is committed before the
+        next task starts — so every change in the tree is this task's agent's. Untracked
+        files are never deleted; the agent is told to remove them."""
         if v.get("changed_source") != "git":
             return []
         out = []
@@ -546,6 +544,25 @@ class Engine:
             self._note("restored_outside_scope", files=out)
         return out
 
+    def _finish_verification(self, task: dict, v: dict) -> None:
+        if not v["passed"]:
+            # the contract moves FIRST: a crash after it can never send a failed
+            # verification to review
+            self._move(task, tc.VERIFICATION_FAILED, evidence={"verification": v})
+            feedback = "Automatic verification failed: " + "; ".join(v["reasons"])
+            restored = self._restore_violations(v)
+            if restored:
+                feedback += ("\nOwner OS restored these files from HEAD because they are "
+                             "outside your scope: " + ", ".join(restored))
+            for x in v["checks"]:
+                if not x["passed"]:
+                    feedback += f"\n$ {' '.join(x['argv'])} (rc={x['rc']})\n{x['output'][-800:]}"
+            self._set(task, verification=v, feedback=feedback[:4000])
+            self._retry(task, why="verification_failed")
+            return
+        self._set(task, verification=v)
+        self._request_review(task, "review", self._review_payload(task))
+
     def _review_payload(self, task: dict) -> dict:
         v = task["verification"]
         return {"title": task["body"]["title"], "goal": task["body"]["goal"],
@@ -553,17 +570,76 @@ class Engine:
                 "summary": v.get("summary", ""), "changed_files": v.get("changed_files", []),
                 "checks": [{"argv": x["argv"], "passed": x["passed"]} for x in v["checks"]]}
 
-    def _retry(self, task: dict, *, why: str) -> None:
+    def _retry(self, task: dict, *, why: str, feedback: Optional[str] = None) -> None:
         if task["attempt"] >= self.max_attempts:
             self._block_for_owner(task, f"max_attempts_{self.max_attempts}:{why}")
             return
-        self._dispatch_or_hold(task, task["attempt"] + 1)
+        self._request_dispatch(task, task["attempt"] + 1, feedback=feedback)
 
-    def _review_for(self, task: dict, kind: str) -> Optional[int]:
-        r = self.conn.execute("SELECT id FROM fc_review WHERE project_id=? AND task_id=? AND"
-                              " attempt=? AND kind=?",
-                              (self.project_id, task["id"], task["attempt"], kind)).fetchone()
-        return r[0] if r else None
+    # -- one task step --------------------------------------------------------
+    def _step(self, task: dict) -> None:
+        if task["redispatch"]:
+            self._try_dispatch(task)
+            return
+        st = task["state"]
+        if st == tc.CREATED:
+            self._request_dispatch(task, 1)
+        elif st == tc.WORKING:
+            self._step_working(task)
+        elif st == tc.AGENT_DONE:
+            self._verify_current(task)
+        elif st == tc.VERIFYING:
+            v = task["verification"]
+            if v and v.get("attempt") == task["attempt"] and v.get("passed"):
+                if not self._review_for(task, "review"):
+                    self._request_review(task, "review", self._review_payload(task))
+            else:
+                self._verify_current(task)       # crashed before the result was recorded
+        elif st == tc.VERIFICATION_FAILED:
+            self._retry(task, why="verification_failed")
+        elif st == tc.BLOCKED and not task["gate_id"]:
+            if not self._review_for(task, "blocked"):
+                # crashed between BLOCKED and the review request
+                result = self.adapter.collect(task["handle"]) or {}
+                self._request_review(task, "blocked", {
+                    "question": str(result.get("question") or result.get("summary")
+                                    or "the agent reported blocked")[:4000]})
+        elif st == tc.OWNER_DECISION and not task["gate_id"]:
+            self._open_gate(task, task["last_reason"] or "owner_decision_without_gate")
+
+    def _verify_current(self, task: dict) -> None:
+        self._move(task, tc.VERIFYING)
+        self._finish_verification(task, self._verify(task, self.adapter.collect(task["handle"]) or {}))
+
+    def _step_working(self, task: dict) -> None:
+        obs = self.adapter.poll(task["handle"])
+        if obs.state == DONE:
+            result = self.adapter.collect(task["handle"]) or {}
+            if result.get("status") == "blocked":
+                self._move(task, tc.BLOCKED)
+                self._request_review(task, "blocked", {
+                    "question": str(result.get("question") or result.get("summary"))[:4000]})
+                return
+            self._move(task, tc.AGENT_DONE)
+            self._verify_current(task)
+        elif obs.state == CRASHED:
+            self._note("agent_crashed", task=task["key"], attempt=task["attempt"],
+                       detail=obs.detail)
+            if not self.adapter.owns_agent:
+                self._block_for_owner(task, "agent_crashed_not_owned")
+                return
+            if task["attempt"] >= self.max_attempts:
+                self._block_for_owner(task, f"max_attempts_{self.max_attempts}_after_crash")
+                return
+            rs = self.adapter.restart(task["handle"])
+            self._note("agent_restart", task=task["key"], result=rs)
+            if rs.get("ok"):
+                self._request_dispatch(task, task["attempt"] + 1, feedback=(
+                    "The previous attempt ended because the agent process exited. "
+                    "Continue from the current state of the workdir."))
+        elif obs.state == WAITING_PERMISSION:
+            gate = gates.check_permission_prompt(obs.detail.get("command", ""), root=self.root)
+            self._owner(task, "agent_permission_prompt", {"permission": gate})
 
     # -- decisions --------------------------------------------------------------
     def _apply_decisions(self) -> None:
@@ -571,41 +647,41 @@ class Engine:
             "SELECT id, task_id, attempt, kind, decision, decision_key, decided_by,"
             " decision_body FROM fc_review WHERE project_id=? AND status='decided' AND"
             " applied=0 ORDER BY id", (self.project_id,)).fetchall()
-        tasks = {t["id"]: t for t in self._tasks()}
         for rid, task_id, attempt, kind, decision, key, by, body in rows:
+            self._lead()
             body = json.loads(body or "{}")
-            task = tasks.get(task_id)
+            task = next((t for t in self._tasks() if t["id"] == task_id), None)
             review = {"review_id": rid, "by": by, "key": key, "decision": decision,
                       "feedback": body.get("feedback", "")}
+            applied = True
             if kind == "project":
                 self._apply_project_decision(rid, decision, body)
             elif task is None or task["attempt"] != attempt:
-                pass                                    # stale: nothing to apply to
+                applied = False                         # stale: nothing to apply to
             elif kind == "review" and task["state"] == tc.VERIFYING:
                 if decision == "approve":
                     self._move(task, tc.VERIFIED_DONE, evidence={
                         "tests": task["verification"]["checks"], "review": review})
-                    self._commit(task)
                 else:
                     self._move(task, tc.VERIFICATION_FAILED, evidence={"review": review})
-                    fb = "Reviewer rejected: " + review["feedback"]
-                    self._set(task_id, feedback=fb)
-                    task["feedback"] = fb
+                    self._set(task, feedback="Reviewer rejected: " + review["feedback"])
             elif kind == "blocked" and task["state"] == tc.BLOCKED:
                 if decision == "answer":
-                    fb = "Answer from the tech lead: " + review["feedback"]
-                    self._set(task_id, feedback=fb)
-                    task["feedback"] = fb
-                    self._retry(task, why="blocked_answered")
+                    self._retry(task, why="blocked_answered",
+                                feedback="Answer from the tech lead: " + review["feedback"])
                 else:
                     self._move(task, tc.CANCELLED)
-            if kind != "project" and body.get("next_tasks"):
+            else:
+                applied = False
+            # tasks a decision proposes only count when the decision itself took effect
+            if applied and kind != "project" and body.get("next_tasks"):
                 self._add_tasks(body["next_tasks"], origin=f"review:{rid}")
             self.conn.execute("UPDATE fc_review SET applied=1 WHERE id=?", (rid,))
             self.conn.commit()
-            self._note("decision_applied", review_id=rid, decision=decision)
+            self._note("decision_applied" if applied else "decision_stale",
+                       review_id=rid, decision=decision)
 
-    def _add_tasks(self, tasks: list, *, origin: str) -> None:
+    def _add_tasks(self, tasks: list, *, origin: str) -> int:
         cur = specs.get_spec(self.project_id, conn=self.conn)
         body = dict(cur["body"])
         have = {t["key"] for t in body["tasks"]}
@@ -613,28 +689,51 @@ class Engine:
         if new:
             body["tasks"] = body["tasks"] + new
             cur = specs.put_spec(self.project_id, body, by=origin, conn=self.conn)
+        created = 0
         for t in tasks:
-            self.add_task(t, spec_version=cur["version"], origin=origin)
+            created += bool(self.add_task(t, spec_version=cur["version"], origin=origin))
+        return created
 
     def _apply_project_decision(self, rid: int, decision: str, body: dict) -> None:
+        added = 0
         if decision == "add_tasks":
-            self._add_tasks(body.get("next_tasks") or [], origin=f"review:{rid}")
-        else:
+            added = self._add_tasks(body.get("next_tasks") or [], origin=f"review:{rid}")
+        if not added:
             self._event(OWNER_EVENT, f"{self.project_id}:__project__",
-                        {"reason": "project_acceptance_escalated", "review_id": rid,
+                        {"reason": "project_acceptance_escalated" if decision != "add_tasks"
+                         else "project_add_tasks_added_nothing", "review_id": rid,
                          "feedback": body.get("feedback", "")},
                         owner=True, dedup_key=f"fullcycle:escalate:{rid}")
 
-    def _commit(self, task: dict) -> None:
-        if not self.commit_on_approve or self._git("rev-parse", "--git-dir")[0] != 0:
-            return
-        self._git("add", "-A", "--", ".", ":(exclude).fullcycle")
-        rc, out, err = self.host.run(
-            ["git", "-C", self.root, "-c", "user.name=Owner OS fullcycle",
-             "-c", "user.email=fullcycle@localhost", "commit", "-q", "--no-verify", "-m",
-             f"fullcycle: {task['key']} (attempt {task['attempt']}) — {task['body']['title']}"],
-            timeout=60)
-        self._note("committed", task=task["key"], rc=rc, out=(out + err).strip()[-200:])
+    def _commit_pending(self) -> None:
+        """Commit every approved task not yet committed — also after a crash between the
+        approval and the commit. Nothing staged means it was committed already."""
+        for task in self._tasks():
+            if task["state"] != tc.VERIFIED_DONE or task["committed"]:
+                continue
+            if not self.commit_on_approve or self._git("rev-parse", "--git-dir")[0] != 0:
+                # the owner commits; until then the dirty tree holds the next task
+                self._set(task, committed=1)
+                continue
+            self._git("add", "-A", "--", ".", ":(exclude).fullcycle")
+            if self._git("diff", "--cached", "--quiet")[0] == 0:
+                self._set(task, committed=1)
+                continue
+            rc, out, err = self.host.run(
+                ["git", "-C", self.root, "-c", "user.name=Owner OS fullcycle",
+                 "-c", "user.email=fullcycle@localhost", "commit", "-q", "--no-verify", "-m",
+                 f"fullcycle: {task['key']} (attempt {task['attempt']}) — {task['body']['title']}"],
+                timeout=60)
+            if rc == 0:
+                self._set(task, committed=1)
+                self._note("committed", task=task["key"])
+            else:
+                self._set(task, last_reason=f"commit_failed:{(out + err).strip()[-200:]}")
+                self._event(OWNER_EVENT, task["id"], {"reason": "commit_failed",
+                                                      "task": task["key"],
+                                                      "detail": (out + err).strip()[-500:]},
+                            owner=True, dedup_key=f"fullcycle:commit_failed:{task['id']}")
+                self._note("commit_failed", task=task["key"])
 
     # -- owner gates answered ----------------------------------------------------
     def _owner_answers(self) -> None:
@@ -645,32 +744,29 @@ class Engine:
                                   (task["gate_id"],)).fetchone()
             if not r or r[0] != "answered":
                 continue
+            self._lead()
             answer = (r[1] or "").strip().lower()
             self.conn.execute("UPDATE owner_gate SET state='resolved' WHERE id=?",
                               (task["gate_id"],))
-            self._set(task["id"], gate_id="")
-            task["gate_id"] = ""
+            self.conn.commit()
             reason = task["last_reason"]
-            if answer in ("cancel", "stop"):
+            self._set(task, gate_id="")
+            if answer in OWNER_CANCEL:
                 self._move(task, tc.CANCELLED)
-            elif answer in ("resume", "retry", "approve"):
+            elif answer in OWNER_RESUME:
                 if reason == "agent_permission_prompt" and task["handle"]:
                     # the owner dealt with the dialog in the pane: keep watching the
                     # SAME attempt; a new envelope would orphan the work in progress
                     self._move(task, tc.WORKING)
-                elif not task["attempt"]:
-                    # refused before it ever reached the agent: the gates are checked
-                    # again — an owner "resume" is not a waiver of a denied root
-                    c = tc.get(task["contract_id"], conn=self.conn)["contract"]
-                    refusal = gates.check_dispatch(root=self.root,
-                                                   executor=self.project["executor"],
-                                                   contract=c)
-                    if refusal:
-                        self._owner(task, f"permission_denied:{refusal}")
-                    else:
-                        self._dispatch_or_hold(task, 1)
                 else:
-                    self._dispatch_or_hold(task, task["attempt"] + 1)
+                    # gates are checked again in _try_dispatch: an owner "resume" is
+                    # not a waiver of a denied root or an untested executor
+                    self._request_dispatch(task, task["attempt"] + 1)
+            else:
+                self._open_gate(task, f"unrecognised_owner_answer:{answer[:40]} "
+                                      f"(reply one of {OWNER_RESUME + OWNER_CANCEL}); "
+                                      f"was: {reason}")
+                self._set(task, last_reason=reason)
             self._note("owner_answer_applied", task=task["key"], answer=answer)
 
     # -- project completion ------------------------------------------------------
@@ -680,8 +776,15 @@ class Engine:
             return "done"
         if not tasks or any(t["state"] not in tc.TERMINAL for t in tasks):
             return None
+        if not any(t["state"] == tc.VERIFIED_DONE for t in tasks):
+            self._event(OWNER_EVENT, f"{self.project_id}:__project__",
+                        {"reason": "project_has_no_verified_task"}, owner=True,
+                        dedup_key=f"fullcycle:no_verified:{self.project_id}:{len(tasks)}")
+            return "no_verified_task"
+        if any(t["state"] == tc.VERIFIED_DONE and not t["committed"] for t in tasks):
+            return None
         s = specs.get_spec(self.project_id, conn=self.conn)
-        checks = self._run_checks(s["body"]["checks"])
+        checks = self._run_checks(s["body"]["checks"], trusted=True)
         if checks and not all(c["passed"] for c in checks):
             n = self.conn.execute("SELECT COUNT(*) FROM fc_review WHERE project_id=? AND"
                                   " kind='project'", (self.project_id,)).fetchone()[0]
@@ -693,7 +796,7 @@ class Engine:
                                      (self.project_id,)).fetchone()
             seen = json.loads(last[0]).get("task_count") if last else None
             # one request per plan size: a decision that added nothing does not re-fire
-            # the event every tick; it waits for the owner (escalate) or for new tasks
+            # every tick; it has already raised an owner event
             if not pending and seen != len(tasks):
                 pseudo = {"id": f"{self.project_id}:__project__", "key": "__project__",
                           "attempt": n + 1}
@@ -714,34 +817,45 @@ class Engine:
         self._note("project_completed", event_id=eid)
         return "done"
 
+    def _next_task(self, tasks: list) -> None:
+        """Single executor: the next task starts only when nothing else is in flight."""
+        if any(t["state"] not in tc.TERMINAL and t["state"] != tc.CREATED for t in tasks):
+            return
+        state = {t["key"]: t["state"] for t in tasks}
+        for t in tasks:
+            if t["state"] != tc.CREATED:
+                continue
+            deps = t["body"]["depends_on"]
+            dead = [d for d in deps if state.get(d) == tc.CANCELLED]
+            if dead:
+                self._owner(t, f"dependency_cancelled:{','.join(dead)}")
+                return
+            if all(state.get(d) == tc.VERIFIED_DONE for d in deps):
+                self._lead()
+                self._step(t)
+                return
+
     # -- the tick ------------------------------------------------------------------
     def tick(self) -> dict:
-        lease = cp.acquire_lease(f"fullcycle:{self.project_id}", self.holder,
-                                 ttl_secs=self.lease_ttl, now=self.clock(), conn=self.conn)
-        if not lease:
-            return {"skipped": "lease_held", "holder": cp.lease_holder(
-                f"fullcycle:{self.project_id}", conn=self.conn)}
         self.log = []
-        self._seed()
-        self._apply_decisions()
-        self._owner_answers()
-        tasks = self._tasks()
-        done_keys = {t["key"] for t in tasks if t["state"] == tc.VERIFIED_DONE}
-        in_flight = [t for t in tasks if t["state"] not in tc.TERMINAL
-                     and t["state"] != tc.CREATED]
-        for t in in_flight:
-            self._step(t)
-        # single executor: the next task starts only when nothing else is in flight
-        tasks = self._tasks()
-        if not any(t["state"] not in tc.TERMINAL and t["state"] != tc.CREATED for t in tasks):
-            for t in tasks:
-                if t["state"] == tc.CREATED and set(t["body"]["depends_on"]) <= done_keys:
+        try:
+            self._lead()
+            self._seed()
+            self._apply_decisions()
+            self._commit_pending()
+            self._owner_answers()
+            for t in self._tasks():
+                if t["state"] not in tc.TERMINAL and t["state"] != tc.CREATED:
+                    self._lead()
                     self._step(t)
-                    break
-        tasks = self._tasks()
-        project = self._project_step(tasks)
+            self._next_task(self._tasks())
+            tasks = self._tasks()
+            project = self._project_step(tasks)
+        except LeaseLost:
+            return {"skipped": "lease_held", "log": self.log,
+                    "holder": cp.lease_holder(f"fullcycle:{self.project_id}", conn=self.conn)}
         return {"project": project, "tasks": {t["key"]: t["state"] for t in tasks},
-                "log": self.log, "fence": lease["fence_token"]}
+                "log": self.log, "fence": self._fence}
 
     def status(self) -> dict:
         tasks = self._tasks()

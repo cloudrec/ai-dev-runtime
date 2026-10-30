@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Optional
 
 from core.control_plane.api import _c
@@ -27,6 +28,11 @@ from core.control_plane.store import now_iso, now_ts
 
 class SpecError(ValueError):
     pass
+
+
+# keys reach file names, tmux send-keys and task ids (`project:key`): no separators,
+# no whitespace or control characters, no `:`
+KEY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
 
 _SPEC_FIELDS = {"title": str, "goal": str, "acceptance_criteria": list,
@@ -79,6 +85,8 @@ def validate_task(t: dict, where: str = "task") -> dict:
     for f in ("key", "title", "goal"):
         if not isinstance(t.get(f), str) or not t[f].strip():
             raise SpecError(f"{where}.{f} is required")
+    if not KEY_RE.match(t["key"]) or t["key"] in (".", ".."):
+        raise SpecError(f"{where}.key must match {KEY_RE.pattern}")
     out = {"checks": [], "scope": [], "depends_on": [], **t}
     _strs(out.get("acceptance_criteria"), f"{where}.acceptance_criteria", nonempty=True)
     _checks(out["checks"], where)
@@ -124,6 +132,8 @@ def create_project(project_id: str, *, name: str, root: str, executor: str,
                    conn=None) -> dict:
     """Idempotent: an existing project with the same root/executor is returned as is;
     a different root or executor under the same id is refused, never overwritten."""
+    if not KEY_RE.match(project_id or ""):
+        raise SpecError(f"project id must match {KEY_RE.pattern}")
     conn, own = conn_with_schema(conn)
     try:
         r = conn.execute("SELECT id,name,root,executor FROM fc_project WHERE id=?",

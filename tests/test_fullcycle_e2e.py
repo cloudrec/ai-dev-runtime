@@ -262,15 +262,26 @@ def test_engine_restart_mid_task_resumes_without_a_second_prompt(fc):
     assert _state(e2.status(), "add")["state"] == tc.WORKING
 
 
-def test_a_crash_between_latch_and_send_resends_the_same_key_once(fc):
+def test_a_crash_right_after_the_send_does_not_send_twice(fc):
+    """The process dies after the adapter sent the prompt and before the engine
+    recorded it (state still CREATED, dispatch latch 'sending')."""
     e, a, log, root = fc()
-    t = next(iter(e._tasks()), None) or (e._seed() or e._tasks()[0])
-    # simulate: latch written + contract moved, process died before the handle was saved
-    e.conn.execute("INSERT INTO fc_dispatch VALUES (?,?,?,?,?,?)",
-                   (f"fullcycle:{t['id']}:1", t["id"], 1, "sending", "", 0))
-    e._set(t["id"], attempt=1)
-    tc.transition(t["contract_id"], tc.WORKING, by="test", conn=e.conn)
-    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE)
+    real = a.submit
+    calls = {"n": 0}
+
+    def submit_then_die(env, key):
+        r = real(env, key)
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("engine process killed")
+        return r
+    a.submit = submit_then_die
+    with pytest.raises(RuntimeError):
+        e.tick()
+    t = next(t for t in e._tasks() if t["key"] == "add")
+    assert t["state"] == tc.CREATED and t["redispatch"] == 1 and t["attempt"] == 1
+    e2 = fe.Engine("tinycalc", a, holder="e1")
+    st = h.run(e2, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE)
     assert [x["attempt"] for x in h.agent_log(log) if x["task_id"] == "tinycalc:add"] == [1]
     assert _state(st, "add")["attempt"] == 1
 
