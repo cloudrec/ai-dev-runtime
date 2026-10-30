@@ -1720,6 +1720,17 @@ def _settled_stop_wake(conn, etype: str, esource: str, agent_id: str) -> bool:
         return False
 
 
+def _fullcycle_review_closed(conn, event_id: int) -> bool:
+    """The event is a Full Cycle review request (fc_review.event_id) and that review is
+    no longer pending. False for anything else, and on any error."""
+    try:
+        r = conn.execute("SELECT status FROM fc_review WHERE event_id=?",
+                         (int(event_id),)).fetchone()
+        return bool(r) and r[0] != "pending"
+    except Exception:  # noqa: BLE001 — no fc tables: not a review request
+        return False
+
+
 def expire_stale(conn=None, now: Optional[float] = None) -> list:
     """Retire (acknowledge) every decided-but-undelivered wake that is either past
     `MAX_WAKE_AGE_SECS` or has since been marked invalid by agent_watch/stall_doctor's
@@ -1778,6 +1789,10 @@ def expire_stale(conn=None, now: Optional[float] = None) -> list:
                 reason = "event_older_than_max_age"
             elif decision_age > MAX_WAKE_AGE_SECS:
                 reason = "stale_past_max_age"
+            elif esource == "fullcycle" and _fullcycle_review_closed(conn, event_id):
+                # a review request whose review was already decided: delivering it late
+                # would hand the tech lead a closed review as open work
+                reason = "fullcycle_review_already_decided"
             elif _settled_stop_wake(conn, etype, esource, eagent):
                 # decided before (or racing) the project's completion; delivering it now
                 # would tell the tech lead a finished agent stopped

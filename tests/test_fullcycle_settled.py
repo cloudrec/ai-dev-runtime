@@ -266,3 +266,24 @@ def test_a_stalled_loop_about_an_active_project_is_still_delivered(db, monkeypat
               severity="critical", event_type="wake_loop_stalled", project_id=PROJECT,
               agent_id=AGENT)
     assert eid not in {e["event_id"] for e in wb.expire_stale()}
+
+
+def test_a_delayed_review_request_for_a_decided_review_is_retired(db, monkeypatch):
+    from core import wake_bridge as wb
+    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "1")
+    e = _project(review=None)
+    (t,) = e._tasks()
+    ids = {}
+    for status in ("decided", "pending"):
+        eid = cp.append_event("fullcycle", "task_completed", agent_id=AGENT,
+                              project_id=PROJECT, severity="high")
+        e.conn.execute("INSERT INTO fc_review (project_id, task_id, attempt, kind, status,"
+                       " event_id, created_ts) VALUES (?,?,?,?,?,?,?)",
+                       (PROJECT, t["id"], len(ids) + 1, "review", status, eid, now_ts()))
+        e.conn.commit()
+        wb.record({"wake": True, "reason": "test", "actionable": False}, event_id=eid,
+                  severity="high", event_type="task_completed", project_id=PROJECT,
+                  agent_id=AGENT)
+        ids[status] = eid
+    out = {x["event_id"]: x["reason"] for x in wb.expire_stale()}
+    assert out == {ids["decided"]: "fullcycle_review_already_decided"}
