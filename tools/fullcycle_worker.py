@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Tick the full-cycle engine of each registered project, forever.
+
+    FULLCYCLE_PROJECTS="<project_id>=<tmux session>[,...]" fullcycle_worker.py [--once]
+
+One engine per project, each driving an EXISTING agent through core.agent_control
+(AgentControlAdapter, actor `fullcycle:engine`): every send passes the automation policy
+of THIS process — the session must be listed as `<session>@fullcycle:engine` in
+AGENT_AUTOMATION_TARGETS — and is refused while the agent is mid-turn. The worker never
+creates, restarts or stops an agent, never pushes or deploys, and never answers an owner
+gate; review events reach the reviewer's chat through the wake bridge.
+
+A project that is not registered (tools/fullcycle_register.py), or whose engine raises, is
+logged and retried next round; one bad project never stops the others.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import socket
+import sys
+import time
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, REPO)
+
+TICK_SECS = float(os.getenv("FULLCYCLE_TICK_SECS", "20"))
+
+
+def projects(raw: str) -> dict:
+    out = {}
+    for item in (raw or "").split(","):
+        pid, _, session = item.strip().partition("=")
+        if pid and session:
+            out[pid.strip()] = session.strip()
+    return out
+
+
+def _log(**kw) -> None:
+    print(json.dumps({"ts": round(time.time(), 1), **kw}, default=str), flush=True)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--once", action="store_true", help="one round, then exit")
+    args = ap.parse_args()
+    from core.fullcycle import engine as fe
+    from core.fullcycle.tmux_adapter import AgentControlAdapter
+
+    wanted = projects(os.getenv("FULLCYCLE_PROJECTS", ""))
+    if not wanted:
+        _log(what="no_projects", hint="set FULLCYCLE_PROJECTS=<project_id>=<session>")
+        return 2
+    stop = {"now": False}
+    signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
+    holder = f"fullcycle-worker:{socket.gethostname()}:{os.getpid()}"
+    engines: dict = {}
+    while not stop["now"]:
+        for pid, session in wanted.items():
+            try:
+                e = engines.get(pid)
+                if e is None:
+                    e = engines[pid] = fe.Engine(pid, AgentControlAdapter(session),
+                                                 holder=holder)
+                r = e.tick()
+                if r.get("log") or r.get("skipped"):
+                    _log(**{**r, "project": pid, "result": r.get("project")})
+            except Exception as ex:  # noqa: BLE001 — logged, retried next round
+                engines.pop(pid, None)
+                _log(project=pid, what="error", error=f"{type(ex).__name__}: {ex}"[:500])
+        if args.once:
+            break
+        for _ in range(int(TICK_SECS * 10)):
+            if stop["now"]:
+                break
+            time.sleep(0.1)
+    for e in engines.values():
+        try:
+            e.release()
+        except Exception:  # noqa: BLE001 — the lease then expires on its own
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

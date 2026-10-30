@@ -68,6 +68,9 @@ LEASE_TTL = int(os.getenv("FULLCYCLE_LEASE_TTL", "900"))
 OWNER_RESUME = ("resume", "retry", "approve")
 OWNER_CANCEL = ("cancel", "stop")
 
+# agent_control._busy_for_send: the agent is mid-turn, the send would only queue
+_BUSY_REFUSALS = ("refused:working", "refused:shell_running",
+                  "refused:queued_messages_pending")
 # refusals that will not change by retrying: they need the owner
 _PERMANENT_REFUSALS = ("hard_denied", "not_allowlisted", "denied", "owner_proof",
                        "unknown target", "no such")
@@ -210,6 +213,27 @@ class LeaseLost(RuntimeError):
     pass
 
 
+def _offer_to_wake_bridge(eid: int, type_: str, severity: str, owner: bool, *,
+                          project_id: str, agent_id: str, correlation_id: str, conn) -> None:
+    """What cto.emit does after recording: a raw append_event is never seen by the wake
+    bridge, so a review would wait in the inbox while the reviewer's chat sleeps.
+    Best-effort, like there: recording the event must never fail because of the bridge."""
+    try:
+        from core import wake_bridge as wb
+        if not (wb._enabled()[0] and wb.is_significant(
+                event_type=type_, severity=severity,
+                owner_action_required=owner)["significant"]):
+            return
+        d = wb.should_wake(event_id=eid, severity=severity, event_type=type_,
+                           correlation_id=correlation_id, owner_action_required=owner,
+                           project_id=project_id, agent_id=agent_id, conn=conn)
+        wb.record(d, event_id=eid, severity=severity, event_type=type_,
+                  correlation_id=correlation_id, project_id=project_id, agent_id=agent_id,
+                  conn=conn)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 _TASK_COLS = ("id", "key", "seq", "spec_version", "body", "contract_id", "attempt", "handle",
               "feedback", "verification", "gate_id", "dispatch_failures", "last_reason",
               "origin", "redispatch", "committed")
@@ -243,13 +267,19 @@ class Engine:
 
     def _event(self, type_: str, entity_id: str, payload: dict, *, owner: bool = False,
                dedup_key: str = "", severity: str = "high") -> int:
-        return cp.append_event(SOURCE, type_, entity_type="fullcycle_task",
-                               entity_id=entity_id, payload=payload,
-                               project_id=self.project_id, severity=severity,
-                               owner_action_required=owner, dedup_key=dedup_key,
-                               dedup_window_secs=10 ** 9 if dedup_key else 0,
-                               correlation_id=f"fullcycle:{self.project_id}",
-                               conn=self.conn)
+        # the executor's session as agent_id: the wake companion's canary filter
+        # (WAKE_BRIDGE_ONLY_AGENTS) offers only wakes whose agent is listed
+        agent = getattr(self.adapter, "target", "") or ""
+        corr = f"fullcycle:{self.project_id}"
+        eid = cp.append_event(SOURCE, type_, entity_type="fullcycle_task",
+                              entity_id=entity_id, payload=payload,
+                              project_id=self.project_id, agent_id=agent, severity=severity,
+                              owner_action_required=owner, dedup_key=dedup_key,
+                              dedup_window_secs=10 ** 9 if dedup_key else 0,
+                              correlation_id=corr, conn=self.conn)
+        _offer_to_wake_bridge(eid, type_, severity, owner, project_id=self.project_id,
+                              agent_id=agent, correlation_id=corr, conn=self.conn)
+        return eid
 
     def _lead(self) -> None:
         """Renew the lease; raise if another engine holds it."""
@@ -257,7 +287,14 @@ class Engine:
                                  ttl_secs=self.lease_ttl, now=self.clock(), conn=self.conn)
         if not lease:
             raise LeaseLost(self.holder)
-        self._fence = lease["fence_token"]
+        self._fence, self._lease_id = lease["fence_token"], lease["lease_id"]
+
+    def release(self) -> bool:
+        """Give the lease back (a worker shutting down), so its successor need not wait
+        out LEASE_TTL. A no-op when this engine holds none."""
+        lid, self._lease_id = getattr(self, "_lease_id", ""), ""
+        return bool(lid) and cp.release_lease(f"fullcycle:{self.project_id}", lid,
+                                              conn=self.conn)
 
     def _tasks(self) -> list:
         rows = self.conn.execute(
@@ -408,6 +445,12 @@ class Engine:
             self._note("dispatched", task=task["key"], attempt=attempt, already=r["already"])
             return True
         reason = r["reason"]
+        if reason in _BUSY_REFUSALS:
+            # mid-turn: agent_control refuses rather than queue; not a failure, retry
+            # next tick without counting towards MAX_DISPATCH_FAILURES
+            self._set(task, last_reason=reason)
+            self._note("dispatch_waiting_for_idle", task=task["key"], reason=reason)
+            return False
         if any(p in reason for p in _PERMANENT_REFUSALS):
             self._set(task, redispatch=0)
             self._owner(task, f"dispatch_refused:{reason}")

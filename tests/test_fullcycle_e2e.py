@@ -116,11 +116,8 @@ def test_review_events_go_through_the_real_wake_bridge_and_a_duplicate_wake_is_h
     (rv,) = fe.pending_reviews("tinycalc")
     eid = rv["event_id"]
 
-    d = wb.should_wake(event_id=eid, severity="high", event_type=fe.REVIEW_EVENT,
-                       project_id="tinycalc", agent_id="")
-    assert d["wake"] is True, d
-    wb.record(d, event_id=eid, severity="high", event_type=fe.REVIEW_EVENT,
-              project_id="tinycalc")
+    # the engine itself offered the review to the bridge (as cto.emit does): nobody
+    # calls should_wake/record by hand, yet the companion has a wake to deliver
     p = wb.pending_wake()
     assert p["pending"] and p["event_id"] == eid, p
     phrase = wb.compose_phrase(event_id=eid, event_type=fe.REVIEW_EVENT, project_id="tinycalc")

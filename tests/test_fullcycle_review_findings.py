@@ -228,6 +228,29 @@ def test_5_a_busy_refusal_after_the_blocked_answer_is_retried(fc):
     assert busy["n"] == 0 and _state(st, "add")["attempt"] == 2
 
 
+# a real agent stays mid-turn for minutes: agent_control refuses ("working") rather than
+# queue. That is a wait, not a failure — it must never use up MAX_DISPATCH_FAILURES.
+@needs_tmux
+def test_a_long_mid_turn_agent_is_waited_for_not_failed(fc):
+    e, a, log, root = fc()
+    real = a.submit
+    busy = {"n": fe.MAX_DISPATCH_FAILURES * 2}
+
+    def mid_turn(env, key):
+        if busy["n"]:
+            busy["n"] -= 1
+            return {"ok": False, "already": False, "reason": "refused:working", "handle": {}}
+        return real(env, key)
+    a.submit = mid_turn
+    for _ in range(fe.MAX_DISPATCH_FAILURES * 2):
+        e.tick()
+    add = _task(e, "add")
+    assert add["dispatch_failures"] == 0 and add["last_reason"] == "refused:working", add
+    assert not add["gate_id"] and add["state"] != tc.BLOCKED, add
+    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE)
+    assert _state(st, "add")["attempt"] == 1
+
+
 # #6 — an unrecognised owner answer keeps a gate open
 @needs_tmux
 def test_6_an_unrecognised_owner_answer_reopens_the_gate(fc):
@@ -327,3 +350,21 @@ def test_15_task_keys_are_plain_names(key):
     with pytest.raises(specs.SpecError):
         specs.validate_task({"key": key, "title": "t", "goal": "g",
                              "acceptance_criteria": ["x"]})
+
+
+# a worker restarting (systemd) must not wait out LEASE_TTL behind its predecessor
+@needs_tmux
+def test_a_released_lease_lets_the_successor_lead_at_once(fc):
+    e, a, log, root = fc()
+    e.tick()
+    nxt = fe.Engine("tinycalc", a, holder="e2")
+    assert nxt.tick().get("skipped") == "lease_held"
+    assert e.release() is True and e.release() is False
+    assert not nxt.tick().get("skipped")
+
+
+def test_worker_project_map():
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
+    import fullcycle_worker as w
+    assert w.projects("a=s1, b = s2 ,bad,=x,c=") == {"a": "s1", "b": "s2"}
+    assert w.projects("") == {}
