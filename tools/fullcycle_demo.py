@@ -10,8 +10,8 @@ change and the final git log. Uses its own control-plane DB; touches nothing liv
 
 The agent and the reviewer are stand-ins: this demonstrates the orchestration, not a
 model. For a real agent, construct the engine with AgentControlAdapter (an existing
-Claude pane, through core.agent_control's policy) or a TmuxAgentAdapter whose
-launch_argv is a real CLI agent.
+Claude pane, through core.agent_control's policy). Starting a NEW agent pane for the
+engine is not supported yet: it must go through the agent creation guard.
 """
 from __future__ import annotations
 

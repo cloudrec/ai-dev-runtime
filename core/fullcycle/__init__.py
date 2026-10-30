@@ -8,7 +8,7 @@ into ChatGPT turns), the leases and the owner gates, `core.agent_creation_policy
   spec.py          versioned project specification + acceptance criteria
   executor.py      technology-agnostic executor contract (envelope / observation)
   hosts.py         where an executor runs: local, SSH; Windows bridge is a stated TODO
-  tmux_adapter.py  tmux-hosted agent (Claude today), and the live agent_control adapter
+  tmux_adapter.py  the live adapter: an existing agent via core.agent_control
   gates.py         permission gates checked before dispatch and on the returned work
   engine.py        the persisted state machine, review inbox, retries, crash recovery
 """

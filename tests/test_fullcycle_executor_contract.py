@@ -139,3 +139,14 @@ def test_agent_control_adapter_duplicate_key_and_crash(tmp_path):
     assert ad.poll({"task_id": "p:a", "attempt": 1, "result": str(tmp_path / "r.json")}) \
         .state == ex.CRASHED
     assert ad.restart({})["ok"] is False                        # never owns a live agent
+
+
+def test_the_test_only_tmux_adapter_cannot_reach_the_shared_server_or_start_an_agent(tmp_path):
+    from private_tmux import PrivateTmuxAdapter, _shared_tmux_dir
+    kw = dict(session="s", workdir=str(tmp_path), state_dir=str(tmp_path))
+    for sock in ("default", "fc-name", os.path.join(_shared_tmux_dir(), "default")):
+        with pytest.raises(ValueError):
+            PrivateTmuxAdapter(LocalHost(), socket=sock, launch_argv=["sh"], **kw)
+    for cli in ("claude", "/usr/local/bin/qwen", "codex"):
+        with pytest.raises(ValueError, match="creation guard"):
+            PrivateTmuxAdapter(LocalHost(), socket=str(tmp_path / "s"), launch_argv=[cli], **kw)

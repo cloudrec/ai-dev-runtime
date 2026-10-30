@@ -70,9 +70,9 @@ def write_scenario(base: str, behaviours: dict) -> tuple:
 
 def make_adapter(base: str, root: str, behaviours: dict, *, host=None, socket=None):
     from core.fullcycle.hosts import LocalHost
-    from core.fullcycle.tmux_adapter import TmuxAgentAdapter
+    from private_tmux import PrivateTmuxAdapter
     scenario, log = write_scenario(base, behaviours)
-    a = TmuxAgentAdapter(host or LocalHost(),
+    a = PrivateTmuxAdapter(host or LocalHost(),
                          socket=socket or os.path.join(base, f"tmux-{uuid.uuid4().hex[:8]}"),
                          session="agent",
                          launch_argv=[sys.executable, os.path.join(HERE, "fake_agent.py")],
