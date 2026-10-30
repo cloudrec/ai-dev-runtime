@@ -1,0 +1,21 @@
+{
+  "title": "tinycalc",
+  "goal": "A tiny calculator package: add, mul and a command-line entry point.",
+  "acceptance_criteria": [
+    "tinycalc.add.add(a, b) returns a + b",
+    "tinycalc.mul.mul(a, b) returns a * b",
+    "python -m tinycalc.cli add 2 3 prints 5"
+  ],
+  "checks": [["{python}", "-c", "from tinycalc.add import add; from tinycalc.mul import mul; assert add(2, 3) == 5 and mul(4, 5) == 20"],
+             ["{python}", "-m", "tinycalc.cli", "add", "2", "3"]],
+  "scope": ["tinycalc/"],
+  "do_not_touch": ["README.md"],
+  "tasks": [
+    {"key": "add", "title": "Implement add", "goal": "Create tinycalc/add.py with add(a, b).",
+     "acceptance_criteria": ["add(2, 3) == 5"],
+     "checks": [["{python}", "-c", "from tinycalc.add import add; assert add(2, 3) == 5"]]},
+    {"key": "mul", "title": "Implement mul", "goal": "Create tinycalc/mul.py with mul(a, b).",
+     "acceptance_criteria": ["mul(4, 5) == 20"], "depends_on": ["add"],
+     "checks": [["{python}", "-c", "from tinycalc.mul import mul; assert mul(4, 5) == 20"]]}
+  ]
+}
