@@ -12,8 +12,9 @@ the path that consults the wake bridge at once (a raw append_event does not) —
 agent identity resolved exactly as the Owner OS hook resolves it, and without paging
 Telegram. One event per (agent, ref, summary) per day: rerunning it does not re-wake.
 
-Refused for an agent whose directory is under the payment hard-deny policy: those
-agents take no automated continuation, so a doorbell would only invite one.
+Refused for an agent that is not permitted full autonomy (not on the automation
+allowlist, no active grant) and for any directory under the payment hard-deny policy:
+those agents take no automated continuation, so a doorbell would only invite one.
 """
 from __future__ import annotations
 
@@ -28,16 +29,47 @@ REPO = "/root/ai-dev-runtime"
 
 def _env_flags() -> None:
     """The bridge is enabled by the services' EnvironmentFile; an agent's shell does not
-    load it. Only the two WAKE_BRIDGE_* flags are read from it — nothing else."""
+    load it. Only the WAKE_BRIDGE_* flags and the automation allowlist (names, not
+    secrets) are read from it — nothing else."""
     path = os.path.join(REPO, "configs", ".env")
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
                 k, _, v = line.strip().partition("=")
-                if k in ("WAKE_BRIDGE_ENABLED", "WAKE_BRIDGE_KILL_SWITCH"):
+                if k in ("WAKE_BRIDGE_ENABLED", "WAKE_BRIDGE_KILL_SWITCH",
+                         "AGENT_AUTOMATION_TARGETS"):
                     os.environ.setdefault(k, v.strip().strip('"').strip("'"))
     except OSError:
         pass
+
+
+def _permitted(session: str) -> bool:
+    """Full autonomy is for permitted agents only: the automation allowlist
+    (AGENT_AUTOMATION_TARGETS, `session@caller`) or an ACTIVE automation grant naming
+    the session or a session prefix it creates."""
+    if not session or session.startswith("session"):
+        return False
+    from core import agent_control as ac
+    try:
+        names = {t.split("@", 1)[0].lower() for t in ac.automation_targets()}
+    except Exception:  # noqa: BLE001
+        names = set()
+    if session.lower() in names:
+        return True
+    try:
+        from core import automation_grants as ag
+        for g in ag.list_grants():
+            if ag.effective_status(g) != "active":
+                continue
+            spec = g.get("spec") or {}
+            if session in (spec.get("targets") or []):
+                return True
+            prefix = ((spec.get("create") or {}).get("session_prefix") or "")
+            if prefix and session.startswith(prefix):
+                return True
+    except Exception:  # noqa: BLE001 — unreadable grants: not permitted
+        return False
+    return False
 
 
 def main(argv=None) -> int:
@@ -72,6 +104,11 @@ def main(argv=None) -> int:
         if t:
             os.environ["OWNEROS_AGENT_TARGET"] = t
     ident = hook._identity({"cwd": a.cwd, "session_id": os.environ.get("CLAUDE_SESSION_ID", "")})
+    session = ident["agent"].split(":", 1)[0]
+    if not _permitted(session):
+        print(json.dumps({"ok": False, "reason": "agent_not_permitted_for_autonomy",
+                          "agent": ident["agent"]}))
+        return 3
     payload = {"stage_done": True, "summary": a.summary[:2000], "ref": a.ref[:200],
                "report": a.report[:400], "tests": a.tests[:400], "next": a.next[:2000],
                "blockers": [b[:400] for b in a.blocker][:10], "cwd": ident["cwd"]}
