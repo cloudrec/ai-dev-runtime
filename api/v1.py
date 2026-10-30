@@ -439,6 +439,23 @@ class FullcycleDecisionReq(BaseModel):
     next_tasks: Optional[list] = None
 
 
+# Who may ACK or DECIDE a full-cycle review. The actor is what caller_identity derives:
+# `api:client/<id>` for an authenticated client token, else `api:<method>/<declared>` —
+# the ChatGPT connector declares its verified MCP token (`mcp-token-<id>`), the same
+# binding the delegation grants use. Reads stay open to any authenticated caller.
+_FULLCYCLE_REVIEWERS_DEFAULT = "api:bearer/mcp-token-3"
+
+
+def fullcycle_reviewers() -> set:
+    raw = os.getenv("FULLCYCLE_REVIEWERS", _FULLCYCLE_REVIEWERS_DEFAULT)
+    return {a.strip() for a in raw.split(",") if a.strip()}
+
+
+def _require_reviewer(actor: str) -> None:
+    if actor not in fullcycle_reviewers():
+        raise HTTPException(status_code=403, detail="not an authorized full-cycle reviewer")
+
+
 def _fullcycle_call(fn, *args, **kw):
     from core.fullcycle import engine as fe
     from core.fullcycle import spec as fs
@@ -461,7 +478,8 @@ def fullcycle_ack(review_id: int, request: Request,
                   x_runtime_actor: Optional[str] = Header(None), _: bool = Depends(_auth)):
     from core.fullcycle import engine as fe
     actor, _src = caller_identity(request, x_runtime_actor)
-    return _fullcycle_call(fe.ack_review, review_id, by=actor or "api")
+    _require_reviewer(actor)
+    return _fullcycle_call(fe.ack_review, review_id, by=actor)
 
 
 @router.post("/fullcycle/reviews/{review_id}/decision")
@@ -473,8 +491,9 @@ def fullcycle_decision(review_id: int, req: FullcycleDecisionReq, request: Reque
     defaults (no push, no deploy) as the spec's own tasks."""
     from core.fullcycle import engine as fe
     actor, _src = caller_identity(request, x_runtime_actor)
+    _require_reviewer(actor)
     return _fullcycle_call(fe.submit_decision, review_id, req.decision,
-                           key=req.idempotency_key, by=actor or "api",
+                           key=req.idempotency_key, by=actor,
                            feedback=req.feedback, next_tasks=req.next_tasks)
 
 

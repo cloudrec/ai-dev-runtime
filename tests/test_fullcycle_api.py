@@ -13,9 +13,14 @@ from core.fullcycle import engine as fe  # noqa: E402
 from core.fullcycle import spec as specs  # noqa: E402
 
 
+REVIEWER = {"X-Runtime-Actor": "mcp-token-3"}
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+    # the auth dependency is overridden, so the auth method reads "unknown"
+    monkeypatch.setenv("FULLCYCLE_REVIEWERS", "api:unknown/mcp-token-3")
     from api import v1
     app = FastAPI()
     app.include_router(v1.router)
@@ -33,7 +38,7 @@ def client(tmp_path, monkeypatch):
 def test_inbox_ack_and_an_idempotent_decision(client):
     (rv,) = client.get("/api/v1/fullcycle/reviews", params={"project_id": "demo"}).json()["reviews"]
     assert rv["kind"] == "review" and rv["decisions"] == ["approve", "reject"]
-    hdr = {"X-Runtime-Actor": "chatgpt-tech-lead"}
+    hdr = REVIEWER
     assert client.post(f"/api/v1/fullcycle/reviews/{rv['review_id']}/ack", headers=hdr).json()["acked_by"]
     body = {"decision": "approve", "idempotency_key": "gpt-1"}
     first = client.post(f"/api/v1/fullcycle/reviews/{rv['review_id']}/decision", json=body, headers=hdr)
@@ -42,18 +47,34 @@ def test_inbox_ack_and_an_idempotent_decision(client):
     assert client.get("/api/v1/fullcycle/reviews").json()["reviews"] == []
 
 
+def test_only_the_authorized_reviewer_may_ack_or_decide(client):
+    rid = client.get("/api/v1/fullcycle/reviews").json()["reviews"][0]["review_id"]
+    body = {"decision": "approve", "idempotency_key": "intruder-1"}
+    for hdr in ({}, {"X-Runtime-Actor": "mcp-token-9"}, {"X-Runtime-Actor": "owner"}):
+        assert client.post(f"/api/v1/fullcycle/reviews/{rid}/decision", json=body,
+                           headers=hdr).status_code == 403
+        assert client.post(f"/api/v1/fullcycle/reviews/{rid}/ack", headers=hdr).status_code == 403
+    (rv,) = client.get("/api/v1/fullcycle/reviews").json()["reviews"]
+    assert rv["acked"] is False                              # nothing was recorded
+    assert client.post(f"/api/v1/fullcycle/reviews/{rid}/decision", json=body,
+                       headers=REVIEWER).json()["ok"] is True
+
+
 def test_bad_decisions_are_400_not_500(client):
     rid = client.get("/api/v1/fullcycle/reviews").json()["reviews"][0]["review_id"]
     url = f"/api/v1/fullcycle/reviews/{rid}/decision"
-    assert client.post(url, json={"decision": "deploy", "idempotency_key": "k"}).status_code == 400
-    assert client.post(url, json={"decision": "reject", "idempotency_key": "k2"}).status_code == 400
+    assert client.post(url, json={"decision": "deploy", "idempotency_key": "k"},
+                       headers=REVIEWER).status_code == 400
+    assert client.post(url, json={"decision": "reject", "idempotency_key": "k2"},
+                       headers=REVIEWER).status_code == 400
     bad_task = {"decision": "approve", "idempotency_key": "k3",
                 "next_tasks": [{"key": "x", "title": "x", "goal": "g",
                                 "acceptance_criteria": ["ok"], "push_allowed": True}]}
-    r = client.post(url, json=bad_task)
+    r = client.post(url, json=bad_task, headers=REVIEWER)
     assert r.status_code == 400 and "unknown field" in r.json()["detail"]
     assert client.post("/api/v1/fullcycle/reviews/999/decision",
-                       json={"decision": "approve", "idempotency_key": "k4"}).status_code == 400
+                       json={"decision": "approve", "idempotency_key": "k4"},
+                       headers=REVIEWER).status_code == 400
 
 
 def test_project_status(client):
