@@ -360,6 +360,22 @@ SELF_WAKE_FLOW = (
     "5) остановись только на настоящем владельческом гейте."
 )
 
+# The same failure, for every agent the owner has put on full autonomy (allowlisted or
+# granted: core.autonomy): the agent rings the tech lead at a stage end, the base phrase
+# lets ChatGPT acknowledge and stop, and the agent stands idle until the owner notices.
+# ChatGPT is that agent's ONLY driver, so the wake must say what to do. Fixed constant,
+# like SELF_WAKE_FLOW: it interpolates nothing.
+AUTONOMY_WAKE_FLOW = (
+    " Это агент с полной автономией: ты его техлид, и без твоего следующего шага он "
+    "стоит. Выполни в этом же ходе: 1) прочитай agent_status и последний вывод агента; "
+    "2) если для проекта есть ревью Full Cycle — fullcycle_reviews_list, "
+    "fullcycle_review_ack и решение через fullcycle_review_decision; 3) проверь "
+    "результат этапа по задаче и тестам; 4) отправь агенту следующий конкретный шаг "
+    "или исправления через agent_send с новым idempotency_key; 5) остановись только на "
+    "настоящем владельческом гейте (push в прод, деньги, секреты, доступы) и назови его "
+    "одной строкой. Статус без следующего шага — не ответ."
+)
+
 # The classes where the supervisor is expected to ACT. `owner_decision` is excluded because
 # that class IS the genuine gate, and `event` because it is the residual bucket.
 SELF_FLOW_TRIGGER_CLASSES = frozenset({
@@ -435,7 +451,17 @@ def compose_phrase(*, event_id, event_type: str = "", project_id: str = "",
             f"agent={agent}. {WAKE_PHRASE}")
     if tc in SELF_FLOW_TRIGGER_CLASSES and is_self_agent(agent_id, project_id):
         return base + SELF_WAKE_FLOW
+    if tc in SELF_FLOW_TRIGGER_CLASSES and _autonomy_permitted(agent_id):
+        return base + AUTONOMY_WAKE_FLOW
     return base
+
+
+def _autonomy_permitted(agent_id: str) -> bool:
+    try:
+        from core import autonomy
+        return autonomy.permitted(agent_id)
+    except Exception:  # noqa: BLE001 — fail closed to the ordinary phrase
+        return False
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS wake_audit (

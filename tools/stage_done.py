@@ -44,32 +44,10 @@ def _env_flags() -> None:
 
 
 def _permitted(session: str) -> bool:
-    """Full autonomy is for permitted agents only: the automation allowlist
-    (AGENT_AUTOMATION_TARGETS, `session@caller`) or an ACTIVE automation grant naming
-    the session or a session prefix it creates."""
-    if not session or session.startswith("session"):
-        return False
-    from core import agent_control as ac
-    try:
-        names = {t.split("@", 1)[0].lower() for t in ac.automation_targets()}
-    except Exception:  # noqa: BLE001
-        names = set()
-    if session.lower() in names:
-        return True
-    try:
-        from core import automation_grants as ag
-        for g in ag.list_grants():
-            if ag.effective_status(g) != "active":
-                continue
-            spec = g.get("spec") or {}
-            if session in (spec.get("targets") or []):
-                return True
-            prefix = ((spec.get("create") or {}).get("session_prefix") or "")
-            if prefix and session.startswith(prefix):
-                return True
-    except Exception:  # noqa: BLE001 — unreadable grants: not permitted
-        return False
-    return False
+    """Full autonomy is for permitted agents only (core.autonomy: the automation
+    allowlist or an ACTIVE automation grant naming the session or its prefix)."""
+    from core import autonomy
+    return autonomy.permitted(session)
 
 
 def main(argv=None) -> int:

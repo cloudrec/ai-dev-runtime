@@ -1283,3 +1283,60 @@ def test_only_agents_matching_is_exact_session_not_prefix(monkeypatch):
     assert not wb._offer_allowed("aes-canary-2:0.0", only)
     assert not wb._offer_allowed("", only)
     assert not wb._offer_allowed("payorch-ha-fresh:0.0", only)
+
+
+# ── full-autonomy agents (core.autonomy) get the act-now flow too ───────────────────
+# The gaika chat (2026-10-30) was woken three times after a country agent's stage-done and
+# sent nothing: the base phrase let it acknowledge and stop. ChatGPT is the only driver of
+# a full-autonomy agent, so its wake must spell out the next step, like the self agent's.
+
+def _autonomy(monkeypatch, allowed=("gaika-country-pl",)):
+    from core import autonomy
+    monkeypatch.setattr(autonomy, "permitted",
+                        lambda a: autonomy.session_of(a) in allowed)
+
+
+def test_a_full_autonomy_agents_stage_end_wake_spells_out_the_next_step(monkeypatch):
+    _self_agent(monkeypatch, target_project="gaika")
+    _autonomy(monkeypatch)
+    p = wb.compose_phrase(event_id=75998, event_type="task_completed",
+                          project_id="gaika-worktrees", agent_id="gaika-country-pl:0.0")
+    assert p.startswith("[Owner OS wake] event=75998 trigger=completion type=task_completed")
+    assert p.endswith(wb.AUTONOMY_WAKE_FLOW)
+    assert "agent_send" in p and "fullcycle_review_decision" in p
+    assert wb.SELF_WAKE_FLOW not in p
+
+
+def test_an_agent_without_autonomy_keeps_the_plain_phrase(monkeypatch):
+    _self_agent(monkeypatch, target_project="hostsecure")
+    _autonomy(monkeypatch)
+    p = wb.compose_phrase(event_id=42, event_type="task_completed",
+                          project_id="hostsecure", agent_id="hostsecure:0.0")
+    assert wb.AUTONOMY_WAKE_FLOW not in p and p.endswith(wb.WAKE_PHRASE + "")
+
+
+def test_an_owner_gate_of_a_full_autonomy_agent_gets_no_flow(monkeypatch):
+    _self_agent(monkeypatch, target_project="gaika")
+    _autonomy(monkeypatch)
+    p = wb.compose_phrase(event_id=7, event_type="owner_decision_required",
+                          project_id="gaika", agent_id="gaika-country-pl:0.0")
+    assert wb.AUTONOMY_WAKE_FLOW not in p
+
+
+def test_autonomy_fails_closed_and_never_covers_the_payment_agent(monkeypatch):
+    from core import agent_control as ac
+    from core import automation_grants as ag
+    from core import autonomy
+    monkeypatch.setenv("AGENT_AUTOMATION_TARGETS", "payorch-ha-fresh@api,owner-os-x@api")
+    monkeypatch.setattr(ag, "list_grants", lambda *a, **k: [
+        {"spec": {"targets": [], "create": {"session_prefix": "gaika-country-"}}}])
+    monkeypatch.setattr(ag, "effective_status", lambda g, *a, **k: "active")
+    assert autonomy.permitted("owner-os-x:0.0")
+    assert autonomy.permitted("gaika-country-ro:0.0")
+    assert not autonomy.permitted("payorch-ha-fresh:0.0")
+    assert not autonomy.permitted("bitwhite-backend-v3:0.0")
+    assert not autonomy.permitted("")
+    monkeypatch.setattr(ag, "list_grants",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db")))
+    assert not autonomy.permitted("gaika-country-ro:0.0")
+    assert "payorch-ha-fresh" in ac.AUTOMATION_HARD_DENY
