@@ -31,8 +31,16 @@ CDP_PORT = 9222
 # 2026-10-28: ChatGPT's composer lost its id — it is now a ProseMirror div with
 # role="textbox" and no #prompt-textarea, so every route failed with
 # composer_ambiguous_or_absent:0. Structural match only (class/role/contenteditable).
-COMPOSER_SEL = ("#prompt-textarea, div[contenteditable='true'][id='prompt-textarea'], "
-                "div.ProseMirror[contenteditable='true'][role='textbox']")
+# 2026-10-29/30: ChatGPT renders an editable "writing block" (a second ProseMirror
+# textbox, `writing-block-editor`) INSIDE some assistant turns. It matched too, every wake
+# to that chat failed composer_ambiguous_or_absent:2 (bitwhite 75652 for 3 h; TaskBoard
+# 75900), and the first match would have been the wrong editor. An editor inside a
+# conversation turn is never the composer, so each alternative excludes them.
+_NOT_IN_THREAD = (":not([data-chatgpt-search-message-ids] *)"
+                  ":not([data-message-author-role] *):not(article *)")
+COMPOSER_SEL = ", ".join(alt + _NOT_IN_THREAD for alt in (
+    "#prompt-textarea", "div[contenteditable='true'][id='prompt-textarea']",
+    "div.ProseMirror[contenteditable='true'][role='textbox']"))
 # ChatGPT renders the send control only once the composer is non-empty, so it is looked for
 # AFTER the phrase is inserted, never before. Structural attributes only — no label text
 # matching, which would break the moment the UI is in another language.

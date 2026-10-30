@@ -130,3 +130,15 @@ def test_no_match_keeps_the_unreadable_values():
     s = _NodeSession({"assistant": [], "user": []})
     assert s.last_len(cdp.ASSISTANT_TURN_SEL) is None
     assert s.last_attr(cdp.ASSISTANT_TURN_SEL, "data-message-id") == ""
+
+
+def test_an_editor_inside_a_conversation_turn_is_never_the_composer():
+    """2026-10-30, live: an assistant turn held an editable `writing-block-editor`
+    ProseMirror textbox; the old selector matched 2 on that tab (TaskBoard 75900,
+    bitwhite 75652). Each alternative must exclude the turn containers."""
+    alts = [a.strip() for a in cdp.COMPOSER_SEL.split(", ")]
+    assert len(alts) == 3
+    for a in alts:
+        assert ":not([data-chatgpt-search-message-ids] *)" in a, a
+        assert ":not([data-message-author-role] *)" in a, a
+        assert ":not(article *)" in a, a
