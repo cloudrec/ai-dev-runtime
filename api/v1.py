@@ -432,6 +432,58 @@ def agents_answer(req: AgentSendReq, request: Request,
                        owner_proof=owner_proof_from_header(x_owner_proof))
 
 
+class FullcycleDecisionReq(BaseModel):
+    decision: str
+    idempotency_key: str
+    feedback: str = ""
+    next_tasks: Optional[list] = None
+
+
+def _fullcycle_call(fn, *args, **kw):
+    from core.fullcycle import engine as fe
+    from core.fullcycle import spec as fs
+    try:
+        return fn(*args, **kw)
+    except (fe.EngineError, fs.SpecError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/fullcycle/reviews")
+def fullcycle_reviews(project_id: Optional[str] = None, _: bool = Depends(_auth)):
+    """The GPT tech lead's inbox: completed tasks waiting for review, blocked agents
+    waiting for an answer, failed project acceptance waiting for new tasks."""
+    from core.fullcycle import engine as fe
+    return {"reviews": _fullcycle_call(fe.pending_reviews, project_id)}
+
+
+@router.post("/fullcycle/reviews/{review_id}/ack")
+def fullcycle_ack(review_id: int, request: Request,
+                  x_runtime_actor: Optional[str] = Header(None), _: bool = Depends(_auth)):
+    from core.fullcycle import engine as fe
+    actor, _src = caller_identity(request, x_runtime_actor)
+    return _fullcycle_call(fe.ack_review, review_id, by=actor or "api")
+
+
+@router.post("/fullcycle/reviews/{review_id}/decision")
+def fullcycle_decision(review_id: int, req: FullcycleDecisionReq, request: Request,
+                       x_runtime_actor: Optional[str] = Header(None),
+                       _: bool = Depends(_auth)):
+    """Recorded, not executed: the engine applies it on its next tick. The decision
+    cannot grant powers — next_tasks go through the same validation and contract
+    defaults (no push, no deploy) as the spec's own tasks."""
+    from core.fullcycle import engine as fe
+    actor, _src = caller_identity(request, x_runtime_actor)
+    return _fullcycle_call(fe.submit_decision, review_id, req.decision,
+                           key=req.idempotency_key, by=actor or "api",
+                           feedback=req.feedback, next_tasks=req.next_tasks)
+
+
+@router.get("/fullcycle/projects/{project_id}")
+def fullcycle_project(project_id: str, _: bool = Depends(_auth)):
+    from core.fullcycle import engine as fe
+    return _fullcycle_call(fe.project_status, project_id)
+
+
 class AgentResumeReq(BaseModel):
     project_dir: str
     conversation_id: Optional[str] = None

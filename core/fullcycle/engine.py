@@ -752,3 +752,27 @@ class Engine:
                            "origin": t["origin"], "last_reason": t["last_reason"]}
                           for t in tasks],
                 "pending_reviews": pending_reviews(self.project_id, conn=self.conn)}
+
+
+def project_status(project_id: str, conn=None) -> dict:
+    """Read-only view for the reviewer: spec version, every task's contract state,
+    pending reviews. Needs no adapter, so it can be served by the API process."""
+    conn, own = connect(conn)
+    try:
+        p = specs.get_project(project_id, conn=conn)
+        if not p:
+            raise EngineError(f"no such project {project_id!r}")
+        s = specs.get_spec(project_id, conn=conn)
+        rows = conn.execute("SELECT key, contract_id, attempt, origin, last_reason FROM fc_task"
+                            " WHERE project_id=? ORDER BY seq", (project_id,)).fetchall()
+        done = conn.execute("SELECT event_id FROM fc_project_done WHERE project_id=?",
+                            (project_id,)).fetchone()
+        return {"project": p, "spec_version": s["version"] if s else None,
+                "spec_sha": s["sha"] if s else None, "done": bool(done),
+                "tasks": [{"key": r[0], "state": tc.get(r[1], conn=conn)["state"],
+                           "attempt": r[2], "origin": r[3], "last_reason": r[4]}
+                          for r in rows],
+                "pending_reviews": pending_reviews(project_id, conn=conn)}
+    finally:
+        if own:
+            conn.close()
