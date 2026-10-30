@@ -410,6 +410,9 @@ def test_the_turn_check_counts_nodes_and_never_reads_them(wired):
     s = wired({"n": 1}, bools=[True, True, True, True])
     cdp.submit_phrase("https://chatgpt.com/c/a", "PHRASE", claim=False)
     for e in s.exprs:
+        # the composer selector EXCLUDES editors inside turns (`:not([...] *)`, 915bf5b):
+        # an exclusion selects nothing in a turn, so it is not a read
+        e = e.replace(":not([data-message-author-role] *)", "")
         assert "data-message-author-role" not in e or ".length" in e, e
 
 
