@@ -21,7 +21,16 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     # the auth dependency is overridden, so the auth method reads "unknown"
     monkeypatch.setenv("FULLCYCLE_REVIEWERS", "api:unknown/mcp-token-3")
-    from api import v1
+    # load THIS tree's api/v1.py: other test modules put the live tree on sys.path at
+    # collection time, and a plain `from api import v1` would then test the live file
+    import importlib.util
+    import os
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "api", "v1.py")
+    spec = importlib.util.spec_from_file_location("api_v1_under_test", path)
+    v1 = importlib.util.module_from_spec(spec)
+    import sys
+    sys.modules["api_v1_under_test"] = v1          # pydantic resolves annotations through it
+    spec.loader.exec_module(v1)
     app = FastAPI()
     app.include_router(v1.router)
     app.dependency_overrides[v1._auth] = lambda: True
