@@ -1399,3 +1399,59 @@ def test_suite_audit_log_is_not_the_live_one():
     path = ac._audit_path()
     assert not path.startswith("/var/log/"), path
     assert os.environ.get("AGENT_CONTROL_AUDIT") == path
+
+
+# 2026-10-31: Claude Code's dim PROMPT SUGGESTION (its guess at the next message, caret
+# parked BEFORE it) is not staged input — gaika-country-ru sat idle ~22h behind one.
+def _suggestion_tmux(row: str, cursor_x: int, pane: str = ""):
+    def fake(args, stdin=None):
+        if args[0] == "display-message":
+            return 0, f"{cursor_x} 17\n", ""
+        if "-E" in args:
+            return 0, row + "\n", ""
+        return 0, pane or f"──────\n{row}\n──────\n  ⏵⏵ auto mode on", ""
+    return fake
+
+
+SUGGESTION_ROW = "\x1b[39m❯\xa0\x1b[2mвлей staging в country/ru и пушь"
+
+
+def test_dim_suggestion_with_caret_at_start_is_not_pending(monkeypatch):
+    monkeypatch.setattr(ac, "_tmux", _suggestion_tmux(SUGGESTION_ROW, 2))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "an unrelated earlier command")
+    assert ac.pending_input_text("gaika-country-ru:0.0", cwd="/opt/gaika-worktrees/ru") == ""
+    assert ac._pane_pending_input("gaika-country-ru:0.0", cwd="/opt/gaika-worktrees/ru") == ""
+    assert ac._pane_pending_input("gaika-country-ru:0.0") == ""     # no cwd needed
+
+
+def test_dim_text_with_caret_at_end_is_still_real_pending(monkeypatch):
+    # staged dim input (mess-qa 2026-08-05) has the caret after it: unchanged
+    row = "❯ \x1b[2mcontinue with slice 2\x1b[0m"
+    monkeypatch.setattr(ac, "_tmux", _suggestion_tmux(row, 2 + len("continue with slice 2")))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "an unrelated earlier command")
+    assert ac.pending_input_text("mess-qa-automation:0.0", cwd="/opt/mess") == "continue with slice 2"
+
+
+def test_plain_typed_text_with_caret_at_start_is_still_pending(monkeypatch):
+    # not dim: a person who typed and moved the caret home still has real input
+    row = "❯ deploy the fix to staging"
+    monkeypatch.setattr(ac, "_tmux", _suggestion_tmux(row, 2))
+    assert ac.pending_input_text("x:0.0", cwd="/x") == "deploy the fix to staging"
+
+
+def test_suggestion_check_fails_closed(monkeypatch):
+    def broken(args, stdin=None):
+        if args[0] == "display-message":
+            return 1, "", "no such pane"
+        return 0, f"──────\n{SUGGESTION_ROW}\n──────", ""
+    monkeypatch.setattr(ac, "_tmux", broken)
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "an unrelated earlier command")
+    assert ac._is_unaccepted_suggestion("x:0.0") is False
+    assert ac.pending_input_text("x:0.0", cwd="/x") == "влей staging в country/ru и пушь"
+
+
+def test_suggestion_on_another_row_does_not_count(monkeypatch):
+    # caret is on a different row (e.g. a menu below): the dim prompt text is not proven a guess
+    monkeypatch.setattr(ac, "_tmux", _suggestion_tmux("  1. Yes", 2, pane=f"──────\n{SUGGESTION_ROW}\n──────"))
+    monkeypatch.setattr(ac, "last_submitted_text", lambda cwd: "an unrelated earlier command")
+    assert ac._is_unaccepted_suggestion("x:0.0") is False

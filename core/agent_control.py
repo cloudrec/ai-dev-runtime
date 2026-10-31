@@ -781,6 +781,8 @@ def pending_input_text(target: str, tail: str | None = None, cwd: str = "") -> s
         raw = prompt_text_from_styled(prompt_lines[-1].split("❯", 1)[1])
         if raw.startswith(DIM_PREFIX):
             dim = raw[len(DIM_PREFIX):]
+            if _is_unaccepted_suggestion(target):
+                return ""                  # Claude's guess at the next message, not input
             # A dim line is the recall ghost ONLY if it matches the last submitted message.
             # Without a cwd we cannot check, so we keep the old conservative answer.
             if not cwd or _is_recall_ghost(dim, cwd):
@@ -1469,10 +1471,42 @@ def _pane_pending_input(target: str, cwd: str = "") -> str:
     if not prompt_lines:
         return ""
     raw = prompt_text_from_styled(prompt_lines[-1].split("❯", 1)[1])
+    if raw.startswith(DIM_PREFIX) and _is_unaccepted_suggestion(target):
+        return ""
     if cwd and raw.startswith(DIM_PREFIX):
         dim = raw[len(DIM_PREFIX):]
         return "" if _is_recall_ghost(dim, cwd) else dim
     return raw
+
+
+def _is_unaccepted_suggestion(target: str) -> bool:
+    """Is the dim text at the `❯` prompt Claude Code's PROMPT SUGGESTION — its own guess at
+    the next message, which nobody typed and Enter-on-paste replaces?
+
+    LIVE 2026-10-31: gaika-country-ru sat idle ~22h behind a dim `влей staging в country/ru
+    и пушь` and owner-os-supervisor-clean behind `ну что, гайка сама дошла до конца?`. Neither
+    matched the last submitted message, so both read as staged input: the stall doctor
+    escalated LOST_CONTINUATION to the owner, the closed loop stood down for it, and the tech
+    lead saw "an unsent message" it would not override. Nobody had typed anything.
+
+    The terminal cursor tells them apart: Claude Code parks it at the START of a suggestion
+    (the text is a placeholder after the caret) and at the END of anything typed or pasted.
+    So: the cursor row is the prompt row, and the dim run begins exactly at the cursor.
+    Fails closed — any read or parse problem answers False (keep treating it as input)."""
+    try:
+        rc, pos, _ = _tmux(["display-message", "-p", "-t", target, "#{cursor_x} #{cursor_y}"])
+        cx, cy = (int(v) for v in pos.split())
+        rc2, row, _ = _tmux(["capture-pane", "-e", "-p", "-t", target,
+                             "-S", str(cy), "-E", str(cy)])
+        if rc != 0 or rc2 != 0:
+            return False
+        row = row.rstrip("\n")
+        if "❯" not in row or "\x1b[2m" not in row:
+            return False
+        before = _SGR_RE.sub("", row.split("\x1b[2m", 1)[0])
+        return "❯" in before and len(before) == cx
+    except Exception:  # noqa: BLE001 — unreadable: not proven a suggestion
+        return False
 
 
 def agent_list() -> dict:
