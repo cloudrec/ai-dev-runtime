@@ -183,3 +183,22 @@ def test_an_empty_answer_after_the_timeout_is_still_a_failure(wire):
     assert r["ok"] is False
     assert r["reason"].startswith("assistant_started_but_produced_nothing")
     assert latched == [13]
+
+
+
+def test_a_pre_send_timeout_names_the_step_and_keeps_the_reason(wire, capsys):
+    """2026-10-29..31: 35 `cdp_error:WebSocketTimeoutException` failures on the shared
+    pl/gaika chat recorded no step, so where the page stopped answering was unknowable.
+    The result must stay byte-identical (callers match it exactly); the step goes to the
+    companion's journal."""
+    latched, _ = wire(_Hung("insert"), _after())
+    r = cdp.submit_phrase(URL, "PHRASE", event_id=76362, claim=False)
+    assert r == {"ok": False, "reason": REASON}
+    assert latched == []
+    assert f"cdp {REASON} at step insert_phrase (event 76362" in capsys.readouterr().out
+
+
+def test_a_post_send_timeout_names_the_verify_step(wire, capsys):
+    wire(_Hung("boolean"), _after(turns=1, assistant=1))
+    cdp.submit_phrase(URL, "PHRASE", event_id=76390, claim=False)
+    assert "at step post_send_verify (event 76390" in capsys.readouterr().out

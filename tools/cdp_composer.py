@@ -36,8 +36,18 @@ CDP_PORT = 9222
 # to that chat failed composer_ambiguous_or_absent:2 (bitwhite 75652 for 3 h; TaskBoard
 # 75900), and the first match would have been the wrong editor. An editor inside a
 # conversation turn is never the composer, so each alternative excludes them.
-_NOT_IN_THREAD = (":not([data-chatgpt-search-message-ids] *)"
-                  ":not([data-message-author-role] *):not(article *)")
+# 2026-10-31, measured read-only on all six live tabs: of the three markers above only
+# `data-chatgpt-search-message-ids` still wraps the writing block (no `article`, no
+# `data-message-author-role` exist any more), so one renamed search attribute would bring
+# the :2 failure back on every chat holding a writing block. The turn and the block carry
+# further, independent structural markers; none of them wraps the form's composer on any
+# tab. Excluding each means the composer survives any single one being renamed.
+_TURN_MARKERS = (
+    "[data-chatgpt-search-message-ids]", "[data-message-author-role]", "article",
+    "[data-turn-key]", "[data-chatgpt-selection-message-id]",
+    "[data-oai-writing-block-surface]", "[data-testid*='writing-block']",
+)
+_NOT_IN_THREAD = "".join(f":not({m} *)" for m in _TURN_MARKERS)
 COMPOSER_SEL = ", ".join(alt + _NOT_IN_THREAD for alt in (
     "#prompt-textarea", "div[contenteditable='true'][id='prompt-textarea']",
     "div.ProseMirror[contenteditable='true'][role='textbox']"))
@@ -1433,9 +1443,15 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
     # Set the instant the send control is pressed, and never before: from then on the
     # phrase may be in the chat, so an exception can no longer be read as "not sent".
     dispatched = False
+    # Which CDP step was running when an exception ended the attempt. Diagnostic only:
+    # 35 `cdp_error:WebSocketTimeoutException` failures (2026-10-29..31, all on the shared
+    # pl/gaika chat) said nothing about WHERE the page stopped answering. The reason string
+    # stays unchanged — callers match it exactly — so the step is only journalled.
+    step = "session_open"
     try:
         s = _Session(target["webSocketDebuggerUrl"])
         s.call("Runtime.enable")
+        step = "page_ready_wait"
 
         import time as _t
         for _ in range(12):
@@ -1449,6 +1465,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # refusing on it would silence working routes. Success still needs the full proof
         # below; the notice is carried into every post-send verdict (`_full_verdict`) so a
         # failure on a capped chat names its cause and a success says the chat is at cap.
+        step = "pre_send_baselines"
         full_before = conversation_is_full(s) is True
         n = s.count(COMPOSER_SEL)
         if n != 1:
@@ -1472,6 +1489,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         asst_id_before = s.last_attr(ASSISTANT_TURN_SEL, "data-message-id")
         # Focus by element identity, then CONFIRM focus. A focus call that silently fails is
         # exactly how the phrase went nowhere before.
+        step = "focus_composer"
         focused = focus_composer(s)
         if focused is not True:
             # Name the cause instead of collapsing it. 2026-08-30, 12:19 -> 16:0x: every
@@ -1489,6 +1507,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # answer the question (None), the previous path runs unchanged.
         # Kept: the stop control's state BEFORE our send, so its later APPEARANCE can be
         # told from mere presence (see `_assistant_advanced`).
+        step = "backpressure_check"
         gen_before = assistant_is_generating(s)
         if gen_before is True:
             # Two different worlds behind one appearance. A turn genuinely in flight is
@@ -1524,6 +1543,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # Refuse rather than clear. Clearing destroys work nobody authorised us to touch,
         # and the wake is not urgent enough to justify it: the event stays pending and the
         # next attempt succeeds once the box is empty.
+        step = "composer_draft_check"
         already = s.boolean(
             f"(document.querySelector({COMPOSER_SEL!r})||{{}}).textContent?.length > 0")
         if already is True:
@@ -1565,6 +1585,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                 % json.dumps(COMPOSER_SEL)})
 
         # The ONLY string ever sent into the page.
+        step = "insert_phrase"
         s.call("Input.insertText", {"text": phrase})
 
         # Confirm the composer is now non-empty WITHOUT reading what it contains.
@@ -1578,6 +1599,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
             f"(function(){{const b=document.querySelector({SEND_SEL!r});"
             f"return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';}})()")
         dispatched = True
+        step = "post_send_verify"
         if enabled is True:
             s.call("Runtime.evaluate",
                    {"expression": f"document.querySelector({SEND_SEL!r}).click()"})
@@ -1649,6 +1671,10 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                              full_before)
     except Exception as e:  # noqa: BLE001
         reason = f"cdp_error:{type(e).__name__}"
+        # Journal only (the companion's stdout): the result dict and its reason are
+        # unchanged, since callers and the ledger match them exactly.
+        print(f"cdp {reason} at step {step} (event {event_id}, source {source})",
+              flush=True)
         if dispatched:
             return _verify_after_cdp_error(
                 target, reason, source=source, event_id=event_id,
