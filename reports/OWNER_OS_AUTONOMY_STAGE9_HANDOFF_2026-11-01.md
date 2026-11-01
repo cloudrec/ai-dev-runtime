@@ -5,7 +5,7 @@ The author wrote this packet; it is **not an independent review**.
 **No live autonomous E2E has been run.** The Stage 6 rehearsal mocks the agent, the ChatGPT page and the reviewer.
 **PROD: NO-GO.**
 
-This file is the canonical entry point. It supersedes the Stage 8 handoff. For the 7 questions, see `OWNER_OS_AUTONOMY_STAGE7_REVIEW_PACKET_2026-11-01.md`.
+**Superseded as entry point by `OWNER_OS_AUTONOMY_STAGE10_HANDOFF_2026-11-01.md` (`dca2287`).** This file was the canonical entry point. It supersedes the Stage 8 handoff. For the 7 questions, see `OWNER_OS_AUTONOMY_STAGE7_REVIEW_PACKET_2026-11-01.md`.
 
 ## 1. State
 - Branch `owneros/autonomy-finish`, worktree `/opt/owneros-autonomy`.
