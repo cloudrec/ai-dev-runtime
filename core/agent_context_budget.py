@@ -562,6 +562,15 @@ def _resume_instruction(handoff_path: str, remaining: dict) -> str:
             "suites unless that exact remaining task requires it.")
 
 
+def fullcycle_holds(target: str) -> bool:
+    """Fail closed: if the check itself fails, the pane is treated as held."""
+    try:
+        from core.fullcycle.engine import attempt_in_flight_for_agent
+        return attempt_in_flight_for_agent(target)
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True, dispatch: bool) -> dict:
     """Assess one agent's context budget and act per policy. Returns fields to merge
     into the record: context_pct, context_tier, and (when acted) notification_state
@@ -611,6 +620,13 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
     checkpoint_due = completion_checkpoint_due(agent, rec, cfg, tail, t)
 
     if tier in ("ok", "unknown"):
+        return out
+
+    # D2b: never checkpoint into, or rotate, a pane whose Full Cycle attempt may be
+    # running — the engine owns that attempt (its handoff path is the agent's
+    # `context_exhausted` result), and a handoff file would dirty the verified tree.
+    if fullcycle_holds(key):
+        out["notification_state"] = "context_deferred_fullcycle_attempt"
         return out
 
     # Finish-soon suppression — unless there is genuine work_remaining to rotate INTO.

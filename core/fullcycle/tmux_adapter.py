@@ -16,6 +16,7 @@ must go through the creation guard and the owner's creation approval.
 from __future__ import annotations
 
 import json
+import re
 from typing import Optional
 
 from core import permission_resolver as _pr
@@ -34,12 +35,38 @@ def parse_result(text: Optional[str], handle: dict) -> Optional[dict]:
     if not isinstance(r, dict) or r.get("task_id") != handle.get("task_id") \
             or r.get("attempt") != handle.get("attempt"):
         return None
-    if r.get("status") not in ("done", "blocked"):
+    if r.get("status") not in ("done", "blocked", "context_exhausted"):
         return None
     files = r.get("changed_files") or []
     r["changed_files"] = [f for f in files if isinstance(f, str)]
     r["summary"] = str(r.get("summary") or "")[:4000]
+    if r["status"] == "context_exhausted":
+        r["handoff"], r["handoff_problem"] = clean_handoff(r.get("handoff"))
     return r
+
+
+HANDOFF_MAX = 8000
+_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def clean_handoff(raw) -> tuple:
+    """(text, problem). A compact handoff is plain text up to HANDOFF_MAX characters.
+    Never silently altered: control characters are removed and an over-long one is cut,
+    and both are named in `problem`; a missing/non-text/empty one yields "" + problem.
+    A malformed handoff still reaches the tech lead — it is reported, not dropped."""
+    if raw is None:
+        return "", "handoff_missing"
+    if not isinstance(raw, str):
+        return "", "handoff_not_text"
+    text = _CTRL.sub("", raw)
+    problems = ["handoff_control_chars_removed"] if text != raw else []
+    text = text.strip()
+    if not text:
+        return "", "handoff_empty"
+    if len(text) > HANDOFF_MAX:
+        text = text[:HANDOFF_MAX]
+        problems.append(f"handoff_truncated_to_{HANDOFF_MAX}")
+    return text, ",".join(problems)
 
 
 def _permission(tail: str) -> Optional[Observation]:

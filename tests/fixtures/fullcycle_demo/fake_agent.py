@@ -11,6 +11,7 @@ that task key and attempt:
   permission    print a Claude-style permission dialog, wait for "1", then do `correct`
   blocked       report blocked with a question
   hang          do nothing (stays "working")
+  exhausted     report context_exhausted with a compact handoff
 
 Scenario JSON (path in $FULLCYCLE_FAKE_SCENARIO):
   {"behaviours": {"<key>": ["crash", "correct"]},       # per attempt; last repeats
@@ -34,9 +35,9 @@ def _write(root, files):
             fh.write(content)
 
 
-def _result(env, status, summary, changed, question=None):
+def _result(env, status, summary, changed, question=None, **extra):
     r = {"task_id": env["task_id"], "attempt": env["attempt"], "status": status,
-         "summary": summary, "changed_files": changed}
+         "summary": summary, "changed_files": changed, **extra}
     if question:
         r["question"] = question
     os.makedirs(os.path.dirname(env["result_path"]), exist_ok=True)
@@ -71,6 +72,10 @@ def main():
             print("fake agent: crashing", flush=True)
             sys.exit(3)
         if how == "hang":
+            continue
+        if how == "exhausted":
+            _result(env, "context_exhausted", "out of context", [],
+                    handoff=f"HANDOFF {key}: started, nothing written yet; next: write the file.")
             continue
         if how == "blocked":
             _result(env, "blocked", "need a decision", [], question="Integers only, or floats too?")

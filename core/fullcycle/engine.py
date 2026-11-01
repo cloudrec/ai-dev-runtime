@@ -759,6 +759,30 @@ class Engine:
         return ({**payload, "id": r[0], "status": r[1], "decision": r[3]}
                 if payload.get("stalled") else None)
 
+    def _blocked_review(self, task: dict, payload: dict) -> None:
+        """This attempt's "blocked" review. If a stall alert already holds the slot and is
+        still pending, the agent's own report replaces its content and the tech lead is
+        told once more (the slot is unique per task/attempt/kind)."""
+        stall = self._stall_review(task, task["attempt"])
+        if not (stall and stall["status"] == "pending"):
+            self._request_review(task, "blocked", payload)
+            return
+        payload = {**payload, "after_stall": stall.get("stalled")}
+        self.conn.execute("UPDATE fc_review SET payload=? WHERE id=?", (_j(payload), stall["id"]))
+        self.conn.commit()
+        self._event(REVIEW_EVENT, task["id"], {
+            "fullcycle": "blocked", "review_id": stall["id"], "project": self.project_id,
+            "task": task["key"], "attempt": task["attempt"], **payload,
+            "decide_with": {"review_id": stall["id"],
+                            "decisions": list(REVIEW_DECISIONS["blocked"])}},
+            dedup_key=f"fullcycle:review:{stall['id']}:report")
+
+    def _blocked_payload(self, task: dict, attempt: int) -> dict:
+        r = self.conn.execute("SELECT payload FROM fc_review WHERE project_id=? AND task_id=?"
+                              " AND attempt=? AND kind='blocked'",
+                              (self.project_id, task["id"], attempt)).fetchone()
+        return json.loads(r[0] or "{}") if r else {}
+
     def _sent_ts(self, task: dict) -> Optional[float]:
         r = self.conn.execute("SELECT ts FROM fc_dispatch WHERE idem_key=? AND status='sent'",
                               (f"fullcycle:{task['id']}:{task['attempt']}",)).fetchone()
@@ -783,7 +807,11 @@ class Engine:
         then the agent must be provably idle. Anything else waits — never a second
         envelope beside a possibly running one."""
         prev = task["handle"] or {}
-        if prev.get("attempt") != attempt - 1 or not self._stall_review(task, attempt - 1):
+        if prev.get("attempt") != attempt - 1:
+            return True
+        if self._blocked_payload(task, attempt - 1).get("context_exhausted"):
+            return self._clean_session_ready(task, prev, attempt)
+        if not self._stall_review(task, attempt - 1):
             return True
         obs = self.adapter.poll(prev)
         if obs.state == DONE:
@@ -796,6 +824,25 @@ class Engine:
             self._note("resend_fenced", task=task["key"], attempt=attempt,
                        observed=obs.state, quiescent=quiet)
             return False
+        return True
+
+    def _clean_session_ready(self, task: dict, prev: dict, attempt: int) -> bool:
+        """D2: the next attempt after a context exhaustion goes to a clean session, and only
+        after a safe stop. An adapter that owns its agent starts the fresh session itself;
+        for any other (live) agent the clean session was confirmed through the owner gate
+        `clean_session_required` before this resend was requested."""
+        quiet = self.adapter.quiescent(prev)
+        if quiet is not True:
+            self._note("resend_fenced", task=task["key"], attempt=attempt,
+                       observed="context_exhausted", quiescent=quiet)
+            return False
+        if self.adapter.owns_agent:
+            rs = self.adapter.restart(prev)
+            self._note("clean_session", task=task["key"], attempt=attempt, result=rs)
+            if not rs.get("ok"):
+                self._set(task, redispatch=0)
+                self._block_for_owner(task, "clean_session_failed")
+                return False
         return True
 
     def _step_working(self, task: dict) -> None:
@@ -815,24 +862,21 @@ class Engine:
             result = self.adapter.collect(task["handle"]) or {}
             if result.get("status") == "blocked":
                 self._move(task, tc.BLOCKED)
-                question = str(result.get("question") or result.get("summary"))[:4000]
-                stall = self._stall_review(task, task["attempt"])
-                if stall and stall["status"] == "pending":
-                    # the stall alert already holds this attempt's "blocked" slot: put the
-                    # agent's real question into it and tell the tech lead once more
-                    self.conn.execute("UPDATE fc_review SET payload=? WHERE id=?",
-                                      (_j({"question": question,
-                                           "after_stall": stall.get("stalled")}), stall["id"]))
-                    self.conn.commit()
-                    self._event(REVIEW_EVENT, task["id"], {
-                        "fullcycle": "blocked", "review_id": stall["id"],
-                        "project": self.project_id, "task": task["key"],
-                        "attempt": task["attempt"], "question": question,
-                        "decide_with": {"review_id": stall["id"],
-                                        "decisions": list(REVIEW_DECISIONS["blocked"])}},
-                        dedup_key=f"fullcycle:review:{stall['id']}:question")
-                else:
-                    self._request_review(task, "blocked", {"question": question})
+                self._blocked_review(task, {"question": str(
+                    result.get("question") or result.get("summary"))[:4000]})
+                return
+            if result.get("status") == "context_exhausted":
+                # D2: the attempt ended at a safe stop with a compact handoff; the routine
+                # decision (continue in a clean session, or cancel) is the tech lead's
+                self._move(task, tc.BLOCKED)
+                self._blocked_review(task, {
+                    "context_exhausted": True, "handoff": result.get("handoff", ""),
+                    "handoff_problem": result.get("handoff_problem", ""),
+                    "summary": result.get("summary", ""),
+                    "question": ("The agent ran out of context and stopped with the handoff "
+                                 "below. Answer to continue the task in a clean session (the "
+                                 "handoff and your answer become its instructions; counts "
+                                 "towards the attempt limit), or cancel.")})
                 return
             self._move(task, tc.AGENT_DONE)
             self._verify_current(task)
@@ -903,6 +947,29 @@ class Engine:
                     # not CANCELLED yet: the task stays in flight (so no other task is sent
                     # to the agent) until _step_working proves the attempt over
                     self._note("stall_cancel_pending", task=task["key"])
+            elif kind == "blocked" and task["state"] == tc.BLOCKED and \
+                    self._blocked_payload(task, attempt).get("context_exhausted"):
+                if decision == "answer":
+                    p = self._blocked_payload(task, attempt)
+                    feedback = ("You are continuing in a clean session after the previous one "
+                                "ran out of context. Handoff from the previous session:\n"
+                                + (p.get("handoff") or "(none was provided)")
+                                + "\n\nTech lead: " + review["feedback"])
+                    if task["attempt"] >= self.max_attempts:
+                        self._block_for_owner(task, f"max_attempts_{self.max_attempts}:"
+                                                    "context_exhausted")
+                    elif self.adapter.owns_agent:
+                        self._request_dispatch(task, task["attempt"] + 1, feedback=feedback)
+                    else:
+                        # a clean session for a live agent is a session-lifecycle action the
+                        # engine does not hold a grant for: the owner provides/confirms it
+                        self._set(task, feedback=feedback[:4000])
+                        self._owner(task, "clean_session_required",
+                                    {"handoff": p.get("handoff", ""),
+                                     "instructions": "Start a clean session for this agent "
+                                     "(e.g. /clear at a safe boundary), then answer resume."})
+                else:
+                    self._move(task, tc.CANCELLED, evidence={"review": review})
             elif kind == "blocked" and task["state"] == tc.BLOCKED:
                 if decision == "answer":
                     self._retry(task, why="blocked_answered",
@@ -1152,6 +1219,45 @@ def project_status(project_id: str, conn=None) -> dict:
 # work finished, and idleness is the expected end state (TaskBoard 2026-10-30, events
 # 76026/76047/76065 after project_completed 76022).
 SETTLE_GRACE_SECS = 300   # the agent's own closing turn may end just after the approval
+
+
+def attempt_in_flight_for_agent(target: str, conn=None) -> bool:
+    """D2b: may a Full Cycle attempt be running on `target`'s session right now? Then its
+    pane must not be rotated (/clear) or have a handoff written into its tree by another
+    controller. True for a task whose contract is WORKING, or with a send pending, whose
+    last recorded handle names that session. No Full Cycle tables → False; any error →
+    True (fail closed: a rotation is deferred, never forced). Read-only."""
+    session = (target or "").strip().split(":", 1)[0]
+    if not session:
+        return False
+    try:
+        conn, own = cp._c(conn)
+    except Exception:  # noqa: BLE001
+        return True
+    try:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                            "name='fc_task'").fetchone():
+            return False
+        for cid, handle, redispatch in conn.execute(
+                "SELECT contract_id, handle, redispatch FROM fc_task WHERE "
+                "COALESCE(handle,'')<>''"):
+            try:
+                h = json.loads(handle)
+            except ValueError:
+                continue
+            if str(h.get("target") or "").split(":", 1)[0] != session:
+                continue
+            if redispatch:
+                return True
+            c = tc.get(cid, conn=conn)
+            if not c or c["state"] == tc.WORKING:
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — unreadable state: defer the rotation
+        return True
+    finally:
+        if own:
+            conn.close()
 
 
 def settled_project_for_agent(target: str, conn=None,
