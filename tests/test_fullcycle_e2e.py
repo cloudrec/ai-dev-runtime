@@ -368,3 +368,26 @@ def test_a_resumed_parked_task_waits_for_the_task_in_flight(fc, monkeypatch):
     assert risky["redispatch"] == 1                            # the intent is kept...
     assert "tinycalc:risky" not in [x["task_id"] for x in h.agent_log(log)]   # ...not sent
     assert _state(e.status(), "mul")["state"] == tc.WORKING
+
+
+# ── failed QA → specific repair → regression ─────────────────────────────────
+def test_a_task_that_breaks_an_earlier_verified_task_is_repaired_before_review(fc, monkeypatch):
+    # mul's first attempt is right for mul but breaks add (already verified and committed)
+    monkeypatch.setitem(h.BROKEN, "mul", {"tinycalc/mul.py": h.SOLUTIONS["mul"]["tinycalc/mul.py"],
+                                          "tinycalc/add.py": h.BROKEN["add"]["tinycalc/add.py"]})
+    monkeypatch.setitem(h.SOLUTIONS, "mul", {**h.SOLUTIONS["mul"], **h.SOLUTIONS["add"]})
+    e, a, log, root = fc({"mul": ["wrong", "correct"]})
+    rv = h.StubReviewer()
+    st = h.run(e, rv, until=lambda s: _state(s, "mul")["state"] == tc.VERIFIED_DONE, timeout=40)
+    assert _state(st, "mul")["attempt"] == 2
+    # the regression never reached the reviewer: one review per task, the repaired one
+    assert [(s["key"], s["choice"]) for s in rv.seen if s["key"] != "__project__"] == [
+        ("add", "approve"), ("mul", "approve")]
+    fb = [x for x in h.agent_log(log) if x["task_id"] == "tinycalc:mul"][1]["feedback"]
+    assert "regression:add:" in fb                       # names the task it broke...
+    assert "assert add(2, 3) == 5" in fb                 # ...and the failing check
+    t = next(t for t in e._tasks() if t["key"] == "mul")
+    failed = [h_["evidence"]["verification"] for h_ in tc.history(t["contract_id"])
+              if h_["to"] == tc.VERIFICATION_FAILED][0]
+    assert [r["task"] for r in failed["regression"]] == ["add"]
+    assert not failed["regression"][0]["passed"]

@@ -585,14 +585,34 @@ class Engine:
         violations = gates.check_changes(changed, scope=c["scope"],
                                          do_not_touch=c["do_not_touch"])
         checks = self._run_checks(task["body"]["checks"], trusted=self._trusted(task))
-        passed = not violations and bool(checks) and all(x["passed"] for x in checks)
+        regression = self._regression_checks(task)
+        passed = (not violations and bool(checks) and all(x["passed"] for x in checks)
+                  and all(r["passed"] for r in regression))
         reasons = violations + [f"check_failed:{' '.join(x['argv'])}"
                                 for x in checks if not x["passed"]]
+        reasons += [f"regression:{r['task']}:{' '.join(r['argv'])}"
+                    for r in regression if not r["passed"]]
         if not checks:
             reasons.append("task_has_no_checks")
         return {"attempt": task["attempt"], "passed": passed, "changed_files": changed,
                 "changed_source": source, "violations": violations, "checks": checks,
-                "reasons": reasons, "summary": result.get("summary", "")}
+                "regression": regression, "reasons": reasons,
+                "summary": result.get("summary", "")}
+
+    def _regression_checks(self, task: dict) -> list:
+        """The checks of every task already VERIFIED_DONE, re-run on this task's tree: a
+        task that breaks earlier verified work fails its own verification (and is told
+        which task and check it broke) instead of reaching review. Each check keeps the
+        trust of the task that owns it. FULLCYCLE_REGRESSION_CHECKS=0 turns this off."""
+        if os.getenv("FULLCYCLE_REGRESSION_CHECKS", "1") == "0":
+            return []
+        out = []
+        for t in self._tasks():
+            if t["id"] == task["id"] or t["state"] != tc.VERIFIED_DONE:
+                continue
+            for x in self._run_checks(t["body"]["checks"], trusted=self._trusted(t)):
+                out.append({"task": t["key"], **x})
+        return out
 
     def _restore_violations(self, v: dict) -> list:
         """A tracked file the task may not touch is put back as it was at HEAD; left in
@@ -627,6 +647,11 @@ class Engine:
             for x in v["checks"]:
                 if not x["passed"]:
                     feedback += f"\n$ {' '.join(x['argv'])} (rc={x['rc']})\n{x['output'][-800:]}"
+            for x in v.get("regression", []):
+                if not x["passed"]:
+                    feedback += (f"\nYour change broke the already verified task "
+                                 f"'{x['task']}':\n$ {' '.join(x['argv'])} (rc={x['rc']})\n"
+                                 f"{x['output'][-800:]}")
             self._set(task, verification=v, feedback=feedback[:4000])
             self._retry(task, why="verification_failed")
             return
