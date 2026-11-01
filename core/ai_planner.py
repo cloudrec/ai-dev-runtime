@@ -131,6 +131,7 @@ def _json_objects(text: str):
 #: arguments). Job 703f780d (task 326) failed that way as "plan missing 'files'
 #: list", which read like a broken plan rather than a planner that never planned.
 _TOOL_CALL_KEYS = frozenset({"command", "file_path", "pattern", "url", "query"})
+TOOL_CALL_REASON = "planner emitted a tool call instead of a plan"
 
 
 def _looks_like_tool_call(obj: dict) -> bool:
@@ -166,7 +167,7 @@ def _extract_json(text: str) -> dict:
             return obj
     if candidates:
         if _looks_like_tool_call(candidates[0]):
-            raise PlannerError("planner emitted a tool call instead of a plan")
+            raise PlannerError(TOOL_CALL_REASON)
         return candidates[0]
     if "{" in text and "}" in text:
         raise PlannerError("malformed planner JSON")

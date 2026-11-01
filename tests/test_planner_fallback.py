@@ -602,3 +602,26 @@ def test_a_lone_non_plan_object_still_fails_as_missing_files():
     obj = ai_planner._extract_json('{"summary": "s"}')
     with pytest.raises(ai_planner.PlannerError, match="plan missing 'files' list"):
         ai_planner._validate(obj, [])
+
+
+def test_a_tool_call_answer_blocks_the_job_instead_of_running_a_fallback(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    before = sorted(p.name for p in repo.rglob("*") if ".git" not in p.parts)
+    cli, counter = _counting_cli(tmp_path, (
+        "import json, sys\n"
+        f"env = {{'type':'result','subtype':'success','is_error':False,'result':{_JOB136_RAW!r}}}\n"
+        "sys.stdout.write(json.dumps(env))\n"
+    ))
+    _reload(monkeypatch, cli)
+    job = job_store.create_job(project_path=str(repo), goal="g", instructions="investigate first",
+                               task_id=326, autonomy_level="execute_safe",
+                               auto_commit=True, auto_push=False)
+    job_executor.execute(job["id"])
+    final = job_store.get_job(job["id"])
+    assert final["status"] == "blocked", final.get("error")
+    assert final["error"].startswith("planner_tool_call")
+    assert not final.get("plan")                       # no fallback plan was made
+    assert any(a.get("planner_tool_call") for a in final["artifacts"])
+    assert int(open(counter).read()) == 1               # one planning attempt, no retry
+    after = sorted(p.name for p in repo.rglob("*") if ".git" not in p.parts)
+    assert after == before                              # nothing written to the repo

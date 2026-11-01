@@ -552,6 +552,24 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
                     note=reason[:200])
             except Exception:  # noqa: BLE001 — routing outcome recording must never block a job
                 pass
+        if reason.startswith(ai_planner.TOOL_CALL_REASON):
+            # The planner never planned: an "investigate first" task made it write a
+            # tool call instead (job 703f780d, task 326). A no-op fallback plan plus a
+            # full suite run would only bury that, so stop here with an explicit,
+            # actionable blocker. One planning attempt, as always — no retry loop.
+            _cur = job_store.get_job(job_id) or job
+            job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
+                "planner_tool_call": True, "reason": reason[:200],
+                "raw": ai_planner._sanitize_raw(diag["raw"], cap=1000),
+                "tokens": diag["tokens"], "cost_usd": diag["cost_usd"],
+                "duration_ms": diag["duration_ms"],
+            }])
+            job_store.append_log(job_id, "warn",
+                                 "planner emitted a tool call instead of a plan — job blocked; "
+                                 "split the task into a concrete code change or give it to an agent")
+            _finish(job_id, "blocked", error="planner_tool_call: task needs investigation "
+                                             "the tools-less planner cannot do")
+            return
         job_store.append_log(job_id, "warn",
                              f"planner failed ({reason[:120]}) — building deterministic fallback plan")
         try:
