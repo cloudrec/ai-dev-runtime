@@ -78,3 +78,18 @@ def test_importing_the_companion_resolves_core_from_this_checkout():
     )
     assert got.startswith(_ROOT + os.sep), got
 
+
+
+_LIVE_CONST = re.compile(r"""^(\w+)\s*=\s*["']/root/ai-dev-runtime/?["']\s*$""", re.M)
+
+
+def test_no_live_tree_constant_is_put_on_sys_path():
+    # tools/stage_done.py: REPO = "/root/ai-dev-runtime"; sys.path.insert(0, REPO)
+    offenders = []
+    for path in _py_files():
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            src = fh.read()
+        for name in _LIVE_CONST.findall(src):
+            if re.search(r"sys\.path\.insert\(\s*0\s*,\s*%s\b" % re.escape(name), src):
+                offenders.append(f"{os.path.relpath(path, _ROOT)}:{name}")
+    assert offenders == [], "live-tree constants on sys.path: " + ", ".join(offenders)

@@ -24,7 +24,7 @@ import json
 import os
 import sys
 
-REPO = "/root/ai-dev-runtime"
+REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
 
 def _env_flags() -> None:
