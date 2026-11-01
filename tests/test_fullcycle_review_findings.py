@@ -288,7 +288,9 @@ def test_7_a_crash_before_recording_attempt_2_reverifies_instead_of_reviewing_at
     e2 = fe.Engine("tinycalc", a, holder="e1")
     e2.tick()
     (rv,) = fe.pending_reviews("tinycalc")
-    assert rv["attempt"] == 2 and rv["payload"]["summary"] == "implemented add"
+    assert rv["attempt"] == 2
+    assert rv["payload"]["agent_report"]["fields"]["summary"] == "implemented add"
+    assert fe.untrusted("SUMMARY", "implemented add") in rv["payload"]["summary"]
     assert all(c["passed"] for c in rv["payload"]["checks"])
 
 

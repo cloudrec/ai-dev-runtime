@@ -1721,12 +1721,27 @@ def _settled_stop_wake(conn, etype: str, esource: str, agent_id: str) -> bool:
 
 
 def _fullcycle_review_closed(conn, event_id: int) -> bool:
-    """The event is a Full Cycle review request (fc_review.event_id) and that review is
-    no longer pending. False for anything else, and on any error."""
+    """The event is a Full Cycle review request and that review is no longer pending —
+    or the review has been re-announced by a NEWER event since (an agent report replacing
+    a stall alert, or a review reopened for a new question: fc_review.event_id moved), so
+    this older wake would show the tech lead a stale question. False for anything else,
+    and on any error."""
     try:
         r = conn.execute("SELECT status FROM fc_review WHERE event_id=?",
                          (int(event_id),)).fetchone()
-        return bool(r) and r[0] != "pending"
+        if r:
+            return r[0] != "pending"
+        e = conn.execute("SELECT type, payload FROM event WHERE id=? AND source='fullcycle'",
+                         (int(event_id),)).fetchone()
+        if not e or e[0] != "task_completed":
+            return False
+        rid = (json.loads(e[1] or "{}") or {}).get("review_id")
+        if rid is None:
+            return False
+        row = conn.execute("SELECT status, event_id FROM fc_review WHERE id=?",
+                           (int(rid),)).fetchone()
+        return bool(row) and (row[0] != "pending" or (row[1] is not None
+                                                      and int(row[1]) != int(event_id)))
     except Exception:  # noqa: BLE001 — no fc tables: not a review request
         return False
 

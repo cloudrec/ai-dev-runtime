@@ -272,10 +272,13 @@ def test_a_late_question_reaches_the_tech_lead_through_the_same_review(fc):
     assert _state(e.status(), "add")["state"] == tc.BLOCKED
     (pending,) = [r for r in fe.pending_reviews(e.project_id) if r["kind"] == "blocked"]
     assert pending["review_id"] == rv["review_id"]
-    assert pending["payload"]["question"] == "ints or floats?"
+    # the agent's words reach the tech lead fenced and labelled as untrusted data
+    assert pending["payload"]["agent_report"]["fields"]["question"] == "ints or floats?"
+    assert pending["payload"]["agent_report"]["trust"] == "untrusted_data"
+    assert fe.untrusted("QUESTION", "ints or floats?") in pending["payload"]["question"]
     assert not pending["payload"].get("stalled")
     qs = [json.loads(p).get("question") for _, _, p, _ in _events(fe.REVIEW_EVENT)]
-    assert qs[-1] == "ints or floats?"
+    assert fe.untrusted("QUESTION", "ints or floats?") in qs[-1]
     _answer_plain = fe.submit_decision(rv["review_id"], "answer", key="q", by="stub-gpt",
                                        feedback="ints")
     assert _answer_plain["ok"]
@@ -285,7 +288,7 @@ def test_a_late_question_reaches_the_tech_lead_through_the_same_review(fc):
 
 # ── the live adapter's idle evidence (agent_control.classify_state) ─────────────
 @pytest.mark.parametrize("state,expected", [
-    ("waiting_input", True), ("dead", True), ("stale", True),
+    ("idle", True), ("dead", True), ("stale", True), ("waiting_input", False),
     ("working", False), ("shell_running", False), ("waiting_owner", False),
     ("something_new", None)])
 def test_live_adapter_quiescent_maps_agent_states(state, expected):

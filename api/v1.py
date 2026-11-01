@@ -439,21 +439,37 @@ class FullcycleDecisionReq(BaseModel):
     next_tasks: Optional[list] = None
 
 
-# Who may ACK or DECIDE a full-cycle review. The actor is what caller_identity derives:
-# `api:client/<id>` for an authenticated client token, else `api:<method>/<declared>` —
-# the ChatGPT connector declares its verified MCP token (`mcp-token-<id>`), the same
-# binding the delegation grants use. Reads stay open to any authenticated caller.
-_FULLCYCLE_REVIEWERS_DEFAULT = "api:bearer/mcp-token-3"
+# Who may ACK or DECIDE a full-cycle review: ONLY an authenticated principal — a caller
+# whose per-client token (RUNTIME_CLIENT_TOKENS_FILE) authenticated it as
+# `api:client/<id>` — that is also on the FULLCYCLE_REVIEWERS allowlist. A declared name
+# (X-Runtime-Actor on the shared bearer or HMAC token) is free text anyone holding that
+# token can type, so it never authorizes a decision, whatever the allowlist says.
+# There is no default reviewer: until the owner provisions a client token for the
+# connector and lists it here, decisions are refused (fail closed).
+_FULLCYCLE_REVIEWERS_DEFAULT = ""
+_AUTHENTICATED_PREFIX = "api:client/"
 
 
 def fullcycle_reviewers() -> set:
     raw = os.getenv("FULLCYCLE_REVIEWERS", _FULLCYCLE_REVIEWERS_DEFAULT)
-    return {a.strip() for a in raw.split(",") if a.strip()}
+    return {a.strip() for a in raw.split(",")
+            if a.strip().startswith(_AUTHENTICATED_PREFIX) and len(a.strip()) > len(_AUTHENTICATED_PREFIX)}
 
 
-def _require_reviewer(actor: str) -> None:
+def _reviewer_principal(request: Request) -> tuple:
+    """(actor, auth) from the VERIFIED authentication only; 403 otherwise."""
+    try:
+        method = getattr(request.state, "auth_method", None)
+        cid = getattr(request.state, "client_id", None)
+    except Exception:  # noqa: BLE001
+        method, cid = None, None
+    if method != "client" or not cid:
+        raise HTTPException(status_code=403,
+                            detail="full-cycle decisions need an authenticated client token")
+    actor = f"{_AUTHENTICATED_PREFIX}{cid}"
     if actor not in fullcycle_reviewers():
         raise HTTPException(status_code=403, detail="not an authorized full-cycle reviewer")
+    return actor, "client_token"
 
 
 def _fullcycle_call(fn, *args, **kw):
@@ -477,9 +493,8 @@ def fullcycle_reviews(project_id: Optional[str] = None, _: bool = Depends(_auth)
 def fullcycle_ack(review_id: int, request: Request,
                   x_runtime_actor: Optional[str] = Header(None), _: bool = Depends(_auth)):
     from core.fullcycle import engine as fe
-    actor, _src = caller_identity(request, x_runtime_actor)
-    _require_reviewer(actor)
-    return _fullcycle_call(fe.ack_review, review_id, by=actor)
+    actor, auth = _reviewer_principal(request)    # X-Runtime-Actor is never trusted here
+    return _fullcycle_call(fe.ack_review, review_id, by=actor, auth=auth)
 
 
 @router.post("/fullcycle/reviews/{review_id}/decision")
@@ -490,10 +505,9 @@ def fullcycle_decision(review_id: int, req: FullcycleDecisionReq, request: Reque
     cannot grant powers — next_tasks go through the same validation and contract
     defaults (no push, no deploy) as the spec's own tasks."""
     from core.fullcycle import engine as fe
-    actor, _src = caller_identity(request, x_runtime_actor)
-    _require_reviewer(actor)
+    actor, auth = _reviewer_principal(request)    # X-Runtime-Actor is never trusted here
     return _fullcycle_call(fe.submit_decision, review_id, req.decision,
-                           key=req.idempotency_key, by=actor,
+                           key=req.idempotency_key, by=actor, auth=auth,
                            feedback=req.feedback, next_tasks=req.next_tasks)
 
 

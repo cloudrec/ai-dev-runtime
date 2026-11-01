@@ -71,12 +71,18 @@ def test_parse_result_accepts_context_exhausted_only_for_its_attempt():
                                     "status": "context_exhausted"}), handle) is None
 
 
+def _handoff(rv):
+    """The handoff is the agent's own text: it travels only as labelled untrusted data."""
+    return rv["payload"]["agent_report"]["fields"].get("handoff", "")
+
+
 # ── the engine path ──────────────────────────────────────────────────────────
 def test_exhaustion_goes_to_the_tech_lead_with_the_handoff(fc):
     e, a, log, root = _exhausted(fc)
     (rv,) = _blocked(e)
     assert rv["payload"]["context_exhausted"] is True
-    assert rv["payload"]["handoff"].startswith("HANDOFF add:")
+    assert _handoff(rv).startswith("HANDOFF add:")
+    assert fe.untrusted("HANDOFF", _handoff(rv)) in rv["payload"]["question"]
     assert rv["payload"]["handoff_problem"] == ""
     assert _events(fe.OWNER_EVENT) == []                 # routine: not an owner gate
     for _ in range(3):
@@ -188,7 +194,7 @@ def test_a_malformed_handoff_still_reaches_the_tech_lead(fc, handoff, problem):
         json.dump(body, fh)
     e.tick()
     (rv,) = _blocked(e)
-    assert rv["payload"]["handoff"] == "" and rv["payload"]["handoff_problem"] == problem
+    assert _handoff(rv) == "" and rv["payload"]["handoff_problem"] == problem
     _answer(e, "answer")
     h.run(e, h.StubReviewer(), until=lambda s: len(h.agent_log(log)) == 2, timeout=20)
     assert "(none was provided)" in h.agent_log(log)[1]["feedback"]
@@ -210,7 +216,7 @@ def test_exhaustion_after_a_stall_alert_uses_the_same_review(fc):
     e.tick()
     (rv,) = _blocked(e)
     assert rv["review_id"] == stall["review_id"]
-    assert rv["payload"]["context_exhausted"] and rv["payload"]["handoff"] == "H"
+    assert rv["payload"]["context_exhausted"] and _handoff(rv) == "H"
     assert rv["payload"]["after_stall"] == "attempt_timeout"
 
 

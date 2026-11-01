@@ -131,9 +131,12 @@ class AgentControlAdapter(ExecutorAdapter):
     def collect(self, handle: dict) -> Optional[dict]:
         return parse_result(self.host.read_file(handle["result"]), handle)
 
-    # agent_control.classify_state: idle at the prompt, or no live agent process
-    _QUIESCENT = ("waiting_input", "dead", "stale")
-    _ACTIVE = ("working", "shell_running", "waiting_owner")
+    # agent_control.classify_state: `idle` = the turn ended and the agent rests at its
+    # prompt; `dead`/`stale` = no live agent process. NOT `waiting_input`: that is text
+    # typed or pasted into the composer but never submitted (possibly the previous
+    # envelope) — a resend would land on top of it, so it is not provably idle (D-1).
+    _QUIESCENT = ("idle", "dead", "stale")
+    _ACTIVE = ("working", "shell_running", "waiting_owner", "waiting_input")
 
     def quiescent(self, handle: dict) -> Optional[bool]:
         try:
