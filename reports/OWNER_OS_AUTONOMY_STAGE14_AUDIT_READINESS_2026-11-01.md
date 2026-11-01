@@ -92,3 +92,23 @@ Path under test: a real event → Owner OS wake → ChatGPT reviewer → authori
 1. **The independent Fable review cannot be run from this session**, because creating agents is forbidden. It stays PENDING; the bundle is `reports/OWNER_OS_AUTONOMY_FABLE_REVIEW_BUNDLE_2026-11-01.md`.
 2. **Live E2E:** owner gates (a)–(c) above, plus the tech-lead decision on the `CDP_PORT` knob.
 3. **Promotion (later):** a live DB backup and the reviewer client token for the PROD connector, both owner-gated. The seo MCP must send the token and map refusals to `isError`.
+
+## 6. Addendum: owner said to finish the safe remainder (same session, 2026-11-01)
+The owner typed an instruction in the session to finish the work, notify ChatGPT and stop. This came from the owner directly, not through the API. It is **not** approval of PROD, tokens, agent creation or deploy.
+
+**Commit `b9c8cec`:**
+- `tools/cdp_composer.py`: a new `CDP_PORT` env knob. The default stays 9222. An invalid or privileged value yields 0, an unusable port, so it never falls back silently to the live browser. This removes the "shared live browser" need from the live-E2E plan in §4, though a separate Chrome profile is still required.
+- `tests/test_stage14_gaps.py` (10 tests). All passed, and **no defect was found**:
+  - **Q2:** an owner resume after an undelivered send keeps attempt 2 rather than 3, and an attestation never opens a later stall's fence (a new gate opens instead).
+  - **Q6:** a valid HMAC signature gets 403 on ack and on decide.
+  - **Q7:** the migration on a populated pre-branch DB (5000 tasks, 2000 reviews) with an open WAL reader succeeds in under 5 s, is idempotent, and gives old rows `unknown_polls=0`.
+  - **CDP_PORT:** the knob's parsing.
+- Full suite at `b9c8cec`: **4359 passed, 4 skipped, 0 failed**, exit 0 (4363 collected, 722 s). Log: `reports/stage14/full_suite_b9c8cec.txt`.
+- The Fable bundle's primary range now extends to `b9c8cec` (adds `tools/cdp_composer.py` and `tests/test_stage14_gaps.py`). Rollback: `git revert b9c8cec` before the commits listed in the bundle.
+
+**Still open (owner only):**
+- the sandbox reviewer client token;
+- approval to create one sandbox Claude agent;
+- a logged-in ChatGPT in a dedicated browser profile, or a sandbox MCP connector.
+
+The independent Fable review is PENDING. PROD stays NO-GO, and live E2E is still NOT PROVEN.
