@@ -110,6 +110,9 @@ class _S:
         pass
 
 
+_REAL_RECOVER_WEDGED_TAB = cdp.recover_wedged_tab
+
+
 @pytest.fixture(autouse=True)
 def _no_waiting(monkeypatch):
     """The delivery poll sleeps a second per attempt. Nothing here is about wall-clock."""
@@ -131,6 +134,12 @@ def wired(monkeypatch):
         monkeypatch.setattr(cdp, "find_target",
                             lambda url: {"webSocketDebuggerUrl": "ws://x"})
         monkeypatch.setattr(cdp, "_Session", lambda ws: s)
+        # The composer-absent case triggers tab recovery, whose `_create_tab` opened a REAL
+        # tab on chatgpt.com/c/a in the live browser on every suite run (2026-11-01).
+        # These tests are about the refusal; recovery has its own tests.
+        # A test that installs its own recovery spy first keeps it.
+        if cdp.recover_wedged_tab is _REAL_RECOVER_WEDGED_TAB:
+            monkeypatch.setattr(cdp, "recover_wedged_tab", lambda target, url: None)
         return s
     return _mk
 

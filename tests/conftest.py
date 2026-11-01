@@ -88,3 +88,57 @@ os.environ.pop("CONTINUATION_WATCHDOG_SESSIONS", None)
 for _k in ("NATIVE_SUPERVISOR_TARGETS", "NATIVE_SUPERVISOR_DENY_PROJECTS",
            "NATIVE_SUPERVISOR_DENY_TARGETS"):
     os.environ.pop(_k, None)
+
+# Fifth door: the LIVE browser. Every Owner OS chat tab lives in the Chromium whose
+# debugging port is 127.0.0.1:9222 on this host. `test_cdp_composer::
+# test_it_refuses_when_no_composer_is_found` reached the composer-absent recovery, whose
+# `_create_tab` PUT /json/new?https://chatgpt.com/c/a to that port — every full-suite run
+# (and every runtime job, which runs the suite) opened a real tab, found 2026-11-01 as a
+# stray "New chat" on chatgpt.com/c/a. Tabs count toward CDP_MAX_PAGES; enough of them
+# make live wake delivery refuse with `browser_degraded:too_many_pages`.
+#
+# Socket-level, so no copy of any module and no future call site can get through. The
+# composer swallows connection errors, so a refusal alone would pass silently: every
+# attempt is recorded and fails the test that made it.
+import socket as _socket  # noqa: E402
+
+import pytest  # noqa: E402
+
+_LIVE_CDP_PORT = 9222
+_live_cdp_attempts: list = []
+_real_sock_connect = _socket.socket.connect
+_real_create_connection = _socket.create_connection
+
+
+def _is_live_cdp(addr) -> bool:
+    try:
+        return int(addr[1]) == _LIVE_CDP_PORT and str(addr[0]) in ("127.0.0.1", "localhost", "::1")
+    except Exception:  # noqa: BLE001 — not an (host, port) address
+        return False
+
+
+def _walled_connect(self, addr):
+    if _is_live_cdp(addr):
+        _live_cdp_attempts.append(str(addr))
+        raise ConnectionRefusedError("test suite: the live browser's CDP port is walled off")
+    return _real_sock_connect(self, addr)
+
+
+def _walled_create_connection(addr, *a, **k):
+    if _is_live_cdp(addr):
+        _live_cdp_attempts.append(str(addr))
+        raise ConnectionRefusedError("test suite: the live browser's CDP port is walled off")
+    return _real_create_connection(addr, *a, **k)
+
+
+_socket.socket.connect = _walled_connect
+_socket.create_connection = _walled_create_connection
+
+
+@pytest.fixture(autouse=True)
+def _no_live_browser():
+    _live_cdp_attempts.clear()
+    yield
+    assert not _live_cdp_attempts, (
+        f"test reached the live browser's CDP port {_live_cdp_attempts}; "
+        "stub browser_degraded/find_target/_create_tab/_http instead")

@@ -138,14 +138,27 @@ Questions for reviewer: should a configured `base_ref` also be required to be an
 ## 8. Next exact step
 
 1. Tech lead: review package §7; decide base-ref policy activation (§2) and re-plan option (§3).
-2. Me (safe, running now): full suite under a blocking CDP wall plugin to list every test that
-   touches the live browser (§9), then a conftest-level wall so the suite can never reach
-   127.0.0.1:9222 again.
+2. Done: live-browser leak attributed and walled off (§9).
+3. Next safe item proposal: promote-readiness package for the tests-only commits (2fe3756 tests,
+   aacad1b, this one) since they also protect live from runtime-job suite runs.
 
-## 9. Open safety finding — test suite vs live browser
+## 9. Safety finding — the test suite opened tabs in the LIVE browser (fixed on branch)
 
-Live Chrome holds a tab on `https://chatgpt.com/c/a` (title "New chat"); that URL appears only in
-test fixtures. The full suite has been run on this host many times (incl. 5× today), so some test
-path likely reached the live CDP port. Attribution in progress (§8.2). Owner-visible impact: a
-ChatGPT tab may have been navigated away from a real conversation; the companion re-opens bound
-conversations on demand, but this must be closed at the conftest level.
+Attribution (full suite under a blocking socket wall on 127.0.0.1:9222, scratch plugin):
+exactly one test reached the live CDP port —
+`tests/test_cdp_composer.py::test_it_refuses_when_no_composer_is_found` (2 connections).
+Path: composer absent (`:0`) → `recover_wedged_tab` → `_create_tab("https://chatgpt.com/c/a")`
+= `PUT /json/new` on the live Chromium. Every full-suite run — including every runtime job,
+which runs the suite — opened a real tab; the stray "New chat" on `chatgpt.com/c/a` (id 20C8121A…)
+is that. Tabs count toward `CDP_MAX_PAGES` (12). Measured impact: none — no
+`too_many_pages` refusal in the live companion journal since 2026-10-25 (currently 7 pages).
+
+Fix (tests only):
+- `tests/conftest.py`: socket-level wall on 127.0.0.1:9222 for the whole suite; every attempt
+  fails the test that made it (the composer swallows connection errors, so a bare refusal would pass).
+- `tests/test_cdp_composer.py`: the `wired` fixture stubs `recover_wedged_tab` unless a test
+  installed its own spy (the two recovery tests keep theirs).
+Result: full suite 4240 passed, 4 skipped, 0 failed with the wall active.
+
+Left for owner/tech lead (live browser state, not touched): close the stray `chatgpt.com/c/a` tab.
+Until this branch is promoted, any suite run from the live tree or a runtime job still opens one.
