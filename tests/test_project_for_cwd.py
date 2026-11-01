@@ -120,8 +120,9 @@ def test_the_result_is_a_usable_route_key():
 
 # ── the hook files the corrected project ────────────────────────────────────
 def test_the_hook_identity_uses_the_resolver():
+    import os
     import sys
-    sys.path.insert(0, "/root/ai-dev-runtime/hooks")
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "hooks"))
     from owneros_hook import _identity
     ident = _identity({"cwd": "/opt/payment-orchestrator/deploy/infra/dns",
                        "session_id": "6db4919a-460a-4b62-9e0d-c9fff356a7be"})

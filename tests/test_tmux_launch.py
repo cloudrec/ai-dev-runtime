@@ -12,11 +12,12 @@ exactly when the caller is inside a service (nothing else is touched), and healt
 a live server that still shares the daemon's cgroup.
 """
 import subprocess
+import os
 import sys
 
 import pytest
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from core import agent_control as ac  # noqa: E402
 from core import session_recovery as sr  # noqa: E402

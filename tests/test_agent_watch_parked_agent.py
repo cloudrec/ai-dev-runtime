@@ -13,10 +13,11 @@ things in the pane reader combined to produce that loop:
 
 These pin all three, and the control cases that keep them narrow.
 """
+import os
 import sys
 import time
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from core import agent_watch as aw  # noqa: E402
 

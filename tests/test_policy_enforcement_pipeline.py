@@ -14,7 +14,7 @@ import sys
 
 import pytest
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from core import ai_planner, job_executor, job_store, policy_engine  # noqa: E402
 

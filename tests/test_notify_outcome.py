@@ -4,11 +4,12 @@ A completion message must let the owner tell an implementation from a plan
 without opening the repo, and must carry the fields needed to act: job id,
 title, outcome, branch, commit, test/validation status, short reason, next step.
 """
+import os
 import sys
 
 import pytest
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from core import notify_format as nf  # noqa: E402
 

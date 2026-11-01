@@ -1045,7 +1045,7 @@ def test_the_paused_project_has_live_actuation_off_in_the_registry():
     """Third gate. The autopilot registry drives ordinary pokes independently of the
     governor, and it had live_actuation: true for this project."""
     import yaml as _y
-    reg = _y.safe_load(open("/root/ai-dev-runtime/config/commander_autopilot.yaml",
+    reg = _y.safe_load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "commander_autopilot.yaml"),
                             encoding="utf-8")) or {}
     agents = reg.get("agents") or reg.get("projects") or reg
     entry = agents.get("arbitrage2-opus:0.0") or {}

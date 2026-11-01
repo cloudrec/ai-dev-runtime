@@ -17,8 +17,8 @@ import os
 import sys
 import time
 
-sys.path.insert(0, "/root/ai-dev-runtime")
-sys.path.insert(0, "/root/ai-dev-runtime/tools")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tools"))
 
 POLL_SECS = int(os.getenv("COMPANION_POLL_SECS", "20"))
 # Inventory the ChatGPT tabs every N ticks (default ~5 minutes at 20s polls).

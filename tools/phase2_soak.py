@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 OUT = os.getenv("PHASE2_SOAK_OUT", "/root/ai-dev-runtime/reports/phase2_soak.jsonl")
 DURATION = float(os.getenv("PHASE2_SOAK_HOURS", "24")) * 3600

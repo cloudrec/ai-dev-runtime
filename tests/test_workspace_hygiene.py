@@ -13,7 +13,7 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from core import job_executor, job_kinds  # noqa: E402
 

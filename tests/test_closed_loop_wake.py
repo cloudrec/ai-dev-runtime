@@ -7,6 +7,7 @@ wait, jobhunter child workflow wait, all three live at once).
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 
 import pytest
@@ -1227,7 +1228,7 @@ def test_a_row_predating_the_route_column_still_scans():
 
 def test_the_companion_passes_project_and_route_separately():
     """The third link: the companion must forward both, not substitute one for the other."""
-    src = open("/root/ai-dev-runtime/tools/wake_companion.py", encoding="utf-8").read()
+    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tools", "wake_companion.py"), encoding="utf-8").read()
     call = src[src.index("closed_loop_wake.register_delivery("):][:400]
     assert 'project_id=p.get("project_id"' in call
     assert 'route_key=p.get("route_key"' in call

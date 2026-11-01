@@ -10,6 +10,7 @@ ask the owner something never woke them.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 
 import pytest
@@ -17,7 +18,7 @@ import pytest
 from core import wake_bridge as wb
 
 spec = importlib.util.spec_from_file_location(
-    "cdp_composer", "/root/ai-dev-runtime/tools/cdp_composer.py")
+    "cdp_composer", os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tools", "cdp_composer.py"))
 cdp = importlib.util.module_from_spec(spec)
 sys.modules["cdp_composer"] = cdp
 spec.loader.exec_module(cdp)

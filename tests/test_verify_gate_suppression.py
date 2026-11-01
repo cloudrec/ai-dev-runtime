@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import sqlite3
+import os
 import sys
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 from tools import verify_gate_suppression as vg  # noqa: E402
 
 TTL = vg.GATE_TTL_SECS

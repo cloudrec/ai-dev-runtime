@@ -6,11 +6,12 @@ repository, so base resolution fell through to the *current workspace branch* â€
 whichever branch the previous job happened to leave checked out.
 """
 import subprocess
+import os
 import sys
 
 import pytest
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from core import git_write  # noqa: E402
 

@@ -14,8 +14,8 @@ import subprocess
 import sys
 import tempfile
 
-HOOK = "/root/ai-dev-runtime/hooks/owneros_hook.py"
-sys.path.insert(0, "/root/ai-dev-runtime")
+HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "hooks", "owneros_hook.py")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 
 def _map(ev, **payload):

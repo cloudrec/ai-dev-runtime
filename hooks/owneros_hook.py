@@ -36,7 +36,7 @@ import re
 import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 _RUNTIME_ENV = "/root/ai-dev-runtime/configs/.env"
 

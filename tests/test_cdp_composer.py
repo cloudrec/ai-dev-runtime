@@ -10,7 +10,7 @@ import os as _os
 _os.environ.setdefault("WAKE_ASSISTANT_SETTLE_SECS", "0")
 
 spec = importlib.util.spec_from_file_location(
-    "cdp_composer", "/root/ai-dev-runtime/tools/cdp_composer.py")
+    "cdp_composer", _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.realpath(__file__))), "tools", "cdp_composer.py"))
 cdp = importlib.util.module_from_spec(spec)
 sys.modules["cdp_composer"] = cdp
 spec.loader.exec_module(cdp)

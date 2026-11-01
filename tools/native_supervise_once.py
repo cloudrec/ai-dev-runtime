@@ -7,14 +7,15 @@ spawned by a hook, so anything it prints or raises would be noise in an agent's 
 """
 from __future__ import annotations
 
+import os
 import sys
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 
 def main() -> int:
     try:
-        sys.path.insert(0, "/root/ai-dev-runtime/hooks")
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "hooks"))
         from owneros_hook import _load_runtime_env
         _load_runtime_env()
         from core import native_supervisor as ns

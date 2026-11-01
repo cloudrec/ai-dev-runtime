@@ -39,7 +39,7 @@ import sqlite3
 import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from core import wake_bridge as wb  # noqa: E402
 from core import wake_routes  # noqa: E402

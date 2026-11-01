@@ -19,11 +19,12 @@ Two causes, both proven at the byte level against a reader pane on 2026-09-24:
 After the fix the same reader saw `b'line one\\nline two\\nline three'` and, 275 ms
 later, a separate `b'\\r'`.
 """
+import os
 import sys
 
 import pytest
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from core import agent_control as ac  # noqa: E402
 

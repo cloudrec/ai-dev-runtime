@@ -9,13 +9,14 @@ resolved THIS tick, acknowledge only on verified delivery.
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import types
 
 import pytest
 
 spec = importlib.util.spec_from_file_location(
-    "wake_companion", "/root/ai-dev-runtime/tools/wake_companion.py")
+    "wake_companion", os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tools", "wake_companion.py"))
 wc = importlib.util.module_from_spec(spec)
 sys.modules["wake_companion"] = wc
 spec.loader.exec_module(wc)

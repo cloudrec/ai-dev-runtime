@@ -7,7 +7,7 @@ import tempfile
 
 import pytest
 
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 # isolate release state per test session before importing the module
 os.environ["RUNTIME_RELEASE_DB"] = os.path.join(

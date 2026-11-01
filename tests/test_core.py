@@ -10,7 +10,7 @@ import json
 import pytest
 
 # добавляем корень проекта в path
-sys.path.insert(0, "/root/ai-dev-runtime")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
 from core.file_engine import FileEngine
 from core.safety import approve_action, validate_file_operation

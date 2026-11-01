@@ -12,11 +12,12 @@ exists to make the reviewer run, so that is what success has to mean.
 """
 from __future__ import annotations
 
+import os
 import sys
 
 import pytest
 
-sys.path.insert(0, "/root/ai-dev-runtime/tools")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tools"))
 import cdp_composer as cc  # noqa: E402
 
 

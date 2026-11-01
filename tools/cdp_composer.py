@@ -1076,7 +1076,7 @@ def _record_delivery(source: str, event_id: Optional[int], res: dict,
     answerable from state."""
     try:
         import sys as _sys
-        _sys.path.insert(0, "/root/ai-dev-runtime")
+        _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
         from core import wake_bridge as _wb
         _wb.record_delivery(source, event_id=event_id, delivered=bool(res.get("ok")),
                             reason=str(res.get("reason", "")), conversation=conversation,
@@ -1142,7 +1142,7 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
     if claim:
         try:
             import sys as _sys
-            _sys.path.insert(0, "/root/ai-dev-runtime")
+            _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
             from core import wake_bridge as _wb
             # The claim is for a slot in THIS conversation, so it carries the
             # conversation. It used to carry only the route key, which is the same
@@ -1217,7 +1217,7 @@ def _latch_submitted(source: str, event_id: Optional[int]) -> None:
     """Record that the phrase was FIRED, before we know whether it landed."""
     try:
         import sys as _sys
-        _sys.path.insert(0, "/root/ai-dev-runtime")
+        _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
         from core import wake_bridge as _wb
         _wb.mark_submitted(event_id, source=source)
     except Exception:  # noqa: BLE001
