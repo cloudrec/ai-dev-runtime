@@ -415,6 +415,63 @@ def _completion_evidence(job: dict) -> dict:
     return ev
 
 
+#: Appended to the instructions for the single replan after a tool-call-shaped reply.
+REPLAN_FOOTER = (
+    "\n\nREPLAN: your previous reply tried to call a tool. You have NO tools and cannot "
+    "inspect the repository. Using only what is written above, reply with the JSON plan "
+    "object and nothing else. If the task cannot be planned without investigating first, "
+    'reply {"summary": "needs investigation", "files": []}.')
+
+
+def _replan_enabled() -> bool:
+    return os.getenv("RUNTIME_PLANNER_REPLAN", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _bounded_replan(job_id: str, job: dict, pp: str, kind, model_id, heartbeat):
+    """One deterministic replan after a tool-call reply. Returns (plan, why).
+
+    `plan` is None when no replan is allowed or it did not yield a valid plan; `why`
+    names the reason for the blocker. Bounded by construction:
+      * off unless RUNTIME_PLANNER_REPLAN is set;
+      * at most once per job — the `planner_replan` artifact is written BEFORE the
+        provider call, so a re-executed or crashed-and-resumed job never replans again;
+      * the result passes the planner's own typed validation (files list, ops, paths,
+        non-empty for code kinds); any PlannerError, including a second tool call, is
+        terminal — never a fallback plan, never another attempt.
+    """
+    if not _replan_enabled():
+        return None, "replan disabled"
+    cur = job_store.get_job(job_id) or job
+    arts = cur.get("artifacts") or []
+    if any(isinstance(a, dict) and "planner_replan" in a for a in arts):
+        return None, "replan already attempted for this job"
+    job_store.update_job(job_id, artifacts=arts + [{"planner_replan": "started"}])
+    job_store.append_log(job_id, "info", "planner replied with a tool call — one bounded replan")
+    outcome: dict = {}
+    plan = None
+    try:
+        plan = ai_planner.plan(job["goal"] or "", (job["instructions"] or "") + REPLAN_FOOTER,
+                               pp, job.get("allowed_paths") or [], heartbeat_cb=heartbeat,
+                               kind=kind, model=model_id)
+        if not isinstance(plan, dict) or not isinstance(plan.get("files"), list) \
+                or plan.get("fallback"):
+            raise ai_planner.PlannerError("replan returned no usable plan")
+        outcome = {"planner_replan": "ok", "files": len(plan["files"])}
+    except ai_planner.PlannerError as e:
+        plan = None
+        outcome = {"planner_replan": "failed", "reason": str(e)[:200],
+                   "raw": ai_planner._sanitize_raw(getattr(e, "raw", "") or "", cap=1000)}
+    cur = job_store.get_job(job_id) or job
+    arts = [a for a in (cur.get("artifacts") or [])
+            if not (isinstance(a, dict) and a.get("planner_replan") == "started")]
+    job_store.update_job(job_id, artifacts=arts + [outcome])
+    if plan is None:
+        return None, f"replan failed: {outcome.get('reason', '')}"
+    job_store.append_log(job_id, "info",
+                         f"replan produced a plan ({len(plan['files'])} file op(s))")
+    return plan, "replanned"
+
+
 def _finish(job_id: str, status: str, **extra):
     # Every terminal state carries an explicit outcome: a job that ends without
     # one is exactly the ambiguity this model removes. Failure paths default to
@@ -555,8 +612,8 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         if reason.startswith(ai_planner.TOOL_CALL_REASON):
             # The planner never planned: an "investigate first" task made it write a
             # tool call instead (job 703f780d, task 326). A no-op fallback plan plus a
-            # full suite run would only bury that, so stop here with an explicit,
-            # actionable blocker. One planning attempt, as always — no retry loop.
+            # full suite run would only bury that. At most ONE bounded replan (opt-in,
+            # RUNTIME_PLANNER_REPLAN=1); otherwise, or if it fails, an explicit blocker.
             _cur = job_store.get_job(job_id) or job
             job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
                 "planner_tool_call": True, "reason": reason[:200],
@@ -564,35 +621,38 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
                 "tokens": diag["tokens"], "cost_usd": diag["cost_usd"],
                 "duration_ms": diag["duration_ms"],
             }])
+            plan, why = _bounded_replan(job_id, job, pp, kind, m_id, _heartbeat)
+            if plan is None:
+                job_store.append_log(job_id, "warn",
+                                     "planner emitted a tool call instead of a plan — job blocked; "
+                                     "split the task into a concrete code change or give it to an agent")
+                _finish(job_id, "blocked", error="planner_tool_call: task needs investigation "
+                                                 f"the tools-less planner cannot do ({why})")
+                return
+        else:
             job_store.append_log(job_id, "warn",
-                                 "planner emitted a tool call instead of a plan — job blocked; "
-                                 "split the task into a concrete code change or give it to an agent")
-            _finish(job_id, "blocked", error="planner_tool_call: task needs investigation "
-                                             "the tools-less planner cannot do")
-            return
-        job_store.append_log(job_id, "warn",
-                             f"planner failed ({reason[:120]}) — building deterministic fallback plan")
-        try:
-            plan = ai_planner.build_fallback_plan(
-                job["goal"] or "", job["instructions"] or "", pp,
-                job.get("allowed_paths") or [], task_id=job.get("task_id"), diagnostics=diag)
-        except Exception as fe:  # noqa: BLE001
-            job_store.append_log(job_id, "error", f"fallback planning failed: {fe}")
-            _finish(job_id, "failed", error=f"planner and fallback both failed: {reason[:300]}")
-            return
-        fallback_used = True
-        # Mark in job metadata that fallback planning was used + preserve accounting.
-        # Re-fetch: the in-memory `job` predates the plan stage, and appending from
-        # it silently drops artifacts recorded since (the model_selection artifact
-        # was lost exactly this way on job b34772f4, 2026-08-15).
-        _cur = job_store.get_job(job_id) or job
-        job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
-            "fallback_planning": True, "reason": reason[:200],
-            "timed_out": diag["timed_out"], "tokens": diag["tokens"],
-            "cost_usd": diag["cost_usd"], "duration_ms": diag["duration_ms"],
-        }])
-        job_store.append_log(job_id, "info",
-                             "fallback plan generated — continuing to execution (no planner retry)")
+                                 f"planner failed ({reason[:120]}) — building deterministic fallback plan")
+            try:
+                plan = ai_planner.build_fallback_plan(
+                    job["goal"] or "", job["instructions"] or "", pp,
+                    job.get("allowed_paths") or [], task_id=job.get("task_id"), diagnostics=diag)
+            except Exception as fe:  # noqa: BLE001
+                job_store.append_log(job_id, "error", f"fallback planning failed: {fe}")
+                _finish(job_id, "failed", error=f"planner and fallback both failed: {reason[:300]}")
+                return
+            fallback_used = True
+            # Mark in job metadata that fallback planning was used + preserve accounting.
+            # Re-fetch: the in-memory `job` predates the plan stage, and appending from
+            # it silently drops artifacts recorded since (the model_selection artifact
+            # was lost exactly this way on job b34772f4, 2026-08-15).
+            _cur = job_store.get_job(job_id) or job
+            job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
+                "fallback_planning": True, "reason": reason[:200],
+                "timed_out": diag["timed_out"], "tokens": diag["tokens"],
+                "cost_usd": diag["cost_usd"], "duration_ms": diag["duration_ms"],
+            }])
+            job_store.append_log(job_id, "info",
+                                 "fallback plan generated — continuing to execution (no planner retry)")
     else:
         if m_dec:
             try:

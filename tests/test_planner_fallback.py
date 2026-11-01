@@ -610,6 +610,7 @@ def test_a_lone_non_plan_object_still_fails_as_missing_files():
 
 
 def test_a_tool_call_answer_blocks_the_job_instead_of_running_a_fallback(tmp_path, monkeypatch):
+    monkeypatch.delenv("RUNTIME_PLANNER_REPLAN", raising=False)
     repo = _repo(tmp_path)
     before = sorted(p.name for p in repo.rglob("*") if ".git" not in p.parts)
     cli, counter = _counting_cli(tmp_path, (
@@ -674,3 +675,90 @@ def test_the_resolved_base_sha_is_logged(tmp_path, monkeypatch):
     sha = _git_out(repo, "rev-parse", "main")
     assert any(f"base branch resolved: main @ {sha} (source: guess)" in l["msg"]
                for l in final["logs"]), [l["msg"] for l in final["logs"]]
+
+
+# ── at most ONE bounded replan after a tool-call reply (RUNTIME_PLANNER_REPLAN) ─
+_GOOD_PLAN = ('{"summary":"real","files":[{"path":"x.txt","operation":"create",'
+              '"content":"hi"}],"test_commands":[]}')
+
+
+def _scripted_cli(tmp_path, replies):
+    """Fake CLI answering call n with replies[n] (last one repeats); each prompt is saved."""
+    prompts = tmp_path / "prompts"
+    prompts.mkdir(exist_ok=True)
+    return _counting_cli(tmp_path, (
+        "import json, sys\n"
+        f"replies = {replies!r}\n"
+        f"open({str(prompts)!r} + f'/{{n}}.txt', 'w').write(sys.stdin.read())\n"
+        "r = replies[min(n, len(replies) - 1)]\n"
+        "sys.stdout.write(json.dumps({'type':'result','subtype':'success','is_error':False,'result':r}))\n"
+    )), prompts
+
+
+def _replan_job(tmp_path, monkeypatch, replies, *, enabled=True, artifacts=None):
+    repo = _repo(tmp_path)
+    if enabled:
+        monkeypatch.setenv("RUNTIME_PLANNER_REPLAN", "1")
+    else:
+        monkeypatch.delenv("RUNTIME_PLANNER_REPLAN", raising=False)
+    (cli, counter), prompts = _scripted_cli(tmp_path, replies)
+    _reload(monkeypatch, cli)
+    job = job_store.create_job(project_path=str(repo), goal="g", instructions="investigate first",
+                               task_id=326, autonomy_level="execute_safe",
+                               auto_commit=True, auto_push=False)
+    if artifacts:
+        job_store.update_job(job["id"], artifacts=artifacts)
+    job_executor.execute(job["id"])
+    return repo, job_store.get_job(job["id"]), int(open(counter).read()), prompts
+
+
+def _replan_arts(final):
+    return [a for a in (final["artifacts"] or []) if "planner_replan" in a]
+
+
+def test_replan_is_off_by_default_and_the_job_blocks_after_one_call(tmp_path, monkeypatch):
+    repo, final, calls, _ = _replan_job(tmp_path, monkeypatch, [_JOB136_RAW, _GOOD_PLAN],
+                                        enabled=False)
+    assert final["status"] == "blocked" and "replan disabled" in final["error"]
+    assert calls == 1 and _replan_arts(final) == []
+    assert not (repo / "x.txt").exists()
+
+
+def test_one_replan_turns_a_tool_call_into_a_real_plan(tmp_path, monkeypatch):
+    repo, final, calls, prompts = _replan_job(tmp_path, monkeypatch, [_JOB136_RAW, _GOOD_PLAN])
+    assert final["status"] == "completed", final.get("error")
+    assert calls == 2
+    assert [f["path"] for f in final["plan"]["files"]] == ["x.txt"]
+    assert final["plan"].get("fallback") is not True
+    assert _replan_arts(final) == [{"planner_replan": "ok", "files": 1}]
+    assert "REPLAN:" not in (prompts / "0.txt").read_text()
+    assert "REPLAN:" in (prompts / "1.txt").read_text()
+
+
+def test_a_second_tool_call_blocks_without_a_third_call_or_a_fallback(tmp_path, monkeypatch):
+    repo, final, calls, _ = _replan_job(tmp_path, monkeypatch, [_JOB136_RAW, _JOB136_RAW])
+    assert final["status"] == "blocked"
+    assert "replan failed" in final["error"] and "tool call" in final["error"]
+    assert calls == 2
+    assert not final.get("plan")
+    (art,) = _replan_arts(final)
+    assert art["planner_replan"] == "failed"
+    assert not (repo / "x.txt").exists()
+
+
+def test_an_empty_or_prose_replan_blocks_never_falls_back(tmp_path, monkeypatch):
+    for i, second in enumerate(['{"summary": "needs investigation", "files": []}',
+                                "I would first look at the code."]):
+        sub = tmp_path / f"case{i}"
+        sub.mkdir()
+        _, final, calls, _ = _replan_job(sub, monkeypatch, [_JOB136_RAW, second])
+        assert final["status"] == "blocked", (second, final.get("error"))
+        assert calls == 2 and not final.get("plan")
+        assert not any(a.get("fallback_planning") for a in final["artifacts"] or [])
+
+
+def test_a_job_that_already_replanned_never_replans_again(tmp_path, monkeypatch):
+    _, final, calls, _ = _replan_job(tmp_path, monkeypatch, [_JOB136_RAW, _GOOD_PLAN],
+                                     artifacts=[{"planner_replan": "started"}])
+    assert final["status"] == "blocked" and "already attempted" in final["error"]
+    assert calls == 1
