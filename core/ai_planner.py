@@ -156,15 +156,21 @@ def _extract_json(text: str) -> dict:
         pass
     # 2) fenced code block(s), then 3) balanced objects anywhere in the prose.
     # The object that carries a `files` list is the plan; an earlier example or
-    # tool-argument object must not shadow it. Without one, keep the first object
-    # so validation reports what was actually returned.
+    # tool-argument object must not shadow it, and two DIFFERENT plans are refused.
+    # Without one, keep the first object so validation reports what was returned.
     candidates: list[dict] = []
     for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE):
         candidates.extend(_json_objects(m.group(1)))
     candidates.extend(_json_objects(text))
+    plans: list[dict] = []
     for obj in candidates:
-        if "files" in obj:
-            return obj
+        if "files" in obj and obj not in plans:   # the fence body is also seen by the prose scan
+            plans.append(obj)
+    if len(plans) > 1:
+        # An example plan next to the real one: executing either is a guess.
+        raise PlannerError("planner returned several different plans")
+    if plans:
+        return plans[0]
     if candidates:
         if _looks_like_tool_call(candidates[0]):
             raise PlannerError(TOOL_CALL_REASON)

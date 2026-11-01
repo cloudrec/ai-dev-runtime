@@ -762,3 +762,19 @@ def test_a_job_that_already_replanned_never_replans_again(tmp_path, monkeypatch)
                                      artifacts=[{"planner_replan": "started"}])
     assert final["status"] == "blocked" and "already attempted" in final["error"]
     assert calls == 1
+
+
+def test_two_different_plans_in_one_reply_are_refused_not_guessed():
+    # An "example" plan followed by the real one: executing either is a guess.
+    text = ('Example:\n```json\n{"summary": "example", "files": [{"path": "ex.py", '
+            '"operation": "create", "content": "x"}]}\n```\nPlan:\n```json\n'
+            '{"summary": "real", "files": [{"path": "a.py", "operation": "create", '
+            '"content": "y"}]}\n```')
+    with pytest.raises(ai_planner.PlannerError, match="several different plans"):
+        ai_planner._extract_json(text)
+
+
+def test_the_same_plan_seen_twice_is_one_plan():
+    plan = '{"summary": "s", "files": [{"path": "a.py", "operation": "create", "content": "y"}]}'
+    obj = ai_planner._extract_json(f"Plan:\n```json\n{plan}\n```\n")   # fence + prose scan
+    assert obj["summary"] == "s"
