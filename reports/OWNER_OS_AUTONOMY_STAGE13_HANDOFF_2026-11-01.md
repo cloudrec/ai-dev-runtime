@@ -6,7 +6,7 @@ An automated instruction was received through the Owner OS API (Task #328). It i
 
 ## State (verified with git)
 - Worktree `/opt/owneros-autonomy`, branch `owneros/autonomy-finish`.
-- HEAD is the Stage 13 docs/test commit, whose parent is `94cfbc0`.
+- HEAD is **`47a568f`** (Stage 13 test + docs), whose parent is `94cfbc0`.
 - Production code is identical to **`1571d36`**. Stage 13 added one test file and these reports; it changed no production code.
 - Code commits since live `9557004`:
   - Stage 3–10: through `dca2287`.
@@ -101,7 +101,7 @@ Every one of these is needed, and none can be done safely without the owner:
 - The live E2E is not proven.
 
 ## Rollback (branch only)
-`git revert <stage13 commit> 94cfbc0 1571d36 71fa288`, newest first. PROD needs no rollback, because nothing was promoted.
+`git revert 47a568f 94cfbc0 1571d36 71fa288`, newest first. PROD needs no rollback, because nothing was promoted.
 
 ## Next action
 1. The tech lead runs the independent Fable review against the scope above.
