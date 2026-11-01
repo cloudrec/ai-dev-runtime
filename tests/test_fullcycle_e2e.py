@@ -406,3 +406,88 @@ def test_the_regression_gate_renews_the_lease_per_verified_task(fc, monkeypatch)
     assert len(calls) == 2
     monkeypatch.setenv("FULLCYCLE_REGRESSION_CHECKS", "0")
     assert e._regression_checks(probe) == []
+
+
+# ── G1: git evidence is required; its absence fails closed ─────────────────────
+def _git_failing(e, *subcmds, rc=128, err="fatal: unable to read index"):
+    real = e._git
+    e._git = lambda *args: (rc, "", err) if args[:1] and args[0] in subcmds else real(*args)
+    return real
+
+
+def test_g1_git_status_failure_fails_verification_closed(fc):
+    e, a, log, root = fc()
+    h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
+          timeout=40)
+    with open(f"{root}/README.md", "w") as fh:                  # out of scope, unclaimed
+        fh.write("tampered\n")
+    t = next(t for t in e._tasks() if t["key"] == "mul")
+    t["attempt"] = 1
+    _git_failing(e, "status")
+    v = e._verify(t, {"changed_files": ["tinycalc/mul.py"], "summary": "ok"})
+    assert not v["passed"]
+    assert v["changed_source"] == "unavailable" and v["changed_files"] == []
+    assert v["claimed_changed_files"] == ["tinycalc/mul.py"]   # kept for the record only
+    assert "changed_files_unverifiable" in v["reasons"]
+
+
+def test_g1_git_failure_before_first_dispatch_sends_nothing(fc):
+    e, a, log, root = fc()
+    _git_failing(e, "status")
+    e.tick()
+    st = e.status()
+    assert _state(st, "add")["state"] == tc.OWNER_DECISION
+    assert _state(st, "add")["last_reason"] == "permission_denied:git_status_unavailable"
+    assert h.agent_log(log) == []
+
+
+def test_g1_unreadable_head_refuses_dispatch(fc):
+    e, a, log, root = fc()
+    real = e._git
+    e._git = lambda *args: (128, "", "fatal: bad HEAD") if args[:2] == ("rev-parse", "--verify") \
+        else real(*args)
+    e.tick()
+    assert _state(e.status(), "add")["last_reason"].startswith("permission_denied:git_head_unavailable")
+    assert h.agent_log(log) == []
+
+
+def test_g1_a_non_git_root_is_refused_by_full_cycle(fc):
+    e, a, log, root = fc()
+    shutil.rmtree(os.path.join(root, ".git"))
+    e.tick()
+    e.tick()
+    st = e.status()
+    assert _state(st, "add")["state"] == tc.OWNER_DECISION
+    assert _state(st, "add")["last_reason"] == "permission_denied:project_root_not_git"
+    assert h.agent_log(log) == []
+    assert len(_events(fe.OWNER_EVENT)) == 1                   # project-wide, gated once
+
+
+def test_g1_a_transient_git_failure_recovers_on_the_next_attempt(fc):
+    e, a, log, root = fc({"add": ["correct"]})
+    h.wait_for(lambda: e.tick() and _state(e.status(), "add")["state"] == tc.WORKING, 15)
+    real = _git_failing(e, "status")
+    h.wait_for(lambda: e.tick() and _state(e.status(), "add")["attempt"] == 2, 15)
+    e._git = real                                              # the lock went away
+    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
+               timeout=30)
+    t = next(t for t in e._tasks() if t["key"] == "add")
+    fails = [x["evidence"]["verification"]["reasons"] for x in tc.history(t["contract_id"])
+             if x["to"] == tc.VERIFICATION_FAILED]
+    assert fails and "changed_files_unverifiable" in fails[0]
+    assert _state(st, "add")["attempt"] == 2
+
+
+def test_g1_a_failed_git_add_never_marks_the_task_committed(fc):
+    e, a, log, root = fc()
+    h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE
+          and True, timeout=40)
+    # put the approved task back to uncommitted and make `git add` fail
+    t = next(t for t in e._tasks() if t["key"] == "add")
+    e._set(t, committed=0)
+    with open(f"{root}/tinycalc/extra.py", "w") as fh:
+        fh.write("x = 1\n")
+    _git_failing(e, "add")
+    e._commit_pending()
+    t = next(t for t in e._tasks() if t["key"] == "add")
+    assert t["committed"] == 0 and t["last_reason"].startswith("commit_failed")

@@ -401,12 +401,17 @@ class Engine:
                                  trusted_checks=self._trusted(task))
         if r:
             return f"permission_denied:{r}"
+        g = self._git_refusal()
+        if g:
+            return f"permission_denied:{g}"
         never_sent = not self.conn.execute(
             "SELECT 1 FROM fc_dispatch WHERE idem_key=?",
             (f"fullcycle:{task['id']}:{attempt}",)).fetchone()
         if attempt == 1 and never_sent:
             # (once the first send may have gone out, changes can be the agent's own)
             dirty = self._changed_files()
+            if dirty is None:
+                return "permission_denied:git_status_unavailable"
             if dirty:
                 # the first attempt must start from a clean tree: everything changed
                 # afterwards is then provably the agent's, and nothing of anyone else's
@@ -544,6 +549,22 @@ class Engine:
     def _git(self, *args) -> tuple:
         return self.host.run(["git", "-C", self.root, *args], timeout=60)
 
+    def _git_refusal(self) -> Optional[str]:
+        """Full Cycle verifies work only from git evidence, so its project root must be a
+        readable git work tree with a HEAD. Anything else refuses the dispatch (fail
+        closed); other Owner OS project kinds are not affected."""
+        rc, out, err = self._git("rev-parse", "--is-inside-work-tree")
+        if rc != 0:
+            if "not a git repository" in (err or "").lower():
+                return "project_root_not_git"
+            return "git_unavailable:" + (err or out or "").strip()[-120:]
+        if out.strip() != "true":
+            return "project_root_not_git"
+        rc, out, err = self._git("rev-parse", "--verify", "--quiet", "HEAD")
+        if rc != 0:
+            return "git_head_unavailable:" + (err or out or "no commit").strip()[-120:]
+        return None
+
     def _changed_files(self) -> Optional[list]:
         """Paths changed against HEAD, both sides of every move (renames are not
         detected, so a moved protected file shows as its deletion), NUL-separated so no
@@ -578,12 +599,16 @@ class Engine:
     def _verify(self, task: dict, result: dict) -> dict:
         c = tc.get(task["contract_id"], conn=self.conn)["contract"]
         changed = self._changed_files()
+        claimed = [f for f in (result.get("changed_files") or []) if isinstance(f, str)]
         if changed is None:
-            changed, source = result.get("changed_files", []), "agent_claim"
+            # no git evidence: the agent's own claim is never verification (fail closed);
+            # the check outputs are still collected for the feedback
+            changed, source = [], "unavailable"
+            violations = ["changed_files_unverifiable"]
         else:
             source = "git"
-        violations = gates.check_changes(changed, scope=c["scope"],
-                                         do_not_touch=c["do_not_touch"])
+            violations = gates.check_changes(changed, scope=c["scope"],
+                                             do_not_touch=c["do_not_touch"])
         checks = self._run_checks(task["body"]["checks"], trusted=self._trusted(task))
         regression = self._regression_checks(task)
         passed = (not violations and bool(checks) and all(x["passed"] for x in checks)
@@ -595,8 +620,8 @@ class Engine:
         if not checks:
             reasons.append("task_has_no_checks")
         return {"attempt": task["attempt"], "passed": passed, "changed_files": changed,
-                "changed_source": source, "violations": violations, "checks": checks,
-                "regression": regression, "reasons": reasons,
+                "changed_source": source, "claimed_changed_files": claimed[:200],
+                "violations": violations, "checks": checks, "regression": regression, "reasons": reasons,
                 "summary": result.get("summary", "")}
 
     def _regression_checks(self, task: dict) -> list:
@@ -809,12 +834,26 @@ class Engine:
         for task in self._tasks():
             if task["state"] != tc.VERIFIED_DONE or task["committed"]:
                 continue
-            if not self.commit_on_approve or self._git("rev-parse", "--git-dir")[0] != 0:
+            if not self.commit_on_approve:
                 # the owner commits; until then the dirty tree holds the next task
                 self._set(task, committed=1)
                 continue
-            self._git("add", "-A", "--", ".", ":(exclude).fullcycle")
-            if self._git("diff", "--cached", "--quiet")[0] == 0:
+            # a git error here must never mark work committed that is not (fail closed)
+            # (`add` + `reset` rather than an exclude pathspec: naming a gitignored
+            # .fullcycle in a pathspec makes `git add` exit 1 although it staged everything)
+            rc_add, out_add, err_add = self._git("add", "-A", "--", ".")
+            if rc_add == 0:
+                rc_add, out_add, err_add = self._git("reset", "-q", "--", ".fullcycle")
+            rc_diff = self._git("diff", "--cached", "--quiet")[0] if rc_add == 0 else None
+            if rc_add != 0 or rc_diff not in (0, 1):
+                detail = (out_add + err_add).strip()[-500:] if rc_add != 0 else "git diff failed"
+                self._set(task, last_reason=f"commit_failed:{detail[-200:]}")
+                self._event(OWNER_EVENT, task["id"], {"reason": "commit_failed",
+                                                      "task": task["key"], "detail": detail},
+                            owner=True, dedup_key=f"fullcycle:commit_failed:{task['id']}")
+                self._note("commit_failed", task=task["key"])
+                continue
+            if rc_diff == 0:
                 self._set(task, committed=1)
                 continue
             rc, out, err = self.host.run(
