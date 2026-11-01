@@ -103,3 +103,19 @@ class AgentControlAdapter(ExecutorAdapter):
 
     def collect(self, handle: dict) -> Optional[dict]:
         return parse_result(self.host.read_file(handle["result"]), handle)
+
+    # agent_control.classify_state: idle at the prompt, or no live agent process
+    _QUIESCENT = ("waiting_input", "dead", "stale")
+    _ACTIVE = ("working", "shell_running", "waiting_owner")
+
+    def quiescent(self, handle: dict) -> Optional[bool]:
+        try:
+            st = self.ac.agent_status(self.target, actor=self.actor)
+        except Exception:  # noqa: BLE001 — unknown is not idle
+            return None
+        state = st.get("state")
+        if state in self._QUIESCENT:
+            return True
+        if state in self._ACTIVE:
+            return False
+        return None

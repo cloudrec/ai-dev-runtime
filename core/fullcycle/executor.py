@@ -97,6 +97,12 @@ class ExecutorAdapter(ABC):
     def restart(self, handle: dict) -> dict:
         return {"ok": False, "reason": "adapter_does_not_own_agent"}
 
+    def quiescent(self, handle: dict) -> Optional[bool]:
+        """Is the agent provably NOT working on anything (idle at its prompt, or its
+        process gone)? True only on positive evidence; False = active; None = cannot
+        tell. The engine resends after a stall only on True."""
+        return None
+
 
 # ── executor profiles ───────────────────────────────────────────────────────
 @dataclass(frozen=True)

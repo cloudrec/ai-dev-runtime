@@ -126,6 +126,11 @@ class PrivateTmuxAdapter(ExecutorAdapter):
     def collect(self, handle: dict) -> Optional[dict]:
         return parse_result(self.host.read_file(handle["result"]), handle)
 
+    def quiescent(self, handle: dict) -> Optional[bool]:
+        # the fixture agent handles one envelope at a time from its stdin, so a new
+        # one can never run beside the old one; tests override this to model "active"
+        return True
+
     def restart(self, handle: dict) -> dict:
         if self._tmux("has-session", "-t", self.session)[0] != 0:
             return {**self.ensure_session(), "how": "new_session"}

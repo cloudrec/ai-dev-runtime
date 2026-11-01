@@ -52,8 +52,8 @@ from core.control_plane import api as cp
 from core.control_plane.store import now_iso, now_ts
 from core.fullcycle import gates
 from core.fullcycle import spec as specs
-from core.fullcycle.executor import (CRASHED, DONE, WAITING_PERMISSION, ExecutorAdapter,
-                                     TaskEnvelope)
+from core.fullcycle.executor import (CRASHED, DONE, UNKNOWN, WAITING_PERMISSION,
+                                     ExecutorAdapter, TaskEnvelope)
 from core.fullcycle.hosts import ExecutionHost, LocalHost
 
 SOURCE = "fullcycle"
@@ -65,6 +65,11 @@ CHECK_TIMEOUT = int(os.getenv("FULLCYCLE_CHECK_TIMEOUT", "300"))
 CHECK_ENV = {"PYTHONDONTWRITEBYTECODE": "1"}
 # longer than the worst tick (every check of a task at CHECK_TIMEOUT), renewed per step
 LEASE_TTL = int(os.getenv("FULLCYCLE_LEASE_TTL", "900"))
+# D1: an attempt with no result this long after its send, or whose agent status could not
+# be read this many polls in a row, is reported to the tech lead ONCE (a "blocked" review
+# carrying `stalled`). The engine never kills, restarts or resends on its own.
+ATTEMPT_TIMEOUT = int(os.getenv("FULLCYCLE_ATTEMPT_TIMEOUT", "7200"))
+UNKNOWN_POLL_LIMIT = int(os.getenv("FULLCYCLE_UNKNOWN_POLL_LIMIT", "20"))
 OWNER_RESUME = ("resume", "retry", "approve")
 OWNER_CANCEL = ("cancel", "stop")
 
@@ -82,7 +87,7 @@ CREATE TABLE IF NOT EXISTS fc_task (
     feedback TEXT DEFAULT '', verification TEXT DEFAULT '', gate_id TEXT DEFAULT '',
     dispatch_failures INTEGER DEFAULT 0, last_reason TEXT DEFAULT '',
     origin TEXT DEFAULT 'spec', redispatch INTEGER DEFAULT 0, committed INTEGER DEFAULT 0,
-    created_ts REAL, updated_ts REAL,
+    created_ts REAL, updated_ts REAL, unknown_polls INTEGER DEFAULT 0,
     UNIQUE (project_id, key)
 );
 CREATE TABLE IF NOT EXISTS fc_dispatch (
@@ -111,11 +116,17 @@ class EngineError(RuntimeError):
     pass
 
 
+_MIGRATIONS = (("fc_task", "unknown_polls", "INTEGER DEFAULT 0"),)
+
+
 def connect(conn=None):
     conn, own = specs.conn_with_schema(conn)
     for stmt in _SCHEMA.strip().split(";"):
         if stmt.strip():
             conn.execute(stmt)
+    for table, col, decl in _MIGRATIONS:          # additive only: old rows get the default
+        if col not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     conn.commit()
     return conn, own
 
@@ -236,7 +247,7 @@ def _offer_to_wake_bridge(eid: int, type_: str, severity: str, owner: bool, *,
 
 _TASK_COLS = ("id", "key", "seq", "spec_version", "body", "contract_id", "attempt", "handle",
               "feedback", "verification", "gate_id", "dispatch_failures", "last_reason",
-              "origin", "redispatch", "committed")
+              "origin", "redispatch", "committed", "unknown_polls")
 
 
 class Engine:
@@ -447,6 +458,8 @@ class Engine:
             # single executor: a resumed parked task waits for the task in flight; the
             # intent (redispatch) stays and is carried out by a later tick
             self._note("dispatch_waiting_for_other_task", task=task["key"], others=others)
+            return False
+        if not self._stall_fence_open(task, attempt):
             return False
         refusal = self._refusal(task, attempt)
         if refusal:
@@ -734,14 +747,92 @@ class Engine:
         self._move(task, tc.VERIFYING)
         self._finish_verification(task, self._verify(task, self.adapter.collect(task["handle"]) or {}))
 
+    # -- D1: a silent attempt ---------------------------------------------------------
+    def _stall_review(self, task: dict, attempt: int) -> Optional[dict]:
+        r = self.conn.execute(
+            "SELECT id, status, payload, decision FROM fc_review WHERE project_id=? AND"
+            " task_id=? AND attempt=? AND kind='blocked'",
+            (self.project_id, task["id"], attempt)).fetchone()
+        if not r:
+            return None
+        payload = json.loads(r[2] or "{}")
+        return ({**payload, "id": r[0], "status": r[1], "decision": r[3]}
+                if payload.get("stalled") else None)
+
+    def _sent_ts(self, task: dict) -> Optional[float]:
+        r = self.conn.execute("SELECT ts FROM fc_dispatch WHERE idem_key=? AND status='sent'",
+                              (f"fullcycle:{task['id']}:{task['attempt']}",)).fetchone()
+        return r[0] if r else None
+
+    def _stall_alert(self, task: dict, reason: str, **detail) -> None:
+        """At most once per attempt: the review row is unique per (task, attempt, kind)
+        and its event is emitted only on first insert."""
+        if self._review_for(task, "blocked"):
+            return
+        self._request_review(task, "blocked", {
+            "stalled": reason, **detail,
+            "question": (f"Attempt {task['attempt']} of task '{task['key']}' has produced no "
+                         f"result ({reason}). Owner OS will not kill, restart or resend while "
+                         "that attempt may still be running. Answer to retry once the agent is "
+                         "provably idle (counts towards the attempt limit), or cancel the task.")})
+        self._note("attempt_stalled", task=task["key"], attempt=task["attempt"], reason=reason)
+
+    def _stall_fence_open(self, task: dict, attempt: int) -> bool:
+        """A resend after a stall alert goes out only when the previous attempt is proven
+        over: its result is checked first (a late result is verified instead of resent),
+        then the agent must be provably idle. Anything else waits — never a second
+        envelope beside a possibly running one."""
+        prev = task["handle"] or {}
+        if prev.get("attempt") != attempt - 1 or not self._stall_review(task, attempt - 1):
+            return True
+        obs = self.adapter.poll(prev)
+        if obs.state == DONE:
+            # the stalled attempt finished after all: drop the resend, verify its result
+            self._set(task, redispatch=0, last_reason="late_result_after_stall")
+            self._note("late_result_after_stall", task=task["key"], attempt=attempt - 1)
+            return False
+        quiet = True if obs.state == CRASHED else self.adapter.quiescent(prev)
+        if quiet is not True:
+            self._note("resend_fenced", task=task["key"], attempt=attempt,
+                       observed=obs.state, quiescent=quiet)
+            return False
+        return True
+
     def _step_working(self, task: dict) -> None:
         obs = self.adapter.poll(task["handle"])
+        stall = self._stall_review(task, task["attempt"])
+        if stall and stall.get("decision") == "cancel":
+            quiet = True if obs.state in (DONE, CRASHED) else self.adapter.quiescent(task["handle"])
+            if quiet is True:
+                self._move(task, tc.CANCELLED, evidence={"stall_cancelled": stall["id"]})
+            else:
+                self._note("stall_cancel_fenced", task=task["key"], observed=obs.state,
+                           quiescent=quiet)
+            return
+        if obs.state != UNKNOWN and task.get("unknown_polls"):
+            self._set(task, unknown_polls=0)
         if obs.state == DONE:
             result = self.adapter.collect(task["handle"]) or {}
             if result.get("status") == "blocked":
                 self._move(task, tc.BLOCKED)
-                self._request_review(task, "blocked", {
-                    "question": str(result.get("question") or result.get("summary"))[:4000]})
+                question = str(result.get("question") or result.get("summary"))[:4000]
+                stall = self._stall_review(task, task["attempt"])
+                if stall and stall["status"] == "pending":
+                    # the stall alert already holds this attempt's "blocked" slot: put the
+                    # agent's real question into it and tell the tech lead once more
+                    self.conn.execute("UPDATE fc_review SET payload=? WHERE id=?",
+                                      (_j({"question": question,
+                                           "after_stall": stall.get("stalled")}), stall["id"]))
+                    self.conn.commit()
+                    self._event(REVIEW_EVENT, task["id"], {
+                        "fullcycle": "blocked", "review_id": stall["id"],
+                        "project": self.project_id, "task": task["key"],
+                        "attempt": task["attempt"], "question": question,
+                        "decide_with": {"review_id": stall["id"],
+                                        "decisions": list(REVIEW_DECISIONS["blocked"])}},
+                        dedup_key=f"fullcycle:review:{stall['id']}:question")
+                else:
+                    self._request_review(task, "blocked", {"question": question})
                 return
             self._move(task, tc.AGENT_DONE)
             self._verify_current(task)
@@ -763,6 +854,18 @@ class Engine:
         elif obs.state == WAITING_PERMISSION:
             gate = gates.check_permission_prompt(obs.detail.get("command", ""), root=self.root)
             self._owner(task, "agent_permission_prompt", {"permission": gate})
+        else:                                            # WORKING or UNKNOWN: still waiting
+            if obs.state == UNKNOWN:
+                n = int(task.get("unknown_polls") or 0) + 1
+                self._set(task, unknown_polls=n)
+                if n >= UNKNOWN_POLL_LIMIT:
+                    self._stall_alert(task, "agent_status_unknown", unknown_polls=n,
+                                      detail=str(obs.detail)[:300])
+                    return
+            sent = self._sent_ts(task)
+            if sent is not None and self.clock() - sent >= ATTEMPT_TIMEOUT:
+                self._stall_alert(task, "attempt_timeout",
+                                  elapsed_s=int(self.clock() - sent), timeout_s=ATTEMPT_TIMEOUT)
 
     # -- decisions --------------------------------------------------------------
     def _apply_decisions(self) -> None:
@@ -788,6 +891,18 @@ class Engine:
                 else:
                     self._move(task, tc.VERIFICATION_FAILED, evidence={"review": review})
                     self._set(task, feedback="Reviewer rejected: " + review["feedback"])
+            elif kind == "blocked" and task["state"] == tc.WORKING and \
+                    self._stall_review(task, attempt):
+                if decision == "answer":
+                    # resend through the fence (_stall_fence_open): never beside a running
+                    # attempt; bounded by max_attempts like every other retry
+                    self._retry(task, why="stalled", feedback=(
+                        "Your previous attempt produced no result and was stopped. Continue "
+                        "from the current state of the workdir. Tech lead: " + review["feedback"]))
+                else:
+                    # not CANCELLED yet: the task stays in flight (so no other task is sent
+                    # to the agent) until _step_working proves the attempt over
+                    self._note("stall_cancel_pending", task=task["key"])
             elif kind == "blocked" and task["state"] == tc.BLOCKED:
                 if decision == "answer":
                     self._retry(task, why="blocked_answered",
