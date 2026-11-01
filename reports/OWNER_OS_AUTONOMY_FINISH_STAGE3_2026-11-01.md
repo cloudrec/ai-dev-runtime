@@ -26,8 +26,9 @@ owner sign-off.** Previous stages: `reports/OWNER_OS_AUTONOMY_FINISH_STAGE1_2026
 | 191519c | fix | `stage_done.py` REPO from `__file__` | none |
 | aacad1b | test | sandbox E2E (7) | tests only |
 | f27d538 | fix (tests) | conftest walls 127.0.0.1:9222; composer fixture | tests only — stops suite opening live tabs |
+| ccbcb25 | fix | two different plans in one reply refused (fallback path, never completed) | plan pick stricter |
 | ff93b10 | feat | ≤1 bounded replan after tool-call reply, `RUNTIME_PLANNER_REPLAN` | none (flag off) |
-| (stage 3) | tool+docs | `tools/base_ref_report.py` (read-only), this report, evidence, diffs | none |
+| d813e48 | tool+docs | `tools/base_ref_report.py` (read-only), this report, evidence, diffs | none |
 
 ## 2. Tech-lead decisions applied
 
@@ -109,9 +110,8 @@ socket, `TELEGRAM_*` unset, composer pinned to the patched module, process-wide 
 
 ## 5. Independent review package
 
-Files: `reports/stage3/diff_production_9557004..ff93b10.patch` (506 lines, 12 files: core/tools/hooks/config),
-`reports/stage3/diff_tests_9557004..ff93b10.patch` (tests). Plus `tools/base_ref_report.py` (new, read-only).
-The callouts below are the **author's own** — they do not replace an independent review.
+Files: `reports/stage3/diff_production_9557004..ccbcb25.patch` (core/tools/hooks/config; includes tools/base_ref_report.py),
+`reports/stage3/diff_tests_9557004..ccbcb25.patch` (tests). The callouts below are the **author's own** — they do not replace an independent review.
 
 **Highest blast radius first**
 1. `hooks/owneros_hook.py:39` — runs in EVERY Claude session on the host. One-line change
@@ -122,11 +122,11 @@ The callouts below are the **author's own** — they do not replace an independe
 3. `core/job_executor.py` — (a) tool-call reply → `blocked` (behaviour change for every runtime job that would
    have run a no-op fallback); (b) `BaseRefBlocked` → `blocked`; (c) bounded replan (flag off).
    Check: no other caller depends on such jobs reaching `fallback_plan_only`/`failed`.
-4. `core/ai_planner.py` `_extract_json` — **policy risk:** the first object carrying `files` now wins over
-   earlier objects. A reply that shows an *example* plan before the real one would execute the example.
-   Mitigated by unchanged `_validate` (relative paths, allowed ops, allowed_paths) and by isolated worktrees,
-   but reviewer should decide whether "last object with files" or "exactly one object with files" is safer.
-   `_looks_like_tool_call` false-positive risk: only objects with no `files`/`summary` and a tool-arg key.
+4. `core/ai_planner.py` `_extract_json` — the object carrying `files` wins over earlier non-plan objects;
+   **two different plan objects are refused** (`planner returned several different plans` → normal
+   planner-failure path → deterministic fallback → `fallback_plan_only`, never completed). Identical
+   repeats (fence + prose scan) count once. `_looks_like_tool_call` false-positive risk: only objects with
+   no `files`/`summary` and a tool-arg key.
 5. `core/git_write.py` — `configured_base_ref` loads YAML (`safe_load`) from the repo's own config: the
    authorization boundary is code review of that file. Key matched by `realpath` and raw path.
    `_staleness` shells out to `git merge-base --is-ancestor` (read-only). `BaseRefBlocked` subclasses
@@ -135,7 +135,7 @@ The callouts below are the **author's own** — they do not replace an independe
    artifacts, like the existing fallback path.
 7. Tests' conftest monkeypatches `socket.socket.connect` process-wide for port 9222 only — test-only.
 
-**Questions for the reviewer**: example-plan precedence (item 4); should a configured `base_ref` also have to be
+**Questions for the reviewer**: should a configured `base_ref` also have to be
 an ancestor of the live HEAD; per-project strict mode instead of a global flag.
 
 ## 6. Tests
@@ -157,8 +157,8 @@ an ancestor of the live HEAD; per-project strict mode instead of a global flag.
 5. Open items, in order: (a) independent review of §5 — needs a reviewer other than the author;
    (b) owner-approved promotion plan (installer + backup + rollback, companion + runtime restarts);
    (c) post-promotion validation (§3 step 1, hook run, one wake delivered); (d) base_ref pins for
-   `/root/ai-dev-runtime` and `/opt/seo` (§3); (e) decide `_extract_json` precedence (§5.4).
+   `/root/ai-dev-runtime` and `/opt/seo` (§3).
 
 ## 8. Final suite at this head
 
-(filled at commit time)
+ccbcb25 (planner ambiguity fix on top of d813e48): **4248 passed, 4 skipped, 0 failed** (596 s), worktree, live-CDP wall active.

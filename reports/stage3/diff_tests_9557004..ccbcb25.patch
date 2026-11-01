@@ -601,10 +601,10 @@ index 6637fa6..33038f6 100644
  from core.safety import approve_action, validate_file_operation
 diff --git a/tests/test_job_base_ref.py b/tests/test_job_base_ref.py
 new file mode 100644
-index 0000000..534cef9
+index 0000000..e0dc172
 --- /dev/null
 +++ b/tests/test_job_base_ref.py
-@@ -0,0 +1,154 @@
+@@ -0,0 +1,171 @@
 +"""Task 326: a runtime job for /root/ai-dev-runtime was built on `main`, 449 commits
 +behind and not an ancestor of the line the project runs, because the live branch is
 +named like a runtime work branch and the API's "master" placeholder resolves nowhere.
@@ -759,6 +759,23 @@ index 0000000..534cef9
 +    # Promoting this code must not change any live job's base by itself.
 +    monkeypatch.delenv("RUNTIME_BASE_REFS_CONFIG", raising=False)
 +    assert git_write.configured_base_ref("/root/ai-dev-runtime") is None
++
++
++def test_the_read_only_report_names_the_task326_shape(tmp_path):
++    import importlib.util
++    import os
++    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
++    spec = importlib.util.spec_from_file_location(
++        "base_ref_report", os.path.join(root, "tools", "base_ref_report.py"))
++    mod = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(mod)
++    repo = _task326_repo(tmp_path, ahead=3)
++    before = _git(repo, "for-each-ref")
++    r = mod.report(str(repo))
++    assert r["legacy_guess"] == "main" and r["guess_behind_head"] == 3
++    assert "not an ancestor" in r["strict_verdict"]
++    assert _git(repo, "for-each-ref") == before                  # read-only
++    assert mod.report(str(tmp_path))["error"] == "not a git repository"
 diff --git a/tests/test_job_kind_pipeline.py b/tests/test_job_kind_pipeline.py
 index c690749..661b3de 100644
 --- a/tests/test_job_kind_pipeline.py
@@ -920,7 +937,7 @@ index 4cf6089..4165505 100644
  
  def _map(ev, **payload):
 diff --git a/tests/test_planner_fallback.py b/tests/test_planner_fallback.py
-index 1dca38a..17cdb80 100644
+index 1dca38a..106772c 100644
 --- a/tests/test_planner_fallback.py
 +++ b/tests/test_planner_fallback.py
 @@ -63,6 +63,11 @@ def _git(path, *args):
@@ -935,7 +952,7 @@ index 1dca38a..17cdb80 100644
  def _repo(tmp_path, with_tests_dir=False):
      """A minimal git repo. By default NO tests/ dir and no test config, so the
      fallback's derived test_commands is [] and the pipeline commits without
-@@ -571,3 +576,189 @@ def test_a_fallback_job_records_no_salvage_artifact(tmp_path, monkeypatch):
+@@ -571,3 +576,205 @@ def test_a_fallback_job_records_no_salvage_artifact(tmp_path, monkeypatch):
      final = job_store.get_job(job["id"])
      assert final["status"] == "fallback_plan_only"
      assert not any(a.get("planner_salvaged_after_timeout") for a in (final["artifacts"] or []))
@@ -1125,6 +1142,22 @@ index 1dca38a..17cdb80 100644
 +                                     artifacts=[{"planner_replan": "started"}])
 +    assert final["status"] == "blocked" and "already attempted" in final["error"]
 +    assert calls == 1
++
++
++def test_two_different_plans_in_one_reply_are_refused_not_guessed():
++    # An "example" plan followed by the real one: executing either is a guess.
++    text = ('Example:\n```json\n{"summary": "example", "files": [{"path": "ex.py", '
++            '"operation": "create", "content": "x"}]}\n```\nPlan:\n```json\n'
++            '{"summary": "real", "files": [{"path": "a.py", "operation": "create", '
++            '"content": "y"}]}\n```')
++    with pytest.raises(ai_planner.PlannerError, match="several different plans"):
++        ai_planner._extract_json(text)
++
++
++def test_the_same_plan_seen_twice_is_one_plan():
++    plan = '{"summary": "s", "files": [{"path": "a.py", "operation": "create", "content": "y"}]}'
++    obj = ai_planner._extract_json(f"Plan:\n```json\n{plan}\n```\n")   # fence + prose scan
++    assert obj["summary"] == "s"
 diff --git a/tests/test_policy_enforcement_pipeline.py b/tests/test_policy_enforcement_pipeline.py
 index 5cf2238..6c1271c 100644
 --- a/tests/test_policy_enforcement_pipeline.py

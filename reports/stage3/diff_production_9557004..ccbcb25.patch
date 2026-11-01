@@ -15,7 +15,7 @@ index 0000000..02e49ab
 +#     base_ref: <full sha or branch>
 +projects: {}
 diff --git a/core/ai_planner.py b/core/ai_planner.py
-index f9e87c9..07989b0 100644
+index f9e87c9..5e1bf84 100644
 --- a/core/ai_planner.py
 +++ b/core/ai_planner.py
 @@ -87,9 +87,9 @@ Rules: use relative paths only; never touch .env, keys, secrets, credentials, or
@@ -54,28 +54,35 @@ index f9e87c9..07989b0 100644
  
  
  def _extract_json(text: str) -> dict:
-@@ -143,15 +154,21 @@ def _extract_json(text: str) -> dict:
+@@ -143,15 +154,27 @@ def _extract_json(text: str) -> dict:
              return obj
      except json.JSONDecodeError:
          pass
 -    # 2) fenced code block(s) — try each fence's body first
 +    # 2) fenced code block(s), then 3) balanced objects anywhere in the prose.
 +    # The object that carries a `files` list is the plan; an earlier example or
-+    # tool-argument object must not shadow it. Without one, keep the first object
-+    # so validation reports what was actually returned.
++    # tool-argument object must not shadow it, and two DIFFERENT plans are refused.
++    # Without one, keep the first object so validation reports what was returned.
 +    candidates: list[dict] = []
      for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE):
 -        obj = _first_json_object(m.group(1))
 -        if obj is not None:
-+        candidates.extend(_json_objects(m.group(1)))
-+    candidates.extend(_json_objects(text))
-+    for obj in candidates:
-+        if "files" in obj:
-             return obj
+-            return obj
 -    # 3) first balanced JSON object anywhere in surrounding prose
 -    obj = _first_json_object(text)
 -    if obj is not None:
 -        return obj
++        candidates.extend(_json_objects(m.group(1)))
++    candidates.extend(_json_objects(text))
++    plans: list[dict] = []
++    for obj in candidates:
++        if "files" in obj and obj not in plans:   # the fence body is also seen by the prose scan
++            plans.append(obj)
++    if len(plans) > 1:
++        # An example plan next to the real one: executing either is a guess.
++        raise PlannerError("planner returned several different plans")
++    if plans:
++        return plans[0]
 +    if candidates:
 +        if _looks_like_tool_call(candidates[0]):
 +            raise PlannerError(TOOL_CALL_REASON)
@@ -384,6 +391,69 @@ index 0c88e22..fde1f0e 100755
  
  _RUNTIME_ENV = "/root/ai-dev-runtime/configs/.env"
  
+diff --git a/tools/base_ref_report.py b/tools/base_ref_report.py
+new file mode 100644
+index 0000000..612e0e1
+--- /dev/null
++++ b/tools/base_ref_report.py
+@@ -0,0 +1,57 @@
++#!/usr/bin/env python3
++"""Read-only: what base would a runtime job get in each project, and is it credible?
++
++    base_ref_report.py /path/to/project [...]
++
++For every project path prints the legacy guess (resolve_base_branch with the API's
++"master" placeholder), its SHA, the checked-out HEAD, and the staleness verdict that
++RUNTIME_STRICT_BASE_REF would apply. Used to validate a project before giving it a
++`base_ref` in config/project_base_refs.yaml or turning strict mode on.
++
++Never fetches, never writes: only rev-parse / rev-list / merge-base, with
++GIT_OPTIONAL_LOCKS=0 (core.git_write._run).
++"""
++from __future__ import annotations
++
++import json
++import os
++import sys
++
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
++
++from core import git_write as gw  # noqa: E402
++
++
++def report(project_path: str) -> dict:
++    out = {"project": project_path}
++    if not os.path.isdir(os.path.join(project_path, ".git")) and \
++            not os.path.isfile(os.path.join(project_path, ".git")):
++        return {**out, "error": "not a git repository"}
++    try:
++        out["head_branch"] = gw.current_branch(project_path)
++        out["head_sha"] = gw.rev_sha(project_path, "HEAD")
++        out["configured_base_ref"] = gw.configured_base_ref(project_path)
++        guess = gw.resolve_base_branch(project_path, "master")
++        out["legacy_guess"] = guess
++        out["legacy_guess_sha"] = gw.rev_sha(project_path, guess)
++        behind = gw._run(project_path, ["rev-list", "--count",
++                                        f"{out['legacy_guess_sha']}..{out['head_sha']}"]).strip()
++        out["guess_behind_head"] = int(behind or 0)
++        out["strict_verdict"] = gw._staleness(project_path, guess) or "ok"
++    except gw.GitWriteError as e:
++        out["error"] = str(e)[:300]
++    return out
++
++
++def main(argv=None) -> int:
++    paths = (argv if argv is not None else sys.argv[1:])
++    if not paths:
++        print(__doc__.strip().splitlines()[2].strip(), file=sys.stderr)
++        return 2
++    for p in paths:
++        print(json.dumps(report(os.path.realpath(p))))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
 diff --git a/tools/cdp_composer.py b/tools/cdp_composer.py
 index 0d8aab6..6c82f67 100644
 --- a/tools/cdp_composer.py
