@@ -158,7 +158,9 @@ def test_answering_a_stall_after_the_late_result_is_stale(fc):
     _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
     e.tick()                                             # verified → review requested
     assert _state(e.status(), "add")["state"] == tc.VERIFYING
-    _answer(e, "answer")
+    (row,) = _all_stall_rows(e)                           # the alert is no longer open...
+    r = fe.submit_decision(row[0], "answer", key="late", by="stub-gpt", feedback="go")
+    assert not r["ok"] and r["reason"] == "review_superseded"   # ...so it cannot be decided
     e.tick()
     assert [x["task_id"] for x in h.agent_log(log)] == ["tinycalc:add"]   # no resend
 
@@ -329,3 +331,84 @@ def test_f1_late_result_after_limit_and_owner_resume_is_verified(fc):
     assert [x["task_id"] for x in h.agent_log(log)].count("tinycalc:add") == 1   # never resent
     hist = [x["to"] for x in tc.history(_task(e, "add")["contract_id"])]
     assert hist[-4:] == [tc.WORKING, tc.AGENT_DONE, tc.VERIFYING, tc.VERIFIED_DONE]
+
+
+
+# ── a stall alert is retired by the late result it was about ─────────────────────
+def _stall_status(e):
+    (row,) = _all_stall_rows(e)
+    return e.conn.execute("SELECT status, event_id, decided_by FROM fc_review WHERE id=?",
+                          (row[0],)).fetchone()
+
+
+def test_a_late_done_result_supersedes_the_pending_stall_alert(fc):
+    from core import wake_bridge as wb
+    e, a, log, root, clock = _hung_add(fc)
+    clock.offset = HOUR2 + 1
+    e.tick()
+    status, eid, _ = _stall_status(e)
+    assert status == "pending" and eid
+    assert not wb._fullcycle_review_closed(e.conn, eid)      # its doorbell is live
+    _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
+    e.tick()
+    status, eid2, by = _stall_status(e)
+    assert status == "superseded" and by == "engine" and eid2 == eid
+    assert wb._fullcycle_review_closed(e.conn, eid)          # an undelivered wake retires
+    kinds = [(r["kind"], bool(r["payload"].get("stalled"))) for r in fe.pending_reviews(e.project_id)]
+    assert kinds == [("review", False)]                     # only the real review is open
+
+
+def test_superseding_is_idempotent_and_emits_nothing_more(fc):
+    e, a, log, root, clock = _hung_add(fc)
+    clock.offset = HOUR2 + 1
+    e.tick()
+    _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
+    e.tick()
+    n_events = len(_events())
+    for _ in range(4):
+        e.tick()
+    assert _stall_status(e)[0] == "superseded"
+    assert len(_events()) == n_events and len(_all_stall_rows(e)) == 1
+
+
+def test_an_unresolved_stall_stays_pending(fc):
+    e, a, log, root, clock = _hung_add(fc)
+    clock.offset = HOUR2 + 1
+    for _ in range(5):
+        e.tick()
+    assert _stall_status(e)[0] == "pending"                  # no result: still alerting
+
+
+def test_a_decided_stall_is_never_superseded(fc):
+    e, a, log, root, clock = _hung_add(fc)
+    clock.offset = HOUR2 + 1
+    e.tick()
+    _answer(e, "answer")
+    _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
+    for _ in range(3):
+        e.tick()
+    assert _stall_status(e)[0] == "decided"                  # the tech lead's decision stands
+
+
+def test_a_late_question_keeps_the_alert_slot_pending(fc):
+    e, a, log, root, clock = _hung_add(fc)
+    clock.offset = HOUR2 + 1
+    e.tick()
+    path = os.path.join(root, ".fullcycle", "results", "add-1.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump({"task_id": "tinycalc:add", "attempt": 1, "status": "blocked",
+                   "summary": "s", "changed_files": [], "question": "q?"}, fh)
+    e.tick()
+    rows = e.conn.execute("SELECT status FROM fc_review WHERE kind='blocked'").fetchall()
+    assert rows == [("pending",)]                           # now a real question: stays open
+
+
+def test_a_late_result_of_an_older_attempt_supersedes_nothing(fc):
+    e, a, log, root, clock = _hung_add(fc)
+    clock.offset = HOUR2 + 1
+    e.tick()
+    _write_late_result(root, "add", 7, h.SOLUTIONS["add"])   # not this attempt's result
+    for _ in range(3):
+        e.tick()
+    assert _stall_status(e)[0] == "pending"

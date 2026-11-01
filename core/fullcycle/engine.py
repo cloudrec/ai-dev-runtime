@@ -193,6 +193,10 @@ def submit_decision(review_id: int, decision: str, *, key: str, by: str,
         if not r:
             raise EngineError(f"no such review {review_id}")
         kind, status, project_id = r
+        if status == "superseded":
+            # a stall alert retired by the late result it was about (_supersede_stall)
+            return {"ok": False, "duplicate": False, "reason": "review_superseded",
+                    "review_id": review_id}
         if status != "pending":
             return {"ok": False, "duplicate": False, "reason": "review_already_decided",
                     "review_id": review_id}
@@ -783,6 +787,24 @@ class Engine:
                               (self.project_id, task["id"], attempt)).fetchone()
         return json.loads(r[0] or "{}") if r else {}
 
+    def _supersede_stall(self, task: dict) -> None:
+        """The attempt a still-pending stall alert was about delivered a result after all:
+        the alert no longer needs an answer. It is marked `superseded` (not decided, not
+        applied), so it leaves the inbox, its undelivered wake retires
+        (wake_bridge._fullcycle_review_closed) and a late answer is refused. Only a
+        PENDING alert of THIS attempt; idempotent; a decided alert is never touched."""
+        stall = self._stall_review(task, task["attempt"])
+        if not (stall and stall["status"] == "pending"):
+            return
+        cur = self.conn.execute(
+            "UPDATE fc_review SET status='superseded', decided_by='engine', decided_ts=?,"
+            " decision_body=? WHERE id=? AND status='pending'",
+            (self.clock(), _j({"reason": "late_result", "attempt": task["attempt"]}),
+             stall["id"]))
+        self.conn.commit()
+        if cur.rowcount == 1:
+            self._note("stall_alert_superseded", task=task["key"], review_id=stall["id"])
+
     def _sent_ts(self, task: dict) -> Optional[float]:
         r = self.conn.execute("SELECT ts FROM fc_dispatch WHERE idem_key=? AND status='sent'",
                               (f"fullcycle:{task['id']}:{task['attempt']}",)).fetchone()
@@ -869,6 +891,8 @@ class Engine:
                 self._blocked_review(task, {"question": str(
                     result.get("question") or result.get("summary"))[:4000]})
                 return
+            if result.get("status") == "done":
+                self._supersede_stall(task)
             if result.get("status") == "context_exhausted":
                 # D2: the attempt ended at a safe stop with a compact handoff; the routine
                 # decision (continue in a clean session, or cancel) is the tech lead's
