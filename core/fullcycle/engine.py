@@ -610,6 +610,9 @@ class Engine:
         for t in self._tasks():
             if t["id"] == task["id"] or t["state"] != tc.VERIFIED_DONE:
                 continue
+            # LEASE_TTL covers one task's checks, not the whole project's: renew per task
+            # (LeaseLost leaves the task VERIFYING; the next holder re-verifies)
+            self._lead()
             for x in self._run_checks(t["body"]["checks"], trusted=self._trusted(t)):
                 out.append({"task": t["key"], **x})
         return out

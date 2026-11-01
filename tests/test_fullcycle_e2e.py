@@ -391,3 +391,18 @@ def test_a_task_that_breaks_an_earlier_verified_task_is_repaired_before_review(f
               if h_["to"] == tc.VERIFICATION_FAILED][0]
     assert [r["task"] for r in failed["regression"]] == ["add"]
     assert not failed["regression"][0]["passed"]
+
+
+def test_the_regression_gate_renews_the_lease_per_verified_task(fc, monkeypatch):
+    e, a, log, root = fc()
+    h.run(e, h.StubReviewer(), until=lambda s: _state(s, "mul")["state"] == tc.VERIFIED_DONE,
+          timeout=40)
+    calls = []
+    real = e._lead
+    monkeypatch.setattr(e, "_lead", lambda: calls.append(1) or real())
+    probe = {"id": "tinycalc:probe"}
+    out = e._regression_checks(probe)
+    assert sorted({r["task"] for r in out}) == ["add", "mul"] and all(r["passed"] for r in out)
+    assert len(calls) == 2
+    monkeypatch.setenv("FULLCYCLE_REGRESSION_CHECKS", "0")
+    assert e._regression_checks(probe) == []
