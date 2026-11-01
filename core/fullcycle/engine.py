@@ -817,6 +817,10 @@ class Engine:
         if obs.state == DONE:
             # the stalled attempt finished after all: drop the resend, verify its result
             self._set(task, redispatch=0, last_reason="late_result_after_stall")
+            if task["state"] != tc.WORKING:
+                # e.g. BLOCKED at the attempt limit and resumed by the owner: back to
+                # WORKING, so the next poll collects and verifies that result (F1)
+                self._move(task, tc.WORKING, evidence={"late_result_after_stall": attempt - 1})
             self._note("late_result_after_stall", task=task["key"], attempt=attempt - 1)
             return False
         quiet = True if obs.state == CRASHED else self.adapter.quiescent(prev)

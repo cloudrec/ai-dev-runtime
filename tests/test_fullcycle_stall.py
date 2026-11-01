@@ -309,3 +309,23 @@ def test_live_adapter_quiescent_is_unknown_when_status_fails():
 def test_the_base_adapter_never_claims_idle():
     from core.fullcycle.executor import ExecutorAdapter
     assert ExecutorAdapter.quiescent(None, {}) is None
+
+
+# ── F1: a late result found by the fence after the attempt limit is verified ────────
+def test_f1_late_result_after_limit_and_owner_resume_is_verified(fc):
+    from core.control_plane import api as cp
+    e, a, log, root, clock = _hung_add(fc, {"add": ["hang"]}, max_attempts=1)
+    clock.offset = HOUR2 + 1
+    e.tick()
+    _answer(e, "answer")                                 # at the limit → owner gate
+    e.tick()
+    t = _task(e, "add")
+    assert t["state"] == tc.BLOCKED and t["last_reason"].startswith("max_attempts_1:stalled")
+    _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
+    cp.answer_gate(t["gate_id"], "resume")
+    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
+               timeout=30)
+    assert _state(st, "add")["attempt"] == 1             # the stalled attempt's own result
+    assert [x["task_id"] for x in h.agent_log(log)].count("tinycalc:add") == 1   # never resent
+    hist = [x["to"] for x in tc.history(_task(e, "add")["contract_id"])]
+    assert hist[-4:] == [tc.WORKING, tc.AGENT_DONE, tc.VERIFYING, tc.VERIFIED_DONE]
