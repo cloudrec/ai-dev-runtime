@@ -571,3 +571,34 @@ def test_a_fallback_job_records_no_salvage_artifact(tmp_path, monkeypatch):
     final = job_store.get_job(job["id"])
     assert final["status"] == "fallback_plan_only"
     assert not any(a.get("planner_salvaged_after_timeout") for a in (final["artifacts"] or []))
+
+
+# ── job #136: a pseudo tool call is not a plan ───────────────────────────────
+# Raw planner output of job 703f780d (task 326): with tools disabled the model wrote
+# a tool call in prose. The first JSON object was the tool's arguments, so the job
+# failed as "plan missing 'files' list" — indistinguishable from a broken plan.
+_JOB136_RAW = (
+    "Let me investigate the actual code before proposing changes.\n\n---\n\n"
+    "**Tool: bash**\n\n```json\n{\n  \"command\": \"cd /root/ai-dev-runtime && git log "
+    "--oneline -15\",\n  \"description\": \"Check recent history\"\n}\n```\n"
+)
+
+
+def test_a_pseudo_tool_call_is_reported_as_one_not_as_a_broken_plan():
+    with pytest.raises(ai_planner.PlannerError) as ei:
+        ai_planner._extract_json(_JOB136_RAW)
+    assert "tool call" in str(ei.value)
+
+
+def test_the_plan_object_wins_over_an_earlier_non_plan_object():
+    text = ('Context:\n```json\n{"note": "example", "n": 1}\n```\n\n'
+            '```json\n{"summary": "s", "files": [{"path": "a.py", "operation": "create", '
+            '"content": "x = 1\\n"}]}\n```')
+    obj = ai_planner._extract_json(text)
+    assert obj["summary"] == "s" and obj["files"][0]["path"] == "a.py"
+
+
+def test_a_lone_non_plan_object_still_fails_as_missing_files():
+    obj = ai_planner._extract_json('{"summary": "s"}')
+    with pytest.raises(ai_planner.PlannerError, match="plan missing 'files' list"):
+        ai_planner._validate(obj, [])

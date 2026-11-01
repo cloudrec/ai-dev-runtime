@@ -84,3 +84,19 @@ Branch-only commit; `git revert <sha>` or `git reset --keep 9557004`. Nothing li
 2. Next safe item meanwhile: planner `files`-missing → fallback no-op (diagnose why the planner
    output lacked `files` for task 326; make the job fail as "planner failed" rather than run a no-op plan + full suite).
 3. Independent review of this diff before any promotion to live.
+
+## 7. Stage 2 — planner "files missing" on job #136 (fixed)
+
+Raw planner output (jobs.plan.raw_planner_response, task 326): with `--tools ""` the model
+wrote a pseudo tool call in prose (`**Tool: bash**` + `{"command": "cd /root/ai-dev-runtime && git log ..."}`).
+`_extract_json` returned that first JSON object → `plan missing 'files' list` → fallback no-op plan.
+
+Fix (`core/ai_planner.py`): collect all candidate objects (fences, then prose); the one with a
+`files` list wins over earlier non-plan objects; if none and the first is tool-argument-shaped,
+raise `planner emitted a tool call instead of a plan`. Fallback flow unchanged
+(`fallback_plan_only` still never resolves to completed). 3 tests in tests/test_planner_fallback.py.
+Full suite: 4217 passed, 4 skipped, 0 failed.
+
+Open (tech lead): task-shaped instructions ("investigate first") push the tools-less planner to
+attempt exploration; options = context-pack in prompt / explicit "no tools, output JSON only" footer /
+route such tasks to an agent pane instead of the runtime planner.

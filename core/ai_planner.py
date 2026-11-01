@@ -87,9 +87,9 @@ Rules: use relative paths only; never touch .env, keys, secrets, credentials, or
 Prefer small, isolated, well-tested changes. For create/replace include the COMPLETE file content."""
 
 
-def _first_json_object(text: str) -> dict | None:
-    """Return the first *balanced, parseable* top-level JSON object in `text`,
-    or None. Brace-matches while respecting string literals/escapes so braces
+def _json_objects(text: str):
+    """Yield every *balanced, parseable* top-level JSON object in `text`, in order.
+    Brace-matches while respecting string literals/escapes so braces
     inside string values don't throw off the depth count, and tries json.loads
     on each complete top-level {...} — tolerating leading/trailing prose without
     a greedy `\\{.*\\}` grabbing an unparseable span from first '{' to last '}'."""
@@ -122,9 +122,19 @@ def _first_json_object(text: str) -> dict | None:
                         start = -1
                         continue
                     if isinstance(obj, dict):
-                        return obj
+                        yield obj
                     start = -1
-    return None
+
+
+#: Argument keys of the CLI's own tools. With `--tools ""` a task-shaped prompt can
+#: still make the model *write* a tool call in prose ("**Tool: bash**" + its JSON
+#: arguments). Job 703f780d (task 326) failed that way as "plan missing 'files'
+#: list", which read like a broken plan rather than a planner that never planned.
+_TOOL_CALL_KEYS = frozenset({"command", "file_path", "pattern", "url", "query"})
+
+
+def _looks_like_tool_call(obj: dict) -> bool:
+    return "files" not in obj and "summary" not in obj and bool(_TOOL_CALL_KEYS & set(obj))
 
 
 def _extract_json(text: str) -> dict:
@@ -143,15 +153,21 @@ def _extract_json(text: str) -> dict:
             return obj
     except json.JSONDecodeError:
         pass
-    # 2) fenced code block(s) — try each fence's body first
+    # 2) fenced code block(s), then 3) balanced objects anywhere in the prose.
+    # The object that carries a `files` list is the plan; an earlier example or
+    # tool-argument object must not shadow it. Without one, keep the first object
+    # so validation reports what was actually returned.
+    candidates: list[dict] = []
     for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE):
-        obj = _first_json_object(m.group(1))
-        if obj is not None:
+        candidates.extend(_json_objects(m.group(1)))
+    candidates.extend(_json_objects(text))
+    for obj in candidates:
+        if "files" in obj:
             return obj
-    # 3) first balanced JSON object anywhere in surrounding prose
-    obj = _first_json_object(text)
-    if obj is not None:
-        return obj
+    if candidates:
+        if _looks_like_tool_call(candidates[0]):
+            raise PlannerError("planner emitted a tool call instead of a plan")
+        return candidates[0]
     if "{" in text and "}" in text:
         raise PlannerError("malformed planner JSON")
     raise PlannerError("model did not return JSON")
