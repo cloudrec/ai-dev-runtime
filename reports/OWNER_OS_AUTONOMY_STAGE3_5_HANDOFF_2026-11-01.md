@@ -104,6 +104,8 @@ Detail is in `reports/OWNER_OS_AUTONOMY_STAGE5_G1_D1_D2_2026-11-01.md` §1.
   - Outcome: the task stays BLOCKED forever and the late result is never verified. No double send.
   - The fix needs tech-lead approval.
 
+## Stage 8 — F1 fixed in `e9afad4` (full suite 4310 passed, 4 skipped, 0 failed). Canonical entry is now `reports/OWNER_OS_AUTONOMY_STAGE8_F1_HANDOFF_2026-11-01.md`. PROD: NO-GO.
+
 ## Next
 1. Independent review (above).
 2. Tech lead resolves the open items.

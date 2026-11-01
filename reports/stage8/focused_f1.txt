@@ -1,0 +1,41 @@
+base sha: e9afad4317312984a0e466829eead0b497ec49ed (F1 fix committed; run was on identical content before commit)
+cmd: python3 -m pytest -q -p no:cacheprovider tests/test_agent_context_budget.py tests/test_agent_watch.py tests/test_agent_watch_crash_false_positive.py tests/test_agent_watch_parked_agent.py tests/test_agent_watch_rename_not_crash.py tests/test_agent_watch_scheduled_park.py tests/test_agent_watcher.py tests/test_autonomy_cycle_e2e.py tests/test_context_budget.py tests/test_fullcycle_api.py tests/test_fullcycle_context.py tests/test_fullcycle_e2e.py tests/test_fullcycle_executor_contract.py tests/test_fullcycle_review_findings.py tests/test_fullcycle_settled.py tests/test_fullcycle_spec_gates.py tests/test_fullcycle_stall.py tests/test_task_contract.py 
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: /opt/owneros-autonomy
+configfile: pytest.ini
+plugins: cov-7.1.0, anyio-4.14.1, asyncio-1.4.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 458 items
+
+tests/test_agent_context_budget.py ..................................... [  8%]
+..........................                                               [ 13%]
+tests/test_agent_watch.py .............................................. [ 23%]
+..............................                                           [ 30%]
+tests/test_agent_watch_crash_false_positive.py ......................    [ 35%]
+tests/test_agent_watch_parked_agent.py ..............                    [ 38%]
+tests/test_agent_watch_rename_not_crash.py ............                  [ 40%]
+tests/test_agent_watch_scheduled_park.py ............................... [ 47%]
+.........................                                                [ 53%]
+tests/test_agent_watcher.py ..................                           [ 56%]
+tests/test_autonomy_cycle_e2e.py .......                                 [ 58%]
+tests/test_context_budget.py ...................                         [ 62%]
+tests/test_fullcycle_api.py ....                                         [ 63%]
+tests/test_fullcycle_context.py ............................             [ 69%]
+tests/test_fullcycle_e2e.py ........................                     [ 74%]
+tests/test_fullcycle_executor_contract.py .........                      [ 76%]
+tests/test_fullcycle_review_findings.py ................................ [ 83%]
+                                                                         [ 83%]
+tests/test_fullcycle_settled.py ......................                   [ 88%]
+tests/test_fullcycle_spec_gates.py ................                      [ 92%]
+tests/test_fullcycle_stall.py .......................                    [ 97%]
+tests/test_task_contract.py .............                                [100%]
+
+=============================== warnings summary ===============================
+../../root/ai-dev-runtime/venv/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /root/ai-dev-runtime/venv/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+================== 458 passed, 1 warning in 87.24s (0:01:27) ===================
+exit=0
