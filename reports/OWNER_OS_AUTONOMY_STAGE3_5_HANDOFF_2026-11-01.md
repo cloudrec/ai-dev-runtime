@@ -97,6 +97,13 @@ Detail is in `reports/OWNER_OS_AUTONOMY_STAGE5_G1_D1_D2_2026-11-01.md` §1.
   - CDP is listening but was not contacted.
 - A real ChatGPT E2E is **blocked at owner gates**: review → promotion → canary route binding. Not simulated; not claimed.
 
+## Stage 7 review packet — `reports/OWNER_OS_AUTONOMY_STAGE7_REVIEW_PACKET_2026-11-01.md`
+- The 7 review questions now have exact line references.
+- **New author finding F1 (CONFIRMED by a throwaway probe, not fixed):**
+  - Sequence: a stall is answered when the task is already at max_attempts → owner "resume" → late result arrives.
+  - Outcome: the task stays BLOCKED forever and the late result is never verified. No double send.
+  - The fix needs tech-lead approval.
+
 ## Next
 1. Independent review (above).
 2. Tech lead resolves the open items.
