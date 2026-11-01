@@ -1,0 +1,101 @@
+diff --git a/core/fullcycle/engine.py b/core/fullcycle/engine.py
+index 02e4ebf..09e4942 100644
+--- a/core/fullcycle/engine.py
++++ b/core/fullcycle/engine.py
+@@ -414,8 +414,35 @@ class Engine:
+                 return "dirty_worktree:" + ",".join(dirty[:5])
+         return None
+ 
++    # A task refused at dispatch for a reason of ITS OWN (an untrusted check, a push or
++    # deploy power) that never reached the agent is "parked": nothing of it is in the tree
++    # and the agent is idle, so it must not hold up independent tasks. Project-wide
++    # refusals (root, executor, dirty tree) and anything that reached the agent are not.
++    _TASK_SCOPED_REFUSALS = ("permission_denied:check_", "permission_denied:push_requires_owner",
++                             "permission_denied:deploy_requires_owner")
++
++    def _parked(self, task: dict) -> bool:
++        # (a resumed one keeps this status, with its intent pending, until a send is
++        # recorded: so it waits for the task in flight and that task never waits for it)
++        if task["state"] != tc.OWNER_DECISION:
++            return False
++        if not str(task["last_reason"] or "").startswith(self._TASK_SCOPED_REFUSALS):
++            return False
++        return not self.conn.execute(          # any dispatch record = may have reached it
++            "SELECT 1 FROM fc_dispatch WHERE task_id=?", (task["id"],)).fetchone()
++
++    def _in_flight(self, task: dict) -> bool:
++        return (task["state"] not in tc.TERMINAL and task["state"] != tc.CREATED
++                and not self._parked(task))
++
+     def _try_dispatch(self, task: dict) -> bool:
+         attempt = task["redispatch"]
++        others = [t["key"] for t in self._tasks() if t["id"] != task["id"] and self._in_flight(t)]
++        if others:
++            # single executor: a resumed parked task waits for the task in flight; the
++            # intent (redispatch) stays and is carried out by a later tick
++            self._note("dispatch_waiting_for_other_task", task=task["key"], others=others)
++            return False
+         refusal = self._refusal(task, attempt)
+         if refusal:
+             self._set(task, redispatch=0)
+@@ -558,14 +585,37 @@ class Engine:
+         violations = gates.check_changes(changed, scope=c["scope"],
+                                          do_not_touch=c["do_not_touch"])
+         checks = self._run_checks(task["body"]["checks"], trusted=self._trusted(task))
+-        passed = not violations and bool(checks) and all(x["passed"] for x in checks)
++        regression = self._regression_checks(task)
++        passed = (not violations and bool(checks) and all(x["passed"] for x in checks)
++                  and all(r["passed"] for r in regression))
+         reasons = violations + [f"check_failed:{' '.join(x['argv'])}"
+                                 for x in checks if not x["passed"]]
++        reasons += [f"regression:{r['task']}:{' '.join(r['argv'])}"
++                    for r in regression if not r["passed"]]
+         if not checks:
+             reasons.append("task_has_no_checks")
+         return {"attempt": task["attempt"], "passed": passed, "changed_files": changed,
+                 "changed_source": source, "violations": violations, "checks": checks,
+-                "reasons": reasons, "summary": result.get("summary", "")}
++                "regression": regression, "reasons": reasons,
++                "summary": result.get("summary", "")}
++
++    def _regression_checks(self, task: dict) -> list:
++        """The checks of every task already VERIFIED_DONE, re-run on this task's tree: a
++        task that breaks earlier verified work fails its own verification (and is told
++        which task and check it broke) instead of reaching review. Each check keeps the
++        trust of the task that owns it. FULLCYCLE_REGRESSION_CHECKS=0 turns this off."""
++        if os.getenv("FULLCYCLE_REGRESSION_CHECKS", "1") == "0":
++            return []
++        out = []
++        for t in self._tasks():
++            if t["id"] == task["id"] or t["state"] != tc.VERIFIED_DONE:
++                continue
++            # LEASE_TTL covers one task's checks, not the whole project's: renew per task
++            # (LeaseLost leaves the task VERIFYING; the next holder re-verifies)
++            self._lead()
++            for x in self._run_checks(t["body"]["checks"], trusted=self._trusted(t)):
++                out.append({"task": t["key"], **x})
++        return out
+ 
+     def _restore_violations(self, v: dict) -> list:
+         """A tracked file the task may not touch is put back as it was at HEAD; left in
+@@ -600,6 +650,11 @@ class Engine:
+             for x in v["checks"]:
+                 if not x["passed"]:
+                     feedback += f"\n$ {' '.join(x['argv'])} (rc={x['rc']})\n{x['output'][-800:]}"
++            for x in v.get("regression", []):
++                if not x["passed"]:
++                    feedback += (f"\nYour change broke the already verified task "
++                                 f"'{x['task']}':\n$ {' '.join(x['argv'])} (rc={x['rc']})\n"
++                                 f"{x['output'][-800:]}")
+             self._set(task, verification=v, feedback=feedback[:4000])
+             self._retry(task, why="verification_failed")
+             return
+@@ -862,7 +917,7 @@ class Engine:
+ 
+     def _next_task(self, tasks: list) -> None:
+         """Single executor: the next task starts only when nothing else is in flight."""
+-        if any(t["state"] not in tc.TERMINAL and t["state"] != tc.CREATED for t in tasks):
++        if any(self._in_flight(t) for t in tasks):
+             return
+         state = {t["key"]: t["state"] for t in tasks}
+         for t in tasks:

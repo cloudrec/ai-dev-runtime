@@ -1,0 +1,122 @@
+diff --git a/tests/test_fullcycle_e2e.py b/tests/test_fullcycle_e2e.py
+index ec2300d..94019e4 100644
+--- a/tests/test_fullcycle_e2e.py
++++ b/tests/test_fullcycle_e2e.py
+@@ -292,3 +292,117 @@ def test_a_second_engine_cannot_run_the_project_while_the_lease_is_held(fc):
+     late = fe.Engine("tinycalc", a, holder="e2", clock=lambda: 10 ** 10)
+     r = late.tick()
+     assert "skipped" not in r and r["fence"] >= 2
++
++
++# ── an owner gate on ONE task parks only that task ─────────────────────────────
++# A reviewer-added task whose check is not a test runner is refused at dispatch
++# (gates.check_argv) and waits for the owner. It never reached the agent, so nothing of
++# it is in the tree: independent tasks go on; only it (and anything depending on it) waits.
++RISKY_TASK = {"key": "risky", "title": "Fetch something", "goal": "Needs a network check.",
++              "acceptance_criteria": ["the URL answers"],
++              "checks": [["curl", "-sf", "http://example.invalid/"]]}
++
++
++def _with_risky(spec=None):
++    import copy
++    s = copy.deepcopy(spec or h.load_spec())
++    s["tasks"].insert(1, dict(RISKY_TASK))       # add, risky, mul (mul depends on add only)
++    specs.put_spec("tinycalc", s, by="review:gpt")
++
++
++def test_a_hazardous_task_gate_parks_only_that_task(fc):
++    e, a, log, root = fc()
++    _with_risky()
++    st = h.run(e, h.StubReviewer(),
++               until=lambda s: _state(s, "mul")["state"] == tc.VERIFIED_DONE, timeout=40)
++    assert _state(st, "risky")["state"] == tc.OWNER_DECISION
++    assert _state(st, "risky")["last_reason"] == "permission_denied:check_runner_not_allowed:curl"
++    assert _state(st, "add")["state"] == tc.VERIFIED_DONE
++    assert [x["task_id"] for x in h.agent_log(log)] == ["tinycalc:add", "tinycalc:mul"]
++    owner = _events(fe.OWNER_EVENT)
++    assert len(owner) == 1 and "risky" in owner[0][2]          # one gate, on the risky task
++    assert not st["done"]                                     # the project is not done...
++    for _ in range(3):
++        e.tick()
++    assert len(_events(fe.OWNER_EVENT)) == 1                   # ...and nothing re-fires
++
++    # the owner cancels the hazardous task: the rest of the project completes
++    t = next(t for t in e._tasks() if t["key"] == "risky")
++    cp.answer_gate(t["gate_id"], "cancel")
++    st = h.run(e, h.StubReviewer(next_tasks={"__project__": [h.CLI_TASK]}), until=DONE,
++               timeout=40)
++    assert _state(st, "risky")["state"] == tc.CANCELLED
++    assert "tinycalc:risky" not in [x["task_id"] for x in h.agent_log(log)]
++
++
++def test_a_dependent_of_a_parked_task_still_waits(fc):
++    e, a, log, root = fc()
++    import copy
++    s = copy.deepcopy(h.load_spec())
++    s["tasks"][1]["depends_on"] = ["add", "risky"]            # mul now needs risky too
++    _with_risky(s)
++    h.run(e, h.StubReviewer(),
++          until=lambda s: _state(s, "risky")["state"] == tc.OWNER_DECISION, timeout=30)
++    for _ in range(5):
++        e.tick()
++    st = e.status()
++    assert _state(st, "mul")["state"] == tc.CREATED
++    assert [x["task_id"] for x in h.agent_log(log)] == ["tinycalc:add"]
++
++
++def test_a_resumed_parked_task_waits_for_the_task_in_flight(fc, monkeypatch):
++    e, a, log, root = fc({"mul": ["hang"]})
++    _with_risky()
++    h.run(e, h.StubReviewer(),
++          until=lambda s: _state(s, "mul")["state"] == tc.WORKING, timeout=30)
++    assert _state(e.status(), "risky")["state"] == tc.OWNER_DECISION
++    # the owner lifts the hazard (simulated: the gate no longer refuses) and resumes
++    real = fe.gates.check_dispatch
++    monkeypatch.setattr(fe.gates, "check_dispatch",
++                        lambda **kw: None if kw.get("trusted_checks") is False else real(**kw))
++    t = next(t for t in e._tasks() if t["key"] == "risky")
++    cp.answer_gate(t["gate_id"], "resume")
++    for _ in range(3):
++        e.tick()
++    risky = next(t for t in e._tasks() if t["key"] == "risky")
++    assert risky["redispatch"] == 1                            # the intent is kept...
++    assert "tinycalc:risky" not in [x["task_id"] for x in h.agent_log(log)]   # ...not sent
++    assert _state(e.status(), "mul")["state"] == tc.WORKING
++
++
++# ── failed QA → specific repair → regression ─────────────────────────────────
++def test_a_task_that_breaks_an_earlier_verified_task_is_repaired_before_review(fc, monkeypatch):
++    # mul's first attempt is right for mul but breaks add (already verified and committed)
++    monkeypatch.setitem(h.BROKEN, "mul", {"tinycalc/mul.py": h.SOLUTIONS["mul"]["tinycalc/mul.py"],
++                                          "tinycalc/add.py": h.BROKEN["add"]["tinycalc/add.py"]})
++    monkeypatch.setitem(h.SOLUTIONS, "mul", {**h.SOLUTIONS["mul"], **h.SOLUTIONS["add"]})
++    e, a, log, root = fc({"mul": ["wrong", "correct"]})
++    rv = h.StubReviewer()
++    st = h.run(e, rv, until=lambda s: _state(s, "mul")["state"] == tc.VERIFIED_DONE, timeout=40)
++    assert _state(st, "mul")["attempt"] == 2
++    # the regression never reached the reviewer: one review per task, the repaired one
++    assert [(s["key"], s["choice"]) for s in rv.seen if s["key"] != "__project__"] == [
++        ("add", "approve"), ("mul", "approve")]
++    fb = [x for x in h.agent_log(log) if x["task_id"] == "tinycalc:mul"][1]["feedback"]
++    assert "regression:add:" in fb                       # names the task it broke...
++    assert "assert add(2, 3) == 5" in fb                 # ...and the failing check
++    t = next(t for t in e._tasks() if t["key"] == "mul")
++    failed = [h_["evidence"]["verification"] for h_ in tc.history(t["contract_id"])
++              if h_["to"] == tc.VERIFICATION_FAILED][0]
++    assert [r["task"] for r in failed["regression"]] == ["add"]
++    assert not failed["regression"][0]["passed"]
++
++
++def test_the_regression_gate_renews_the_lease_per_verified_task(fc, monkeypatch):
++    e, a, log, root = fc()
++    h.run(e, h.StubReviewer(), until=lambda s: _state(s, "mul")["state"] == tc.VERIFIED_DONE,
++          timeout=40)
++    calls = []
++    real = e._lead
++    monkeypatch.setattr(e, "_lead", lambda: calls.append(1) or real())
++    probe = {"id": "tinycalc:probe"}
++    out = e._regression_checks(probe)
++    assert sorted({r["task"] for r in out}) == ["add", "mul"] and all(r["passed"] for r in out)
++    assert len(calls) == 2
++    monkeypatch.setenv("FULLCYCLE_REGRESSION_CHECKS", "0")
++    assert e._regression_checks(probe) == []
