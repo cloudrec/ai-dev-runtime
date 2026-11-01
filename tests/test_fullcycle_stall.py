@@ -412,3 +412,88 @@ def test_a_late_result_of_an_older_attempt_supersedes_nothing(fc):
     for _ in range(3):
         e.tick()
     assert _stall_status(e)[0] == "pending"
+
+
+# ── a crash after a stall alert: the crash path escalates; the alert is retired ────
+def _crash(monkeypatch, a):
+    from core.fullcycle.executor import CRASHED
+    monkeypatch.setattr(a, "poll", lambda handle: Observation(CRASHED, {"pane": "dead"}))
+
+
+def _stall_row(e):
+    (row,) = _all_stall_rows(e)
+    return e.conn.execute("SELECT id, status, decision_body FROM fc_review WHERE id=?",
+                          (row[0],)).fetchone()
+
+
+def test_crash_after_alert_unowned_goes_to_owner_and_retires_the_alert(fc, monkeypatch):
+    e, a, log, root, clock = _hung_add(fc)
+    clock.offset = HOUR2 + 1
+    e.tick()
+    rid = _stall_row(e)[0]
+    monkeypatch.setattr(type(a), "owns_agent", False)
+    _crash(monkeypatch, a)
+    e.tick()
+    t = _task(e, "add")
+    assert t["state"] == tc.BLOCKED and t["last_reason"] == "agent_crashed_not_owned" and t["gate_id"]
+    assert len(_events(fe.OWNER_EVENT)) == 1                 # correct crash escalation
+    _, status, body = _stall_row(e)
+    assert status == "superseded" and json.loads(body)["reason"] == "crashed"
+    # the tech lead's answer to the old alert cannot bypass the owner gate
+    r = fe.submit_decision(rid, "answer", key="late", by="stub-gpt", feedback="retry")
+    assert not r["ok"] and r["reason"] == "review_superseded"
+    for _ in range(3):
+        e.tick()
+    t = _task(e, "add")
+    assert t["state"] == tc.BLOCKED and t["gate_id"] and len(h.agent_log(log)) == 1
+
+
+def test_a_stall_answer_never_bypasses_a_crash_owner_gate(fc, monkeypatch):
+    # decided by the tech lead in the same instant the crash is observed: the engine
+    # sees the crash first only if the decision is not yet recorded — force the order
+    e, a, log, root, clock = _hung_add(fc)
+    clock.offset = HOUR2 + 1
+    e.tick()
+    rid = _stall_row(e)[0]
+    monkeypatch.setattr(type(a), "owns_agent", False)
+    t = _task(e, "add")
+    e._block_for_owner(t, "agent_crashed_not_owned")          # crash path already ran
+    fe.ack_review(rid, by="stub-gpt")
+    assert fe.submit_decision(rid, "answer", key="race", by="stub-gpt", feedback="go")["ok"]
+    for _ in range(3):
+        e.tick()
+    t = _task(e, "add")
+    assert t["state"] == tc.BLOCKED and t["gate_id"]          # still the owner's
+    assert len(h.agent_log(log)) == 1                          # nothing resent
+
+
+def test_crash_after_alert_owned_recovers_once_and_retires_the_alert(fc, monkeypatch):
+    e, a, log, root, clock = _hung_add(fc)
+    clock.offset = HOUR2 + 1
+    e.tick()
+    real_poll = type(a).poll
+    calls = {"n": 0}
+    from core.fullcycle.executor import CRASHED
+
+    def crash_once(handle):
+        calls["n"] += 1
+        return Observation(CRASHED, {}) if calls["n"] == 1 else real_poll(a, handle)
+    monkeypatch.setattr(a, "poll", crash_once)
+    monkeypatch.setattr(a, "restart", lambda handle: {"ok": True, "how": "test"})
+    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
+               timeout=30)
+    assert _state(st, "add")["attempt"] == 2
+    assert _stall_row(e)[1] == "superseded"
+    assert [x["attempt"] for x in h.agent_log(log) if x["task_id"] == "tinycalc:add"] == [1, 2]
+
+
+def test_crash_after_alert_at_the_limit_goes_to_owner(fc, monkeypatch):
+    e, a, log, root, clock = _hung_add(fc, {"add": ["hang"]}, max_attempts=1)
+    clock.offset = HOUR2 + 1
+    e.tick()
+    _crash(monkeypatch, a)
+    e.tick()
+    t = _task(e, "add")
+    assert t["state"] == tc.BLOCKED and t["last_reason"] == "max_attempts_1_after_crash"
+    assert _stall_row(e)[1] == "superseded"
+    assert len(h.agent_log(log)) == 1

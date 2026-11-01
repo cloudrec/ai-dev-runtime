@@ -787,7 +787,7 @@ class Engine:
                               (self.project_id, task["id"], attempt)).fetchone()
         return json.loads(r[0] or "{}") if r else {}
 
-    def _supersede_stall(self, task: dict) -> None:
+    def _supersede_stall(self, task: dict, reason: str = "late_result") -> None:
         """The attempt a still-pending stall alert was about delivered a result after all:
         the alert no longer needs an answer. It is marked `superseded` (not decided, not
         applied), so it leaves the inbox, its undelivered wake retires
@@ -799,11 +799,12 @@ class Engine:
         cur = self.conn.execute(
             "UPDATE fc_review SET status='superseded', decided_by='engine', decided_ts=?,"
             " decision_body=? WHERE id=? AND status='pending'",
-            (self.clock(), _j({"reason": "late_result", "attempt": task["attempt"]}),
+            (self.clock(), _j({"reason": reason, "attempt": task["attempt"]}),
              stall["id"]))
         self.conn.commit()
         if cur.rowcount == 1:
-            self._note("stall_alert_superseded", task=task["key"], review_id=stall["id"])
+            self._note("stall_alert_superseded", task=task["key"], review_id=stall["id"],
+                       reason=reason)
 
     def _sent_ts(self, task: dict) -> Optional[float]:
         r = self.conn.execute("SELECT ts FROM fc_dispatch WHERE idem_key=? AND status='sent'",
@@ -911,6 +912,9 @@ class Engine:
         elif obs.state == CRASHED:
             self._note("agent_crashed", task=task["key"], attempt=task["attempt"],
                        detail=obs.detail)
+            # the crash path below decides what happens next (restart or owner gate): a
+            # pending stall alert about this attempt is answered by the crash itself
+            self._supersede_stall(task, reason="crashed")
             if not self.adapter.owns_agent:
                 self._block_for_owner(task, "agent_crashed_not_owned")
                 return
@@ -998,7 +1002,10 @@ class Engine:
                                      "(e.g. /clear at a safe boundary), then answer resume."})
                 else:
                     self._move(task, tc.CANCELLED, evidence={"review": review})
-            elif kind == "blocked" and task["state"] == tc.BLOCKED:
+            elif kind == "blocked" and task["state"] == tc.BLOCKED and \
+                    not self._stall_review(task, attempt):
+                # (a pure stall alert answered for a task that is BLOCKED meanwhile — e.g.
+                # by a crash owner gate — is stale: it must never resend past that gate)
                 if decision == "answer":
                     self._retry(task, why="blocked_answered",
                                 feedback="Answer from the tech lead: " + review["feedback"])
