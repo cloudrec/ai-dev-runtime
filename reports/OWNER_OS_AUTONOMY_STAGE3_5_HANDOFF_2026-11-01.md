@@ -3,7 +3,7 @@
 All direction was automated Owner OS API instructions (ChatGPT tech lead). **Nothing here is owner approval.**
 This file supersedes `OWNER_OS_AUTONOMY_STAGE3_4_HANDOFF_2026-11-01.md` as the entry point.
 
-## State
+## State (HEAD after Stage 6 docs: see `git log -1`; code unchanged since bf38344)
 - Worktree `/opt/owneros-autonomy`, branch `owneros/autonomy-finish`. Base `9557004` = live.
 - **PROD unchanged.** No push, merge or deploy. No change to grants, secrets, the global DB, the live browser, tmux or other sessions.
 - Code SHAs:
@@ -86,6 +86,16 @@ Detail is in `reports/OWNER_OS_AUTONOMY_STAGE5_G1_D1_D2_2026-11-01.md` §1.
 **Out of scope:** policy changes to grants, owner gates, timeouts.
 
 **Expected output:** CONFIRMED / PLAUSIBLE / REJECTED per question, with file:line.
+
+## Stage 6 (isolated rehearsal + preflight) — `reports/OWNER_OS_AUTONOMY_STAGE6_REHEARSAL_2026-11-01.md`
+- Rehearsal `tests/test_autonomy_cycle_e2e.py` at code bf38344: **7 passed, exit 0**. Evidence is in `reports/stage6/rehearsal_autonomy_cycle_b968696.txt`.
+- Mocked: the agent, the ChatGPT page (fake CDP) and the reviewer. Everything else in the loop is real code, running on temp DBs and private tmux.
+- Live preflight (read-only):
+  - live tree at `9557004`, dirty;
+  - live does not contain the branch code;
+  - companion, chromium and fullcycle-worker are active;
+  - CDP is listening but was not contacted.
+- A real ChatGPT E2E is **blocked at owner gates**: review → promotion → canary route binding. Not simulated; not claimed.
 
 ## Next
 1. Independent review (above).

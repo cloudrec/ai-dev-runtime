@@ -1,0 +1,22 @@
+sha: b968696363de7eca0e8cc99126b7ccb41e9698ca
+code sha: bf3834419fa0c11c0f27a7b1e59e60c009785564
+cmd: python3 -m pytest -v -p no:cacheprovider tests/test_autonomy_cycle_e2e.py
+env: CONTROL_PLANE_DB/AGENT_CONTROL_DB/runtime DBs = per-test temp (tests/conftest.py); tmux = private socket; 127.0.0.1:9222 walled; TELEGRAM_* unset
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /root/ai-dev-runtime/venv/bin/python3
+rootdir: /opt/owneros-autonomy
+configfile: pytest.ini
+plugins: cov-7.1.0, anyio-4.14.1, asyncio-1.4.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 7 items
+
+tests/test_autonomy_cycle_e2e.py::test_spec_to_done_every_review_reaches_the_project_chat_verified PASSED [ 14%]
+tests/test_autonomy_cycle_e2e.py::test_a_failed_delivery_is_retried_and_the_review_waits_for_it PASSED [ 28%]
+tests/test_autonomy_cycle_e2e.py::test_a_restarted_companion_never_redelivers_an_acknowledged_wake PASSED [ 42%]
+tests/test_autonomy_cycle_e2e.py::test_a_taken_but_unverified_wake_is_never_resent_and_its_watch_is_bounded PASSED [ 57%]
+tests/test_autonomy_cycle_e2e.py::test_stage_done_wakes_the_tech_lead_once_and_is_delivered_verified PASSED [ 71%]
+tests/test_autonomy_cycle_e2e.py::test_stage_done_refuses_an_agent_without_autonomy PASSED [ 85%]
+tests/test_autonomy_cycle_e2e.py::test_a_finished_project_leaves_the_watchdog_quiet PASSED [100%]
+
+============================== 7 passed in 16.26s ==============================
+exit=0
