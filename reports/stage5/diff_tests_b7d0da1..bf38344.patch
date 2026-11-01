@@ -1,0 +1,738 @@
+diff --git a/tests/fixtures/fullcycle_demo/fake_agent.py b/tests/fixtures/fullcycle_demo/fake_agent.py
+index 5718123..1cbfa91 100644
+--- a/tests/fixtures/fullcycle_demo/fake_agent.py
++++ b/tests/fixtures/fullcycle_demo/fake_agent.py
+@@ -11,6 +11,7 @@ that task key and attempt:
+   permission    print a Claude-style permission dialog, wait for "1", then do `correct`
+   blocked       report blocked with a question
+   hang          do nothing (stays "working")
++  exhausted     report context_exhausted with a compact handoff
+ 
+ Scenario JSON (path in $FULLCYCLE_FAKE_SCENARIO):
+   {"behaviours": {"<key>": ["crash", "correct"]},       # per attempt; last repeats
+@@ -34,9 +35,9 @@ def _write(root, files):
+             fh.write(content)
+ 
+ 
+-def _result(env, status, summary, changed, question=None):
++def _result(env, status, summary, changed, question=None, **extra):
+     r = {"task_id": env["task_id"], "attempt": env["attempt"], "status": status,
+-         "summary": summary, "changed_files": changed}
++         "summary": summary, "changed_files": changed, **extra}
+     if question:
+         r["question"] = question
+     os.makedirs(os.path.dirname(env["result_path"]), exist_ok=True)
+@@ -72,6 +73,10 @@ def main():
+             sys.exit(3)
+         if how == "hang":
+             continue
++        if how == "exhausted":
++            _result(env, "context_exhausted", "out of context", [],
++                    handoff=f"HANDOFF {key}: started, nothing written yet; next: write the file.")
++            continue
+         if how == "blocked":
+             _result(env, "blocked", "need a decision", [], question="Integers only, or floats too?")
+             continue
+diff --git a/tests/fixtures/fullcycle_demo/private_tmux.py b/tests/fixtures/fullcycle_demo/private_tmux.py
+index c998225..041e501 100644
+--- a/tests/fixtures/fullcycle_demo/private_tmux.py
++++ b/tests/fixtures/fullcycle_demo/private_tmux.py
+@@ -126,6 +126,11 @@ class PrivateTmuxAdapter(ExecutorAdapter):
+     def collect(self, handle: dict) -> Optional[dict]:
+         return parse_result(self.host.read_file(handle["result"]), handle)
+ 
++    def quiescent(self, handle: dict) -> Optional[bool]:
++        # the fixture agent handles one envelope at a time from its stdin, so a new
++        # one can never run beside the old one; tests override this to model "active"
++        return True
++
+     def restart(self, handle: dict) -> dict:
+         if self._tmux("has-session", "-t", self.session)[0] != 0:
+             return {**self.ensure_session(), "how": "new_session"}
+diff --git a/tests/test_fullcycle_context.py b/tests/test_fullcycle_context.py
+new file mode 100644
+index 0000000..bba65a6
+--- /dev/null
++++ b/tests/test_fullcycle_context.py
+@@ -0,0 +1,271 @@
++"""D2 — an agent that runs out of context; D2b — no rotation under a running attempt.
++
++D2: the agent ends its attempt with `status: context_exhausted` and a compact handoff.
++The task goes to the tech lead as a "blocked" review carrying the (validated) handoff.
++"answer" continues in a CLEAN session — only after a safe stop; an adapter that owns its
++agent starts that session itself, a live agent's clean session goes through the owner
++gate `clean_session_required` (the engine holds no session-lifecycle grant). Bounded by
++max_attempts. A malformed handoff is reported, never dropped or silently altered.
++
++D2b: core.agent_context_budget never writes a handoff into, or /clears, a pane whose Full
++Cycle attempt may be running (fail closed).
++
++Mocked: the agent (fixture script), the reviewer (driven by hand). Real: engine, tmux,
++git, contracts, the context-budget evaluate() path up to its first side effect.
++"""
++from __future__ import annotations
++
++import json
++import os
++
++import pytest
++
++from core import task_contract as tc
++from core.control_plane import api as cp
++from core.fullcycle import engine as fe
++from core.fullcycle.tmux_adapter import HANDOFF_MAX, clean_handoff, parse_result
++from tests.test_fullcycle_e2e import _events, _state, fc, h  # noqa: F401
++
++
++def _blocked(e):
++    return [r for r in fe.pending_reviews(e.project_id) if r["kind"] == "blocked"]
++
++
++def _answer(e, choice, key="k1", feedback="carry on from the handoff"):
++    (rv,) = _blocked(e)
++    fe.ack_review(rv["review_id"], by="stub-gpt")
++    return fe.submit_decision(rv["review_id"], choice, key=key, by="stub-gpt", feedback=feedback)
++
++
++def _exhausted(fc, behaviours=None, **kw):
++    e, a, log, root = fc(behaviours or {"add": ["exhausted", "correct"]}, **kw)
++    h.wait_for(lambda: e.tick() and _state(e.status(), "add")["state"] == tc.BLOCKED, 15)
++    return e, a, log, root
++
++
++# ── handoff validation (pure) ────────────────────────────────────────────────
++@pytest.mark.parametrize("raw,text,problem", [
++    ("next: write add.py", "next: write add.py", ""),
++    (None, "", "handoff_missing"),
++    (42, "", "handoff_not_text"),
++    (["a"], "", "handoff_not_text"),
++    ("   \n\t ", "", "handoff_empty"),
++    ("ok\x00\x1b[31mred", "ok[31mred", "handoff_control_chars_removed"),
++    ("line1\nline2\tx", "line1\nline2\tx", ""),
++])
++def test_clean_handoff(raw, text, problem):
++    assert clean_handoff(raw) == (text, problem)
++
++
++def test_an_over_long_handoff_is_cut_and_says_so():
++    text, problem = clean_handoff("x" * (HANDOFF_MAX + 50))
++    assert len(text) == HANDOFF_MAX and problem == f"handoff_truncated_to_{HANDOFF_MAX}"
++
++
++def test_parse_result_accepts_context_exhausted_only_for_its_attempt():
++    handle = {"task_id": "p:t", "attempt": 2}
++    r = parse_result(json.dumps({"task_id": "p:t", "attempt": 2, "status": "context_exhausted",
++                                 "summary": "s", "changed_files": [], "handoff": 7}), handle)
++    assert r["status"] == "context_exhausted" and r["handoff_problem"] == "handoff_not_text"
++    assert parse_result(json.dumps({"task_id": "p:t", "attempt": 1,
++                                    "status": "context_exhausted"}), handle) is None
++
++
++# ── the engine path ──────────────────────────────────────────────────────────
++def test_exhaustion_goes_to_the_tech_lead_with_the_handoff(fc):
++    e, a, log, root = _exhausted(fc)
++    (rv,) = _blocked(e)
++    assert rv["payload"]["context_exhausted"] is True
++    assert rv["payload"]["handoff"].startswith("HANDOFF add:")
++    assert rv["payload"]["handoff_problem"] == ""
++    assert _events(fe.OWNER_EVENT) == []                 # routine: not an owner gate
++    for _ in range(3):
++        e.tick()
++    assert len(_blocked(e)) == 1 and len(h.agent_log(log)) == 1
++
++
++def test_answer_continues_in_a_clean_session_with_the_handoff(fc, monkeypatch):
++    e, a, log, root = _exhausted(fc)
++    restarts = []
++    real = a.restart
++    monkeypatch.setattr(a, "restart", lambda handle: restarts.append(handle["attempt"]) or real(handle))
++    _answer(e, "answer")
++    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
++               timeout=30)
++    assert _state(st, "add")["attempt"] == 2
++    assert restarts[:1] == [1]                           # fresh session for attempt 2
++    fb = [x for x in h.agent_log(log) if x["task_id"] == "tinycalc:add"][1]["feedback"]
++    assert "HANDOFF add:" in fb and "carry on from the handoff" in fb
++
++
++def test_no_clean_session_and_no_resend_before_a_safe_stop(fc, monkeypatch):
++    e, a, log, root = _exhausted(fc)
++    quiet = {"v": None}
++    monkeypatch.setattr(a, "quiescent", lambda handle: quiet["v"])
++    monkeypatch.setattr(a, "restart", lambda handle: pytest.fail("restart before a safe stop"))
++    _answer(e, "answer")
++    for _ in range(4):
++        e.tick()
++    assert len(h.agent_log(log)) == 1
++    quiet["v"] = False
++    e.tick()
++    assert len(h.agent_log(log)) == 1
++
++
++def test_a_live_agent_gets_its_clean_session_through_the_owner_gate(fc, monkeypatch):
++    e, a, log, root = _exhausted(fc)
++    monkeypatch.setattr(type(a), "owns_agent", False)
++    monkeypatch.setattr(a, "restart", lambda handle: pytest.fail("the engine never restarts a live agent"))
++    _answer(e, "answer")
++    e.tick()
++    t = next(t for t in e._tasks() if t["key"] == "add")
++    assert t["state"] == tc.OWNER_DECISION and t["last_reason"] == "clean_session_required"
++    (owner_ev,) = _events(fe.OWNER_EVENT)
++    assert "HANDOFF add:" in json.loads(owner_ev[2])["handoff"]
++    assert len(h.agent_log(log)) == 1
++    cp.answer_gate(t["gate_id"], "resume")               # owner: the session is clean
++    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
++               timeout=30)
++    fb = [x for x in h.agent_log(log) if x["task_id"] == "tinycalc:add"][1]["feedback"]
++    assert "HANDOFF add:" in fb
++
++
++def test_a_failed_clean_session_goes_to_the_owner(fc, monkeypatch):
++    e, a, log, root = _exhausted(fc)
++    monkeypatch.setattr(a, "restart", lambda handle: {"ok": False, "reason": "tmux gone"})
++    _answer(e, "answer")
++    e.tick()
++    st = e.status()
++    assert _state(st, "add")["state"] == tc.BLOCKED
++    assert _state(st, "add")["last_reason"] == "clean_session_failed"
++    assert len(h.agent_log(log)) == 1
++
++
++def test_cancel_ends_the_task(fc):
++    e, a, log, root = _exhausted(fc)
++    _answer(e, "cancel", feedback="")
++    e.tick()
++    assert _state(e.status(), "add")["state"] == tc.CANCELLED
++    assert len(h.agent_log(log)) == 1
++
++
++def test_repeated_exhaustion_is_bounded(fc):
++    e, a, log, root = _exhausted(fc, {"add": ["exhausted"]}, max_attempts=2)
++    _answer(e, "answer", key="a1")
++    h.wait_for(lambda: e.tick() and len(_blocked(e)) == 1 and _blocked(e)[0]["attempt"] == 2, 20)
++    _answer(e, "answer", key="a2")
++    e.tick()
++    st = e.status()
++    assert _state(st, "add")["state"] == tc.BLOCKED
++    assert _state(st, "add")["last_reason"] == "max_attempts_2:context_exhausted"
++    assert len(h.agent_log(log)) == 2
++
++
++def test_a_duplicate_decision_continues_once(fc):
++    e, a, log, root = _exhausted(fc)
++    (rv,) = _blocked(e)
++    fe.ack_review(rv["review_id"], by="stub-gpt")
++    for _ in range(2):
++        assert fe.submit_decision(rv["review_id"], "answer", key="dup", by="stub-gpt",
++                                  feedback="go")["ok"]
++    h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
++          timeout=30)
++    assert [x["attempt"] for x in h.agent_log(log) if x["task_id"] == "tinycalc:add"] == [1, 2]
++
++
++@pytest.mark.parametrize("handoff,problem", [(None, "handoff_missing"), ("", "handoff_empty"),
++                                             ({"x": 1}, "handoff_not_text")])
++def test_a_malformed_handoff_still_reaches_the_tech_lead(fc, handoff, problem):
++    e, a, log, root = fc({"add": ["hang"]})
++    h.wait_for(lambda: e.tick() and len(h.agent_log(log)) == 1, 15)
++    path = os.path.join(root, ".fullcycle", "results", "add-1.json")
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    body = {"task_id": "tinycalc:add", "attempt": 1, "status": "context_exhausted",
++            "summary": "s", "changed_files": []}
++    if handoff is not None:
++        body["handoff"] = handoff
++    with open(path, "w") as fh:
++        json.dump(body, fh)
++    e.tick()
++    (rv,) = _blocked(e)
++    assert rv["payload"]["handoff"] == "" and rv["payload"]["handoff_problem"] == problem
++    _answer(e, "answer")
++    h.run(e, h.StubReviewer(), until=lambda s: len(h.agent_log(log)) == 2, timeout=20)
++    assert "(none was provided)" in h.agent_log(log)[1]["feedback"]
++
++
++def test_exhaustion_after_a_stall_alert_uses_the_same_review(fc):
++    e, a, log, root = fc({"add": ["hang"]})
++    h.wait_for(lambda: e.tick() and len(h.agent_log(log)) == 1, 15)
++    base = e.clock
++    e.clock = lambda: base() + fe.ATTEMPT_TIMEOUT + 1
++    e.tick()
++    (stall,) = _blocked(e)
++    assert stall["payload"]["stalled"] == "attempt_timeout"
++    path = os.path.join(root, ".fullcycle", "results", "add-1.json")
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w") as fh:
++        json.dump({"task_id": "tinycalc:add", "attempt": 1, "status": "context_exhausted",
++                   "summary": "s", "changed_files": [], "handoff": "H"}, fh)
++    e.tick()
++    (rv,) = _blocked(e)
++    assert rv["review_id"] == stall["review_id"]
++    assert rv["payload"]["context_exhausted"] and rv["payload"]["handoff"] == "H"
++    assert rv["payload"]["after_stall"] == "attempt_timeout"
++
++
++# ── D2b ──────────────────────────────────────────────────────────────────────
++def _target(a):
++    return a.target
++
++
++def test_in_flight_predicate_follows_the_attempt(fc):
++    e, a, log, root = fc({"add": ["hang"]})
++    assert fe.attempt_in_flight_for_agent(_target(a)) is False
++    h.wait_for(lambda: e.tick() and len(h.agent_log(log)) == 1, 15)
++    assert fe.attempt_in_flight_for_agent(_target(a)) is True
++    assert fe.attempt_in_flight_for_agent("some-other-session:0.0") is False
++
++
++def test_in_flight_predicate_releases_at_a_safe_stop(fc):
++    e, a, log, root = _exhausted(fc)
++    assert fe.attempt_in_flight_for_agent(_target(a)) is False   # BLOCKED: may rotate
++
++
++def test_in_flight_predicate_fails_closed(fc, monkeypatch):
++    e, a, log, root = fc({"add": ["hang"]})
++    h.wait_for(lambda: e.tick() and len(h.agent_log(log)) == 1, 15)
++    monkeypatch.setattr(tc, "get", lambda *a_, **k: (_ for _ in ()).throw(RuntimeError("db")))
++    assert fe.attempt_in_flight_for_agent(_target(a)) is True
++
++
++def test_in_flight_predicate_without_full_cycle_tables(tmp_path, monkeypatch):
++    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "empty.db"))
++    assert fe.attempt_in_flight_for_agent("any:0.0") is False
++
++
++@pytest.mark.parametrize("pct_text", ["50% context used", "90% context used"])
++def test_context_budget_never_touches_a_pane_with_a_running_attempt(monkeypatch, tmp_path, pct_text):
++    from core import agent_context_budget as acb
++    monkeypatch.setattr(acb, "fullcycle_holds", lambda target: True)
++    monkeypatch.setattr(acb, "_rotation_row", lambda key: {})
++    monkeypatch.setattr(acb.ac, "pending_input_text", lambda key, tail="": "")
++    for name in ("write_handoff", "_save_rotation"):
++        monkeypatch.setattr(acb, name, lambda *a_, **k: pytest.fail(f"{name} under a running attempt"))
++    monkeypatch.setattr(acb.ac, "agent_send", lambda *a_, **k: pytest.fail("/clear sent"))
++    monkeypatch.setattr(acb.ac, "submit_clear", lambda *a_, **k: pytest.fail("/clear sent"))
++    if acb.detect_context_pct(pct_text) is None:
++        pytest.skip("context text format not recognised by this build")
++    agent = {"target": "fc:0.0", "recent_activity": pct_text, "cwd": str(tmp_path)}
++    out = acb.evaluate(agent, {"root": str(tmp_path)}, {"agent_key": "fc:0.0", "state": "idle"},
++                       {}, act=True, dispatch=True)
++    assert out["notification_state"] == "context_deferred_fullcycle_attempt"
++    assert not os.listdir(tmp_path)
++
++
++def test_context_budget_hold_check_fails_closed(monkeypatch):
++    from core import agent_context_budget as acb
++    import core.fullcycle.engine as eng
++    monkeypatch.setattr(eng, "attempt_in_flight_for_agent",
++                        lambda t: (_ for _ in ()).throw(RuntimeError("x")))
++    assert acb.fullcycle_holds("x:0.0") is True
+diff --git a/tests/test_fullcycle_e2e.py b/tests/test_fullcycle_e2e.py
+index 94019e4..e186a21 100644
+--- a/tests/test_fullcycle_e2e.py
++++ b/tests/test_fullcycle_e2e.py
+@@ -406,3 +406,88 @@ def test_the_regression_gate_renews_the_lease_per_verified_task(fc, monkeypatch)
+     assert len(calls) == 2
+     monkeypatch.setenv("FULLCYCLE_REGRESSION_CHECKS", "0")
+     assert e._regression_checks(probe) == []
++
++
++# ── G1: git evidence is required; its absence fails closed ─────────────────────
++def _git_failing(e, *subcmds, rc=128, err="fatal: unable to read index"):
++    real = e._git
++    e._git = lambda *args: (rc, "", err) if args[:1] and args[0] in subcmds else real(*args)
++    return real
++
++
++def test_g1_git_status_failure_fails_verification_closed(fc):
++    e, a, log, root = fc()
++    h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
++          timeout=40)
++    with open(f"{root}/README.md", "w") as fh:                  # out of scope, unclaimed
++        fh.write("tampered\n")
++    t = next(t for t in e._tasks() if t["key"] == "mul")
++    t["attempt"] = 1
++    _git_failing(e, "status")
++    v = e._verify(t, {"changed_files": ["tinycalc/mul.py"], "summary": "ok"})
++    assert not v["passed"]
++    assert v["changed_source"] == "unavailable" and v["changed_files"] == []
++    assert v["claimed_changed_files"] == ["tinycalc/mul.py"]   # kept for the record only
++    assert "changed_files_unverifiable" in v["reasons"]
++
++
++def test_g1_git_failure_before_first_dispatch_sends_nothing(fc):
++    e, a, log, root = fc()
++    _git_failing(e, "status")
++    e.tick()
++    st = e.status()
++    assert _state(st, "add")["state"] == tc.OWNER_DECISION
++    assert _state(st, "add")["last_reason"] == "permission_denied:git_status_unavailable"
++    assert h.agent_log(log) == []
++
++
++def test_g1_unreadable_head_refuses_dispatch(fc):
++    e, a, log, root = fc()
++    real = e._git
++    e._git = lambda *args: (128, "", "fatal: bad HEAD") if args[:2] == ("rev-parse", "--verify") \
++        else real(*args)
++    e.tick()
++    assert _state(e.status(), "add")["last_reason"].startswith("permission_denied:git_head_unavailable")
++    assert h.agent_log(log) == []
++
++
++def test_g1_a_non_git_root_is_refused_by_full_cycle(fc):
++    e, a, log, root = fc()
++    shutil.rmtree(os.path.join(root, ".git"))
++    e.tick()
++    e.tick()
++    st = e.status()
++    assert _state(st, "add")["state"] == tc.OWNER_DECISION
++    assert _state(st, "add")["last_reason"] == "permission_denied:project_root_not_git"
++    assert h.agent_log(log) == []
++    assert len(_events(fe.OWNER_EVENT)) == 1                   # project-wide, gated once
++
++
++def test_g1_a_transient_git_failure_recovers_on_the_next_attempt(fc):
++    e, a, log, root = fc({"add": ["correct"]})
++    h.wait_for(lambda: e.tick() and _state(e.status(), "add")["state"] == tc.WORKING, 15)
++    real = _git_failing(e, "status")
++    h.wait_for(lambda: e.tick() and _state(e.status(), "add")["attempt"] == 2, 15)
++    e._git = real                                              # the lock went away
++    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
++               timeout=30)
++    t = next(t for t in e._tasks() if t["key"] == "add")
++    fails = [x["evidence"]["verification"]["reasons"] for x in tc.history(t["contract_id"])
++             if x["to"] == tc.VERIFICATION_FAILED]
++    assert fails and "changed_files_unverifiable" in fails[0]
++    assert _state(st, "add")["attempt"] == 2
++
++
++def test_g1_a_failed_git_add_never_marks_the_task_committed(fc):
++    e, a, log, root = fc()
++    h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE
++          and True, timeout=40)
++    # put the approved task back to uncommitted and make `git add` fail
++    t = next(t for t in e._tasks() if t["key"] == "add")
++    e._set(t, committed=0)
++    with open(f"{root}/tinycalc/extra.py", "w") as fh:
++        fh.write("x = 1\n")
++    _git_failing(e, "add")
++    e._commit_pending()
++    t = next(t for t in e._tasks() if t["key"] == "add")
++    assert t["committed"] == 0 and t["last_reason"].startswith("commit_failed")
+diff --git a/tests/test_fullcycle_stall.py b/tests/test_fullcycle_stall.py
+new file mode 100644
+index 0000000..5c2bf47
+--- /dev/null
++++ b/tests/test_fullcycle_stall.py
+@@ -0,0 +1,311 @@
++"""D1 — an attempt that goes silent (tech-lead decision, Stage 4).
++
++After FULLCYCLE_ATTEMPT_TIMEOUT (7200 s) without a result, or UNKNOWN_POLL_LIMIT (20)
++unreadable agent statuses in a row, the engine asks the tech lead ONCE per attempt (a
++"blocked" review carrying `stalled`). It never kills, restarts or resends on its own; a
++resend (the tech lead's "answer") or a cancel waits until the old attempt is proven over:
++its late result is verified instead, and otherwise the agent must be provably idle.
++
++Same harness as test_fullcycle_e2e: real engine, tmux, git, contracts; the agent is the
++fixture script; the reviewer is driven by hand here. The clock is shifted, not slept.
++"""
++from __future__ import annotations
++
++import json
++import os
++
++import pytest
++
++from core import task_contract as tc
++from core.fullcycle import engine as fe
++from core.fullcycle.executor import UNKNOWN, Observation
++from tests.test_fullcycle_e2e import _events, _state, fc, h  # noqa: F401
++
++HOUR2 = fe.ATTEMPT_TIMEOUT
++
++
++class Clock:
++    def __init__(self, e):
++        self.base, self.offset = e.clock, 0.0
++        e.clock = self
++
++    def __call__(self):
++        return self.base() + self.offset
++
++
++def _task(e, key):
++    return next(t for t in e._tasks() if t["key"] == key)
++
++
++def _stall_reviews(e):
++    return [r for r in fe.pending_reviews(e.project_id) if r["payload"].get("stalled")]
++
++
++def _all_stall_rows(e):
++    rows = e.conn.execute("SELECT id, task_id, attempt, payload FROM fc_review WHERE kind='blocked'"
++                          ).fetchall()
++    return [r for r in rows if json.loads(r[3]).get("stalled")]
++
++
++def _hung_add(fc, behaviours=None, **kw):
++    e, a, log, root = fc(behaviours or {"add": ["hang", "correct"]}, **kw)
++    h.wait_for(lambda: e.tick() and _state(e.status(), "add")["state"] == tc.WORKING, 15)
++    h.wait_for(lambda: len(h.agent_log(log)) == 1, 10)
++    clock = Clock(e)
++    a.restart = lambda handle: pytest.fail("the engine must never restart on a stall")
++    return e, a, log, root, clock
++
++
++def _answer(e, choice, key="k1"):
++    (rv,) = _stall_reviews(e)
++    fe.ack_review(rv["review_id"], by="stub-gpt")
++    return fe.submit_decision(rv["review_id"], choice, key=key, by="stub-gpt",
++                              feedback="the agent looked stuck")
++
++
++def _write_late_result(root, task_key, attempt, files):
++    for rel, body in files.items():
++        with open(os.path.join(root, rel), "w") as fh:
++            fh.write(body)
++    path = os.path.join(root, ".fullcycle", "results", f"{task_key}-{attempt}.json")
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w") as fh:
++        json.dump({"task_id": f"tinycalc:{task_key}", "attempt": attempt, "status": "done",
++                   "summary": "late", "changed_files": list(files)}, fh)
++
++
++# ── the alert ────────────────────────────────────────────────────────────────
++def test_no_alert_before_the_deadline(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 - 60
++    for _ in range(3):
++        e.tick()
++    assert _stall_reviews(e) == []
++
++
++def test_a_silent_attempt_alerts_the_tech_lead_exactly_once(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    for _ in range(6):
++        e.tick()
++    (rv,) = _stall_reviews(e)
++    assert rv["kind"] == "blocked" and rv["payload"]["stalled"] == "attempt_timeout"
++    assert rv["payload"]["timeout_s"] == HOUR2 and rv["attempt"] == 1
++    review_events = [json.loads(p) for _, _, p, _ in _events(fe.REVIEW_EVENT)]
++    assert [x.get("stalled") for x in review_events] == ["attempt_timeout"]
++    assert _events(fe.OWNER_EVENT) == []                 # routine: tech lead, not owner
++    assert len(h.agent_log(log)) == 1                    # nothing resent
++    assert _state(e.status(), "add")["state"] == tc.WORKING
++
++
++def test_the_deadline_and_the_once_survive_an_engine_restart(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    assert len(_all_stall_rows(e)) == 1
++    e.release()
++    e2 = fe.Engine("tinycalc", a, holder="e2")
++    Clock(e2).offset = HOUR2 + 5
++    for _ in range(3):
++        e2.tick()
++    assert len(_all_stall_rows(e2)) == 1 and len(_events(fe.REVIEW_EVENT)) == 1
++
++
++def test_lost_status_alerts_after_the_unknown_streak_once(fc, monkeypatch):
++    e, a, log, root, clock = _hung_add(fc)
++    monkeypatch.setattr(a, "poll", lambda handle: Observation(UNKNOWN, {"reason": "boom"}))
++    for _ in range(fe.UNKNOWN_POLL_LIMIT - 1):
++        e.tick()
++    assert _stall_reviews(e) == []
++    for _ in range(5):
++        e.tick()
++    (rv,) = _stall_reviews(e)
++    assert rv["payload"]["stalled"] == "agent_status_unknown"
++    assert rv["payload"]["unknown_polls"] == fe.UNKNOWN_POLL_LIMIT
++
++
++def test_a_readable_status_resets_the_unknown_streak(fc, monkeypatch):
++    e, a, log, root, clock = _hung_add(fc)
++    real = a.poll
++    n = {"i": 0}
++
++    def flaky(handle):
++        n["i"] += 1
++        return real(handle) if n["i"] % 10 == 0 else Observation(UNKNOWN, {})
++    monkeypatch.setattr(a, "poll", flaky)
++    for _ in range(3 * fe.UNKNOWN_POLL_LIMIT):
++        e.tick()
++    assert _stall_reviews(e) == []
++
++
++# ── late completion ──────────────────────────────────────────────────────────
++def test_a_late_result_after_the_alert_is_verified_not_resent(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    assert len(_stall_reviews(e)) == 1
++    _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
++    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE
++               and _state(s, "mul")["state"] == tc.WORKING, timeout=30)
++    assert _state(st, "add")["attempt"] == 1
++    assert [x["task_id"] for x in h.agent_log(log)] == ["tinycalc:add", "tinycalc:mul"]
++
++
++def test_answering_a_stall_after_the_late_result_is_stale(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
++    e.tick()                                             # verified → review requested
++    assert _state(e.status(), "add")["state"] == tc.VERIFYING
++    _answer(e, "answer")
++    e.tick()
++    assert [x["task_id"] for x in h.agent_log(log)] == ["tinycalc:add"]   # no resend
++
++
++def test_a_late_result_while_the_resend_is_fenced_wins(fc, monkeypatch):
++    e, a, log, root, clock = _hung_add(fc)
++    monkeypatch.setattr(a, "quiescent", lambda handle: False)   # agent looks busy
++    clock.offset = HOUR2 + 1
++    e.tick()
++    _answer(e, "answer")
++    for _ in range(3):
++        e.tick()
++    assert len(h.agent_log(log)) == 1                    # fenced: nothing resent
++    _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
++    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
++               timeout=30)
++    assert _state(st, "add")["attempt"] == 1
++    assert "tinycalc:add" not in [x["task_id"] for x in h.agent_log(log)][1:]
++
++
++# ── the resend ───────────────────────────────────────────────────────────────
++def test_a_resend_waits_until_the_agent_is_provably_idle(fc, monkeypatch):
++    e, a, log, root, clock = _hung_add(fc)
++    quiet = {"v": False}
++    monkeypatch.setattr(a, "quiescent", lambda handle: quiet["v"])
++    clock.offset = HOUR2 + 1
++    e.tick()
++    _answer(e, "answer")
++    for _ in range(4):
++        e.tick()
++    assert len(h.agent_log(log)) == 1                    # never two attempts at once
++    quiet["v"] = None                                    # status lost: still fenced
++    for _ in range(2):
++        e.tick()
++    assert len(h.agent_log(log)) == 1
++    quiet["v"] = True
++    st = h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
++               timeout=30)
++    assert _state(st, "add")["attempt"] == 2
++    log_ = h.agent_log(log)
++    assert [(x["task_id"], x["attempt"]) for x in log_][:2] == [("tinycalc:add", 1), ("tinycalc:add", 2)]
++    assert "no result and was stopped" in log_[1]["feedback"]
++
++
++def test_a_duplicate_decision_resends_once(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    (rv,) = _stall_reviews(e)
++    fe.ack_review(rv["review_id"], by="stub-gpt")
++    first = fe.submit_decision(rv["review_id"], "answer", key="dup", by="stub-gpt", feedback="go")
++    again = fe.submit_decision(rv["review_id"], "answer", key="dup", by="stub-gpt", feedback="go")
++    assert first["ok"] and again["ok"]
++    other = fe.submit_decision(rv["review_id"], "cancel", key="other", by="stub-gpt", feedback="x")
++    assert not other["ok"] and other["reason"] == "review_already_decided"
++    h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
++          timeout=30)
++    assert [x["attempt"] for x in h.agent_log(log) if x["task_id"] == "tinycalc:add"] == [1, 2]
++
++
++def test_stalls_are_bounded_by_max_attempts(fc):
++    e, a, log, root, clock = _hung_add(fc, {"add": ["hang"]}, max_attempts=2)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    _answer(e, "answer", key="a1")
++    h.wait_for(lambda: e.tick() and len(h.agent_log(log)) == 2, 15)
++    clock.offset += HOUR2 + 1                            # attempt 2 stalls too
++    e.tick()
++    (rv,) = _stall_reviews(e)
++    assert rv["attempt"] == 2
++    _answer(e, "answer", key="a2")
++    e.tick()
++    st = e.status()
++    assert _state(st, "add")["state"] == tc.BLOCKED      # limit reached → owner gate
++    assert _state(st, "add")["last_reason"].startswith("max_attempts_2:stalled")
++    assert len(h.agent_log(log)) == 2
++
++
++# ── cancel ───────────────────────────────────────────────────────────────────
++def test_a_cancel_holds_the_next_task_until_the_attempt_is_over(fc, monkeypatch):
++    e, a, log, root, clock = _hung_add(fc)
++    quiet = {"v": False}
++    monkeypatch.setattr(a, "quiescent", lambda handle: quiet["v"])
++    clock.offset = HOUR2 + 1
++    e.tick()
++    _answer(e, "cancel")
++    for _ in range(4):
++        e.tick()
++    st = e.status()
++    assert _state(st, "add")["state"] == tc.WORKING      # still in flight: holds the agent
++    assert len(h.agent_log(log)) == 1                    # mul not sent beside it
++    quiet["v"] = True
++    e.tick()
++    assert _state(e.status(), "add")["state"] == tc.CANCELLED
++
++
++# ── a late "blocked" result after the alert ──────────────────────────────────
++def test_a_late_question_reaches_the_tech_lead_through_the_same_review(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    (rv,) = _stall_reviews(e)
++    path = os.path.join(root, ".fullcycle", "results", "add-1.json")
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w") as fh:
++        json.dump({"task_id": "tinycalc:add", "attempt": 1, "status": "blocked",
++                   "summary": "stuck", "changed_files": [], "question": "ints or floats?"}, fh)
++    e.tick()
++    assert _state(e.status(), "add")["state"] == tc.BLOCKED
++    (pending,) = [r for r in fe.pending_reviews(e.project_id) if r["kind"] == "blocked"]
++    assert pending["review_id"] == rv["review_id"]
++    assert pending["payload"]["question"] == "ints or floats?"
++    assert not pending["payload"].get("stalled")
++    qs = [json.loads(p).get("question") for _, _, p, _ in _events(fe.REVIEW_EVENT)]
++    assert qs[-1] == "ints or floats?"
++    _answer_plain = fe.submit_decision(rv["review_id"], "answer", key="q", by="stub-gpt",
++                                       feedback="ints")
++    assert _answer_plain["ok"]
++    h.run(e, h.StubReviewer(), until=lambda s: _state(s, "add")["state"] == tc.VERIFIED_DONE,
++          timeout=30)
++
++
++# ── the live adapter's idle evidence (agent_control.classify_state) ─────────────
++@pytest.mark.parametrize("state,expected", [
++    ("waiting_input", True), ("dead", True), ("stale", True),
++    ("working", False), ("shell_running", False), ("waiting_owner", False),
++    ("something_new", None)])
++def test_live_adapter_quiescent_maps_agent_states(state, expected):
++    from core.fullcycle.tmux_adapter import AgentControlAdapter as TmuxAdapter
++
++    class AC:
++        @staticmethod
++        def agent_status(target, actor):
++            return {"state": state}
++    assert TmuxAdapter("s:0.0", ac=AC).quiescent({}) is expected
++
++
++def test_live_adapter_quiescent_is_unknown_when_status_fails():
++    from core.fullcycle.tmux_adapter import AgentControlAdapter as TmuxAdapter
++
++    class AC:
++        @staticmethod
++        def agent_status(target, actor):
++            raise RuntimeError("tmux gone")
++    assert TmuxAdapter("s:0.0", ac=AC).quiescent({}) is None
++
++
++def test_the_base_adapter_never_claims_idle():
++    from core.fullcycle.executor import ExecutorAdapter
++    assert ExecutorAdapter.quiescent(None, {}) is None

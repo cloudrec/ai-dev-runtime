@@ -1,0 +1,545 @@
+diff --git a/core/agent_context_budget.py b/core/agent_context_budget.py
+index 7442583..f3f8a30 100644
+--- a/core/agent_context_budget.py
++++ b/core/agent_context_budget.py
+@@ -562,6 +562,15 @@ def _resume_instruction(handoff_path: str, remaining: dict) -> str:
+             "suites unless that exact remaining task requires it.")
+ 
+ 
++def fullcycle_holds(target: str) -> bool:
++    """Fail closed: if the check itself fails, the pane is treated as held."""
++    try:
++        from core.fullcycle.engine import attempt_in_flight_for_agent
++        return attempt_in_flight_for_agent(target)
++    except Exception:  # noqa: BLE001
++        return True
++
++
+ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True, dispatch: bool) -> dict:
+     """Assess one agent's context budget and act per policy. Returns fields to merge
+     into the record: context_pct, context_tier, and (when acted) notification_state
+@@ -613,6 +622,13 @@ def evaluate(agent: dict, cfg: dict, rec: dict, prev: dict, *, act: bool = True,
+     if tier in ("ok", "unknown"):
+         return out
+ 
++    # D2b: never checkpoint into, or rotate, a pane whose Full Cycle attempt may be
++    # running — the engine owns that attempt (its handoff path is the agent's
++    # `context_exhausted` result), and a handoff file would dirty the verified tree.
++    if fullcycle_holds(key):
++        out["notification_state"] = "context_deferred_fullcycle_attempt"
++        return out
++
+     # Finish-soon suppression — unless there is genuine work_remaining to rotate INTO.
+     if finish_soon(agent, rec) and cls != "work_remaining":
+         out["notification_state"] = "context_finish_soon_suppressed"
+diff --git a/core/fullcycle/engine.py b/core/fullcycle/engine.py
+index 09e4942..553ab7a 100644
+--- a/core/fullcycle/engine.py
++++ b/core/fullcycle/engine.py
+@@ -52,8 +52,8 @@ from core.control_plane import api as cp
+ from core.control_plane.store import now_iso, now_ts
+ from core.fullcycle import gates
+ from core.fullcycle import spec as specs
+-from core.fullcycle.executor import (CRASHED, DONE, WAITING_PERMISSION, ExecutorAdapter,
+-                                     TaskEnvelope)
++from core.fullcycle.executor import (CRASHED, DONE, UNKNOWN, WAITING_PERMISSION,
++                                     ExecutorAdapter, TaskEnvelope)
+ from core.fullcycle.hosts import ExecutionHost, LocalHost
+ 
+ SOURCE = "fullcycle"
+@@ -65,6 +65,11 @@ CHECK_TIMEOUT = int(os.getenv("FULLCYCLE_CHECK_TIMEOUT", "300"))
+ CHECK_ENV = {"PYTHONDONTWRITEBYTECODE": "1"}
+ # longer than the worst tick (every check of a task at CHECK_TIMEOUT), renewed per step
+ LEASE_TTL = int(os.getenv("FULLCYCLE_LEASE_TTL", "900"))
++# D1: an attempt with no result this long after its send, or whose agent status could not
++# be read this many polls in a row, is reported to the tech lead ONCE (a "blocked" review
++# carrying `stalled`). The engine never kills, restarts or resends on its own.
++ATTEMPT_TIMEOUT = int(os.getenv("FULLCYCLE_ATTEMPT_TIMEOUT", "7200"))
++UNKNOWN_POLL_LIMIT = int(os.getenv("FULLCYCLE_UNKNOWN_POLL_LIMIT", "20"))
+ OWNER_RESUME = ("resume", "retry", "approve")
+ OWNER_CANCEL = ("cancel", "stop")
+ 
+@@ -82,7 +87,7 @@ CREATE TABLE IF NOT EXISTS fc_task (
+     feedback TEXT DEFAULT '', verification TEXT DEFAULT '', gate_id TEXT DEFAULT '',
+     dispatch_failures INTEGER DEFAULT 0, last_reason TEXT DEFAULT '',
+     origin TEXT DEFAULT 'spec', redispatch INTEGER DEFAULT 0, committed INTEGER DEFAULT 0,
+-    created_ts REAL, updated_ts REAL,
++    created_ts REAL, updated_ts REAL, unknown_polls INTEGER DEFAULT 0,
+     UNIQUE (project_id, key)
+ );
+ CREATE TABLE IF NOT EXISTS fc_dispatch (
+@@ -111,11 +116,17 @@ class EngineError(RuntimeError):
+     pass
+ 
+ 
++_MIGRATIONS = (("fc_task", "unknown_polls", "INTEGER DEFAULT 0"),)
++
++
+ def connect(conn=None):
+     conn, own = specs.conn_with_schema(conn)
+     for stmt in _SCHEMA.strip().split(";"):
+         if stmt.strip():
+             conn.execute(stmt)
++    for table, col, decl in _MIGRATIONS:          # additive only: old rows get the default
++        if col not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}:
++            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+     conn.commit()
+     return conn, own
+ 
+@@ -236,7 +247,7 @@ def _offer_to_wake_bridge(eid: int, type_: str, severity: str, owner: bool, *,
+ 
+ _TASK_COLS = ("id", "key", "seq", "spec_version", "body", "contract_id", "attempt", "handle",
+               "feedback", "verification", "gate_id", "dispatch_failures", "last_reason",
+-              "origin", "redispatch", "committed")
++              "origin", "redispatch", "committed", "unknown_polls")
+ 
+ 
+ class Engine:
+@@ -401,12 +412,17 @@ class Engine:
+                                  trusted_checks=self._trusted(task))
+         if r:
+             return f"permission_denied:{r}"
++        g = self._git_refusal()
++        if g:
++            return f"permission_denied:{g}"
+         never_sent = not self.conn.execute(
+             "SELECT 1 FROM fc_dispatch WHERE idem_key=?",
+             (f"fullcycle:{task['id']}:{attempt}",)).fetchone()
+         if attempt == 1 and never_sent:
+             # (once the first send may have gone out, changes can be the agent's own)
+             dirty = self._changed_files()
++            if dirty is None:
++                return "permission_denied:git_status_unavailable"
+             if dirty:
+                 # the first attempt must start from a clean tree: everything changed
+                 # afterwards is then provably the agent's, and nothing of anyone else's
+@@ -443,6 +459,8 @@ class Engine:
+             # intent (redispatch) stays and is carried out by a later tick
+             self._note("dispatch_waiting_for_other_task", task=task["key"], others=others)
+             return False
++        if not self._stall_fence_open(task, attempt):
++            return False
+         refusal = self._refusal(task, attempt)
+         if refusal:
+             self._set(task, redispatch=0)
+@@ -544,6 +562,22 @@ class Engine:
+     def _git(self, *args) -> tuple:
+         return self.host.run(["git", "-C", self.root, *args], timeout=60)
+ 
++    def _git_refusal(self) -> Optional[str]:
++        """Full Cycle verifies work only from git evidence, so its project root must be a
++        readable git work tree with a HEAD. Anything else refuses the dispatch (fail
++        closed); other Owner OS project kinds are not affected."""
++        rc, out, err = self._git("rev-parse", "--is-inside-work-tree")
++        if rc != 0:
++            if "not a git repository" in (err or "").lower():
++                return "project_root_not_git"
++            return "git_unavailable:" + (err or out or "").strip()[-120:]
++        if out.strip() != "true":
++            return "project_root_not_git"
++        rc, out, err = self._git("rev-parse", "--verify", "--quiet", "HEAD")
++        if rc != 0:
++            return "git_head_unavailable:" + (err or out or "no commit").strip()[-120:]
++        return None
++
+     def _changed_files(self) -> Optional[list]:
+         """Paths changed against HEAD, both sides of every move (renames are not
+         detected, so a moved protected file shows as its deletion), NUL-separated so no
+@@ -578,12 +612,16 @@ class Engine:
+     def _verify(self, task: dict, result: dict) -> dict:
+         c = tc.get(task["contract_id"], conn=self.conn)["contract"]
+         changed = self._changed_files()
++        claimed = [f for f in (result.get("changed_files") or []) if isinstance(f, str)]
+         if changed is None:
+-            changed, source = result.get("changed_files", []), "agent_claim"
++            # no git evidence: the agent's own claim is never verification (fail closed);
++            # the check outputs are still collected for the feedback
++            changed, source = [], "unavailable"
++            violations = ["changed_files_unverifiable"]
+         else:
+             source = "git"
+-        violations = gates.check_changes(changed, scope=c["scope"],
+-                                         do_not_touch=c["do_not_touch"])
++            violations = gates.check_changes(changed, scope=c["scope"],
++                                             do_not_touch=c["do_not_touch"])
+         checks = self._run_checks(task["body"]["checks"], trusted=self._trusted(task))
+         regression = self._regression_checks(task)
+         passed = (not violations and bool(checks) and all(x["passed"] for x in checks)
+@@ -595,8 +633,8 @@ class Engine:
+         if not checks:
+             reasons.append("task_has_no_checks")
+         return {"attempt": task["attempt"], "passed": passed, "changed_files": changed,
+-                "changed_source": source, "violations": violations, "checks": checks,
+-                "regression": regression, "reasons": reasons,
++                "changed_source": source, "claimed_changed_files": claimed[:200],
++                "violations": violations, "checks": checks, "regression": regression, "reasons": reasons,
+                 "summary": result.get("summary", "")}
+ 
+     def _regression_checks(self, task: dict) -> list:
+@@ -709,14 +747,136 @@ class Engine:
+         self._move(task, tc.VERIFYING)
+         self._finish_verification(task, self._verify(task, self.adapter.collect(task["handle"]) or {}))
+ 
++    # -- D1: a silent attempt ---------------------------------------------------------
++    def _stall_review(self, task: dict, attempt: int) -> Optional[dict]:
++        r = self.conn.execute(
++            "SELECT id, status, payload, decision FROM fc_review WHERE project_id=? AND"
++            " task_id=? AND attempt=? AND kind='blocked'",
++            (self.project_id, task["id"], attempt)).fetchone()
++        if not r:
++            return None
++        payload = json.loads(r[2] or "{}")
++        return ({**payload, "id": r[0], "status": r[1], "decision": r[3]}
++                if payload.get("stalled") else None)
++
++    def _blocked_review(self, task: dict, payload: dict) -> None:
++        """This attempt's "blocked" review. If a stall alert already holds the slot and is
++        still pending, the agent's own report replaces its content and the tech lead is
++        told once more (the slot is unique per task/attempt/kind)."""
++        stall = self._stall_review(task, task["attempt"])
++        if not (stall and stall["status"] == "pending"):
++            self._request_review(task, "blocked", payload)
++            return
++        payload = {**payload, "after_stall": stall.get("stalled")}
++        self.conn.execute("UPDATE fc_review SET payload=? WHERE id=?", (_j(payload), stall["id"]))
++        self.conn.commit()
++        self._event(REVIEW_EVENT, task["id"], {
++            "fullcycle": "blocked", "review_id": stall["id"], "project": self.project_id,
++            "task": task["key"], "attempt": task["attempt"], **payload,
++            "decide_with": {"review_id": stall["id"],
++                            "decisions": list(REVIEW_DECISIONS["blocked"])}},
++            dedup_key=f"fullcycle:review:{stall['id']}:report")
++
++    def _blocked_payload(self, task: dict, attempt: int) -> dict:
++        r = self.conn.execute("SELECT payload FROM fc_review WHERE project_id=? AND task_id=?"
++                              " AND attempt=? AND kind='blocked'",
++                              (self.project_id, task["id"], attempt)).fetchone()
++        return json.loads(r[0] or "{}") if r else {}
++
++    def _sent_ts(self, task: dict) -> Optional[float]:
++        r = self.conn.execute("SELECT ts FROM fc_dispatch WHERE idem_key=? AND status='sent'",
++                              (f"fullcycle:{task['id']}:{task['attempt']}",)).fetchone()
++        return r[0] if r else None
++
++    def _stall_alert(self, task: dict, reason: str, **detail) -> None:
++        """At most once per attempt: the review row is unique per (task, attempt, kind)
++        and its event is emitted only on first insert."""
++        if self._review_for(task, "blocked"):
++            return
++        self._request_review(task, "blocked", {
++            "stalled": reason, **detail,
++            "question": (f"Attempt {task['attempt']} of task '{task['key']}' has produced no "
++                         f"result ({reason}). Owner OS will not kill, restart or resend while "
++                         "that attempt may still be running. Answer to retry once the agent is "
++                         "provably idle (counts towards the attempt limit), or cancel the task.")})
++        self._note("attempt_stalled", task=task["key"], attempt=task["attempt"], reason=reason)
++
++    def _stall_fence_open(self, task: dict, attempt: int) -> bool:
++        """A resend after a stall alert goes out only when the previous attempt is proven
++        over: its result is checked first (a late result is verified instead of resent),
++        then the agent must be provably idle. Anything else waits — never a second
++        envelope beside a possibly running one."""
++        prev = task["handle"] or {}
++        if prev.get("attempt") != attempt - 1:
++            return True
++        if self._blocked_payload(task, attempt - 1).get("context_exhausted"):
++            return self._clean_session_ready(task, prev, attempt)
++        if not self._stall_review(task, attempt - 1):
++            return True
++        obs = self.adapter.poll(prev)
++        if obs.state == DONE:
++            # the stalled attempt finished after all: drop the resend, verify its result
++            self._set(task, redispatch=0, last_reason="late_result_after_stall")
++            self._note("late_result_after_stall", task=task["key"], attempt=attempt - 1)
++            return False
++        quiet = True if obs.state == CRASHED else self.adapter.quiescent(prev)
++        if quiet is not True:
++            self._note("resend_fenced", task=task["key"], attempt=attempt,
++                       observed=obs.state, quiescent=quiet)
++            return False
++        return True
++
++    def _clean_session_ready(self, task: dict, prev: dict, attempt: int) -> bool:
++        """D2: the next attempt after a context exhaustion goes to a clean session, and only
++        after a safe stop. An adapter that owns its agent starts the fresh session itself;
++        for any other (live) agent the clean session was confirmed through the owner gate
++        `clean_session_required` before this resend was requested."""
++        quiet = self.adapter.quiescent(prev)
++        if quiet is not True:
++            self._note("resend_fenced", task=task["key"], attempt=attempt,
++                       observed="context_exhausted", quiescent=quiet)
++            return False
++        if self.adapter.owns_agent:
++            rs = self.adapter.restart(prev)
++            self._note("clean_session", task=task["key"], attempt=attempt, result=rs)
++            if not rs.get("ok"):
++                self._set(task, redispatch=0)
++                self._block_for_owner(task, "clean_session_failed")
++                return False
++        return True
++
+     def _step_working(self, task: dict) -> None:
+         obs = self.adapter.poll(task["handle"])
++        stall = self._stall_review(task, task["attempt"])
++        if stall and stall.get("decision") == "cancel":
++            quiet = True if obs.state in (DONE, CRASHED) else self.adapter.quiescent(task["handle"])
++            if quiet is True:
++                self._move(task, tc.CANCELLED, evidence={"stall_cancelled": stall["id"]})
++            else:
++                self._note("stall_cancel_fenced", task=task["key"], observed=obs.state,
++                           quiescent=quiet)
++            return
++        if obs.state != UNKNOWN and task.get("unknown_polls"):
++            self._set(task, unknown_polls=0)
+         if obs.state == DONE:
+             result = self.adapter.collect(task["handle"]) or {}
+             if result.get("status") == "blocked":
+                 self._move(task, tc.BLOCKED)
+-                self._request_review(task, "blocked", {
+-                    "question": str(result.get("question") or result.get("summary"))[:4000]})
++                self._blocked_review(task, {"question": str(
++                    result.get("question") or result.get("summary"))[:4000]})
++                return
++            if result.get("status") == "context_exhausted":
++                # D2: the attempt ended at a safe stop with a compact handoff; the routine
++                # decision (continue in a clean session, or cancel) is the tech lead's
++                self._move(task, tc.BLOCKED)
++                self._blocked_review(task, {
++                    "context_exhausted": True, "handoff": result.get("handoff", ""),
++                    "handoff_problem": result.get("handoff_problem", ""),
++                    "summary": result.get("summary", ""),
++                    "question": ("The agent ran out of context and stopped with the handoff "
++                                 "below. Answer to continue the task in a clean session (the "
++                                 "handoff and your answer become its instructions; counts "
++                                 "towards the attempt limit), or cancel.")})
+                 return
+             self._move(task, tc.AGENT_DONE)
+             self._verify_current(task)
+@@ -738,6 +898,18 @@ class Engine:
+         elif obs.state == WAITING_PERMISSION:
+             gate = gates.check_permission_prompt(obs.detail.get("command", ""), root=self.root)
+             self._owner(task, "agent_permission_prompt", {"permission": gate})
++        else:                                            # WORKING or UNKNOWN: still waiting
++            if obs.state == UNKNOWN:
++                n = int(task.get("unknown_polls") or 0) + 1
++                self._set(task, unknown_polls=n)
++                if n >= UNKNOWN_POLL_LIMIT:
++                    self._stall_alert(task, "agent_status_unknown", unknown_polls=n,
++                                      detail=str(obs.detail)[:300])
++                    return
++            sent = self._sent_ts(task)
++            if sent is not None and self.clock() - sent >= ATTEMPT_TIMEOUT:
++                self._stall_alert(task, "attempt_timeout",
++                                  elapsed_s=int(self.clock() - sent), timeout_s=ATTEMPT_TIMEOUT)
+ 
+     # -- decisions --------------------------------------------------------------
+     def _apply_decisions(self) -> None:
+@@ -763,6 +935,41 @@ class Engine:
+                 else:
+                     self._move(task, tc.VERIFICATION_FAILED, evidence={"review": review})
+                     self._set(task, feedback="Reviewer rejected: " + review["feedback"])
++            elif kind == "blocked" and task["state"] == tc.WORKING and \
++                    self._stall_review(task, attempt):
++                if decision == "answer":
++                    # resend through the fence (_stall_fence_open): never beside a running
++                    # attempt; bounded by max_attempts like every other retry
++                    self._retry(task, why="stalled", feedback=(
++                        "Your previous attempt produced no result and was stopped. Continue "
++                        "from the current state of the workdir. Tech lead: " + review["feedback"]))
++                else:
++                    # not CANCELLED yet: the task stays in flight (so no other task is sent
++                    # to the agent) until _step_working proves the attempt over
++                    self._note("stall_cancel_pending", task=task["key"])
++            elif kind == "blocked" and task["state"] == tc.BLOCKED and \
++                    self._blocked_payload(task, attempt).get("context_exhausted"):
++                if decision == "answer":
++                    p = self._blocked_payload(task, attempt)
++                    feedback = ("You are continuing in a clean session after the previous one "
++                                "ran out of context. Handoff from the previous session:\n"
++                                + (p.get("handoff") or "(none was provided)")
++                                + "\n\nTech lead: " + review["feedback"])
++                    if task["attempt"] >= self.max_attempts:
++                        self._block_for_owner(task, f"max_attempts_{self.max_attempts}:"
++                                                    "context_exhausted")
++                    elif self.adapter.owns_agent:
++                        self._request_dispatch(task, task["attempt"] + 1, feedback=feedback)
++                    else:
++                        # a clean session for a live agent is a session-lifecycle action the
++                        # engine does not hold a grant for: the owner provides/confirms it
++                        self._set(task, feedback=feedback[:4000])
++                        self._owner(task, "clean_session_required",
++                                    {"handoff": p.get("handoff", ""),
++                                     "instructions": "Start a clean session for this agent "
++                                     "(e.g. /clear at a safe boundary), then answer resume."})
++                else:
++                    self._move(task, tc.CANCELLED, evidence={"review": review})
+             elif kind == "blocked" and task["state"] == tc.BLOCKED:
+                 if decision == "answer":
+                     self._retry(task, why="blocked_answered",
+@@ -809,12 +1016,26 @@ class Engine:
+         for task in self._tasks():
+             if task["state"] != tc.VERIFIED_DONE or task["committed"]:
+                 continue
+-            if not self.commit_on_approve or self._git("rev-parse", "--git-dir")[0] != 0:
++            if not self.commit_on_approve:
+                 # the owner commits; until then the dirty tree holds the next task
+                 self._set(task, committed=1)
+                 continue
+-            self._git("add", "-A", "--", ".", ":(exclude).fullcycle")
+-            if self._git("diff", "--cached", "--quiet")[0] == 0:
++            # a git error here must never mark work committed that is not (fail closed)
++            # (`add` + `reset` rather than an exclude pathspec: naming a gitignored
++            # .fullcycle in a pathspec makes `git add` exit 1 although it staged everything)
++            rc_add, out_add, err_add = self._git("add", "-A", "--", ".")
++            if rc_add == 0:
++                rc_add, out_add, err_add = self._git("reset", "-q", "--", ".fullcycle")
++            rc_diff = self._git("diff", "--cached", "--quiet")[0] if rc_add == 0 else None
++            if rc_add != 0 or rc_diff not in (0, 1):
++                detail = (out_add + err_add).strip()[-500:] if rc_add != 0 else "git diff failed"
++                self._set(task, last_reason=f"commit_failed:{detail[-200:]}")
++                self._event(OWNER_EVENT, task["id"], {"reason": "commit_failed",
++                                                      "task": task["key"], "detail": detail},
++                            owner=True, dedup_key=f"fullcycle:commit_failed:{task['id']}")
++                self._note("commit_failed", task=task["key"])
++                continue
++            if rc_diff == 0:
+                 self._set(task, committed=1)
+                 continue
+             rc, out, err = self.host.run(
+@@ -1000,6 +1221,45 @@ def project_status(project_id: str, conn=None) -> dict:
+ SETTLE_GRACE_SECS = 300   # the agent's own closing turn may end just after the approval
+ 
+ 
++def attempt_in_flight_for_agent(target: str, conn=None) -> bool:
++    """D2b: may a Full Cycle attempt be running on `target`'s session right now? Then its
++    pane must not be rotated (/clear) or have a handoff written into its tree by another
++    controller. True for a task whose contract is WORKING, or with a send pending, whose
++    last recorded handle names that session. No Full Cycle tables → False; any error →
++    True (fail closed: a rotation is deferred, never forced). Read-only."""
++    session = (target or "").strip().split(":", 1)[0]
++    if not session:
++        return False
++    try:
++        conn, own = cp._c(conn)
++    except Exception:  # noqa: BLE001
++        return True
++    try:
++        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
++                            "name='fc_task'").fetchone():
++            return False
++        for cid, handle, redispatch in conn.execute(
++                "SELECT contract_id, handle, redispatch FROM fc_task WHERE "
++                "COALESCE(handle,'')<>''"):
++            try:
++                h = json.loads(handle)
++            except ValueError:
++                continue
++            if str(h.get("target") or "").split(":", 1)[0] != session:
++                continue
++            if redispatch:
++                return True
++            c = tc.get(cid, conn=conn)
++            if not c or c["state"] == tc.WORKING:
++                return True
++        return False
++    except Exception:  # noqa: BLE001 — unreadable state: defer the rotation
++        return True
++    finally:
++        if own:
++            conn.close()
++
++
+ def settled_project_for_agent(target: str, conn=None,
+                               now: Optional[float] = None) -> Optional[str]:
+     """The Full Cycle project `target` worked for, when nothing is left for that agent:
+diff --git a/core/fullcycle/executor.py b/core/fullcycle/executor.py
+index 11175b5..7f8f49a 100644
+--- a/core/fullcycle/executor.py
++++ b/core/fullcycle/executor.py
+@@ -97,6 +97,12 @@ class ExecutorAdapter(ABC):
+     def restart(self, handle: dict) -> dict:
+         return {"ok": False, "reason": "adapter_does_not_own_agent"}
+ 
++    def quiescent(self, handle: dict) -> Optional[bool]:
++        """Is the agent provably NOT working on anything (idle at its prompt, or its
++        process gone)? True only on positive evidence; False = active; None = cannot
++        tell. The engine resends after a stall only on True."""
++        return None
++
+ 
+ # ── executor profiles ───────────────────────────────────────────────────────
+ @dataclass(frozen=True)
+diff --git a/core/fullcycle/tmux_adapter.py b/core/fullcycle/tmux_adapter.py
+index e4c096e..2cae3cf 100644
+--- a/core/fullcycle/tmux_adapter.py
++++ b/core/fullcycle/tmux_adapter.py
+@@ -16,6 +16,7 @@ must go through the creation guard and the owner's creation approval.
+ from __future__ import annotations
+ 
+ import json
++import re
+ from typing import Optional
+ 
+ from core import permission_resolver as _pr
+@@ -34,14 +35,40 @@ def parse_result(text: Optional[str], handle: dict) -> Optional[dict]:
+     if not isinstance(r, dict) or r.get("task_id") != handle.get("task_id") \
+             or r.get("attempt") != handle.get("attempt"):
+         return None
+-    if r.get("status") not in ("done", "blocked"):
++    if r.get("status") not in ("done", "blocked", "context_exhausted"):
+         return None
+     files = r.get("changed_files") or []
+     r["changed_files"] = [f for f in files if isinstance(f, str)]
+     r["summary"] = str(r.get("summary") or "")[:4000]
++    if r["status"] == "context_exhausted":
++        r["handoff"], r["handoff_problem"] = clean_handoff(r.get("handoff"))
+     return r
+ 
+ 
++HANDOFF_MAX = 8000
++_CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
++
++
++def clean_handoff(raw) -> tuple:
++    """(text, problem). A compact handoff is plain text up to HANDOFF_MAX characters.
++    Never silently altered: control characters are removed and an over-long one is cut,
++    and both are named in `problem`; a missing/non-text/empty one yields "" + problem.
++    A malformed handoff still reaches the tech lead — it is reported, not dropped."""
++    if raw is None:
++        return "", "handoff_missing"
++    if not isinstance(raw, str):
++        return "", "handoff_not_text"
++    text = _CTRL.sub("", raw)
++    problems = ["handoff_control_chars_removed"] if text != raw else []
++    text = text.strip()
++    if not text:
++        return "", "handoff_empty"
++    if len(text) > HANDOFF_MAX:
++        text = text[:HANDOFF_MAX]
++        problems.append(f"handoff_truncated_to_{HANDOFF_MAX}")
++    return text, ",".join(problems)
++
++
+ def _permission(tail: str) -> Optional[Observation]:
+     if _pr.is_permission_prompt(tail):
+         return Observation(WAITING_PERMISSION,
+@@ -103,3 +130,19 @@ class AgentControlAdapter(ExecutorAdapter):
+ 
+     def collect(self, handle: dict) -> Optional[dict]:
+         return parse_result(self.host.read_file(handle["result"]), handle)
++
++    # agent_control.classify_state: idle at the prompt, or no live agent process
++    _QUIESCENT = ("waiting_input", "dead", "stale")
++    _ACTIVE = ("working", "shell_running", "waiting_owner")
++
++    def quiescent(self, handle: dict) -> Optional[bool]:
++        try:
++            st = self.ac.agent_status(self.target, actor=self.actor)
++        except Exception:  # noqa: BLE001 — unknown is not idle
++            return None
++        state = st.get("state")
++        if state in self._QUIESCENT:
++            return True
++        if state in self._ACTIVE:
++            return False
++        return None
