@@ -414,8 +414,35 @@ class Engine:
                 return "dirty_worktree:" + ",".join(dirty[:5])
         return None
 
+    # A task refused at dispatch for a reason of ITS OWN (an untrusted check, a push or
+    # deploy power) that never reached the agent is "parked": nothing of it is in the tree
+    # and the agent is idle, so it must not hold up independent tasks. Project-wide
+    # refusals (root, executor, dirty tree) and anything that reached the agent are not.
+    _TASK_SCOPED_REFUSALS = ("permission_denied:check_", "permission_denied:push_requires_owner",
+                             "permission_denied:deploy_requires_owner")
+
+    def _parked(self, task: dict) -> bool:
+        # (a resumed one keeps this status, with its intent pending, until a send is
+        # recorded: so it waits for the task in flight and that task never waits for it)
+        if task["state"] != tc.OWNER_DECISION:
+            return False
+        if not str(task["last_reason"] or "").startswith(self._TASK_SCOPED_REFUSALS):
+            return False
+        return not self.conn.execute(          # any dispatch record = may have reached it
+            "SELECT 1 FROM fc_dispatch WHERE task_id=?", (task["id"],)).fetchone()
+
+    def _in_flight(self, task: dict) -> bool:
+        return (task["state"] not in tc.TERMINAL and task["state"] != tc.CREATED
+                and not self._parked(task))
+
     def _try_dispatch(self, task: dict) -> bool:
         attempt = task["redispatch"]
+        others = [t["key"] for t in self._tasks() if t["id"] != task["id"] and self._in_flight(t)]
+        if others:
+            # single executor: a resumed parked task waits for the task in flight; the
+            # intent (redispatch) stays and is carried out by a later tick
+            self._note("dispatch_waiting_for_other_task", task=task["key"], others=others)
+            return False
         refusal = self._refusal(task, attempt)
         if refusal:
             self._set(task, redispatch=0)
@@ -862,7 +889,7 @@ class Engine:
 
     def _next_task(self, tasks: list) -> None:
         """Single executor: the next task starts only when nothing else is in flight."""
-        if any(t["state"] not in tc.TERMINAL and t["state"] != tc.CREATED for t in tasks):
+        if any(self._in_flight(t) for t in tasks):
             return
         state = {t["key"]: t["state"] for t in tasks}
         for t in tasks:

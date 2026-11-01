@@ -292,3 +292,79 @@ def test_a_second_engine_cannot_run_the_project_while_the_lease_is_held(fc):
     late = fe.Engine("tinycalc", a, holder="e2", clock=lambda: 10 ** 10)
     r = late.tick()
     assert "skipped" not in r and r["fence"] >= 2
+
+
+# ── an owner gate on ONE task parks only that task ─────────────────────────────
+# A reviewer-added task whose check is not a test runner is refused at dispatch
+# (gates.check_argv) and waits for the owner. It never reached the agent, so nothing of
+# it is in the tree: independent tasks go on; only it (and anything depending on it) waits.
+RISKY_TASK = {"key": "risky", "title": "Fetch something", "goal": "Needs a network check.",
+              "acceptance_criteria": ["the URL answers"],
+              "checks": [["curl", "-sf", "http://example.invalid/"]]}
+
+
+def _with_risky(spec=None):
+    import copy
+    s = copy.deepcopy(spec or h.load_spec())
+    s["tasks"].insert(1, dict(RISKY_TASK))       # add, risky, mul (mul depends on add only)
+    specs.put_spec("tinycalc", s, by="review:gpt")
+
+
+def test_a_hazardous_task_gate_parks_only_that_task(fc):
+    e, a, log, root = fc()
+    _with_risky()
+    st = h.run(e, h.StubReviewer(),
+               until=lambda s: _state(s, "mul")["state"] == tc.VERIFIED_DONE, timeout=40)
+    assert _state(st, "risky")["state"] == tc.OWNER_DECISION
+    assert _state(st, "risky")["last_reason"] == "permission_denied:check_runner_not_allowed:curl"
+    assert _state(st, "add")["state"] == tc.VERIFIED_DONE
+    assert [x["task_id"] for x in h.agent_log(log)] == ["tinycalc:add", "tinycalc:mul"]
+    owner = _events(fe.OWNER_EVENT)
+    assert len(owner) == 1 and "risky" in owner[0][2]          # one gate, on the risky task
+    assert not st["done"]                                     # the project is not done...
+    for _ in range(3):
+        e.tick()
+    assert len(_events(fe.OWNER_EVENT)) == 1                   # ...and nothing re-fires
+
+    # the owner cancels the hazardous task: the rest of the project completes
+    t = next(t for t in e._tasks() if t["key"] == "risky")
+    cp.answer_gate(t["gate_id"], "cancel")
+    st = h.run(e, h.StubReviewer(next_tasks={"__project__": [h.CLI_TASK]}), until=DONE,
+               timeout=40)
+    assert _state(st, "risky")["state"] == tc.CANCELLED
+    assert "tinycalc:risky" not in [x["task_id"] for x in h.agent_log(log)]
+
+
+def test_a_dependent_of_a_parked_task_still_waits(fc):
+    e, a, log, root = fc()
+    import copy
+    s = copy.deepcopy(h.load_spec())
+    s["tasks"][1]["depends_on"] = ["add", "risky"]            # mul now needs risky too
+    _with_risky(s)
+    h.run(e, h.StubReviewer(),
+          until=lambda s: _state(s, "risky")["state"] == tc.OWNER_DECISION, timeout=30)
+    for _ in range(5):
+        e.tick()
+    st = e.status()
+    assert _state(st, "mul")["state"] == tc.CREATED
+    assert [x["task_id"] for x in h.agent_log(log)] == ["tinycalc:add"]
+
+
+def test_a_resumed_parked_task_waits_for_the_task_in_flight(fc, monkeypatch):
+    e, a, log, root = fc({"mul": ["hang"]})
+    _with_risky()
+    h.run(e, h.StubReviewer(),
+          until=lambda s: _state(s, "mul")["state"] == tc.WORKING, timeout=30)
+    assert _state(e.status(), "risky")["state"] == tc.OWNER_DECISION
+    # the owner lifts the hazard (simulated: the gate no longer refuses) and resumes
+    real = fe.gates.check_dispatch
+    monkeypatch.setattr(fe.gates, "check_dispatch",
+                        lambda **kw: None if kw.get("trusted_checks") is False else real(**kw))
+    t = next(t for t in e._tasks() if t["key"] == "risky")
+    cp.answer_gate(t["gate_id"], "resume")
+    for _ in range(3):
+        e.tick()
+    risky = next(t for t in e._tasks() if t["key"] == "risky")
+    assert risky["redispatch"] == 1                            # the intent is kept...
+    assert "tinycalc:risky" not in [x["task_id"] for x in h.agent_log(log)]   # ...not sent
+    assert _state(e.status(), "mul")["state"] == tc.WORKING
