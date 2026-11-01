@@ -25,7 +25,24 @@ import urllib.request
 from typing import Optional
 
 CDP_HOST = "127.0.0.1"
-CDP_PORT = 9222
+
+
+def _cdp_port() -> int:
+    """The browser's DevTools port. 9222 (the live shared browser) unless CDP_PORT names
+    another one, so an isolated sandbox (its own Chrome profile) never drives the live
+    browser. Only loopback is ever used; an invalid value fails closed to an unusable
+    port rather than silently falling back to the live browser."""
+    raw = os.getenv("CDP_PORT", "").strip()
+    if not raw:
+        return 9222
+    try:
+        port = int(raw)
+    except ValueError:
+        return 0
+    return port if 1024 <= port <= 65535 else 0
+
+
+CDP_PORT = _cdp_port()
 
 # Structural selectors: element identity and ARIA attributes only. No text, no message nodes.
 # 2026-10-28: ChatGPT's composer lost its id — it is now a ProseMirror div with
