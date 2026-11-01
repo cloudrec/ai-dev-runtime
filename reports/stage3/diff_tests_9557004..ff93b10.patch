@@ -1,0 +1,1287 @@
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 41af1b3..f5c2131 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -88,3 +88,57 @@ os.environ.pop("CONTINUATION_WATCHDOG_SESSIONS", None)
+ for _k in ("NATIVE_SUPERVISOR_TARGETS", "NATIVE_SUPERVISOR_DENY_PROJECTS",
+            "NATIVE_SUPERVISOR_DENY_TARGETS"):
+     os.environ.pop(_k, None)
++
++# Fifth door: the LIVE browser. Every Owner OS chat tab lives in the Chromium whose
++# debugging port is 127.0.0.1:9222 on this host. `test_cdp_composer::
++# test_it_refuses_when_no_composer_is_found` reached the composer-absent recovery, whose
++# `_create_tab` PUT /json/new?https://chatgpt.com/c/a to that port — every full-suite run
++# (and every runtime job, which runs the suite) opened a real tab, found 2026-11-01 as a
++# stray "New chat" on chatgpt.com/c/a. Tabs count toward CDP_MAX_PAGES; enough of them
++# make live wake delivery refuse with `browser_degraded:too_many_pages`.
++#
++# Socket-level, so no copy of any module and no future call site can get through. The
++# composer swallows connection errors, so a refusal alone would pass silently: every
++# attempt is recorded and fails the test that made it.
++import socket as _socket  # noqa: E402
++
++import pytest  # noqa: E402
++
++_LIVE_CDP_PORT = 9222
++_live_cdp_attempts: list = []
++_real_sock_connect = _socket.socket.connect
++_real_create_connection = _socket.create_connection
++
++
++def _is_live_cdp(addr) -> bool:
++    try:
++        return int(addr[1]) == _LIVE_CDP_PORT and str(addr[0]) in ("127.0.0.1", "localhost", "::1")
++    except Exception:  # noqa: BLE001 — not an (host, port) address
++        return False
++
++
++def _walled_connect(self, addr):
++    if _is_live_cdp(addr):
++        _live_cdp_attempts.append(str(addr))
++        raise ConnectionRefusedError("test suite: the live browser's CDP port is walled off")
++    return _real_sock_connect(self, addr)
++
++
++def _walled_create_connection(addr, *a, **k):
++    if _is_live_cdp(addr):
++        _live_cdp_attempts.append(str(addr))
++        raise ConnectionRefusedError("test suite: the live browser's CDP port is walled off")
++    return _real_create_connection(addr, *a, **k)
++
++
++_socket.socket.connect = _walled_connect
++_socket.create_connection = _walled_create_connection
++
++
++@pytest.fixture(autouse=True)
++def _no_live_browser():
++    _live_cdp_attempts.clear()
++    yield
++    assert not _live_cdp_attempts, (
++        f"test reached the live browser's CDP port {_live_cdp_attempts}; "
++        "stub browser_degraded/find_target/_create_tab/_http instead")
+diff --git a/tests/test_agent_send_submit.py b/tests/test_agent_send_submit.py
+index a727099..ca48109 100644
+--- a/tests/test_agent_send_submit.py
++++ b/tests/test_agent_send_submit.py
+@@ -19,11 +19,12 @@ Two causes, both proven at the byte level against a reader pane on 2026-09-24:
+ After the fix the same reader saw `b'line one\\nline two\\nline three'` and, 275 ms
+ later, a separate `b'\\r'`.
+ """
++import os
+ import sys
+ 
+ import pytest
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import agent_control as ac  # noqa: E402
+ 
+diff --git a/tests/test_agent_watch_parked_agent.py b/tests/test_agent_watch_parked_agent.py
+index b22303e..173aa8e 100644
+--- a/tests/test_agent_watch_parked_agent.py
++++ b/tests/test_agent_watch_parked_agent.py
+@@ -13,10 +13,11 @@ things in the pane reader combined to produce that loop:
+ 
+ These pin all three, and the control cases that keep them narrow.
+ """
++import os
+ import sys
+ import time
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import agent_watch as aw  # noqa: E402
+ 
+diff --git a/tests/test_autonomy_cycle_e2e.py b/tests/test_autonomy_cycle_e2e.py
+new file mode 100644
+index 0000000..0126a58
+--- /dev/null
++++ b/tests/test_autonomy_cycle_e2e.py
+@@ -0,0 +1,397 @@
++"""The autonomy loop end to end, in a sandbox, through the companion's real delivery path.
++
++    owner spec → dispatch → agent → checks → review event → wake decision →
++    route resolution → companion tick → composer submit + verification → ack →
++    reviewer decision → next task (continuation) → … → project done → watchdog quiet
++    plus: agent stage_done doorbell → wake → delivery; failure → retry; companion restart;
++    duplicate doorbells and duplicate decisions.
++
++test_fullcycle_e2e.py already proves the engine loop, but it records the browser leg by
++hand (`wb.record_delivery`). Here the leg is the production code: tools/wake_companion.tick
++→ tools/cdp_composer.submit_phrase (claim, latch, verify, record) → wb.acknowledge, with
++wake_routes resolving the chat per project.
++
++REAL: temp control-plane / agent-control DBs (conftest + fixture), a private tmux socket,
++the fake agent, task contracts, git in the fixture repo, wake_bridge, wake_routes,
++cdp_composer, wake_companion.tick, tools/stage_done.main, closed_loop_wake.slo_scan.
++MOCKED: the ChatGPT page (a fake CDP session; nothing is typed into a browser), the GPT
++reviewer (it answers only reviews whose wake was verifiably delivered), the LLM agent.
++No live DB, pane, chat, Telegram or production job is touched.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++import os
++import shutil
++import sys
++
++import pytest
++
++from core import task_contract as tc
++from core import wake_bridge as wb
++from core import wake_routes as wr
++from core.control_plane import api as cp
++from core.fullcycle import engine as fe
++from core.fullcycle import spec as specs
++
++_ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
++sys.path.insert(0, os.path.join(_ROOT, "tests", "fixtures", "fullcycle_demo"))
++import harness as h  # noqa: E402
++
++
++def _load(name, rel):
++    spec = importlib.util.spec_from_file_location(name, os.path.join(_ROOT, rel))
++    mod = importlib.util.module_from_spec(spec)
++    sys.modules[name] = mod
++    spec.loader.exec_module(mod)
++    return mod
++
++
++# The fake CDP session the delivery-verification tests use; it also loads cdp_composer
++# from THIS checkout into sys.modules, which is where the companion imports it from.
++_twdv = _load("_twdv_for_cycle", "tests/test_wake_delivery_verification.py")
++cdp = _twdv.cdp
++_FakePage = _twdv._S
++
++pytestmark = pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not installed")
++
++PROJECT_CHAT = "https://chatgpt.com/c/sandbox-tinycalc-chat"
++OWNEROS_CHAT = "https://chatgpt.com/c/sandbox-owneros-chat"
++
++
++class _Browser:
++    """The ChatGPT side: a fake page per submission. `fail_next` makes the next N
++    submissions fail before anything is typed (send never enabled), which leaves the
++    wake unlatched and retryable."""
++
++    def __init__(self, monkeypatch):
++        self.submissions = []          # (conversation, phrase)
++        self.fail_next = 0
++        self.latch_only = 0
++        self._turns = 0
++        self._asst = 0
++        # Sandbox wall: the composer's only ways to the real browser are `_http` (CDP
++        # HTTP on 127.0.0.1:9222) and websocket connects. Both raise here, so no code
++        # path in this file can open, close or type into a live tab.
++        self.live_attempts = []        # the composer swallows errors; the fixture checks this
++
++        def _no_live_browser(*a, **k):
++            self.live_attempts.append(repr(a)[:200])
++            raise AssertionError("sandbox: live CDP access attempted")
++        monkeypatch.setattr(cdp, "_http", _no_live_browser)
++        import websocket
++        monkeypatch.setattr(websocket, "create_connection", _no_live_browser)
++        # ...and process-wide, so even another copy of the composer module (other test
++        # files load their own) cannot reach the browser's debugging port.
++        import urllib.request
++        real_urlopen = urllib.request.urlopen
++
++        def _guarded_urlopen(req, *a, **k):
++            url = getattr(req, "full_url", req)
++            if ":9222" in str(url):
++                self.live_attempts.append(str(url)[:200])
++                raise AssertionError(f"sandbox: live CDP access attempted ({url})")
++            return real_urlopen(req, *a, **k)
++        monkeypatch.setattr(urllib.request, "urlopen", _guarded_urlopen)
++        monkeypatch.setattr(cdp, "browser_degraded", self._degraded)
++        monkeypatch.setattr(cdp, "page_responsive", lambda t, timeout=8.0: True)
++        monkeypatch.setattr(cdp, "find_target", self._find)
++        monkeypatch.setattr(cdp, "_Session", self._session)
++        self._url = ""
++
++    def _find(self, url):
++        self._url = url
++        return {"webSocketDebuggerUrl": "ws://sandbox"}
++
++    def _degraded(self, *a, **k):
++        # A pre-send failure: the browser is refused before anything is typed or
++        # claimed, so the wake must stay pending and be retried.
++        if self.fail_next:
++            self.fail_next -= 1
++            return {"degraded": True, "reason": "too_many_pages:13"}
++        return {"degraded": False}
++
++    def _session(self, ws):
++        if self.latch_only:
++            # The page TOOK the phrase (composer cleared) but no user turn ever renders.
++            self.latch_only -= 1
++            page = _FakePage([True, True, True, True], [self._turns] * 40)
++            orig = page.call
++
++            def call(method, params=None):
++                if method == "Input.insertText":
++                    self.submissions.append((self._url, (params or {}).get("text")))
++                return orig(method, params)
++            page.call = call
++            return page
++        page = _FakePage([True, True, True, True], [self._turns, self._turns + 1])
++        self._turns += 1
++        self._asst += 1
++        orig, orig_count = page.call, page.count
++
++        state = {"answered": False}
++
++        def count(selector):
++            # the reply arrives whole: no streaming; one more assistant turn once our
++            # message was sent (the composer's start + settle checks see a real answer)
++            if selector == cdp.STREAMING_SEL:
++                return 0
++            if selector == cdp.ASSISTANT_TURN_SEL:
++                return self._asst + (1 if state["answered"] else 0)
++            return orig_count(selector)
++        page.count = count
++
++        def call(method, params=None):
++            if method == "Input.insertText":
++                self.submissions.append((self._url, (params or {}).get("text")))
++                state["answered"] = True   # ChatGPT answers the turn we just sent
++            return orig(method, params)
++        page.call = call
++        return page
++
++
++@pytest.fixture
++def cycle(tmp_path, monkeypatch):
++    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
++    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
++    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "1")
++    monkeypatch.setenv("WAKE_BRIDGE_KILL_SWITCH", "0")
++    # no owner push from the sandbox, whatever the parent environment holds
++    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
++    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
++    # sandbox pacing: no global cooldown or backoff between the test's own wakes
++    for knob in ("COOLDOWN_SECS", "ACTIONABLE_COOLDOWN_SECS", "RETRY_BACKOFF_SECS",
++                 "TRANSIENT_RETRY_BACKOFF_SECS"):
++        monkeypatch.setattr(wb, knob, 0)
++    import time as _time
++    real_sleep = _time.sleep
++    monkeypatch.setattr(cdp.time, "sleep", lambda *_a, **_k: None)
++    assert wr.bind_route("owner-os", OWNEROS_CHAT, by="test")["ok"]
++    assert wr.bind_route("tinycalc", PROJECT_CHAT, by="test")["ok"]
++    # The companion does `from cdp_composer import submit_phrase`; other test files
++    # replace sys.modules["cdp_composer"] with their own copy at collection time, so pin
++    # the patched one here or the companion would drive an unpatched composer.
++    monkeypatch.setitem(sys.modules, "cdp_composer", cdp)
++    browser = _Browser(monkeypatch)
++    companion = _load("wake_companion", "tools/wake_companion.py")
++    root = h.make_project(str(tmp_path))
++    specs.create_project("tinycalc", name="tinycalc", root=root, executor="fixture")
++    specs.put_spec("tinycalc", h.load_spec(), by="test")
++    a, log = h.make_adapter(str(tmp_path), root, {})
++    engine = fe.Engine("tinycalc", a, max_attempts=3, holder="sandbox")
++    yield {"engine": engine, "adapter": a, "log": log, "root": root, "browser": browser,
++           "companion": companion, "tmp": tmp_path, "sleep": real_sleep}
++    a.kill()
++    assert browser.live_attempts == [], browser.live_attempts
++
++
++def _deliveries(eid=None):
++    conn, _ = cp._c(None)
++    try:
++        q = "SELECT event_id, delivered, reason FROM wake_delivery"
++        rows = conn.execute(q + (" WHERE event_id=?" if eid else "") + " ORDER BY id",
++                            (eid,) if eid else ()).fetchall()
++    finally:
++        conn.close()
++    return rows
++
++
++def _woken_reviewer(c, seen, *, next_tasks=None):
++    """One reviewer turn: deliver whatever the bridge has pending through the companion,
++    then answer only the reviews whose wake was VERIFIABLY delivered."""
++    r = c["companion"].tick(wb)
++    delivered = {r["event_id"]} if r.get("acted") and r.get("ok") else set()
++    for rv in fe.pending_reviews("tinycalc"):
++        if rv["event_id"] not in delivered and rv["event_id"] not in seen["delivered"]:
++            continue
++        seen["delivered"].add(rv["event_id"])
++        key = rv["payload"].get("task") or rv["task_id"].split(":", 1)[1]
++        fe.ack_review(rv["review_id"], by="sandbox-gpt")
++        choice = "add_tasks" if rv["kind"] == "project" else "approve"
++        res = fe.submit_decision(rv["review_id"], choice, key=f"gpt:{rv['review_id']}",
++                                 by="sandbox-gpt",
++                                 next_tasks=next_tasks if choice == "add_tasks" else None)
++        seen["decisions"].append((key, rv["kind"], choice, res.get("ok"), rv["review_id"]))
++    return r
++
++
++def _run_cycle(c, seen, *, until, timeout=60, next_tasks=None):
++    import time
++    end = time.time() + timeout
++    while time.time() < end:
++        c["engine"].tick()
++        _woken_reviewer(c, seen, next_tasks=next_tasks)
++        st = c["engine"].status()
++        if until(st):
++            return st
++        c["sleep"](0.15)
++    conn, _ = cp._c(None)
++    dbg = conn.execute("SELECT id, kind, decision, applied FROM fc_review").fetchall()
++    ev = conn.execute("SELECT id, type, substr(payload,1,160) FROM event ORDER BY id").fetchall()
++    conn.close()
++    raise AssertionError(f"timeout: {c['engine'].status()} seen={seen} reviews={dbg} ev={ev}")
++
++
++# ── the whole loop through the real delivery path ───────────────────────────
++def test_spec_to_done_every_review_reaches_the_project_chat_verified(cycle):
++    c = cycle
++    seen = {"delivered": set(), "decisions": []}
++    st = _run_cycle(c, seen, until=lambda s: s["done"], next_tasks=[h.CLI_TASK])
++
++    assert [(t["key"], t["state"]) for t in st["tasks"]] == [
++        ("add", tc.VERIFIED_DONE), ("mul", tc.VERIFIED_DONE), ("cli", tc.VERIFIED_DONE)]
++    # continuation: each next task was decided only after its predecessor's wake landed
++    assert [(k, ch) for k, _, ch, ok, _ in seen["decisions"] if ok] == [
++        ("add", "approve"), ("mul", "approve"), ("__project__", "add_tasks"), ("cli", "approve")]
++    # every wake went to the PROJECT's chat (route resolution), none to owner-os
++    urls = {u for u, _ in c["browser"].submissions}
++    assert urls == {PROJECT_CHAT}, urls
++    # every reviewed event was delivered exactly once, verified, and then acknowledged
++    for eid in seen["delivered"]:
++        rows = _deliveries(eid)
++        assert [d for _, d, _ in rows] == [1], (eid, rows)
++    assert not wb.pending_wake().get("pending")
++    # one prompt per task reached the agent: no stale or duplicate wake re-dispatched
++    assert [x["task_id"] for x in h.agent_log(c["log"])] == [
++        "tinycalc:add", "tinycalc:mul", "tinycalc:cli"]
++
++
++def test_a_failed_delivery_is_retried_and_the_review_waits_for_it(cycle):
++    c = cycle
++    c["browser"].fail_next = 2
++    seen = {"delivered": set(), "decisions": []}
++    h.wait_for(lambda: c["engine"].tick() and fe.pending_reviews("tinycalc"), 20, step=0.15)
++    (rv,) = fe.pending_reviews("tinycalc")
++    eid = rv["event_id"]
++
++    r1 = _woken_reviewer(c, seen)
++    r2 = _woken_reviewer(c, seen)
++    assert (r1.get("ok"), r2.get("ok")) == (False, False), (r1, r2, _deliveries())
++    assert seen["decisions"] == []                 # nobody acted on an undelivered wake
++    assert wb.pending_wake()["event_id"] == eid    # still pending, not consumed
++    r3 = _woken_reviewer(c, seen)
++    assert r3["ok"] and r3["event_id"] == eid, [x.get("reason") for x in (r1, r2, r3)]
++    assert [d for _, d, _ in _deliveries(eid)] == [0, 0, 1]
++    assert seen["decisions"][0][:3] == ("add", "review", "approve")
++
++
++def test_a_restarted_companion_never_redelivers_an_acknowledged_wake(cycle):
++    c = cycle
++    seen = {"delivered": set(), "decisions": []}
++    h.wait_for(lambda: c["engine"].tick() and fe.pending_reviews("tinycalc"), 20, step=0.15)
++    assert _woken_reviewer(c, seen)["ok"]
++    n = len(c["browser"].submissions)
++    restarted = _load("wake_companion", "tools/wake_companion.py")   # a fresh process
++    for _ in range(3):
++        assert restarted.tick(wb)["acted"] is False
++    assert len(c["browser"].submissions) == n
++    # the reviewer answering the same review again (it was woken twice) is harmless
++    rid = seen["decisions"][0][4]
++    again = fe.submit_decision(rid, "approve", key=f"gpt:{rid}", by="sandbox-gpt")
++    other = fe.submit_decision(rid, "reject", key=f"gpt:{rid}:2", by="sandbox-gpt",
++                               feedback="second thoughts")
++    assert again.get("duplicate") and other.get("reason") == "review_already_decided"
++
++
++def test_a_taken_but_unverified_wake_is_never_resent_and_its_watch_is_bounded(cycle):
++    """The page took the phrase (latched) but no user turn rendered. Resending would
++    duplicate the turn; instead the SLO watchdog re-wakes ONCE, escalates ONCE, then
++    stays quiet — no unbounded loop."""
++    from core import closed_loop_wake as clw
++    from core.control_plane.store import now_ts
++    c = cycle
++    c["browser"].latch_only = 1
++    seen = {"delivered": set(), "decisions": []}
++    h.wait_for(lambda: c["engine"].tick() and fe.pending_reviews("tinycalc"), 20, step=0.15)
++    eid = fe.pending_reviews("tinycalc")[0]["event_id"]
++    r = _woken_reviewer(c, seen)
++    assert r["ok"] is False and r["event_id"] == eid
++    assert seen["decisions"] == []
++    sent = len(c["browser"].submissions)
++    for _ in range(3):                                   # latched: never typed again
++        c["companion"].tick(wb)
++    assert len(c["browser"].submissions) == sent == 1
++    emitted = []
++
++    def emit(source, type_, **kw):
++        emitted.append(type_)
++        return {"event_id": 10_000 + len(emitted)}
++    t0 = now_ts()
++    for hours in (2, 4, 6, 8, 24):
++        clw.slo_scan(now=t0 + hours * 3600, emit_fn=emit)
++    conn, _ = cp._c(None)
++    watch = conn.execute("SELECT event_id, rewoken, escalated FROM wake_loop_watch").fetchall()
++    conn.close()
++    assert watch == [(eid, 1, 1)]
++    # exactly one re-wake and one escalation over 24h of scans, then silence
++    assert emitted == ["wake_loop_no_progress", "wake_loop_stalled"], emitted
++
++
++# ── the agent's doorbell ────────────────────────────────────────────────────
++def _stage_done(c, monkeypatch, *argv):
++    monkeypatch.setenv("OWNEROS_AGENT_TARGET", "sandbox-agent:0.0")
++    monkeypatch.setenv("AGENT_AUTOMATION_TARGETS", "sandbox-agent")
++    monkeypatch.delenv("TMUX_PANE", raising=False)
++    sd = _load("stage_done_sandbox", "tools/stage_done.py")
++    import contextlib
++    import io
++    buf = io.StringIO()
++    with contextlib.redirect_stdout(buf):
++        rc = sd.main(["--cwd", c["root"], *argv])
++    return rc, json.loads(buf.getvalue().strip().splitlines()[-1])
++
++
++def test_stage_done_wakes_the_tech_lead_once_and_is_delivered_verified(cycle, monkeypatch):
++    c = cycle
++    rc, out = _stage_done(c, monkeypatch, "--summary", "stage 1 done", "--ref", "b@abc",
++                          "--tests", "3 passed", "--next", "review abc")
++    assert rc == 0 and out["ok"], out
++    assert out["wake"]["decision"] == "wake", out
++    eid = out["event_id"]
++    p = wb.pending_wake()
++    assert p["pending"] and p["event_id"] == eid
++    r = c["companion"].tick(wb)
++    assert r["ok"] and r["event_id"] == eid
++    assert r["conversation"] in (PROJECT_CHAT, OWNEROS_CHAT)
++    assert [d for _, d, _ in _deliveries(eid)] == [1]
++    # the same doorbell again (agent retried the command) does not re-wake
++    rc2, out2 = _stage_done(c, monkeypatch, "--summary", "stage 1 done", "--ref", "b@abc",
++                            "--tests", "3 passed", "--next", "review abc")
++    assert rc2 == 0
++    assert not wb.pending_wake().get("pending")
++    assert c["companion"].tick(wb)["acted"] is False
++    assert len([s for s in c["browser"].submissions if f"event={eid}" in (s[1] or "")]) == 1
++
++
++def test_stage_done_refuses_an_agent_without_autonomy(cycle, monkeypatch):
++    c = cycle
++    monkeypatch.setenv("OWNEROS_AGENT_TARGET", "unpermitted-agent:0.0")
++    monkeypatch.setenv("AGENT_AUTOMATION_TARGETS", "someone-else")
++    sd = _load("stage_done_sandbox", "tools/stage_done.py")
++    import contextlib
++    import io
++    buf = io.StringIO()
++    with contextlib.redirect_stdout(buf):
++        rc = sd.main(["--cwd", c["root"], "--summary", "x"])
++    assert rc == 3 and json.loads(buf.getvalue())["reason"] == "agent_not_permitted_for_autonomy"
++    assert not wb.pending_wake().get("pending")
++
++
++# ── watchdog after the project is settled ───────────────────────────────────
++def test_a_finished_project_leaves_the_watchdog_quiet(cycle):
++    from core import closed_loop_wake as clw
++    from core.control_plane.store import now_ts
++    c = cycle
++    seen = {"delivered": set(), "decisions": []}
++    _run_cycle(c, seen, until=lambda s: s["done"], next_tasks=[h.CLI_TASK])
++    emitted = []
++    out = clw.slo_scan(now=now_ts() + 7 * 24 * 3600,
++                       emit_fn=lambda *a, **k: emitted.append((a, k)) or {"event_id": 0})
++    assert emitted == [], (out, emitted)
++    # and the finished engine stays finished: more ticks emit nothing, deliver nothing
++    n = len(c["browser"].submissions)
++    for _ in range(3):
++        c["engine"].tick()
++        assert c["companion"].tick(wb)["acted"] is False
++    assert len(c["browser"].submissions) == n
+diff --git a/tests/test_branch_isolation.py b/tests/test_branch_isolation.py
+index cbd5d7b..0dbfe0d 100644
+--- a/tests/test_branch_isolation.py
++++ b/tests/test_branch_isolation.py
+@@ -6,11 +6,12 @@ repository, so base resolution fell through to the *current workspace branch* 
+ whichever branch the previous job happened to leave checked out.
+ """
+ import subprocess
++import os
+ import sys
+ 
+ import pytest
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import git_write  # noqa: E402
+ 
+diff --git a/tests/test_cdp_composer.py b/tests/test_cdp_composer.py
+index 9ae0af8..f49226f 100644
+--- a/tests/test_cdp_composer.py
++++ b/tests/test_cdp_composer.py
+@@ -10,7 +10,7 @@ import os as _os
+ _os.environ.setdefault("WAKE_ASSISTANT_SETTLE_SECS", "0")
+ 
+ spec = importlib.util.spec_from_file_location(
+-    "cdp_composer", "/root/ai-dev-runtime/tools/cdp_composer.py")
++    "cdp_composer", _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.realpath(__file__))), "tools", "cdp_composer.py"))
+ cdp = importlib.util.module_from_spec(spec)
+ sys.modules["cdp_composer"] = cdp
+ spec.loader.exec_module(cdp)
+@@ -110,6 +110,9 @@ class _S:
+         pass
+ 
+ 
++_REAL_RECOVER_WEDGED_TAB = cdp.recover_wedged_tab
++
++
+ @pytest.fixture(autouse=True)
+ def _no_waiting(monkeypatch):
+     """The delivery poll sleeps a second per attempt. Nothing here is about wall-clock."""
+@@ -131,6 +134,12 @@ def wired(monkeypatch):
+         monkeypatch.setattr(cdp, "find_target",
+                             lambda url: {"webSocketDebuggerUrl": "ws://x"})
+         monkeypatch.setattr(cdp, "_Session", lambda ws: s)
++        # The composer-absent case triggers tab recovery, whose `_create_tab` opened a REAL
++        # tab on chatgpt.com/c/a in the live browser on every suite run (2026-11-01).
++        # These tests are about the refusal; recovery has its own tests.
++        # A test that installs its own recovery spy first keeps it.
++        if cdp.recover_wedged_tab is _REAL_RECOVER_WEDGED_TAB:
++            monkeypatch.setattr(cdp, "recover_wedged_tab", lambda target, url: None)
+         return s
+     return _mk
+ 
+diff --git a/tests/test_closed_loop_wake.py b/tests/test_closed_loop_wake.py
+index dc6944b..a4a434e 100644
+--- a/tests/test_closed_loop_wake.py
++++ b/tests/test_closed_loop_wake.py
+@@ -7,6 +7,7 @@ wait, jobhunter child workflow wait, all three live at once).
+ """
+ from __future__ import annotations
+ 
++import os
+ import sqlite3
+ 
+ import pytest
+@@ -1227,7 +1228,7 @@ def test_a_row_predating_the_route_column_still_scans():
+ 
+ def test_the_companion_passes_project_and_route_separately():
+     """The third link: the companion must forward both, not substitute one for the other."""
+-    src = open("/root/ai-dev-runtime/tools/wake_companion.py", encoding="utf-8").read()
++    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tools", "wake_companion.py"), encoding="utf-8").read()
+     call = src[src.index("closed_loop_wake.register_delivery("):][:400]
+     assert 'project_id=p.get("project_id"' in call
+     assert 'route_key=p.get("route_key"' in call
+diff --git a/tests/test_continuation_governor.py b/tests/test_continuation_governor.py
+index afaf7d2..f1fec33 100644
+--- a/tests/test_continuation_governor.py
++++ b/tests/test_continuation_governor.py
+@@ -1045,7 +1045,7 @@ def test_the_paused_project_has_live_actuation_off_in_the_registry():
+     """Third gate. The autopilot registry drives ordinary pokes independently of the
+     governor, and it had live_actuation: true for this project."""
+     import yaml as _y
+-    reg = _y.safe_load(open("/root/ai-dev-runtime/config/commander_autopilot.yaml",
++    reg = _y.safe_load(open(os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "config", "commander_autopilot.yaml"),
+                             encoding="utf-8")) or {}
+     agents = reg.get("agents") or reg.get("projects") or reg
+     entry = agents.get("arbitrage2-opus:0.0") or {}
+diff --git a/tests/test_core.py b/tests/test_core.py
+index 6637fa6..33038f6 100644
+--- a/tests/test_core.py
++++ b/tests/test_core.py
+@@ -10,7 +10,7 @@ import json
+ import pytest
+ 
+ # добавляем корень проекта в path
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core.file_engine import FileEngine
+ from core.safety import approve_action, validate_file_operation
+diff --git a/tests/test_job_base_ref.py b/tests/test_job_base_ref.py
+new file mode 100644
+index 0000000..534cef9
+--- /dev/null
++++ b/tests/test_job_base_ref.py
+@@ -0,0 +1,154 @@
++"""Task 326: a runtime job for /root/ai-dev-runtime was built on `main`, 449 commits
++behind and not an ancestor of the line the project runs, because the live branch is
++named like a runtime work branch and the API's "master" placeholder resolves nowhere.
++
++resolve_job_base(): explicit base -> project's configured base_ref -> legacy guess,
++always with the exact SHA. A configured ref that does not resolve blocks; with
++RUNTIME_STRICT_BASE_REF on, so does an unresolvable explicit base and a stale or
++diverged guess. With no config and the flag off it returns what resolve_base_branch
++returned before (contract preserved)."""
++import subprocess
++
++import pytest
++
++from core import git_write
++
++
++def _git(path, *args):
++    return subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t"]
++                          + list(args), check=True, capture_output=True, text=True).stdout.strip()
++
++
++_SEQ = iter(range(10**6))
++
++
++def _commit(path, n=1):
++    # Unique messages: identical empty commits made in the same second hash the
++    # same, which would silently make two "different" branches share history.
++    for _ in range(n):
++        _git(path, "commit", "-q", "--allow-empty", "-m", f"c{next(_SEQ)}")
++
++
++def _task326_repo(tmp_path, ahead=5):
++    """main, then a deployed line on an ai-runtime/ branch that main lacks."""
++    repo = tmp_path / "r"
++    repo.mkdir()
++    _git(repo, "init", "-q", "-b", "main")
++    _commit(repo)
++    _git(repo, "checkout", "-q", "-b", "ai-runtime/220-windows-bridge")
++    _commit(repo, ahead)
++    _git(repo, "checkout", "-q", "main")
++    _commit(repo)                       # main has its own commit: not an ancestor
++    _git(repo, "checkout", "-q", "ai-runtime/220-windows-bridge")
++    return repo
++
++
++@pytest.fixture(autouse=True)
++def _clean_env(monkeypatch, tmp_path):
++    monkeypatch.delenv("RUNTIME_STRICT_BASE_REF", raising=False)
++    monkeypatch.delenv("RUNTIME_BASE_STALE_MAX", raising=False)
++    monkeypatch.setenv("RUNTIME_BASE_REFS_CONFIG", str(tmp_path / "absent.yaml"))
++
++
++def _config(tmp_path, monkeypatch, project, ref):
++    p = tmp_path / "refs.yaml"
++    p.write_text(f"projects:\n  {project}:\n    base_ref: {ref}\n")
++    monkeypatch.setenv("RUNTIME_BASE_REFS_CONFIG", str(p))
++
++
++# ── contract preserved ──────────────────────────────────────────────────────
++def test_without_config_or_flag_the_legacy_guess_is_unchanged(tmp_path):
++    repo = _task326_repo(tmp_path)
++    for explicit in (None, "master", "nope"):
++        got = git_write.resolve_job_base(str(repo), explicit)
++        assert got["ref"] == git_write.resolve_base_branch(str(repo), explicit) == "main"
++        assert got["source"] == "guess"
++        assert got["sha"] == _git(repo, "rev-parse", "main")
++
++
++def test_a_real_explicit_branch_still_wins(tmp_path):
++    repo = _task326_repo(tmp_path)
++    _git(repo, "branch", "feature-x", "main")
++    got = git_write.resolve_job_base(str(repo), "feature-x")
++    assert (got["ref"], got["source"]) == ("feature-x", "explicit")
++
++
++def test_the_master_placeholder_is_not_an_explicit_choice(tmp_path, monkeypatch):
++    repo = _task326_repo(tmp_path)
++    _git(repo, "branch", "master", "main")
++    _config(tmp_path, monkeypatch, repo, "ai-runtime/220-windows-bridge")
++    assert git_write.resolve_job_base(str(repo), "master")["source"] == "config"
++
++
++# ── configured base_ref ─────────────────────────────────────────────────────
++def test_the_configured_base_ref_beats_the_stale_guess_and_carries_its_sha(tmp_path, monkeypatch):
++    repo = _task326_repo(tmp_path)
++    _config(tmp_path, monkeypatch, repo, "ai-runtime/220-windows-bridge")
++    got = git_write.resolve_job_base(str(repo), "master")
++    assert got == {"ref": "ai-runtime/220-windows-bridge",
++                   "sha": _git(repo, "rev-parse", "HEAD"), "source": "config"}
++
++
++def test_a_configured_sha_pins_the_base(tmp_path, monkeypatch):
++    repo = _task326_repo(tmp_path)
++    sha = _git(repo, "rev-parse", "HEAD~2")
++    _config(tmp_path, monkeypatch, repo, sha)
++    assert git_write.resolve_job_base(str(repo), None)["sha"] == sha
++
++
++def test_a_configured_ref_that_does_not_resolve_blocks_never_falls_back(tmp_path, monkeypatch):
++    repo = _task326_repo(tmp_path)
++    _config(tmp_path, monkeypatch, repo, "gone-branch")
++    with pytest.raises(git_write.BaseRefBlocked, match="gone-branch"):
++        git_write.resolve_job_base(str(repo), None)
++
++
++def test_another_projects_config_does_not_apply(tmp_path, monkeypatch):
++    repo = _task326_repo(tmp_path)
++    _config(tmp_path, monkeypatch, "/some/other/project", "ai-runtime/220-windows-bridge")
++    assert git_write.resolve_job_base(str(repo), None)["ref"] == "main"
++
++
++# ── strict mode ─────────────────────────────────────────────────────────────
++def test_strict_blocks_the_task326_guess(tmp_path, monkeypatch):
++    repo = _task326_repo(tmp_path)
++    monkeypatch.setenv("RUNTIME_STRICT_BASE_REF", "1")
++    with pytest.raises(git_write.BaseRefBlocked, match="not an ancestor"):
++        git_write.resolve_job_base(str(repo), "master")
++
++
++def test_strict_blocks_a_guess_far_behind_head(tmp_path, monkeypatch):
++    repo = tmp_path / "r"
++    repo.mkdir()
++    _git(repo, "init", "-q", "-b", "main")
++    _commit(repo)
++    _git(repo, "checkout", "-q", "-b", "ai-runtime/live")
++    _commit(repo, 4)
++    monkeypatch.setenv("RUNTIME_STRICT_BASE_REF", "1")
++    monkeypatch.setenv("RUNTIME_BASE_STALE_MAX", "3")
++    with pytest.raises(git_write.BaseRefBlocked, match="4 commits behind"):
++        git_write.resolve_job_base(str(repo), None)
++    monkeypatch.setenv("RUNTIME_BASE_STALE_MAX", "4")
++    assert git_write.resolve_job_base(str(repo), None)["ref"] == "main"
++
++
++def test_strict_accepts_a_current_guess(tmp_path, monkeypatch):
++    repo = tmp_path / "r"
++    repo.mkdir()
++    _git(repo, "init", "-q", "-b", "main")
++    _commit(repo)
++    monkeypatch.setenv("RUNTIME_STRICT_BASE_REF", "1")
++    assert git_write.resolve_job_base(str(repo), None)["ref"] == "main"
++
++
++def test_strict_blocks_an_explicit_base_that_does_not_resolve(tmp_path, monkeypatch):
++    repo = _task326_repo(tmp_path)
++    monkeypatch.setenv("RUNTIME_STRICT_BASE_REF", "1")
++    with pytest.raises(git_write.BaseRefBlocked, match="'nope'"):
++        git_write.resolve_job_base(str(repo), "nope")
++
++
++def test_the_shipped_config_names_no_project(monkeypatch):
++    # Promoting this code must not change any live job's base by itself.
++    monkeypatch.delenv("RUNTIME_BASE_REFS_CONFIG", raising=False)
++    assert git_write.configured_base_ref("/root/ai-dev-runtime") is None
+diff --git a/tests/test_job_kind_pipeline.py b/tests/test_job_kind_pipeline.py
+index c690749..661b3de 100644
+--- a/tests/test_job_kind_pipeline.py
++++ b/tests/test_job_kind_pipeline.py
+@@ -17,7 +17,7 @@ import tempfile
+ 
+ import pytest
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import ai_planner, job_executor, job_kinds, job_store  # noqa: E402
+ 
+diff --git a/tests/test_job_kinds.py b/tests/test_job_kinds.py
+index 9c2a53a..2d3e63d 100644
+--- a/tests/test_job_kinds.py
++++ b/tests/test_job_kinds.py
+@@ -4,7 +4,7 @@ import sys
+ 
+ import pytest
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import job_kinds, job_validation  # noqa: E402
+ 
+diff --git a/tests/test_no_live_tree_imports.py b/tests/test_no_live_tree_imports.py
+new file mode 100644
+index 0000000..09a4aa8
+--- /dev/null
++++ b/tests/test_no_live_tree_imports.py
+@@ -0,0 +1,95 @@
++"""Code under test must import from its OWN checkout, never from the live tree.
++
++Runtime job #136 (task 326) ran the suite in an isolated worktree of `main` and got
++30 failures in test_cdp_composer / test_wake_assistant_proof /
++test_wake_delivery_verification. The job's only change was one Markdown plan file.
++Cause: tools/wake_companion.py, tools/cdp_composer.py, hooks/owneros_hook.py and
++several tests prepended the hard-coded live repo path to sys.path, so once any of them
++was imported, every not-yet-imported module (core.wake_bridge, cdp_composer, ...)
++resolved to the live, possibly newer and dirty, tree. Old tests then exercised new
++code. Production is unaffected by resolving the root from __file__: every entrypoint
++(systemd unit, Claude hooks) runs the file in place under /root/ai-dev-runtime.
++"""
++from __future__ import annotations
++
++import os
++import re
++import subprocess
++import sys
++
++_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++_LIVE = "/root/ai-dev-runtime"
++_INSERT_LIVE = re.compile(r"""sys\.path\.insert\(\s*0\s*,\s*["']/root/ai-dev-runtime""")
++
++
++def _py_files():
++    for sub in ("api", "cli", "core", "hooks", "integrations", "runtime", "tools", "tests"):
++        base = os.path.join(_ROOT, sub)
++        for dirpath, _dirs, files in os.walk(base):
++            for f in files:
++                if f.endswith(".py"):
++                    yield os.path.join(dirpath, f)
++
++
++def test_no_source_file_puts_the_live_tree_on_sys_path():
++    offenders = []
++    for path in _py_files():
++        with open(path, encoding="utf-8", errors="replace") as fh:
++            for n, line in enumerate(fh, 1):
++                if _INSERT_LIVE.search(line):
++                    offenders.append(f"{os.path.relpath(path, _ROOT)}:{n}")
++    assert offenders == [], "hard-coded live-tree sys.path inserts: " + ", ".join(offenders)
++
++
++# A test that loads a module or config by absolute live path (spec_from_file_location,
++# open(), subprocess of the hook) tests the live tree, not the change under review:
++# job #136's test_wake_delivery_verification loaded the live cdp_composer.py this way.
++_LIVE_SOURCE = re.compile(
++    r"""["']/root/ai-dev-runtime/(tools|core|hooks|api|cli|config|runtime|integrations)/[^"']*\.(py|ya?ml)["']""")
++
++
++def test_no_test_loads_code_or_config_from_the_live_tree():
++    offenders = []
++    tests_dir = os.path.join(_ROOT, "tests")
++    for f in sorted(os.listdir(tests_dir)):
++        if not f.endswith(".py"):
++            continue
++        with open(os.path.join(tests_dir, f), encoding="utf-8", errors="replace") as fh:
++            for n, line in enumerate(fh, 1):
++                if _LIVE_SOURCE.search(line) and not line.lstrip().startswith("#"):
++                    offenders.append(f"tests/{f}:{n}")
++    assert offenders == [], "tests load live-tree source: " + ", ".join(offenders)
++
++
++def _probe(code: str) -> str:
++    env = dict(os.environ)
++    env.pop("PYTHONPATH", None)
++    out = subprocess.run([sys.executable, "-I", "-c", code], cwd=_ROOT, env=env,
++                         capture_output=True, text=True, timeout=60)
++    assert out.returncode == 0, out.stderr
++    return out.stdout.strip()
++
++
++def test_importing_the_companion_resolves_core_from_this_checkout():
++    got = _probe(
++        "import sys; sys.path[:0] = [%r, %r]\n"
++        "import wake_companion\n"
++        "import core.wake_bridge as wb; print(wb.__file__)" % (_ROOT, os.path.join(_ROOT, "tools"))
++    )
++    assert got.startswith(_ROOT + os.sep), got
++
++
++
++_LIVE_CONST = re.compile(r"""^(\w+)\s*=\s*["']/root/ai-dev-runtime/?["']\s*$""", re.M)
++
++
++def test_no_live_tree_constant_is_put_on_sys_path():
++    # tools/stage_done.py: REPO = "/root/ai-dev-runtime"; sys.path.insert(0, REPO)
++    offenders = []
++    for path in _py_files():
++        with open(path, encoding="utf-8", errors="replace") as fh:
++            src = fh.read()
++        for name in _LIVE_CONST.findall(src):
++            if re.search(r"sys\.path\.insert\(\s*0\s*,\s*%s\b" % re.escape(name), src):
++                offenders.append(f"{os.path.relpath(path, _ROOT)}:{name}")
++    assert offenders == [], "live-tree constants on sys.path: " + ", ".join(offenders)
+diff --git a/tests/test_notify_outcome.py b/tests/test_notify_outcome.py
+index 90b8568..032bf07 100644
+--- a/tests/test_notify_outcome.py
++++ b/tests/test_notify_outcome.py
+@@ -4,11 +4,12 @@ A completion message must let the owner tell an implementation from a plan
+ without opening the repo, and must carry the fields needed to act: job id,
+ title, outcome, branch, commit, test/validation status, short reason, next step.
+ """
++import os
+ import sys
+ 
+ import pytest
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import notify_format as nf  # noqa: E402
+ 
+diff --git a/tests/test_owneros_hook.py b/tests/test_owneros_hook.py
+index 4cf6089..4165505 100644
+--- a/tests/test_owneros_hook.py
++++ b/tests/test_owneros_hook.py
+@@ -14,8 +14,8 @@ import subprocess
+ import sys
+ import tempfile
+ 
+-HOOK = "/root/ai-dev-runtime/hooks/owneros_hook.py"
+-sys.path.insert(0, "/root/ai-dev-runtime")
++HOOK = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "hooks", "owneros_hook.py")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ 
+ def _map(ev, **payload):
+diff --git a/tests/test_planner_fallback.py b/tests/test_planner_fallback.py
+index 1dca38a..17cdb80 100644
+--- a/tests/test_planner_fallback.py
++++ b/tests/test_planner_fallback.py
+@@ -63,6 +63,11 @@ def _git(path, *args):
+                    capture_output=True, text=True)
+ 
+ 
++def _git_out(path, *args):
++    return subprocess.run(["git", "-C", str(path)] + list(args), check=True,
++                          capture_output=True, text=True).stdout.strip()
++
++
+ def _repo(tmp_path, with_tests_dir=False):
+     """A minimal git repo. By default NO tests/ dir and no test config, so the
+     fallback's derived test_commands is [] and the pipeline commits without
+@@ -571,3 +576,189 @@ def test_a_fallback_job_records_no_salvage_artifact(tmp_path, monkeypatch):
+     final = job_store.get_job(job["id"])
+     assert final["status"] == "fallback_plan_only"
+     assert not any(a.get("planner_salvaged_after_timeout") for a in (final["artifacts"] or []))
++
++
++# ── job #136: a pseudo tool call is not a plan ───────────────────────────────
++# Raw planner output of job 703f780d (task 326): with tools disabled the model wrote
++# a tool call in prose. The first JSON object was the tool's arguments, so the job
++# failed as "plan missing 'files' list" — indistinguishable from a broken plan.
++_JOB136_RAW = (
++    "Let me investigate the actual code before proposing changes.\n\n---\n\n"
++    "**Tool: bash**\n\n```json\n{\n  \"command\": \"cd /root/ai-dev-runtime && git log "
++    "--oneline -15\",\n  \"description\": \"Check recent history\"\n}\n```\n"
++)
++
++
++def test_a_pseudo_tool_call_is_reported_as_one_not_as_a_broken_plan():
++    with pytest.raises(ai_planner.PlannerError) as ei:
++        ai_planner._extract_json(_JOB136_RAW)
++    assert "tool call" in str(ei.value)
++
++
++def test_the_plan_object_wins_over_an_earlier_non_plan_object():
++    text = ('Context:\n```json\n{"note": "example", "n": 1}\n```\n\n'
++            '```json\n{"summary": "s", "files": [{"path": "a.py", "operation": "create", '
++            '"content": "x = 1\\n"}]}\n```')
++    obj = ai_planner._extract_json(text)
++    assert obj["summary"] == "s" and obj["files"][0]["path"] == "a.py"
++
++
++def test_a_lone_non_plan_object_still_fails_as_missing_files():
++    obj = ai_planner._extract_json('{"summary": "s"}')
++    with pytest.raises(ai_planner.PlannerError, match="plan missing 'files' list"):
++        ai_planner._validate(obj, [])
++
++
++def test_a_tool_call_answer_blocks_the_job_instead_of_running_a_fallback(tmp_path, monkeypatch):
++    monkeypatch.delenv("RUNTIME_PLANNER_REPLAN", raising=False)
++    repo = _repo(tmp_path)
++    before = sorted(p.name for p in repo.rglob("*") if ".git" not in p.parts)
++    cli, counter = _counting_cli(tmp_path, (
++        "import json, sys\n"
++        f"env = {{'type':'result','subtype':'success','is_error':False,'result':{_JOB136_RAW!r}}}\n"
++        "sys.stdout.write(json.dumps(env))\n"
++    ))
++    _reload(monkeypatch, cli)
++    job = job_store.create_job(project_path=str(repo), goal="g", instructions="investigate first",
++                               task_id=326, autonomy_level="execute_safe",
++                               auto_commit=True, auto_push=False)
++    job_executor.execute(job["id"])
++    final = job_store.get_job(job["id"])
++    assert final["status"] == "blocked", final.get("error")
++    assert final["error"].startswith("planner_tool_call")
++    assert not final.get("plan")                       # no fallback plan was made
++    assert any(a.get("planner_tool_call") for a in final["artifacts"])
++    assert int(open(counter).read()) == 1               # one planning attempt, no retry
++    after = sorted(p.name for p in repo.rglob("*") if ".git" not in p.parts)
++    assert after == before                              # nothing written to the repo
++
++
++# ── task 326: an unusable base blocks the job, it is not guessed ─────────────
++def _valid_plan_cli(tmp_path):
++    plan_json = ('{"summary":"real","files":[{"path":"x.txt","operation":"create",'
++                 '"content":"hi"}],"test_commands":[]}')
++    return _counting_cli(tmp_path, (
++        "import json, sys\n"
++        f"result = {plan_json!r}\n"
++        "sys.stdout.write(json.dumps({'type':'result','subtype':'success','is_error':False,'result':result}))\n"
++    ))
++
++
++def test_a_configured_base_ref_that_does_not_resolve_blocks_the_job(tmp_path, monkeypatch):
++    repo = _repo(tmp_path)
++    cfg = tmp_path / "refs.yaml"
++    cfg.write_text(f"projects:\n  {repo}:\n    base_ref: gone-branch\n")
++    monkeypatch.setenv("RUNTIME_BASE_REFS_CONFIG", str(cfg))
++    cli, _ = _valid_plan_cli(tmp_path)
++    _reload(monkeypatch, cli)
++    job = job_store.create_job(project_path=str(repo), goal="g", instructions="i",
++                               task_id=2, autonomy_level="execute_safe",
++                               auto_commit=True, auto_push=False)
++    job_executor.execute(job["id"])
++    final = job_store.get_job(job["id"])
++    assert final["status"] == "blocked", final.get("error")
++    assert final["error"].startswith("base_ref:") and "gone-branch" in final["error"]
++    assert not (repo / "x.txt").exists()
++    assert _git_out(repo, "branch", "--list", "ai-runtime/*") == ""
++
++
++def test_the_resolved_base_sha_is_logged(tmp_path, monkeypatch):
++    repo = _repo(tmp_path)
++    monkeypatch.setenv("RUNTIME_BASE_REFS_CONFIG", str(tmp_path / "absent.yaml"))
++    cli, _ = _valid_plan_cli(tmp_path)
++    _reload(monkeypatch, cli)
++    job = job_store.create_job(project_path=str(repo), goal="g", instructions="i",
++                               task_id=3, autonomy_level="execute_safe",
++                               auto_commit=True, auto_push=False)
++    job_executor.execute(job["id"])
++    final = job_store.get_job(job["id"])
++    sha = _git_out(repo, "rev-parse", "main")
++    assert any(f"base branch resolved: main @ {sha} (source: guess)" in l["msg"]
++               for l in final["logs"]), [l["msg"] for l in final["logs"]]
++
++
++# ── at most ONE bounded replan after a tool-call reply (RUNTIME_PLANNER_REPLAN) ─
++_GOOD_PLAN = ('{"summary":"real","files":[{"path":"x.txt","operation":"create",'
++              '"content":"hi"}],"test_commands":[]}')
++
++
++def _scripted_cli(tmp_path, replies):
++    """Fake CLI answering call n with replies[n] (last one repeats); each prompt is saved."""
++    prompts = tmp_path / "prompts"
++    prompts.mkdir(exist_ok=True)
++    return _counting_cli(tmp_path, (
++        "import json, sys\n"
++        f"replies = {replies!r}\n"
++        f"open({str(prompts)!r} + f'/{{n}}.txt', 'w').write(sys.stdin.read())\n"
++        "r = replies[min(n, len(replies) - 1)]\n"
++        "sys.stdout.write(json.dumps({'type':'result','subtype':'success','is_error':False,'result':r}))\n"
++    )), prompts
++
++
++def _replan_job(tmp_path, monkeypatch, replies, *, enabled=True, artifacts=None):
++    repo = _repo(tmp_path)
++    if enabled:
++        monkeypatch.setenv("RUNTIME_PLANNER_REPLAN", "1")
++    else:
++        monkeypatch.delenv("RUNTIME_PLANNER_REPLAN", raising=False)
++    (cli, counter), prompts = _scripted_cli(tmp_path, replies)
++    _reload(monkeypatch, cli)
++    job = job_store.create_job(project_path=str(repo), goal="g", instructions="investigate first",
++                               task_id=326, autonomy_level="execute_safe",
++                               auto_commit=True, auto_push=False)
++    if artifacts:
++        job_store.update_job(job["id"], artifacts=artifacts)
++    job_executor.execute(job["id"])
++    return repo, job_store.get_job(job["id"]), int(open(counter).read()), prompts
++
++
++def _replan_arts(final):
++    return [a for a in (final["artifacts"] or []) if "planner_replan" in a]
++
++
++def test_replan_is_off_by_default_and_the_job_blocks_after_one_call(tmp_path, monkeypatch):
++    repo, final, calls, _ = _replan_job(tmp_path, monkeypatch, [_JOB136_RAW, _GOOD_PLAN],
++                                        enabled=False)
++    assert final["status"] == "blocked" and "replan disabled" in final["error"]
++    assert calls == 1 and _replan_arts(final) == []
++    assert not (repo / "x.txt").exists()
++
++
++def test_one_replan_turns_a_tool_call_into_a_real_plan(tmp_path, monkeypatch):
++    repo, final, calls, prompts = _replan_job(tmp_path, monkeypatch, [_JOB136_RAW, _GOOD_PLAN])
++    assert final["status"] == "completed", final.get("error")
++    assert calls == 2
++    assert [f["path"] for f in final["plan"]["files"]] == ["x.txt"]
++    assert final["plan"].get("fallback") is not True
++    assert _replan_arts(final) == [{"planner_replan": "ok", "files": 1}]
++    assert "REPLAN:" not in (prompts / "0.txt").read_text()
++    assert "REPLAN:" in (prompts / "1.txt").read_text()
++
++
++def test_a_second_tool_call_blocks_without_a_third_call_or_a_fallback(tmp_path, monkeypatch):
++    repo, final, calls, _ = _replan_job(tmp_path, monkeypatch, [_JOB136_RAW, _JOB136_RAW])
++    assert final["status"] == "blocked"
++    assert "replan failed" in final["error"] and "tool call" in final["error"]
++    assert calls == 2
++    assert not final.get("plan")
++    (art,) = _replan_arts(final)
++    assert art["planner_replan"] == "failed"
++    assert not (repo / "x.txt").exists()
++
++
++def test_an_empty_or_prose_replan_blocks_never_falls_back(tmp_path, monkeypatch):
++    for i, second in enumerate(['{"summary": "needs investigation", "files": []}',
++                                "I would first look at the code."]):
++        sub = tmp_path / f"case{i}"
++        sub.mkdir()
++        _, final, calls, _ = _replan_job(sub, monkeypatch, [_JOB136_RAW, second])
++        assert final["status"] == "blocked", (second, final.get("error"))
++        assert calls == 2 and not final.get("plan")
++        assert not any(a.get("fallback_planning") for a in final["artifacts"] or [])
++
++
++def test_a_job_that_already_replanned_never_replans_again(tmp_path, monkeypatch):
++    _, final, calls, _ = _replan_job(tmp_path, monkeypatch, [_JOB136_RAW, _GOOD_PLAN],
++                                     artifacts=[{"planner_replan": "started"}])
++    assert final["status"] == "blocked" and "already attempted" in final["error"]
++    assert calls == 1
+diff --git a/tests/test_policy_enforcement_pipeline.py b/tests/test_policy_enforcement_pipeline.py
+index 5cf2238..6c1271c 100644
+--- a/tests/test_policy_enforcement_pipeline.py
++++ b/tests/test_policy_enforcement_pipeline.py
+@@ -14,7 +14,7 @@ import sys
+ 
+ import pytest
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import ai_planner, job_executor, job_store, policy_engine  # noqa: E402
+ 
+diff --git a/tests/test_project_for_cwd.py b/tests/test_project_for_cwd.py
+index a17ac8b..598ce40 100644
+--- a/tests/test_project_for_cwd.py
++++ b/tests/test_project_for_cwd.py
+@@ -120,8 +120,9 @@ def test_the_result_is_a_usable_route_key():
+ 
+ # ── the hook files the corrected project ────────────────────────────────────
+ def test_the_hook_identity_uses_the_resolver():
++    import os
+     import sys
+-    sys.path.insert(0, "/root/ai-dev-runtime/hooks")
++    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "hooks"))
+     from owneros_hook import _identity
+     ident = _identity({"cwd": "/opt/payment-orchestrator/deploy/infra/dns",
+                        "session_id": "6db4919a-460a-4b62-9e0d-c9fff356a7be"})
+diff --git a/tests/test_release_controller.py b/tests/test_release_controller.py
+index f264439..287f197 100644
+--- a/tests/test_release_controller.py
++++ b/tests/test_release_controller.py
+@@ -7,7 +7,7 @@ import tempfile
+ 
+ import pytest
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ # isolate release state per test session before importing the module
+ os.environ["RUNTIME_RELEASE_DB"] = os.path.join(
+diff --git a/tests/test_tmux_control.py b/tests/test_tmux_control.py
+index afce4ab..c4954d4 100644
+--- a/tests/test_tmux_control.py
++++ b/tests/test_tmux_control.py
+@@ -13,7 +13,7 @@ import sys
+ 
+ import pytest
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import tmux_control as tc  # noqa: E402
+ 
+diff --git a/tests/test_tmux_launch.py b/tests/test_tmux_launch.py
+index 55434e4..7a77432 100644
+--- a/tests/test_tmux_launch.py
++++ b/tests/test_tmux_launch.py
+@@ -12,11 +12,12 @@ exactly when the caller is inside a service (nothing else is touched), and healt
+ a live server that still shares the daemon's cgroup.
+ """
+ import subprocess
++import os
+ import sys
+ 
+ import pytest
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import agent_control as ac  # noqa: E402
+ from core import session_recovery as sr  # noqa: E402
+diff --git a/tests/test_verify_gate_suppression.py b/tests/test_verify_gate_suppression.py
+index fe7ed9a..190b163 100644
+--- a/tests/test_verify_gate_suppression.py
++++ b/tests/test_verify_gate_suppression.py
+@@ -2,9 +2,10 @@
+ from __future__ import annotations
+ 
+ import sqlite3
++import os
+ import sys
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ from tools import verify_gate_suppression as vg  # noqa: E402
+ 
+ TTL = vg.GATE_TTL_SECS
+diff --git a/tests/test_wake_assistant_proof.py b/tests/test_wake_assistant_proof.py
+index 596104c..f14155c 100644
+--- a/tests/test_wake_assistant_proof.py
++++ b/tests/test_wake_assistant_proof.py
+@@ -12,11 +12,12 @@ exists to make the reviewer run, so that is what success has to mean.
+ """
+ from __future__ import annotations
+ 
++import os
+ import sys
+ 
+ import pytest
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime/tools")
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tools"))
+ import cdp_composer as cc  # noqa: E402
+ 
+ 
+diff --git a/tests/test_wake_companion.py b/tests/test_wake_companion.py
+index 9a5e8db..54fc2b0 100644
+--- a/tests/test_wake_companion.py
++++ b/tests/test_wake_companion.py
+@@ -9,13 +9,14 @@ resolved THIS tick, acknowledge only on verified delivery.
+ from __future__ import annotations
+ 
+ import importlib.util
++import os
+ import sys
+ import types
+ 
+ import pytest
+ 
+ spec = importlib.util.spec_from_file_location(
+-    "wake_companion", "/root/ai-dev-runtime/tools/wake_companion.py")
++    "wake_companion", os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tools", "wake_companion.py"))
+ wc = importlib.util.module_from_spec(spec)
+ sys.modules["wake_companion"] = wc
+ spec.loader.exec_module(wc)
+diff --git a/tests/test_wake_delivery_verification.py b/tests/test_wake_delivery_verification.py
+index 7ce20d2..cc71fae 100644
+--- a/tests/test_wake_delivery_verification.py
++++ b/tests/test_wake_delivery_verification.py
+@@ -10,6 +10,7 @@ ask the owner something never woke them.
+ from __future__ import annotations
+ 
+ import importlib.util
++import os
+ import sys
+ 
+ import pytest
+@@ -17,7 +18,7 @@ import pytest
+ from core import wake_bridge as wb
+ 
+ spec = importlib.util.spec_from_file_location(
+-    "cdp_composer", "/root/ai-dev-runtime/tools/cdp_composer.py")
++    "cdp_composer", os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tools", "cdp_composer.py"))
+ cdp = importlib.util.module_from_spec(spec)
+ sys.modules["cdp_composer"] = cdp
+ spec.loader.exec_module(cdp)
+diff --git a/tests/test_workspace_hygiene.py b/tests/test_workspace_hygiene.py
+index aeb1d62..6bbed7d 100644
+--- a/tests/test_workspace_hygiene.py
++++ b/tests/test_workspace_hygiene.py
+@@ -13,7 +13,7 @@ import os
+ import sys
+ import tempfile
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import job_executor, job_kinds  # noqa: E402
+ 

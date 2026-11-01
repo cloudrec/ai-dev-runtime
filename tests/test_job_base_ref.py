@@ -152,3 +152,20 @@ def test_the_shipped_config_names_no_project(monkeypatch):
     # Promoting this code must not change any live job's base by itself.
     monkeypatch.delenv("RUNTIME_BASE_REFS_CONFIG", raising=False)
     assert git_write.configured_base_ref("/root/ai-dev-runtime") is None
+
+
+def test_the_read_only_report_names_the_task326_shape(tmp_path):
+    import importlib.util
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        "base_ref_report", os.path.join(root, "tools", "base_ref_report.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    repo = _task326_repo(tmp_path, ahead=3)
+    before = _git(repo, "for-each-ref")
+    r = mod.report(str(repo))
+    assert r["legacy_guess"] == "main" and r["guess_behind_head"] == 3
+    assert "not an ancestor" in r["strict_verdict"]
+    assert _git(repo, "for-each-ref") == before                  # read-only
+    assert mod.report(str(tmp_path))["error"] == "not a git repository"

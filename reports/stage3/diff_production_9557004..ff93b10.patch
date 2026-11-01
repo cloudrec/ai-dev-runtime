@@ -1,0 +1,506 @@
+diff --git a/config/project_base_refs.yaml b/config/project_base_refs.yaml
+new file mode 100644
+index 0000000..02e49ab
+--- /dev/null
++++ b/config/project_base_refs.yaml
+@@ -0,0 +1,10 @@
++# Authorized base for runtime jobs, per project (core.git_write.resolve_job_base).
++# A configured base_ref wins over the legacy guess; if it does not resolve, the job
++# is BLOCKED instead of falling back. Prefer a full commit SHA (immutable).
++# Changing this file changes which code every future job for that project builds on:
++# tech-lead/owner decision, audited like any config change.
++#
++# projects:
++#   /root/ai-dev-runtime:
++#     base_ref: <full sha or branch>
++projects: {}
+diff --git a/core/ai_planner.py b/core/ai_planner.py
+index f9e87c9..07989b0 100644
+--- a/core/ai_planner.py
++++ b/core/ai_planner.py
+@@ -87,9 +87,9 @@ Rules: use relative paths only; never touch .env, keys, secrets, credentials, or
+ Prefer small, isolated, well-tested changes. For create/replace include the COMPLETE file content."""
+ 
+ 
+-def _first_json_object(text: str) -> dict | None:
+-    """Return the first *balanced, parseable* top-level JSON object in `text`,
+-    or None. Brace-matches while respecting string literals/escapes so braces
++def _json_objects(text: str):
++    """Yield every *balanced, parseable* top-level JSON object in `text`, in order.
++    Brace-matches while respecting string literals/escapes so braces
+     inside string values don't throw off the depth count, and tries json.loads
+     on each complete top-level {...} — tolerating leading/trailing prose without
+     a greedy `\\{.*\\}` grabbing an unparseable span from first '{' to last '}'."""
+@@ -122,9 +122,20 @@ def _first_json_object(text: str) -> dict | None:
+                         start = -1
+                         continue
+                     if isinstance(obj, dict):
+-                        return obj
++                        yield obj
+                     start = -1
+-    return None
++
++
++#: Argument keys of the CLI's own tools. With `--tools ""` a task-shaped prompt can
++#: still make the model *write* a tool call in prose ("**Tool: bash**" + its JSON
++#: arguments). Job 703f780d (task 326) failed that way as "plan missing 'files'
++#: list", which read like a broken plan rather than a planner that never planned.
++_TOOL_CALL_KEYS = frozenset({"command", "file_path", "pattern", "url", "query"})
++TOOL_CALL_REASON = "planner emitted a tool call instead of a plan"
++
++
++def _looks_like_tool_call(obj: dict) -> bool:
++    return "files" not in obj and "summary" not in obj and bool(_TOOL_CALL_KEYS & set(obj))
+ 
+ 
+ def _extract_json(text: str) -> dict:
+@@ -143,15 +154,21 @@ def _extract_json(text: str) -> dict:
+             return obj
+     except json.JSONDecodeError:
+         pass
+-    # 2) fenced code block(s) — try each fence's body first
++    # 2) fenced code block(s), then 3) balanced objects anywhere in the prose.
++    # The object that carries a `files` list is the plan; an earlier example or
++    # tool-argument object must not shadow it. Without one, keep the first object
++    # so validation reports what was actually returned.
++    candidates: list[dict] = []
+     for m in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE):
+-        obj = _first_json_object(m.group(1))
+-        if obj is not None:
++        candidates.extend(_json_objects(m.group(1)))
++    candidates.extend(_json_objects(text))
++    for obj in candidates:
++        if "files" in obj:
+             return obj
+-    # 3) first balanced JSON object anywhere in surrounding prose
+-    obj = _first_json_object(text)
+-    if obj is not None:
+-        return obj
++    if candidates:
++        if _looks_like_tool_call(candidates[0]):
++            raise PlannerError(TOOL_CALL_REASON)
++        return candidates[0]
+     if "{" in text and "}" in text:
+         raise PlannerError("malformed planner JSON")
+     raise PlannerError("model did not return JSON")
+diff --git a/core/git_write.py b/core/git_write.py
+index c5322f1..bd32994 100644
+--- a/core/git_write.py
++++ b/core/git_write.py
+@@ -127,6 +127,116 @@ def resolve_base_branch(project_path: str, explicit: str | None = None) -> str:
+     raise GitWriteError(f"no valid base branch found (tried: {', '.join(tried)})")
+ 
+ 
++class BaseRefBlocked(GitWriteError):
++    """No trustworthy base for this job: an actionable blocker, never a guess."""
++
++
++#: Placeholder the API and supervisor put in `base_branch` when the caller named
++#: nothing (`JobCreate.base_branch = "master"`). It is not an explicit choice.
++_DEFAULT_SENTINELS = frozenset({"", "master"})
++
++_BASE_REFS_CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
++                                 "config", "project_base_refs.yaml")
++
++
++def _strict_base_ref() -> bool:
++    return os.getenv("RUNTIME_STRICT_BASE_REF", "0").strip().lower() in ("1", "true", "yes", "on")
++
++
++def configured_base_ref(project_path: str) -> str | None:
++    """The base the project's authorized config names for runtime jobs, or None.
++
++    config/project_base_refs.yaml (path overridable via RUNTIME_BASE_REFS_CONFIG):
++        projects:
++          /abs/project/path: {base_ref: <branch, tag or full SHA>}
++    """
++    path = os.getenv("RUNTIME_BASE_REFS_CONFIG") or _BASE_REFS_CONFIG
++    if not os.path.isfile(path):
++        return None
++    import yaml  # local: only needed when the file exists
++    with open(path, encoding="utf-8") as fh:
++        data = yaml.safe_load(fh) or {}
++    entry = ((data.get("projects") or {}).get(os.path.realpath(project_path))
++             or (data.get("projects") or {}).get(project_path))
++    if isinstance(entry, dict):
++        ref = entry.get("base_ref")
++    else:
++        ref = entry
++    ref = str(ref).strip() if ref else ""
++    return ref or None
++
++
++def rev_sha(project_path: str, ref: str) -> str:
++    return _run(project_path, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"]).strip()
++
++
++def _staleness(project_path: str, base: str) -> str | None:
++    """Why `base` is not a credible base for work on this checkout, or None.
++
++    The checked-out HEAD is the line the project actually runs. A guessed base that
++    is not its ancestor, or trails it by more than RUNTIME_BASE_STALE_MAX commits,
++    would build and test the job on code the project no longer runs (task 326: main
++    was 449 commits behind and not an ancestor)."""
++    try:
++        head = rev_sha(project_path, "HEAD")
++        base_sha = rev_sha(project_path, base)
++    except GitWriteError:
++        return None
++    if head == base_sha:
++        return None
++    behind = int(_run(project_path, ["rev-list", "--count", f"{base_sha}..{head}"]).strip() or 0)
++    ancestor = subprocess.run(
++        ["git", "-c", "safe.directory=*", "-C", project_path, "merge-base", "--is-ancestor",
++         base_sha, head], capture_output=True, timeout=_TIMEOUT).returncode == 0
++    limit = int(os.getenv("RUNTIME_BASE_STALE_MAX", "50"))
++    if not ancestor:
++        return (f"{base}@{base_sha[:12]} is not an ancestor of the checked-out HEAD "
++                f"@{head[:12]} ({behind} commits only on HEAD)")
++    if behind > limit:
++        return f"{base}@{base_sha[:12]} is {behind} commits behind the checked-out HEAD @{head[:12]}"
++    return None
++
++
++def resolve_job_base(project_path: str, explicit: str | None = None) -> dict:
++    """The base for a runtime job, with its exact SHA and where it came from.
++
++    1. An explicit base (anything but the "master" placeholder).
++    2. The project's configured base_ref (config/project_base_refs.yaml).
++       A configured ref that does not resolve is a blocker, never a fallback.
++    3. The legacy guess (resolve_base_branch).
++
++    With RUNTIME_STRICT_BASE_REF on, an explicit base that does not resolve and a
++    guessed base that is stale or diverged from the checked-out HEAD are blockers
++    too. Off (the default), steps 1 and 3 behave exactly as resolve_base_branch.
++
++    Returns {"ref", "sha", "source"}; raises BaseRefBlocked with the fix in the text.
++    """
++    strict = _strict_base_ref()
++    exp = (explicit or "").strip()
++    if exp not in _DEFAULT_SENTINELS:
++        for cand in (exp, f"origin/{exp}"):
++            if _rev_ok(project_path, cand):
++                return {"ref": cand, "sha": rev_sha(project_path, cand), "source": "explicit"}
++        if strict:
++            raise BaseRefBlocked(f"explicit base {exp!r} does not resolve in {project_path}")
++    configured = configured_base_ref(project_path)
++    if configured:
++        for cand in (configured, f"origin/{configured}"):
++            if _rev_ok(project_path, cand):
++                return {"ref": cand, "sha": rev_sha(project_path, cand), "source": "config"}
++        raise BaseRefBlocked(
++            f"configured base_ref {configured!r} for {project_path} does not resolve; "
++            "fix config/project_base_refs.yaml")
++    ref = resolve_base_branch(project_path, explicit)
++    if strict:
++        why = _staleness(project_path, ref)
++        if why:
++            raise BaseRefBlocked(
++                f"no authorized base for {project_path}: guessed {why}. Set base_ref for this "
++                "project in config/project_base_refs.yaml or pass an explicit base_branch")
++    return {"ref": ref, "sha": rev_sha(project_path, ref), "source": "guess"}
++
++
+ def create_work_branch(project_path: str, task_id, goal: str, base: str) -> str:
+     name = f"ai-runtime/{task_id or 'job'}-{slug(goal)}"
+     # if branch exists, append a short suffix
+diff --git a/core/job_executor.py b/core/job_executor.py
+index e48a6c4..25aa624 100644
+--- a/core/job_executor.py
++++ b/core/job_executor.py
+@@ -415,6 +415,63 @@ def _completion_evidence(job: dict) -> dict:
+     return ev
+ 
+ 
++#: Appended to the instructions for the single replan after a tool-call-shaped reply.
++REPLAN_FOOTER = (
++    "\n\nREPLAN: your previous reply tried to call a tool. You have NO tools and cannot "
++    "inspect the repository. Using only what is written above, reply with the JSON plan "
++    "object and nothing else. If the task cannot be planned without investigating first, "
++    'reply {"summary": "needs investigation", "files": []}.')
++
++
++def _replan_enabled() -> bool:
++    return os.getenv("RUNTIME_PLANNER_REPLAN", "0").strip().lower() in ("1", "true", "yes", "on")
++
++
++def _bounded_replan(job_id: str, job: dict, pp: str, kind, model_id, heartbeat):
++    """One deterministic replan after a tool-call reply. Returns (plan, why).
++
++    `plan` is None when no replan is allowed or it did not yield a valid plan; `why`
++    names the reason for the blocker. Bounded by construction:
++      * off unless RUNTIME_PLANNER_REPLAN is set;
++      * at most once per job — the `planner_replan` artifact is written BEFORE the
++        provider call, so a re-executed or crashed-and-resumed job never replans again;
++      * the result passes the planner's own typed validation (files list, ops, paths,
++        non-empty for code kinds); any PlannerError, including a second tool call, is
++        terminal — never a fallback plan, never another attempt.
++    """
++    if not _replan_enabled():
++        return None, "replan disabled"
++    cur = job_store.get_job(job_id) or job
++    arts = cur.get("artifacts") or []
++    if any(isinstance(a, dict) and "planner_replan" in a for a in arts):
++        return None, "replan already attempted for this job"
++    job_store.update_job(job_id, artifacts=arts + [{"planner_replan": "started"}])
++    job_store.append_log(job_id, "info", "planner replied with a tool call — one bounded replan")
++    outcome: dict = {}
++    plan = None
++    try:
++        plan = ai_planner.plan(job["goal"] or "", (job["instructions"] or "") + REPLAN_FOOTER,
++                               pp, job.get("allowed_paths") or [], heartbeat_cb=heartbeat,
++                               kind=kind, model=model_id)
++        if not isinstance(plan, dict) or not isinstance(plan.get("files"), list) \
++                or plan.get("fallback"):
++            raise ai_planner.PlannerError("replan returned no usable plan")
++        outcome = {"planner_replan": "ok", "files": len(plan["files"])}
++    except ai_planner.PlannerError as e:
++        plan = None
++        outcome = {"planner_replan": "failed", "reason": str(e)[:200],
++                   "raw": ai_planner._sanitize_raw(getattr(e, "raw", "") or "", cap=1000)}
++    cur = job_store.get_job(job_id) or job
++    arts = [a for a in (cur.get("artifacts") or [])
++            if not (isinstance(a, dict) and a.get("planner_replan") == "started")]
++    job_store.update_job(job_id, artifacts=arts + [outcome])
++    if plan is None:
++        return None, f"replan failed: {outcome.get('reason', '')}"
++    job_store.append_log(job_id, "info",
++                         f"replan produced a plan ({len(plan['files'])} file op(s))")
++    return plan, "replanned"
++
++
+ def _finish(job_id: str, status: str, **extra):
+     # Every terminal state carries an explicit outcome: a job that ends without
+     # one is exactly the ambiguity this model removes. Failure paths default to
+@@ -552,29 +609,50 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
+                     note=reason[:200])
+             except Exception:  # noqa: BLE001 — routing outcome recording must never block a job
+                 pass
+-        job_store.append_log(job_id, "warn",
+-                             f"planner failed ({reason[:120]}) — building deterministic fallback plan")
+-        try:
+-            plan = ai_planner.build_fallback_plan(
+-                job["goal"] or "", job["instructions"] or "", pp,
+-                job.get("allowed_paths") or [], task_id=job.get("task_id"), diagnostics=diag)
+-        except Exception as fe:  # noqa: BLE001
+-            job_store.append_log(job_id, "error", f"fallback planning failed: {fe}")
+-            _finish(job_id, "failed", error=f"planner and fallback both failed: {reason[:300]}")
+-            return
+-        fallback_used = True
+-        # Mark in job metadata that fallback planning was used + preserve accounting.
+-        # Re-fetch: the in-memory `job` predates the plan stage, and appending from
+-        # it silently drops artifacts recorded since (the model_selection artifact
+-        # was lost exactly this way on job b34772f4, 2026-08-15).
+-        _cur = job_store.get_job(job_id) or job
+-        job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
+-            "fallback_planning": True, "reason": reason[:200],
+-            "timed_out": diag["timed_out"], "tokens": diag["tokens"],
+-            "cost_usd": diag["cost_usd"], "duration_ms": diag["duration_ms"],
+-        }])
+-        job_store.append_log(job_id, "info",
+-                             "fallback plan generated — continuing to execution (no planner retry)")
++        if reason.startswith(ai_planner.TOOL_CALL_REASON):
++            # The planner never planned: an "investigate first" task made it write a
++            # tool call instead (job 703f780d, task 326). A no-op fallback plan plus a
++            # full suite run would only bury that. At most ONE bounded replan (opt-in,
++            # RUNTIME_PLANNER_REPLAN=1); otherwise, or if it fails, an explicit blocker.
++            _cur = job_store.get_job(job_id) or job
++            job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
++                "planner_tool_call": True, "reason": reason[:200],
++                "raw": ai_planner._sanitize_raw(diag["raw"], cap=1000),
++                "tokens": diag["tokens"], "cost_usd": diag["cost_usd"],
++                "duration_ms": diag["duration_ms"],
++            }])
++            plan, why = _bounded_replan(job_id, job, pp, kind, m_id, _heartbeat)
++            if plan is None:
++                job_store.append_log(job_id, "warn",
++                                     "planner emitted a tool call instead of a plan — job blocked; "
++                                     "split the task into a concrete code change or give it to an agent")
++                _finish(job_id, "blocked", error="planner_tool_call: task needs investigation "
++                                                 f"the tools-less planner cannot do ({why})")
++                return
++        else:
++            job_store.append_log(job_id, "warn",
++                                 f"planner failed ({reason[:120]}) — building deterministic fallback plan")
++            try:
++                plan = ai_planner.build_fallback_plan(
++                    job["goal"] or "", job["instructions"] or "", pp,
++                    job.get("allowed_paths") or [], task_id=job.get("task_id"), diagnostics=diag)
++            except Exception as fe:  # noqa: BLE001
++                job_store.append_log(job_id, "error", f"fallback planning failed: {fe}")
++                _finish(job_id, "failed", error=f"planner and fallback both failed: {reason[:300]}")
++                return
++            fallback_used = True
++            # Mark in job metadata that fallback planning was used + preserve accounting.
++            # Re-fetch: the in-memory `job` predates the plan stage, and appending from
++            # it silently drops artifacts recorded since (the model_selection artifact
++            # was lost exactly this way on job b34772f4, 2026-08-15).
++            _cur = job_store.get_job(job_id) or job
++            job_store.update_job(job_id, artifacts=(_cur.get("artifacts") or []) + [{
++                "fallback_planning": True, "reason": reason[:200],
++                "timed_out": diag["timed_out"], "tokens": diag["tokens"],
++                "cost_usd": diag["cost_usd"], "duration_ms": diag["duration_ms"],
++            }])
++            job_store.append_log(job_id, "info",
++                                 "fallback plan generated — continuing to execution (no planner retry)")
+     else:
+         if m_dec:
+             try:
+@@ -710,8 +788,11 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
+         job_store.update_job(job_id, status="branching")
+         try:
+             git_write.fetch(pp)
+-            base = git_write.resolve_base_branch(pp, job["base_branch"])
+-            job_store.append_log(job_id, "info", f"base branch resolved: {base}")
++            resolved = git_write.resolve_job_base(pp, job["base_branch"])
++            base = resolved["ref"]
++            job_store.append_log(job_id, "info",
++                                 f"base branch resolved: {base} @ {resolved['sha']} "
++                                 f"(source: {resolved['source']})")
+             if _isolated_workspaces():
+                 created = job_workspace.create(pp, job_id, job.get("task_id"),
+                                                job["goal"] or "", base)
+@@ -723,6 +804,10 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
+             else:
+                 branch = git_write.create_work_branch(pp, job.get("task_id"), job["goal"] or "", base)
+                 job_store.append_log(job_id, "info", f"work branch: {branch}")
++        except git_write.BaseRefBlocked as e:
++            job_store.append_log(job_id, "warn", f"no trustworthy base — job blocked: {e}")
++            _finish(job_id, "blocked", error=f"base_ref: {e}")
++            return
+         except git_write.GitWriteError as e:
+             _finish(job_id, "failed", error=f"branch failed: {e}")
+             return
+diff --git a/hooks/owneros_hook.py b/hooks/owneros_hook.py
+index 0c88e22..fde1f0e 100755
+--- a/hooks/owneros_hook.py
++++ b/hooks/owneros_hook.py
+@@ -36,7 +36,7 @@ import re
+ import sys
+ from datetime import datetime, timezone
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ _RUNTIME_ENV = "/root/ai-dev-runtime/configs/.env"
+ 
+diff --git a/tools/cdp_composer.py b/tools/cdp_composer.py
+index 0d8aab6..6c82f67 100644
+--- a/tools/cdp_composer.py
++++ b/tools/cdp_composer.py
+@@ -1076,7 +1076,7 @@ def _record_delivery(source: str, event_id: Optional[int], res: dict,
+     answerable from state."""
+     try:
+         import sys as _sys
+-        _sys.path.insert(0, "/root/ai-dev-runtime")
++        _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+         from core import wake_bridge as _wb
+         _wb.record_delivery(source, event_id=event_id, delivered=bool(res.get("ok")),
+                             reason=str(res.get("reason", "")), conversation=conversation,
+@@ -1142,7 +1142,7 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
+     if claim:
+         try:
+             import sys as _sys
+-            _sys.path.insert(0, "/root/ai-dev-runtime")
++            _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+             from core import wake_bridge as _wb
+             # The claim is for a slot in THIS conversation, so it carries the
+             # conversation. It used to carry only the route key, which is the same
+@@ -1217,7 +1217,7 @@ def _latch_submitted(source: str, event_id: Optional[int]) -> None:
+     """Record that the phrase was FIRED, before we know whether it landed."""
+     try:
+         import sys as _sys
+-        _sys.path.insert(0, "/root/ai-dev-runtime")
++        _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+         from core import wake_bridge as _wb
+         _wb.mark_submitted(event_id, source=source)
+     except Exception:  # noqa: BLE001
+diff --git a/tools/native_supervise_once.py b/tools/native_supervise_once.py
+index fb78648..3cbe654 100755
+--- a/tools/native_supervise_once.py
++++ b/tools/native_supervise_once.py
+@@ -7,14 +7,15 @@ spawned by a hook, so anything it prints or raises would be noise in an agent's
+ """
+ from __future__ import annotations
+ 
++import os
+ import sys
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ 
+ def main() -> int:
+     try:
+-        sys.path.insert(0, "/root/ai-dev-runtime/hooks")
++        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "hooks"))
+         from owneros_hook import _load_runtime_env
+         _load_runtime_env()
+         from core import native_supervisor as ns
+diff --git a/tools/phase2_soak.py b/tools/phase2_soak.py
+index 80f5756..c73083f 100644
+--- a/tools/phase2_soak.py
++++ b/tools/phase2_soak.py
+@@ -16,7 +16,7 @@ import subprocess
+ import sys
+ import time
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ OUT = os.getenv("PHASE2_SOAK_OUT", "/root/ai-dev-runtime/reports/phase2_soak.jsonl")
+ DURATION = float(os.getenv("PHASE2_SOAK_HOURS", "24")) * 3600
+diff --git a/tools/phase3_soak.py b/tools/phase3_soak.py
+index 346a54d..4c16fed 100644
+--- a/tools/phase3_soak.py
++++ b/tools/phase3_soak.py
+@@ -15,7 +15,7 @@ import subprocess
+ import sys
+ import time
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ OUT = os.getenv("PHASE3_SOAK_OUT", "/root/ai-dev-runtime/reports/phase3_soak.jsonl")
+ DURATION = float(os.getenv("PHASE3_SOAK_HOURS", "24")) * 3600
+diff --git a/tools/rebind_chat.py b/tools/rebind_chat.py
+index b1e81b5..de84443 100755
+--- a/tools/rebind_chat.py
++++ b/tools/rebind_chat.py
+@@ -39,7 +39,7 @@ import sqlite3
+ import sys
+ from datetime import datetime, timezone
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+ 
+ from core import wake_bridge as wb  # noqa: E402
+ from core import wake_routes  # noqa: E402
+diff --git a/tools/stage_done.py b/tools/stage_done.py
+index e6c0314..8b4e868 100644
+--- a/tools/stage_done.py
++++ b/tools/stage_done.py
+@@ -24,7 +24,7 @@ import json
+ import os
+ import sys
+ 
+-REPO = "/root/ai-dev-runtime"
++REPO = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+ 
+ 
+ def _env_flags() -> None:
+diff --git a/tools/wake_companion.py b/tools/wake_companion.py
+index b524756..56f75db 100644
+--- a/tools/wake_companion.py
++++ b/tools/wake_companion.py
+@@ -17,8 +17,8 @@ import os
+ import sys
+ import time
+ 
+-sys.path.insert(0, "/root/ai-dev-runtime")
+-sys.path.insert(0, "/root/ai-dev-runtime/tools")
++sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
++sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "tools"))
+ 
+ POLL_SECS = int(os.getenv("COMPANION_POLL_SECS", "20"))
+ # Inventory the ChatGPT tabs every N ticks (default ~5 minutes at 20s polls).
