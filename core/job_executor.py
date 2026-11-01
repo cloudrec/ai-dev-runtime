@@ -728,8 +728,11 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
         job_store.update_job(job_id, status="branching")
         try:
             git_write.fetch(pp)
-            base = git_write.resolve_base_branch(pp, job["base_branch"])
-            job_store.append_log(job_id, "info", f"base branch resolved: {base}")
+            resolved = git_write.resolve_job_base(pp, job["base_branch"])
+            base = resolved["ref"]
+            job_store.append_log(job_id, "info",
+                                 f"base branch resolved: {base} @ {resolved['sha']} "
+                                 f"(source: {resolved['source']})")
             if _isolated_workspaces():
                 created = job_workspace.create(pp, job_id, job.get("task_id"),
                                                job["goal"] or "", base)
@@ -741,6 +744,10 @@ def _run_pipeline(job_id: str, job: dict, pp: str) -> None:
             else:
                 branch = git_write.create_work_branch(pp, job.get("task_id"), job["goal"] or "", base)
                 job_store.append_log(job_id, "info", f"work branch: {branch}")
+        except git_write.BaseRefBlocked as e:
+            job_store.append_log(job_id, "warn", f"no trustworthy base — job blocked: {e}")
+            _finish(job_id, "blocked", error=f"base_ref: {e}")
+            return
         except git_write.GitWriteError as e:
             _finish(job_id, "failed", error=f"branch failed: {e}")
             return

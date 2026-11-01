@@ -127,6 +127,116 @@ def resolve_base_branch(project_path: str, explicit: str | None = None) -> str:
     raise GitWriteError(f"no valid base branch found (tried: {', '.join(tried)})")
 
 
+class BaseRefBlocked(GitWriteError):
+    """No trustworthy base for this job: an actionable blocker, never a guess."""
+
+
+#: Placeholder the API and supervisor put in `base_branch` when the caller named
+#: nothing (`JobCreate.base_branch = "master"`). It is not an explicit choice.
+_DEFAULT_SENTINELS = frozenset({"", "master"})
+
+_BASE_REFS_CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                                 "config", "project_base_refs.yaml")
+
+
+def _strict_base_ref() -> bool:
+    return os.getenv("RUNTIME_STRICT_BASE_REF", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+def configured_base_ref(project_path: str) -> str | None:
+    """The base the project's authorized config names for runtime jobs, or None.
+
+    config/project_base_refs.yaml (path overridable via RUNTIME_BASE_REFS_CONFIG):
+        projects:
+          /abs/project/path: {base_ref: <branch, tag or full SHA>}
+    """
+    path = os.getenv("RUNTIME_BASE_REFS_CONFIG") or _BASE_REFS_CONFIG
+    if not os.path.isfile(path):
+        return None
+    import yaml  # local: only needed when the file exists
+    with open(path, encoding="utf-8") as fh:
+        data = yaml.safe_load(fh) or {}
+    entry = ((data.get("projects") or {}).get(os.path.realpath(project_path))
+             or (data.get("projects") or {}).get(project_path))
+    if isinstance(entry, dict):
+        ref = entry.get("base_ref")
+    else:
+        ref = entry
+    ref = str(ref).strip() if ref else ""
+    return ref or None
+
+
+def rev_sha(project_path: str, ref: str) -> str:
+    return _run(project_path, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"]).strip()
+
+
+def _staleness(project_path: str, base: str) -> str | None:
+    """Why `base` is not a credible base for work on this checkout, or None.
+
+    The checked-out HEAD is the line the project actually runs. A guessed base that
+    is not its ancestor, or trails it by more than RUNTIME_BASE_STALE_MAX commits,
+    would build and test the job on code the project no longer runs (task 326: main
+    was 449 commits behind and not an ancestor)."""
+    try:
+        head = rev_sha(project_path, "HEAD")
+        base_sha = rev_sha(project_path, base)
+    except GitWriteError:
+        return None
+    if head == base_sha:
+        return None
+    behind = int(_run(project_path, ["rev-list", "--count", f"{base_sha}..{head}"]).strip() or 0)
+    ancestor = subprocess.run(
+        ["git", "-c", "safe.directory=*", "-C", project_path, "merge-base", "--is-ancestor",
+         base_sha, head], capture_output=True, timeout=_TIMEOUT).returncode == 0
+    limit = int(os.getenv("RUNTIME_BASE_STALE_MAX", "50"))
+    if not ancestor:
+        return (f"{base}@{base_sha[:12]} is not an ancestor of the checked-out HEAD "
+                f"@{head[:12]} ({behind} commits only on HEAD)")
+    if behind > limit:
+        return f"{base}@{base_sha[:12]} is {behind} commits behind the checked-out HEAD @{head[:12]}"
+    return None
+
+
+def resolve_job_base(project_path: str, explicit: str | None = None) -> dict:
+    """The base for a runtime job, with its exact SHA and where it came from.
+
+    1. An explicit base (anything but the "master" placeholder).
+    2. The project's configured base_ref (config/project_base_refs.yaml).
+       A configured ref that does not resolve is a blocker, never a fallback.
+    3. The legacy guess (resolve_base_branch).
+
+    With RUNTIME_STRICT_BASE_REF on, an explicit base that does not resolve and a
+    guessed base that is stale or diverged from the checked-out HEAD are blockers
+    too. Off (the default), steps 1 and 3 behave exactly as resolve_base_branch.
+
+    Returns {"ref", "sha", "source"}; raises BaseRefBlocked with the fix in the text.
+    """
+    strict = _strict_base_ref()
+    exp = (explicit or "").strip()
+    if exp not in _DEFAULT_SENTINELS:
+        for cand in (exp, f"origin/{exp}"):
+            if _rev_ok(project_path, cand):
+                return {"ref": cand, "sha": rev_sha(project_path, cand), "source": "explicit"}
+        if strict:
+            raise BaseRefBlocked(f"explicit base {exp!r} does not resolve in {project_path}")
+    configured = configured_base_ref(project_path)
+    if configured:
+        for cand in (configured, f"origin/{configured}"):
+            if _rev_ok(project_path, cand):
+                return {"ref": cand, "sha": rev_sha(project_path, cand), "source": "config"}
+        raise BaseRefBlocked(
+            f"configured base_ref {configured!r} for {project_path} does not resolve; "
+            "fix config/project_base_refs.yaml")
+    ref = resolve_base_branch(project_path, explicit)
+    if strict:
+        why = _staleness(project_path, ref)
+        if why:
+            raise BaseRefBlocked(
+                f"no authorized base for {project_path}: guessed {why}. Set base_ref for this "
+                "project in config/project_base_refs.yaml or pass an explicit base_branch")
+    return {"ref": ref, "sha": rev_sha(project_path, ref), "source": "guess"}
+
+
 def create_work_branch(project_path: str, task_id, goal: str, base: str) -> str:
     name = f"ai-runtime/{task_id or 'job'}-{slug(goal)}"
     # if branch exists, append a short suffix

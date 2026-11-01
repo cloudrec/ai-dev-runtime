@@ -1,0 +1,10 @@
+# Authorized base for runtime jobs, per project (core.git_write.resolve_job_base).
+# A configured base_ref wins over the legacy guess; if it does not resolve, the job
+# is BLOCKED instead of falling back. Prefer a full commit SHA (immutable).
+# Changing this file changes which code every future job for that project builds on:
+# tech-lead/owner decision, audited like any config change.
+#
+# projects:
+#   /root/ai-dev-runtime:
+#     base_ref: <full sha or branch>
+projects: {}

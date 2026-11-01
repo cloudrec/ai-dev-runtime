@@ -63,6 +63,11 @@ def _git(path, *args):
                    capture_output=True, text=True)
 
 
+def _git_out(path, *args):
+    return subprocess.run(["git", "-C", str(path)] + list(args), check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
 def _repo(tmp_path, with_tests_dir=False):
     """A minimal git repo. By default NO tests/ dir and no test config, so the
     fallback's derived test_commands is [] and the pipeline commits without
@@ -625,3 +630,47 @@ def test_a_tool_call_answer_blocks_the_job_instead_of_running_a_fallback(tmp_pat
     assert int(open(counter).read()) == 1               # one planning attempt, no retry
     after = sorted(p.name for p in repo.rglob("*") if ".git" not in p.parts)
     assert after == before                              # nothing written to the repo
+
+
+# ── task 326: an unusable base blocks the job, it is not guessed ─────────────
+def _valid_plan_cli(tmp_path):
+    plan_json = ('{"summary":"real","files":[{"path":"x.txt","operation":"create",'
+                 '"content":"hi"}],"test_commands":[]}')
+    return _counting_cli(tmp_path, (
+        "import json, sys\n"
+        f"result = {plan_json!r}\n"
+        "sys.stdout.write(json.dumps({'type':'result','subtype':'success','is_error':False,'result':result}))\n"
+    ))
+
+
+def test_a_configured_base_ref_that_does_not_resolve_blocks_the_job(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    cfg = tmp_path / "refs.yaml"
+    cfg.write_text(f"projects:\n  {repo}:\n    base_ref: gone-branch\n")
+    monkeypatch.setenv("RUNTIME_BASE_REFS_CONFIG", str(cfg))
+    cli, _ = _valid_plan_cli(tmp_path)
+    _reload(monkeypatch, cli)
+    job = job_store.create_job(project_path=str(repo), goal="g", instructions="i",
+                               task_id=2, autonomy_level="execute_safe",
+                               auto_commit=True, auto_push=False)
+    job_executor.execute(job["id"])
+    final = job_store.get_job(job["id"])
+    assert final["status"] == "blocked", final.get("error")
+    assert final["error"].startswith("base_ref:") and "gone-branch" in final["error"]
+    assert not (repo / "x.txt").exists()
+    assert _git_out(repo, "branch", "--list", "ai-runtime/*") == ""
+
+
+def test_the_resolved_base_sha_is_logged(tmp_path, monkeypatch):
+    repo = _repo(tmp_path)
+    monkeypatch.setenv("RUNTIME_BASE_REFS_CONFIG", str(tmp_path / "absent.yaml"))
+    cli, _ = _valid_plan_cli(tmp_path)
+    _reload(monkeypatch, cli)
+    job = job_store.create_job(project_path=str(repo), goal="g", instructions="i",
+                               task_id=3, autonomy_level="execute_safe",
+                               auto_commit=True, auto_push=False)
+    job_executor.execute(job["id"])
+    final = job_store.get_job(job["id"])
+    sha = _git_out(repo, "rev-parse", "main")
+    assert any(f"base branch resolved: main @ {sha} (source: guess)" in l["msg"]
+               for l in final["logs"]), [l["msg"] for l in final["logs"]]
