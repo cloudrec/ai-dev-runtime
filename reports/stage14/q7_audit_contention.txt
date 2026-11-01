@@ -1,0 +1,4 @@
+sha: da6ab2f3c7d12ea65a77cd9e7bcf216d548bf2c4
+cmd: python3 -I reports/stage14/q7_audit_contention.py <tmp>/cp.db (temp DB, 4 procs x 100 appends)
+exitcodes [0, 0, 0, 0]
+{'ok': True, 'rows': 400, 'broken_at': None}
