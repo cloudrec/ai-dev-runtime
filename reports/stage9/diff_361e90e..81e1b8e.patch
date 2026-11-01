@@ -1,0 +1,149 @@
+diff --git a/core/fullcycle/engine.py b/core/fullcycle/engine.py
+index 281a5f2..b60d3b5 100644
+--- a/core/fullcycle/engine.py
++++ b/core/fullcycle/engine.py
+@@ -193,6 +193,10 @@ def submit_decision(review_id: int, decision: str, *, key: str, by: str,
+         if not r:
+             raise EngineError(f"no such review {review_id}")
+         kind, status, project_id = r
++        if status == "superseded":
++            # a stall alert retired by the late result it was about (_supersede_stall)
++            return {"ok": False, "duplicate": False, "reason": "review_superseded",
++                    "review_id": review_id}
+         if status != "pending":
+             return {"ok": False, "duplicate": False, "reason": "review_already_decided",
+                     "review_id": review_id}
+@@ -783,6 +787,24 @@ class Engine:
+                               (self.project_id, task["id"], attempt)).fetchone()
+         return json.loads(r[0] or "{}") if r else {}
+ 
++    def _supersede_stall(self, task: dict) -> None:
++        """The attempt a still-pending stall alert was about delivered a result after all:
++        the alert no longer needs an answer. It is marked `superseded` (not decided, not
++        applied), so it leaves the inbox, its undelivered wake retires
++        (wake_bridge._fullcycle_review_closed) and a late answer is refused. Only a
++        PENDING alert of THIS attempt; idempotent; a decided alert is never touched."""
++        stall = self._stall_review(task, task["attempt"])
++        if not (stall and stall["status"] == "pending"):
++            return
++        cur = self.conn.execute(
++            "UPDATE fc_review SET status='superseded', decided_by='engine', decided_ts=?,"
++            " decision_body=? WHERE id=? AND status='pending'",
++            (self.clock(), _j({"reason": "late_result", "attempt": task["attempt"]}),
++             stall["id"]))
++        self.conn.commit()
++        if cur.rowcount == 1:
++            self._note("stall_alert_superseded", task=task["key"], review_id=stall["id"])
++
+     def _sent_ts(self, task: dict) -> Optional[float]:
+         r = self.conn.execute("SELECT ts FROM fc_dispatch WHERE idem_key=? AND status='sent'",
+                               (f"fullcycle:{task['id']}:{task['attempt']}",)).fetchone()
+@@ -869,6 +891,8 @@ class Engine:
+                 self._blocked_review(task, {"question": str(
+                     result.get("question") or result.get("summary"))[:4000]})
+                 return
++            if result.get("status") == "done":
++                self._supersede_stall(task)
+             if result.get("status") == "context_exhausted":
+                 # D2: the attempt ended at a safe stop with a compact handoff; the routine
+                 # decision (continue in a clean session, or cancel) is the tech lead's
+diff --git a/tests/test_fullcycle_stall.py b/tests/test_fullcycle_stall.py
+index 81e682a..0bf924d 100644
+--- a/tests/test_fullcycle_stall.py
++++ b/tests/test_fullcycle_stall.py
+@@ -158,7 +158,9 @@ def test_answering_a_stall_after_the_late_result_is_stale(fc):
+     _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
+     e.tick()                                             # verified → review requested
+     assert _state(e.status(), "add")["state"] == tc.VERIFYING
+-    _answer(e, "answer")
++    (row,) = _all_stall_rows(e)                           # the alert is no longer open...
++    r = fe.submit_decision(row[0], "answer", key="late", by="stub-gpt", feedback="go")
++    assert not r["ok"] and r["reason"] == "review_superseded"   # ...so it cannot be decided
+     e.tick()
+     assert [x["task_id"] for x in h.agent_log(log)] == ["tinycalc:add"]   # no resend
+ 
+@@ -329,3 +331,84 @@ def test_f1_late_result_after_limit_and_owner_resume_is_verified(fc):
+     assert [x["task_id"] for x in h.agent_log(log)].count("tinycalc:add") == 1   # never resent
+     hist = [x["to"] for x in tc.history(_task(e, "add")["contract_id"])]
+     assert hist[-4:] == [tc.WORKING, tc.AGENT_DONE, tc.VERIFYING, tc.VERIFIED_DONE]
++
++
++
++# ── a stall alert is retired by the late result it was about ─────────────────────
++def _stall_status(e):
++    (row,) = _all_stall_rows(e)
++    return e.conn.execute("SELECT status, event_id, decided_by FROM fc_review WHERE id=?",
++                          (row[0],)).fetchone()
++
++
++def test_a_late_done_result_supersedes_the_pending_stall_alert(fc):
++    from core import wake_bridge as wb
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    status, eid, _ = _stall_status(e)
++    assert status == "pending" and eid
++    assert not wb._fullcycle_review_closed(e.conn, eid)      # its doorbell is live
++    _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
++    e.tick()
++    status, eid2, by = _stall_status(e)
++    assert status == "superseded" and by == "engine" and eid2 == eid
++    assert wb._fullcycle_review_closed(e.conn, eid)          # an undelivered wake retires
++    kinds = [(r["kind"], bool(r["payload"].get("stalled"))) for r in fe.pending_reviews(e.project_id)]
++    assert kinds == [("review", False)]                     # only the real review is open
++
++
++def test_superseding_is_idempotent_and_emits_nothing_more(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
++    e.tick()
++    n_events = len(_events())
++    for _ in range(4):
++        e.tick()
++    assert _stall_status(e)[0] == "superseded"
++    assert len(_events()) == n_events and len(_all_stall_rows(e)) == 1
++
++
++def test_an_unresolved_stall_stays_pending(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    for _ in range(5):
++        e.tick()
++    assert _stall_status(e)[0] == "pending"                  # no result: still alerting
++
++
++def test_a_decided_stall_is_never_superseded(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    _answer(e, "answer")
++    _write_late_result(root, "add", 1, h.SOLUTIONS["add"])
++    for _ in range(3):
++        e.tick()
++    assert _stall_status(e)[0] == "decided"                  # the tech lead's decision stands
++
++
++def test_a_late_question_keeps_the_alert_slot_pending(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    path = os.path.join(root, ".fullcycle", "results", "add-1.json")
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w") as fh:
++        json.dump({"task_id": "tinycalc:add", "attempt": 1, "status": "blocked",
++                   "summary": "s", "changed_files": [], "question": "q?"}, fh)
++    e.tick()
++    rows = e.conn.execute("SELECT status FROM fc_review WHERE kind='blocked'").fetchall()
++    assert rows == [("pending",)]                           # now a real question: stays open
++
++
++def test_a_late_result_of_an_older_attempt_supersedes_nothing(fc):
++    e, a, log, root, clock = _hung_add(fc)
++    clock.offset = HOUR2 + 1
++    e.tick()
++    _write_late_result(root, "add", 7, h.SOLUTIONS["add"])   # not this attempt's result
++    for _ in range(3):
++        e.tick()
++    assert _stall_status(e)[0] == "pending"

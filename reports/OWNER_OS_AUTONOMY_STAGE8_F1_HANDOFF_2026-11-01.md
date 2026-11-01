@@ -4,6 +4,8 @@ An automated instruction was received via the Owner OS API (tech lead). It is no
 **No independent review has been done.** **No live autonomous E2E has been done**; the Stage 6 rehearsal is not a live E2E.
 **PROD: NO-GO.**
 
+**Superseded as entry point by `OWNER_OS_AUTONOMY_STAGE9_HANDOFF_2026-11-01.md` (stall-alert supersede, `81e1b8e`).**
+
 Entry points:
 - this file
 - `OWNER_OS_AUTONOMY_STAGE7_REVIEW_PACKET_2026-11-01.md` (the 7 questions)
