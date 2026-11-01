@@ -103,6 +103,13 @@ class ExecutorAdapter(ABC):
         tell. The engine resends after a stall only on True."""
         return None
 
+    def idle_evidence(self, handle: dict) -> tuple:
+        """(quiescent, fingerprint): `quiescent` as above, plus an opaque fingerprint of
+        what the agent's screen shows (None = not available). The engine needs the agent
+        idle CONTINUOUSLY with an unchanged fingerprint for QUIET_CONFIRM_SECS before it
+        acts on "idle" — a single reading can be a misclassified active pane."""
+        return self.quiescent(handle), None
+
 
 # ── executor profiles ───────────────────────────────────────────────────────
 @dataclass(frozen=True)

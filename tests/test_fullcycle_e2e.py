@@ -40,6 +40,9 @@ def _state(st, key):
 def fc(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+    # the fixture agent takes one envelope at a time from stdin, so its "idle" is exact:
+    # no confirmation window here (test_fullcycle_idle_confirm covers the window)
+    monkeypatch.setattr(fe, "QUIET_CONFIRM_SECS", 0)
     adapters = []
 
     def make(behaviours=None, *, executor="fixture", spec=None, max_attempts=3, holder="e1"):

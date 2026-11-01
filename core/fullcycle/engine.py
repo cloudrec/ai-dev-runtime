@@ -78,6 +78,12 @@ UNKNOWN_POLL_LIMIT = int(os.getenv("FULLCYCLE_UNKNOWN_POLL_LIMIT", "20"))
 # that the agent is idle; "cancel" cancels. The engine never forces anything itself.
 STALL_HOLD_TIMEOUT = int(os.getenv("FULLCYCLE_STALL_HOLD_TIMEOUT", "3600"))
 HOLD_GATE_PREFIX = "stall_hold_timeout"
+# "Idle" read from a live pane is a classification, not proof: before acting on it (a
+# resend, a cancel, a clean session after a stall/exhaustion) the agent must read idle
+# CONTINUOUSLY, with an unchanged screen fingerprint, for this long. Any other reading
+# or a changed screen restarts the window. A crashed agent or a delivered result needs
+# no window (that is positive evidence). 0 = act on the first idle reading.
+QUIET_CONFIRM_SECS = int(os.getenv("FULLCYCLE_QUIET_CONFIRM_SECS", "60"))
 # Gate reasons under which an attempt may still be alive in the agent's pane
 # (attempt_in_flight_for_agent must keep the pane from being rotated).
 _LIVE_ATTEMPT_GATES = ("agent_permission_prompt", HOLD_GATE_PREFIX)
@@ -127,7 +133,8 @@ CREATE TABLE IF NOT EXISTS fc_project_done (
 );
 CREATE TABLE IF NOT EXISTS fc_escalation (
     review_id INTEGER PRIMARY KEY, project_id TEXT, task_id TEXT, hold_since REAL,
-    reason TEXT DEFAULT '', ts REAL, gate_id TEXT DEFAULT '', owner_resumed_ts REAL
+    reason TEXT DEFAULT '', ts REAL, gate_id TEXT DEFAULT '', owner_resumed_ts REAL,
+    idle_since REAL, idle_fp TEXT
 );
 CREATE TABLE IF NOT EXISTS fc_decision_audit (
     seq INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, review_id INTEGER, action TEXT,
@@ -153,7 +160,9 @@ class EngineError(RuntimeError):
     pass
 
 
-_MIGRATIONS = (("fc_task", "unknown_polls", "INTEGER DEFAULT 0"),)
+_MIGRATIONS = (("fc_task", "unknown_polls", "INTEGER DEFAULT 0"),
+               ("fc_escalation", "idle_since", "REAL"),
+               ("fc_escalation", "idle_fp", "TEXT"))
 
 
 def connect(conn=None):
@@ -420,6 +429,7 @@ class Engine:
         self.root = p["root"]
         self.log: list = []
         self._fence = 0
+        self._last_quiet: Optional[bool] = None
 
     # -- small helpers --------------------------------------------------------
     def _note(self, what: str, **kw) -> None:
@@ -1028,6 +1038,43 @@ class Engine:
         return ({"hold_since": r[0], "reason": r[1], "ts": r[2], "gate_id": r[3],
                  "owner_resumed_ts": r[4]} if r else None)
 
+    def _idle_confirmed(self, task: dict, review: Optional[dict], handle: dict) -> bool:
+        """Has the agent read idle continuously, with an unchanged screen, for
+        QUIET_CONFIRM_SECS (engine clock)? The window lives in fc_escalation (per review),
+        so it survives an engine restart; any non-idle reading or screen change resets it."""
+        quiet, fp = self.adapter.idle_evidence(handle)
+        if quiet is not True:
+            if review:
+                self.conn.execute("UPDATE fc_escalation SET idle_since=NULL, idle_fp=NULL"
+                                  " WHERE review_id=?", (review["id"],))
+                self.conn.commit()
+            self._last_quiet = quiet
+            return False
+        self._last_quiet = True
+        if QUIET_CONFIRM_SECS <= 0:
+            return True
+        if not review:
+            return False                          # nowhere to time the window: never act
+        self.conn.execute("INSERT OR IGNORE INTO fc_escalation (review_id, project_id, task_id,"
+                          " hold_since) VALUES (?,?,?,?)",
+                          (review["id"], self.project_id, task["id"], self.clock()))
+        r = self.conn.execute("SELECT idle_since, idle_fp FROM fc_escalation WHERE review_id=?",
+                              (review["id"],)).fetchone()
+        since, seen_fp = r[0], r[1]
+        if since is None or (fp or "") != (seen_fp or ""):
+            self.conn.execute("UPDATE fc_escalation SET idle_since=?, idle_fp=? WHERE"
+                              " review_id=?", (self.clock(), fp, review["id"]))
+            self.conn.commit()
+            self._note("idle_unconfirmed", task=task["key"], review_id=review["id"],
+                       restarted=since is not None)
+            return False
+        self.conn.commit()
+        if self.clock() - float(since) < QUIET_CONFIRM_SECS:
+            self._note("idle_unconfirmed", task=task["key"], review_id=review["id"],
+                       idle_s=int(self.clock() - float(since)))
+            return False
+        return True
+
     def _hold(self, task: dict, review: Optional[dict], what: str, **detail) -> bool:
         """A held resend/cancel. Returns True when the OWNER has attested (by resuming the
         hold-timeout gate) that the old attempt is over, so the caller may proceed.
@@ -1105,21 +1152,20 @@ class Engine:
                 self._move(task, tc.WORKING, evidence={"late_result_after_stall": attempt - 1})
             self._note("late_result_after_stall", task=task["key"], attempt=attempt - 1)
             return False
-        quiet = True if obs.state == CRASHED else self.adapter.quiescent(prev)
-        if quiet is not True:
-            return self._hold(task, stall, "resend", attempt=attempt, observed=obs.state,
-                              quiescent=quiet)
-        return True
+        if obs.state == CRASHED or self._idle_confirmed(task, stall, prev):
+            return True
+        return self._hold(task, stall, "resend", attempt=attempt, observed=obs.state,
+                          quiescent=self._last_quiet)
 
     def _clean_session_ready(self, task: dict, prev: dict, attempt: int) -> bool:
         """D2: the next attempt after a context exhaustion goes to a clean session, and only
         after a safe stop. An adapter that owns its agent starts the fresh session itself;
         for any other (live) agent the clean session was confirmed through the owner gate
         `clean_session_required` before this resend was requested."""
-        quiet = self.adapter.quiescent(prev)
-        if quiet is not True and not self._hold(task, self._blocked_row(task, attempt - 1),
-                                                "clean_session", attempt=attempt,
-                                                observed="context_exhausted", quiescent=quiet):
+        review = self._blocked_row(task, attempt - 1)
+        if not self._idle_confirmed(task, review, prev) and \
+                not self._hold(task, review, "clean_session", attempt=attempt,
+                               observed="context_exhausted", quiescent=self._last_quiet):
             return False
         if self.adapter.owns_agent:
             rs = self.adapter.restart(prev)
@@ -1134,9 +1180,10 @@ class Engine:
         obs = self.adapter.poll(task["handle"])
         stall = self._stall_review(task, task["attempt"])
         if stall and stall.get("decision") == "cancel":
-            quiet = True if obs.state in (DONE, CRASHED) else self.adapter.quiescent(task["handle"])
-            if quiet is True or self._hold(task, stall, "cancel", observed=obs.state,
-                                           quiescent=quiet):
+            if obs.state in (DONE, CRASHED) or \
+                    self._idle_confirmed(task, stall, task["handle"]) or \
+                    self._hold(task, stall, "cancel", observed=obs.state,
+                               quiescent=self._last_quiet):
                 self._move(task, tc.CANCELLED, evidence={"stall_cancelled": stall["id"]})
             return
         if obs.state != UNKNOWN and task.get("unknown_polls"):

@@ -15,6 +15,7 @@ must go through the creation guard and the owner's creation approval.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Optional
@@ -139,13 +140,22 @@ class AgentControlAdapter(ExecutorAdapter):
     _ACTIVE = ("working", "shell_running", "waiting_owner", "waiting_input")
 
     def quiescent(self, handle: dict) -> Optional[bool]:
+        return self.idle_evidence(handle)[0]
+
+    def idle_evidence(self, handle: dict) -> tuple:
+        """One agent_status read: the idle verdict and a fingerprint of the pane's recent
+        output. A pane whose text still changes (a ticking spinner the classifier did not
+        recognise, streaming output) changes the fingerprint, and the engine then
+        restarts its idle-confirmation window."""
         try:
             st = self.ac.agent_status(self.target, actor=self.actor)
         except Exception:  # noqa: BLE001 — unknown is not idle
-            return None
+            return None, None
         state = st.get("state")
+        tail = str(st.get("recent_activity") or "")[-1500:]
+        fp = hashlib.sha256(tail.encode("utf-8", "replace")).hexdigest()[:32] if tail else None
         if state in self._QUIESCENT:
-            return True
+            return True, fp
         if state in self._ACTIVE:
-            return False
-        return None
+            return False, fp
+        return None, fp
