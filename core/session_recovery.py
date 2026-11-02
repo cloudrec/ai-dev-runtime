@@ -483,6 +483,14 @@ def _recover_inner(target: str, *, registry, conn, run_fn, sleep, now, explicit,
     conv = entry.get("conversation_id") or ""
     shape = entry.get("resume_shape") or "claude --resume {conversation_id}"
     cmd = shape.format(conversation_id=conv, cwd=cwd)
+    # never revive into API credits, never with an inherited API key (agent_auth_mode)
+    from core import agent_auth_mode as _aam
+    safe = _aam.recovery_command(session, cmd)
+    if not safe["ok"]:
+        _log(conn, target, "refuse", False, f"auth_mode:{safe['reason']}", {})
+        return {"recovered": False, "reason": f"auth_mode:{safe['reason']}",
+                "owner_blocker": True}
+    cmd = safe["cmd"]
     run = run_fn or (lambda a: _tmux(a))
 
     # Revive the EXACT pane. respawn-pane reuses the existing window; only if the

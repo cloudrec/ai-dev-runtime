@@ -2306,7 +2306,8 @@ def _session_liveness(name: str) -> dict:
 
 def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
                  session_name: Optional[str] = None, actor: Optional[str] = None,
-                 owner_proof: Optional[dict] = None) -> dict:
+                 owner_proof: Optional[dict] = None, auth_mode: Optional[str] = None,
+                 model: Optional[str] = None, risk: Optional[str] = None) -> dict:
     """Resume a Claude agent — but only when no matching live one exists.
 
     Returns `duplicate_created: False` in every path: either an existing agent
@@ -2369,7 +2370,25 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
                     "agent_created": False,
                 }
 
-        argv = ["new-session", "-d", "-s", name, "-c", resolved, "claude"]
+        # auth mode (core.agent_auth_mode): subscription unless THIS launch explicitly asks
+        # for API credits and every opt-in/guardrail check passes. A refusal starts
+        # nothing — it never falls back to the other mode.
+        from core import agent_auth_mode as aam
+        auth = aam.resolve(name, resolved, requested=auth_mode, model=model, risk=risk,
+                           live_sessions=lambda: {a.get("session") for a in
+                                                  agent_list().get("agents", [])
+                                                  if a.get("alive")})
+        if not auth["ok"]:
+            audit("agent_resume", name, resumed=False, refused=f"auth_mode:{auth['reason']}",
+                  actor=actor, cwd=resolved, auth_mode=auth_mode or aam.SUBSCRIPTION)
+            return {"resumed": False, "refused": f"auth_mode:{auth['reason']}",
+                    "reason": "auth mode: not authorized", "duplicate_created": False,
+                    "agent_created": False}
+        if auth["mode"] == aam.API:
+            # counted BEFORE the start: a launch that then fails still counts (caps err low)
+            aam.record_launch(session=name, project_dir=resolved, mode=aam.API,
+                              model=auth["model"], risk=risk or "", actor=actor or "")
+        argv = ["new-session", "-d", "-s", name, "-c", resolved, *auth["argv"]]
         if conversation_id:
             argv += ["--resume", str(conversation_id)]
         rc, _, err = _tmux(argv)
@@ -2377,11 +2396,20 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
             audit("agent_resume", name, resumed=False, error=err.strip()[:120])
             raise AgentControlError(f"failed to start session {name!r}: {err.strip()[:200]}")
         acp.reserve(resolved, name)          # visible as live until Claude shows up
+        if auth["mode"] == aam.SUBSCRIPTION:
+            try:
+                aam.record_launch(session=name, project_dir=resolved, mode=aam.SUBSCRIPTION,
+                                  model=auth["model"], actor=actor or "")
+            except Exception:  # noqa: BLE001 — the ledger never fails a subscription start
+                pass
 
     audit("agent_resume", name, resumed=True, conversation_id=conversation_id, cwd=resolved,
-          actor=actor, authorized_by=gate["reason"], scope=gate.get("scope"))
+          actor=actor, authorized_by=gate["reason"], scope=gate.get("scope"),
+          auth_mode=auth["mode"], model=auth["model"], auth_reason=auth["reason"])
     return {
         "resumed": True,
+        "auth_mode": auth["mode"],
+        "model": auth["model"],
         "session": name,
         "target": f"{name}:0.0",
         "cwd": resolved,

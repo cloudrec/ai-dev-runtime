@@ -1,0 +1,250 @@
+"""Per-agent auth mode for NEW Claude sessions: subscription (default) or Anthropic API
+credits (explicit, per-agent opt-in), 2026-11-02.
+
+Why: when the subscription's limits are exhausted, the owner may want ONE selected future
+agent to run on API credits through the verified launcher `/usr/local/bin/claude-owner-api`.
+That launcher reads the key and workspace id from /root/.config/owner-os/secrets/ itself,
+at exec time. Owner OS therefore never reads, holds, logs or passes any secret: it only
+chooses WHICH program the new pane runs.
+
+Rules (all fail closed):
+  * subscription is the default for every session; nothing switches automatically —
+    no fallback to API on a refused/limited subscription, no mass switch;
+  * a subscription session is started with the API credential variables REMOVED from its
+    environment, so it can never inherit an API key from the tmux server or the daemon;
+  * API mode needs ALL of: an explicit per-launch request (`auth_mode="api"`), the master
+    switch `enabled: true` in config/agent_auth_modes.yaml, an entry for exactly this
+    session name AND project dir, a safe launcher file (root-owned, not group/other
+    writable, executable), and the spend guardrails (live API agents and API launches per
+    24 h under their caps, both counted from the launch ledger; an unknown population
+    refuses);
+  * model: Sonnet by default; Opus only when the launch says `risk="high"` AND the
+    agent's entry allows Opus for high-risk work; anything else is refused;
+  * session recovery never starts API mode: a recorded API session is not revived
+    (an explicit relaunch is required) and a resume command naming the API launcher
+    is refused.
+
+Not enforceable here (stated, not hidden): a dollar cap per interactive session — the
+Claude CLI caps spend only in print mode. The hard money ceiling must be the API
+workspace's own spend limit (owner, Anthropic console).
+"""
+from __future__ import annotations
+
+import os
+import re
+import sqlite3
+import stat
+import time
+from typing import Callable, Optional
+
+SUBSCRIPTION, API = "subscription", "api"
+MODES = (SUBSCRIPTION, API)
+DEFAULT_MODEL = "sonnet"
+HIGH_RISK_MODEL = "opus"
+DEFAULT_LAUNCHER = "/usr/local/bin/claude-owner-api"
+
+# credential variables a subscription session must never inherit
+API_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS")
+
+_CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
+                       "config", "agent_auth_modes.yaml")
+
+
+def config_path() -> str:
+    return os.getenv("AGENT_AUTH_MODES_CONFIG") or _CONFIG
+
+
+def load_config(path: Optional[str] = None) -> dict:
+    """The parsed config, or {"_error": why}. Missing file = API disabled (not an error)."""
+    path = path or config_path()
+    if not os.path.isfile(path):
+        return {"enabled": False, "agents": {}, "limits": {}}
+    try:
+        import yaml
+        with open(path, encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except Exception as e:  # noqa: BLE001
+        return {"_error": f"config_unreadable:{type(e).__name__}"}
+    if not isinstance(data, dict):
+        return {"_error": "config_not_a_mapping"}
+    return data
+
+
+def subscription_argv(base: Optional[list] = None) -> list:
+    """`claude …` with every API credential variable removed from its environment."""
+    argv = ["env"]
+    for v in API_ENV_VARS:
+        argv += ["-u", v]
+    return argv + ["claude", *(base or [])]
+
+
+def subscription_shell(cmd: str) -> str:
+    """The same, for a shell command string (session recovery's resume shape)."""
+    return "env " + " ".join(f"-u {v}" for v in API_ENV_VARS) + " " + cmd
+
+
+def _launcher_problem(path: str) -> Optional[str]:
+    """Checks the launcher FILE (never its content, never the secrets it reads)."""
+    try:
+        st = os.stat(path, follow_symlinks=False)
+    except OSError:
+        return "launcher_missing"
+    if not stat.S_ISREG(st.st_mode):
+        return "launcher_not_regular_file"
+    if st.st_uid != 0:
+        return "launcher_not_root_owned"
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        return "launcher_group_or_other_writable"
+    if not st.st_mode & stat.S_IXUSR:
+        return "launcher_not_executable"
+    return None
+
+
+# ── launch ledger (agent_control DB; additive table) ───────────────────────────
+def _ledger(conn=None):
+    if conn is not None:
+        c = conn
+    else:
+        from core import agent_control as ac
+        c = sqlite3.connect(ac._db_path(), timeout=10)
+    c.execute("""CREATE TABLE IF NOT EXISTS agent_auth_launch (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, session TEXT, project_dir TEXT,
+        mode TEXT, model TEXT, risk TEXT, actor TEXT)""")
+    return c
+
+
+def record_launch(*, session: str, project_dir: str, mode: str, model: str = "",
+                  risk: str = "", actor: str = "", conn=None,
+                  now: Optional[float] = None) -> None:
+    c = _ledger(conn)
+    try:
+        c.execute("INSERT INTO agent_auth_launch (ts, session, project_dir, mode, model, risk,"
+                  " actor) VALUES (?,?,?,?,?,?,?)",
+                  (now if now is not None else time.time(), session, project_dir, mode,
+                   model, risk, actor or ""))
+        c.commit()
+    finally:
+        if conn is None:
+            c.close()
+
+
+def last_mode(session: str, conn=None) -> Optional[str]:
+    c = _ledger(conn)
+    try:
+        r = c.execute("SELECT mode FROM agent_auth_launch WHERE session=? ORDER BY id DESC"
+                      " LIMIT 1", (session,)).fetchone()
+        return r[0] if r else None
+    finally:
+        if conn is None:
+            c.close()
+
+
+def _api_usage(live_sessions: set, conn=None, now: Optional[float] = None) -> dict:
+    c = _ledger(conn)
+    try:
+        now = now if now is not None else time.time()
+        day = c.execute("SELECT COUNT(*) FROM agent_auth_launch WHERE mode=? AND ts>?",
+                        (API, now - 86400)).fetchone()[0]
+        latest: dict = {}
+        for session, mode in c.execute("SELECT session, mode FROM agent_auth_launch"
+                                       " ORDER BY id"):
+            latest[session] = mode
+        live = sorted(s for s, m in latest.items() if m == API and s in live_sessions)
+        return {"launches_24h": day, "live_api_sessions": live}
+    finally:
+        if conn is None:
+            c.close()
+
+
+def _int(v, default: int) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
+_MODEL_RE = re.compile(r"^[a-z0-9.\-]{1,40}$")
+
+
+def resolve(session: str, project_dir: str, *, requested: Optional[str] = None,
+            model: Optional[str] = None, risk: Optional[str] = None,
+            live_sessions: Optional[Callable[[], set]] = None,
+            config: Optional[dict] = None, conn=None,
+            now: Optional[float] = None) -> dict:
+    """Decide how a NEW session starts. Returns
+    {"ok", "mode", "model", "argv" (the program + args for tmux), "reason", ...}.
+    `ok=False` means: start nothing (never "start it on subscription instead")."""
+    mode = (requested or SUBSCRIPTION).strip().lower()
+    if mode not in MODES:
+        return {"ok": False, "reason": f"unknown_auth_mode:{mode[:20]}"}
+    if mode == SUBSCRIPTION:
+        if model and model != DEFAULT_MODEL and not (model == HIGH_RISK_MODEL and risk == "high"):
+            return {"ok": False, "reason": "model_not_allowed"}
+        extra = ["--model", model] if model else []
+        return {"ok": True, "mode": SUBSCRIPTION, "model": model or "",
+                "argv": subscription_argv(extra), "reason": "default_subscription"}
+
+    # ── API: explicit opt-in, every check must pass ─────────────────────────────
+    cfg = config if config is not None else load_config()
+    if cfg.get("_error"):
+        return {"ok": False, "reason": cfg["_error"]}
+    if cfg.get("enabled") is not True:
+        return {"ok": False, "reason": "api_mode_disabled"}
+    entry = (cfg.get("agents") or {}).get(session)
+    if not isinstance(entry, dict):
+        return {"ok": False, "reason": "agent_not_opted_in"}
+    want_dir = os.path.realpath(str(entry.get("project_dir") or ""))
+    if not entry.get("project_dir") or want_dir != os.path.realpath(project_dir):
+        return {"ok": False, "reason": "project_dir_mismatch"}
+    use = (model or DEFAULT_MODEL).strip().lower()
+    if not _MODEL_RE.match(use):
+        return {"ok": False, "reason": "model_invalid"}
+    if use == HIGH_RISK_MODEL:
+        if risk != "high" or entry.get("allow_opus_for_high_risk") is not True:
+            return {"ok": False, "reason": "opus_requires_high_risk_and_entry_permission"}
+    elif use != DEFAULT_MODEL:
+        return {"ok": False, "reason": "model_not_allowed"}
+    launcher = str(cfg.get("launcher") or DEFAULT_LAUNCHER)
+    problem = _launcher_problem(launcher)
+    if problem:
+        return {"ok": False, "reason": problem}
+    limits = cfg.get("limits") or {}
+    max_live = _int(limits.get("max_live_api_agents"), 0)
+    max_day = _int(limits.get("max_api_launches_per_day"), 0)
+    if max_live < 1 or max_day < 1:
+        return {"ok": False, "reason": "api_limits_not_configured"}
+    if live_sessions is None:
+        return {"ok": False, "reason": "live_population_unknown"}
+    try:
+        live = set(live_sessions())
+    except Exception:  # noqa: BLE001 — unknown population: refuse
+        return {"ok": False, "reason": "live_population_unknown"}
+    usage = _api_usage(live, conn=conn, now=now)
+    if len(usage["live_api_sessions"]) >= max_live:
+        return {"ok": False, "reason": "api_live_agent_cap_reached", **usage}
+    if usage["launches_24h"] >= max_day:
+        return {"ok": False, "reason": "api_daily_launch_cap_reached", **usage}
+    return {"ok": True, "mode": API, "model": use, "argv": [launcher, "--model", use],
+            "reason": "explicit_api_opt_in", **usage}
+
+
+def recovery_command(session: str, shape_cmd: str, conn=None) -> dict:
+    """Session recovery's command, made safe: never API, never an inherited key.
+    {"ok", "cmd"} or {"ok": False, "reason"}."""
+    launcher_names = {os.path.basename(DEFAULT_LAUNCHER)}
+    try:
+        cfg = load_config()
+        if cfg.get("launcher"):
+            launcher_names.add(os.path.basename(str(cfg["launcher"])))
+    except Exception:  # noqa: BLE001
+        pass
+    if any(n and n in shape_cmd for n in launcher_names) or "ANTHROPIC_API_KEY" in shape_cmd:
+        return {"ok": False, "reason": "recovery_never_starts_api_mode"}
+    try:
+        prior = last_mode(session, conn=conn)
+    except Exception:  # noqa: BLE001
+        return {"ok": False, "reason": "auth_ledger_unreadable"}
+    if prior == API:
+        return {"ok": False, "reason": "api_session_needs_explicit_relaunch"}
+    cmd = shape_cmd.strip()
+    return {"ok": True, "cmd": subscription_shell(cmd) if cmd.startswith("claude") else cmd}

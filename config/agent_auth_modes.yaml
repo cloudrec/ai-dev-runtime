@@ -1,0 +1,16 @@
+# Per-agent auth mode for NEW Claude sessions (core/agent_auth_mode.py).
+# Default for every session: subscription (API credential variables stripped from its env).
+# API credits are used ONLY for a launch that explicitly asks for auth_mode=api AND whose
+# session is listed below with its project dir, while `enabled` is true and the caps hold.
+# Nothing switches automatically. The launcher reads the key itself; never put secrets here.
+# Changing this file authorizes spending money: owner decision, audited like any config.
+enabled: false
+launcher: /usr/local/bin/claude-owner-api
+limits:
+  max_live_api_agents: 1          # API-mode sessions alive at once
+  max_api_launches_per_day: 2     # API-mode launches in any 24 h
+agents: {}
+#   agent-example:                       # tmux session name
+#     project_dir: /abs/path/to/project
+#     allow_opus_for_high_risk: false    # Opus only with risk=high AND this true
+#     reason: "subscription limit reached; owner-approved one-off"

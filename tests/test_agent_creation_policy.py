@@ -193,8 +193,9 @@ def test_refused_resume_never_mutates_tmux(wt, tmux):
 def test_authorized_resume_creates_exactly_the_scoped_session(wt, tmux):
     r = ac.agent_resume(wt["kz"], session_name="gaika-kz", actor="api:hmac/chatgpt")
     assert r["agent_created"] and r["session"] == "gaika-kz"
+    from core import agent_auth_mode as aam      # subscription: API credential vars stripped
     assert mutations(tmux["calls"]) == [["new-session", "-d", "-s", "gaika-kz", "-c",
-                                         os.path.realpath(wt["kz"]), "claude"]]
+                                         os.path.realpath(wt["kz"]), *aam.subscription_argv()]]
 
 
 def test_resume_respects_concurrency_with_real_inventory(wt, tmux):

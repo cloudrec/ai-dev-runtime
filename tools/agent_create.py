@@ -26,15 +26,21 @@ def main(argv=None) -> int:
     ap.add_argument("--dir", required=True)
     ap.add_argument("--session", required=True)
     ap.add_argument("--conversation")
+    ap.add_argument("--auth-mode", choices=("subscription", "api"), default=None,
+                    help="default subscription; 'api' needs an opt-in entry in "
+                         "config/agent_auth_modes.yaml and spends API credits")
+    ap.add_argument("--model", default=None, help="sonnet (default) or opus (needs --risk high)")
+    ap.add_argument("--risk", choices=("normal", "high"), default=None)
     a = ap.parse_args(argv)
     from core import agent_control as ac
     try:
         r = ac.agent_resume(a.dir, conversation_id=a.conversation, session_name=a.session,
-                            actor=CALLER)
+                            actor=CALLER, auth_mode=a.auth_mode, model=a.model, risk=a.risk)
     except ac.AgentControlError as e:
         r = {"agent_created": False, "error": str(e)[:300]}
     print(json.dumps({k: r.get(k) for k in ("agent_created", "session", "target", "refused",
-                                            "scope", "reason", "error") if k in r}))
+                                            "scope", "reason", "error", "auth_mode",
+                                            "model") if k in r}))
     return 0 if r.get("agent_created") else 1
 
 
