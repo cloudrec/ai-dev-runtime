@@ -74,14 +74,22 @@ class _LiveGuardedPopen(_REAL_POPEN):
     def __init__(self, args, *a, **k):
         env = k.get("env")
         env = os.environ if env is None else env
+        program = args if isinstance(args, (str, bytes)) else args[0]
+        runs_python = os.path.basename(os.fsdecode(program)).startswith("python")
         for var in LIVE_DB_VARS:
             if env.get(var) and _is_live(env[var]):
                 raise AssertionError(f"offline acceptance child points {var} at a live DB")
+            if runs_python and not env.get(var):      # unset means the live default path
+                raise AssertionError(f"offline acceptance child has no {var}: live DB default")
         for arg in ([args] if isinstance(args, (str, bytes)) else args):
             text = os.fsdecode(arg) if isinstance(arg, (bytes, os.PathLike)) else str(arg)
             if LIVE_DIR in text and ".db" in text:
                 raise AssertionError(f"offline acceptance child names a live DB: {text[:120]}")
         super().__init__(args, *a, **k)
+
+
+def _refuse_unguarded_spawn(*a, **k):
+    raise AssertionError("offline acceptance child started outside subprocess.Popen")
 
 
 @pytest.fixture(autouse=True)
@@ -109,6 +117,8 @@ def isolation(monkeypatch):
         return conn
     monkeypatch.setattr(sqlite3, "connect", recording)
     monkeypatch.setattr(subprocess, "Popen", _LiveGuardedPopen)
+    for spawn in ("system", "posix_spawn", "posix_spawnp"):
+        monkeypatch.setattr(os, spawn, _refuse_unguarded_spawn)
     yield opened
     live = [p for p in opened if p != ":memory:" and
             (os.path.realpath(p) + os.sep).startswith(LIVE_DIR + os.sep)]
@@ -369,6 +379,23 @@ def test_G_guard_refuses_a_child_named_a_live_db(isolation, stand_in_live):
     with pytest.raises(AssertionError, match="live DB"):
         subprocess.run(["sqlite3", stand_in_live, "select 1"])
     assert subprocess.run(["true"]).returncode == 0        # an ordinary child still runs
+
+
+@pytest.mark.parametrize("var", LIVE_DB_VARS)
+def test_G_guard_refuses_a_python_child_with_a_db_var_unset(isolation, var):
+    env = {k: v for k, v in os.environ.items() if k != var}
+    ran = []
+    with pytest.raises(AssertionError, match="live DB default"):
+        ran.append(subprocess.run(["python3", "-c", "pass"], env=env))
+    assert ran == []
+    assert subprocess.run(["python3", "-c", "pass"]).returncode == 0
+    assert subprocess.run(["true"], env=env).returncode == 0
+
+
+@pytest.mark.parametrize("spawn", ["system", "posix_spawn", "posix_spawnp"])
+def test_G_guard_refuses_spawns_outside_popen(isolation, spawn):
+    with pytest.raises(AssertionError, match="outside subprocess.Popen"):
+        getattr(os, spawn)("true")
 
 
 def test_G_isolation_guard_refuses_before_connecting(isolation):

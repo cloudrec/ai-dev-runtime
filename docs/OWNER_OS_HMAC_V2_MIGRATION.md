@@ -29,6 +29,9 @@ Each step is the owner's decision, and each is undone by restoring the previous 
 | 3. Watch | same | run long enough to cover the rarest client; no new log lines |
 | 4. Switch off | `RUNTIME_HMAC_LEGACY=0` | legacy gets 401 `legacy signature disabled` |
 
+## Finding the client behind a proxy
+The `warn` line logs the peer address. The Dockerfile starts uvicorn without `--proxy-headers`, so behind docker or nginx that address is the gateway, not the client. Match on the logged path and time in the proxy's access log, or run uvicorn with `--proxy-headers` and `--forwarded-allow-ips` set to the proxy's address only. Never trust forwarded headers from any other source.
+
 ## Limits
 - Counters and the v2 replay cache are per process, and a restart clears them.
 - Bearer authentication is separate and unaffected.
