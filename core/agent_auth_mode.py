@@ -297,6 +297,27 @@ def _chain(c):
     return c
 
 
+def _close_anchor_lag(c) -> Optional[str]:
+    """After a failed anchor write the newest row is unanchored, so deleting it together with
+    its spent nonce would go unseen. The next attempt, even a refused one, anchors it. Call
+    under _anchor_lock, after _chain_problem has accepted the anchor."""
+    _, hashes = _chain_rows_problem(c)
+    if not hashes:
+        return None
+    try:
+        with open(_anchor_path(), encoding="utf-8") as fh:
+            rows = json.load(fh)["rows"]
+    except FileNotFoundError:
+        rows = 0
+    if rows == len(hashes):
+        return None
+    try:
+        _write_anchor(len(hashes), hashes[-1])
+    except OSError:
+        return "api_anchor_write_failed"
+    return None
+
+
 def _chain_hash(prev: str, row: dict) -> str:
     return hashlib.sha256((prev + "|" + json.dumps(row, sort_keys=True)).encode()).hexdigest()
 
@@ -346,7 +367,7 @@ def commit_api_launch(*, session: str, project_dir: str, model: str, risk: str =
                 c.commit()
             c.execute("BEGIN IMMEDIATE")
             try:
-                problem = _chain_problem(c) or _api_proof_problem(
+                problem = _chain_problem(c) or _close_anchor_lag(c) or _api_proof_problem(
                     proof, session, project_dir, model, risk, conversation_id, launcher, c, now,
                     verify_proof)
                 if problem:

@@ -121,3 +121,53 @@ def test_l1_a_hostile_settings_file_does_not_block_a_resume(wt, tmux):  # noqa: 
         fh.write("[" * 100_000)
     r = ac.agent_resume(wt["kz"], session_name="gaika-kz", actor="api:hmac/chatgpt")
     assert r["resumed"] is True
+
+
+# ── L3: the one-row anchor lag closes at the next attempt ────────────────────────
+def _fail_anchor_write_once(monkeypatch):
+    real = aam._write_anchor
+
+    def fail(rows, head):
+        monkeypatch.setattr(aam, "_write_anchor", real)
+        raise OSError("disk full")
+    monkeypatch.setattr(aam, "_write_anchor", fail)
+
+
+def _anchored_rows():
+    return json.load(open(aam._anchor_path()))["rows"]
+
+
+def test_l3_a_refused_attempt_anchors_the_lagging_row(wt, api_cfg, monkeypatch):  # noqa: F811
+    assert _commit(wt, _sign(wt)) == ""
+    proof = _sign(wt)
+    _fail_anchor_write_once(monkeypatch)
+    assert _commit(wt, proof) == "api_anchor_write_failed"
+    assert _anchored_rows() == 1
+    assert _commit(wt, proof) == "owner_proof_replayed"
+    assert _anchored_rows() == 2
+    _sql(*[f"DROP TRIGGER {t}" for t in (*aam._CHAIN_TRIGGERS, *aam._PROOF_TRIGGERS)],
+         "DELETE FROM agent_auth_api_chain WHERE seq=2",
+         "DELETE FROM owner_proof_used WHERE nonce='{}'".format(proof["nonce"]))
+    assert _commit(wt, proof) == "api_ledger_tampered"
+
+
+def test_l3_the_first_row_is_anchored_too(wt, api_cfg, monkeypatch):  # noqa: F811
+    proof = _sign(wt)
+    _fail_anchor_write_once(monkeypatch)
+    assert _commit(wt, proof) == "api_anchor_write_failed"
+    assert not os.path.exists(aam._anchor_path())
+    assert _commit(wt, proof) == "owner_proof_replayed"
+    assert _anchored_rows() == 1
+
+
+def test_l3_a_persistent_write_failure_starts_nothing(wt, api_cfg, monkeypatch):  # noqa: F811
+    assert _commit(wt, _sign(wt)) == ""
+    proof = _sign(wt)
+
+    def fail(rows, head):
+        raise OSError("disk full")
+    monkeypatch.setattr(aam, "_write_anchor", fail)
+    assert _commit(wt, proof) == "api_anchor_write_failed"
+    assert _commit(wt, _sign(wt)) == "api_anchor_write_failed"
+    assert sqlite3.connect(ac._db_path()).execute(
+        "SELECT COUNT(*) FROM agent_auth_api_chain").fetchone()[0] == 2
