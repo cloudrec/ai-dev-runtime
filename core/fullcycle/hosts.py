@@ -104,9 +104,12 @@ def _script_runs_claude(script: str) -> bool:
     command: list = []
     redirect_target = False
     for token in tokens + [";"]:
-        if token and set(token) <= set("<>&") and set(token) & set("<>"):
+        operator = bool(token) and set(token) <= set("();<>|&")
+        if operator and token.startswith(("<", ">", "&>")):
+            if command and command[-1].isdigit():     # the fd of `2> file`
+                command.pop()
             redirect_target = True
-        elif token and set(token) <= set("();|&"):
+        elif operator:
             if _runs_claude(command):
                 return True
             command, redirect_target = [], False

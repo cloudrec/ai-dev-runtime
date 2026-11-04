@@ -95,14 +95,15 @@ _WORD_BREAK = re.compile(r"[\s;&|()<>'\"`=,:]+")
 def _names_api_launcher(argv: list) -> bool:
     """Whole words only. `tests/api` is a project path, not a launcher called `api`: the
     launcher lives outside the project, so a plain relative path reaches it only by spelling
-    out its own path. This is a lint on specs: a glob or a spliced variable gets past it."""
+    out its own path. This is a lint on specs: a glob or a spliced variable gets past it,
+    and indirect invocation always will."""
     from core import agent_auth_mode as aam
     paths = {aam.DEFAULT_LAUNCHER}
     cfg = aam.load_config()
     if cfg.get("launcher"):
         paths.add(str(cfg["launcher"]))
     names = {os.path.basename(p) for p in paths} - {""}
-    words = (w for a in argv for w in _WORD_BREAK.split(str(a)) if w)
+    words = (w for a in argv for w in _WORD_BREAK.split(str(a).replace("\\", "")) if w)
     return any(w.rsplit("/", 1)[-1] in names and (
         "/" not in w or w[0] in "/.~$" or any(p.endswith("/" + w) for p in paths))
         for w in words)
