@@ -30,6 +30,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 import time
 
 import pytest
@@ -329,37 +330,44 @@ def test_F_api_credit_mode_is_off_by_default():
         assert v in sub["argv"]                                        # stripped, not passed
 
 
-NEVER_THERE = LIVE_DIR + "/__offline_guard_never_exists__.db"
+@pytest.fixture
+def stand_in_live(tmp_path, monkeypatch):
+    """The guard's own tests point it at a tmp dir. If the guard ever fails, ATTACH creates
+    its file for real, and that file must not land in the live tree."""
+    live = tmp_path / "live"
+    live.mkdir()
+    monkeypatch.setattr(sys.modules[__name__], "LIVE_DIR", os.path.realpath(live))
+    return os.path.join(os.path.realpath(live), "guarded.db")
 
 
-@pytest.mark.parametrize("sql,params", [(f"ATTACH '{NEVER_THERE}' AS live", ()),
-                                        (f"ATTACH 'file:{NEVER_THERE}?mode=ro' AS live", ()),
-                                        ("ATTACH ? AS live", (NEVER_THERE,))])
-def test_G_guard_refuses_attach_of_a_live_db(isolation, sql, params):
+@pytest.mark.parametrize("sql,params", [("ATTACH '{db}' AS live", False),
+                                        ("ATTACH 'file:{db}?mode=ro' AS live", False),
+                                        ("ATTACH ? AS live", True)])
+def test_G_guard_refuses_attach_of_a_live_db(isolation, stand_in_live, sql, params):
     conn = sqlite3.connect(":memory:")
     with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
-        conn.execute(sql, params)
-    assert not os.path.exists(NEVER_THERE)
+        conn.execute(sql.format(db=stand_in_live), (stand_in_live,) if params else ())
+    assert not os.path.exists(stand_in_live)
     conn.close()
 
 
-def test_G_guard_allows_attach_of_a_tmp_db(isolation, tmp_path):
+def test_G_guard_allows_attach_of_a_tmp_db(isolation, stand_in_live, tmp_path):
     conn = sqlite3.connect(":memory:")
     conn.execute(f"ATTACH '{tmp_path / 'other.db'}' AS other")
     conn.close()
 
 
 @pytest.mark.parametrize("var", LIVE_DB_VARS)
-def test_G_guard_refuses_a_child_pointed_at_a_live_db(isolation, var):
+def test_G_guard_refuses_a_child_pointed_at_a_live_db(isolation, stand_in_live, var):
     ran = []
     with pytest.raises(AssertionError, match="live DB"):
-        ran.append(subprocess.run(["true"], env={**os.environ, var: NEVER_THERE}))
+        ran.append(subprocess.run(["true"], env={**os.environ, var: stand_in_live}))
     assert ran == []
 
 
-def test_G_guard_refuses_a_child_named_a_live_db(isolation):
+def test_G_guard_refuses_a_child_named_a_live_db(isolation, stand_in_live):
     with pytest.raises(AssertionError, match="live DB"):
-        subprocess.run(["sqlite3", NEVER_THERE, "select 1"])
+        subprocess.run(["sqlite3", stand_in_live, "select 1"])
     assert subprocess.run(["true"]).returncode == 0        # an ordinary child still runs
 
 
