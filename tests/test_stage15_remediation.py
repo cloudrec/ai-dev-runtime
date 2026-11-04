@@ -54,6 +54,7 @@ def test_f4_plain_claude_is_wrapped_with_the_full_strip():
 import asyncio
 import hashlib
 import hmac
+import json
 import time
 import types
 
@@ -77,8 +78,9 @@ def _req(method="POST", path="/api/v1/jobs", query="", body=b"{}"):
 
 
 def _v2(ts, method="POST", path="/api/v1/jobs", query="", body=b"{}"):
-    msg = "|".join(("v2", ts, method, path, query, hashlib.sha256(body).hexdigest()))
-    return hmac.new(TOKEN.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    msg = json.dumps(["v2", ts, method, path, query, hashlib.sha256(body).hexdigest()],
+                     separators=(",", ":")).encode()
+    return hmac.new(TOKEN.encode(), msg, hashlib.sha256).hexdigest()
 
 
 def _call(req, ts, sig, ver="2"):
@@ -121,6 +123,28 @@ def test_f5_legacy_signature_cannot_pass_as_v2_and_can_be_disabled(hmac_env, mon
     with pytest.raises(v1.HTTPException) as e:
         _call(_req(), ts, legacy, ver=None)
     assert e.value.status_code == 401
+
+
+def test_r2_v2_fields_cannot_run_into_each_other():
+    body = b"{}"
+    assert v1.hmac_v2_message("1", "GET", "/a|b", "", body) != \
+        v1.hmac_v2_message("1", "GET", "/a", "b|", body)
+    assert v1.hmac_v2_message("1", "GET", '/a","b', "", body) != \
+        v1.hmac_v2_message("1", "GET", "/a", 'b",""', body)
+
+
+def test_r2_v2_message_is_the_documented_bytes():
+    sha = hashlib.sha256(b"x").hexdigest()
+    assert v1.hmac_v2_message("12", "post", "/p", "q=1", b"x") == \
+        f'["v2","12","POST","/p","q=1","{sha}"]'.encode()
+
+
+def test_r2_the_old_pipe_format_is_refused(hmac_env):
+    ts = str(int(time.time()))
+    msg = "|".join(("v2", ts, "POST", "/api/v1/jobs", "", hashlib.sha256(b"{}").hexdigest()))
+    sig = hmac.new(TOKEN.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    with pytest.raises(v1.HTTPException):
+        _call(_req(), ts, sig)
 
 
 def test_f5_stale_v2_is_refused(hmac_env):

@@ -47,6 +47,13 @@ def _hmac_first_use(sig: str) -> bool:
         return True
 
 
+def hmac_v2_message(ts: str, method: str, path: str, query: str, body: bytes) -> bytes:
+    """What a v2 client signs: a compact ASCII JSON array, so no field can run into the
+    next one (R2: `|`-joined, path "/a|b" + query "" equalled path "/a" + query "b|")."""
+    return json.dumps(["v2", ts, method.upper(), path, query, hashlib.sha256(body).hexdigest()],
+                      separators=(",", ":"), ensure_ascii=True).encode("ascii")
+
+
 # ── auth (bearer + optional HMAC, constant-time, replay-protected) ──────────
 async def _auth(request: Request,
                 authorization: Optional[str] = Header(None),
@@ -68,10 +75,9 @@ async def _auth(request: Request,
             # captured header pair cannot be replayed on another endpoint or body, and an
             # identical replay inside the window is refused (single-use signature).
             body = await request.body()
-            msg = "|".join(("v2", x_runtime_timestamp, request.method.upper(),
-                            request.url.path, request.url.query or "",
-                            hashlib.sha256(body).hexdigest()))
-            expected = hmac.new(_TOKEN.encode(), msg.encode(), hashlib.sha256).hexdigest()
+            msg = hmac_v2_message(x_runtime_timestamp, request.method, request.url.path,
+                                  request.url.query or "", body)
+            expected = hmac.new(_TOKEN.encode(), msg, hashlib.sha256).hexdigest()
             if not hmac.compare_digest(expected, x_runtime_signature):
                 raise HTTPException(status_code=401, detail="bad signature")
             if not _hmac_first_use(expected):
