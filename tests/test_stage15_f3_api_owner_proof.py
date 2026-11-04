@@ -178,17 +178,32 @@ def test_replay_after_the_session_died_is_refused(wt, tmux, api_cfg):  # noqa: F
 
 def test_replay_is_refused_even_if_the_used_table_is_emptied(wt, tmux, api_cfg):  # noqa: F811
     proof = _sign(wt)
-    assert aam.commit_api_launch(session="gaika-kz", project_dir=wt["kz"], model="sonnet",
-                                 proof=proof) == ""
+    assert _commit(wt, proof) == ""
     _sql("DELETE FROM owner_proof_used")
-    assert aam.commit_api_launch(session="gaika-kz", project_dir=wt["kz"], model="sonnet",
-                                 proof=proof) == "owner_proof_replayed"
+    assert _commit(wt, proof) == "owner_proof_replayed"
     assert _rows("agent_auth_api_chain") == 1
 
 
-def test_commit_without_a_proof_is_refused():
-    assert aam.commit_api_launch(session="s", project_dir="/x", model="sonnet",
-                                 proof=None) == "api_owner_proof_required"
+def _commit(wt, proof, **over):  # noqa: F811
+    kw = {"session": "gaika-kz", "project_dir": wt["kz"], "model": "sonnet",
+          "launcher": str(aam.load_config()["launcher"]), **over}
+    return aam.commit_api_launch(proof=proof, **kw)
+
+
+@pytest.mark.parametrize("proof,reason", [
+    (None, "api_owner_proof_required"), ("owner", "api_owner_proof_required"),
+    ({"nonce": "ab" * 16}, "owner_proof_malformed"),
+    ({"ts": 1, "nonce": "ab" * 16, "sig": "0" * 64}, "owner_proof_expired")])
+def test_commit_refuses_anything_but_a_verified_proof(wt, api_cfg, proof, reason):  # noqa: F811
+    assert _commit(wt, proof) == reason
+    assert _rows("agent_auth_api_chain") == 0
+
+
+@pytest.mark.parametrize("over", [{"session": "gaika-ru"}, {"model": "opus"}, {"risk": "high"},
+                                  {"conversation_id": "other"}, {"launcher": "/evil"}])
+def test_commit_rechecks_the_binding_itself(wt, api_cfg, over):  # noqa: F811
+    assert _commit(wt, _sign(wt), **over) == "owner_proof_bad_signature"
+    assert _rows("agent_auth_api_chain") == 0
 
 
 # ── idempotency: a retry changes nothing and spends nothing ───────────────────────
@@ -269,18 +284,20 @@ def test_concurrent_starts_cannot_overrun_the_daily_cap(wt, tmux, api_cfg):  # n
 
 
 _SPENDER = """
-import sys
+import json, sys
 sys.path.insert(0, {root!r})
 from core import agent_auth_mode as aam
-print(repr(aam.commit_api_launch(session="s", project_dir="/x", model="sonnet",
-                                 proof={{"nonce": sys.argv[1]}})))
+print(repr(aam.commit_api_launch(session="gaika-kz", project_dir=sys.argv[2], model="sonnet",
+                                 launcher=sys.argv[3], proof=json.loads(sys.argv[1]))))
 """
 
 
-def test_separate_processes_cannot_both_spend_one_nonce(wt):  # noqa: F811
+def test_separate_processes_cannot_both_spend_one_nonce(wt, api_cfg):  # noqa: F811
     env = {**os.environ}
-    procs = [subprocess.Popen([sys.executable, "-c", _SPENDER.format(root=ROOT), "ab" * 16],
-                              env=env, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    lp = str(aam.load_config()["launcher"])
+    proof = json.dumps(_sign(wt, launcher_path=lp))
+    procs = [subprocess.Popen([sys.executable, "-c", _SPENDER.format(root=ROOT), proof, wt["kz"],
+                               lp], env=env, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True) for _ in range(6)]
     results = []
     for p in procs:

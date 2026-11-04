@@ -2407,7 +2407,9 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
             # and its proof stays spent. Proof and count commit together.
             why = aam.commit_api_launch(session=name, project_dir=resolved,
                                         model=auth["model"], risk=risk or "",
-                                        actor=actor or "", proof=api_proof)
+                                        actor=actor or "", proof=api_proof,
+                                        conversation_id=conversation_id,
+                                        launcher=auth["launcher"])
             if why:
                 audit("agent_resume", name, resumed=False, refused=f"auth_mode:{why}",
                       actor=actor, cwd=resolved, auth_mode=aam.API)

@@ -207,13 +207,13 @@ def _chain_problem(c) -> Optional[str]:
 
 
 def commit_api_launch(*, session: str, project_dir: str, model: str, risk: str = "",
-                      actor: str = "", proof: Optional[dict] = None, conn=None,
-                      now: Optional[float] = None) -> str:
-    """Spend the owner proof and count the launch, one transaction. "" or why refused. The
-    caller holds the creation guard and starts the session only on ""."""
-    nonce = str((proof or {}).get("nonce") or "")
-    if not nonce:
-        return "api_owner_proof_required"
+                      actor: str = "", proof: Optional[dict] = None,
+                      conversation_id: Optional[str] = None,
+                      launcher: str = DEFAULT_LAUNCHER, conn=None, now: Optional[float] = None,
+                      verify_proof: Optional[Callable] = None) -> str:
+    """Verify and spend the owner proof and count the launch, one transaction. "" or why
+    refused. Trusts nothing resolve() decided: the proof is checked again against this exact
+    launch (audit R4). The caller holds the creation guard and starts the session only on ""."""
     c = _chain(_ledger(conn))
     ts = now if now is not None else time.time()
     try:
@@ -221,10 +221,13 @@ def commit_api_launch(*, session: str, project_dir: str, model: str, risk: str =
             c.commit()
         c.execute("BEGIN IMMEDIATE")
         try:
-            problem = _chain_problem(c)
+            problem = _chain_problem(c) or _api_proof_problem(
+                proof, session, project_dir, model, risk, conversation_id, launcher, c, now,
+                verify_proof)
             if problem:
                 c.rollback()
                 return problem
+            nonce = str(proof.get("nonce"))
             r = c.execute("SELECT hash FROM agent_auth_api_chain ORDER BY seq DESC LIMIT 1"
                           ).fetchone()
             prev = r[0] if r else ""
@@ -422,6 +425,7 @@ def resolve(session: str, project_dir: str, *, requested: Optional[str] = None,
     if why:
         return {"ok": False, "reason": why, **usage}
     return {"ok": True, "mode": API, "model": use, "argv": [launcher, "--model", use],
+            "launcher": launcher,
             "reason": "explicit_api_opt_in", **usage}
 
 
