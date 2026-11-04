@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import time
@@ -54,6 +55,22 @@ def hmac_v2_message(ts: str, method: str, path: str, query: str, body: bytes) ->
                       separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
 
+_log = logging.getLogger("runtime.api.hmac")
+_legacy_hmac_stats = {"accepted": 0, "refused": 0}     # this process, since it started
+
+
+def _hmac_legacy_mode() -> str:
+    """RUNTIME_HMAC_LEGACY: `0` off; `warn` accepted and logged, to find who still uses it;
+    anything else, including unset, accepted silently as it always was."""
+    raw = os.getenv("RUNTIME_HMAC_LEGACY", "1").strip().lower()
+    return {"0": "off", "warn": "warn"}.get(raw, "on")
+
+
+def _client_host(request: Request) -> str:
+    client = getattr(request, "client", None)
+    return getattr(client, "host", "") or "unknown"
+
+
 def _signed_target(request: Request) -> tuple:
     """(path, query) exactly as the client sent them. Read from the ASGI scope: request.url
     is re-parsed from the DECODED path, so a %23 or %3F there would move characters from
@@ -97,12 +114,19 @@ async def _auth(request: Request,
         else:
             # legacy timestamp-only signature (replayable on any request in the window);
             # kept for existing clients until the owner sets RUNTIME_HMAC_LEGACY=0
-            if os.getenv("RUNTIME_HMAC_LEGACY", "1") == "0":
+            # (docs/OWNER_OS_HMAC_V2_MIGRATION.md)
+            mode = _hmac_legacy_mode()
+            if mode == "off":
+                _legacy_hmac_stats["refused"] += 1
                 raise HTTPException(status_code=401, detail="legacy signature disabled")
             expected = hmac.new(_TOKEN.encode(), x_runtime_timestamp.encode(),
                                 hashlib.sha256).hexdigest()
             if not hmac.compare_digest(expected, x_runtime_signature):
                 raise HTTPException(status_code=401, detail="bad signature")
+            _legacy_hmac_stats["accepted"] += 1
+            if mode == "warn":
+                _log.warning("legacy_hmac_accepted client=%s path=%s", _client_host(request),
+                             _signed_target(request)[0][:200])
         request.state.auth_method = "hmac"
         return True
     # Bearer path

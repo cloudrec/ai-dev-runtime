@@ -211,3 +211,73 @@ def test_f7_enforce_passes_a_clean_host(wt, tmux, tmp_path, monkeypatch):  # noq
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "empty"))
     monkeypatch.setenv("AGENT_AUTH_SETTINGS_GUARD", "enforce")
     assert _launch(wt)["agent_created"]
+
+
+# ── F5: opt-in migration off legacy HMAC; the default does not move ─────────────
+def _legacy_headers():
+    import hashlib
+    import hmac
+    import time
+    ts = str(int(time.time()))
+    return {"X-Runtime-Timestamp": ts,
+            "X-Runtime-Signature": hmac.new(TOKEN.encode(), ts.encode(),
+                                            hashlib.sha256).hexdigest()}
+
+
+@pytest.fixture
+def stats():
+    from api import v1
+    v1._legacy_hmac_stats.update(accepted=0, refused=0)
+    return v1._legacy_hmac_stats
+
+
+@pytest.mark.parametrize("value", [None, "1", "", "yes", "WARNING"])
+def test_f5_default_and_unknown_values_keep_accepting_silently(signed_client, stats, value,
+                                                               monkeypatch, caplog):
+    client, _ = signed_client
+    if value is None:
+        monkeypatch.delenv("RUNTIME_HMAC_LEGACY", raising=False)
+    else:
+        monkeypatch.setenv("RUNTIME_HMAC_LEGACY", value)
+    assert client.get("/jobs/x", headers=_legacy_headers()).status_code == 200
+    assert stats == {"accepted": 1, "refused": 0}
+    assert "legacy_hmac_accepted" not in caplog.text
+
+
+def test_f5_shipped_default_is_not_flipped(monkeypatch):
+    from api import v1
+    monkeypatch.delenv("RUNTIME_HMAC_LEGACY", raising=False)
+    assert v1._hmac_legacy_mode() == "on"
+
+
+def test_f5_warn_accepts_and_names_the_client(signed_client, stats, monkeypatch, caplog):
+    client, _ = signed_client
+    monkeypatch.setenv("RUNTIME_HMAC_LEGACY", "warn")
+    assert client.get("/jobs/x?secret=1", headers=_legacy_headers()).status_code == 200
+    assert "legacy_hmac_accepted" in caplog.text and "path=/jobs/x" in caplog.text
+    assert "secret" not in caplog.text and stats["accepted"] == 1
+
+
+def test_f5_warn_does_not_log_a_bad_signature_as_accepted(signed_client, stats, monkeypatch,
+                                                          caplog):
+    client, _ = signed_client
+    monkeypatch.setenv("RUNTIME_HMAC_LEGACY", "warn")
+    h = {**_legacy_headers(), "X-Runtime-Signature": "0" * 64}
+    assert client.get("/jobs/x", headers=h).status_code == 401
+    assert stats["accepted"] == 0 and "legacy_hmac_accepted" not in caplog.text
+
+
+def test_f5_off_refuses_legacy_and_v2_keeps_working(signed_client, stats, monkeypatch):
+    client, headers = signed_client
+    monkeypatch.setenv("RUNTIME_HMAC_LEGACY", "0")
+    assert client.get("/jobs/x", headers=_legacy_headers()).status_code == 401
+    assert stats["refused"] == 1
+    assert client.get("/jobs/x", headers=headers("GET", "/jobs/x")).status_code == 200
+
+
+def test_f5_rollback_restores_legacy(signed_client, monkeypatch):
+    client, _ = signed_client
+    monkeypatch.setenv("RUNTIME_HMAC_LEGACY", "0")
+    assert client.get("/jobs/x", headers=_legacy_headers()).status_code == 401
+    monkeypatch.delenv("RUNTIME_HMAC_LEGACY")
+    assert client.get("/jobs/x", headers=_legacy_headers()).status_code == 200
