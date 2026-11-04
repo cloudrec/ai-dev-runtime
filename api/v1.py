@@ -76,11 +76,11 @@ def _signed_target(request: Request) -> tuple:
     is re-parsed from the DECODED path, so a %23 or %3F there would move characters from
     path to query and leave part of the request unsigned (N1)."""
     scope = request.scope
+    query = scope.get("query_string", b"").decode("latin-1")
     raw = scope.get("raw_path")
-    if raw is None:
-        raw = scope.get("path", "").encode("utf-8")
-    return (raw.split(b"?", 1)[0].decode("latin-1"),
-            scope.get("query_string", b"").decode("latin-1"))
+    if raw is None:         # already decoded: a ? here is part of the path, never a separator
+        return scope.get("path", ""), query
+    return raw.split(b"?", 1)[0].decode("latin-1"), query
 
 
 # ── auth (bearer + optional HMAC, constant-time, replay-protected) ──────────

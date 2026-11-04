@@ -211,3 +211,14 @@ def test_l2_a_check_keeps_its_environment(monkeypatch):
     env = hosts._child_env(["bash", "-c", "pytest -k claude"], {"PYTHONDONTWRITEBYTECODE": "1"})
     assert env["VIRTUAL_ENV"] == "/v" and env["PYTHONDONTWRITEBYTECODE"] == "1"
     assert "ANTHROPIC_API_KEY" not in env
+
+
+# ── L4: without raw_path a decoded ? stays in the signed path ────────────────────
+def test_l4_a_decoded_question_mark_is_signed_with_the_path():
+    from types import SimpleNamespace
+
+    from api.v1 import _signed_target
+    req = SimpleNamespace(scope={"path": "/jobs/x?evil", "query_string": b"a=1"})
+    assert _signed_target(req) == ("/jobs/x?evil", "a=1")
+    req = SimpleNamespace(scope={"raw_path": b"/jobs/x%3Fevil?a=1", "query_string": b"a=1"})
+    assert _signed_target(req) == ("/jobs/x%3Fevil", "a=1")
