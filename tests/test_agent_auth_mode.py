@@ -252,3 +252,21 @@ def test_agent_create_cli_passes_auth_mode(monkeypatch, capsys):
     assert (seen["auth_mode"], seen["model"], seen["risk"]) == ("api", "opus", "high")
     assert mod.main(["--dir", "/tmp", "--session", "s"]) == 0
     assert seen["auth_mode"] is None                  # default: subscription
+
+
+def test_a_refused_api_request_does_not_even_clean_a_zombie_session(wt, monkeypatch):
+    """The auth decision precedes EVERY tmux mutation, incl. the dead-session cleanup."""
+    calls = []
+    monkeypatch.setattr(ac, "_tmux", lambda args, stdin=None: calls.append(list(args))
+                        or (0, "", ""))                       # the session name exists
+    monkeypatch.setattr(ac, "_session_liveness", lambda name: {"panes": 1, "dead": 1,
+                                                               "live": 0})
+    monkeypatch.setattr(ac, "agent_list", lambda: {"agents": []})
+    monkeypatch.setattr(ac, "find_live_agent_for_dir", lambda d: None)
+    monkeypatch.setattr(ac, "validate_project_dir", lambda d: os.path.realpath(d))
+    r = _create(wt, auth_mode="api")                          # API is disabled by default
+    assert r["refused"] == "auth_mode:api_mode_disabled"
+    assert mutations(calls) == [] and not any(c[0] == "has-session" for c in calls)
+    # the same zombie IS cleaned for an authorized (subscription) start
+    r = _create(wt)
+    assert r["agent_created"] and ["kill-session", "-t", "gaika-kz"] in calls

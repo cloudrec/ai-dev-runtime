@@ -2345,6 +2345,21 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
             return {"resumed": False, "refused": gate["reason"], "scope": gate.get("scope"),
                     "reason": "agent creation policy: not authorized",
                     "duplicate_created": False, "agent_created": False}
+        # auth mode (core.agent_auth_mode), decided BEFORE any tmux mutation (incl. the
+        # zombie cleanup below): subscription unless THIS launch explicitly asks
+        # for API credits and every opt-in/guardrail check passes. A refusal starts
+        # nothing — it never falls back to the other mode.
+        from core import agent_auth_mode as aam
+        auth = aam.resolve(name, resolved, requested=auth_mode, model=model, risk=risk,
+                           live_sessions=lambda: {a.get("session") for a in
+                                                  agent_list().get("agents", [])
+                                                  if a.get("alive")})
+        if not auth["ok"]:
+            audit("agent_resume", name, resumed=False, refused=f"auth_mode:{auth['reason']}",
+                  actor=actor, cwd=resolved, auth_mode=auth_mode or aam.SUBSCRIPTION)
+            return {"resumed": False, "refused": f"auth_mode:{auth['reason']}",
+                    "reason": "auth mode: not authorized", "duplicate_created": False,
+                    "agent_created": False}
         rc, _, _ = _tmux(["has-session", "-t", name])
         if rc == 0:
             # The session NAME exists — but it may be a ZOMBIE whose panes are all dead
@@ -2370,20 +2385,6 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
                     "agent_created": False,
                 }
 
-        # auth mode (core.agent_auth_mode): subscription unless THIS launch explicitly asks
-        # for API credits and every opt-in/guardrail check passes. A refusal starts
-        # nothing — it never falls back to the other mode.
-        from core import agent_auth_mode as aam
-        auth = aam.resolve(name, resolved, requested=auth_mode, model=model, risk=risk,
-                           live_sessions=lambda: {a.get("session") for a in
-                                                  agent_list().get("agents", [])
-                                                  if a.get("alive")})
-        if not auth["ok"]:
-            audit("agent_resume", name, resumed=False, refused=f"auth_mode:{auth['reason']}",
-                  actor=actor, cwd=resolved, auth_mode=auth_mode or aam.SUBSCRIPTION)
-            return {"resumed": False, "refused": f"auth_mode:{auth['reason']}",
-                    "reason": "auth mode: not authorized", "duplicate_created": False,
-                    "agent_created": False}
         if auth["mode"] == aam.API:
             # counted BEFORE the start: a launch that then fails still counts (caps err low)
             aam.record_launch(session=name, project_dir=resolved, mode=aam.API,
