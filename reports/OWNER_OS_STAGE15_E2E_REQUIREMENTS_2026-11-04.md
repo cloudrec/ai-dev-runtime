@@ -48,9 +48,14 @@ A real agent with a scripted reviewer is possible as a middle step, but it needs
 ## Owner gates
 1. Approve one sandbox Claude agent. `config/agent_creation.yaml` has `scopes: {}`, so it needs an owner proof.
 2. Approve the reviewer path. Recommended: a separate sandbox MCP instance with `RUNTIME_URL` at the sandbox API. ChatGPT must be able to reach it, so check whether that needs new exposure, which is itself an owner decision.
-3. Approve the `/opt/seo` change on a new branch: `fullcycle_get` and `fullcycle_post` send a new `RUNTIME_FULLCYCLE_TOKEN` instead of the shared token. No effect until an MCP is built with it.
+3. Done on a branch, on the owner's word: see the update below. Merge and image build remain owner decisions.
 4. Issue the sandbox token as in section A.
 5. A dedicated ChatGPT chat and a logged-in browser profile on its own CDP port.
 
 ## Next step
-Owner decides gates 1-3. The seo branch change can then be written and tested offline without any live change. Stop here until then. No PROD canary without separate owner approval.
+Owner decides gates 1, 2, 4 and 5. Stop here until then. No PROD canary without separate owner approval.
+
+## Update: seo branch
+`feat/mcp-fullcycle-client-token` @ `414c4e5` in worktree `/opt/seo-fullcycle-token`, off `7039d6c`, requested by the owner directly. Local only, not merged, not built, not deployed. `/opt/seo` itself was not touched.
+- `fullcycle_get` and `fullcycle_post` send `RUNTIME_FULLCYCLE_TOKEN` when set; unset keeps today's behaviour. Other calls keep the shared token.
+- Real round trip with test tokens: seo client, uvicorn, API from this branch. Shared token: ack 403, list ok. Client token: ack and decision pass auth and reach the engine (`no such review 1`). So the 403 blocker is closed in code. Local integration, not live: no real review was decided.
