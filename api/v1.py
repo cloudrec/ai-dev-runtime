@@ -26,11 +26,33 @@ _DANGEROUS_RE = re.compile(
     re.IGNORECASE)
 
 
+_seen_sigs: dict = {}
+_seen_lock = __import__("threading").Lock()
+_SEEN_MAX = 20000
+
+
+def _hmac_first_use(sig: str) -> bool:
+    """True the first time a v2 signature is seen inside the replay window (in-process;
+    a restart forgets, but the window is bounded and the signature is request-bound)."""
+    now = time.time()
+    with _seen_lock:
+        if len(_seen_sigs) >= _SEEN_MAX or len(_seen_sigs) % 256 == 0:
+            for k in [k for k, exp in _seen_sigs.items() if exp < now]:
+                del _seen_sigs[k]
+        if sig in _seen_sigs:
+            return False
+        if len(_seen_sigs) >= _SEEN_MAX:
+            return False              # fail closed under flood rather than grow unbounded
+        _seen_sigs[sig] = now + _REPLAY_WINDOW * 2
+        return True
+
+
 # ── auth (bearer + optional HMAC, constant-time, replay-protected) ──────────
 async def _auth(request: Request,
                 authorization: Optional[str] = Header(None),
                 x_runtime_timestamp: Optional[str] = Header(None),
-                x_runtime_signature: Optional[str] = Header(None)) -> bool:
+                x_runtime_signature: Optional[str] = Header(None),
+                x_runtime_signature_version: Optional[str] = Header(None)) -> bool:
     if not _TOKEN:
         raise HTTPException(status_code=503, detail="runtime auth not configured (RUNTIME_TOKEN unset)")
     # HMAC path (preferred)
@@ -41,9 +63,28 @@ async def _auth(request: Request,
             raise HTTPException(status_code=401, detail="bad timestamp")
         if abs(time.time() - ts) > _REPLAY_WINDOW:
             raise HTTPException(status_code=401, detail="stale request (replay window)")
-        expected = hmac.new(_TOKEN.encode(), x_runtime_timestamp.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, x_runtime_signature):
-            raise HTTPException(status_code=401, detail="bad signature")
+        if x_runtime_signature_version == "2":
+            # F5: v2 binds the signature to THIS request (method, path+query, body), so a
+            # captured header pair cannot be replayed on another endpoint or body, and an
+            # identical replay inside the window is refused (single-use signature).
+            body = await request.body()
+            msg = "|".join(("v2", x_runtime_timestamp, request.method.upper(),
+                            request.url.path, request.url.query or "",
+                            hashlib.sha256(body).hexdigest()))
+            expected = hmac.new(_TOKEN.encode(), msg.encode(), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected, x_runtime_signature):
+                raise HTTPException(status_code=401, detail="bad signature")
+            if not _hmac_first_use(expected):
+                raise HTTPException(status_code=401, detail="signature already used")
+        else:
+            # legacy timestamp-only signature (replayable on any request in the window);
+            # kept for existing clients until the owner sets RUNTIME_HMAC_LEGACY=0
+            if os.getenv("RUNTIME_HMAC_LEGACY", "1") == "0":
+                raise HTTPException(status_code=401, detail="legacy signature disabled")
+            expected = hmac.new(_TOKEN.encode(), x_runtime_timestamp.encode(),
+                                hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected, x_runtime_signature):
+                raise HTTPException(status_code=401, detail="bad signature")
         request.state.auth_method = "hmac"
         return True
     # Bearer path
