@@ -54,6 +54,18 @@ def hmac_v2_message(ts: str, method: str, path: str, query: str, body: bytes) ->
                       separators=(",", ":"), ensure_ascii=True).encode("ascii")
 
 
+def _signed_target(request: Request) -> tuple:
+    """(path, query) exactly as the client sent them. Read from the ASGI scope: request.url
+    is re-parsed from the DECODED path, so a %23 or %3F there would move characters from
+    path to query and leave part of the request unsigned (N1)."""
+    scope = request.scope
+    raw = scope.get("raw_path")
+    if raw is None:
+        raw = scope.get("path", "").encode("utf-8")
+    return (raw.split(b"?", 1)[0].decode("latin-1"),
+            scope.get("query_string", b"").decode("latin-1"))
+
+
 # ── auth (bearer + optional HMAC, constant-time, replay-protected) ──────────
 async def _auth(request: Request,
                 authorization: Optional[str] = Header(None),
@@ -75,8 +87,8 @@ async def _auth(request: Request,
             # captured header pair cannot be replayed on another endpoint or body, and an
             # identical replay inside the window is refused (single-use signature).
             body = await request.body()
-            msg = hmac_v2_message(x_runtime_timestamp, request.method, request.url.path,
-                                  request.url.query or "", body)
+            path, query = _signed_target(request)
+            msg = hmac_v2_message(x_runtime_timestamp, request.method, path, query, body)
             expected = hmac.new(_TOKEN.encode(), msg, hashlib.sha256).hexdigest()
             if not hmac.compare_digest(expected, x_runtime_signature):
                 raise HTTPException(status_code=401, detail="bad signature")

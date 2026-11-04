@@ -74,7 +74,8 @@ def _req(method="POST", path="/api/v1/jobs", query="", body=b"{}"):
     async def _body():
         return body
     return types.SimpleNamespace(state=types.SimpleNamespace(), method=method, body=_body,
-                                 url=types.SimpleNamespace(path=path, query=query))
+                                 scope={"raw_path": path.encode(),
+                                        "query_string": query.encode()})
 
 
 def _v2(ts, method="POST", path="/api/v1/jobs", query="", body=b"{}"):

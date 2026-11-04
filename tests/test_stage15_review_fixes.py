@@ -93,3 +93,60 @@ def test_n2_ordinary_trusted_checks_still_run(tmp_path):
     for argv in (["python3", "-m", "pytest"], ["sh", "-c", "claude --version"], ["./verify.sh"]):
         assert gates.check_argv(argv, root=str(tmp_path), trusted=True) is None
     assert aam.DEFAULT_LAUNCHER.endswith("claude-owner-api")
+
+
+# ── N1: v2 signs the request target as sent, through the real ASGI stack ────────
+TOKEN = "n1-test-token"
+
+
+@pytest.fixture
+def signed_client(monkeypatch):
+    import hashlib
+    import hmac
+    import time
+
+    from fastapi import Depends, FastAPI
+    from fastapi.testclient import TestClient
+
+    from api import v1
+    monkeypatch.setattr(v1, "_TOKEN", TOKEN)
+    v1._seen_sigs.clear()
+    app = FastAPI()
+
+    @app.api_route("/jobs/{jid}", methods=["GET", "POST"], dependencies=[Depends(v1._auth)])
+    def job(jid: str):
+        return {"jid": jid}
+    client = TestClient(app)
+
+    def headers(method, path, query="", body=b""):
+        ts = str(int(time.time()))
+        msg = v1.hmac_v2_message(ts, method, path, query, body)
+        return {"X-Runtime-Timestamp": ts, "X-Runtime-Signature-Version": "2",
+                "X-Runtime-Signature": hmac.new(TOKEN.encode(), msg, hashlib.sha256).hexdigest()}
+    return client, headers
+
+
+def test_n1_a_signed_request_passes(signed_client):
+    client, headers = signed_client
+    r = client.get("/jobs/x?a=1", headers=headers("GET", "/jobs/x", "a=1"))
+    assert r.status_code == 200 and r.json() == {"jid": "x"}
+
+
+@pytest.mark.parametrize("sent", ["/jobs/x%23y?any=thing", "/jobs/x%3Fy?any=thing"])
+def test_n1_a_signature_does_not_cover_an_unsigned_query(signed_client, sent):
+    client, headers = signed_client
+    assert client.get(sent, headers=headers("GET", "/jobs/x")).status_code == 401
+
+
+def test_n1_an_encoded_character_is_signed_as_sent(signed_client):
+    client, headers = signed_client
+    r = client.get("/jobs/x%23y", headers=headers("GET", "/jobs/x%23y"))
+    assert r.status_code == 200 and r.json() == {"jid": "x#y"}
+    assert client.get("/jobs/x%23z", headers=headers("GET", "/jobs/x%23y")).status_code == 401
+
+
+def test_n1_query_and_body_stay_bound(signed_client):
+    client, headers = signed_client
+    assert client.get("/jobs/x?a=2", headers=headers("GET", "/jobs/x", "a=1")).status_code == 401
+    assert client.post("/jobs/x", content=b"other",
+                       headers=headers("POST", "/jobs/x", body=b"signed")).status_code == 401
