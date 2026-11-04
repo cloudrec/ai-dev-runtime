@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import subprocess
 import time
 
 import pytest
@@ -43,6 +45,42 @@ from tests.test_autonomy_e2e_authenticated import (REVIEWER_TOKEN, SHARED, _hdr,
 from tests.test_fullcycle_stall import Clock
 
 LIVE_DIR = "/root/ai-dev-runtime"
+LIVE_DB_VARS = ("CONTROL_PLANE_DB", "RUNTIME_DB", "AGENT_CONTROL_DB")
+
+
+def _is_live(path) -> bool:
+    name = str(path)
+    if name.startswith("file:"):
+        name = name[5:].split("?", 1)[0]
+    return (os.path.realpath(name) + os.sep).startswith(LIVE_DIR + os.sep)
+
+
+def _refuse_live_attach(action, arg1, *_):
+    """F6: a connection to a harmless DB must not reach a live one through ATTACH. An
+    unknown name (a bound parameter) is refused too: it cannot be shown to be safe."""
+    if action == sqlite3.SQLITE_ATTACH and (arg1 is None or _is_live(arg1)):
+        return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+
+
+_REAL_POPEN = subprocess.Popen
+
+
+class _LiveGuardedPopen(_REAL_POPEN):
+    """F6: a child process is outside the sqlite3.connect wrapper, so what it is told to
+    open is checked before it starts: its DB variables and any live *.db in its argv."""
+
+    def __init__(self, args, *a, **k):
+        env = k.get("env")
+        env = os.environ if env is None else env
+        for var in LIVE_DB_VARS:
+            if env.get(var) and _is_live(env[var]):
+                raise AssertionError(f"offline acceptance child points {var} at a live DB")
+        for arg in ([args] if isinstance(args, (str, bytes)) else args):
+            text = os.fsdecode(arg) if isinstance(arg, (bytes, os.PathLike)) else str(arg)
+            if LIVE_DIR in text and ".db" in text:
+                raise AssertionError(f"offline acceptance child names a live DB: {text[:120]}")
+        super().__init__(args, *a, **k)
 
 
 @pytest.fixture(autouse=True)
@@ -65,8 +103,11 @@ def isolation(monkeypatch):
         if name != ":memory:" and name and (
                 os.path.realpath(name) + os.sep).startswith(LIVE_DIR + os.sep):
             raise AssertionError(f"offline acceptance must never open a live DB: {name}")
-        return real(database, *a, **k)
+        conn = real(database, *a, **k)
+        conn.set_authorizer(_refuse_live_attach)
+        return conn
     monkeypatch.setattr(sqlite3, "connect", recording)
+    monkeypatch.setattr(subprocess, "Popen", _LiveGuardedPopen)
     yield opened
     live = [p for p in opened if p != ":memory:" and
             (os.path.realpath(p) + os.sep).startswith(LIVE_DIR + os.sep)]
@@ -286,6 +327,40 @@ def test_F_api_credit_mode_is_off_by_default():
     assert sub["mode"] == "subscription" and sub["argv"][-1] == "claude"
     for v in aam.API_ENV_VARS:
         assert v in sub["argv"]                                        # stripped, not passed
+
+
+NEVER_THERE = LIVE_DIR + "/__offline_guard_never_exists__.db"
+
+
+@pytest.mark.parametrize("sql,params", [(f"ATTACH '{NEVER_THERE}' AS live", ()),
+                                        (f"ATTACH 'file:{NEVER_THERE}?mode=ro' AS live", ()),
+                                        ("ATTACH ? AS live", (NEVER_THERE,))])
+def test_G_guard_refuses_attach_of_a_live_db(isolation, sql, params):
+    conn = sqlite3.connect(":memory:")
+    with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+        conn.execute(sql, params)
+    assert not os.path.exists(NEVER_THERE)
+    conn.close()
+
+
+def test_G_guard_allows_attach_of_a_tmp_db(isolation, tmp_path):
+    conn = sqlite3.connect(":memory:")
+    conn.execute(f"ATTACH '{tmp_path / 'other.db'}' AS other")
+    conn.close()
+
+
+@pytest.mark.parametrize("var", LIVE_DB_VARS)
+def test_G_guard_refuses_a_child_pointed_at_a_live_db(isolation, var):
+    ran = []
+    with pytest.raises(AssertionError, match="live DB"):
+        ran.append(subprocess.run(["true"], env={**os.environ, var: NEVER_THERE}))
+    assert ran == []
+
+
+def test_G_guard_refuses_a_child_named_a_live_db(isolation):
+    with pytest.raises(AssertionError, match="live DB"):
+        subprocess.run(["sqlite3", NEVER_THERE, "select 1"])
+    assert subprocess.run(["true"]).returncode == 0        # an ordinary child still runs
 
 
 def test_G_isolation_guard_refuses_before_connecting(isolation):
