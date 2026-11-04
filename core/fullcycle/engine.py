@@ -432,7 +432,10 @@ def _offer_to_wake_bridge(eid: int, type_: str, severity: str, owner: bool, *,
                   correlation_id=correlation_id, project_id=project_id, agent_id=agent_id,
                   conn=conn)
     except Exception:  # noqa: BLE001
-        pass
+        # append_event already committed the event. Only the bridge's own half-done work
+        # can be open here, and it must not reach the next _tx on this connection (N4).
+        if conn.in_transaction:
+            conn.rollback()
 
 
 _TASK_COLS = ("id", "key", "seq", "spec_version", "body", "contract_id", "attempt", "handle",
