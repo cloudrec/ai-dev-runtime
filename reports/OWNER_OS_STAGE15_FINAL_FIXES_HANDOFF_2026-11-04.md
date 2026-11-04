@@ -11,6 +11,13 @@ Written by the Opus 5.5 session. Not an independent audit.
 - Earlier on this branch: `a15dd26` 4651 passed, `acee756` 4676 passed, `ddc75f3` 4690 passed, `294e3c1` 4703 passed, 0 failed each.
 - Mutants, in a disposable repo archive outside the repo, guard code never mutated: 15 at `a15dd26`, 14 at `acee756`, 7 at `6150727`, 6 at `294e3c1`, 1 at `7559ed2`. One survived: the rows-0 anchor check. `ddc75f3` adds its tests and 3 variants of that check were then caught. All others caught. Scoped to `tests/test_stage15_final_fixes.py`.
 
+## Real claude smoke
+Run on the host at `7559ed2`, on the owner's instruction: `claude` 2.1.318 through `LocalHost.run`, in a temp dir, `-p`, one turn, Sonnet, no session persisted.
+- Parent env held sentinel `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` pointing at a closed local port. The child env had no `ANTHROPIC_*` name, 12 variables in all.
+- rc 0, `result: OK`, `apiKeySource: none`: the allowlist is enough for real subscription auth.
+- One live subscription request. Not a canary: no daemon, pane launch or fullcycle task was exercised.
+- The CLI waited 3 s on stdin because `LocalHost.run` leaves it inherited when no input is given. Delay only.
+
 ## Audit reports
 - `reports/OWNER_OS_STAGE15_FABLE_REVIEW_FIXES_AUDIT_2026-11-04.md` (`05073f4..e96e72d`)
 - `reports/OWNER_OS_STAGE15_FABLE_FINAL_FIXES_AUDIT_2026-11-04.md` (`acdeb95..a15dd26`)
@@ -59,7 +66,6 @@ Departures from the auditor's suggestions, on purpose:
 - `ac.audit` is best-effort; the tool's printed JSON is the owner's record.
 - F5 stays open until clients move. Replay cache and counters are per process.
 - `connect()`, `commit_api_launch` and `_chain` still commit a caller's open work. No live caller passes a connection there.
-- Real `claude` binary never run with the allowlist.
 
 ## Conditions for sandbox E2E
 1. Keep `AGENT_AUTH_SETTINGS_GUARD` unset unless the project settings files are owner-written.
@@ -67,8 +73,8 @@ Departures from the auditor's suggestions, on purpose:
 
 ## Owner gates
 - Sandbox token and live E2E setup.
-- Real `claude` smoke with the allowlist, as part of a canary.
-- Whether a live spec names the launcher: needs a read of `control_plane.db` or a copy.
+- Whether a live spec names the launcher: unknown. A read-only scan of `control_plane.db` was refused by the session's auto-mode classifier as a production read, and was not worked around.
+- `stage_done` refuses this pane: `owneros-fable-audit` is not on the autonomy list. Stages after `c9a0d92` were not delivered to the tech lead.
 - `RUNTIME_HMAC_LEGACY=warn` in PROD to find off-host clients.
 - Anything paid, any deploy, `enabled: true`.
 
