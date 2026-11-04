@@ -41,7 +41,8 @@ is a boundary against a process willing to work at it:
     or dropped chain, an old or forged anchor file. Routine use repairs none of it: only the
     owner's reanchor does. Unless the anchor vouches for the chain it also needs an explicit
     accept_chain, because that is the owner judging the chain complete. Each one is audited;
-  * not detected: wiping chain, spent rows and anchor together (looks like a fresh install);
+  * not detected: wiping chain, spent rows and anchor together (looks like a fresh install),
+    or putting back an old copy of the anchor together with a chain cut to match it;
   * not stopped: reading the owner key, pointing AGENT_OWNER_PROOF_KEY_FILE at a key of
     one's own, or editing this code. Each forges a proof outright.
 A non-API proof is protected only by the triggers and its 300 s expiry: a deleted row makes
@@ -265,12 +266,14 @@ def _anchored_rows() -> Optional[int]:
 
 def _anchor_problem(hashes: list) -> bool:
     """True when the chain does not match its anchor. The anchor may lag by one row (a crash
-    between COMMIT and the file write), never lead: fewer rows than anchored is truncation."""
+    between COMMIT and the file write), never lead: fewer rows than anchored is truncation.
+    The file exists before the first row (rows 0), so no file under a row means deletion:
+    "no file" is the one state the key cannot vouch for."""
     try:
         with open(_anchor_path(), encoding="utf-8") as fh:
             a = json.load(fh)
     except FileNotFoundError:
-        return len(hashes) > 1
+        return len(hashes) > 0
     except (OSError, ValueError):
         return True
     if not isinstance(a, dict):
@@ -281,6 +284,8 @@ def _anchor_problem(hashes: list) -> bool:
     want = _anchor_mac(rows, head)
     if not want or not hmac.compare_digest(want, mac):
         return True
+    if rows == 0:
+        return head != "" or len(hashes) > 1
     return not (1 <= rows <= len(hashes) <= rows + 1 and hashes[rows - 1] == head)
 
 
@@ -312,19 +317,20 @@ def _chain(c):
 
 def _close_anchor_lag(c) -> Optional[str]:
     """After a failed anchor write the newest row is unanchored, so deleting it together with
-    its spent nonce would go unseen. The next attempt, even a refused one, anchors it. Call
-    under _anchor_lock, after _chain_problem has accepted the anchor."""
+    its spent nonce would go unseen. The next attempt, even a refused one, anchors it. An
+    empty chain gets its rows-0 anchor here, before the first row can exist. Call under
+    _anchor_lock, after _chain_problem has accepted the anchor."""
     from core import agent_control as ac
+    if ac._owner_key() is None:                   # no key: the proof check refuses anyway
+        return None
     _, hashes = _chain_rows_problem(c)
-    if not hashes or ac._owner_key() is None:     # no key: the proof check refuses anyway
-        return None
     rows = _anchored_rows()
-    if rows == len(hashes):
-        return None
     if rows is None:
         return "api_ledger_tampered"
+    if rows == len(hashes) and os.path.exists(_anchor_path()):
+        return None
     try:
-        _write_anchor(len(hashes), hashes[-1])
+        _write_anchor(len(hashes), hashes[-1] if hashes else "")
     except OSError:
         return "api_anchor_write_failed"
     return None
@@ -456,13 +462,12 @@ def reanchor(conn=None, *, accept_chain: bool = False) -> dict:
             except BaseException:
                 c.rollback()
                 raise
-            if hashes:
-                _write_anchor(len(hashes), hashes[-1])
-            else:
-                with contextlib.suppress(FileNotFoundError):
-                    os.unlink(_anchor_path())
             result = {"ok": True, "rows": len(hashes), "restored_triggers": missing,
                       "anchored_rows_before": before, "anchor_vouched": vouched}
+            try:
+                _write_anchor(len(hashes), hashes[-1] if hashes else "")
+            except OSError:
+                result.update(ok=False, reason="api_anchor_write_failed")
             ac.audit("api_chain_reanchor", "agent_auth_api_chain", **result)
             return result
     finally:

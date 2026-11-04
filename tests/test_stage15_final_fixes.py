@@ -101,7 +101,8 @@ def test_reanchor_clears_the_anchor_of_a_chain_reset_to_empty(wt, api_cfg):  # n
          "DELETE FROM agent_auth_api_chain", "DELETE FROM owner_proof_used")
     assert _state() == "api_ledger_tampered"
     assert aam.reanchor()["reason"] == "api_chain_needs_owner_review"
-    assert aam.reanchor(accept_chain=True)["ok"] and not os.path.exists(aam._anchor_path())
+    assert aam.reanchor(accept_chain=True)["ok"]
+    assert _anchored_rows() == 0
     assert _state() is None
 
 
@@ -132,10 +133,14 @@ def test_l1_a_hostile_settings_file_does_not_block_a_resume(wt, tmux):  # noqa: 
 
 
 # ── L3: the one-row anchor lag closes at the next attempt ────────────────────────
-def _fail_anchor_write_once(monkeypatch):
+def _fail_anchor_write_once(monkeypatch, after=0):
     real = aam._write_anchor
+    left = [after]
 
     def fail(rows, head):
+        if left[0]:
+            left[0] -= 1
+            return real(rows, head)
         monkeypatch.setattr(aam, "_write_anchor", real)
         raise OSError("disk full")
     monkeypatch.setattr(aam, "_write_anchor", fail)
@@ -161,9 +166,9 @@ def test_l3_a_refused_attempt_anchors_the_lagging_row(wt, api_cfg, monkeypatch):
 
 def test_l3_the_first_row_is_anchored_too(wt, api_cfg, monkeypatch):  # noqa: F811
     proof = _sign(wt)
-    _fail_anchor_write_once(monkeypatch)
+    _fail_anchor_write_once(monkeypatch, after=1)
     assert _commit(wt, proof) == "api_anchor_write_failed"
-    assert not os.path.exists(aam._anchor_path())
+    assert _anchored_rows() == 0 and _state() is None
     assert _commit(wt, proof) == "owner_proof_replayed"
     assert _anchored_rows() == 1
 
@@ -211,7 +216,9 @@ def test_l2_a_word_in_an_argument_is_data(argv):
     ["sh", "-c", "claude 'unbalanced"], ["sh", "-c", "echo `claude -p x`"],
     ["bash", "--rcfile", "f", "-c", "claude"], ["sh", "-c", "exec -a name claude"],
     ["sh", "-c", "builtin claude"], ["bash", "-c", "coproc claude"],
-    ["sh", "-c", "> out claude"], ["sh", "-c", "claude 2>&1"]])
+    ["sh", "-c", "> out claude"], ["sh", "-c", "claude 2>&1"],
+    ["sh", "-c", "2>/dev/null claude -p x"], ["sh", "-c", "1> out claude"],
+    ["sh", "-c", ">| out claude"], ["sh", "-c", "&> out claude"]])
 def test_l2_claude_in_command_position_is_seen(argv):
     from core.fullcycle import hosts
     assert hosts._runs_claude(argv) is True
@@ -266,7 +273,8 @@ def test_l5_a_short_configured_name_spares_project_paths(monkeypatch):
     ["sh", "-c", "~/../usr/local/bin/claude-owner-api"],
     ["sh", "-c", "$HOME/../usr/local/bin/claude-owner-api"],
     ["sh", "-c", "cd / && usr/local/bin/claude-owner-api"],
-    ["x", "claude-owner-api,"], ["x", "a:claude-owner-api:b"]])
+    ["x", "claude-owner-api,"], ["x", "a:claude-owner-api:b"],
+    ["sh", "-c", "\\claude-owner-api -p x"]])
 def test_l5_the_launcher_is_still_refused(argv):
     from core.fullcycle import gates
     assert gates._names_api_launcher(argv) is True
@@ -356,7 +364,8 @@ def test_ma_the_owner_can_accept_and_it_is_audited(wt, api_cfg, tmp_path, monkey
 
 def test_ma_the_tool_passes_the_flag(wt, api_cfg, capsys):  # noqa: F811
     import importlib.util
-    spec = importlib.util.spec_from_file_location("owner_proof", "tools/owner_proof.py")
+    spec = importlib.util.spec_from_file_location("owner_proof", os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools", "owner_proof.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     _three_rows_then_truncate(wt)
@@ -368,12 +377,13 @@ def test_ma_the_tool_passes_the_flag(wt, api_cfg, capsys):  # noqa: F811
 # ── L-A and the lag read: an anchor is never written or trusted blindly ──────────
 def test_la_no_key_writes_no_anchor(wt, api_cfg, monkeypatch):  # noqa: F811
     proof = _sign(wt)
-    _fail_anchor_write_once(monkeypatch)
+    _fail_anchor_write_once(monkeypatch, after=1)
     assert _commit(wt, proof) == "api_anchor_write_failed"
+    before = open(aam._anchor_path()).read()
     with monkeypatch.context() as m:
         m.setattr(ac, "_owner_key", lambda: None)
         assert _commit(wt, None) != ""
-    assert not os.path.exists(aam._anchor_path())
+    assert open(aam._anchor_path()).read() == before
     assert _state() is None
 
 
@@ -394,3 +404,79 @@ def test_lb_a_long_wrapper_chain_stays_linear():
     assert hosts._runs_claude(["env"] * 200_000) is False
     assert hosts._runs_claude(["sh", "-c", "exec " * 200_000]) is False
     assert time.monotonic() - start < 10
+
+
+# ── M-B: no anchor file under a row is always deletion ───────────────────────────
+def _rebuild_without_last_row(proof):
+    """The audit's clean attack: tables rebuilt with triggers intact, anchor unlinked."""
+    c = sqlite3.connect(ac._db_path())
+    chain = c.execute("SELECT sql FROM sqlite_master WHERE name='agent_auth_api_chain'").fetchone()[0]
+    triggers = [r[0] for r in c.execute("SELECT sql FROM sqlite_master WHERE type='trigger'")]
+    rows = c.execute("SELECT * FROM agent_auth_api_chain ORDER BY seq").fetchall()[:-1]
+    used = [r for r in c.execute("SELECT * FROM owner_proof_used") if r[0] != proof["nonce"]]
+    c.executescript("DROP TABLE agent_auth_api_chain; DROP TABLE owner_proof_used;")
+    c.execute(chain)
+    c.execute(aam._PROOF_TABLE)
+    c.executemany(f"INSERT INTO agent_auth_api_chain VALUES ({','.join('?' * 10)})", rows)
+    c.executemany("INSERT INTO owner_proof_used VALUES (?,?,?,?)", used)
+    for t in triggers:
+        c.execute(t)
+    c.commit()
+    c.close()
+    os.unlink(aam._anchor_path())
+
+
+def test_mb_cutting_two_rows_to_one_with_the_anchor_gone_is_caught(wt, api_cfg):  # noqa: F811
+    first, second = _sign(wt), _sign(wt)
+    assert _commit(wt, first) == "" and _commit(wt, second) == ""
+    _rebuild_without_last_row(second)
+    assert _state() == "api_ledger_tampered"
+    assert _commit(wt, second) == "api_ledger_tampered"
+    assert aam.reanchor()["reason"] == "api_chain_needs_owner_review"
+
+
+def test_mb_a_one_row_chain_with_no_anchor_needs_the_owner(wt, api_cfg):  # noqa: F811
+    assert _commit(wt, _sign(wt)) == ""
+    os.unlink(aam._anchor_path())
+    assert _state() == "api_ledger_tampered"
+    r = aam.reanchor()
+    assert r == {"ok": False, "reason": "api_chain_needs_owner_review", "rows": 1,
+                 "anchored_rows_before": 0}
+    assert aam.reanchor(accept_chain=True)["ok"] and _state() is None
+
+
+def test_mb_the_anchor_exists_before_the_first_row(wt, api_cfg):  # noqa: F811
+    assert _commit(wt, {"nonce": "ab" * 16}) != ""
+    assert _anchored_rows() == 0 and _state() is None
+
+
+def test_mb_no_first_row_without_its_anchor(wt, api_cfg, monkeypatch):  # noqa: F811
+    proof = _sign(wt)
+    _fail_anchor_write_once(monkeypatch)
+    assert _commit(wt, proof) == "api_anchor_write_failed"
+    assert sqlite3.connect(ac._db_path()).execute(
+        "SELECT COUNT(*) FROM agent_auth_api_chain").fetchone()[0] == 0
+    assert _commit(wt, proof) == ""
+
+
+@pytest.mark.parametrize("data", [{"rows": 0, "head": "x"}, {"rows": 0, "head": ""}])
+def test_mb_a_rows_zero_anchor_is_keyed_too(wt, api_cfg, data):  # noqa: F811
+    assert _commit(wt, _sign(wt)) == "" and _commit(wt, _sign(wt)) == ""
+    json.dump({**data, "mac": "0" * 64}, open(aam._anchor_path(), "w"))
+    assert _state() == "api_ledger_tampered"
+
+
+# ── L-E: a failed anchor write in reanchor is reported and audited ───────────────
+def test_le_reanchor_reports_a_failed_write(wt, api_cfg, tmp_path, monkeypatch):  # noqa: F811
+    log = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("AGENT_CONTROL_AUDIT", str(log))
+    aam._chain(aam._ledger())
+    _sql("DROP TRIGGER owner_proof_used_no_delete")
+
+    def fail(rows, head):
+        raise OSError("disk full")
+    monkeypatch.setattr(aam, "_write_anchor", fail)
+    r = aam.reanchor()
+    assert r["ok"] is False and r["reason"] == "api_anchor_write_failed"
+    assert r["restored_triggers"] == ["owner_proof_used_no_delete"]
+    assert json.loads(log.read_text())["reason"] == "api_anchor_write_failed"

@@ -10,8 +10,13 @@ must not be able to read the key. Prints the proof JSON only; the key is never p
   tools/owner_proof.py sign --action agent_stop --target T --text-file /dev/null
   tools/owner_proof.py sign-api-launch --session S --dir /abs/worktree [--model opus --risk high]
   tools/owner_proof.py reanchor                     # restore API ledger triggers
-  tools/owner_proof.py reanchor --accept-chain      # after a key rotation: first judge the
-                                                    # chain complete; see what it reports
+  tools/owner_proof.py reanchor --accept-chain      # the anchor cannot vouch for the chain
+
+Reading reanchor: `api_chain_needs_owner_review` with anchored_rows_before above rows means
+rows were deleted, so investigate before --accept-chain. Before rotating the key, run a plain
+reanchor and keep its rows: afterwards the old anchor's count can no longer be verified.
+owner_proof_used_* in restored_triggers means the spent table may have been rebuilt, so a
+general proof could have been replayed inside its expiry.
 
 Send the command with header `X-Owner-Proof: <printed JSON>` (or `owner_proof=` in
 process). The proof binds action, target, the exact text (sha256), a timestamp (valid
