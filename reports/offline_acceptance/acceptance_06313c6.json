@@ -1,0 +1,47 @@
+{
+  "commit": "06313c6a58277c1b8c7918b983b8193f452a7d94",
+  "dirty": [],
+  "module": "tests/test_offline_acceptance.py",
+  "pytest_exit": 0,
+  "seconds": 24.5,
+  "ok": true,
+  "scenarios": [
+    {
+      "scenario": "test_A_spec_to_done_with_reject_fix_approve",
+      "result": "passed",
+      "seconds": 4.916
+    },
+    {
+      "scenario": "test_B_crash_restart_retry",
+      "result": "passed",
+      "seconds": 3.735
+    },
+    {
+      "scenario": "test_C_duplicate_wakes_and_decisions_change_nothing",
+      "result": "passed",
+      "seconds": 2.864
+    },
+    {
+      "scenario": "test_D_stalled_agent_alert_answer_idle_window_single_resend",
+      "result": "passed",
+      "seconds": 4.864
+    },
+    {
+      "scenario": "test_E_owner_gate_stops_the_loop_until_the_owner_acts",
+      "result": "passed",
+      "seconds": 6.608
+    },
+    {
+      "scenario": "test_F_api_credit_mode_is_off_by_default",
+      "result": "passed",
+      "seconds": 0.002
+    }
+  ],
+  "simulated": [
+    "LLM agent (fixture script)",
+    "ChatGPT page (fake CDP)",
+    "reviewer judgment (deterministic policy)",
+    "wall clock in the stall scenario"
+  ],
+  "live_e2e_proven": false
+}
