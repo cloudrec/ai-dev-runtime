@@ -480,3 +480,17 @@ def test_le_reanchor_reports_a_failed_write(wt, api_cfg, tmp_path, monkeypatch):
     assert r["ok"] is False and r["reason"] == "api_anchor_write_failed"
     assert r["restored_triggers"] == ["owner_proof_used_no_delete"]
     assert json.loads(log.read_text())["reason"] == "api_anchor_write_failed"
+
+
+def test_mb_a_genuine_rows_zero_anchor_cannot_cover_a_longer_chain(wt, api_cfg):  # noqa: F811
+    assert _commit(wt, {"nonce": "ab" * 16}) != ""
+    old = open(aam._anchor_path()).read()
+    assert _commit(wt, _sign(wt)) == "" and _commit(wt, _sign(wt)) == ""
+    open(aam._anchor_path(), "w").write(old)
+    assert _state() == "api_ledger_tampered"
+
+
+def test_mb_a_rows_zero_anchor_with_a_head_is_refused(wt, api_cfg):  # noqa: F811
+    aam._chain(aam._ledger())
+    aam._write_anchor(0, "not-empty")
+    assert _state() == "api_ledger_tampered"
