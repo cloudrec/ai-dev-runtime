@@ -602,6 +602,7 @@ def resolve(session: str, project_dir: str, *, requested: Optional[str] = None,
 
 # F7: panes can drop variables, but a settings file can bring a credential back
 _SETTINGS_CREDENTIAL_KEYS = ("apiKeyHelper", "awsCredentialExport", "awsAuthRefresh")
+_SETTINGS_MAX_BYTES = 1 << 20
 
 
 def settings_guard_enforced() -> bool:
@@ -624,9 +625,11 @@ def settings_api_overrides(project_dir: str, config_dir: Optional[str] = None) -
         if not os.path.isfile(path):
             continue
         try:
+            if os.path.getsize(path) > _SETTINGS_MAX_BYTES:
+                raise ValueError("oversized")
             with open(path, encoding="utf-8") as fh:
                 data = json.load(fh)
-        except (OSError, ValueError):
+        except Exception:      # an agent can write this file: no content may stop a launch
             found.append(f"{path}:unreadable")
             continue
         if not isinstance(data, dict):

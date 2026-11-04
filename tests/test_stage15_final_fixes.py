@@ -101,3 +101,23 @@ def test_a_missing_owner_key_is_not_reported_as_tampering(wt, api_cfg, monkeypat
     assert _commit(wt, _sign(wt)) == ""
     monkeypatch.setattr(ac, "_owner_key", lambda: None)
     assert _state() == "owner_proof_unconfigured"
+
+
+# ── L1: no settings file can stop a launch by accident ───────────────────────────
+@pytest.mark.parametrize("content", ["[" * 100_000, "{" + '"a":' * 50_000, "x" * (1 << 21)])
+def test_l1_a_hostile_settings_file_counts_as_unreadable(tmp_path, content):
+    proj = tmp_path / "p"
+    (proj / ".claude").mkdir(parents=True)
+    path = proj / ".claude" / "settings.json"
+    path.write_text(content)
+    found = aam.settings_api_overrides(str(proj), config_dir=str(tmp_path / "none"))
+    assert f"{path}:unreadable" in found
+
+
+def test_l1_a_hostile_settings_file_does_not_block_a_resume(wt, tmux):  # noqa: F811
+    d = os.path.join(wt["kz"], ".claude")
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "settings.json"), "w") as fh:
+        fh.write("[" * 100_000)
+    r = ac.agent_resume(wt["kz"], session_name="gaika-kz", actor="api:hmac/chatgpt")
+    assert r["resumed"] is True
