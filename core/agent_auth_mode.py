@@ -232,6 +232,9 @@ def resolve(session: str, project_dir: str, *, requested: Optional[str] = None,
             "reason": "explicit_api_opt_in", **usage}
 
 
+_PLAIN_CLAUDE_RE = re.compile(r"\Aclaude(?:[ \t]+[A-Za-z0-9_./=:@%+,-]+)*\Z")
+
+
 def recovery_command(session: str, shape_cmd: str, conn=None) -> dict:
     """Session recovery's command, made safe: never API, never an inherited key.
     {"ok", "cmd"} or {"ok": False, "reason"}."""
@@ -251,4 +254,9 @@ def recovery_command(session: str, shape_cmd: str, conn=None) -> dict:
     if prior == API:
         return {"ok": False, "reason": "api_session_needs_explicit_relaunch"}
     cmd = shape_cmd.strip()
-    return {"ok": True, "cmd": subscription_shell(cmd) if cmd.startswith("claude") else cmd}
+    # F4: fail closed. Only a plain `claude …` can be wrapped with `env -u …`; a prefix
+    # (`cd x && claude`, `FOO=1 claude`, an absolute path, `bash -lc …`) would keep the
+    # inherited credential, so it is refused instead of passed through.
+    if not _PLAIN_CLAUDE_RE.match(cmd):
+        return {"ok": False, "reason": "recovery_shape_not_plain_claude"}
+    return {"ok": True, "cmd": subscription_shell(cmd)}

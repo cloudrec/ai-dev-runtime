@@ -29,3 +29,22 @@ def test_f7_spawned_subscription_process_sees_none_of_them(tmp_path, monkeypatch
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
     out = subprocess.run(aam.subscription_argv(), capture_output=True, text=True).stdout
     assert out.strip() == "", out
+
+
+# ── F4: recovery fails closed on any shape that cannot be env-wrapped ───────────
+@pytest.mark.parametrize("shape", [
+    "cd /tmp && claude --resume x", "FOO=1 claude --resume x",
+    "/root/.local/bin/claude --resume x", "bash -lc 'claude --resume x'",
+    "claude --resume x; env", "claude --resume $(id)", "claude --resume `id`",
+    "claude --resume x | tee y", "claude\n--resume x"])
+def test_f4_non_plain_shapes_are_refused(shape):
+    r = aam.recovery_command("zz", shape, conn=sqlite3.connect(":memory:"))
+    assert r == {"ok": False, "reason": "recovery_shape_not_plain_claude"}
+
+
+def test_f4_plain_claude_is_wrapped_with_the_full_strip():
+    r = aam.recovery_command("zz", "claude --resume abc-123", conn=sqlite3.connect(":memory:"))
+    assert r["ok"] and r["cmd"].startswith("env ")
+    for v in aam.API_ENV_VARS:
+        assert f"-u {v}" in r["cmd"]
+    assert r["cmd"].endswith("claude --resume abc-123")
