@@ -1,20 +1,21 @@
 # Stage 15 final fixes handoff, 2026-11-04
 
 Written by the Opus 5.5 session. Not an independent audit.
-**Fable reviewed everything up to `acee756`: sandbox E2E yes with conditions. `a0b6409..ddc75f3` (M-B, L-E, L-G) has NOT been reviewed by Fable. PROD: NO-GO. Nothing deployed.**
+**Fable reviewed everything up to `ddc75f3`: sandbox E2E yes with one condition, its LOW-1, fixed in `294e3c1`. That commit has NOT been reviewed by Fable; it said a short diff read is enough, not a full round. PROD: NO-GO. Nothing deployed.**
 
 ## Branch
-`owneros/stage15-final-fixes` @ `ddc75f3`, off `owneros/stage15-review-fixes` @ `acdeb95`. API mode stays `enabled: false`. No live DB, secret, service, paid call or `claude` launch was touched.
+`owneros/stage15-final-fixes` @ `294e3c1`, off `owneros/stage15-review-fixes` @ `acdeb95`. API mode stays `enabled: false`. No live DB, secret, service, paid call or `claude` launch was touched.
 
 ## Evidence
-- Full suite at `ddc75f3`: 4690 passed, 4 skipped, 0 failed, exit 0, 661 s (`reports/stage15/full_suite_ddc75f3.txt`).
-- Earlier on this branch: `a15dd26` 4651 passed, `acee756` 4676 passed, 0 failed each.
-- Mutants, in a disposable repo archive outside the repo, guard code never mutated: 15 at `a15dd26`, 14 at `acee756`, 7 at `6150727`. One survived the last round: the rows-0 anchor check. `ddc75f3` adds its tests and 3 variants of that check were then caught. All others caught. Scoped to `tests/test_stage15_final_fixes.py`.
+- Full suite at `294e3c1`: 4703 passed, 4 skipped, exit 0, 816.74 s (`reports/stage15/full_suite_294e3c1.txt`).
+- Earlier on this branch: `a15dd26` 4651 passed, `acee756` 4676 passed, `ddc75f3` 4690 passed, 0 failed each.
+- Mutants, in a disposable repo archive outside the repo, guard code never mutated: 15 at `a15dd26`, 14 at `acee756`, 7 at `6150727`, 6 at `294e3c1`. One survived: the rows-0 anchor check. `ddc75f3` adds its tests and 3 variants of that check were then caught. All others caught. Scoped to `tests/test_stage15_final_fixes.py`.
 
 ## Audit reports
 - `reports/OWNER_OS_STAGE15_FABLE_REVIEW_FIXES_AUDIT_2026-11-04.md` (`05073f4..e96e72d`)
 - `reports/OWNER_OS_STAGE15_FABLE_FINAL_FIXES_AUDIT_2026-11-04.md` (`acdeb95..a15dd26`)
 - `reports/OWNER_OS_STAGE15_FABLE_LATEST_FIXES_AUDIT_2026-11-04.md` (`a15dd26..acee756`)
+- `reports/OWNER_OS_STAGE15_FABLE_MB_FIXES_AUDIT_2026-11-04.md` (`acee756..ddc75f3`)
 The model of each is a self-report, and billing for those runs was not checked.
 
 ## What changed
@@ -30,6 +31,7 @@ The model of each is a self-report, and billing for those runs was not checked.
 | M-A | `a401430` | `reanchor` needs the anchor to vouch for the chain, or `--accept-chain`; audited |
 | M-B | `6150727`, `ddc75f3` | a rows-0 anchor exists before the first row, so no file under a row means deletion |
 | L-A, L-D, L-E | `a401430`, `6150727` | no keyless anchor; old ledgers with no chain get triggers; a failed write is reported and audited |
+| LOW-1, LOW-2 | `294e3c1` | a redirect's fd is removed before lexing, only when adjacent (LOW-1 was a regression from `a0b6409`); glued operators and `<(` are read; a missing anchor directory is a reason code, not an exception |
 | INFO | `a15dd26` | acceptance guard covers unset DB variables and spawns outside Popen; proxy note in the HMAC doc |
 
 Departures from the auditor's suggestions, on purpose:
@@ -48,7 +50,8 @@ Departures from the auditor's suggestions, on purpose:
 - Root agents remain outside these controls: see the `core/agent_auth_mode.py` docstring. Newly stated: an old copy of the anchor put back with a chain cut to match it is not detected.
 - Lag window: a row after a failed anchor write is exposed until the next attempt.
 - Settings guard is report-only by default, not run for `recovery_command` or `SshHost`.
-- `_runs_claude` misses fall to the denylist: `env -S`, `coproc NAME { claude; }`, substitution inside double quotes, indirect children such as pytest calling `claude`.
+- `_runs_claude` misses fall to the denylist and skip the F7 report: `env -S`, `coproc NAME { claude; }`, substitution inside double quotes, indirect children such as pytest calling `claude`.
+- The rows-0 anchor is a per-key constant. Together with a kept copy, a chain cut to one row or less and a rebuilt spent table, it reaches a clean state: the documented old-anchor class.
 - The launcher check is a lint on specs. A glob, a spliced variable or an indirect call gets past it.
 - `ac.audit` is best-effort; the tool's printed JSON is the owner's record.
 - F5 stays open until clients move. Replay cache and counters are per process.
@@ -58,7 +61,7 @@ Departures from the auditor's suggestions, on purpose:
 ## Conditions for sandbox E2E
 1. Keep `AGENT_AUTH_SETTINGS_GUARD` unset unless the project settings files are owner-written.
 2. Read `restored_triggers` in any reanchor output.
-3. Have Fable review `a0b6409..ddc75f3`, or accept that range unreviewed.
+3. Have Fable read the `294e3c1` diff, or accept it unreviewed.
 
 ## Owner gates
 - Sandbox token and live E2E setup.
