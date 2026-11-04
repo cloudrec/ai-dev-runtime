@@ -1,0 +1,62 @@
+Reviewed: 53e7a2b..f6c76ef
+Model: Claude Fable 5.1 (claude-fable-5-1), independent final auditor, Owner OS Stage 15.
+Date: 2026-11-04. Branch owneros/stage15-f1-f3 at a11452f (tree clean). Read-only; no repo mutation, no live DB, no secrets, no network, no subagents. Paths are absolute under /opt/owneros-autonomy.
+
+Scope: `git diff 53e7a2b f6c76ef -- core api tools config` (10 files, +488/-145). Tests read only to judge what they prove. Pre-audit read first, handoff read last.
+
+**Verdict: live sandbox E2E — YES, with the five conditions in section 4. PROD stays NO-GO.**
+
+## 1. F1-F7 status
+
+| # | status | evidence |
+|---|---|---|
+| F1 decision/audit atomicity | **CLOSED** | `core/fullcycle/engine.py:210-223` (`_tx`: BEGIN IMMEDIATE, commit on normal exit incl. `return`, rollback on BaseException); `:226-253` (`_audit(in_tx=True)` refuses to run outside a tx, `:238`); `:314-328` ack; `:354-399` submit_decision (spent-key read → UPDATE → audit row in one tx); `:976-1001` reopen; `:1035-1045` supersede; `:1133-1140` hold; `:1446-1452` owner-answered-hold. Spent-key query now also matches `review_reopened` rows carrying the cleared key (`:359-362`, written at `:999-1001`). Tests are real: `_audit` raising, a SQLite trigger aborting the INSERT, `os._exit` between INSERT and COMMIT in a child process, 8 concurrent processes (`tests/test_stage15_f1_audit_atomic.py:55-96,183-205`). The refused-path test (`:122-128`) proves an early `return` inside `with _tx` commits. |
+| F2 planner spawn inherits credentials | **CLOSED** for every direct `claude` spawn in the tree | `core/ai_planner.py:316-318`, `core/native_agents.py:42-43`, `core/native_sessions.py:54-55` pass `env=subscription_env()`; `core/agent_auth_mode.py:99-106` is an allowlist with the denylist applied on top. `tests/test_stage15_f2_spawn_env.py:30-116` runs a real fake executable that dumps its env with sentinels for named and unnamed vars; `:126-171` AST guard over core/api/tools/hooks. Residual: `core/fullcycle/hosts.py:58-61` `LocalHost.run` merges the full `os.environ` and takes argv from callers; nothing passes `claude` through it today, and the AST guard would not see it if something did (no claude literal in that module). |
+| F3 spend gate enforceable by the agent | **PARTLY CLOSED** (code gate closed; host trust boundary unchanged, admitted) | Proof required after every cap check: `core/agent_auth_mode.py:404-424`; proof bound to session/realpath(dir)/model/risk/conversation/launcher: `:317-324`; verify-only in resolve (`:327-350`), spend+count in one BEGIN IMMEDIATE with UNIQUE nonce and chain hash: `:211-255`; caller `core/agent_control.py:2404-2415` inside `acp.creation_guard()` (cross-process flock, `core/agent_creation_policy.py:67-78`). Only `tools/agent_create.py:30-52` can request `auth_mode=api`; `api/v1.py:561-574` and `core/agent_fabric.py:216-217` never pass `auth_mode`, so the HTTP API cannot reach API mode at all. Still open from the pre-audit's F3 list: `_launcher_problem` (`core/agent_auth_mode.py:123-137`) checks the launcher file, not its parent directory; YAML, ledger and owner key remain readable/writable by root agents (docstring `:33-37` admits it). See R4, R6. |
+| F4 recovery strip bypass | **CLOSED** | `core/agent_auth_mode.py:433` regex `\Aclaude(?:[ \t]+[A-Za-z0-9_./=:@%+,-]+)*\Z`; `:450-455` refuses anything else; the only caller fails closed: `core/session_recovery.py:486-493`. All three shapes in `config/managed_sessions.yaml:20,31,39` are plain. Repro (python3 -I): `cd …`, `FOO=1 …`, `/abs/claude`, `bash -lc`, `~`, quotes, `$`, `;`, `|` all refused; `claude --resume` with an empty conversation id still passes (pre-existing, same as before). |
+| F5 HMAC not request-bound | **PARTLY CLOSED** | v2 exists and is single-use: `api/v1.py:29-46,66-78`. Default still accepts the legacy timestamp-only signature (`:82`, `RUNTIME_HMAC_LEGACY` defaults to `"1"`), so the pre-audit's replayable bearer remains for any client that omits `X-Runtime-Signature-Version: 2`. Replay cache is per process (one uvicorn loop per `api/v1.py:405-409`; restart forgets). Canonical form has an ambiguity, see R2. Test `tests/test_stage15_remediation.py:114-123` documents that legacy passes by default. |
+| F6 harness false-success | **PARTLY CLOSED** | Guard now raises before `sqlite3.connect` (`tests/test_offline_acceptance.py:58-69`, `test_G`). Credential strip proven on a spawned process with sentinels (`test_H :298-310`), and again in F2 tests. Still blind to subprocess connections, `ATTACH`, and non-Python; the new subprocess tests rely on `tests/conftest.py:32,36` env (tmp DB dirs) rather than the guard — verified those env vars are inherited (`{**os.environ}`), so no live DB is reachable by them. |
+| F7 strip list | **PARTLY CLOSED** | `core/agent_auth_mode.py:58-63` adds BASE_URL, Bedrock, Vertex, Foundry, AWS bearer. Settings-file `apiKeyHelper` / `env` block are not stripped for panes (handoff admits). Not checked: `/root/.claude/settings.json` (host state, out of scope). |
+
+## 2. Regressions / new defects
+
+**R1 — PLAUSIBLE, LOW-MEDIUM (operational). The `subscription_env` allowlist drops non-credential behaviour knobs.** `core/agent_auth_mode.py:70-76` keeps only PATH/HOME/locale/proxy/CA/CLAUDE_CONFIG_DIR/OAUTH_TOKEN. Anything else the daemon unit sets for the planner's `claude -p` is silently gone: `DISABLE_AUTOUPDATER`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`, `ALL_PROXY`, `CLAUDE_CODE_MAX_OUTPUT_TOKENS`, `MAX_THINKING_TOKENS`, `ANTHROPIC_MODEL`/`ANTHROPIC_DEFAULT_*_MODEL`. If the unit relies on `DISABLE_AUTOUPDATER` to stop the planner child from updating the shared `/root/.local/bin/claude` under live panes, that protection vanishes with this diff. Nothing in the repo tells me what the live unit sets (I did not read it). Condition for the canary, not a blocker. The binary is a native ELF (`/root/.local/bin/claude -> …/versions/2.1.318`), so no node/nvm variables are needed.
+
+**R2 — CONFIRMED, LOW. HMAC v2 canonical form is ambiguous.** `api/v1.py:70-73` joins `v2|ts|METHOD|path|query|sha256(body)` with `|` and no length prefix. Repro (python3 -I): path `/a|b` + query `""` and path `/a` + query `b|` produce byte-identical messages and signatures. Routes contain no `|` and ASGI decodes `%7C` into the path, so today a signature for one real route cannot be re-aimed at another; but the format should be length-prefixed or JSON before any external client is written to it. Also `request.url.path` is the decoded path: a client signing the raw encoded path gets a false 401 (fail closed).
+
+**R3 — CONFIRMED, LOW. `_tx` commits whatever the caller left open on the shared connection** (`core/fullcycle/engine.py:215-216`) before BEGIN IMMEDIATE. Old `_audit` did the same, but `_tx` is now entered *before* the state change too, in six engine paths on `self.conn`. Every current engine helper commits itself (`_set :516`, `_event`, `_lead` via `acquire_lease` commit), so there is no live bug; a future caller with deliberately uncommitted work would have it committed silently. Lock contention is not worse than before: the old `_audit` already took BEGIN IMMEDIATE per row; now there are fewer transactions, each short (`specs.validate_task` is pure). Busy timeout 10 s, WAL (`core/control_plane/store.py:247-248`). Duplicate/refused decisions now take the write lock (handoff item 6) — bounded, acceptable.
+
+**R4 — CONFIRMED, LOW. `commit_api_launch` trusts its caller.** `core/agent_auth_mode.py:211-255` spends and counts without verifying the proof's signature or binding; `tests/test_stage15_f3_api_owner_proof.py:271-291` shows a `{"nonce": …}` dict spends. The only caller (`core/agent_control.py:2408`) runs it after `resolve` verified, inside the same flock, so the gate holds; but the function is a public footgun. Suggest re-running `_api_proof_problem` inside the spend transaction.
+
+**R5 — CONFIRMED, INFO. Reopen branch deletes `fc_escalation` before the rowcount check** (`core/fullcycle/engine.py:985-995`): if the UPDATE touches 0 rows the DELETE still commits on the early return. Same ordering as before the diff; only reachable if the review row vanished.
+
+**R6 — PLAUSIBLE, LOW. Chain tamper detection rests on `owner_proof_used`, which has no triggers.** `_chain_problem` (`core/agent_auth_mode.py:190-209`) flags a dropped table only via `spent > rows`. `DROP TABLE agent_auth_api_chain` plus `DELETE FROM owner_proof_used WHERE action='agent_launch_api'` resets both the caps and the spent nonces; `_chain` (`:157-183`) then recreates a clean table. The DROP TABLE test (`tests/test_stage15_f3_api_owner_proof.py:312-323`) passes only because it leaves `owner_proof_used` intact. Docstring admits root agents defeat this; stating it here so nobody reads the chain as a money ceiling.
+
+**R7 — CONFIRMED, INFO.** `agent_resume` kills a dead-pane zombie session (`core/agent_control.py:2383-2391`) before the proof is spent; a replayed proof still gets the zombie killed. Harmless.
+
+Checked and found sound: early `return` inside `with _tx` commits (contextmanager semantics; proven by the refused-path test); `_audit(in_tx=False)` is never called inside a `_tx` block (all seven in-tx sites pass `in_tx=True`); no `_audit` caller outside engine.py; no API or fabric path can select API mode; recovery never revives API (`:445-449`) and ledger deletion only pushes recovery toward subscription with the strip; subscription launches never create the chain; proof TTL 300 s with nonce regex and HMAC compare_digest (`core/agent_control.py:1938-1963`); `owner_proof_used` is the same table in the same DB for all actions, and the action is inside the HMAC so cross-action replay is impossible.
+
+## 3. Tests that pass vacuously or would survive removing the fix
+
+None found vacuous. Notes:
+- `test_in_tx_audit_outside_a_transaction_is_a_bug_not_a_silent_write` (f1:131-134) tests only the guard clause.
+- `test_a_damaged_chain_refuses_every_api_launch[DROP TABLE]` (f3:312-323) passes through `owner_proof_used` only (R6); it would still pass if hash verification were removed.
+- `test_f5_legacy_signature_cannot_pass_as_v2_and_can_be_disabled` (remediation:114-123) asserts the open default, i.e. it pins F5 as partly open.
+- F2 AST guard hard-codes the guarded-file list (f2:170-171); a new guarded site must be added by hand (fails loudly, fine). It would not catch a `claude` argv routed through `hosts.LocalHost.run`.
+- Handoff claim "F1 7/12, F2 5/11, F3 25/44 fail on mutants" — not reproduced here.
+
+## 4. Verdict for the next stage
+
+Live sandbox E2E: **YES**, under these conditions. PROD: **NO-GO** regardless.
+1. Sandbox only, `config/agent_auth_modes.yaml` stays `enabled: false`; any API-launch E2E uses a sandbox key file via `AGENT_OWNER_PROOF_KEY_FILE`, never the live key, and the workspace spend limit is the only money ceiling (R6).
+2. Before relying on the planner in the sandbox: dump the daemon unit's environment and diff it against `SUBSCRIPTION_ENV_KEEP`; run one real `claude -p` smoke via `ai_planner.smoke()` and one `claude agents --json` via `native_sessions._list_raw()` under the real binary (R1). Add any non-credential knobs the unit relies on to the keep list first.
+3. Treat F5 as open: leave `RUNTIME_HMAC_LEGACY` at default until clients move, and fix R2's canonical form before any client implements v2.
+4. Do not route any `claude` argv through `core/fullcycle/hosts.py:LocalHost.run` without `subscription_env` (F2 residual).
+5. Migration of `agent_auth_api_chain`/`owner_proof_used` and the engine's `_tx` behaviour were never tried against a copy of the live DBs; do that in the sandbox before any deploy discussion.
+
+## Not checked
+Live daemon environment and systemd unit; `/root/.claude/settings.json` (`apiKeyHelper`, `env`); uvicorn worker count (assumed 1 from the comment at `api/v1.py:405-409`); the full suite (took `reports/stage15/full_suite_f6c76ef.txt` as given, not re-run); the handoff's mutant counts; `hooks/` contents; `agent_creation_policy.authorize` internals; fullcycle Q1-Q5 semantics outside this diff; anything under /root/ai-dev-runtime, /etc/ai-runtime or /root/.config/owner-os.
+
+## Commands run
+- `git diff 53e7a2b f6c76ef -- core api tools config`, targeted `sed`/`grep` reads of the files named above.
+- One `python3 -I` script (no DB, no network): HMAC v2 separator ambiguity (R2) and `_PLAIN_CLAUDE_RE` edge cases (F4). No pytest run.
