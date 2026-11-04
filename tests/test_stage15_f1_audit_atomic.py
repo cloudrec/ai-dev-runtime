@@ -145,6 +145,15 @@ def test_open_caller_work_is_refused_not_committed_on_its_behalf(db):
                         ).fetchone() == ("{}", "pending")
 
 
+def test_ack_refuses_open_caller_work_too(db):
+    conn, rid = db
+    conn.execute("UPDATE fc_review SET payload='uncommitted' WHERE id=?", (rid,))
+    with pytest.raises(fe.EngineError, match="already open"):
+        fe.ack_review(rid, by="api:client/r", conn=conn)
+    conn.rollback()
+    assert conn.execute("SELECT payload FROM fc_review WHERE id=?", (rid,)).fetchone() == ("{}",)
+
+
 def test_a_key_from_before_atomicity_stays_spent_after_reopen(fc, monkeypatch):  # noqa: F811
     """A decision left without its `accepted` row by the old code: the reopen row names the
     key it clears, so a replay is refused even though no `accepted` row ever existed."""

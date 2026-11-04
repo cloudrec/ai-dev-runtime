@@ -13,12 +13,13 @@ contract — not that any particular remote machine is reachable.
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 from abc import ABC, abstractmethod
 from typing import Optional, Sequence
 
-from core.agent_auth_mode import API_ENV_VARS, subscription_env
+from core.agent_auth_mode import is_api_env_var, subscription_env
 
 
 class HostError(RuntimeError):
@@ -53,13 +54,31 @@ class ExecutionHost(ABC):
         return self.run(["test", "-e", path])[0] == 0
 
 
+# what commonly stands in front of a command; only these make a later word a program name
+_EXEC_WRAPPERS = {"env", "sh", "bash", "dash", "zsh", "nohup", "timeout", "nice", "xargs",
+                  "sudo"}
+_CLAUDE_WORD = re.compile(r"(?:^|[\s/;&|(=])claude(?:[\s;&|)]|$)")
+
+
+def _runs_claude(argv: Sequence[str]) -> bool:
+    """A direct `claude`, or one behind a shell or exec wrapper (N3). An argument of any
+    other program is only data: `git commit -m "… claude …"` keeps its environment."""
+    if not argv:
+        return False
+    exe = os.path.basename(str(argv[0]))
+    if exe == "claude":
+        return True
+    return exe in _EXEC_WRAPPERS and any(_CLAUDE_WORD.search(str(a)) for a in argv[1:])
+
+
 def _child_env(argv: Sequence[str], env: Optional[dict]) -> dict:
     """No local child inherits API credentials, whatever it is: a check script may call
-    `claude` itself. A direct `claude` gets the full subscription allowlist (F2)."""
+    `claude` itself. Anything recognisably running `claude` gets the full subscription
+    allowlist (F2). A wrapper this cannot see through still loses every API variable."""
     merged = {**os.environ, **(env or {})}
-    if argv and os.path.basename(str(argv[0])) == "claude":
+    if _runs_claude(argv):
         return subscription_env(merged)
-    return {k: v for k, v in merged.items() if k not in API_ENV_VARS}
+    return {k: v for k, v in merged.items() if not is_api_env_var(k)}
 
 
 class LocalHost(ExecutionHost):

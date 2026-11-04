@@ -191,7 +191,7 @@ def _commit(wt, proof, **over):  # noqa: F811
 
 
 @pytest.mark.parametrize("proof,reason", [
-    (None, "api_owner_proof_required"), ("owner", "api_owner_proof_required"),
+    ("owner", "api_owner_proof_required"), (["ok"], "api_owner_proof_required"),
     ({"nonce": "ab" * 16}, "owner_proof_malformed"),
     ({"ts": 1, "nonce": "ab" * 16, "sig": "0" * 64}, "owner_proof_expired")])
 def test_commit_refuses_anything_but_a_verified_proof(wt, api_cfg, proof, reason):  # noqa: F811

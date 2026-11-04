@@ -193,11 +193,31 @@ def test_localhost_gives_a_direct_claude_the_subscription_env(fake_claude):
     assert "NODE_OPTIONS" not in call["env"]
 
 
+@pytest.mark.parametrize("wrap", [
+    lambda c: ["sh", "-c", f"{c} --version"], lambda c: ["env", "X=1", c, "--version"],
+    lambda c: ["timeout", "5", c, "--version"]])
+def test_localhost_sees_a_claude_behind_a_wrapper(fake_claude, monkeypatch, wrap):
+    from core.fullcycle.hosts import LocalHost
+    monkeypatch.setenv("PATH", f"{os.path.dirname(fake_claude[0])}:{os.environ['PATH']}")
+    rc, out, err = LocalHost().run(wrap("claude"))
+    assert rc == 0 and "9.9.9" in out, err
+    _assert_clean(fake_claude[1]()[0])
+
+
+def test_localhost_treats_a_word_in_data_as_data(monkeypatch):
+    from core.fullcycle import hosts
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "someone")
+    env = hosts._child_env(["git", "commit", "-m", "teach claude to run"], None)
+    assert env["GIT_AUTHOR_NAME"] == "someone"
+    assert hosts._child_env(["python3", "tests/test_claude.py"], None)["GIT_AUTHOR_NAME"]
+
+
 def test_localhost_strips_credentials_from_every_child(fake_claude, monkeypatch):
     from core.fullcycle.hosts import LocalHost
     monkeypatch.setenv("PROJECT_SETTING", "kept")
     rc, out, _ = LocalHost().run(["sh", "-c", "env"], env={"CHECK_VAR": "1"})
     assert rc == 0
     names = {line.split("=", 1)[0] for line in out.splitlines()}
-    assert not names & set(aam.API_ENV_VARS)
+    assert not [n for n in names if aam.is_api_env_var(n)]
+    assert "ANTHROPIC_FUTURE_CREDENTIAL" not in names and "CLAUDE_CODE_USE_SOMETHING_NEW" not in names
     assert {"PROJECT_SETTING", "CHECK_VAR", "PATH"} <= names     # a check keeps its environment

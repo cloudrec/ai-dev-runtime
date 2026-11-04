@@ -96,6 +96,11 @@ def load_config(path: Optional[str] = None) -> dict:
     return data
 
 
+def is_api_env_var(name: str) -> bool:
+    """A named credential or switch, or one in a family that exists only to route the CLI."""
+    return name in API_ENV_VARS or name.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_"))
+
+
 def subscription_env(base: Optional[dict] = None) -> dict:
     """The environment for a `claude` child spawned directly (`env=`). Only the allowlist
     passes, and API_ENV_VARS never does. Panes cannot use this: tmux hands them the server's
@@ -103,7 +108,7 @@ def subscription_env(base: Optional[dict] = None) -> dict:
     src = os.environ if base is None else base
     return {k: v for k, v in src.items()
             if (k in SUBSCRIPTION_ENV_KEEP or k.startswith(SUBSCRIPTION_ENV_KEEP_PREFIXES))
-            and k not in API_ENV_VARS}
+            and not is_api_env_var(k)}
 
 
 def subscription_argv(base: Optional[list] = None) -> list:
