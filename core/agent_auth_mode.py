@@ -44,7 +44,11 @@ HIGH_RISK_MODEL = "opus"
 DEFAULT_LAUNCHER = "/usr/local/bin/claude-owner-api"
 
 # credential variables a subscription session must never inherit
-API_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS")
+# (F7: also the switches that re-route the CLI to another billing path or another host)
+API_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
+                "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
+                "AWS_BEARER_TOKEN_BEDROCK")
 
 _CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
                        "config", "agent_auth_modes.yaml")
