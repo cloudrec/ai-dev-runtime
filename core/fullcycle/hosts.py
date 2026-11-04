@@ -68,6 +68,7 @@ _SHELL_VALUE_OPTS = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file")
 _SHELL_KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "{", "!", "coproc"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _DURATION = re.compile(r"[0-9.]+[smhd]?\Z")
+_REDIRECT_FD = re.compile(r"(?<![^\s;&|(])[0-9]+(?=[<>])")   # `2>f`, but not the word in `2 >f`
 _CLAUDE_WORD = re.compile(r"(?:^|[\s/;&|(=])claude(?:[\s;&|)]|$)")
 
 
@@ -93,8 +94,8 @@ def _after_wrapper(exe: str, words: list, i: int) -> int:
 def _script_runs_claude(script: str) -> bool:
     """Whether a shell string has `claude` in command position. Quoting is honoured, so a
     word inside an argument stays data; a string that cannot be parsed is read loosely."""
-    lex = shlex.shlex(script.translate({ord("\n"): ";", ord("`"): ";"}), posix=True,
-                      punctuation_chars=True)
+    plain = _REDIRECT_FD.sub("", script.translate({ord("\n"): ";", ord("`"): ";"}))
+    lex = shlex.shlex(plain, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""
     try:
@@ -105,14 +106,13 @@ def _script_runs_claude(script: str) -> bool:
     redirect_target = False
     for token in tokens + [";"]:
         operator = bool(token) and set(token) <= set("();<>|&")
-        if operator and token.startswith(("<", ">", "&>")):
-            if command and command[-1].isdigit():     # the fd of `2> file`
-                command.pop()
+        if operator and token.startswith(("<", ">", "&>")) and "(" not in token:
             redirect_target = True
-        elif operator:
+        elif operator:          # glued forms too: `;>f`, `&&>f`, and `<(` opens a command
             if _runs_claude(command):
                 return True
-            command, redirect_target = [], False
+            command = []
+            redirect_target = token.endswith(("<", ">", ">&", "<&"))
         elif redirect_target:
             redirect_target = False
         elif command or not (token in _SHELL_KEYWORDS or _ASSIGNMENT.match(token)):

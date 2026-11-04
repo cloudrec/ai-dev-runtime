@@ -421,6 +421,8 @@ def commit_api_launch(*, session: str, project_dir: str, model: str, risk: str =
             except OSError:
                 return "api_anchor_write_failed"      # counted and spent; start nothing
             return ""
+    except OSError:                                   # the lock file: nothing spent
+        return "api_anchor_write_failed"
     finally:
         if conn is None:
             c.close()
@@ -470,6 +472,8 @@ def reanchor(conn=None, *, accept_chain: bool = False) -> dict:
                 result.update(ok=False, reason="api_anchor_write_failed")
             ac.audit("api_chain_reanchor", "agent_auth_api_chain", **result)
             return result
+    except OSError:
+        return {"ok": False, "reason": "api_anchor_write_failed"}
     finally:
         if conn is None:
             c.close()

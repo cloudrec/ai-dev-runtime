@@ -195,7 +195,9 @@ def test_l3_a_persistent_write_failure_starts_nothing(wt, api_cfg, monkeypatch):
     ["sudo", "-u", "claude", "pytest"], ["nice", "-n", "5", "pytest", "claude"],
     ["sh", "-c", "X=claude pytest"], ["xargs", "grep", "claude"], ["sh"], ["sh", "-c"], [],
     ["sh", "-c", "command -v claude"], ["command", "-V", "claude"],
-    ["sh", "-c", "cat f > claude"], ["sh", "-c", "pytest 2>&1 > claude; wc -l < claude"]])
+    ["sh", "-c", "cat f > claude"], ["sh", "-c", "pytest 2>&1 > claude; wc -l < claude"],
+    ["sh", "-c", "x 2>&1 claude"], ["sh", "-c", "sleep 2 > claude"],
+    ["sh", "-c", "echo;>claude x"]])
 def test_l2_a_word_in_an_argument_is_data(argv):
     from core.fullcycle import hosts
     assert hosts._runs_claude(argv) is False
@@ -218,7 +220,11 @@ def test_l2_a_word_in_an_argument_is_data(argv):
     ["sh", "-c", "builtin claude"], ["bash", "-c", "coproc claude"],
     ["sh", "-c", "> out claude"], ["sh", "-c", "claude 2>&1"],
     ["sh", "-c", "2>/dev/null claude -p x"], ["sh", "-c", "1> out claude"],
-    ["sh", "-c", ">| out claude"], ["sh", "-c", "&> out claude"]])
+    ["sh", "-c", ">| out claude"], ["sh", "-c", "&> out claude"],
+    ["sh", "-c", "nice -n 10 >/dev/null claude -p x"], ["sh", "-c", "timeout -k 5 >out claude"],
+    ["sh", "-c", "sudo -u 0 >f claude"], ["sh", "-c", "echo;>f claude"],
+    ["sh", "-c", "x &&>log claude"], ["sh", "-c", "(>f claude)"], ["sh", "-c", "a |>f claude"],
+    ["sh", "-c", "diff <(claude -p x) f"], ["sh", "-c", "true;2>f claude"]])
 def test_l2_claude_in_command_position_is_seen(argv):
     from core.fullcycle import hosts
     assert hosts._runs_claude(argv) is True
@@ -494,3 +500,12 @@ def test_mb_a_rows_zero_anchor_with_a_head_is_refused(wt, api_cfg):  # noqa: F81
     aam._chain(aam._ledger())
     aam._write_anchor(0, "not-empty")
     assert _state() == "api_ledger_tampered"
+
+
+def test_a_missing_anchor_directory_is_a_reason_not_an_exception(wt, api_cfg, tmp_path,  # noqa: F811
+                                                                 monkeypatch):
+    monkeypatch.setenv("AGENT_AUTH_API_ANCHOR_FILE", str(tmp_path / "no" / "such" / "anchor"))
+    assert _commit(wt, _sign(wt)) == "api_anchor_write_failed"
+    assert aam.reanchor() == {"ok": False, "reason": "api_anchor_write_failed"}
+    assert sqlite3.connect(ac._db_path()).execute(
+        "SELECT COUNT(*) FROM agent_auth_api_chain").fetchone()[0] == 0
