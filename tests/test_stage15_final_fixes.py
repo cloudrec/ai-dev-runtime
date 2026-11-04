@@ -253,3 +253,36 @@ def test_l5_a_short_configured_name_spares_project_paths(monkeypatch):
 def test_l5_the_launcher_is_still_refused(argv):
     from core.fullcycle import gates
     assert gates._names_api_launcher(argv) is True
+
+
+# ── F7: fullcycle children are covered too ───────────────────────────────────────
+@pytest.fixture
+def project_with_helper(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "no-config"))
+    d = tmp_path / "proj"
+    (d / ".claude").mkdir(parents=True)
+    (d / ".claude" / "settings.json").write_text(json.dumps({"apiKeyHelper": "sentinel-value"}))
+    claude = tmp_path / "bin" / "claude"
+    claude.parent.mkdir()
+    claude.write_text("#!/bin/sh\necho ran\n")
+    claude.chmod(0o755)
+    return str(d), str(claude)
+
+
+def test_f7_a_settings_override_is_reported_not_refused_by_default(
+        project_with_helper, caplog, monkeypatch):
+    from core.fullcycle.hosts import LocalHost
+    monkeypatch.delenv("AGENT_AUTH_SETTINGS_GUARD", raising=False)
+    d, claude = project_with_helper
+    rc, out, _ = LocalHost().run([claude], cwd=d)
+    assert rc == 0 and out.strip() == "ran"
+    assert "apiKeyHelper" in caplog.text and "sentinel-value" not in caplog.text
+
+
+def test_f7_enforce_refuses_the_child(project_with_helper, monkeypatch):
+    from core.fullcycle.hosts import LocalHost
+    monkeypatch.setenv("AGENT_AUTH_SETTINGS_GUARD", "enforce")
+    d, claude = project_with_helper
+    rc, out, err = LocalHost().run([claude], cwd=d)
+    assert rc == 126 and out == "" and "apiKeyHelper" in err and "sentinel-value" not in err
+    assert LocalHost().run(["sh", "-c", "echo fine"], cwd=d)[0] == 0

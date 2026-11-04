@@ -12,6 +12,7 @@ contract — not that any particular remote machine is reachable.
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shlex
@@ -19,7 +20,10 @@ import subprocess
 from abc import ABC, abstractmethod
 from typing import Optional, Sequence
 
-from core.agent_auth_mode import is_api_env_var, subscription_env
+from core.agent_auth_mode import (is_api_env_var, settings_api_overrides,
+                                  settings_guard_enforced, subscription_env)
+
+log = logging.getLogger(__name__)
 
 
 class HostError(RuntimeError):
@@ -137,11 +141,27 @@ def _child_env(argv: Sequence[str], env: Optional[dict]) -> dict:
     return {k: v for k, v in merged.items() if not is_api_env_var(k)}
 
 
+def _settings_refusal(argv: Sequence[str], cwd: Optional[str]) -> Optional[str]:
+    """F7 for fullcycle children: a stripped environment does not help if a settings file in
+    the project brings a credential back. Same rule as agent_resume: reported by name, and
+    refused under AGENT_AUTH_SETTINGS_GUARD=enforce."""
+    if not _runs_claude(argv):
+        return None
+    found = settings_api_overrides(cwd or os.getcwd())
+    if not found:
+        return None
+    log.warning("claude child with settings overrides: %s", found)
+    return "settings_api_override: " + ",".join(found) if settings_guard_enforced() else None
+
+
 class LocalHost(ExecutionHost):
     kind = "local"
     tested = True
 
     def run(self, argv, *, cwd=None, timeout=60, stdin=None, env=None):
+        refused = _settings_refusal(argv, cwd)
+        if refused:
+            return 126, "", refused
         try:
             p = subprocess.run(list(argv), cwd=cwd, input=stdin, capture_output=True,
                                timeout=timeout, env=_child_env(argv, env))
