@@ -38,7 +38,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
-from core import agent_privilege, tmux_launch
+from core import agent_privilege as _privilege
+from core import tmux_launch
 
 # ── bounds ──────────────────────────────────────────────────────────────────
 MAX_CAPTURE_LINES = 2000
@@ -351,7 +352,7 @@ def find_claude_in_pane(pane_pid: Optional[int]) -> Optional[dict]:
         cmdline = _proc_cmdline(pid)
         if is_claude_cmdline(cmdline):
             return {"pid": pid, "cmdline": redact(cmdline), "cwd": _proc_cwd(pid),
-                    "uid": agent_privilege.process_uid(pid)}
+                    "uid": _privilege.process_uid(pid)}
     return None
 
 
@@ -645,7 +646,7 @@ def _last_user_text_from_tail(path: str) -> str:
     try:
         size = os.path.getsize(path)
         start = max(0, size - TRANSCRIPT_TAIL_BYTES)
-        with agent_privilege.open_regular(path, "rb") as fh:
+        with _privilege.open_regular(path, "rb") as fh:
             fh.seek(start)
             if start:
                 fh.readline()          # discard the partial line the seek landed inside
@@ -658,7 +659,7 @@ def _last_user_text_from_tail(path: str) -> str:
         # the last user line sat beyond the window. Falling back to "" there would SILENTLY
         # change classification for exactly the longest-running agents, so pay the full
         # read in that rare case and stay bit-identical to the old behaviour.
-        with agent_privilege.open_regular(path, "rb") as fh:
+        with _privilege.open_regular(path, "rb") as fh:
             return _scan_back_for_user_text(fh.read())
     except Exception:  # noqa: BLE001
         return ""
@@ -675,7 +676,7 @@ def last_submitted_text(cwd: str) -> str:
     import glob
     import json as _json
     try:
-        files = sorted(agent_privilege.transcripts(cwd), key=os.path.getmtime)
+        files = sorted(_privilege.transcripts(cwd), key=os.path.getmtime)
         if not files:
             return ""
         # Read BACKWARDS. The answer is the LAST matching line, so parsing the file
@@ -711,7 +712,7 @@ def conversation_recently_active(cwd: str, within_secs: int = RECENTLY_ACTIVE_SE
     always win over a pending-input guess — never the other way around."""
     import glob
     try:
-        files = agent_privilege.transcripts(cwd)
+        files = _privilege.transcripts(cwd)
         if not files:
             return False
         newest_mtime = max(os.path.getmtime(f) for f in files)
@@ -1675,8 +1676,8 @@ def conversation_evidence(cwd: str) -> dict:
     if not cwd:
         return {"present": False}
     slug = "-" + cwd.strip("/").replace("/", "-")
-    proj_dir = os.path.join(agent_privilege.claude_home(), ".claude", "projects", slug) \
-        if agent_privilege.run_as_name() else os.path.join(
+    proj_dir = os.path.join(_privilege.claude_home(), ".claude", "projects", slug) \
+        if _privilege.run_as_name() else os.path.join(
             os.path.expanduser("~/.claude/projects"), slug)
     if not os.path.isdir(proj_dir):
         return {"present": False, "project_dir": proj_dir}
@@ -1920,7 +1921,7 @@ def _owner_key() -> Optional[bytes]:
     if not _stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o077):
         return None
     try:
-        with agent_privilege.open_regular(path, "rb") as fh:
+        with _privilege.open_regular(path, "rb") as fh:
             key = fh.read().strip()
     except OSError:
         return None
@@ -2109,14 +2110,14 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
 
 def _pane_run_as_problem(target: str) -> Optional[str]:
     """Under AGENT_RUN_AS nothing is typed into a pane running as anyone else."""
-    if not agent_privilege.run_as_name():
+    if not _privilege.run_as_name():
         return None
     rc, out, _ = _tmux(["display-message", "-p", "-t", target, "#{pane_pid}"])
     pid = out.strip()
     if rc != 0 or not pid.isdigit():
-        return agent_privilege.pane_problem(None)
+        return _privilege.pane_problem(None)
     claude = find_claude_in_pane(int(pid))
-    return agent_privilege.pane_problem(int(pid), claude["pid"] if claude else None)
+    return _privilege.pane_problem(int(pid), claude["pid"] if claude else None)
 
 
 def _require_pane_run_as(target: str, action: str) -> None:
@@ -2375,8 +2376,8 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
         raise AgentControlError(f"invalid conversation id: {conversation_id!r}")
 
     existing = find_live_agent_for_dir(resolved)
-    if existing and agent_privilege.run_as_name():
-        problem = agent_privilege.pane_problem(existing["pid"], existing["claude_pid"])
+    if existing and _privilege.run_as_name():
+        problem = _privilege.pane_problem(existing["pid"], existing["claude_pid"])
         if problem:
             audit("agent_resume", existing["target"], resumed=False,
                   refused=f"agent_run_as:{problem}", actor=actor, cwd=resolved)
@@ -2429,12 +2430,12 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
         # cannot be honoured refuses the start: it never falls back to root.
         run_as, why = None, None
         try:
-            run_as = agent_privilege.target()
-        except agent_privilege.AgentPrivilegeError as e:
+            run_as = _privilege.target()
+        except _privilege.AgentPrivilegeError as e:
             why = str(e)
         if run_as and auth["mode"] == aam.API:
             why = "api_mode_unsupported"          # the launcher is root-only by design
-        elif run_as and not agent_privilege.can_use_dir(run_as, resolved):
+        elif run_as and not _privilege.can_use_dir(run_as, resolved):
             why = "project_not_usable"
         if why:
             audit("agent_resume", name, resumed=False, refused=f"agent_run_as:{why}",
@@ -2495,7 +2496,7 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
                         "agent_created": False}
         if run_as:
             try:
-                agent_privilege.pin(run_as)
+                _privilege.pin(run_as)
             except OSError:
                 audit("agent_resume", name, resumed=False, refused="agent_run_as:pin_failed",
                       actor=actor, cwd=resolved)
@@ -2503,7 +2504,7 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
                         "reason": "agent uid: not authorized", "duplicate_created": False,
                         "agent_created": False}
         argv = ["new-session", "-d", "-s", name, "-c", resolved,
-                *(agent_privilege.pane_prefix(run_as) if run_as else []), *auth["argv"]]
+                *(_privilege.pane_prefix(run_as) if run_as else []), *auth["argv"]]
         if conversation_id:
             argv += ["--resume", str(conversation_id)]
         rc, _, err = _tmux(argv)
@@ -2590,7 +2591,7 @@ def agent_report_read(project_dir: str, path: str) -> dict:
     if not os.path.isfile(full):
         raise AgentControlError(f"report not found: {path}")
     try:
-        with agent_privilege.open_regular(full, "r", errors="replace") as fh:
+        with _privilege.open_regular(full, "r", errors="replace") as fh:
             content = fh.read(MAX_REPORT_BYTES + 1)
     except OSError:
         raise AgentControlError(f"report not readable: {path}") from None
