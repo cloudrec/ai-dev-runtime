@@ -89,20 +89,23 @@ _RUNNER_ALLOWED_SUBCMDS = {"npm": {"test"}, "go": {"test", "vet"}, "cargo": {"te
                            "make": {"test", "check"}}
 
 
-_WORD_BREAK = re.compile(r"[\s;&|()<>'\"`=]+")
+_WORD_BREAK = re.compile(r"[\s;&|()<>'\"`=,:]+")
 
 
 def _names_api_launcher(argv: list) -> bool:
     """Whole words only. `tests/api` is a project path, not a launcher called `api`: the
-    launcher lives outside the project, so a plain relative path cannot reach it."""
+    launcher lives outside the project, so a plain relative path reaches it only by spelling
+    out its own path. This is a lint on specs: a glob or a spliced variable gets past it."""
     from core import agent_auth_mode as aam
-    names = {os.path.basename(aam.DEFAULT_LAUNCHER)}
+    paths = {aam.DEFAULT_LAUNCHER}
     cfg = aam.load_config()
     if cfg.get("launcher"):
-        names.add(os.path.basename(str(cfg["launcher"])))
-    names.discard("")
+        paths.add(str(cfg["launcher"]))
+    names = {os.path.basename(p) for p in paths} - {""}
     words = (w for a in argv for w in _WORD_BREAK.split(str(a)) if w)
-    return any(w.rsplit("/", 1)[-1] in names and (w[0] in "/." or "/" not in w) for w in words)
+    return any(w.rsplit("/", 1)[-1] in names and (
+        "/" not in w or w[0] in "/.~$" or any(p.endswith("/" + w) for p in paths))
+        for w in words)
 
 
 def check_argv(argv: list, *, root: str, trusted: bool) -> Optional[str]:

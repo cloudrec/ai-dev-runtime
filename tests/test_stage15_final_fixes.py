@@ -262,7 +262,11 @@ def test_l5_a_short_configured_name_spares_project_paths(monkeypatch):
     ["claude-owner-api"], ["/usr/local/bin/claude-owner-api", "-p", "x"],
     ["sh", "-c", "claude-owner-api -p x"], ["sh", "-c", "true;claude-owner-api"],
     ["sh", "-c", "X=$(claude-owner-api)"], ["env", "A=claude-owner-api"],
-    ["../bin/claude-owner-api"], ["./claude-owner-api"]])
+    ["../bin/claude-owner-api"], ["./claude-owner-api"],
+    ["sh", "-c", "~/../usr/local/bin/claude-owner-api"],
+    ["sh", "-c", "$HOME/../usr/local/bin/claude-owner-api"],
+    ["sh", "-c", "cd / && usr/local/bin/claude-owner-api"],
+    ["x", "claude-owner-api,"], ["x", "a:claude-owner-api:b"]])
 def test_l5_the_launcher_is_still_refused(argv):
     from core.fullcycle import gates
     assert gates._names_api_launcher(argv) is True
