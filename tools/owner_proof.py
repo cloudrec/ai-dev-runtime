@@ -9,8 +9,9 @@ must not be able to read the key. Prints the proof JSON only; the key is never p
   printf 'status?' | tools/owner_proof.py sign --action agent_send --target vtb:0.0
   tools/owner_proof.py sign --action agent_stop --target T --text-file /dev/null
   tools/owner_proof.py sign-api-launch --session S --dir /abs/worktree [--model opus --risk high]
-  tools/owner_proof.py reanchor                     # after a key rotation, or to restore
-                                                    # API ledger triggers (upgrade step)
+  tools/owner_proof.py reanchor                     # restore API ledger triggers
+  tools/owner_proof.py reanchor --accept-chain      # after a key rotation: first judge the
+                                                    # chain complete; see what it reports
 
 Send the command with header `X-Owner-Proof: <printed JSON>` (or `owner_proof=` in
 process). The proof binds action, target, the exact text (sha256), a timestamp (valid
@@ -44,7 +45,9 @@ def main(argv=None, stdin=None) -> int:
     api.add_argument("--model", default="sonnet")
     api.add_argument("--risk", choices=("normal", "high"), default=None)
     api.add_argument("--conversation", default=None)
-    sub.add_parser("reanchor", help="re-sign the API chain head; restore its triggers")
+    re_a = sub.add_parser("reanchor", help="re-sign the API chain head; restore its triggers")
+    re_a.add_argument("--accept-chain", action="store_true",
+                      help="the anchor cannot vouch for the chain: accept it as complete")
     a = ap.parse_args(argv)
     path = ac._owner_key_path()
     if a.cmd == "init-key":
@@ -63,7 +66,7 @@ def main(argv=None, stdin=None) -> int:
         return 1
     if a.cmd == "reanchor":
         from core import agent_auth_mode as aam
-        r = aam.reanchor()
+        r = aam.reanchor(accept_chain=a.accept_chain)
         print(json.dumps(r))
         return 0 if r["ok"] else 1
     if a.cmd == "sign-api-launch":

@@ -48,6 +48,13 @@ def test_m1_a_dropped_proof_table_is_not_repaired_by_proof_use(wt, api_cfg):  # 
     assert _state() == "api_ledger_tampered"
 
 
+def test_ld_an_old_ledger_without_a_chain_gets_its_triggers(wt):  # noqa: F811
+    _sql(aam._PROOF_TABLE)
+    assert not set(aam._PROOF_TRIGGERS) & _triggers()
+    assert _use_general_proof() == ""
+    assert set(aam._PROOF_TRIGGERS) <= _triggers()
+
+
 def test_m1_a_new_ledger_gets_its_triggers_from_the_first_proof(wt):  # noqa: F811
     assert _use_general_proof() == ""
     assert set(aam._PROOF_TRIGGERS) <= _triggers()
@@ -93,7 +100,8 @@ def test_reanchor_clears_the_anchor_of_a_chain_reset_to_empty(wt, api_cfg):  # n
     _sql(*[f"DROP TRIGGER {t}" for t in (*aam._CHAIN_TRIGGERS, *aam._PROOF_TRIGGERS)],
          "DELETE FROM agent_auth_api_chain", "DELETE FROM owner_proof_used")
     assert _state() == "api_ledger_tampered"
-    assert aam.reanchor()["ok"] and not os.path.exists(aam._anchor_path())
+    assert aam.reanchor()["reason"] == "api_chain_needs_owner_review"
+    assert aam.reanchor(accept_chain=True)["ok"] and not os.path.exists(aam._anchor_path())
     assert _state() is None
 
 
@@ -286,3 +294,84 @@ def test_f7_enforce_refuses_the_child(project_with_helper, monkeypatch):
     rc, out, err = LocalHost().run([claude], cwd=d)
     assert rc == 126 and out == "" and "apiKeyHelper" in err and "sentinel-value" not in err
     assert LocalHost().run(["sh", "-c", "echo fine"], cwd=d)[0] == 0
+
+
+# ── M-A: reanchor cannot seal a chain its anchor does not vouch for ──────────────
+ALL_TRIGGERS = (*aam._CHAIN_TRIGGERS, *aam._PROOF_TRIGGERS)
+
+
+def _three_rows_then_truncate(wt):  # noqa: F811
+    proofs = [_sign(wt) for _ in range(3)]
+    for p in proofs:
+        assert _commit(wt, p) == ""
+    _sql(*[f"DROP TRIGGER {t}" for t in ALL_TRIGGERS],
+         "DELETE FROM agent_auth_api_chain WHERE seq=3",
+         "DELETE FROM owner_proof_used WHERE nonce='{}'".format(proofs[2]["nonce"]))
+
+
+def test_ma_reanchor_refuses_a_truncated_chain(wt, api_cfg):  # noqa: F811
+    _three_rows_then_truncate(wt)
+    r = aam.reanchor()
+    assert r == {"ok": False, "reason": "api_chain_needs_owner_review", "rows": 2,
+                 "anchored_rows_before": 3}
+    assert not set(ALL_TRIGGERS) & _triggers()
+    assert _state() == "api_ledger_tampered"
+
+
+def test_ma_a_rewritten_anchor_does_not_vouch(wt, api_cfg):  # noqa: F811
+    _three_rows_then_truncate(wt)
+    path = aam._anchor_path()
+    data = json.load(open(path))
+    data["rows"] = 2
+    json.dump(data, open(path, "w"))
+    assert aam.reanchor()["reason"] == "api_chain_needs_owner_review"
+
+
+def test_ma_a_deleted_anchor_does_not_vouch(wt, api_cfg):  # noqa: F811
+    _three_rows_then_truncate(wt)
+    os.unlink(aam._anchor_path())
+    assert aam.reanchor()["reason"] == "api_chain_needs_owner_review"
+
+
+def test_ma_the_owner_can_accept_and_it_is_audited(wt, api_cfg, tmp_path, monkeypatch):  # noqa: F811
+    log = tmp_path / "audit.jsonl"
+    monkeypatch.setenv("AGENT_CONTROL_AUDIT", str(log))
+    _three_rows_then_truncate(wt)
+    r = aam.reanchor(accept_chain=True)
+    assert r["ok"] and r["rows"] == 2 and r["anchored_rows_before"] == 3
+    assert r["anchor_vouched"] is False and r["restored_triggers"] == sorted(ALL_TRIGGERS)
+    assert _state() is None
+    entry = json.loads(log.read_text().splitlines()[-1])
+    assert entry["action"] == "api_chain_reanchor" and entry["anchored_rows_before"] == 3
+
+
+def test_ma_the_tool_passes_the_flag(wt, api_cfg, capsys):  # noqa: F811
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("owner_proof", "tools/owner_proof.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _three_rows_then_truncate(wt)
+    assert mod.main(["reanchor"]) == 1
+    assert "api_chain_needs_owner_review" in capsys.readouterr().out
+    assert mod.main(["reanchor", "--accept-chain"]) == 0
+
+
+# ── L-A and the lag read: an anchor is never written or trusted blindly ──────────
+def test_la_no_key_writes_no_anchor(wt, api_cfg, monkeypatch):  # noqa: F811
+    proof = _sign(wt)
+    _fail_anchor_write_once(monkeypatch)
+    assert _commit(wt, proof) == "api_anchor_write_failed"
+    with monkeypatch.context() as m:
+        m.setattr(ac, "_owner_key", lambda: None)
+        assert _commit(wt, None) != ""
+    assert not os.path.exists(aam._anchor_path())
+    assert _state() is None
+
+
+def test_la_an_unreadable_anchor_does_not_raise_in_the_lag_check(wt, api_cfg):  # noqa: F811
+    assert _commit(wt, _sign(wt)) == ""
+    with open(aam._anchor_path(), "w") as fh:
+        fh.write('{"rows": "x"}')
+    c = sqlite3.connect(ac._db_path())
+    assert aam._close_anchor_lag(c) == "api_ledger_tampered"
+    c.close()

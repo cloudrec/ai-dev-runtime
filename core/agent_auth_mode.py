@@ -39,7 +39,8 @@ is a boundary against a process willing to work at it:
     through SQL, accidental or scripted (triggers), and replay of a spent nonce;
   * detected, every API launch then refused: a dropped trigger, an edited row, a truncated
     or dropped chain, an old or forged anchor file. Routine use repairs none of it: only the
-    owner's reanchor restores triggers, and it names what it restored;
+    owner's reanchor does. Unless the anchor vouches for the chain it also needs an explicit
+    accept_chain, because that is the owner judging the chain complete. Each one is audited;
   * not detected: wiping chain, spent rows and anchor together (looks like a fresh install);
   * not stopped: reading the owner key, pointing AGENT_OWNER_PROOF_KEY_FILE at a key of
     one's own, or editing this code. Each forges a proof outright.
@@ -199,16 +200,15 @@ def _chain_triggers(c) -> None:
 
 
 def ensure_proof_table(c) -> None:
-    """The spent-nonce table for any owner proof. Triggers come only with a brand-new ledger,
-    never onto an existing one: this runs on every proof, so repairing here would erase what
-    _chain_problem must keep seeing. Restoring them is the owner's step (reanchor). The
-    caller owns the transaction."""
+    """The spent-nonce table for any owner proof, with its triggers until a chain exists.
+    From then on this never adds them: it runs on every proof, so repairing here would erase
+    what _chain_problem must keep seeing, and restoring them is the owner's step (reanchor).
+    The caller owns the transaction."""
     have = {r[0] for r in c.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name IN"
         " ('owner_proof_used','agent_auth_api_chain')")}
-    if "owner_proof_used" in have:
-        return
-    c.execute(_PROOF_TABLE)
+    if "owner_proof_used" not in have:
+        c.execute(_PROOF_TABLE)
     if "agent_auth_api_chain" not in have:
         _proof_triggers(c)
 
@@ -248,6 +248,19 @@ def _anchor_lock():
         yield
     finally:
         os.close(fd)
+
+
+def _anchored_rows() -> Optional[int]:
+    """The row count the anchor file claims, unverified: 0 with no file, None if unreadable."""
+    try:
+        with open(_anchor_path(), encoding="utf-8") as fh:
+            a = json.load(fh)
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError):
+        return None
+    rows = a.get("rows") if isinstance(a, dict) else None
+    return rows if isinstance(rows, int) else None
 
 
 def _anchor_problem(hashes: list) -> bool:
@@ -301,16 +314,15 @@ def _close_anchor_lag(c) -> Optional[str]:
     """After a failed anchor write the newest row is unanchored, so deleting it together with
     its spent nonce would go unseen. The next attempt, even a refused one, anchors it. Call
     under _anchor_lock, after _chain_problem has accepted the anchor."""
+    from core import agent_control as ac
     _, hashes = _chain_rows_problem(c)
-    if not hashes:
+    if not hashes or ac._owner_key() is None:     # no key: the proof check refuses anyway
         return None
-    try:
-        with open(_anchor_path(), encoding="utf-8") as fh:
-            rows = json.load(fh)["rows"]
-    except FileNotFoundError:
-        rows = 0
+    rows = _anchored_rows()
     if rows == len(hashes):
         return None
+    if rows is None:
+        return "api_ledger_tampered"
     try:
         _write_anchor(len(hashes), hashes[-1])
     except OSError:
@@ -408,11 +420,12 @@ def commit_api_launch(*, session: str, project_dir: str, model: str, risk: str =
             c.close()
 
 
-def reanchor(conn=None) -> dict:
-    """Owner step: re-sign the head of an intact chain after a key rotation, restore missing
-    triggers (a DB from before them, or one the refusal reported; the names are returned so
-    they get looked at), and clear the anchor of a chain reset to empty. A chain whose own
-    rows are damaged is refused; judging a shorter chain as complete is the owner's."""
+def reanchor(conn=None, *, accept_chain: bool = False) -> dict:
+    """Owner step: restore missing triggers (a DB from before them, or a reported drop) and
+    re-sign the head. Refused without accept_chain unless the present anchor vouches for
+    the chain: rows deleted with their nonces look intact, and only the anchor knows, so a
+    key rotation, a shorter chain or a missing anchor is the owner's explicit judgement.
+    Rows that are themselves damaged are always refused. Every change is audited."""
     from core import agent_control as ac
     c = _chain(_ledger(conn))
     try:
@@ -428,6 +441,12 @@ def reanchor(conn=None) -> dict:
                 if why:
                     c.rollback()
                     return {"ok": False, "reason": why}
+                before = _anchored_rows()
+                vouched = not _anchor_problem(hashes)
+                if not (vouched or accept_chain):
+                    c.rollback()
+                    return {"ok": False, "reason": "api_chain_needs_owner_review",
+                            "rows": len(hashes), "anchored_rows_before": before}
                 have = {r[0] for r in c.execute(
                     "SELECT name FROM sqlite_master WHERE type='trigger'")}
                 missing = sorted((set(_CHAIN_TRIGGERS) | set(_PROOF_TRIGGERS)) - have)
@@ -442,7 +461,10 @@ def reanchor(conn=None) -> dict:
             else:
                 with contextlib.suppress(FileNotFoundError):
                     os.unlink(_anchor_path())
-            return {"ok": True, "rows": len(hashes), "restored_triggers": missing}
+            result = {"ok": True, "rows": len(hashes), "restored_triggers": missing,
+                      "anchored_rows_before": before, "anchor_vouched": vouched}
+            ac.audit("api_chain_reanchor", "agent_auth_api_chain", **result)
+            return result
     finally:
         if conn is None:
             c.close()
