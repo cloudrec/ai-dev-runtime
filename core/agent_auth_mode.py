@@ -48,7 +48,19 @@ DEFAULT_LAUNCHER = "/usr/local/bin/claude-owner-api"
 API_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_HEADERS",
                 "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
                 "ANTHROPIC_BEDROCK_BASE_URL", "ANTHROPIC_VERTEX_BASE_URL",
-                "AWS_BEARER_TOKEN_BEDROCK")
+                "AWS_BEARER_TOKEN_BEDROCK", "CLAUDE_CODE_USE_FOUNDRY",
+                "ANTHROPIC_FOUNDRY_API_KEY", "ANTHROPIC_FOUNDRY_BASE_URL")
+
+# F2: what a `claude` child run directly by this process may inherit. An allowlist, so a
+# credential or a routing switch nobody has named yet stays out. It keeps what the CLI needs
+# to find its login and its sessions (HOME, CLAUDE_CONFIG_DIR, the subscription's own
+# CLAUDE_CODE_OAUTH_TOKEN) and to reach the network from this host (proxy and CA settings).
+SUBSCRIPTION_ENV_KEEP = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "TERM",
+    "TMPDIR", "TEMP", "TMP", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy",
+    "https_proxy", "no_proxy", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR"})
+SUBSCRIPTION_ENV_KEEP_PREFIXES = ("LC_", "XDG_")
 
 _CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
                        "config", "agent_auth_modes.yaml")
@@ -72,6 +84,16 @@ def load_config(path: Optional[str] = None) -> dict:
     if not isinstance(data, dict):
         return {"_error": "config_not_a_mapping"}
     return data
+
+
+def subscription_env(base: Optional[dict] = None) -> dict:
+    """The environment for a `claude` child spawned directly (`env=`). Only the allowlist
+    passes, and API_ENV_VARS never does. Panes cannot use this: tmux hands them the server's
+    environment, so they go through subscription_argv / subscription_shell instead."""
+    src = os.environ if base is None else base
+    return {k: v for k, v in src.items()
+            if (k in SUBSCRIPTION_ENV_KEEP or k.startswith(SUBSCRIPTION_ENV_KEEP_PREFIXES))
+            and k not in API_ENV_VARS}
 
 
 def subscription_argv(base: Optional[list] = None) -> list:

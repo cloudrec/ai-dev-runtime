@@ -14,6 +14,8 @@ import subprocess
 import threading
 import time
 
+from core.agent_auth_mode import subscription_env
+
 _CLAUDE = os.getenv("RUNTIME_CLAUDE_BIN", shutil.which("claude") or "/root/.local/bin/claude")
 _MODEL = os.getenv("RUNTIME_CLAUDE_MODEL", "")
 # Root cause of the 180s/900s planner hangs (issue #10): the planner invoked the
@@ -307,10 +309,13 @@ def _invoke_cli(cmd: list[str], prompt: str, timeout: float, heartbeat_cb=None) 
     both: `--tools ""` so the CLI can never act, `--setting-sources ""` +
     `--strict-mcp-config` so the operator's live session state can't leak in,
     a whole-process-group kill on timeout (start_new_session=True), and a
-    capped drain so a runaway response can't exhaust memory."""
+    capped drain so a runaway response can't exhaust memory. The daemon's API
+    credentials stay out of the child (subscription_env), so a planner call
+    never bills API credits behind the auth-mode gate."""
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, shell=False, start_new_session=True)
+                                stderr=subprocess.PIPE, shell=False, start_new_session=True,
+                                env=subscription_env())
     except FileNotFoundError:
         raise PlannerError("provider_not_configured")
 

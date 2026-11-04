@@ -32,6 +32,8 @@ import subprocess
 import time
 from typing import Optional
 
+from core.agent_auth_mode import subscription_env
+
 # Off switch, on by default. A native view that starts misbehaving must be
 # removable without a deploy of every caller.
 ENABLED = os.getenv("OWNEROS_NATIVE_SESSIONS", "1") not in ("0", "", "false", "no")
@@ -50,7 +52,7 @@ _cache: dict = {"ts": 0.0, "rows": []}
 def _list_raw() -> list:
     """One real call. Injectable: tests replace this, never the subprocess itself."""
     out = subprocess.run([_BIN, "agents", "--json"], capture_output=True, text=True,
-                         timeout=TIMEOUT_SECS)
+                         timeout=TIMEOUT_SECS, env=subscription_env())
     if out.returncode != 0:
         return []
     body = (out.stdout or "").strip()

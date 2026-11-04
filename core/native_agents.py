@@ -21,6 +21,8 @@ import re
 import subprocess
 from typing import Callable, Optional
 
+from core.agent_auth_mode import subscription_env
+
 CLAUDE_BIN = os.getenv("RUNTIME_CLAUDE_BIN", "/root/.local/bin/claude")
 TIMEOUT_SECS = int(os.getenv("NATIVE_AGENTS_TIMEOUT_SECS", "30"))
 MAX_BYTES = int(os.getenv("NATIVE_AGENTS_MAX_BYTES", str(2 * 1024 * 1024)))
@@ -38,7 +40,7 @@ Runner = Callable[[list], tuple]          # argv -> (returncode, stdout, stderr)
 def _run(argv: list) -> tuple:
     try:
         p = subprocess.run(argv, capture_output=True, timeout=TIMEOUT_SECS,
-                           stdin=subprocess.DEVNULL)
+                           stdin=subprocess.DEVNULL, env=subscription_env())
     except (OSError, subprocess.TimeoutExpired) as e:
         return 127, b"", type(e).__name__.encode()
     return p.returncode, p.stdout[:MAX_BYTES + 1], p.stderr[:4000]
