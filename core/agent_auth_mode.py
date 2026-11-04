@@ -21,7 +21,8 @@ Rules (all fail closed):
     model, risk, conversation and launcher. No actor name, config edit or agent text can
     stand in for it. The proof is spent and the launch counted in one transaction, in an
     append-only, hash-chained table (agent_auth_api_chain), so deleting ledger rows
-    resets nothing and a damaged chain refuses every API launch;
+    resets nothing and a damaged chain refuses every API launch. A keyed head anchor in a
+    file outside the DB catches truncation and a dropped table;
   * model: Sonnet by default; Opus only when the launch says `risk="high"` AND the
     agent's entry allows Opus for high-risk work; anything else is refused;
   * session recovery never starts API mode: a recorded API session is not revived
@@ -30,14 +31,25 @@ Rules (all fail closed):
 
 Not enforceable here (stated, not hidden): a dollar cap per interactive session — the
 Claude CLI caps spend only in print mode. The hard money ceiling must be the API
-workspace's own spend limit (owner, Anthropic console). And agents run as root on this
-host: one that reads the owner key file, or rebuilds the chain after dropping its
-triggers, gets past these checks. They stop mistakes and text-level spoofing, not a
-hostile root process.
+workspace's own spend limit (owner, Anthropic console).
+
+Security model of the proof ledger (R6). Agents run as root on this host, so nothing here
+is a boundary against a process willing to work at it:
+  * stopped outright: any UPDATE or DELETE on owner_proof_used or agent_auth_api_chain
+    through SQL, accidental or scripted (triggers), and replay of a spent nonce;
+  * detected, every API launch then refused: a dropped trigger, an edited row, a truncated
+    or dropped chain, an old or forged anchor file;
+  * not detected: wiping chain, spent rows and anchor together (looks like a fresh install);
+  * not stopped: reading the owner key, pointing AGENT_OWNER_PROOF_KEY_FILE at a key of
+    one's own, or editing this code. Each forges a proof outright.
+A non-API proof is protected only by the triggers and its 300 s expiry: a deleted row makes
+it replayable for what is left of those 300 s.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -157,6 +169,76 @@ def _ledger(conn=None):
 _CHAIN_TRIGGERS = {
     "agent_auth_api_chain_no_update": "UPDATE",
     "agent_auth_api_chain_no_delete": "DELETE"}
+_PROOF_TRIGGERS = {
+    "owner_proof_used_no_update": "UPDATE",
+    "owner_proof_used_no_delete": "DELETE"}
+
+
+def ensure_proof_table(c) -> None:
+    """The spent-nonce table, append-only (R6). The caller owns the transaction."""
+    c.execute("CREATE TABLE IF NOT EXISTS owner_proof_used (nonce TEXT PRIMARY KEY, "
+              "action TEXT, target TEXT, used_at TEXT)")
+    for name, verb in _PROOF_TRIGGERS.items():
+        c.execute(f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {verb} ON owner_proof_used"
+                  " BEGIN SELECT RAISE(ABORT, 'owner_proof_used is append-only'); END")
+
+
+# ── head anchor: the chain's latest row, recorded outside the DB and keyed ────────
+def _anchor_path() -> str:
+    from core import agent_control as ac
+    return os.getenv("AGENT_AUTH_API_ANCHOR_FILE") or ac._db_path() + ".api_anchor"
+
+
+def _anchor_mac(rows: int, head: str) -> str:
+    from core import agent_control as ac
+    key = ac._owner_key()
+    if key is None:
+        return ""
+    return hmac.new(key, f"api-chain-anchor-v1|{rows}|{head}".encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _write_anchor(rows: int, head: str) -> None:
+    path = _anchor_path()
+    tmp = f"{path}.tmp.{os.getpid()}"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump({"rows": rows, "head": head, "mac": _anchor_mac(rows, head)}, fh)
+    os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def _anchor_lock():
+    """Commit and anchor write stay in order across processes: an anchor can never move
+    backwards because a slower process wrote last."""
+    import fcntl
+    fd = os.open(_anchor_path() + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _anchor_problem(hashes: list) -> bool:
+    """True when the chain does not match its anchor. The anchor may lag by one row (a crash
+    between COMMIT and the file write), never lead: fewer rows than anchored is truncation."""
+    try:
+        with open(_anchor_path(), encoding="utf-8") as fh:
+            a = json.load(fh)
+    except FileNotFoundError:
+        return len(hashes) > 1
+    except (OSError, ValueError):
+        return True
+    if not isinstance(a, dict):
+        return True
+    rows, head, mac = a.get("rows"), a.get("head"), a.get("mac")
+    if not isinstance(rows, int) or not isinstance(head, str) or not isinstance(mac, str):
+        return True
+    want = _anchor_mac(rows, head)
+    if not want or not hmac.compare_digest(want, mac):
+        return True
+    return not (1 <= rows <= len(hashes) <= rows + 1 and hashes[rows - 1] == head)
 
 
 def _chain(c):
@@ -178,8 +260,7 @@ def _chain(c):
             c.execute(f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {verb} ON"
                       " agent_auth_api_chain BEGIN SELECT RAISE(ABORT,"
                       " 'agent_auth_api_chain is append-only'); END")
-        c.execute("CREATE TABLE IF NOT EXISTS owner_proof_used (nonce TEXT PRIMARY KEY, "
-                  "action TEXT, target TEXT, used_at TEXT)")
+        ensure_proof_table(c)
         c.commit()
     except BaseException:
         c.rollback()
@@ -193,22 +274,28 @@ def _chain_hash(prev: str, row: dict) -> str:
 
 def _chain_problem(c) -> Optional[str]:
     """Why the chain cannot be trusted, or None: refuse rather than count from bad data."""
-    have = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND"
-                                    " tbl_name='agent_auth_api_chain'")}
-    if not set(_CHAIN_TRIGGERS) <= have:
+    have = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='trigger'")}
+    if not (set(_CHAIN_TRIGGERS) | set(_PROOF_TRIGGERS)) <= have:
         return "api_ledger_tampered"
-    prev, rows = "", 0
+    why, hashes = _chain_rows_problem(c)
+    return why or ("api_ledger_tampered" if _anchor_problem(hashes) else None)
+
+
+def _chain_rows_problem(c) -> tuple:
+    """(why the rows themselves are damaged or None, the row hashes in order)."""
+    prev, hashes = "", []
     for ts, session, project_dir, model, risk, actor, nonce, row_prev, row_hash in c.execute(
             "SELECT ts, session, project_dir, model, risk, actor, nonce, prev_hash, hash FROM"
             " agent_auth_api_chain ORDER BY seq"):
         row = {"ts": ts, "session": session, "project_dir": project_dir, "model": model,
                "risk": risk, "actor": actor, "nonce": nonce}
         if row_prev != prev or row_hash != _chain_hash(prev, row):
-            return "api_ledger_tampered"
-        prev, rows = row_hash, rows + 1
+            return "api_ledger_tampered", hashes
+        prev = row_hash
+        hashes.append(row_hash)
     spent = c.execute("SELECT COUNT(*) FROM owner_proof_used WHERE action=?",
                       (API_PROOF_ACTION,)).fetchone()[0]
-    return "api_ledger_tampered" if spent > rows else None      # a dropped or emptied chain
+    return ("api_ledger_tampered" if spent > len(hashes) else None), hashes
 
 
 def commit_api_launch(*, session: str, project_dir: str, model: str, risk: str = "",
@@ -222,40 +309,64 @@ def commit_api_launch(*, session: str, project_dir: str, model: str, risk: str =
     c = _chain(_ledger(conn))
     ts = now if now is not None else time.time()
     try:
-        if c.in_transaction:
-            c.commit()
-        c.execute("BEGIN IMMEDIATE")
-        try:
-            problem = _chain_problem(c) or _api_proof_problem(
-                proof, session, project_dir, model, risk, conversation_id, launcher, c, now,
-                verify_proof)
-            if problem:
+        with _anchor_lock():
+            if c.in_transaction:
+                c.commit()
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                problem = _chain_problem(c) or _api_proof_problem(
+                    proof, session, project_dir, model, risk, conversation_id, launcher, c, now,
+                    verify_proof)
+                if problem:
+                    c.rollback()
+                    return problem
+                nonce = str(proof.get("nonce"))
+                r = c.execute("SELECT hash FROM agent_auth_api_chain ORDER BY seq DESC LIMIT 1"
+                              ).fetchone()
+                prev = r[0] if r else ""
+                row = {"ts": ts, "session": session, "project_dir": project_dir, "model": model,
+                       "risk": risk or "", "actor": actor or "", "nonce": nonce}
+                head = _chain_hash(prev, row)
+                c.execute("INSERT INTO agent_auth_api_chain (ts, session, project_dir, model, risk,"
+                          " actor, nonce, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?,?)",
+                          (ts, session, project_dir, model, row["risk"], row["actor"], nonce, prev,
+                           head))
+                rows = c.execute("SELECT COUNT(*) FROM agent_auth_api_chain").fetchone()[0]
+                c.execute("INSERT INTO owner_proof_used VALUES (?,?,?,?)",
+                          (nonce, API_PROOF_ACTION, session,
+                           time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))))
+                c.execute("INSERT INTO agent_auth_launch (ts, session, project_dir, mode, model,"
+                          " risk, actor) VALUES (?,?,?,?,?,?,?)",
+                          (ts, session, project_dir, API, model, row["risk"], row["actor"]))
+                c.commit()
+            except sqlite3.IntegrityError:
                 c.rollback()
-                return problem
-            nonce = str(proof.get("nonce"))
-            r = c.execute("SELECT hash FROM agent_auth_api_chain ORDER BY seq DESC LIMIT 1"
-                          ).fetchone()
-            prev = r[0] if r else ""
-            row = {"ts": ts, "session": session, "project_dir": project_dir, "model": model,
-                   "risk": risk or "", "actor": actor or "", "nonce": nonce}
-            c.execute("INSERT INTO agent_auth_api_chain (ts, session, project_dir, model, risk,"
-                      " actor, nonce, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?,?)",
-                      (ts, session, project_dir, model, row["risk"], row["actor"], nonce, prev,
-                       _chain_hash(prev, row)))
-            c.execute("INSERT INTO owner_proof_used VALUES (?,?,?,?)",
-                      (nonce, API_PROOF_ACTION, session,
-                       time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))))
-            c.execute("INSERT INTO agent_auth_launch (ts, session, project_dir, mode, model,"
-                      " risk, actor) VALUES (?,?,?,?,?,?,?)",
-                      (ts, session, project_dir, API, model, row["risk"], row["actor"]))
-            c.commit()
-        except sqlite3.IntegrityError:
-            c.rollback()
-            return "owner_proof_replayed"
-        except BaseException:
-            c.rollback()
-            raise
-        return ""
+                return "owner_proof_replayed"
+            except BaseException:
+                c.rollback()
+                raise
+            try:
+                _write_anchor(rows, head)
+            except OSError:
+                return "api_anchor_write_failed"      # counted and spent; start nothing
+            return ""
+    finally:
+        if conn is None:
+            c.close()
+
+
+def reanchor(conn=None) -> dict:
+    """Owner step after a key rotation: re-sign the head of an intact chain. A chain whose
+    own rows are damaged is refused; judging a shorter chain as complete is the owner's."""
+    c = _chain(_ledger(conn))
+    try:
+        with _anchor_lock():
+            why, hashes = _chain_rows_problem(c)
+            if why:
+                return {"ok": False, "reason": why}
+            if hashes:
+                _write_anchor(len(hashes), hashes[-1])
+            return {"ok": True, "rows": len(hashes)}
     finally:
         if conn is None:
             c.close()

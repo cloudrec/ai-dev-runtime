@@ -179,8 +179,10 @@ def test_replay_after_the_session_died_is_refused(wt, tmux, api_cfg):  # noqa: F
 def test_replay_is_refused_even_if_the_used_table_is_emptied(wt, tmux, api_cfg):  # noqa: F811
     proof = _sign(wt)
     assert _commit(wt, proof) == ""
-    _sql("DELETE FROM owner_proof_used")
-    assert _commit(wt, proof) == "owner_proof_replayed"
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        _sql("DELETE FROM owner_proof_used")
+    _sql("DROP TRIGGER owner_proof_used_no_delete", "DELETE FROM owner_proof_used")
+    assert _commit(wt, proof) == "api_ledger_tampered"
     assert _rows("agent_auth_api_chain") == 1
 
 
@@ -387,3 +389,148 @@ def test_agent_create_passes_the_proof_and_reports_a_bad_file(monkeypatch, capsy
     assert mod.main(["--dir", "/tmp", "--session", "s", "--auth-mode", "api",
                      "--api-proof-file", str(good)]) == 1
     assert seen == {}
+
+
+# ── R6: the proof ledger and its anchor ───────────────────────────────────────────
+DROP_ALL_TRIGGERS = ("DROP TRIGGER agent_auth_api_chain_no_delete",
+                     "DROP TRIGGER agent_auth_api_chain_no_update",
+                     "DROP TRIGGER owner_proof_used_no_delete",
+                     "DROP TRIGGER owner_proof_used_no_update")
+
+
+def _two_launches(wt):  # noqa: F811
+    assert _commit(wt, _sign(wt)) == "" and _commit(wt, _sign(wt)) == ""
+
+
+def _state():
+    c = sqlite3.connect(ac._db_path())
+    try:
+        return aam._chain_problem(aam._chain(aam._ledger(c)))
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("stmt", ["DELETE FROM owner_proof_used",
+                                  "UPDATE owner_proof_used SET nonce='x'"])
+def test_r6_the_used_table_refuses_edits(wt, api_cfg, stmt):  # noqa: F811
+    assert _commit(wt, _sign(wt)) == ""
+    with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+        _sql(stmt)
+
+
+def test_r6_the_audit_attack_is_caught_by_the_anchor(wt, api_cfg):  # noqa: F811
+    """DROP TABLE chain + DELETE the spent rows: what the audit showed reset the caps."""
+    _two_launches(wt)
+    _sql(*DROP_ALL_TRIGGERS, "DROP TABLE agent_auth_api_chain",
+         f"DELETE FROM owner_proof_used WHERE action='{aam.API_PROOF_ACTION}'")
+    assert _state() == "api_ledger_tampered"
+    assert _commit(wt, _sign(wt)) == "api_ledger_tampered"
+
+
+def test_r6_tail_truncation_is_caught(wt, api_cfg):  # noqa: F811
+    _two_launches(wt)
+    _sql(*DROP_ALL_TRIGGERS,
+         "DELETE FROM agent_auth_api_chain WHERE seq=(SELECT MAX(seq) FROM agent_auth_api_chain)",
+         "DELETE FROM owner_proof_used")
+    assert _state() == "api_ledger_tampered"
+
+
+def test_r6_a_repaired_trigger_does_not_hide_the_loss(wt, api_cfg):  # noqa: F811
+    _two_launches(wt)
+    _sql(*DROP_ALL_TRIGGERS, "DELETE FROM agent_auth_api_chain", "DELETE FROM owner_proof_used")
+    c = sqlite3.connect(ac._db_path())
+    aam.ensure_proof_table(c)
+    c.commit()
+    c.close()
+    other = ac.sign_owner_proof(KEY, "agent_send", "t:0.0", "x")
+    assert ac.verify_owner_proof(other, "agent_send", "t:0.0", "x") == ""
+    assert _commit(wt, _sign(wt)) == "api_ledger_tampered"
+
+
+@pytest.mark.parametrize("damage", [
+    lambda d: d.update(rows=1), lambda d: d.update(head="0" * 64),
+    lambda d: d.update(mac="0" * 64), lambda d: d.pop("mac")])
+def test_r6_a_forged_anchor_refuses(wt, api_cfg, damage):  # noqa: F811
+    _two_launches(wt)
+    path = aam._anchor_path()
+    data = json.load(open(path))
+    damage(data)
+    json.dump(data, open(path, "w"))
+    assert _state() == "api_ledger_tampered"
+
+
+def test_r6_a_restored_old_anchor_refuses(wt, api_cfg):  # noqa: F811
+    assert _commit(wt, _sign(wt)) == ""
+    old = open(aam._anchor_path()).read()
+    _two_launches(wt)
+    open(aam._anchor_path(), "w").write(old)
+    assert _state() == "api_ledger_tampered"
+
+
+def test_r6_a_deleted_anchor_refuses_once_the_chain_has_rows(wt, api_cfg):  # noqa: F811
+    _two_launches(wt)
+    os.remove(aam._anchor_path())
+    assert _state() == "api_ledger_tampered"
+
+
+def test_r6_a_garbage_anchor_refuses(wt, api_cfg):  # noqa: F811
+    assert _commit(wt, _sign(wt)) == ""
+    open(aam._anchor_path(), "w").write("not json")
+    assert _state() == "api_ledger_tampered"
+
+
+def test_r6_a_crash_before_the_anchor_write_is_not_tampering(wt, api_cfg, monkeypatch):  # noqa: F811
+    assert _commit(wt, _sign(wt)) == ""
+    with monkeypatch.context() as m:
+        def boom(rows, head):
+            raise OSError("disk full")
+        m.setattr(aam, "_write_anchor", boom)
+        assert _commit(wt, _sign(wt)) == "api_anchor_write_failed"
+    assert _rows("agent_auth_api_chain") == 2      # counted, and the caller starts nothing
+    assert _state() is None
+    assert _commit(wt, _sign(wt)) == ""            # the next launch catches the anchor up
+    assert _state() is None and json.load(open(aam._anchor_path()))["rows"] == 3
+
+
+def test_r6_a_failed_anchor_write_starts_no_session(wt, tmux, api_cfg, monkeypatch):  # noqa: F811
+    def boom(rows, head):
+        raise OSError("disk full")
+    monkeypatch.setattr(aam, "_write_anchor", boom)
+    assert _start(wt, _sign(wt))["refused"] == "auth_mode:api_anchor_write_failed"
+    assert _new_sessions(tmux) == []
+
+
+def test_r6_key_rotation_refuses_until_the_owner_reanchors(wt, api_cfg, tmp_path, monkeypatch):  # noqa: F811
+    _two_launches(wt)
+    kf = tmp_path / "rotated.key"
+    kf.write_bytes(b"r" * 64)
+    kf.chmod(0o600)
+    monkeypatch.setenv("AGENT_OWNER_PROOF_KEY_FILE", str(kf))
+    assert _state() == "api_ledger_tampered"
+    assert aam.reanchor() == {"ok": True, "rows": 2}
+    assert _state() is None
+
+
+def test_r6_reanchor_refuses_damaged_rows(wt, api_cfg):  # noqa: F811
+    _two_launches(wt)
+    _sql(*DROP_ALL_TRIGGERS, "UPDATE agent_auth_api_chain SET ts=0")
+    assert aam.reanchor() == {"ok": False, "reason": "api_ledger_tampered"}
+
+
+def test_r6_concurrent_spends_keep_the_chain_and_anchor_in_step(wt, api_cfg):  # noqa: F811
+    lp = str(aam.load_config()["launcher"])
+    procs = [subprocess.Popen([sys.executable, "-c", _SPENDER.format(root=ROOT),
+                               json.dumps(_sign(wt, launcher_path=lp)), wt["kz"], lp],
+                              env={**os.environ}, cwd=ROOT, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) for _ in range(6)]
+    for p in procs:
+        out, err = p.communicate(timeout=60)
+        assert p.returncode == 0 and out.strip() == "''", err
+    assert _rows("agent_auth_api_chain") == 6 and _state() is None
+    assert json.load(open(aam._anchor_path()))["rows"] == 6
+
+
+def test_r6_one_general_proof_is_spent_once_under_race(wt):  # noqa: F811
+    proof = ac.sign_owner_proof(KEY, "agent_send", "t:0.0", "x")
+    out = _race(8, lambda i: ac.verify_owner_proof(proof, "agent_send", "t:0.0", "x"))
+    assert sorted(out) == [""] + ["owner_proof_replayed"] * 7

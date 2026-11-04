@@ -1972,8 +1972,8 @@ def verify_owner_proof(proof: Optional[dict], action: str, target: str, text: st
     nonce = str(proof.get("nonce"))
     conn = _db()
     try:
-        conn.execute("CREATE TABLE IF NOT EXISTS owner_proof_used (nonce TEXT PRIMARY KEY, "
-                     "action TEXT, target TEXT, used_at TEXT)")
+        from core import agent_auth_mode as aam
+        aam.ensure_proof_table(conn)
         try:
             conn.execute("INSERT INTO owner_proof_used VALUES (?,?,?,?)",
                          (nonce, action, (target or "").strip(), _now()))
