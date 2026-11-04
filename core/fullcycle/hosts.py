@@ -20,6 +20,7 @@ import subprocess
 from abc import ABC, abstractmethod
 from typing import Optional, Sequence
 
+from core import agent_privilege
 from core.agent_auth_mode import (is_api_env_var, settings_api_overrides,
                                   settings_guard_enforced, subscription_env)
 
@@ -156,13 +157,14 @@ def _child_env(argv: Sequence[str], env: Optional[dict]) -> dict:
     return {k: v for k, v in merged.items() if not is_api_env_var(k)}
 
 
-def _settings_refusal(argv: Sequence[str], cwd: Optional[str]) -> Optional[str]:
+def _settings_refusal(argv: Sequence[str], cwd: Optional[str],
+                      config_dir: Optional[str] = None) -> Optional[str]:
     """F7 for fullcycle children: a stripped environment does not help if a settings file in
     the project brings a credential back. Same rule as agent_resume: reported by name, and
     refused under AGENT_AUTH_SETTINGS_GUARD=enforce."""
     if not _runs_claude(argv):
         return None
-    found = settings_api_overrides(cwd or os.getcwd())
+    found = settings_api_overrides(cwd or os.getcwd(), config_dir)
     if not found:
         return None
     log.warning("claude child with settings overrides: %s", found)
@@ -170,16 +172,33 @@ def _settings_refusal(argv: Sequence[str], cwd: Optional[str]) -> Optional[str]:
 
 
 class LocalHost(ExecutionHost):
+    """Under AGENT_RUN_AS everything here runs as that user: git hooks, check scripts and
+    the paths in read_file and write_file are all the agent's to control."""
     kind = "local"
     tested = True
 
+    def __init__(self, *, drop: bool = True):
+        self.drop = drop                  # False only for a transport, such as ssh
+
     def run(self, argv, *, cwd=None, timeout=60, stdin=None, env=None):
-        refused = _settings_refusal(argv, cwd)
+        run_as = None
+        if self.drop:
+            try:
+                run_as = agent_privilege.target()
+            except agent_privilege.AgentPrivilegeError as e:
+                return 126, "", f"agent_run_as: {e}"
+        refused = _settings_refusal(argv, cwd,
+                                    os.path.join(run_as.home, ".claude") if run_as else None)
         if refused:
             return 126, "", refused
+        if run_as:
+            argv, child_env, cwd = (agent_privilege.host_argv(run_as, argv),
+                                    agent_privilege.child_env(run_as, env), cwd or "/")
+        else:
+            child_env = _child_env(argv, env)
         try:
             p = subprocess.run(list(argv), cwd=cwd, input=stdin, capture_output=True,
-                               timeout=timeout, env=_child_env(argv, env))
+                               timeout=timeout, env=child_env)
         except subprocess.TimeoutExpired:
             return 124, "", f"timeout after {timeout}s"
         except FileNotFoundError as e:
@@ -216,7 +235,7 @@ class SshHost(ExecutionHost):
     def run(self, argv, *, cwd=None, timeout=60, stdin=None, env=None):
         if env:
             argv = ["env", *[f"{k}={v}" for k, v in sorted(env.items())], *argv]
-        return LocalHost().run(self.argv(argv, cwd), timeout=timeout, stdin=stdin)
+        return LocalHost(drop=False).run(self.argv(argv, cwd), timeout=timeout, stdin=stdin)
 
 
 class WindowsBridgeHost(ExecutionHost):

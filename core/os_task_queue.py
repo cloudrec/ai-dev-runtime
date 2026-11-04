@@ -97,7 +97,9 @@ def transcript_messages(cwd: str, limit_files: int = 4) -> list:
     import glob
     out = []
     try:
-        proj = "/root/.claude/projects/" + (cwd or "").replace("/", "-")
+        from core import agent_privilege
+        proj = os.path.join(agent_privilege.claude_home(), ".claude", "projects",
+                            (cwd or "").replace("/", "-"))
         files = sorted(glob.glob(proj + "/*.jsonl"), key=os.path.getmtime)[-limit_files:]
         for path in files:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:

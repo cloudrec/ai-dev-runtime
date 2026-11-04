@@ -13,7 +13,7 @@ import signal
 import subprocess
 import threading
 
-from core import ai_planner, git_write, job_kinds, job_store, job_validation
+from core import agent_privilege, ai_planner, git_write, job_kinds, job_store, job_validation
 from core import job_workspace
 from core import model_router
 from core import policy_engine
@@ -239,9 +239,12 @@ def _run_step(project_path: str, step: str) -> tuple[bool, str]:
     # its tests had spawned running on the server indefinitely. That is not
     # hypothetical here — this repo's own suite spawns long-lived CLI stubs, and
     # 7 recorded jobs (tasks 162/182/193/220/221) hit that cap on the full suite.
-    proc = subprocess.Popen(parts, cwd=project_path, stdout=subprocess.PIPE,
+    run_as = agent_privilege.target()     # raises rather than run a step as root by mistake
+    proc = subprocess.Popen(agent_privilege.host_argv(run_as, parts) if run_as else parts,
+                            cwd=project_path, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, shell=False,
-                            start_new_session=True)
+                            start_new_session=True,
+                            env=agent_privilege.child_env(run_as) if run_as else None)
     try:
         out, err = proc.communicate(timeout=_TEST_TIMEOUT)
     except subprocess.TimeoutExpired:

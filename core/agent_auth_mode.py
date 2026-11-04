@@ -56,6 +56,7 @@ import hmac
 import json
 import os
 import re
+import shlex
 import sqlite3
 import stat
 import time
@@ -721,4 +722,12 @@ def recovery_command(session: str, shape_cmd: str, conn=None) -> dict:
     # inherited credential, so it is refused instead of passed through.
     if not _PLAIN_CLAUDE_RE.match(cmd):
         return {"ok": False, "reason": "recovery_shape_not_plain_claude"}
-    return {"ok": True, "cmd": subscription_shell(cmd)}
+    from core import agent_privilege
+    try:
+        run_as = agent_privilege.target()
+    except agent_privilege.AgentPrivilegeError as e:
+        return {"ok": False, "reason": f"agent_run_as:{e}"}
+    safe = subscription_shell(cmd)
+    if run_as:
+        safe = f"{shlex.join(agent_privilege.pane_prefix(run_as))} {safe}"
+    return {"ok": True, "cmd": safe}

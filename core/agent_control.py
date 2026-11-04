@@ -38,7 +38,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
-from core import tmux_launch
+from core import agent_privilege, tmux_launch
 
 # ── bounds ──────────────────────────────────────────────────────────────────
 MAX_CAPTURE_LINES = 2000
@@ -673,8 +673,7 @@ def last_submitted_text(cwd: str) -> str:
     import glob
     import json as _json
     try:
-        proj = "/root/.claude/projects/" + cwd.replace("/", "-")
-        files = sorted(glob.glob(proj + "/*.jsonl"), key=os.path.getmtime)
+        files = sorted(agent_privilege.transcripts(cwd), key=os.path.getmtime)
         if not files:
             return ""
         # Read BACKWARDS. The answer is the LAST matching line, so parsing the file
@@ -710,8 +709,7 @@ def conversation_recently_active(cwd: str, within_secs: int = RECENTLY_ACTIVE_SE
     always win over a pending-input guess — never the other way around."""
     import glob
     try:
-        proj = "/root/.claude/projects/" + cwd.replace("/", "-")
-        files = glob.glob(proj + "/*.jsonl")
+        files = agent_privilege.transcripts(cwd)
         if not files:
             return False
         newest_mtime = max(os.path.getmtime(f) for f in files)
@@ -2377,9 +2375,27 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
             return {"resumed": False, "refused": f"auth_mode:{auth['reason']}",
                     "reason": "auth mode: not authorized", "duplicate_created": False,
                     "agent_created": False}
+        # who the agent runs as, also decided before any tmux mutation. A setting that
+        # cannot be honoured refuses the start: it never falls back to root.
+        run_as, why = None, None
+        try:
+            run_as = agent_privilege.target()
+        except agent_privilege.AgentPrivilegeError as e:
+            why = str(e)
+        if run_as and auth["mode"] == aam.API:
+            why = "api_mode_unsupported"          # the launcher is root-only by design
+        elif run_as and not agent_privilege.can_use_dir(run_as, resolved):
+            why = "project_not_usable"
+        if why:
+            audit("agent_resume", name, resumed=False, refused=f"agent_run_as:{why}",
+                  actor=actor, cwd=resolved)
+            return {"resumed": False, "refused": f"agent_run_as:{why}",
+                    "reason": "agent uid: not authorized", "duplicate_created": False,
+                    "agent_created": False}
         settings_overrides = []
         if auth["mode"] == aam.SUBSCRIPTION:
-            settings_overrides = aam.settings_api_overrides(resolved)
+            settings_overrides = aam.settings_api_overrides(
+                resolved, os.path.join(run_as.home, ".claude") if run_as else None)
             if settings_overrides and aam.settings_guard_enforced():
                 audit("agent_resume", name, resumed=False,
                       refused="auth_mode:settings_api_override", actor=actor, cwd=resolved,
@@ -2427,7 +2443,8 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
                 return {"resumed": False, "refused": f"auth_mode:{why}",
                         "reason": "auth mode: not authorized", "duplicate_created": False,
                         "agent_created": False}
-        argv = ["new-session", "-d", "-s", name, "-c", resolved, *auth["argv"]]
+        argv = ["new-session", "-d", "-s", name, "-c", resolved,
+                *(agent_privilege.pane_prefix(run_as) if run_as else []), *auth["argv"]]
         if conversation_id:
             argv += ["--resume", str(conversation_id)]
         rc, _, err = _tmux(argv)
@@ -2445,7 +2462,7 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
     audit("agent_resume", name, resumed=True, conversation_id=conversation_id, cwd=resolved,
           actor=actor, authorized_by=gate["reason"], scope=gate.get("scope"),
           auth_mode=auth["mode"], model=auth["model"], auth_reason=auth["reason"],
-          settings_overrides=settings_overrides)
+          settings_overrides=settings_overrides, run_as=run_as.name if run_as else None)
     return {
         "resumed": True,
         "auth_mode": auth["mode"],
