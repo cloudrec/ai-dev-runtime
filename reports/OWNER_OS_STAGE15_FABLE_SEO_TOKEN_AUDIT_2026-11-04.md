@@ -38,3 +38,21 @@ Other INFO: no redirects or retries in httpx 0.27.0; `trust_env=True`, so a prox
 
 ## Not checked by the auditor
 Live uid of agents, container env, `/opt/seo` dirty tree, runtime unit `User=`, the real client tokens file, any DB. Compose parser delivery of an interior newline. Mutation runs. Wider seo suite.
+
+## Fixes at `fc97908` (Opus 5.5 session, not audited by Fable)
+Owner said to fix M1, M2 and L1-L4 on the branch. H1 stays a deployment rule. Not merged, built or deployed.
+
+| finding | change |
+|---|---|
+| M1 | `call_tool` refuses ack and decision unless the MCP token id is in `MCP_FULLCYCLE_REVIEWER_TOKEN_IDS`; unset refuses all, audited as `denied`. The runtime side (declared actor beside the decision) is not done |
+| M2 | 401 and 403 name the side to fix; reads stay fail closed |
+| L1 | a malformed token is dropped at load, the value is never logged |
+| L2 | `status()` gives `fullcycle_client_token`: `set`, `unset` or `malformed` |
+| L3 | both variables in the three example env files |
+| L4 | the test now sends `status` and `agent_get` and checks the bearer on the wire |
+
+Evidence:
+- `test_mcp_fullcycle_tools.py`: 65 passed, in the host venv and in `seo-backend:latest`.
+- 13 mutants on a disposable copy outside both repos: all caught.
+- Real loopback run (seo client, uvicorn, runtime API from this branch, test tokens): shared ack 403 "not set"; wrong token list 401 "did not accept"; unlisted client list ok, ack 403 "not listed"; listed client ack and decision reach the engine (`no such review 1`). Manual script, still no committed test (I6). The MCP gate was not in that run; it is covered by unit tests.
+- Full seo suite in `seo-backend:latest`, `--network none`, read-only mount, no env file: branch 985 passed, 50 failed, 18 errors, 1 skipped; base `7039d6c` 948 passed, 50 failed, 18 errors, 1 skipped. The 68 failing test ids are identical on both. Delta +37 is the 37 new tests. The cause of the 68 was not investigated, so that suite is not green; this shows only that the branch added no failure in these conditions.
