@@ -2377,6 +2377,17 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
             return {"resumed": False, "refused": f"auth_mode:{auth['reason']}",
                     "reason": "auth mode: not authorized", "duplicate_created": False,
                     "agent_created": False}
+        settings_overrides = []
+        if auth["mode"] == aam.SUBSCRIPTION:
+            settings_overrides = aam.settings_api_overrides(resolved)
+            if settings_overrides and aam.settings_guard_enforced():
+                audit("agent_resume", name, resumed=False,
+                      refused="auth_mode:settings_api_override", actor=actor, cwd=resolved,
+                      settings_overrides=settings_overrides)
+                return {"resumed": False, "refused": "auth_mode:settings_api_override",
+                        "settings_overrides": settings_overrides,
+                        "reason": "auth mode: not authorized", "duplicate_created": False,
+                        "agent_created": False}
         rc, _, _ = _tmux(["has-session", "-t", name])
         if rc == 0:
             # The session NAME exists — but it may be a ZOMBIE whose panes are all dead
@@ -2433,7 +2444,8 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
 
     audit("agent_resume", name, resumed=True, conversation_id=conversation_id, cwd=resolved,
           actor=actor, authorized_by=gate["reason"], scope=gate.get("scope"),
-          auth_mode=auth["mode"], model=auth["model"], auth_reason=auth["reason"])
+          auth_mode=auth["mode"], model=auth["model"], auth_reason=auth["reason"],
+          settings_overrides=settings_overrides)
     return {
         "resumed": True,
         "auth_mode": auth["mode"],

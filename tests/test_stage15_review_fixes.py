@@ -9,6 +9,7 @@ import pytest
 from core import agent_auth_mode as aam
 from core.fullcycle import engine as fe
 from core.fullcycle import gates
+from tests.test_agent_creation_policy import mutations, tmux, wt  # noqa: F401
 
 
 # ── N4: a failing wake bridge leaves nothing open on the shared connection ───────
@@ -150,3 +151,63 @@ def test_n1_query_and_body_stay_bound(signed_client):
     assert client.get("/jobs/x?a=2", headers=headers("GET", "/jobs/x", "a=1")).status_code == 401
     assert client.post("/jobs/x", content=b"other",
                        headers=headers("POST", "/jobs/x", body=b"signed")).status_code == 401
+
+
+# ── F7: a settings file can bring a credential back into a pane ─────────────────
+def _settings(path, **data):
+    import json
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
+
+
+def test_f7_helper_and_env_block_are_named_and_values_never_returned(tmp_path):
+    cfg, proj = tmp_path / "cfg", tmp_path / "proj"
+    _settings(cfg / "settings.json", apiKeyHelper="/bin/print-secret-value")
+    _settings(proj / ".claude" / "settings.json",
+              env={"ANTHROPIC_API_KEY": "secret-value", "DISABLE_TELEMETRY": "1"})
+    found = aam.settings_api_overrides(str(proj), config_dir=str(cfg))
+    assert [f.rsplit(":", 1)[1] for f in found] == ["apiKeyHelper", "env.ANTHROPIC_API_KEY"]
+    assert "secret-value" not in " ".join(found)
+
+
+def test_f7_a_clean_or_absent_settings_file_reports_nothing(tmp_path):
+    _settings(tmp_path / "settings.json", model="opus", env={"DISABLE_TELEMETRY": "1"})
+    assert aam.settings_api_overrides(str(tmp_path / "none"), config_dir=str(tmp_path)) == []
+
+
+@pytest.mark.parametrize("content", ["{not json", "[1, 2]"])
+def test_f7_an_unreadable_settings_file_counts(tmp_path, content):
+    (tmp_path / "settings.json").write_text(content)
+    assert aam.settings_api_overrides(str(tmp_path / "none"), config_dir=str(tmp_path)) == [
+        f"{tmp_path / 'settings.json'}:unreadable"]
+
+
+@pytest.fixture
+def overridden(wt, tmp_path, monkeypatch):  # noqa: F811
+    _settings(tmp_path / "cfg" / "settings.json", apiKeyHelper="/bin/x")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+
+
+def _launch(wt):  # noqa: F811
+    from core import agent_control as ac
+    return ac.agent_resume(wt["kz"], session_name="gaika-kz", actor="api:hmac/chatgpt")
+
+
+def test_f7_default_reports_and_still_starts(wt, tmux, overridden, tmp_path):  # noqa: F811
+    assert _launch(wt)["agent_created"]
+    line = [x for x in (tmp_path / "audit.jsonl").read_text().splitlines()
+            if '"resumed": true' in x]
+    assert line and "apiKeyHelper" in line[-1] and "/bin/x" not in line[-1]
+
+
+def test_f7_enforce_refuses_before_any_tmux_mutation(wt, tmux, overridden, monkeypatch):  # noqa: F811
+    monkeypatch.setenv("AGENT_AUTH_SETTINGS_GUARD", "enforce")
+    r = _launch(wt)
+    assert r["refused"] == "auth_mode:settings_api_override" and not r["agent_created"]
+    assert mutations(tmux["calls"]) == []
+
+
+def test_f7_enforce_passes_a_clean_host(wt, tmux, tmp_path, monkeypatch):  # noqa: F811
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "empty"))
+    monkeypatch.setenv("AGENT_AUTH_SETTINGS_GUARD", "enforce")
+    assert _launch(wt)["agent_created"]

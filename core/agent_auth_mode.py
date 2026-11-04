@@ -551,6 +551,45 @@ def resolve(session: str, project_dir: str, *, requested: Optional[str] = None,
             "reason": "explicit_api_opt_in", **usage}
 
 
+# F7: panes can drop variables, but a settings file can bring a credential back
+_SETTINGS_CREDENTIAL_KEYS = ("apiKeyHelper", "awsCredentialExport", "awsAuthRefresh")
+
+
+def settings_guard_enforced() -> bool:
+    """Off by default: a host whose settings use one of these keeps starting sessions until
+    its owner has seen what the audit field reports. `enforce` refuses the launch."""
+    return os.getenv("AGENT_AUTH_SETTINGS_GUARD", "").strip().lower() == "enforce"
+
+
+def settings_api_overrides(project_dir: str, config_dir: Optional[str] = None) -> list:
+    """`<file>:<key>` for each setting that could put a session on API billing. Names only:
+    a value here may be a secret, so it is never returned, logged or stored. A file that
+    cannot be read counts: its content is unknown."""
+    base = config_dir or os.getenv("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    files = [os.path.join(base, "settings.json"),
+             os.path.join(project_dir, ".claude", "settings.json"),
+             os.path.join(project_dir, ".claude", "settings.local.json"),
+             "/etc/claude-code/managed-settings.json"]
+    found = []
+    for path in files:
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            found.append(f"{path}:unreadable")
+            continue
+        if not isinstance(data, dict):
+            found.append(f"{path}:unreadable")
+            continue
+        found += [f"{path}:{k}" for k in _SETTINGS_CREDENTIAL_KEYS if data.get(k)]
+        env = data.get("env")
+        if isinstance(env, dict):
+            found += [f"{path}:env.{k}" for k in sorted(env) if is_api_env_var(str(k))]
+    return found
+
+
 _PLAIN_CLAUDE_RE = re.compile(r"\Aclaude(?:[ \t]+[A-Za-z0-9_./=:@%+,-]+)*\Z")
 
 
