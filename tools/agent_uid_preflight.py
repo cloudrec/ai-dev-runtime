@@ -33,9 +33,18 @@ def _as_agent(t, argv: list) -> int:
 
 def _root_trusts(t) -> list:
     """Root's git refuses a repo owned by someone else unless safe.directory says otherwise."""
-    p = subprocess.run(["git", "config", "--global", "--get-all", "safe.directory"],
+    p = subprocess.run(["git", "config", "--get-all", "safe.directory"], cwd="/",
                        capture_output=True, text=True)
-    return [d for d in p.stdout.split() if d == "*" or _as_agent(t, ["test", "-w", d]) == 0]
+    out = []
+    for d in filter(None, p.stdout.splitlines()):
+        path = d[:-2] if d.endswith("/*") else d
+        try:
+            mine = os.stat(path).st_uid == t.uid
+        except OSError:
+            mine = False
+        if d == "*" or d.endswith("/*") or mine or _as_agent(t, ["test", "-w", path]) == 0:
+            out.append(d)
+    return out
 
 
 def main(argv=None) -> int:

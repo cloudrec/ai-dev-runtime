@@ -101,7 +101,7 @@ def goal_state(cwd: str, session_id: str, *, path: Optional[str] = None) -> dict
           "iterations": None}
     p = path or _transcript(cwd, session_id)
     try:
-        fh = open(p, encoding="utf-8", errors="replace")
+        fh = agent_privilege.open_regular(p, encoding="utf-8", errors="replace")
     except OSError:
         return st
     with fh:

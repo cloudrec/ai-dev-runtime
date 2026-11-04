@@ -41,6 +41,7 @@ def sandbox(monkeypatch):
         os.chown(path, n.pw_uid, n.pw_gid)
     t = priv.Target("nobody", n.pw_uid, n.pw_gid, home)
     monkeypatch.setenv("AGENT_RUN_AS", "nobody")
+    monkeypatch.setenv("AGENT_CONTROL_DB", os.path.join(base, "agent_control.db"))
     monkeypatch.setattr(priv, "_lookup", lambda name: t)
     secret = os.path.join(base, "secret")
     with open(secret, "w") as fh:
@@ -225,7 +226,7 @@ def agent_repo(sandbox):
 def test_git_write_refuses_an_agent_tree(agent_repo):
     from core import git_write
     _, project, marker = agent_repo
-    with pytest.raises(git_write.GitWriteError, match="agent_writable_tree"):
+    with pytest.raises(git_write.GitWriteError, match="root_tooling_disabled"):
         git_write._run(project, ["checkout", "-b", "x"], check=False)
     assert not os.path.exists(marker)
 
@@ -234,8 +235,8 @@ def test_git_write_refuses_an_agent_tree(agent_repo):
 def test_deliver_refuses_an_agent_tree(agent_repo):
     from core import deliver
     _, project, _ = agent_repo
-    assert "agent_writable_tree" in deliver.deliver(project, "b")["error"]
-    assert "agent_writable_tree" in deliver.rollback(project, "b", "abc")["error"]
+    assert "root_tooling_disabled" in deliver.deliver(project, "b")["error"]
+    assert "root_tooling_disabled" in deliver.rollback(project, "b", "abc")["error"]
 
 
 @real
@@ -243,9 +244,9 @@ def test_release_refuses_an_agent_tree(agent_repo, monkeypatch):
     from core import release_controller as rc
     _, project, _ = agent_repo
     monkeypatch.setattr(rc, "_require", lambda _id: {})
-    with pytest.raises(rc.ReleaseError, match="agent_writable_tree"):
+    with pytest.raises(rc.ReleaseError, match="root_tooling_disabled"):
         rc._git(project, ["status"])
-    with pytest.raises(rc.ReleaseError, match="agent_writable_tree"):
+    with pytest.raises(rc.ReleaseError, match="root_tooling_disabled"):
         rc.run_tests(project, "rc-1")
 
 
@@ -253,7 +254,7 @@ def test_release_refuses_an_agent_tree(agent_repo, monkeypatch):
 def test_validator_refuses_an_agent_tree(agent_repo):
     from core.validator import Validator
     _, project, _ = agent_repo
-    with pytest.raises(priv.AgentPrivilegeError, match="agent_writable_tree"):
+    with pytest.raises(priv.AgentPrivilegeError, match="root_tooling_disabled"):
         Validator(project)
 
 
@@ -269,31 +270,26 @@ def test_a_job_on_an_agent_tree_fails_before_the_pipeline(agent_repo, monkeypatc
     monkeypatch.setattr(job_executor.job_store, "append_log", lambda *a, **k: None)
     monkeypatch.setattr(job_executor, "_run_pipeline", lambda *a: pytest.fail("pipeline ran"))
     job_executor.execute("job-1")
-    assert any("agent_writable_tree" in str(u) for u in updates)
+    assert any("root_tooling_disabled" in str(u) for u in updates)
 
 
 @real
-@pytest.mark.parametrize("relative", ["", "sub/project"])
-def test_a_tree_inside_an_agent_directory_is_refused(sandbox, relative):
-    t, project, _ = sandbox
-    tree = os.path.join(project, "root-owned")
-    os.makedirs(os.path.join(tree, relative), exist_ok=True)      # root's, in the agent's dir
-    with pytest.raises(priv.AgentPrivilegeError, match="agent_writable_tree"):
-        priv.require_root_work(os.path.join(tree, relative))
-
-
-@real
-def test_an_agent_owned_git_dir_is_refused_in_a_root_tree(sandbox):
-    t, _, _ = sandbox
-    base = tempfile.mkdtemp(prefix="agent-uid-gitdir-", dir="/tmp")
-    os.chmod(base, 0o755)
+def test_root_tooling_is_off_for_a_root_tree_too(sandbox):
+    """No per-tree rule: ownership, a .git file and subdirectories each beat one."""
+    base = tempfile.mkdtemp(prefix="agent-uid-root-", dir="/tmp")
     try:
-        os.makedirs(os.path.join(base, ".git"))
-        os.chown(os.path.join(base, ".git"), t.uid, t.gid)
-        with pytest.raises(priv.AgentPrivilegeError, match="agent_writable_tree"):
+        with pytest.raises(priv.AgentPrivilegeError, match="root_tooling_disabled"):
             priv.require_root_work(base)
     finally:
-        shutil.rmtree(base)
+        os.rmdir(base)
+
+
+@real
+def test_slash_run_refuses_before_touching_the_tree(sandbox, monkeypatch):
+    from runtime import engine
+    monkeypatch.setattr(engine, "build_context", lambda p: pytest.fail("touched the tree"))
+    with pytest.raises(priv.AgentPrivilegeError):
+        engine.RuntimeEngine().run("x", "/tmp")
 
 
 @real
@@ -308,13 +304,109 @@ def test_a_transcript_swapped_after_the_listing_is_not_followed(sandbox, monkeyp
     assert SECRET not in json.dumps(os_task_queue.transcript_messages(project))
 
 
+# ── root writes nothing through the agent's tree ────────────────────────────
 @real
-def test_a_root_tree_is_still_root_work(sandbox):
-    base = tempfile.mkdtemp(prefix="agent-uid-root-", dir="/tmp")
-    try:
-        priv.require_root_work(base)
-    finally:
-        os.rmdir(base)
+def test_a_planted_handoff_link_does_not_reach_a_root_file(sandbox):
+    from core import agent_context_budget as acb
+    _, project, secret = sandbox
+    os.symlink(secret, os.path.join(project, acb.HANDOFF_FILENAME))
+    path = acb.write_handoff(project, "handoff")
+    assert path and open(secret).read() == SECRET and open(path).read() == "handoff"
+    assert os.stat(path).st_uid != 0
+
+
+@real
+def test_a_planted_checkpoint_link_does_not_reach_a_root_file(sandbox):
+    from core import context_budget as cb
+    _, project, secret = sandbox
+    os.symlink(secret, os.path.join(project, "CONTEXT_CHECKPOINT.md.tmp"))
+    os.symlink(secret, os.path.join(project, "CONTEXT_CHECKPOINT.md"))
+    cb.write_project_checkpoint_copy(project, "text")     # refused or replaced, both fine
+    assert open(secret).read() == SECRET
+
+
+@real
+def test_a_goal_transcript_fifo_does_not_hang(sandbox):
+    from core import native_goals
+    _, project, _ = sandbox
+    fifo = os.path.join(project, "g.jsonl")
+    os.mkfifo(fifo)
+    assert native_goals.goal_state(project, "s", path=fifo)["active"] is False
+
+
+@real
+def test_work_evidence_does_not_follow_a_planted_report(sandbox):
+    from core import work_evidence
+    _, project, secret = sandbox
+    link = os.path.join(project, "report.md")
+    os.symlink(secret, link)
+    assert work_evidence._read(link) is None
+
+
+# ── the setting is pinned to the instance ───────────────────────────────────
+@real
+def test_a_process_without_the_variable_obeys_the_pin(sandbox, monkeypatch):
+    t, _, _ = sandbox
+    priv.pin(t)
+    assert stat.S_IMODE(os.stat(priv._pin_path()).st_mode) == 0o600
+    monkeypatch.delenv("AGENT_RUN_AS")
+    assert priv.target() == t
+    rc, out, _ = LocalHost().run(["id", "-u"])
+    assert rc == 0 and out.strip() == str(t.uid)
+
+
+@real
+def test_starting_an_agent_pins_the_setting(resume, sandbox):
+    t, project, _ = sandbox
+    assert ac.agent_resume(project, session_name="uid-p")["resumed"] is True
+    assert open(priv._pin_path()).read().strip() == t.name
+
+
+@real
+def test_a_pin_that_cannot_be_written_starts_nothing(resume, sandbox, monkeypatch):
+    _, project, _ = sandbox
+    def refuse(_t):
+        raise OSError("read-only")
+    monkeypatch.setattr(priv, "pin", refuse)
+    r = ac.agent_resume(project, session_name="uid-q")
+    assert r["refused"] == "agent_run_as:pin_failed" and _started(resume) == []
+
+
+@real
+def test_a_different_variable_refuses(sandbox, monkeypatch):
+    t, _, _ = sandbox
+    priv.pin(t)
+    monkeypatch.setenv("AGENT_RUN_AS", "daemon")
+    with pytest.raises(priv.AgentPrivilegeError, match="setting_mismatch"):
+        priv.target()
+
+
+@real
+@pytest.mark.parametrize("change", ["writable", "symlink", "empty"])
+def test_an_unsafe_pin_refuses(sandbox, monkeypatch, change, tmp_path):
+    t, _, secret = sandbox
+    priv.pin(t)
+    path = priv._pin_path()
+    if change == "writable":
+        os.chmod(path, 0o666)
+    elif change == "symlink":
+        os.remove(path)
+        os.symlink(secret, path)
+    else:
+        open(path, "w").close()
+    monkeypatch.delenv("AGENT_RUN_AS")
+    with pytest.raises(priv.AgentPrivilegeError, match="pin_unsafe"):
+        priv.target()
+    assert LocalHost().run(["id", "-u"])[0] == 126
+
+
+@real
+def test_a_pin_is_per_instance(sandbox, monkeypatch, tmp_path):
+    t, _, _ = sandbox
+    priv.pin(t)
+    monkeypatch.delenv("AGENT_RUN_AS")
+    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "other.db"))
+    assert priv.target() is None
 
 
 def test_root_work_is_unrestricted_when_unset(monkeypatch, tmp_path):
@@ -359,6 +451,52 @@ def test_send_refuses_a_root_pane(monkeypatch):
     assert [a[0] for a in typed] == ["display-message"]
 
 
+@pytest.fixture
+def root_pane(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_AS", "nobody")
+    sent = []
+
+    def fake(args, stdin=None):
+        sent.append(args[0])
+        return 0, "123\n", ""
+    monkeypatch.setattr(ac, "_tmux", fake)
+    monkeypatch.setattr(ac, "find_claude_in_pane", lambda pid: {"pid": pid + 1})
+    monkeypatch.setattr(priv, "target", lambda: priv.Target("nobody", 65534, 65534, "/h"))
+    monkeypatch.setattr(priv, "process_uid", lambda pid: 0)
+    return sent
+
+
+def test_a_root_shell_around_a_dropped_claude_is_refused(root_pane, monkeypatch):
+    monkeypatch.setattr(priv, "process_uid", lambda pid: {123: 0, 124: 65534}[pid])
+    assert ac._pane_run_as_problem("s:0.0") == "pane_uid_mismatch"
+
+
+def test_a_permission_prompt_is_not_approved_in_a_root_pane(root_pane):
+    with pytest.raises(ac.AgentControlError, match="pane_uid_mismatch"):
+        ac.approve_prompt("s:0.0")
+    assert "send-keys" not in root_pane
+
+
+def test_a_clear_is_not_submitted_in_a_root_pane(root_pane, monkeypatch):
+    monkeypatch.setattr(ac, "pending_input_text", lambda t: "/clear")
+    with pytest.raises(ac.AgentControlError, match="pane_uid_mismatch"):
+        ac.submit_clear("s:0.0")
+    assert "send-keys" not in root_pane
+
+
+def test_auto_mode_is_not_pressed_in_a_root_pane(root_pane):
+    r = ac.ensure_auto_mode("s:0.0", tail_fn=lambda: "shift+tab to cycle")
+    assert r["action"] == "error" and "pane_uid_mismatch" in r["error"]
+    assert "send-keys" not in root_pane
+
+
+def test_control_keys_are_not_sent_to_a_root_pane(root_pane, monkeypatch):
+    monkeypatch.setattr(ac, "_pane_is_live_agent", lambda t: {"target": t, "session": "s"})
+    monkeypatch.setattr(ac, "automation_refusal", lambda *a, **k: "")
+    r = ac.send_control_keys("s:0.0", ["Escape"])
+    assert r["sent"] is False and "send-keys" not in root_pane
+
+
 def test_send_refuses_a_pane_with_no_agent(monkeypatch):
     monkeypatch.setenv("AGENT_RUN_AS", "nobody")
     monkeypatch.setattr(ac, "_tmux", lambda args, stdin=None: (0, "123\n", ""))
@@ -377,7 +515,8 @@ def test_send_is_unchanged_when_unset(monkeypatch):
 def test_resume_does_not_reuse_a_root_agent(resume, sandbox, monkeypatch):
     _, project, _ = sandbox
     monkeypatch.setattr(ac, "find_live_agent_for_dir", lambda _d: {
-        "target": "old:0.0", "session": "old", "claude_pid": os.getpid(), "claude_cwd": project})
+        "target": "old:0.0", "session": "old", "pid": os.getpid(), "claude_pid": os.getpid(),
+        "claude_cwd": project})
     r = ac.agent_resume(project, session_name="uid-f")
     assert r["refused"] == "agent_run_as:pane_uid_mismatch" and _started(resume) == []
 
@@ -562,6 +701,36 @@ def test_report_read_refuses_a_fifo(sandbox, monkeypatch):
 def test_a_vanished_user_is_not_roots_home(monkeypatch):
     monkeypatch.setenv("AGENT_RUN_AS", "no-such-user-here")
     assert priv.claude_home() == "/nonexistent"
+
+
+@real
+def test_resume_does_not_reuse_a_dropped_claude_in_a_root_shell(resume, sandbox, monkeypatch):
+    t, project, _ = sandbox
+    monkeypatch.setattr(ac, "find_live_agent_for_dir", lambda _d: {
+        "target": "old:0.0", "session": "old", "pid": 1, "claude_pid": 2, "claude_cwd": project})
+    monkeypatch.setattr(priv, "process_uid", lambda pid: {1: 0, 2: t.uid}[pid])
+    r = ac.agent_resume(project, session_name="uid-g")
+    assert r["refused"] == "agent_run_as:pane_uid_mismatch"
+
+
+@real
+@pytest.mark.parametrize("entry", ["*", "{project}", "{parent}/*", "/opt/not-the-agents-{n}"])
+def test_preflight_reads_roots_git_trust(sandbox, monkeypatch, tmp_path, capsys, entry):
+    import importlib.util
+    t, project, _ = sandbox
+    spec = importlib.util.spec_from_file_location("agent_uid_preflight",
+                                                  ROOT / "tools" / "agent_uid_preflight.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    value = entry.format(project=project, parent=os.path.dirname(project), n=os.getpid())
+    cfg = tmp_path / "gitconfig"
+    cfg.write_text(f"[safe]\n\tdirectory = {value}\n")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(cfg))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    trusted = mod._root_trusts(t)
+    assert trusted == ([] if entry.startswith("/opt/") else [value])
+    mod.main([])
+    capsys.readouterr()
 
 
 def test_preflight_refuses_without_the_setting(monkeypatch, capsys):

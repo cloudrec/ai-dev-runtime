@@ -37,6 +37,8 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from core import agent_privilege
+
 from core.control_plane import cto
 from core.control_plane.api import _c
 from core.control_plane.store import now_iso
@@ -400,7 +402,7 @@ def _iter_reports(root: str) -> list:
 
 def _read(path: str) -> Optional[str]:
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with agent_privilege.open_regular(path, "r", encoding="utf-8", errors="replace") as fh:
             return fh.read()
     except OSError:
         return None

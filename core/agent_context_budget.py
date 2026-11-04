@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from core import agent_control as ac
+from core import agent_privilege
 
 # ── default tunables (overridable per project/model via cfg['context_budget']) ─
 _DEFAULTS = {
@@ -484,6 +485,8 @@ def write_handoff(root: str, content: str) -> Optional[str]:
     if not root or not os.path.isdir(root):
         return None
     path = os.path.join(root, HANDOFF_FILENAME)
+    if agent_privilege.run_as_name():
+        return path if agent_privilege.write_as_agent(path, content) else None
     try:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(content)

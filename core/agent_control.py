@@ -592,6 +592,7 @@ def approve_prompt(target: str) -> bool:
     keystroke to the named pane.
     """
     validate_target(target)
+    _require_pane_run_as(target, "approve_prompt")
     rc, _, err = _tmux(["send-keys", "-t", target, "1"])
     audit("approve_prompt", target, sent=(rc == 0))
     if rc != 0:
@@ -806,6 +807,7 @@ def submit_clear(target: str, idempotency_key: Optional[str] = None) -> bool:
     line is exactly a clear command — never submits an arbitrary queued
     instruction (defends against a race between check and submit)."""
     validate_target(target)
+    _require_pane_run_as(target, "submit_clear")
     pending = pending_input_text(target)
     if not re.match(r"^/(clear|compact)\s*$", pending):
         raise AgentControlError(
@@ -851,6 +853,11 @@ def ensure_auto_mode(target: str, tail_fn=None, max_cycles: int = 3) -> dict:
         return {"target": target, "mode": mode, "action": "none", "reason": "mode not visible"}
     presses = 0
     for _ in range(max_cycles):
+        problem = _pane_run_as_problem(target)
+        if problem:
+            audit("ensure_auto_mode", target, sent=False, refused=f"agent_run_as:{problem}")
+            return {"target": target, "mode": mode, "action": "error",
+                    "error": f"agent_run_as:{problem}"}
         rc, _out, err = _tmux(["send-keys", "-t", target, "BTab"])
         presses += 1
         if rc != 0:
@@ -2075,6 +2082,12 @@ def send_control_keys(target: str, keys: list, actor: Optional[str] = None,
               actor=actor, source=source)
         return {"sent": False, "rc": 1, "refused": refusal, "target": resolved}
     with _DELIVER_LOCK:
+        problem = _pane_run_as_problem(resolved)
+        if problem:
+            audit("control_keys", resolved, None, delivered=False,
+                  refused=f"agent_run_as:{problem}", actor=actor, source=source)
+            return {"sent": False, "rc": None, "target": resolved,
+                    "refused": f"agent_run_as:{problem}"}
         rc, _, err = _tmux(["send-keys", "-t", resolved, *keys])
     audit("control_keys", resolved, None, delivered=rc == 0, keys=list(keys), actor=actor,
           source=source)
@@ -2095,13 +2108,22 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
 
 
 def _pane_run_as_problem(target: str) -> Optional[str]:
-    """Under AGENT_RUN_AS nothing is typed into an agent running as anyone else."""
+    """Under AGENT_RUN_AS nothing is typed into a pane running as anyone else."""
     if not agent_privilege.run_as_name():
         return None
     rc, out, _ = _tmux(["display-message", "-p", "-t", target, "#{pane_pid}"])
     pid = out.strip()
-    claude = find_claude_in_pane(int(pid)) if rc == 0 and pid.isdigit() else None
-    return agent_privilege.pane_problem(claude["pid"] if claude else None)
+    if rc != 0 or not pid.isdigit():
+        return agent_privilege.pane_problem(None)
+    claude = find_claude_in_pane(int(pid))
+    return agent_privilege.pane_problem(int(pid), claude["pid"] if claude else None)
+
+
+def _require_pane_run_as(target: str, action: str) -> None:
+    problem = _pane_run_as_problem(target)
+    if problem:
+        audit(action, target, refused=f"agent_run_as:{problem}")
+        raise AgentControlError(f"refusing {action}: agent_run_as:{problem}")
 
 
 def _deliver_locked(target: str, text: str, action: str, idempotency_key: Optional[str],
@@ -2354,7 +2376,7 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
 
     existing = find_live_agent_for_dir(resolved)
     if existing and agent_privilege.run_as_name():
-        problem = agent_privilege.pane_problem(existing["claude_pid"])
+        problem = agent_privilege.pane_problem(existing["pid"], existing["claude_pid"])
         if problem:
             audit("agent_resume", existing["target"], resumed=False,
                   refused=f"agent_run_as:{problem}", actor=actor, cwd=resolved)
@@ -2470,6 +2492,15 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
                       actor=actor, cwd=resolved, auth_mode=aam.API)
                 return {"resumed": False, "refused": f"auth_mode:{why}",
                         "reason": "auth mode: not authorized", "duplicate_created": False,
+                        "agent_created": False}
+        if run_as:
+            try:
+                agent_privilege.pin(run_as)
+            except OSError:
+                audit("agent_resume", name, resumed=False, refused="agent_run_as:pin_failed",
+                      actor=actor, cwd=resolved)
+                return {"resumed": False, "refused": "agent_run_as:pin_failed",
+                        "reason": "agent uid: not authorized", "duplicate_created": False,
                         "agent_created": False}
         argv = ["new-session", "-d", "-s", name, "-c", resolved,
                 *(agent_privilege.pane_prefix(run_as) if run_as else []), *auth["argv"]]

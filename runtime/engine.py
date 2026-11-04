@@ -1,3 +1,4 @@
+from core import agent_privilege
 from core.parser import parse_command
 from core.planner import plan_task
 from core.executor import execute_plan
@@ -6,6 +7,7 @@ from runtime.context_builder import build_context
 
 class RuntimeEngine:
     def run(self, command: str, project_path: str):
+        agent_privilege.require_root_work(project_path)
         context = build_context(project_path)
 
         parsed = parse_command(command, context)

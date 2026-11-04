@@ -6,7 +6,12 @@ recovery, the full-cycle engine's git, checks and file access, and job steps. Th
 must keep different uids: an agent sharing the runtime's uid could rewrite the client tokens
 file and read the owner key, so a non-root runtime is refused here, not supported.
 
-A problem with the setting refuses the start. It never falls back to root.
+A problem with the setting refuses the start. It never falls back to root. Tooling that
+stays root refuses to run at all under the setting: see require_root_work.
+
+The setting is pinned beside the agent DB when the first dropped agent starts, so a worker,
+companion or recovery process of the same instance that lacks the variable still obeys it.
+The pin is per instance, not host-wide: another runtime on this host is not affected.
 
 setpriv clears supplementary groups, so membership of `docker` does not survive, and sets
 no_new_privs, so sudo and su cannot climb back. The environment is rebuilt, not filtered: a
@@ -41,8 +46,45 @@ class Target:
     home: str
 
 
+def _pin_path() -> str:
+    db = os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+    return db + ".run_as"
+
+
+def _pinned() -> str:
+    """The pinned name, "" when there is none, or a !reason that target() refuses."""
+    try:
+        st = os.lstat(_pin_path())
+    except OSError:
+        return ""
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o022):
+        return "!pin_unsafe"
+    try:
+        with open(_pin_path(), encoding="ascii") as fh:
+            return fh.read(64).strip() or "!pin_unsafe"
+    except (OSError, ValueError):
+        return "!pin_unsafe"
+
+
 def run_as_name() -> str:
-    return os.getenv("AGENT_RUN_AS", "").strip()
+    """Truthy whenever the setting is in force or broken. Never raises: status paths use it."""
+    env, pin = os.getenv("AGENT_RUN_AS", "").strip(), _pinned()
+    if pin.startswith("!"):
+        return pin
+    if env and pin and env != pin:
+        return "!setting_mismatch"
+    return env or pin
+
+
+def pin(t: Target) -> None:
+    """Called before the first dropped agent starts. Raises OSError if it cannot be written."""
+    if _pinned() == t.name:
+        return
+    tmp = _pin_path() + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as fh:
+        fh.write(t.name + "\n")
+    os.replace(tmp, _pin_path())
 
 
 def _lookup(name: str) -> Target:
@@ -58,6 +100,8 @@ def target() -> Optional[Target]:
     name = run_as_name()
     if not name:
         return None
+    if name.startswith("!"):
+        raise AgentPrivilegeError(name[1:])
     if not _NAME_RE.match(name):
         raise AgentPrivilegeError("bad_user_name")
     t = _lookup(name)
@@ -109,40 +153,15 @@ def can_use_dir(t: Target, path: str) -> bool:
         return False
 
 
-def _writable(t: Target, path: str) -> bool:
-    argv = host_argv(t, ["test", "-w", path])
-    try:
-        return subprocess.run(argv, env=child_env(t), cwd="/", capture_output=True,
-                              timeout=_PROBE_TIMEOUT).returncode == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return True                       # unknown counts as writable
-
-
-def _agent_can_change(t: Target, path: str) -> bool:
-    """The tree, its .git, or a parent the agent could swap it out of. A sticky directory
-    such as /tmp protects what root put in it."""
-    real = os.path.realpath(path)
-    if _writable(t, real) or _writable(t, os.path.join(real, ".git")):
-        return True
-    parent = os.path.dirname(real)
-    while parent != "/":
-        try:
-            sticky = bool(os.stat(parent).st_mode & stat.S_ISVTX)
-        except OSError:
-            return True
-        if not sticky and _writable(t, parent):
-            return True
-        parent = os.path.dirname(parent)
-    return False
-
-
 def require_root_work(path: str) -> None:
-    """For tooling that stays root (job queue, deliver, release, validator). They run git,
-    pytest and file walks in `path`, so a tree the agent can change would hand it root
-    through a hook, a conftest.py or a symlink. Raises under AGENT_RUN_AS."""
-    t = target()
-    if t and _agent_can_change(t, path):
-        raise AgentPrivilegeError("agent_writable_tree")
+    """For tooling that stays root: the job queue, deliver, release, validator and /run.
+    They run git, pytest and file walks, and no check of a tree holds: ownership, a `.git`
+    file pointing elsewhere, one writable subdirectory, a symlink swapped after the check.
+    Two audits broke each narrower rule. So with AGENT_RUN_AS in force they do not run at
+    all, and an instance with agents under their own uid works through the full-cycle
+    engine only, which runs as the agent. Raises; silent when the setting is off."""
+    if target():
+        raise AgentPrivilegeError("root_tooling_disabled")
 
 
 def process_uid(pid: int) -> Optional[int]:
@@ -156,16 +175,27 @@ def process_uid(pid: int) -> Optional[int]:
     return None
 
 
-def pane_problem(pid: Optional[int]) -> Optional[str]:
-    """Is the agent in this pane really the target? A pane started before the setting, by
-    hand, or by a process without it would otherwise be driven as root."""
+def pane_problem(*pids: Optional[int]) -> Optional[str]:
+    """Do the pane's process and its agent all run as the target? A pane started before the
+    setting or by hand would otherwise be driven as root, and a root shell around a dropped
+    claude would receive the typed text once claude exits."""
     try:
         t = target()
     except AgentPrivilegeError as e:
         return str(e)
-    if not t or process_uid(pid) == t.uid:
+    if not t or (pids and all(process_uid(p) == t.uid for p in pids)):
         return None
     return "pane_uid_mismatch"
+
+
+def write_as_agent(path: str, content: str) -> bool:
+    """For a file in the agent's tree. As root a planted symlink would pick the target."""
+    from core.fullcycle.hosts import HostError, LocalHost
+    try:
+        LocalHost().write_file(path, content)
+    except HostError:
+        return False
+    return True
 
 
 def open_regular(path: str, *args, **kwargs):
@@ -188,13 +218,13 @@ def open_regular(path: str, *args, **kwargs):
 
 def claude_home() -> str:
     """Whose ~/.claude holds the transcripts. Never raises: it is on the status path."""
-    name = run_as_name()
-    if not name:
+    if not run_as_name():
         return "/root"
     try:
-        return _lookup(name).home
+        t = target()
     except AgentPrivilegeError:
-        return "/nonexistent"             # not root's transcripts: nothing is better
+        t = None
+    return t.home if t else "/nonexistent"     # not root's transcripts: nothing is better
 
 
 def transcripts(cwd: str) -> list:

@@ -41,6 +41,8 @@ import time
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from core import agent_privilege
+
 ENABLED = os.getenv("CONTEXT_BUDGET_ENABLED", "1") not in ("0", "false", "no", "")
 INTERVAL = int(os.getenv("CONTEXT_BUDGET_INTERVAL_SECS", "120"))
 _EST_BYTES_PER_TOKEN = 4
@@ -226,7 +228,7 @@ def verify_checkpoint(path: str) -> dict:
     """Re-read the checkpoint and verify it is COMPLETE and READABLE: every required
     section present, HEAD and NEXT COMMAND non-empty. Rotation must refuse on failure."""
     try:
-        with open(path) as fh:
+        with agent_privilege.open_regular(path) as fh:
             text = fh.read()
     except OSError as e:
         return {"ok": False, "reason": f"unreadable:{e}"}
@@ -281,6 +283,9 @@ def write_project_checkpoint_copy(root: str, content: str) -> Optional[str]:
         if not root or not os.path.isdir(root):
             return None
         p = os.path.join(root, "CONTEXT_CHECKPOINT.md")
+        if agent_privilege.run_as_name():
+            ok = agent_privilege.write_as_agent(p, content) and verify_checkpoint(p).get("ok")
+            return p if ok else None
         tmp = p + ".tmp"
         with open(tmp, "w") as fh:
             fh.write(content)
