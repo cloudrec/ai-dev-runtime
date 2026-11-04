@@ -1935,9 +1935,10 @@ def sign_owner_proof(key: bytes, action: str, target: str, text: str,
     return {"ts": ts, "nonce": nonce, "sig": sig}
 
 
-def verify_owner_proof(proof: Optional[dict], action: str, target: str, text: str,
-                       now: Optional[float] = None) -> str:
-    """"" when the proof authorises exactly this command (and consumes it), else why not."""
+def check_owner_proof(proof: Optional[dict], action: str, target: str, text: str,
+                      now: Optional[float] = None) -> str:
+    """"" when the proof is genuine, fresh and bound to exactly this command, else why not.
+    Consumes nothing: spending the nonce is the caller's next step."""
     import hmac as _hmac
     if not isinstance(proof, dict):
         return "owner_proof_malformed"
@@ -1959,6 +1960,16 @@ def verify_owner_proof(proof: Optional[dict], action: str, target: str, text: st
                      hashlib.sha256).hexdigest()
     if not _hmac.compare_digest(want, sig):
         return "owner_proof_bad_signature"
+    return ""
+
+
+def verify_owner_proof(proof: Optional[dict], action: str, target: str, text: str,
+                       now: Optional[float] = None) -> str:
+    """"" when the proof authorises exactly this command (and consumes it), else why not."""
+    why = check_owner_proof(proof, action, target, text, now=now)
+    if why:
+        return why
+    nonce = str(proof.get("nonce"))
     conn = _db()
     try:
         conn.execute("CREATE TABLE IF NOT EXISTS owner_proof_used (nonce TEXT PRIMARY KEY, "
@@ -2307,12 +2318,17 @@ def _session_liveness(name: str) -> dict:
 def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
                  session_name: Optional[str] = None, actor: Optional[str] = None,
                  owner_proof: Optional[dict] = None, auth_mode: Optional[str] = None,
-                 model: Optional[str] = None, risk: Optional[str] = None) -> dict:
+                 model: Optional[str] = None, risk: Optional[str] = None,
+                 api_proof: Optional[dict] = None) -> dict:
     """Resume a Claude agent — but only when no matching live one exists.
 
     Returns `duplicate_created: False` in every path: either an existing agent
     was found and returned untouched, or exactly one new session was created
     after proving none existed.
+
+    `owner_proof` is for the creation gate. `api_proof` is the separate owner proof that
+    auth_mode="api" needs (agent_auth_mode.api_launch_text): money and scope are different
+    decisions, and neither proof answers for the other.
     """
     resolved = validate_project_dir(project_dir)
     if conversation_id and not _CONVERSATION_RE.match(str(conversation_id)):
@@ -2351,6 +2367,7 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
         # nothing — it never falls back to the other mode.
         from core import agent_auth_mode as aam
         auth = aam.resolve(name, resolved, requested=auth_mode, model=model, risk=risk,
+                           conversation_id=conversation_id, owner_proof=api_proof,
                            live_sessions=lambda: {a.get("session") for a in
                                                   agent_list().get("agents", [])
                                                   if a.get("alive")})
@@ -2387,8 +2404,16 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
 
         if auth["mode"] == aam.API:
             # counted BEFORE the start: a launch that then fails still counts (caps err low)
-            aam.record_launch(session=name, project_dir=resolved, mode=aam.API,
-                              model=auth["model"], risk=risk or "", actor=actor or "")
+            # and its proof stays spent. Proof and count commit together.
+            why = aam.commit_api_launch(session=name, project_dir=resolved,
+                                        model=auth["model"], risk=risk or "",
+                                        actor=actor or "", proof=api_proof)
+            if why:
+                audit("agent_resume", name, resumed=False, refused=f"auth_mode:{why}",
+                      actor=actor, cwd=resolved, auth_mode=aam.API)
+                return {"resumed": False, "refused": f"auth_mode:{why}",
+                        "reason": "auth mode: not authorized", "duplicate_created": False,
+                        "agent_created": False}
         argv = ["new-session", "-d", "-s", name, "-c", resolved, *auth["argv"]]
         if conversation_id:
             argv += ["--resume", str(conversation_id)]

@@ -59,6 +59,13 @@ def no_secret_reads(monkeypatch):
 
 
 def _create(wt, **kw):
+    if kw.get("auth_mode") == "api":        # the F3 owner proof; refused without one
+        launcher = str(aam.load_config().get("launcher") or aam.DEFAULT_LAUNCHER)
+        kw["api_proof"] = ac.sign_owner_proof(KEY, aam.API_PROOF_ACTION, "gaika-kz",
+                                              aam.api_launch_text(
+                                                  "gaika-kz", wt["kz"],
+                                                  kw.get("model") or aam.DEFAULT_MODEL,
+                                                  kw.get("risk"), None, launcher))
     return ac.agent_resume(wt["kz"], session_name="gaika-kz", actor="api:hmac/chatgpt", **kw)
 
 

@@ -15,9 +15,13 @@ Rules (all fail closed):
   * API mode needs ALL of: an explicit per-launch request (`auth_mode="api"`), the master
     switch `enabled: true` in config/agent_auth_modes.yaml, an entry for exactly this
     session name AND project dir, a safe launcher file (root-owned, not group/other
-    writable, executable), and the spend guardrails (live API agents and API launches per
-    24 h under their caps, both counted from the launch ledger; an unknown population
-    refuses);
+    writable, executable), the spend guardrails (live API agents and API launches per
+    24 h under their caps; an unknown population refuses), and a verified owner proof:
+    signed with the owner key, single use, short-lived, bound to this session, directory,
+    model, risk, conversation and launcher. No actor name, config edit or agent text can
+    stand in for it. The proof is spent and the launch counted in one transaction, in an
+    append-only, hash-chained table (agent_auth_api_chain), so deleting ledger rows
+    resets nothing and a damaged chain refuses every API launch;
   * model: Sonnet by default; Opus only when the launch says `risk="high"` AND the
     agent's entry allows Opus for high-risk work; anything else is refused;
   * session recovery never starts API mode: a recorded API session is not revived
@@ -26,10 +30,15 @@ Rules (all fail closed):
 
 Not enforceable here (stated, not hidden): a dollar cap per interactive session — the
 Claude CLI caps spend only in print mode. The hard money ceiling must be the API
-workspace's own spend limit (owner, Anthropic console).
+workspace's own spend limit (owner, Anthropic console). And agents run as root on this
+host: one that reads the owner key file, or rebuilds the chain after dropping its
+triggers, gets past these checks. They stop mistakes and text-level spoofing, not a
+hostile root process.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import sqlite3
@@ -42,6 +51,7 @@ MODES = (SUBSCRIPTION, API)
 DEFAULT_MODEL = "sonnet"
 HIGH_RISK_MODEL = "opus"
 DEFAULT_LAUNCHER = "/usr/local/bin/claude-owner-api"
+API_PROOF_ACTION = "agent_launch_api"
 
 # credential variables a subscription session must never inherit
 # (F7: also the switches that re-route the CLI to another billing path or another host)
@@ -139,6 +149,110 @@ def _ledger(conn=None):
     return c
 
 
+_CHAIN_TRIGGERS = {
+    "agent_auth_api_chain_no_update": "UPDATE",
+    "agent_auth_api_chain_no_delete": "DELETE"}
+
+
+def _chain(c):
+    """The append-only API launch chain. Created once, table and triggers together, and
+    never repaired afterwards: a dropped trigger must stay visible to _chain_problem."""
+    if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND"
+                 " name='agent_auth_api_chain'").fetchone():
+        return c
+    if c.in_transaction:
+        c.commit()
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        c.execute("""CREATE TABLE IF NOT EXISTS agent_auth_api_chain (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, session TEXT NOT NULL,
+            project_dir TEXT NOT NULL, model TEXT NOT NULL, risk TEXT NOT NULL,
+            actor TEXT NOT NULL, nonce TEXT NOT NULL UNIQUE, prev_hash TEXT NOT NULL,
+            hash TEXT NOT NULL)""")
+        for name, verb in _CHAIN_TRIGGERS.items():
+            c.execute(f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {verb} ON"
+                      " agent_auth_api_chain BEGIN SELECT RAISE(ABORT,"
+                      " 'agent_auth_api_chain is append-only'); END")
+        c.execute("CREATE TABLE IF NOT EXISTS owner_proof_used (nonce TEXT PRIMARY KEY, "
+                  "action TEXT, target TEXT, used_at TEXT)")
+        c.commit()
+    except BaseException:
+        c.rollback()
+        raise
+    return c
+
+
+def _chain_hash(prev: str, row: dict) -> str:
+    return hashlib.sha256((prev + "|" + json.dumps(row, sort_keys=True)).encode()).hexdigest()
+
+
+def _chain_problem(c) -> Optional[str]:
+    """Why the chain cannot be trusted, or None: refuse rather than count from bad data."""
+    have = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND"
+                                    " tbl_name='agent_auth_api_chain'")}
+    if not set(_CHAIN_TRIGGERS) <= have:
+        return "api_ledger_tampered"
+    prev, rows = "", 0
+    for ts, session, project_dir, model, risk, actor, nonce, row_prev, row_hash in c.execute(
+            "SELECT ts, session, project_dir, model, risk, actor, nonce, prev_hash, hash FROM"
+            " agent_auth_api_chain ORDER BY seq"):
+        row = {"ts": ts, "session": session, "project_dir": project_dir, "model": model,
+               "risk": risk, "actor": actor, "nonce": nonce}
+        if row_prev != prev or row_hash != _chain_hash(prev, row):
+            return "api_ledger_tampered"
+        prev, rows = row_hash, rows + 1
+    spent = c.execute("SELECT COUNT(*) FROM owner_proof_used WHERE action=?",
+                      (API_PROOF_ACTION,)).fetchone()[0]
+    return "api_ledger_tampered" if spent > rows else None      # a dropped or emptied chain
+
+
+def commit_api_launch(*, session: str, project_dir: str, model: str, risk: str = "",
+                      actor: str = "", proof: Optional[dict] = None, conn=None,
+                      now: Optional[float] = None) -> str:
+    """Spend the owner proof and count the launch, one transaction. "" or why refused. The
+    caller holds the creation guard and starts the session only on ""."""
+    nonce = str((proof or {}).get("nonce") or "")
+    if not nonce:
+        return "api_owner_proof_required"
+    c = _chain(_ledger(conn))
+    ts = now if now is not None else time.time()
+    try:
+        if c.in_transaction:
+            c.commit()
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            problem = _chain_problem(c)
+            if problem:
+                c.rollback()
+                return problem
+            r = c.execute("SELECT hash FROM agent_auth_api_chain ORDER BY seq DESC LIMIT 1"
+                          ).fetchone()
+            prev = r[0] if r else ""
+            row = {"ts": ts, "session": session, "project_dir": project_dir, "model": model,
+                   "risk": risk or "", "actor": actor or "", "nonce": nonce}
+            c.execute("INSERT INTO agent_auth_api_chain (ts, session, project_dir, model, risk,"
+                      " actor, nonce, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?,?)",
+                      (ts, session, project_dir, model, row["risk"], row["actor"], nonce, prev,
+                       _chain_hash(prev, row)))
+            c.execute("INSERT INTO owner_proof_used VALUES (?,?,?,?)",
+                      (nonce, API_PROOF_ACTION, session,
+                       time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))))
+            c.execute("INSERT INTO agent_auth_launch (ts, session, project_dir, mode, model,"
+                      " risk, actor) VALUES (?,?,?,?,?,?,?)",
+                      (ts, session, project_dir, API, model, row["risk"], row["actor"]))
+            c.commit()
+        except sqlite3.IntegrityError:
+            c.rollback()
+            return "owner_proof_replayed"
+        except BaseException:
+            c.rollback()
+            raise
+        return ""
+    finally:
+        if conn is None:
+            c.close()
+
+
 def record_launch(*, session: str, project_dir: str, mode: str, model: str = "",
                   risk: str = "", actor: str = "", conn=None,
                   now: Optional[float] = None) -> None:
@@ -166,16 +280,24 @@ def last_mode(session: str, conn=None) -> Optional[str]:
 
 
 def _api_usage(live_sessions: set, conn=None, now: Optional[float] = None) -> dict:
-    c = _ledger(conn)
+    """Counted from the append-only chain. agent_auth_launch can only raise a count: losing
+    its rows resets nothing, and it still says when a session later moved to subscription."""
+    c = _chain(_ledger(conn))
     try:
         now = now if now is not None else time.time()
-        day = c.execute("SELECT COUNT(*) FROM agent_auth_launch WHERE mode=? AND ts>?",
-                        (API, now - 86400)).fetchone()[0]
+        day = max(c.execute("SELECT COUNT(*) FROM agent_auth_launch WHERE mode=? AND ts>?",
+                            (API, now - 86400)).fetchone()[0],
+                  c.execute("SELECT COUNT(*) FROM agent_auth_api_chain WHERE ts>?",
+                            (now - 86400,)).fetchone()[0])
         latest: dict = {}
-        for session, mode in c.execute("SELECT session, mode FROM agent_auth_launch"
-                                       " ORDER BY id"):
-            latest[session] = mode
-        live = sorted(s for s, m in latest.items() if m == API and s in live_sessions)
+        for session, mode, ts in c.execute("SELECT session, mode, ts FROM agent_auth_launch"
+                                           " ORDER BY id"):
+            latest[session] = (mode, ts)
+        for session, ts in c.execute("SELECT session, MAX(ts) FROM agent_auth_api_chain"
+                                     " GROUP BY session"):
+            if session not in latest or latest[session][1] < ts:
+                latest[session] = (API, ts)
+        live = sorted(s for s, (m, _) in latest.items() if m == API and s in live_sessions)
         return {"launches_24h": day, "live_api_sessions": live}
     finally:
         if conn is None:
@@ -192,11 +314,48 @@ def _int(v, default: int) -> int:
 _MODEL_RE = re.compile(r"^[a-z0-9.\-]{1,40}$")
 
 
+def api_launch_text(session: str, project_dir: str, model: str, risk: Optional[str] = None,
+                    conversation_id: Optional[str] = None,
+                    launcher: str = DEFAULT_LAUNCHER) -> str:
+    """The exact launch an owner proof authorises. Sign and verify the same bytes."""
+    return json.dumps({"session": session, "project_dir": os.path.realpath(project_dir),
+                       "model": model, "risk": risk or "",
+                       "conversation_id": conversation_id or "", "launcher": launcher},
+                      sort_keys=True)
+
+
+def _api_proof_problem(proof, session: str, project_dir: str, model: str, risk, conversation_id,
+                       launcher: str, conn, now, verify_proof) -> Optional[str]:
+    """Why this proof cannot authorise this launch, or None. Spends nothing."""
+    if not isinstance(proof, dict):       # never a string, an actor name or agent text
+        return "api_owner_proof_required"
+    if verify_proof is None:
+        from core import agent_control as ac
+        verify_proof = ac.check_owner_proof
+    why = verify_proof(proof, API_PROOF_ACTION, session,
+                       api_launch_text(session, project_dir, model, risk, conversation_id,
+                                       launcher), now=now)
+    if why:
+        return why
+    c = _chain(_ledger(conn))
+    try:
+        nonce = str(proof.get("nonce"))
+        if c.execute("SELECT 1 FROM owner_proof_used WHERE nonce=? UNION SELECT 1 FROM"
+                     " agent_auth_api_chain WHERE nonce=?", (nonce, nonce)).fetchone():
+            return "owner_proof_replayed"
+    finally:
+        if conn is None:
+            c.close()
+    return None
+
+
 def resolve(session: str, project_dir: str, *, requested: Optional[str] = None,
             model: Optional[str] = None, risk: Optional[str] = None,
             live_sessions: Optional[Callable[[], set]] = None,
             config: Optional[dict] = None, conn=None,
-            now: Optional[float] = None) -> dict:
+            now: Optional[float] = None, conversation_id: Optional[str] = None,
+            owner_proof: Optional[dict] = None,
+            verify_proof: Optional[Callable] = None) -> dict:
     """Decide how a NEW session starts. Returns
     {"ok", "mode", "model", "argv" (the program + args for tmux), "reason", ...}.
     `ok=False` means: start nothing (never "start it on subscription instead")."""
@@ -245,11 +404,23 @@ def resolve(session: str, project_dir: str, *, requested: Optional[str] = None,
         live = set(live_sessions())
     except Exception:  # noqa: BLE001 — unknown population: refuse
         return {"ok": False, "reason": "live_population_unknown"}
+    c = _chain(_ledger(conn))
+    try:
+        tampered = _chain_problem(c)
+    finally:
+        if conn is None:
+            c.close()
+    if tampered:
+        return {"ok": False, "reason": tampered}
     usage = _api_usage(live, conn=conn, now=now)
     if len(usage["live_api_sessions"]) >= max_live:
         return {"ok": False, "reason": "api_live_agent_cap_reached", **usage}
     if usage["launches_24h"] >= max_day:
         return {"ok": False, "reason": "api_daily_launch_cap_reached", **usage}
+    why = _api_proof_problem(owner_proof, session, project_dir, use, risk, conversation_id,
+                             launcher, conn, now, verify_proof)
+    if why:
+        return {"ok": False, "reason": why, **usage}
     return {"ok": True, "mode": API, "model": use, "argv": [launcher, "--model", use],
             "reason": "explicit_api_opt_in", **usage}
 

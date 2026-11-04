@@ -1,7 +1,8 @@
 # Per-agent auth mode for NEW Claude sessions (core/agent_auth_mode.py).
 # Default for every session: subscription (API credential variables stripped from its env).
 # API credits are used ONLY for a launch that explicitly asks for auth_mode=api AND whose
-# session is listed below with its project dir, while `enabled` is true and the caps hold.
+# session is listed below with its project dir, while `enabled` is true and the caps hold,
+# and that launch carries a single-use owner proof (tools/owner_proof.py sign-api-launch).
 # Nothing switches automatically. The launcher reads the key itself; never put secrets here.
 # Changing this file authorizes spending money: owner decision, audited like any config.
 enabled: false

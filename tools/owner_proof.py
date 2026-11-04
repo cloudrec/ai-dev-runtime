@@ -8,6 +8,7 @@ must not be able to read the key. Prints the proof JSON only; the key is never p
   tools/owner_proof.py sign --action agent_send --target vtb:0.0 --text-file msg.txt
   printf 'status?' | tools/owner_proof.py sign --action agent_send --target vtb:0.0
   tools/owner_proof.py sign --action agent_stop --target T --text-file /dev/null
+  tools/owner_proof.py sign-api-launch --session S --dir /abs/worktree [--model opus --risk high]
 
 Send the command with header `X-Owner-Proof: <printed JSON>` (or `owner_proof=` in
 process). The proof binds action, target, the exact text (sha256), a timestamp (valid
@@ -35,6 +36,12 @@ def main(argv=None, stdin=None) -> int:
                    choices=("agent_send", "agent_answer", "control_keys", "agent_stop"))
     s.add_argument("--target", required=True)
     s.add_argument("--text-file")
+    api = sub.add_parser("sign-api-launch", help="authorise ONE API-credit launch (spends money)")
+    api.add_argument("--session", required=True)
+    api.add_argument("--dir", required=True)
+    api.add_argument("--model", default="sonnet")
+    api.add_argument("--risk", choices=("normal", "high"), default=None)
+    api.add_argument("--conversation", default=None)
     a = ap.parse_args(argv)
     path = ac._owner_key_path()
     if a.cmd == "init-key":
@@ -51,6 +58,13 @@ def main(argv=None, stdin=None) -> int:
     if key is None:
         print(json.dumps({"ok": False, "reason": "owner key missing or not root-only 0600"}))
         return 1
+    if a.cmd == "sign-api-launch":
+        from core import agent_auth_mode as aam
+        launcher = str(aam.load_config().get("launcher") or aam.DEFAULT_LAUNCHER)
+        print(json.dumps(ac.sign_owner_proof(
+            key, aam.API_PROOF_ACTION, a.session,
+            aam.api_launch_text(a.session, a.dir, a.model, a.risk, a.conversation, launcher))))
+        return 0
     if a.text_file:
         with open(a.text_file, encoding="utf-8") as fh:
             text = fh.read()
