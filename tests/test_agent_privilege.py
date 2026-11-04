@@ -84,7 +84,7 @@ def test_a_group_zero_target_is_refused(monkeypatch):
 def test_missing_setpriv_refuses(monkeypatch):
     monkeypatch.setenv("AGENT_RUN_AS", "nobody")
     monkeypatch.setattr(priv.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(priv.shutil, "which", lambda _: None)
+    monkeypatch.setattr(priv.shutil, "which", lambda *a, **k: None)
     with pytest.raises(priv.AgentPrivilegeError, match="setpriv_missing"):
         priv.target()
 
@@ -148,8 +148,9 @@ def test_resume_wraps_the_pane(resume, sandbox):
     r = ac.agent_resume(project, session_name="uid-a")
     assert r["resumed"] is True, r
     argv = _started(resume)[0]
-    assert argv[argv.index("setpriv"):][:8] == [*priv._setpriv(t), "--reset-env"]
-    assert argv.index("setpriv") < argv.index("claude")
+    start = argv.index(priv._setpriv_bin())
+    assert argv[start:][:8] == [*priv._setpriv(t), "--reset-env"]
+    assert start < argv.index("claude")
 
 
 def test_resume_refuses_a_bad_setting_before_tmux(resume, monkeypatch, tmp_path):
@@ -196,7 +197,7 @@ def test_resume_reads_the_agents_settings(resume, sandbox, monkeypatch):
 @real
 def test_recovery_wraps_the_shape(sandbox):
     r = aam.recovery_command("s-ok", "claude --continue")
-    assert r["ok"] and r["cmd"].startswith("setpriv ")
+    assert r["ok"] and r["cmd"].startswith(priv._setpriv_bin() + " ")
     assert "--reset-env" in r["cmd"] and r["cmd"].endswith("claude --continue")
 
 
@@ -522,6 +523,22 @@ def test_resume_does_not_reuse_a_root_agent(resume, sandbox, monkeypatch):
 
 
 # ── real processes ──────────────────────────────────────────────────────────
+@real
+def test_a_setpriv_in_the_agents_home_is_never_run(sandbox):
+    t, project, _ = sandbox
+    marker = os.path.join(project, "planted-ran")
+    planted = os.path.join(t.home, ".local", "bin", "setpriv")
+    with open(planted, "w") as fh:
+        fh.write(f'#!/bin/sh\ntouch "{marker}"\n')
+    os.chmod(planted, 0o755)
+    assert os.path.isabs(priv._setpriv(t)[0])
+    assert priv._setpriv_bin().startswith(("/usr/bin/", "/bin/"))
+    LocalHost().run(["true"])
+    priv.can_use_dir(t, project)
+    job_executor._run_step(project, "true")
+    assert not os.path.exists(marker)
+
+
 @real
 def test_a_check_runs_as_the_agent_with_a_clean_env(sandbox, monkeypatch):
     t, project, secret = sandbox

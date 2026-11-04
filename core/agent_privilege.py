@@ -109,13 +109,19 @@ def target() -> Optional[Target]:
         raise AgentPrivilegeError("target_is_root")
     if os.geteuid() != 0:
         raise AgentPrivilegeError("runtime_not_root")
-    if not shutil.which("setpriv"):
+    if not _setpriv_bin():
         raise AgentPrivilegeError("setpriv_missing")
     return t
 
 
+def _setpriv_bin() -> Optional[str]:
+    """Always a root-owned system path. subprocess resolves argv[0] through the PATH of the
+    env it is given, and child_env's PATH starts in the agent's home."""
+    return shutil.which("setpriv", path="/usr/bin:/bin")
+
+
 def _setpriv(t: Target) -> list:
-    return ["setpriv", f"--reuid={t.uid}", f"--regid={t.gid}", "--clear-groups",
+    return [_setpriv_bin(), f"--reuid={t.uid}", f"--regid={t.gid}", "--clear-groups",
             "--no-new-privs", "--inh-caps=-all", "--bounding-set=-all"]
 
 
