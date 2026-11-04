@@ -56,12 +56,20 @@ def isolation(monkeypatch):
     opened, real = [], sqlite3.connect
 
     def recording(database, *a, **k):
-        opened.append(str(database))
+        # F6: PREVENTIVE — refuse before the real connect, so a live DB is never opened
+        # (a post-hoc assertion would fire after the write had already happened).
+        name = os.fspath(database) if not isinstance(database, (bytes, int)) else str(database)
+        if name.startswith("file:"):
+            name = name[5:].split("?", 1)[0]
+        opened.append(name)
+        if name != ":memory:" and name and (
+                os.path.realpath(name) + os.sep).startswith(LIVE_DIR + os.sep):
+            raise AssertionError(f"offline acceptance must never open a live DB: {name}")
         return real(database, *a, **k)
     monkeypatch.setattr(sqlite3, "connect", recording)
     yield opened
     live = [p for p in opened if p != ":memory:" and
-            os.path.realpath(p).startswith(LIVE_DIR + os.sep)]
+            (os.path.realpath(p) + os.sep).startswith(LIVE_DIR + os.sep)]
     assert live == [], live
 
 
@@ -278,3 +286,26 @@ def test_F_api_credit_mode_is_off_by_default():
     assert sub["mode"] == "subscription" and sub["argv"][-1] == "claude"
     for v in aam.API_ENV_VARS:
         assert v in sub["argv"]                                        # stripped, not passed
+
+
+def test_G_isolation_guard_refuses_before_connecting(isolation):
+    import sqlite3
+    for bad in (LIVE_DIR + "/no_such_dir/x.db", "file:" + LIVE_DIR + "/no_such_dir/y.db?mode=rw"):
+        with pytest.raises(AssertionError, match="never open a live DB"):
+            sqlite3.connect(bad, uri=bad.startswith("file:"))
+    isolation.clear()                       # the attempts above were the point of this test
+
+
+def test_H_credential_strip_is_proven_on_a_spawned_process(tmp_path, monkeypatch):
+    """The autouse fixture clears the credential variables, so asserting 'none in events'
+    alone is vacuous. Set sentinels and prove a real subscription spawn drops them."""
+    import stat
+    import subprocess
+    fake = tmp_path / "claude"
+    fake.write_text("#!/bin/sh\nenv | grep -c -E '^(ANTHROPIC_|CLAUDE_CODE_USE_|AWS_BEARER)' || true\n")
+    fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+    for v in aam.API_ENV_VARS:
+        monkeypatch.setenv(v, "sentinel")
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    out = subprocess.run(aam.subscription_argv(), capture_output=True, text=True).stdout
+    assert out.strip() == "0", out
