@@ -62,34 +62,39 @@ class ExecutionHost(ABC):
 _EXEC_WRAPPERS = {"env": ("-u", "-C", "--unset", "--chdir"), "nohup": (), "setsid": (),
                   "timeout": ("-k", "-s", "--kill-after", "--signal"), "nice": ("-n",),
                   "xargs": ("-I", "-L", "-P", "-d", "-n", "-s"), "sudo": ("-u", "-g"),
-                  "command": (), "exec": (), "time": ()}
+                  "command": (), "builtin": (), "exec": ("-a",), "time": ()}
 _SHELLS = {"sh", "bash", "dash", "zsh"}
-_SHELL_KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "{", "!"}
+_SHELL_VALUE_OPTS = ("-o", "+o", "-O", "+O", "--rcfile", "--init-file")
+_SHELL_KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "{", "!", "coproc"}
 _ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _DURATION = re.compile(r"[0-9.]+[smhd]?\Z")
 _CLAUDE_WORD = re.compile(r"(?:^|[\s/;&|(=])claude(?:[\s;&|)]|$)")
 
 
-def _after_wrapper(exe: str, words: list) -> list:
-    """The command an exec wrapper runs: its options, assignments and numbers skipped."""
+def _after_wrapper(exe: str, words: list, i: int) -> int:
+    """Index of the command an exec wrapper runs: options, assignments and numbers skipped.
+    `command -v` only looks a name up, so it runs nothing."""
     takes_value = _EXEC_WRAPPERS[exe]
-    while words:
-        w = words[0]
+    while i < len(words):
+        w = words[i]
         if w == "--":
-            return words[1:]
+            return i + 1
+        if exe == "command" and w in ("-v", "-V"):
+            return len(words)
         if w in takes_value:
-            words = words[2:]
+            i += 2
         elif w.startswith("-") or _ASSIGNMENT.match(w) or _DURATION.match(w):
-            words = words[1:]
+            i += 1
         else:
             break
-    return words
+    return i
 
 
 def _script_runs_claude(script: str) -> bool:
     """Whether a shell string has `claude` in command position. Quoting is honoured, so a
     word inside an argument stays data; a string that cannot be parsed is read loosely."""
-    lex = shlex.shlex(script.replace("\n", ";"), posix=True, punctuation_chars=True)
+    lex = shlex.shlex(script.translate({ord("\n"): ";", ord("`"): ";"}), posix=True,
+                      punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""
     try:
@@ -97,11 +102,16 @@ def _script_runs_claude(script: str) -> bool:
     except ValueError:
         return bool(_CLAUDE_WORD.search(script))
     command: list = []
+    redirect_target = False
     for token in tokens + [";"]:
-        if token and set(token) <= set("();<>|&"):
+        if token and set(token) <= set("<>&") and set(token) & set("<>"):
+            redirect_target = True
+        elif token and set(token) <= set("();|&"):
             if _runs_claude(command):
                 return True
-            command = []
+            command, redirect_target = [], False
+        elif redirect_target:
+            redirect_target = False
         elif command or not (token in _SHELL_KEYWORDS or _ASSIGNMENT.match(token)):
             command.append(token)
     return False
@@ -112,22 +122,24 @@ def _runs_claude(argv: Sequence[str]) -> bool:
     counts, so `bash -c "pytest -k claude"` keeps its environment (L2). A wrapper this cannot
     see through falls to the API-variable denylist in _child_env."""
     words = [str(a) for a in argv]
-    while words:
-        exe = os.path.basename(words[0])
+    i = 0
+    while i < len(words):
+        exe = os.path.basename(words[i])
         if exe == "claude":
             return True
         if exe in _SHELLS:
-            rest = words[1:]
-            while rest and rest[0].startswith(("-", "+")):
-                opt, rest = rest[0], rest[1:]
-                if opt in ("-o", "+o", "-O", "+O"):
-                    rest = rest[1:]
+            i += 1
+            while i < len(words) and words[i].startswith(("-", "+")):
+                opt = words[i]
+                i += 1
+                if opt in _SHELL_VALUE_OPTS:
+                    i += 1
                 elif not opt.startswith("--") and "c" in opt:
-                    return bool(rest) and _script_runs_claude(rest[0])
+                    return i < len(words) and _script_runs_claude(words[i])
             return False
         if exe not in _EXEC_WRAPPERS:
             return False
-        words = _after_wrapper(exe, words[1:])
+        i = _after_wrapper(exe, words, i + 1)
     return False
 
 

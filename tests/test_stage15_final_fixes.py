@@ -188,7 +188,9 @@ def test_l3_a_persistent_write_failure_starts_nothing(wt, api_cfg, monkeypatch):
     ["timeout", "60", "npm", "test", "--", "--grep", "claude"],
     ["sh", "-c", "echo 'a; claude b'"], ["bash", "run_claude.sh"], ["bash", "claude"],
     ["sudo", "-u", "claude", "pytest"], ["nice", "-n", "5", "pytest", "claude"],
-    ["sh", "-c", "X=claude pytest"], ["xargs", "grep", "claude"], ["sh"], ["sh", "-c"], []])
+    ["sh", "-c", "X=claude pytest"], ["xargs", "grep", "claude"], ["sh"], ["sh", "-c"], [],
+    ["sh", "-c", "command -v claude"], ["command", "-V", "claude"],
+    ["sh", "-c", "cat f > claude"], ["sh", "-c", "pytest 2>&1 > claude; wc -l < claude"]])
 def test_l2_a_word_in_an_argument_is_data(argv):
     from core.fullcycle import hosts
     assert hosts._runs_claude(argv) is False
@@ -206,7 +208,10 @@ def test_l2_a_word_in_an_argument_is_data(argv):
     ["sh", "-c", "a | claude"], ["sh", "-c", "if true; then claude; fi"],
     ["bash", "-o", "pipefail", "-c", "claude"], ["env", "sh", "-c", "nohup claude"],
     ["sh", "-c", "sh -c 'claude -p x'"], ["sh", "-c", "exec claude"],
-    ["sh", "-c", "claude 'unbalanced"]])
+    ["sh", "-c", "claude 'unbalanced"], ["sh", "-c", "echo `claude -p x`"],
+    ["bash", "--rcfile", "f", "-c", "claude"], ["sh", "-c", "exec -a name claude"],
+    ["sh", "-c", "builtin claude"], ["bash", "-c", "coproc claude"],
+    ["sh", "-c", "> out claude"], ["sh", "-c", "claude 2>&1"]])
 def test_l2_claude_in_command_position_is_seen(argv):
     from core.fullcycle import hosts
     assert hosts._runs_claude(argv) is True
@@ -375,3 +380,13 @@ def test_la_an_unreadable_anchor_does_not_raise_in_the_lag_check(wt, api_cfg):  
     c = sqlite3.connect(ac._db_path())
     assert aam._close_anchor_lag(c) == "api_ledger_tampered"
     c.close()
+
+
+def test_lb_a_long_wrapper_chain_stays_linear():
+    import time
+
+    from core.fullcycle import hosts
+    start = time.monotonic()
+    assert hosts._runs_claude(["env"] * 200_000) is False
+    assert hosts._runs_claude(["sh", "-c", "exec " * 200_000]) is False
+    assert time.monotonic() - start < 10
