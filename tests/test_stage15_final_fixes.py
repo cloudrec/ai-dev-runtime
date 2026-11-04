@@ -171,3 +171,43 @@ def test_l3_a_persistent_write_failure_starts_nothing(wt, api_cfg, monkeypatch):
     assert _commit(wt, _sign(wt)) == "api_anchor_write_failed"
     assert sqlite3.connect(ac._db_path()).execute(
         "SELECT COUNT(*) FROM agent_auth_api_chain").fetchone()[0] == 2
+
+
+# ── L2: only command position counts ─────────────────────────────────────────────
+@pytest.mark.parametrize("argv", [
+    ["bash", "-c", "pytest -k claude"], ["env", "FOO=claude", "pytest"],
+    ["sh", "-c", "git log --grep claude | wc -l"],
+    ["timeout", "60", "npm", "test", "--", "--grep", "claude"],
+    ["sh", "-c", "echo 'a; claude b'"], ["bash", "run_claude.sh"], ["bash", "claude"],
+    ["sudo", "-u", "claude", "pytest"], ["nice", "-n", "5", "pytest", "claude"],
+    ["sh", "-c", "X=claude pytest"], ["xargs", "grep", "claude"], ["sh"], ["sh", "-c"], []])
+def test_l2_a_word_in_an_argument_is_data(argv):
+    from core.fullcycle import hosts
+    assert hosts._runs_claude(argv) is False
+
+
+@pytest.mark.parametrize("argv", [
+    ["claude"], ["/usr/local/bin/claude", "-p", "x"], ["env", "X=1", "claude"],
+    ["env", "-u", "Y", "claude"], ["timeout", "-k", "5", "60s", "claude"],
+    ["nohup", "claude"], ["nice", "-n", "5", "claude"], ["sudo", "-u", "root", "claude"],
+    ["xargs", "-n", "1", "claude"], ["setsid", "claude"],
+    ["sh", "-c", "claude -p x"], ["bash", "-lc", "cd x && claude -p y"],
+    ["bash", "-c", "true; claude"], ["bash", "-c", "true\nclaude"],
+    ["sh", "-c", "X=1 claude"], ["sh", "-c", "'claude' -p x"], ["sh", "-c", '"claude"'],
+    ["sh", "-c", "(claude)"], ["sh", "-c", "echo $(claude -p x)"],
+    ["sh", "-c", "a | claude"], ["sh", "-c", "if true; then claude; fi"],
+    ["bash", "-o", "pipefail", "-c", "claude"], ["env", "sh", "-c", "nohup claude"],
+    ["sh", "-c", "sh -c 'claude -p x'"], ["sh", "-c", "exec claude"],
+    ["sh", "-c", "claude 'unbalanced"]])
+def test_l2_claude_in_command_position_is_seen(argv):
+    from core.fullcycle import hosts
+    assert hosts._runs_claude(argv) is True
+
+
+def test_l2_a_check_keeps_its_environment(monkeypatch):
+    from core.fullcycle import hosts
+    monkeypatch.setenv("VIRTUAL_ENV", "/v")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sentinel")
+    env = hosts._child_env(["bash", "-c", "pytest -k claude"], {"PYTHONDONTWRITEBYTECODE": "1"})
+    assert env["VIRTUAL_ENV"] == "/v" and env["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert "ANTHROPIC_API_KEY" not in env

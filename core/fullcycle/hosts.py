@@ -54,21 +54,77 @@ class ExecutionHost(ABC):
         return self.run(["test", "-e", path])[0] == 0
 
 
-# what commonly stands in front of a command; only these make a later word a program name
-_EXEC_WRAPPERS = {"env", "sh", "bash", "dash", "zsh", "nohup", "timeout", "nice", "xargs",
-                  "sudo"}
+# what commonly stands in front of a command, with its options that take a value
+_EXEC_WRAPPERS = {"env": ("-u", "-C", "--unset", "--chdir"), "nohup": (), "setsid": (),
+                  "timeout": ("-k", "-s", "--kill-after", "--signal"), "nice": ("-n",),
+                  "xargs": ("-I", "-L", "-P", "-d", "-n", "-s"), "sudo": ("-u", "-g"),
+                  "command": (), "exec": (), "time": ()}
+_SHELLS = {"sh", "bash", "dash", "zsh"}
+_SHELL_KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "{", "!"}
+_ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_DURATION = re.compile(r"[0-9.]+[smhd]?\Z")
 _CLAUDE_WORD = re.compile(r"(?:^|[\s/;&|(=])claude(?:[\s;&|)]|$)")
 
 
+def _after_wrapper(exe: str, words: list) -> list:
+    """The command an exec wrapper runs: its options, assignments and numbers skipped."""
+    takes_value = _EXEC_WRAPPERS[exe]
+    while words:
+        w = words[0]
+        if w == "--":
+            return words[1:]
+        if w in takes_value:
+            words = words[2:]
+        elif w.startswith("-") or _ASSIGNMENT.match(w) or _DURATION.match(w):
+            words = words[1:]
+        else:
+            break
+    return words
+
+
+def _script_runs_claude(script: str) -> bool:
+    """Whether a shell string has `claude` in command position. Quoting is honoured, so a
+    word inside an argument stays data; a string that cannot be parsed is read loosely."""
+    lex = shlex.shlex(script.replace("\n", ";"), posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return bool(_CLAUDE_WORD.search(script))
+    command: list = []
+    for token in tokens + [";"]:
+        if token and set(token) <= set("();<>|&"):
+            if _runs_claude(command):
+                return True
+            command = []
+        elif command or not (token in _SHELL_KEYWORDS or _ASSIGNMENT.match(token)):
+            command.append(token)
+    return False
+
+
 def _runs_claude(argv: Sequence[str]) -> bool:
-    """A direct `claude`, or one behind a shell or exec wrapper (N3). An argument of any
-    other program is only data: `git commit -m "… claude …"` keeps its environment."""
-    if not argv:
-        return False
-    exe = os.path.basename(str(argv[0]))
-    if exe == "claude":
-        return True
-    return exe in _EXEC_WRAPPERS and any(_CLAUDE_WORD.search(str(a)) for a in argv[1:])
+    """A direct `claude`, or one a shell or exec wrapper will run (N3). Only command position
+    counts, so `bash -c "pytest -k claude"` keeps its environment (L2). A wrapper this cannot
+    see through falls to the API-variable denylist in _child_env."""
+    words = [str(a) for a in argv]
+    while words:
+        exe = os.path.basename(words[0])
+        if exe == "claude":
+            return True
+        if exe in _SHELLS:
+            rest = words[1:]
+            while rest and rest[0].startswith(("-", "+")):
+                opt, rest = rest[0], rest[1:]
+                if opt in ("-o", "+o", "-O", "+O"):
+                    rest = rest[1:]
+                elif not opt.startswith("--") and "c" in opt:
+                    return bool(rest) and _script_runs_claude(rest[0])
+            return False
+        if exe not in _EXEC_WRAPPERS:
+            return False
+        words = _after_wrapper(exe, words[1:])
+    return False
 
 
 def _child_env(argv: Sequence[str], env: Optional[dict]) -> dict:
