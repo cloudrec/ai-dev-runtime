@@ -9,6 +9,8 @@ import os
 import re
 import subprocess
 
+from core import agent_privilege
+
 _TIMEOUT = 60
 _SECRET_CONTENT_RE = re.compile(
     r"(AKIA[0-9A-Z]{16})|(-----BEGIN [A-Z ]*PRIVATE KEY-----)|(sk-[A-Za-z0-9]{20,})|"
@@ -21,6 +23,10 @@ class GitWriteError(RuntimeError):
 
 
 def _run(project_path: str, args: list[str], check: bool = True) -> str:
+    try:
+        agent_privilege.require_root_work(project_path)   # safe.directory=* trusts any owner
+    except agent_privilege.AgentPrivilegeError as e:
+        raise GitWriteError(f"agent_run_as:{e}") from None
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
     cmd = ["git", "-c", "safe.directory=*", "-C", project_path] + args
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=_TIMEOUT, env=env, shell=False)

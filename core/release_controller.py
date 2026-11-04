@@ -38,7 +38,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from core import git_write
+from core import agent_privilege, git_write
 
 _DB = os.getenv("RUNTIME_RELEASE_DB",
                 os.path.join(os.path.dirname(os.path.dirname(__file__)), "runtime_releases.db"))
@@ -158,7 +158,15 @@ def _log(rc_id: str, msg: str) -> None:
     _update(rc_id, log=entries[-200:])
 
 
+def _require_root_tree(project_path: str) -> None:
+    try:
+        agent_privilege.require_root_work(project_path)
+    except agent_privilege.AgentPrivilegeError as e:
+        raise ReleaseError(f"agent_run_as:{e}") from None
+
+
 def _git(project_path: str, args: List[str], check: bool = True) -> str:
+    _require_root_tree(project_path)
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
     p = subprocess.run(["git", "-c", "safe.directory=*", "-C", project_path] + args,
                        capture_output=True, text=True, timeout=_GIT_TIMEOUT, env=env, shell=False)
@@ -250,6 +258,7 @@ def run_tests(project_path: str, rc_id: str, command: Optional[List[str]] = None
               phase: str = "tests_before") -> Dict[str, Any]:
     """Run the repository suite and record the result on the candidate."""
     _require(rc_id)
+    _require_root_tree(project_path)
     cmd = command or ["python3", "-m", "pytest", "-q"]
     try:
         p = subprocess.run(cmd, cwd=project_path, capture_output=True, text=True,

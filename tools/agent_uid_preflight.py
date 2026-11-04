@@ -19,6 +19,8 @@ from core import tmux_control  # noqa: E402
 
 DENY = ("/root", "/opt/seo/.env", "/etc/ai-runtime/runtime-clients.json",
         "/var/run/docker.sock")
+_LOCKED = ('grep -q "^NoNewPrivs:.*1$" /proc/self/status && '
+           'grep -q "^CapBnd:.*0000000000000000$" /proc/self/status')
 
 
 def _as_agent(t, argv: list) -> int:
@@ -27,6 +29,13 @@ def _as_agent(t, argv: list) -> int:
                               capture_output=True, timeout=20).returncode
     except (OSError, subprocess.TimeoutExpired):
         return 125
+
+
+def _root_trusts(t) -> list:
+    """Root's git refuses a repo owned by someone else unless safe.directory says otherwise."""
+    p = subprocess.run(["git", "config", "--global", "--get-all", "safe.directory"],
+                       capture_output=True, text=True)
+    return [d for d in p.stdout.split() if d == "*" or _as_agent(t, ["test", "-w", d]) == 0]
 
 
 def main(argv=None) -> int:
@@ -42,10 +51,16 @@ def main(argv=None) -> int:
     if not t:
         print(json.dumps({"ok": False, "reason": "AGENT_RUN_AS is not set"}))
         return 1
-    paths = {*DENY, *a.deny, tmux_control.socket_path(),
-             os.getenv("RUNTIME_CLIENT_TOKENS_FILE") or DENY[2]}
+    paths = {*DENY, *a.deny, tmux_control.socket_path(), *filter(None, map(os.getenv, (
+        "RUNTIME_CLIENT_TOKENS_FILE", "AGENT_CONTROL_DB", "CONTROL_PLANE_DB")))}
+    absent = sorted(p for p in paths if not os.path.lexists(p))
     checks = {f"cannot_reach:{p}": _as_agent(t, ["sh", "-c", 'test ! -r "$1" && test ! -w "$1"',
-                                                 "sh", p]) == 0 for p in sorted(paths)}
+                                                 "sh", p]) == 0
+              for p in sorted(paths) if p not in absent}
+    # a path the owner named must exist: a typo would otherwise pass as closed
+    checks.update({f"deny_path_exists:{p}": os.path.lexists(p) for p in a.deny})
+    checks["no_new_privs_and_no_caps"] = _as_agent(t, ["sh", "-c", _LOCKED]) == 0
+    checks["root_git_trusts_no_agent_path"] = not _root_trusts(t)
     checks["uid_is_not_root"] = _as_agent(t, ["sh", "-c", 'test "$(id -u)" != 0']) == 0
     checks["no_extra_groups"] = _as_agent(t, ["sh", "-c", 'test "$(id -G)" = "$(id -g)"']) == 0
     checks["docker_refused"] = _as_agent(t, ["docker", "ps"]) != 0
@@ -54,7 +69,7 @@ def main(argv=None) -> int:
     if a.project:
         checks["project_usable"] = priv.can_use_dir(t, a.project)
     ok = all(checks.values())
-    print(json.dumps({"ok": ok, "run_as": t.name, "checks": checks}, indent=1))
+    print(json.dumps({"ok": ok, "run_as": t.name, "absent": absent, "checks": checks}, indent=1))
     return 0 if ok else 1
 
 

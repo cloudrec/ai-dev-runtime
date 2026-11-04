@@ -62,6 +62,8 @@ import stat
 import time
 from typing import Callable, Optional
 
+from core import agent_privilege
+
 SUBSCRIPTION, API = "subscription", "api"
 MODES = (SUBSCRIPTION, API)
 DEFAULT_MODEL = "sonnet"
@@ -680,7 +682,7 @@ def settings_api_overrides(project_dir: str, config_dir: Optional[str] = None) -
         try:
             if os.path.getsize(path) > _SETTINGS_MAX_BYTES:
                 raise ValueError("oversized")
-            with open(path, encoding="utf-8") as fh:
+            with agent_privilege.open_regular(path, encoding="utf-8") as fh:
                 data = json.load(fh)
         except Exception:      # an agent can write this file: no content may stop a launch
             found.append(f"{path}:unreadable")
@@ -722,7 +724,6 @@ def recovery_command(session: str, shape_cmd: str, conn=None) -> dict:
     # inherited credential, so it is refused instead of passed through.
     if not _PLAIN_CLAUDE_RE.match(cmd):
         return {"ok": False, "reason": "recovery_shape_not_plain_claude"}
-    from core import agent_privilege
     try:
         run_as = agent_privilege.target()
     except agent_privilege.AgentPrivilegeError as e:

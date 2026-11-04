@@ -203,9 +203,183 @@ def test_no_new_session_outside_the_two_gated_sites():
     """Anything else starting a pane would run the agent as root."""
     found = set()
     for path in [*ROOT.glob("core/**/*.py"), *ROOT.glob("tools/*.py"), *ROOT.glob("api/*.py")]:
-        if re.search(r'\[\s*"(new-session|respawn-pane)"', path.read_text(errors="replace")):
+        if re.search(r'"(new-session|respawn-pane|new-window|split-window|run-shell|pipe-pane)"',
+                     path.read_text(errors="replace")):
             found.add(path.relative_to(ROOT).as_posix())
-    assert found == {"core/agent_control.py", "core/session_recovery.py"}
+    assert found == {"core/agent_control.py", "core/session_recovery.py", "core/tmux_launch.py"}
+
+
+# ── root tooling stays out of trees the agent can change ────────────────────
+@pytest.fixture
+def agent_repo(sandbox):
+    t, project, secret = sandbox
+    LocalHost().run(["git", "init", "-q", project])
+    marker = os.path.join(project, "ran-as-root")
+    hook = os.path.join(project, ".git", "hooks", "post-checkout")
+    LocalHost().write_file(hook, f'#!/bin/sh\ntouch "{marker}"\n')
+    LocalHost().run(["chmod", "+x", hook])
+    return t, project, marker
+
+
+@real
+def test_git_write_refuses_an_agent_tree(agent_repo):
+    from core import git_write
+    _, project, marker = agent_repo
+    with pytest.raises(git_write.GitWriteError, match="agent_writable_tree"):
+        git_write._run(project, ["checkout", "-b", "x"], check=False)
+    assert not os.path.exists(marker)
+
+
+@real
+def test_deliver_refuses_an_agent_tree(agent_repo):
+    from core import deliver
+    _, project, _ = agent_repo
+    assert "agent_writable_tree" in deliver.deliver(project, "b")["error"]
+    assert "agent_writable_tree" in deliver.rollback(project, "b", "abc")["error"]
+
+
+@real
+def test_release_refuses_an_agent_tree(agent_repo, monkeypatch):
+    from core import release_controller as rc
+    _, project, _ = agent_repo
+    monkeypatch.setattr(rc, "_require", lambda _id: {})
+    with pytest.raises(rc.ReleaseError, match="agent_writable_tree"):
+        rc._git(project, ["status"])
+    with pytest.raises(rc.ReleaseError, match="agent_writable_tree"):
+        rc.run_tests(project, "rc-1")
+
+
+@real
+def test_validator_refuses_an_agent_tree(agent_repo):
+    from core.validator import Validator
+    _, project, _ = agent_repo
+    with pytest.raises(priv.AgentPrivilegeError, match="agent_writable_tree"):
+        Validator(project)
+
+
+@real
+def test_a_job_on_an_agent_tree_fails_before_the_pipeline(agent_repo, monkeypatch):
+    _, project, _ = agent_repo
+    updates = []
+    monkeypatch.setattr(job_executor.job_store, "get_job",
+                        lambda _id: {"project_path": project, "status": "queued"})
+    monkeypatch.setattr(job_executor.job_store, "update_job",
+                        lambda _id, **kw: updates.append(kw))
+    monkeypatch.setattr(job_executor.job_store, "touch_heartbeat", lambda _id: None)
+    monkeypatch.setattr(job_executor.job_store, "append_log", lambda *a, **k: None)
+    monkeypatch.setattr(job_executor, "_run_pipeline", lambda *a: pytest.fail("pipeline ran"))
+    job_executor.execute("job-1")
+    assert any("agent_writable_tree" in str(u) for u in updates)
+
+
+@real
+@pytest.mark.parametrize("relative", ["", "sub/project"])
+def test_a_tree_inside_an_agent_directory_is_refused(sandbox, relative):
+    t, project, _ = sandbox
+    tree = os.path.join(project, "root-owned")
+    os.makedirs(os.path.join(tree, relative), exist_ok=True)      # root's, in the agent's dir
+    with pytest.raises(priv.AgentPrivilegeError, match="agent_writable_tree"):
+        priv.require_root_work(os.path.join(tree, relative))
+
+
+@real
+def test_an_agent_owned_git_dir_is_refused_in_a_root_tree(sandbox):
+    t, _, _ = sandbox
+    base = tempfile.mkdtemp(prefix="agent-uid-gitdir-", dir="/tmp")
+    os.chmod(base, 0o755)
+    try:
+        os.makedirs(os.path.join(base, ".git"))
+        os.chown(os.path.join(base, ".git"), t.uid, t.gid)
+        with pytest.raises(priv.AgentPrivilegeError, match="agent_writable_tree"):
+            priv.require_root_work(base)
+    finally:
+        shutil.rmtree(base)
+
+
+@real
+def test_a_transcript_swapped_after_the_listing_is_not_followed(sandbox, monkeypatch):
+    from core import os_task_queue
+    _, project, secret = sandbox
+    with open(secret, "w") as fh:
+        fh.write('{"type": "user", "message": {"content": "%s"}}\n' % SECRET)
+    link = os.path.join(project, "swapped.jsonl")
+    os.symlink(secret, link)
+    monkeypatch.setattr(priv, "transcripts", lambda cwd: [link])
+    assert SECRET not in json.dumps(os_task_queue.transcript_messages(project))
+
+
+@real
+def test_a_root_tree_is_still_root_work(sandbox):
+    base = tempfile.mkdtemp(prefix="agent-uid-root-", dir="/tmp")
+    try:
+        priv.require_root_work(base)
+    finally:
+        os.rmdir(base)
+
+
+def test_root_work_is_unrestricted_when_unset(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENT_RUN_AS", raising=False)
+    priv.require_root_work(str(tmp_path))
+
+
+def test_root_work_refuses_a_bad_setting(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENT_RUN_AS", "no-such-user-here")
+    with pytest.raises(priv.AgentPrivilegeError, match="user_not_found"):
+        priv.require_root_work(str(tmp_path))
+
+
+# ── a pane that is not the target is not driven ─────────────────────────────
+def test_pane_problem(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_AS", "nobody")
+    monkeypatch.setattr(priv, "target", lambda: priv.Target("nobody", 65534, 65534, "/h"))
+    monkeypatch.setattr(priv, "process_uid", lambda pid: {1: 65534, 2: 0}.get(pid))
+    assert priv.pane_problem(1) is None
+    assert priv.pane_problem(2) == "pane_uid_mismatch"
+    assert priv.pane_problem(None) == "pane_uid_mismatch"
+
+
+def test_process_uid_reads_the_effective_uid():
+    assert priv.process_uid(os.getpid()) == os.geteuid()
+    assert priv.process_uid(None) is None and priv.process_uid(2 ** 30) is None
+
+
+def test_send_refuses_a_root_pane(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_AS", "nobody")
+    typed = []
+
+    def fake(args, stdin=None):
+        typed.append(args)
+        return 0, "123\n", ""
+    monkeypatch.setattr(ac, "_tmux", fake)
+    monkeypatch.setattr(ac, "find_claude_in_pane", lambda pid: {"pid": pid})
+    monkeypatch.setattr(priv, "target", lambda: priv.Target("nobody", 65534, 65534, "/h"))
+    monkeypatch.setattr(priv, "process_uid", lambda pid: 0)
+    r = ac._deliver("s:0.0", "work", "agent_send", None)
+    assert r["refused"] == "agent_run_as:pane_uid_mismatch" and r["delivered"] is False
+    assert [a[0] for a in typed] == ["display-message"]
+
+
+def test_send_refuses_a_pane_with_no_agent(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_AS", "nobody")
+    monkeypatch.setattr(ac, "_tmux", lambda args, stdin=None: (0, "123\n", ""))
+    monkeypatch.setattr(ac, "find_claude_in_pane", lambda pid: None)
+    monkeypatch.setattr(priv, "target", lambda: priv.Target("nobody", 65534, 65534, "/h"))
+    assert ac._pane_run_as_problem("s:0.0") == "pane_uid_mismatch"
+
+
+def test_send_is_unchanged_when_unset(monkeypatch):
+    monkeypatch.delenv("AGENT_RUN_AS", raising=False)
+    monkeypatch.setattr(ac, "_tmux", lambda *a, **k: pytest.fail("no extra tmux call"))
+    assert ac._pane_run_as_problem("s:0.0") is None
+
+
+@real
+def test_resume_does_not_reuse_a_root_agent(resume, sandbox, monkeypatch):
+    _, project, _ = sandbox
+    monkeypatch.setattr(ac, "find_live_agent_for_dir", lambda _d: {
+        "target": "old:0.0", "session": "old", "claude_pid": os.getpid(), "claude_cwd": project})
+    r = ac.agent_resume(project, session_name="uid-f")
+    assert r["refused"] == "agent_run_as:pane_uid_mismatch" and _started(resume) == []
 
 
 # ── real processes ──────────────────────────────────────────────────────────
@@ -345,6 +519,49 @@ def test_transcripts_skip_what_would_hang_or_redirect_root(sandbox):
     os.symlink(secret, os.path.join(d, "link.jsonl"))
     assert priv.transcripts(project) == [good]
     assert ac.conversation_recently_active(project) is True
+    from core import os_task_queue
+    with open(good, "w") as fh:
+        fh.write('{"type": "user", "message": {"content": "hello"}}\n')
+    assert [m for m in os_task_queue.transcript_messages(project)]    # no hang on the FIFO
+
+
+@real
+def test_open_regular_refuses_a_fifo_and_a_symlink(sandbox):
+    t, project, secret = sandbox
+    fifo = os.path.join(project, "f")
+    os.mkfifo(fifo)
+    link = os.path.join(project, "l")
+    os.symlink(secret, link)
+    for path in (fifo, link):
+        with pytest.raises(OSError):
+            priv.open_regular(path)
+
+
+def test_open_regular_follows_links_when_unset(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENT_RUN_AS", raising=False)
+    real_file, link = tmp_path / "a", tmp_path / "b"
+    real_file.write_text("x")
+    link.symlink_to(real_file)
+    with priv.open_regular(str(link)) as fh:
+        assert fh.read() == "x"
+
+
+@real
+def test_report_read_refuses_a_fifo(sandbox, monkeypatch):
+    _, project, _ = sandbox
+    monkeypatch.setattr(ac, "validate_project_dir", lambda p: p)
+    reports = os.path.join(project, ac._REPORT_SUBDIRS[0])
+    os.makedirs(reports)
+    monkeypatch.setattr(ac.os.path, "isfile", lambda p: True)
+    fifo = os.path.join(reports, "r.md")
+    os.mkfifo(fifo)
+    with pytest.raises(ac.AgentControlError, match="not readable"):
+        ac.agent_report_read(project, os.path.relpath(fifo, project))
+
+
+def test_a_vanished_user_is_not_roots_home(monkeypatch):
+    monkeypatch.setenv("AGENT_RUN_AS", "no-such-user-here")
+    assert priv.claude_home() == "/nonexistent"
 
 
 def test_preflight_refuses_without_the_setting(monkeypatch, capsys):
@@ -372,9 +589,14 @@ def test_preflight_catches_a_readable_file_and_passes_a_closed_one(sandbox, caps
     os.chmod(bin_, 0o755)
     mod.main(["--deny", secret, "--project", project])
     closed = json.loads(capsys.readouterr().out)
+    assert closed["checks"]["no_new_privs_and_no_caps"] is True
     assert closed["checks"][f"cannot_reach:{secret}"] is True
     assert closed["checks"]["claude_runs"] is True and closed["checks"]["project_usable"] is True
     assert SECRET not in json.dumps(closed)
     os.chmod(secret, 0o644)
     assert mod.main(["--deny", secret]) == 1
     assert json.loads(capsys.readouterr().out)["checks"][f"cannot_reach:{secret}"] is False
+    os.chmod(secret, 0o600)
+    missing = secret + "-typo"
+    assert mod.main(["--deny", missing]) == 1
+    assert json.loads(capsys.readouterr().out)["checks"][f"deny_path_exists:{missing}"] is False

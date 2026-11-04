@@ -350,7 +350,8 @@ def find_claude_in_pane(pane_pid: Optional[int]) -> Optional[dict]:
     for pid in [pane_pid, *_descendants(pane_pid)]:
         cmdline = _proc_cmdline(pid)
         if is_claude_cmdline(cmdline):
-            return {"pid": pid, "cmdline": redact(cmdline), "cwd": _proc_cwd(pid)}
+            return {"pid": pid, "cmdline": redact(cmdline), "cwd": _proc_cwd(pid),
+                    "uid": agent_privilege.process_uid(pid)}
     return None
 
 
@@ -643,7 +644,7 @@ def _last_user_text_from_tail(path: str) -> str:
     try:
         size = os.path.getsize(path)
         start = max(0, size - TRANSCRIPT_TAIL_BYTES)
-        with open(path, "rb") as fh:
+        with agent_privilege.open_regular(path, "rb") as fh:
             fh.seek(start)
             if start:
                 fh.readline()          # discard the partial line the seek landed inside
@@ -656,7 +657,7 @@ def _last_user_text_from_tail(path: str) -> str:
         # the last user line sat beyond the window. Falling back to "" there would SILENTLY
         # change classification for exactly the longest-running agents, so pay the full
         # read in that rare case and stay bit-identical to the old behaviour.
-        with open(path, "rb") as fh:
+        with agent_privilege.open_regular(path, "rb") as fh:
             return _scan_back_for_user_text(fh.read())
     except Exception:  # noqa: BLE001
         return ""
@@ -1667,7 +1668,9 @@ def conversation_evidence(cwd: str) -> dict:
     if not cwd:
         return {"present": False}
     slug = "-" + cwd.strip("/").replace("/", "-")
-    proj_dir = os.path.join(os.path.expanduser("~/.claude/projects"), slug)
+    proj_dir = os.path.join(agent_privilege.claude_home(), ".claude", "projects", slug) \
+        if agent_privilege.run_as_name() else os.path.join(
+            os.path.expanduser("~/.claude/projects"), slug)
     if not os.path.isdir(proj_dir):
         return {"present": False, "project_dir": proj_dir}
     try:
@@ -1910,7 +1913,7 @@ def _owner_key() -> Optional[bytes]:
     if not _stat.S_ISREG(st.st_mode) or st.st_uid != 0 or (st.st_mode & 0o077):
         return None
     try:
-        with open(path, "rb") as fh:
+        with agent_privilege.open_regular(path, "rb") as fh:
             key = fh.read().strip()
     except OSError:
         return None
@@ -2091,6 +2094,16 @@ def _deliver(target: str, text: str, action: str, idempotency_key: Optional[str]
                                actor=actor, source=source, owner_proof=owner_proof)
 
 
+def _pane_run_as_problem(target: str) -> Optional[str]:
+    """Under AGENT_RUN_AS nothing is typed into an agent running as anyone else."""
+    if not agent_privilege.run_as_name():
+        return None
+    rc, out, _ = _tmux(["display-message", "-p", "-t", target, "#{pane_pid}"])
+    pid = out.strip()
+    claude = find_claude_in_pane(int(pid)) if rc == 0 and pid.isdigit() else None
+    return agent_privilege.pane_problem(claude["pid"] if claude else None)
+
+
 def _deliver_locked(target: str, text: str, action: str, idempotency_key: Optional[str],
                     actor: Optional[str] = None, source: Optional[str] = None,
                     owner_proof: Optional[dict] = None) -> dict:
@@ -2102,6 +2115,13 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     Delivery is *proven* by diffing the pane capture before and after.
     """
     _check_message(text)
+    problem = _pane_run_as_problem(target)
+    if problem:
+        audit(action, target, idempotency_key, delivered=False,
+              refused=f"agent_run_as:{problem}", actor=actor, source=source)
+        return {"target": target, "action": action, "delivered": False, "submitted": False,
+                "queued": False, "refused": f"agent_run_as:{problem}",
+                "reason": "the agent in this pane is not running as AGENT_RUN_AS"}
     raw_text = text
     text = _tag_if_automated(text, actor)
     pane = _pane_is_live_agent(target)
@@ -2333,6 +2353,14 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
         raise AgentControlError(f"invalid conversation id: {conversation_id!r}")
 
     existing = find_live_agent_for_dir(resolved)
+    if existing and agent_privilege.run_as_name():
+        problem = agent_privilege.pane_problem(existing["claude_pid"])
+        if problem:
+            audit("agent_resume", existing["target"], resumed=False,
+                  refused=f"agent_run_as:{problem}", actor=actor, cwd=resolved)
+            return {"resumed": False, "refused": f"agent_run_as:{problem}",
+                    "reason": "a live agent here is not running as AGENT_RUN_AS",
+                    "duplicate_created": False, "agent_created": False}
     if existing:
         audit("agent_resume", existing["target"], resumed=False, reason="live agent already exists")
         return {
@@ -2530,8 +2558,11 @@ def agent_report_read(project_dir: str, path: str) -> dict:
         raise AgentControlError(f"report path {path!r} is outside the allowed report directories")
     if not os.path.isfile(full):
         raise AgentControlError(f"report not found: {path}")
-    with open(full, "r", errors="replace") as fh:
-        content = fh.read(MAX_REPORT_BYTES + 1)
+    try:
+        with agent_privilege.open_regular(full, "r", errors="replace") as fh:
+            content = fh.read(MAX_REPORT_BYTES + 1)
+    except OSError:
+        raise AgentControlError(f"report not readable: {path}") from None
     truncated = len(content) > MAX_REPORT_BYTES
     audit("agent_report_read", resolved, path=path, truncated=truncated)
     return {"project_dir": resolved, "path": path, "truncated": truncated,

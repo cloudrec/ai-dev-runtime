@@ -94,15 +94,13 @@ def transcript_messages(cwd: str, limit_files: int = 4) -> list:
     RESUBMITTED work the agent had already completed — the duplicate this whole ledger exists
     to prevent, caused by looking in one file.
     """
-    import glob
     out = []
     try:
         from core import agent_privilege
-        proj = os.path.join(agent_privilege.claude_home(), ".claude", "projects",
-                            (cwd or "").replace("/", "-"))
-        files = sorted(glob.glob(proj + "/*.jsonl"), key=os.path.getmtime)[-limit_files:]
+        files = sorted(agent_privilege.transcripts(cwd), key=os.path.getmtime)[-limit_files:]
         for path in files:
-            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            with agent_privilege.open_regular(path, "r", encoding="utf-8",
+                                              errors="replace") as fh:
                 for line in fh:
                     try:
                         d = json.loads(line)

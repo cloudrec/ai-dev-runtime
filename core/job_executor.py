@@ -534,6 +534,7 @@ def execute(job_id: str) -> None:
     job_store.touch_heartbeat(job_id)
     hb_thread.start()
     try:
+        agent_privilege.require_root_work(pp)
         _run_pipeline(job_id, job, pp)
     except BaseException as e:  # noqa: BLE001
         # Any unhandled crash in a pipeline stage (e.g. a backup worker dying)

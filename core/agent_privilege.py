@@ -109,23 +109,103 @@ def can_use_dir(t: Target, path: str) -> bool:
         return False
 
 
+def _writable(t: Target, path: str) -> bool:
+    argv = host_argv(t, ["test", "-w", path])
+    try:
+        return subprocess.run(argv, env=child_env(t), cwd="/", capture_output=True,
+                              timeout=_PROBE_TIMEOUT).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return True                       # unknown counts as writable
+
+
+def _agent_can_change(t: Target, path: str) -> bool:
+    """The tree, its .git, or a parent the agent could swap it out of. A sticky directory
+    such as /tmp protects what root put in it."""
+    real = os.path.realpath(path)
+    if _writable(t, real) or _writable(t, os.path.join(real, ".git")):
+        return True
+    parent = os.path.dirname(real)
+    while parent != "/":
+        try:
+            sticky = bool(os.stat(parent).st_mode & stat.S_ISVTX)
+        except OSError:
+            return True
+        if not sticky and _writable(t, parent):
+            return True
+        parent = os.path.dirname(parent)
+    return False
+
+
+def require_root_work(path: str) -> None:
+    """For tooling that stays root (job queue, deliver, release, validator). They run git,
+    pytest and file walks in `path`, so a tree the agent can change would hand it root
+    through a hook, a conftest.py or a symlink. Raises under AGENT_RUN_AS."""
+    t = target()
+    if t and _agent_can_change(t, path):
+        raise AgentPrivilegeError("agent_writable_tree")
+
+
+def process_uid(pid: int) -> Optional[int]:
+    try:
+        with open(f"/proc/{int(pid)}/status", encoding="ascii", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("Uid:"):
+                    return int(line.split()[2])       # effective
+    except (OSError, ValueError, IndexError, TypeError):
+        pass
+    return None
+
+
+def pane_problem(pid: Optional[int]) -> Optional[str]:
+    """Is the agent in this pane really the target? A pane started before the setting, by
+    hand, or by a process without it would otherwise be driven as root."""
+    try:
+        t = target()
+    except AgentPrivilegeError as e:
+        return str(e)
+    if not t or process_uid(pid) == t.uid:
+        return None
+    return "pane_uid_mismatch"
+
+
+def open_regular(path: str, *args, **kwargs):
+    """open() for a file the agent may own: no symlink, and a FIFO cannot hang the caller.
+    Plain open() when AGENT_RUN_AS is unset, so a symlinked dotfile keeps working."""
+    if not run_as_name():
+        return open(path, *args, **kwargs)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(f"not a regular file: {path}")
+        return os.fdopen(fd, *args, **kwargs)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+
+
 def claude_home() -> str:
     """Whose ~/.claude holds the transcripts. Never raises: it is on the status path."""
     name = run_as_name()
-    if name:
-        try:
-            return _lookup(name).home
-        except AgentPrivilegeError:
-            pass
-    return "/root"
+    if not name:
+        return "/root"
+    try:
+        return _lookup(name).home
+    except AgentPrivilegeError:
+        return "/nonexistent"             # not root's transcripts: nothing is better
 
 
 def transcripts(cwd: str) -> list:
     """This project's transcript files, regular files only. Root reads these, and the agent
     owns the directory: a FIFO there would hang the reader, a symlink would redirect it."""
     proj = os.path.join(claude_home(), ".claude", "projects", (cwd or "").replace("/", "-"))
+    found = glob.glob(proj + "/*.jsonl")
+    if not run_as_name():
+        return found
     out = []
-    for path in glob.glob(proj + "/*.jsonl"):
+    for path in found:
         try:
             if stat.S_ISREG(os.lstat(path).st_mode):
                 out.append(path)

@@ -12,6 +12,7 @@ import os
 import signal
 import subprocess
 
+from core import agent_privilege
 from core import git_write as gw
 
 _TEST_TIMEOUT = int(os.getenv("RUNTIME_TEST_TIMEOUT", "180"))
@@ -84,9 +85,20 @@ def _checkout_target(pp: str, target: str) -> None:
         gw._run(pp, ["checkout", "-B", target, f"origin/{target}"])
 
 
+def _root_work_refusal(pp: str) -> str:
+    try:
+        agent_privilege.require_root_work(pp)
+    except agent_privilege.AgentPrivilegeError as e:
+        return f"agent_run_as:{e}"
+    return ""
+
+
 def deliver(project_path: str, source_branch: str, target_branch: str = "master",
             test_commands: list[str] | None = None, push: bool = False) -> dict:
     pp = os.path.realpath(project_path)
+    refused = _root_work_refusal(pp)
+    if refused:
+        return {"ok": False, "stage": "precheck", "error": refused}
     if not gw.is_repo(pp):
         return {"ok": False, "stage": "precheck", "error": "not a git repo"}
     if not source_branch:
@@ -133,6 +145,9 @@ def deliver(project_path: str, source_branch: str, target_branch: str = "master"
 def rollback(project_path: str, target_branch: str, to_commit: str, push: bool = False) -> dict:
     """Undo a delivery: hard-reset target back to a known-good commit (+ push)."""
     pp = os.path.realpath(project_path)
+    refused = _root_work_refusal(pp)
+    if refused:
+        return {"ok": False, "error": refused}
     if not gw.is_repo(pp) or not to_commit:
         return {"ok": False, "error": "bad repo / to_commit"}
     try:

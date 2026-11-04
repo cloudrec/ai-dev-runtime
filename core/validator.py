@@ -15,9 +15,12 @@ import py_compile
 import subprocess
 from datetime import datetime
 
+from core import agent_privilege
+
 
 class Validator:
     def __init__(self, project_root: str):
+        agent_privilege.require_root_work(project_root)   # it runs the tree's python as root
         self.project_root = os.path.realpath(project_root)
         self.venv_python = self._find_python()
 

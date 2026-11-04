@@ -29,6 +29,7 @@ import json
 import os
 from typing import Callable, Optional
 
+from core import agent_privilege
 from core.control_plane.api import _c
 from core.control_plane.store import now_iso, now_ts
 
@@ -82,7 +83,9 @@ def condition_hash(cond: str) -> str:
 
 def _transcript(cwd: str, session_id: str) -> str:
     enc = (cwd or "").replace("/", "-").replace(".", "-")
-    return os.path.join(os.path.expanduser("~/.claude/projects"), enc, f"{session_id}.jsonl")
+    home = agent_privilege.claude_home() if agent_privilege.run_as_name() \
+        else os.path.expanduser("~")
+    return os.path.join(home, ".claude", "projects", enc, f"{session_id}.jsonl")
 
 
 def goal_state(cwd: str, session_id: str, *, path: Optional[str] = None) -> dict:
