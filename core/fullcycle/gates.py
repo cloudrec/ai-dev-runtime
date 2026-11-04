@@ -18,6 +18,7 @@ slice never answers an agent's permission dialog on anyone's behalf.
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from core.fullcycle.executor import ExecutorUnavailable, profile
@@ -88,13 +89,20 @@ _RUNNER_ALLOWED_SUBCMDS = {"npm": {"test"}, "go": {"test", "vet"}, "cargo": {"te
                            "make": {"test", "check"}}
 
 
+_WORD_BREAK = re.compile(r"[\s;&|()<>'\"`=]+")
+
+
 def _names_api_launcher(argv: list) -> bool:
+    """Whole words only. `tests/api` is a project path, not a launcher called `api`: the
+    launcher lives outside the project, so a plain relative path cannot reach it."""
     from core import agent_auth_mode as aam
     names = {os.path.basename(aam.DEFAULT_LAUNCHER)}
     cfg = aam.load_config()
     if cfg.get("launcher"):
         names.add(os.path.basename(str(cfg["launcher"])))
-    return any(n and n in a for a in argv for n in names)
+    names.discard("")
+    words = (w for a in argv for w in _WORD_BREAK.split(str(a)) if w)
+    return any(w.rsplit("/", 1)[-1] in names and (w[0] in "/." or "/" not in w) for w in words)
 
 
 def check_argv(argv: list, *, root: str, trusted: bool) -> Optional[str]:

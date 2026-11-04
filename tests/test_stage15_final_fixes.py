@@ -222,3 +222,34 @@ def test_l4_a_decoded_question_mark_is_signed_with_the_path():
     assert _signed_target(req) == ("/jobs/x?evil", "a=1")
     req = SimpleNamespace(scope={"raw_path": b"/jobs/x%3Fevil?a=1", "query_string": b"a=1"})
     assert _signed_target(req) == ("/jobs/x%3Fevil", "a=1")
+
+
+# ── L5: the launcher is matched as a whole word ──────────────────────────────────
+def _launcher_named(monkeypatch, path):
+    monkeypatch.setattr(aam, "load_config", lambda: {"launcher": path})
+
+
+@pytest.mark.parametrize("argv", [
+    ["pytest", "/opt/claude-owner-api-docs/t.py"], ["pytest", "tests/test_claude-owner-api.py"],
+    ["python3", "my-claude-owner-api"]])
+def test_l5_a_longer_name_is_not_the_launcher(monkeypatch, argv):
+    from core.fullcycle import gates
+    assert gates._names_api_launcher(argv) is False
+
+
+def test_l5_a_short_configured_name_spares_project_paths(monkeypatch):
+    from core.fullcycle import gates
+    _launcher_named(monkeypatch, "/usr/local/bin/api")
+    assert gates._names_api_launcher(["pytest", "tests/api"]) is False
+    assert gates._names_api_launcher(["pytest", "tests/test_api.py"]) is False
+    assert gates._names_api_launcher(["/usr/local/bin/api"]) is True
+
+
+@pytest.mark.parametrize("argv", [
+    ["claude-owner-api"], ["/usr/local/bin/claude-owner-api", "-p", "x"],
+    ["sh", "-c", "claude-owner-api -p x"], ["sh", "-c", "true;claude-owner-api"],
+    ["sh", "-c", "X=$(claude-owner-api)"], ["env", "A=claude-owner-api"],
+    ["../bin/claude-owner-api"], ["./claude-owner-api"]])
+def test_l5_the_launcher_is_still_refused(argv):
+    from core.fullcycle import gates
+    assert gates._names_api_launcher(argv) is True
