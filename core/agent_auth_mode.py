@@ -38,7 +38,8 @@ is a boundary against a process willing to work at it:
   * stopped outright: any UPDATE or DELETE on owner_proof_used or agent_auth_api_chain
     through SQL, accidental or scripted (triggers), and replay of a spent nonce;
   * detected, every API launch then refused: a dropped trigger, an edited row, a truncated
-    or dropped chain, an old or forged anchor file;
+    or dropped chain, an old or forged anchor file. Routine use repairs none of it: only the
+    owner's reanchor restores triggers, and it names what it restored;
   * not detected: wiping chain, spent rows and anchor together (looks like a fresh install);
   * not stopped: reading the owner key, pointing AGENT_OWNER_PROOF_KEY_FILE at a key of
     one's own, or editing this code. Each forges a proof outright.
@@ -180,13 +181,36 @@ _PROOF_TRIGGERS = {
     "owner_proof_used_no_delete": "DELETE"}
 
 
-def ensure_proof_table(c) -> None:
-    """The spent-nonce table, append-only (R6). The caller owns the transaction."""
-    c.execute("CREATE TABLE IF NOT EXISTS owner_proof_used (nonce TEXT PRIMARY KEY, "
-              "action TEXT, target TEXT, used_at TEXT)")
+_PROOF_TABLE = ("CREATE TABLE IF NOT EXISTS owner_proof_used (nonce TEXT PRIMARY KEY, "
+                "action TEXT, target TEXT, used_at TEXT)")
+
+
+def _proof_triggers(c) -> None:
     for name, verb in _PROOF_TRIGGERS.items():
         c.execute(f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {verb} ON owner_proof_used"
                   " BEGIN SELECT RAISE(ABORT, 'owner_proof_used is append-only'); END")
+
+
+def _chain_triggers(c) -> None:
+    for name, verb in _CHAIN_TRIGGERS.items():
+        c.execute(f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {verb} ON"
+                  " agent_auth_api_chain BEGIN SELECT RAISE(ABORT,"
+                  " 'agent_auth_api_chain is append-only'); END")
+
+
+def ensure_proof_table(c) -> None:
+    """The spent-nonce table for any owner proof. Triggers come only with a brand-new ledger,
+    never onto an existing one: this runs on every proof, so repairing here would erase what
+    _chain_problem must keep seeing. Restoring them is the owner's step (reanchor). The
+    caller owns the transaction."""
+    have = {r[0] for r in c.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN"
+        " ('owner_proof_used','agent_auth_api_chain')")}
+    if "owner_proof_used" in have:
+        return
+    c.execute(_PROOF_TABLE)
+    if "agent_auth_api_chain" not in have:
+        _proof_triggers(c)
 
 
 # ── head anchor: the chain's latest row, recorded outside the DB and keyed ────────
@@ -249,7 +273,8 @@ def _anchor_problem(hashes: list) -> bool:
 
 def _chain(c):
     """The append-only API launch chain. Created once, table and triggers together, and
-    never repaired afterwards: a dropped trigger must stay visible to _chain_problem."""
+    repaired only by the owner (reanchor): a dropped trigger must stay visible to
+    _chain_problem."""
     if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND"
                  " name='agent_auth_api_chain'").fetchone():
         return c
@@ -262,11 +287,9 @@ def _chain(c):
             project_dir TEXT NOT NULL, model TEXT NOT NULL, risk TEXT NOT NULL,
             actor TEXT NOT NULL, nonce TEXT NOT NULL UNIQUE, prev_hash TEXT NOT NULL,
             hash TEXT NOT NULL)""")
-        for name, verb in _CHAIN_TRIGGERS.items():
-            c.execute(f"CREATE TRIGGER IF NOT EXISTS {name} BEFORE {verb} ON"
-                      " agent_auth_api_chain BEGIN SELECT RAISE(ABORT,"
-                      " 'agent_auth_api_chain is append-only'); END")
-        ensure_proof_table(c)
+        _chain_triggers(c)
+        c.execute(_PROOF_TABLE)
+        _proof_triggers(c)
         c.commit()
     except BaseException:
         c.rollback()
@@ -284,7 +307,10 @@ def _chain_problem(c) -> Optional[str]:
     if not (set(_CHAIN_TRIGGERS) | set(_PROOF_TRIGGERS)) <= have:
         return "api_ledger_tampered"
     why, hashes = _chain_rows_problem(c)
-    return why or ("api_ledger_tampered" if _anchor_problem(hashes) else None)
+    if why or not _anchor_problem(hashes):
+        return why
+    from core import agent_control as ac
+    return "api_ledger_tampered" if ac._owner_key() is not None else "owner_proof_unconfigured"
 
 
 def _chain_rows_problem(c) -> tuple:
@@ -362,17 +388,40 @@ def commit_api_launch(*, session: str, project_dir: str, model: str, risk: str =
 
 
 def reanchor(conn=None) -> dict:
-    """Owner step after a key rotation: re-sign the head of an intact chain. A chain whose
-    own rows are damaged is refused; judging a shorter chain as complete is the owner's."""
+    """Owner step: re-sign the head of an intact chain after a key rotation, restore missing
+    triggers (a DB from before them, or one the refusal reported; the names are returned so
+    they get looked at), and clear the anchor of a chain reset to empty. A chain whose own
+    rows are damaged is refused; judging a shorter chain as complete is the owner's."""
+    from core import agent_control as ac
     c = _chain(_ledger(conn))
     try:
+        if ac._owner_key() is None:
+            return {"ok": False, "reason": "owner_proof_unconfigured"}
         with _anchor_lock():
-            why, hashes = _chain_rows_problem(c)
-            if why:
-                return {"ok": False, "reason": why}
+            if c.in_transaction:
+                c.commit()
+            c.execute("BEGIN IMMEDIATE")
+            try:
+                c.execute(_PROOF_TABLE)
+                why, hashes = _chain_rows_problem(c)
+                if why:
+                    c.rollback()
+                    return {"ok": False, "reason": why}
+                have = {r[0] for r in c.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'")}
+                missing = sorted((set(_CHAIN_TRIGGERS) | set(_PROOF_TRIGGERS)) - have)
+                _chain_triggers(c)
+                _proof_triggers(c)
+                c.commit()
+            except BaseException:
+                c.rollback()
+                raise
             if hashes:
                 _write_anchor(len(hashes), hashes[-1])
-            return {"ok": True, "rows": len(hashes)}
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(_anchor_path())
+            return {"ok": True, "rows": len(hashes), "restored_triggers": missing}
     finally:
         if conn is None:
             c.close()

@@ -507,7 +507,7 @@ def test_r6_key_rotation_refuses_until_the_owner_reanchors(wt, api_cfg, tmp_path
     kf.chmod(0o600)
     monkeypatch.setenv("AGENT_OWNER_PROOF_KEY_FILE", str(kf))
     assert _state() == "api_ledger_tampered"
-    assert aam.reanchor() == {"ok": True, "rows": 2}
+    assert aam.reanchor() == {"ok": True, "rows": 2, "restored_triggers": []}
     assert _state() is None
 
 
