@@ -221,3 +221,36 @@ def test_localhost_strips_credentials_from_every_child(fake_claude, monkeypatch)
     assert not [n for n in names if aam.is_api_env_var(n)]
     assert "ANTHROPIC_FUTURE_CREDENTIAL" not in names and "CLAUDE_CODE_USE_SOMETHING_NEW" not in names
     assert {"PROJECT_SETTING", "CHECK_VAR", "PATH"} <= names     # a check keeps its environment
+
+
+# ── R1: the allowlist against what this repo configures ─────────────────────────
+CLI_FAMILIES = re.compile(r"^(CLAUDE|ANTHROPIC|DISABLE_|NODE_|MAX_THINKING|HTTPS?_PROXY|ALL_PROXY)")
+
+
+def _repo_env_names() -> set:
+    """Every variable a deploy file or launcher script sets."""
+    names = set()
+    pat = re.compile(r"^\s*(?:Environment=\"?|export\s+)([A-Za-z_][A-Za-z0-9_]*)=", re.M)
+    for f in [*(ROOT / "deploy").rglob("*"), *(ROOT / "tools").glob("*.sh")]:
+        if f.is_file():
+            names |= set(pat.findall(f.read_text(errors="replace")))
+    return names
+
+
+def test_r1_nothing_this_repo_sets_for_the_cli_is_dropped():
+    names = _repo_env_names()
+    assert "OWNER_OS_CTO_PROVIDER" in names           # the scan really reads the deploy files
+    meant_for_the_cli = {n for n in names if CLI_FAMILIES.match(n)}
+    env = aam.subscription_env({n: "x" for n in meant_for_the_cli})
+    dropped = {n for n in meant_for_the_cli if n not in env and not aam.is_api_env_var(n)}
+    assert dropped == set()
+
+
+@pytest.mark.parametrize("name", ["DISABLE_AUTOUPDATER", "DISABLE_TELEMETRY", "ALL_PROXY",
+                                  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "MAX_THINKING_TOKENS"])
+def test_r1_behaviour_switches_reach_the_child(fake_claude, monkeypatch, name):
+    from core import native_sessions as ns
+    monkeypatch.setattr(ns, "_BIN", fake_claude[0])
+    monkeypatch.setenv(name, "1")
+    ns._list_raw()
+    assert fake_claude[1]()[0]["env"][name] == "1"

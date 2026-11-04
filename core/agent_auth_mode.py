@@ -80,8 +80,14 @@ API_ENV_VARS = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_CUSTOM_H
 SUBSCRIPTION_ENV_KEEP = frozenset({
     "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "TERM",
     "TMPDIR", "TEMP", "TMP", "CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy",
-    "https_proxy", "no_proxy", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR"})
+    "CLAUDE_CODE_TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy",
+    "https_proxy", "all_proxy", "no_proxy", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    # R1: behaviour switches that hold no credential and move no traffic to another biller.
+    # DISABLE_AUTOUPDATER matters most: without it a child could update the shared binary.
+    "DISABLE_AUTOUPDATER", "DISABLE_TELEMETRY", "DISABLE_ERROR_REPORTING",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+    "MAX_THINKING_TOKENS"})
 SUBSCRIPTION_ENV_KEEP_PREFIXES = ("LC_", "XDG_")
 
 _CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
