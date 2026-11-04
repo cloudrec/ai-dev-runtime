@@ -88,11 +88,24 @@ _RUNNER_ALLOWED_SUBCMDS = {"npm": {"test"}, "go": {"test", "vet"}, "cargo": {"te
                            "make": {"test", "check"}}
 
 
+def _names_api_launcher(argv: list) -> bool:
+    from core import agent_auth_mode as aam
+    names = {os.path.basename(aam.DEFAULT_LAUNCHER)}
+    cfg = aam.load_config()
+    if cfg.get("launcher"):
+        names.add(os.path.basename(str(cfg["launcher"])))
+    return any(n and n in a for a in argv for n in names)
+
+
 def check_argv(argv: list, *, root: str, trusted: bool) -> Optional[str]:
     """None = may run. Trusted (spec-authored) checks only need to be argv lists;
     untrusted ones are confined to a test runner over project files."""
     if not argv or not all(isinstance(a, str) for a in argv):
         return "check_not_argv"
+    # The API launcher never runs as a check, trusted or not: that path has no owner proof,
+    # cap or ledger (N2). Any argument counts, so `sh -c "claude-owner-api …"` is caught.
+    if _names_api_launcher(argv):
+        return "check_api_launcher_forbidden"
     if trusted:
         return None
     import sys
