@@ -47,6 +47,7 @@ import json
 import os
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from typing import Callable, Optional
 
 from core import task_contract as tc
@@ -205,33 +206,50 @@ def agent_report(**fields) -> dict:
 
 
 # ── immutable decision audit ───────────────────────────────────────────────────
-def _audit(conn, *, action: str, review_id: Optional[int], actor: str, auth: str = "",
-           decision: str = "", key: str = "", outcome: str = "", body=None,
-           ts: Optional[float] = None) -> str:
-    """Append one hash-chained row to fc_decision_audit (UPDATE/DELETE are refused by
-    triggers). Each hash covers the previous one, so a rewritten row breaks the chain
-    (verify_decision_audit). Serialised with BEGIN IMMEDIATE so the chain never forks."""
+@contextmanager
+def _tx(conn):
+    """One write transaction: a state change and the audit row that records it commit or
+    roll back together, so a decided review without its audit row cannot exist (F1).
+    BEGIN IMMEDIATE takes the write lock first: what the block reads stays true until it
+    commits, and the audit chain never forks. Work the caller left open commits first."""
     if conn.in_transaction:
         conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        r = conn.execute("SELECT hash FROM fc_decision_audit ORDER BY seq DESC LIMIT 1").fetchone()
-        prev = r[0] if r else ""
-        row = {"ts": ts if ts is not None else now_ts(), "review_id": review_id,
-               "action": action, "decision": decision or "", "decision_key": key or "",
-               "actor": actor or "", "auth": auth or "", "outcome": outcome or "",
-               "body_sha": hashlib.sha256(_j(body).encode()).hexdigest() if body is not None
-               else ""}
-        h = hashlib.sha256((prev + "|" + json.dumps(row, sort_keys=True)).encode()).hexdigest()
-        conn.execute(
-            "INSERT INTO fc_decision_audit (ts, review_id, action, decision, decision_key,"
-            " actor, auth, outcome, body_sha, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            (row["ts"], review_id, action, row["decision"], row["decision_key"], row["actor"],
-             row["auth"], row["outcome"], row["body_sha"], prev, h))
+        yield conn
         conn.commit()
-    except Exception:
+    except BaseException:
         conn.rollback()
         raise
+
+
+def _audit(conn, *, action: str, review_id: Optional[int], actor: str, auth: str = "",
+           decision: str = "", key: str = "", outcome: str = "", body=None,
+           ts: Optional[float] = None, in_tx: bool = False) -> str:
+    """Append one hash-chained row to fc_decision_audit (UPDATE/DELETE are refused by
+    triggers). Each hash covers the previous one, so a rewritten row breaks the chain
+    (verify_decision_audit). Alone, it runs in its own transaction. With in_tx=True it
+    joins the caller's `_tx` and never commits: the row lands with the state change."""
+    if not in_tx:
+        with _tx(conn):
+            return _audit(conn, action=action, review_id=review_id, actor=actor, auth=auth,
+                          decision=decision, key=key, outcome=outcome, body=body, ts=ts,
+                          in_tx=True)
+    if not conn.in_transaction:
+        raise EngineError("audit in_tx=True outside a transaction")
+    r = conn.execute("SELECT hash FROM fc_decision_audit ORDER BY seq DESC LIMIT 1").fetchone()
+    prev = r[0] if r else ""
+    row = {"ts": ts if ts is not None else now_ts(), "review_id": review_id,
+           "action": action, "decision": decision or "", "decision_key": key or "",
+           "actor": actor or "", "auth": auth or "", "outcome": outcome or "",
+           "body_sha": hashlib.sha256(_j(body).encode()).hexdigest() if body is not None
+           else ""}
+    h = hashlib.sha256((prev + "|" + json.dumps(row, sort_keys=True)).encode()).hexdigest()
+    conn.execute(
+        "INSERT INTO fc_decision_audit (ts, review_id, action, decision, decision_key,"
+        " actor, auth, outcome, body_sha, prev_hash, hash) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (row["ts"], review_id, action, row["decision"], row["decision_key"], row["actor"],
+         row["auth"], row["outcome"], row["body_sha"], prev, h))
     return h
 
 
@@ -296,16 +314,16 @@ def ack_review(review_id: int, *, by: str, auth: str = "", conn=None) -> dict:
     by = _require_actor(by)
     conn, own = connect(conn)
     try:
-        cur = conn.execute("UPDATE fc_review SET acked_ts=?, acked_by=? WHERE id=? AND"
-                           " acked_ts IS NULL", (now_ts(), by, review_id))
-        conn.commit()
-        r = conn.execute("SELECT acked_ts, acked_by FROM fc_review WHERE id=?",
-                         (review_id,)).fetchone()
-        if not r:
-            raise EngineError(f"no such review {review_id}")
-        if cur.rowcount == 1:
-            _audit(conn, action="ack", review_id=review_id, actor=by, auth=auth,
-                   outcome="acked")
+        with _tx(conn):
+            cur = conn.execute("UPDATE fc_review SET acked_ts=?, acked_by=? WHERE id=? AND"
+                               " acked_ts IS NULL", (now_ts(), by, review_id))
+            r = conn.execute("SELECT acked_ts, acked_by FROM fc_review WHERE id=?",
+                             (review_id,)).fetchone()
+            if not r:
+                raise EngineError(f"no such review {review_id}")
+            if cur.rowcount == 1:
+                _audit(conn, action="ack", review_id=review_id, actor=by, auth=auth,
+                       outcome="acked", in_tx=True)
         return {"review_id": review_id, "acked_ts": r[0], "acked_by": r[1]}
     finally:
         if own:
@@ -327,51 +345,58 @@ def submit_decision(review_id: int, decision: str, *, key: str, by: str,
 
     def refused(reason: str, **extra) -> dict:
         _audit(conn, action="decide", review_id=review_id, actor=by, auth=auth,
-               decision=decision, key=key, outcome=reason)
+               decision=decision, key=key, outcome=reason, in_tx=True)
         return {"ok": False, "duplicate": False, "reason": reason, "review_id": review_id,
                 **extra}
     try:
-        spent = conn.execute("SELECT review_id, decision FROM fc_decision_audit WHERE"
-                             " decision_key=? AND action='decide' AND outcome='accepted'"
-                             " ORDER BY seq LIMIT 1", (key,)).fetchone()
-        seen = conn.execute("SELECT id, decision FROM fc_review WHERE decision_key=?",
-                            (key,)).fetchone()
-        if spent and not seen:
-            # the key's decision was consumed and its review reopened since (D-2)
-            return refused("decision_key_already_used", decision=spent[1])
-        if seen:
-            return {"ok": seen[0] == review_id, "duplicate": True, "review_id": seen[0],
-                    "decision": seen[1]}
-        r = conn.execute("SELECT kind, status, project_id FROM fc_review WHERE id=?",
-                         (review_id,)).fetchone()
-        if not r:
-            raise EngineError(f"no such review {review_id}")
-        kind, status, project_id = r
-        if status == "superseded":
-            # a stall alert retired by the late result it was about (_supersede_stall)
-            return refused("review_superseded")
-        if status != "pending":
-            return refused("review_already_decided")
-        if decision not in REVIEW_DECISIONS[kind]:
-            raise EngineError(f"{kind} review takes {REVIEW_DECISIONS[kind]}, not {decision!r}")
-        if decision in ("reject", "answer") and not feedback.strip():
-            raise EngineError(f"{decision} needs feedback for the agent")
-        tasks = [specs.validate_task(t, f"next_tasks[{i}]")
-                 for i, t in enumerate(next_tasks or [])]
-        if decision == "add_tasks" and not tasks:
-            raise EngineError("add_tasks needs next_tasks")
-        cur = conn.execute(
-            "UPDATE fc_review SET status='decided', decision=?, decision_key=?, decided_by=?,"
-            " decision_body=?, decided_ts=? WHERE id=? AND status='pending'",
-            (decision, key, by, _j({"feedback": feedback, "next_tasks": tasks}), now_ts(),
-             review_id))
-        conn.commit()
-        if cur.rowcount != 1:
-            return refused("review_already_decided")
-        _audit(conn, action="decide", review_id=review_id, actor=by, auth=auth,
-               decision=decision, key=key, outcome="accepted",
-               body={"feedback": feedback, "next_tasks": tasks})
-        return {"ok": True, "duplicate": False, "review_id": review_id, "decision": decision}
+        # One transaction from the spent-key read to the audit row (F1): any failure leaves
+        # the review pending with no audit row, and a reader never sees one without the other.
+        with _tx(conn):
+            # `review_reopened` carries the key its reopen cleared, so a key stays spent
+            # even for a decision whose `accepted` row was lost before this was atomic.
+            spent = conn.execute(
+                "SELECT review_id, decision FROM fc_decision_audit WHERE decision_key=? AND"
+                " ((action='decide' AND outcome='accepted') OR action='review_reopened')"
+                " ORDER BY seq LIMIT 1", (key,)).fetchone()
+            seen = conn.execute("SELECT id, decision FROM fc_review WHERE decision_key=?",
+                                (key,)).fetchone()
+            if spent and not seen:
+                # the key's decision was consumed and its review reopened since (D-2)
+                return refused("decision_key_already_used", decision=spent[1])
+            if seen:
+                return {"ok": seen[0] == review_id, "duplicate": True, "review_id": seen[0],
+                        "decision": seen[1]}
+            r = conn.execute("SELECT kind, status, project_id FROM fc_review WHERE id=?",
+                             (review_id,)).fetchone()
+            if not r:
+                raise EngineError(f"no such review {review_id}")
+            kind, status, project_id = r
+            if status == "superseded":
+                # a stall alert retired by the late result it was about (_supersede_stall)
+                return refused("review_superseded")
+            if status != "pending":
+                return refused("review_already_decided")
+            if decision not in REVIEW_DECISIONS[kind]:
+                raise EngineError(
+                    f"{kind} review takes {REVIEW_DECISIONS[kind]}, not {decision!r}")
+            if decision in ("reject", "answer") and not feedback.strip():
+                raise EngineError(f"{decision} needs feedback for the agent")
+            tasks = [specs.validate_task(t, f"next_tasks[{i}]")
+                     for i, t in enumerate(next_tasks or [])]
+            if decision == "add_tasks" and not tasks:
+                raise EngineError("add_tasks needs next_tasks")
+            cur = conn.execute(
+                "UPDATE fc_review SET status='decided', decision=?, decision_key=?,"
+                " decided_by=?, decision_body=?, decided_ts=? WHERE id=? AND status='pending'",
+                (decision, key, by, _j({"feedback": feedback, "next_tasks": tasks}), now_ts(),
+                 review_id))
+            if cur.rowcount != 1:
+                return refused("review_already_decided")
+            _audit(conn, action="decide", review_id=review_id, actor=by, auth=auth,
+                   decision=decision, key=key, outcome="accepted",
+                   body={"feedback": feedback, "next_tasks": tasks}, in_tx=True)
+            return {"ok": True, "duplicate": False, "review_id": review_id,
+                    "decision": decision}
     finally:
         if own:
             conn.close()
@@ -948,26 +973,32 @@ class Engine:
             self._request_review(task, "blocked", payload)
             return
         payload = {**payload, "after_stall": stall.get("stalled")}
-        if stall["status"] == "pending":
-            cur = self.conn.execute("UPDATE fc_review SET payload=? WHERE id=? AND"
-                                    " status='pending'", (_j(payload), stall["id"]))
-            what = "report"
-        else:
-            # the earlier decision stays in fc_decision_audit; its key stays spent
-            cur = self.conn.execute(
-                "UPDATE fc_review SET status='pending', payload=?, decision=NULL,"
-                " decision_key=NULL, decided_by=NULL, decision_body=NULL, decided_ts=NULL,"
-                " acked_ts=NULL, acked_by=NULL, applied=0 WHERE id=?",
-                (_j(payload), stall["id"]))
-            # a new question gets a new hold clock and no carried-over owner attestation
-            self.conn.execute("DELETE FROM fc_escalation WHERE review_id=?", (stall["id"],))
-            what = "reopened"
-        self.conn.commit()
-        if cur.rowcount != 1:
-            return
-        h = _audit(self.conn, action=f"review_{what}", review_id=stall["id"],
-                   actor=SOURCE, auth="engine", outcome=f"prior_status:{stall['status']}",
-                   ts=self.clock())
+        with _tx(self.conn):
+            prior_key, prior_decision = "", ""
+            if stall["status"] == "pending":
+                cur = self.conn.execute("UPDATE fc_review SET payload=? WHERE id=? AND"
+                                        " status='pending'", (_j(payload), stall["id"]))
+                what = "report"
+            else:
+                # the earlier decision stays in fc_decision_audit; its key stays spent
+                # (the reopen row below names the key this UPDATE clears)
+                prior_key, prior_decision = self.conn.execute(
+                    "SELECT COALESCE(decision_key,''), COALESCE(decision,'') FROM fc_review"
+                    " WHERE id=?", (stall["id"],)).fetchone()
+                cur = self.conn.execute(
+                    "UPDATE fc_review SET status='pending', payload=?, decision=NULL,"
+                    " decision_key=NULL, decided_by=NULL, decision_body=NULL, decided_ts=NULL,"
+                    " acked_ts=NULL, acked_by=NULL, applied=0 WHERE id=?",
+                    (_j(payload), stall["id"]))
+                # a new question gets a new hold clock and no carried-over owner attestation
+                self.conn.execute("DELETE FROM fc_escalation WHERE review_id=?",
+                                  (stall["id"],))
+                what = "reopened"
+            if cur.rowcount != 1:
+                return
+            h = _audit(self.conn, action=f"review_{what}", review_id=stall["id"],
+                       actor=SOURCE, auth="engine", decision=prior_decision, key=prior_key,
+                       outcome=f"prior_status:{stall['status']}", ts=self.clock(), in_tx=True)
         eid = self._event(REVIEW_EVENT, task["id"], {
             "fullcycle": "blocked", "review_id": stall["id"], "project": self.project_id,
             "task": task["key"], "attempt": task["attempt"], **payload,
@@ -1001,15 +1032,17 @@ class Engine:
         stall = self._stall_review(task, task["attempt"])
         if not (stall and stall["status"] == "pending"):
             return
-        cur = self.conn.execute(
-            "UPDATE fc_review SET status='superseded', decided_by='engine', decided_ts=?,"
-            " decision_body=? WHERE id=? AND status='pending'",
-            (self.clock(), _j({"reason": reason, "attempt": task["attempt"]}),
-             stall["id"]))
-        self.conn.commit()
+        with _tx(self.conn):
+            cur = self.conn.execute(
+                "UPDATE fc_review SET status='superseded', decided_by='engine', decided_ts=?,"
+                " decision_body=? WHERE id=? AND status='pending'",
+                (self.clock(), _j({"reason": reason, "attempt": task["attempt"]}),
+                 stall["id"]))
+            if cur.rowcount == 1:
+                _audit(self.conn, action="review_superseded", review_id=stall["id"],
+                       actor=SOURCE, auth="engine", outcome=reason, ts=self.clock(),
+                       in_tx=True)
         if cur.rowcount == 1:
-            _audit(self.conn, action="review_superseded", review_id=stall["id"],
-                   actor=SOURCE, auth="engine", outcome=reason, ts=self.clock())
             self._note("stall_alert_superseded", task=task["key"], review_id=stall["id"],
                        reason=reason)
 
@@ -1097,13 +1130,14 @@ class Engine:
         if esc["reason"] or held < STALL_HOLD_TIMEOUT:
             return False
         reason = f"{HOLD_GATE_PREFIX}:{what}"
-        cur = self.conn.execute("UPDATE fc_escalation SET reason=?, ts=? WHERE review_id=? AND"
-                                " COALESCE(reason,'')=''", (reason, self.clock(), review["id"]))
-        self.conn.commit()
-        if cur.rowcount != 1:
-            return False
-        _audit(self.conn, action="hold_escalated", review_id=review["id"], actor=SOURCE,
-               auth="engine", outcome=reason, ts=self.clock())
+        with _tx(self.conn):
+            cur = self.conn.execute(
+                "UPDATE fc_escalation SET reason=?, ts=? WHERE review_id=? AND"
+                " COALESCE(reason,'')=''", (reason, self.clock(), review["id"]))
+            if cur.rowcount != 1:
+                return False
+            _audit(self.conn, action="hold_escalated", review_id=review["id"], actor=SOURCE,
+                   auth="engine", outcome=reason, ts=self.clock(), in_tx=True)
         self._set(task, redispatch=0)
         self._move(task, tc.BLOCKED)
         if task["gate_id"]:                      # (an older gate cannot carry this reason)
@@ -1407,16 +1441,16 @@ class Engine:
                 continue
             self._lead()
             answer = (r[1] or "").strip().lower()
-            self.conn.execute("UPDATE owner_gate SET state='resolved' WHERE id=?",
-                              (task["gate_id"],))
-            self.conn.commit()
             reason = task["last_reason"]
             gate_id = task["gate_id"]
+            with _tx(self.conn):
+                self.conn.execute("UPDATE owner_gate SET state='resolved' WHERE id=?",
+                                  (gate_id,))
+                if str(reason or "").startswith(HOLD_GATE_PREFIX):
+                    _audit(self.conn, action="owner_answered_hold", review_id=None,
+                           actor=f"owner_gate:{gate_id}", auth="owner_gate", decision=answer,
+                           outcome=reason, ts=self.clock(), in_tx=True)
             self._set(task, gate_id="")
-            if str(reason or "").startswith(HOLD_GATE_PREFIX):
-                _audit(self.conn, action="owner_answered_hold", review_id=None,
-                       actor=f"owner_gate:{gate_id}", auth="owner_gate", decision=answer,
-                       outcome=reason, ts=self.clock())
             if answer in OWNER_CANCEL:
                 self._move(task, tc.CANCELLED)
             elif answer in OWNER_RESUME and str(reason or "").startswith(HOLD_GATE_PREFIX):
