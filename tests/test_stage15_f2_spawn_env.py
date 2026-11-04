@@ -181,3 +181,23 @@ def test_every_claude_spawn_site_uses_the_helper():
 ])
 def test_the_guard_itself_catches_an_unsafe_spawn(src, expected):
     assert _unsafe_spawns(src) == expected
+
+
+# ── fullcycle LocalHost: the audit's F2 residual ────────────────────────────────
+def test_localhost_gives_a_direct_claude_the_subscription_env(fake_claude):
+    from core.fullcycle.hosts import LocalHost
+    rc, out, _ = LocalHost().run([fake_claude[0], "--version"], env={"ANTHROPIC_API_KEY": "x"})
+    assert rc == 0 and "9.9.9" in out
+    call = fake_claude[1]()[0]
+    _assert_clean(call)
+    assert "NODE_OPTIONS" not in call["env"]
+
+
+def test_localhost_strips_credentials_from_every_child(fake_claude, monkeypatch):
+    from core.fullcycle.hosts import LocalHost
+    monkeypatch.setenv("PROJECT_SETTING", "kept")
+    rc, out, _ = LocalHost().run(["sh", "-c", "env"], env={"CHECK_VAR": "1"})
+    assert rc == 0
+    names = {line.split("=", 1)[0] for line in out.splitlines()}
+    assert not names & set(aam.API_ENV_VARS)
+    assert {"PROJECT_SETTING", "CHECK_VAR", "PATH"} <= names     # a check keeps its environment

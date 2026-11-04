@@ -18,6 +18,8 @@ import subprocess
 from abc import ABC, abstractmethod
 from typing import Optional, Sequence
 
+from core.agent_auth_mode import API_ENV_VARS, subscription_env
+
 
 class HostError(RuntimeError):
     pass
@@ -51,6 +53,15 @@ class ExecutionHost(ABC):
         return self.run(["test", "-e", path])[0] == 0
 
 
+def _child_env(argv: Sequence[str], env: Optional[dict]) -> dict:
+    """No local child inherits API credentials, whatever it is: a check script may call
+    `claude` itself. A direct `claude` gets the full subscription allowlist (F2)."""
+    merged = {**os.environ, **(env or {})}
+    if argv and os.path.basename(str(argv[0])) == "claude":
+        return subscription_env(merged)
+    return {k: v for k, v in merged.items() if k not in API_ENV_VARS}
+
+
 class LocalHost(ExecutionHost):
     kind = "local"
     tested = True
@@ -58,7 +69,7 @@ class LocalHost(ExecutionHost):
     def run(self, argv, *, cwd=None, timeout=60, stdin=None, env=None):
         try:
             p = subprocess.run(list(argv), cwd=cwd, input=stdin, capture_output=True,
-                               timeout=timeout, env={**os.environ, **env} if env else None)
+                               timeout=timeout, env=_child_env(argv, env))
         except subprocess.TimeoutExpired:
             return 124, "", f"timeout after {timeout}s"
         except FileNotFoundError as e:
