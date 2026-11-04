@@ -94,7 +94,7 @@ def _after_wrapper(exe: str, words: list, i: int) -> int:
 def _script_runs_claude(script: str) -> bool:
     """Whether a shell string has `claude` in command position. Quoting is honoured, so a
     word inside an argument stays data; a string that cannot be parsed is read loosely."""
-    plain = _REDIRECT_FD.sub("", script.translate({ord("\n"): ";", ord("`"): ";"}))
+    plain = _REDIRECT_FD.sub(" ", script.translate({ord("\n"): ";", ord("`"): ";"}))
     lex = shlex.shlex(plain, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
     lex.commenters = ""

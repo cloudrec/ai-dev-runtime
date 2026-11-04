@@ -197,7 +197,7 @@ def test_l3_a_persistent_write_failure_starts_nothing(wt, api_cfg, monkeypatch):
     ["sh", "-c", "command -v claude"], ["command", "-V", "claude"],
     ["sh", "-c", "cat f > claude"], ["sh", "-c", "pytest 2>&1 > claude; wc -l < claude"],
     ["sh", "-c", "x 2>&1 claude"], ["sh", "-c", "sleep 2 > claude"],
-    ["sh", "-c", "echo;>claude x"]])
+    ["sh", "-c", "echo;>claude x"], ["sh", "-c", "echo '|2>|' claude"]])
 def test_l2_a_word_in_an_argument_is_data(argv):
     from core.fullcycle import hosts
     assert hosts._runs_claude(argv) is False
@@ -224,7 +224,9 @@ def test_l2_a_word_in_an_argument_is_data(argv):
     ["sh", "-c", "nice -n 10 >/dev/null claude -p x"], ["sh", "-c", "timeout -k 5 >out claude"],
     ["sh", "-c", "sudo -u 0 >f claude"], ["sh", "-c", "echo;>f claude"],
     ["sh", "-c", "x &&>log claude"], ["sh", "-c", "(>f claude)"], ["sh", "-c", "a |>f claude"],
-    ["sh", "-c", "diff <(claude -p x) f"], ["sh", "-c", "true;2>f claude"]])
+    ["sh", "-c", "diff <(claude -p x) f"], ["sh", "-c", "true;2>f claude"],
+    ["sh", "-c", "x &2>/dev/null claude -p y"], ["sh", "-c", "x&2>&1 claude"],
+    ["sh", "-c", "x &1>f claude"]])
 def test_l2_claude_in_command_position_is_seen(argv):
     from core.fullcycle import hosts
     assert hosts._runs_claude(argv) is True
