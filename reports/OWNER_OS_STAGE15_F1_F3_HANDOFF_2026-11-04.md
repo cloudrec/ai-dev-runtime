@@ -36,3 +36,17 @@ Nothing was deployed. No PROD, live DB, server auth, credential or paid API was 
 
 ## Rollback
 Branch only. `git revert f6c76ef efd4837 ad76c5b` (any subset), or delete the branch. `agent_auth_api_chain` is only created by an API launch attempt, which is disabled.
+
+## Post-audit fixes (after `reports/OWNER_OS_STAGE15_FABLE_AUDIT_2026-11-04.md`)
+Branch `owneros/stage15-audit-fixes`, from `owneros/stage15-f1-f3` @ `e94a32e`. Requested by the user in this session. Not pushed, not deployed. **Fable reviewed only `53e7a2b..f6c76ef`; these commits are not audited.**
+
+| commit | item | change |
+|---|---|---|
+| `353e5ba` | F2 residual | `LocalHost.run`: every child loses `API_ENV_VARS`; a direct `claude` gets `subscription_env` |
+| `3674163` | R2 | HMAC v2 signs a compact JSON array (`api/v1.py` `hmac_v2_message`). Changed in place: no client signs v2 yet |
+| `28b38d5` | R3 | `_tx`, `submit_decision` and `ack_review` raise `EngineError` on open caller work instead of committing it |
+| `2d762c4` | R4 | `commit_api_launch` re-verifies signature, expiry and binding inside the spend transaction |
+
+Full suite at `2d762c4`: **4502 passed, 4 skipped, 0 failed, exit code 0**, 565 s, one run. Log: `reports/stage15/full_suite_2d762c4.txt`. Delta from `f6c76ef`: +14 tests.
+
+Still open from the audit: R1 (allowlist drops non-credential settings), R6 (`owner_proof_used` unprotected), F5 legacy default, F6 and F7 partial, and the 5 sandbox E2E conditions. Rollback: `git revert` any of the four commits, or delete the branch.
