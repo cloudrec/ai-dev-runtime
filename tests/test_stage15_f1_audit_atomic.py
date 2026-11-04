@@ -134,6 +134,17 @@ def test_in_tx_audit_outside_a_transaction_is_a_bug_not_a_silent_write(db):
         fe._audit(conn, action="x", review_id=None, actor="t", in_tx=True)
 
 
+def test_open_caller_work_is_refused_not_committed_on_its_behalf(db):
+    conn, rid = db
+    conn.execute("UPDATE fc_review SET payload='uncommitted' WHERE id=?", (rid,))
+    with pytest.raises(fe.EngineError, match="already open"):
+        fe.submit_decision(rid, "approve", key="k1", by="api:client/r", conn=conn)
+    assert conn.in_transaction
+    conn.rollback()
+    assert conn.execute("SELECT payload, status FROM fc_review WHERE id=?", (rid,)
+                        ).fetchone() == ("{}", "pending")
+
+
 def test_a_key_from_before_atomicity_stays_spent_after_reopen(fc, monkeypatch):  # noqa: F811
     """A decision left without its `accepted` row by the old code: the reopen row names the
     key it clears, so a replay is refused even though no `accepted` row ever existed."""

@@ -206,14 +206,19 @@ def agent_report(**fields) -> dict:
 
 
 # ── immutable decision audit ───────────────────────────────────────────────────
+def _refuse_open_tx(conn) -> None:
+    if conn is not None and conn.in_transaction:
+        raise EngineError("transaction already open on this connection")
+
+
 @contextmanager
 def _tx(conn):
     """One write transaction: a state change and the audit row that records it commit or
     roll back together, so a decided review without its audit row cannot exist (F1).
     BEGIN IMMEDIATE takes the write lock first: what the block reads stays true until it
-    commits, and the audit chain never forks. Work the caller left open commits first."""
-    if conn.in_transaction:
-        conn.commit()
+    commits, and the audit chain never forks. Work the caller left open is refused, never
+    committed on its behalf: its atomicity is the caller's to decide (audit R3)."""
+    _refuse_open_tx(conn)
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
@@ -312,6 +317,7 @@ def _require_actor(by: str) -> str:
 def ack_review(review_id: int, *, by: str, auth: str = "", conn=None) -> dict:
     """The reviewer saw the wake. Idempotent: the first ack is kept."""
     by = _require_actor(by)
+    _refuse_open_tx(conn)                 # before connect(), which commits
     conn, own = connect(conn)
     try:
         with _tx(conn):
@@ -341,6 +347,7 @@ def submit_decision(review_id: int, decision: str, *, key: str, by: str,
     if not key or not key.strip():
         raise EngineError("decision key required")
     by = _require_actor(by)
+    _refuse_open_tx(conn)                 # before connect(), which commits
     conn, own = connect(conn)
 
     def refused(reason: str, **extra) -> dict:
