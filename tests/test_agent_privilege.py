@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1054,3 +1055,68 @@ def test_recovery_still_starts_in_the_agents_own_tree(sandbox, monkeypatch):
     res, calls = _recover(monkeypatch, project)
     assert "agent_run_as" not in str(res.get("reason"))
     assert len(calls) == 1 and f"--reuid={t.uid}" in " ".join(calls[0])
+
+
+# ── root reads of files the agent writes ────────────────────────────────────
+def _bounded(call):
+    """A FIFO hangs an unguarded open(), so the read runs where it cannot hang the suite."""
+    out = []
+    worker = threading.Thread(target=lambda: out.append(call()), daemon=True)
+    worker.start()
+    worker.join(5)
+    assert out, "the read hung"
+    return out[0]
+
+
+def _reads(tree):
+    """Each root read of an agent-written file, and the answer that means it read nothing."""
+    from core import continuation_governor as cg
+    from core import project_supervisor as ps
+    plan = os.path.join(tree, "PROJECT_PLAN.md")
+    conf = {"t": {"enabled": True, "authoritative_pointer": plan}}
+    return {
+        "plan": (plan, lambda: ps.parse_plan(tree), lambda r: r["ok"] is False),
+        "handoff": (os.path.join(tree, ps.HANDOFF_PATH), lambda: ps.read_handoff(tree),
+                    lambda r: r == {"_malformed": True}),
+        "resume": (plan, lambda: cg.resume_instruction(plan), lambda r: r == ""),
+        "yaml": (plan, lambda: cg.parse_queue_yaml(plan),
+                 lambda r: r["reason"].startswith("queue_unreadable")),
+        "queue": (plan, lambda: cg.parse_queue(plan),
+                  lambda r: r["reason"].startswith("queue_unreadable")),
+        "pointer": (plan, lambda: cg.read_pointer("t", conf),
+                    lambda r: r["reason"].startswith("pointer_unreadable")),
+    }
+
+
+READS = ["plan", "handoff", "resume", "yaml", "queue", "pointer"]
+
+
+@real
+@pytest.mark.parametrize("read", READS)
+@pytest.mark.parametrize("kind", ["link", "fifo"])
+def test_root_reads_refuse_a_planted_file(sandbox, kind, read):
+    _, project, _ = sandbox
+    base = os.path.dirname(project)
+    rooty = os.path.join(base, "root-file")
+    with open(rooty, "w") as fh:
+        fh.write(json.dumps({"s": SECRET}) if read == "handoff"
+                 else f"- [ ] {SECRET}\n\n## RESUME AFTER\n> {SECRET}\n")
+    path, call, nothing = _reads(project)[read]
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.symlink(rooty, path) if kind == "link" else os.mkfifo(path)
+    got = _bounded(call)
+    assert nothing(got) and SECRET not in str(got)
+
+
+@real
+def test_regular_agent_files_still_parse_under_the_setting(sandbox):
+    from core import continuation_governor as cg
+    from core import project_supervisor as ps
+    t, project, _ = sandbox
+    plan = os.path.join(project, "PROJECT_PLAN.md")
+    with open(plan, "w") as fh:
+        fh.write("# Plan\n\n## Now\n- [ ] do one thing\n")
+    os.chown(plan, t.uid, t.gid)
+    got = ps.parse_plan(project)
+    assert got["ok"] is True and "do one thing" in str(got)
+    assert cg.parse_queue_yaml(plan)["reason"] == "no_machine_readable_block"

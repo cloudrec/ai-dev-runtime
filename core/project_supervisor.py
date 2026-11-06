@@ -146,7 +146,7 @@ def parse_plan(repo: str) -> dict:
         if not os.path.exists(path):
             continue
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
+            with agent_privilege.open_regular(path, "r", encoding="utf-8", errors="replace") as f:
                 lines = f.read().splitlines()
         except OSError as e:
             return {"ok": False, "reason": f"plan_unreadable:{e}", "source": name}
@@ -236,7 +236,7 @@ def read_handoff(repo: str) -> Optional[dict]:
     if not os.path.exists(path):
         return None
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as f:
+        with agent_privilege.open_regular(path, "r", encoding="utf-8", errors="replace") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return {"_malformed": True}

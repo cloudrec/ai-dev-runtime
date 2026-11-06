@@ -24,6 +24,8 @@ import os
 import re
 from typing import Optional
 
+from core import agent_privilege
+
 CONFIG_PATH = os.getenv("PROJECT_QUEUES_CONFIG",
                         "/root/ai-dev-runtime/config/project_queues.yaml")
 
@@ -233,7 +235,7 @@ def resume_instruction(path: str) -> str:
     here, so this returns the blockquote lines exactly as written.
     """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with agent_privilege.open_regular(path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except Exception:  # noqa: BLE001
         return ""
@@ -250,7 +252,7 @@ def parse_queue_yaml(path: str) -> dict:
     owner's agent has written it; the markdown parser below stays as a fallback."""
     try:
         import yaml
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with agent_privilege.open_regular(path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": f"queue_unreadable:{e}"}
@@ -341,7 +343,7 @@ def parse_queue(path: str) -> dict:
     if y.get("reason") != "no_machine_readable_block":
         return y
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with agent_privilege.open_regular(path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": f"queue_unreadable:{e}"}
@@ -408,7 +410,7 @@ def read_pointer(target: str, config: Optional[dict] = None) -> dict:
     if not path:
         return {"ok": False, "reason": "no_authoritative_pointer"}
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        with agent_privilege.open_regular(path, "r", encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "reason": f"pointer_unreadable:{e}"}
