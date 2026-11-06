@@ -59,3 +59,13 @@ Auditor's evidence: read-only on the repo; repros and mutants in the session scr
 
 ## Not checked by the auditor
 Live unit environments and live pin absence. A real OOM. The `work_evidence` stat/read race. tmux multi-arg exec beyond the existing test. `hooks/owneros_hook.py` and `tools/stage_done.py` under the setting, code read only. `api/` and `core/control_plane/` beyond greps. cdp and companion code. The full suite.
+
+## Follow-up: A1-A4 fixed, narrow audit
+Fixes in `282bd9a`. Narrow audit of `f1dadd9..282bd9a`, core, tools and tests only, same route, self-reported `claude-fable-5-1`. **A1, A2, A3, A4 closed as specified. Nothing blocks.** Focused `tests/test_agent_privilege.py`: 135 passed. Full suite by the filer before the last test edit: 4859 passed, 4 skipped, 0 failed; the auditor did not run it.
+
+Left open by decision, not fixed:
+- **L1, LOW, PLAUSIBLE.** `_open_no_agent_links` looks up a root-owned link's target by name after `fstat`. In an agent-writable directory the agent could swap it in between (mechanism confirmed with a stand-in for the race). Needs a root-owned link inside an agent-writable directory; the auditor found no way for the agent to get one under condition 4. Fix: `os.readlink("", dir_fd=fd)` before closing the fd, or follow root links only when `os.fstat(at).st_uid == 0`.
+- **L2, LOW, PLAUSIBLE.** Possible double close in `open_regular` if `io.BufferedReader` raises; only `MemoryError` can. Fix: `raw.close()` in the handler.
+
+Still open from above: A5 (keep `project_supervisor` off under the setting), A6, A7, A8. Conditions 1-4 of the sandbox run still apply; condition 5 is met by A1. `AGENT_RUN_AS` needs `AGENT_CONTROL_DB` in every unit that carries it.
+Not checked: live units, live pin, a logged-in agent under the setting.
