@@ -29,6 +29,7 @@ import time
 import uuid
 from typing import Optional
 
+from core import agent_privilege
 from core.control_plane.api import _c
 from core.control_plane.store import now_iso, now_ts
 
@@ -285,12 +286,16 @@ def set_state(task_id: str, state: str, *, conn=None, **fields) -> dict:
 def _write_task_file(task: dict, cwd: str) -> str:
     """Persist the task's text where the AGENT can read it, inside its own project only."""
     d = os.path.join(cwd or ".", ".owner-os-tasks")
-    os.makedirs(d, exist_ok=True)
     path = os.path.join(d, f"task_{task['id']}.md")
     body = (f"# Owner OS task {task['id']}\n\n"
             f"Queued {task.get('created_at', '')} for {task['target']}.\n"
             f"Do exactly what this says, then stop. Nothing else.\n\n"
             f"{task['text']}\n")
+    if agent_privilege.run_as_name():      # as root a planted link would pick the directory
+        if not agent_privilege.write_as_agent(path, body):
+            raise OSError(f"task file not written: {path}")
+        return path
+    os.makedirs(d, exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(body)
     return path

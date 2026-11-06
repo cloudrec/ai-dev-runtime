@@ -53,7 +53,7 @@ def main(argv=None) -> int:
     ap.add_argument("--project", help="project dir the agent must be able to use")
     a = ap.parse_args(argv)
     try:
-        t = priv.target()
+        t = priv.resolve()
     except priv.AgentPrivilegeError as e:
         print(json.dumps({"ok": False, "reason": f"agent_run_as:{e}"}))
         return 1

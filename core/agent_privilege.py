@@ -26,6 +26,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -77,14 +78,22 @@ def run_as_name() -> str:
 
 
 def pin(t: Target) -> None:
-    """Called before the first dropped agent starts. Raises OSError if it cannot be written."""
+    """Written by target() before any dropped work. Raises OSError if it cannot be written.
+    link() so concurrent first uses agree: the file appears whole, and never changes name."""
     if _pinned() == t.name:
         return
-    tmp = _pin_path() + ".tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "w", encoding="ascii") as fh:
-        fh.write(t.name + "\n")
-    os.replace(tmp, _pin_path())
+    path = _pin_path()
+    fd, tmp = tempfile.mkstemp(prefix=".run_as.", dir=os.path.dirname(path) or ".")
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as fh:
+            fh.write(t.name + "\n")
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            if _pinned() != t.name:
+                raise
+    finally:
+        os.unlink(tmp)
 
 
 def _lookup(name: str) -> Target:
@@ -95,8 +104,8 @@ def _lookup(name: str) -> Target:
     return Target(name, p.pw_uid, p.pw_gid, p.pw_dir)
 
 
-def target() -> Optional[Target]:
-    """Who agents run as; None when AGENT_RUN_AS is unset. Raises when it cannot be honoured."""
+def resolve() -> Optional[Target]:
+    """The checks of target() without its pin, for a tool that only looks."""
     name = run_as_name()
     if not name:
         return None
@@ -111,6 +120,18 @@ def target() -> Optional[Target]:
         raise AgentPrivilegeError("runtime_not_root")
     if not _setpriv_bin():
         raise AgentPrivilegeError("setpriv_missing")
+    return t
+
+
+def target() -> Optional[Target]:
+    """Who agents run as; None when AGENT_RUN_AS is unset. Raises when it cannot be honoured.
+    Every drop passes here, so the pin exists before the first one, whichever comes first."""
+    t = resolve()
+    if t:
+        try:
+            pin(t)
+        except OSError:
+            raise AgentPrivilegeError("pin_failed") from None
     return t
 
 

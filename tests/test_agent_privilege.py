@@ -12,6 +12,7 @@ import stat
 import subprocess
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -19,6 +20,7 @@ from core import agent_auth_mode as aam
 from core import agent_control as ac
 from core import agent_privilege as priv
 from core import job_executor
+from core import os_task_queue
 from core.fullcycle.hosts import LocalHost, SshHost
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -786,3 +788,102 @@ def test_preflight_catches_a_readable_file_and_passes_a_closed_one(sandbox, caps
     missing = secret + "-typo"
     assert mod.main(["--deny", missing]) == 1
     assert json.loads(capsys.readouterr().out)["checks"][f"deny_path_exists:{missing}"] is False
+
+
+# ── the pin is written by the first dropped work, whatever that work is ─────
+@real
+def test_the_first_dropped_command_pins_the_setting(sandbox, monkeypatch):
+    t, _, _ = sandbox
+    assert LocalHost().run(["id", "-u"])[0] == 0
+    monkeypatch.delenv("AGENT_RUN_AS")
+    assert priv.target() == t
+
+
+@real
+def test_a_pane_started_after_a_host_command_is_dropped_without_the_variable(
+        resume, sandbox, monkeypatch):
+    t, project, _ = sandbox
+    LocalHost().run(["true"])
+    monkeypatch.delenv("AGENT_RUN_AS")
+    assert ac.agent_resume(project, session_name="uid-r")["resumed"] is True
+    assert f"--reuid={t.uid}" in _started(resume)[0]
+
+
+@real
+def test_no_dropped_work_runs_when_the_pin_cannot_be_written(sandbox, monkeypatch):
+    def refuse(_t):
+        raise OSError("read-only")
+    monkeypatch.setattr(priv, "pin", refuse)
+    with pytest.raises(priv.AgentPrivilegeError, match="pin_failed"):
+        priv.target()
+    assert LocalHost().run(["id", "-u"])[0] == 126
+
+
+@real
+def test_concurrent_first_use_leaves_one_pin(sandbox):
+    t, _, _ = sandbox
+    with ThreadPoolExecutor(16) as pool:
+        got = list(pool.map(lambda _: priv.target(), range(64)))
+    assert got == [t] * 64
+    d = os.path.dirname(priv._pin_path())
+    assert [f for f in os.listdir(d) if "run_as" in f] == [os.path.basename(priv._pin_path())]
+
+
+@real
+def test_a_pin_is_not_replaced_by_another_name(sandbox):
+    t, _, _ = sandbox
+    priv.pin(t)
+    with pytest.raises(OSError):
+        priv.pin(priv.Target("daemon", 1, 1, "/"))
+    assert open(priv._pin_path()).read().strip() == t.name
+
+
+@real
+def test_preflight_checks_without_pinning(sandbox, monkeypatch, capsys):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_uid_preflight",
+                                                  ROOT / "tools" / "agent_uid_preflight.py")
+    preflight = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(preflight)
+    monkeypatch.setattr(preflight, "_as_agent", lambda *a: 1)
+    assert preflight.main([]) == 1
+    assert '"run_as": "nobody"' in capsys.readouterr().out
+    assert not os.path.lexists(priv._pin_path())
+
+
+# ── the task file is written by the agent, not by root ──────────────────────
+def _task():
+    return {"id": "abc123", "created_at": "now", "target": "t:0.0", "text": "do it"}
+
+
+@real
+def test_the_task_file_belongs_to_the_agent(sandbox):
+    t, project, _ = sandbox
+    path = os_task_queue._write_task_file(_task(), project)
+    st = os.lstat(path)
+    assert path == os.path.join(project, ".owner-os-tasks", "task_abc123.md")
+    assert (st.st_uid, stat.S_ISREG(st.st_mode)) == (t.uid, True)
+    assert os.lstat(os.path.dirname(path)).st_uid == t.uid
+    assert "do it" in open(path).read()
+
+
+@real
+def test_a_planted_task_dir_link_gets_no_root_write(sandbox):
+    t, project, secret = sandbox
+    closed = os.path.join(os.path.dirname(project), "closed")
+    os.mkdir(closed, 0o700)
+    os.symlink(closed, os.path.join(project, ".owner-os-tasks"))
+    with pytest.raises(OSError):
+        os_task_queue._write_task_file(_task(), project)
+    assert os.listdir(closed) == []
+
+
+@real
+def test_a_broken_setting_writes_no_task_file(sandbox, monkeypatch):
+    _, project, _ = sandbox
+    monkeypatch.setenv("AGENT_RUN_AS", "no-such-user")
+    monkeypatch.setattr(priv, "_lookup", lambda name: (_ for _ in ()).throw(
+        priv.AgentPrivilegeError("user_not_found")))
+    with pytest.raises(OSError):
+        os_task_queue._write_task_file(_task(), project)
+    assert os.listdir(project) == []

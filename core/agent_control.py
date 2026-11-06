@@ -2494,15 +2494,6 @@ def agent_resume(project_dir: str, conversation_id: Optional[str] = None,
                 return {"resumed": False, "refused": f"auth_mode:{why}",
                         "reason": "auth mode: not authorized", "duplicate_created": False,
                         "agent_created": False}
-        if run_as:
-            try:
-                _privilege.pin(run_as)
-            except OSError:
-                audit("agent_resume", name, resumed=False, refused="agent_run_as:pin_failed",
-                      actor=actor, cwd=resolved)
-                return {"resumed": False, "refused": "agent_run_as:pin_failed",
-                        "reason": "agent uid: not authorized", "duplicate_created": False,
-                        "agent_created": False}
         argv = ["new-session", "-d", "-s", name, "-c", resolved,
                 *(_privilege.pane_prefix(run_as) if run_as else []), *auth["argv"]]
         if conversation_id:
