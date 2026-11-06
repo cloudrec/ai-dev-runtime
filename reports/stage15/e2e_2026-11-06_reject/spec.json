@@ -1,0 +1,12 @@
+{"title":"pricecalc","goal":"A small price calculator package: order total with tax, and an amount formatter.",
+ "acceptance_criteria":["pricecalc.total.total(prices, tax_rate) returns the sum of prices plus tax, rounded to 2 places","pricecalc.fmt.fmt(amount) returns the amount with 2 decimals and ' RUB'"],
+ "checks":[["python3","-c","from pricecalc.total import total; from pricecalc.fmt import fmt; assert fmt(total([10, 20], '0.1')) == '33.00 RUB'"]],
+ "scope":["pricecalc/"],"do_not_touch":["README.md"],
+ "tasks":[
+  {"key":"total","title":"Implement total","goal":"Create pricecalc/total.py with total(prices, tax_rate): the sum of prices plus tax at tax_rate, rounded to 2 places. prices may be ints or strings; tax_rate may be a string.",
+   "acceptance_criteria":["total([10, 20], '0.1') equals 33"],
+   "checks":[["python3","-c","from pricecalc.total import total; assert total([10, 20], '0.1') == 33"]]},
+  {"key":"fmt","title":"Implement fmt","goal":"Create pricecalc/fmt.py with fmt(amount) returning the amount with exactly 2 decimals followed by ' RUB'.",
+   "acceptance_criteria":["fmt(33) == '33.00 RUB'"],"depends_on":["total"],
+   "checks":[["python3","-c","from pricecalc.fmt import fmt; assert fmt(33) == '33.00 RUB'"]]}
+ ]}

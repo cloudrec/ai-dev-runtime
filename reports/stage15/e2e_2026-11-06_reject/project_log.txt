@@ -1,0 +1,3 @@
+18f9682 fullcycle: fmt (attempt 1) — Implement fmt
+0efdb9c fullcycle: total (attempt 2) — Implement total
+69a1677 baseline
