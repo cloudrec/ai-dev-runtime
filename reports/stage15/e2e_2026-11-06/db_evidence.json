@@ -1,0 +1,245 @@
+{
+ "fc_decision_audit": [
+  {
+   "seq": 1,
+   "ts": 1793890351.758206,
+   "review_id": 2,
+   "action": "ack",
+   "decision": "",
+   "decision_key": "",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "acked",
+   "body_sha": "",
+   "prev_hash": "",
+   "hash": "608fe20fd310fc7370e6713b7e469b149736af30ca42db322d21612fce2bca3c"
+  },
+  {
+   "seq": 2,
+   "ts": 1793890357.2980244,
+   "review_id": 2,
+   "action": "decide",
+   "decision": "approve",
+   "decision_key": "sandbox-calc-review-2-approve-20261105",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "accepted",
+   "body_sha": "3ab6cf5d66e18c1f58767263d2728eb55f33aae327e0cf99d7f368e9faaf59e9",
+   "prev_hash": "608fe20fd310fc7370e6713b7e469b149736af30ca42db322d21612fce2bca3c",
+   "hash": "eeef5b1978553c09e1f230ee51869ec76b4f49bb09c253dbe39d50fd74a9c4a0"
+  },
+  {
+   "seq": 3,
+   "ts": 1793890396.5537157,
+   "review_id": 3,
+   "action": "ack",
+   "decision": "",
+   "decision_key": "",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "acked",
+   "body_sha": "",
+   "prev_hash": "eeef5b1978553c09e1f230ee51869ec76b4f49bb09c253dbe39d50fd74a9c4a0",
+   "hash": "bf3533e4debe618ebb8a0de9e78824ca788a9f5731f68181de386e70d3e93586"
+  },
+  {
+   "seq": 4,
+   "ts": 1793890397.8584392,
+   "review_id": 3,
+   "action": "decide",
+   "decision": "approve",
+   "decision_key": "sandbox-calc-review-3-approve-20261105",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "accepted",
+   "body_sha": "3ab6cf5d66e18c1f58767263d2728eb55f33aae327e0cf99d7f368e9faaf59e9",
+   "prev_hash": "bf3533e4debe618ebb8a0de9e78824ca788a9f5731f68181de386e70d3e93586",
+   "hash": "2ef026950cc99daf3c7c15a05a804c6e0385ed1bc0718ac4195decaf5f6a80e6"
+  },
+  {
+   "seq": 5,
+   "ts": 1793890478.8709085,
+   "review_id": 4,
+   "action": "ack",
+   "decision": "",
+   "decision_key": "",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "acked",
+   "body_sha": "",
+   "prev_hash": "2ef026950cc99daf3c7c15a05a804c6e0385ed1bc0718ac4195decaf5f6a80e6",
+   "hash": "2183c275e975aa45d4da5cf4fc224d655756786d5b0b4913ff6ff85843920223"
+  },
+  {
+   "seq": 6,
+   "ts": 1793939177.4186292,
+   "review_id": 4,
+   "action": "decide",
+   "decision": "approve",
+   "decision_key": "sandbox-calc-review-4-approve-20261105",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "accepted",
+   "body_sha": "3ab6cf5d66e18c1f58767263d2728eb55f33aae327e0cf99d7f368e9faaf59e9",
+   "prev_hash": "2183c275e975aa45d4da5cf4fc224d655756786d5b0b4913ff6ff85843920223",
+   "hash": "bba21de4c051742db029b1c73692198fd699b197711c8b65c4e81033881b5520"
+  },
+  {
+   "seq": 7,
+   "ts": 1793944028.9734104,
+   "review_id": 5,
+   "action": "ack",
+   "decision": "",
+   "decision_key": "",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "acked",
+   "body_sha": "",
+   "prev_hash": "bba21de4c051742db029b1c73692198fd699b197711c8b65c4e81033881b5520",
+   "hash": "e33e3fd1e8ee420b0b515b5f29553be5b120860f288a31d3f3b0fbbd5a3f4c71"
+  },
+  {
+   "seq": 8,
+   "ts": 1793944030.1137476,
+   "review_id": 5,
+   "action": "decide",
+   "decision": "approve",
+   "decision_key": "sandbox-calc2-review-5-approve-20261106",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "accepted",
+   "body_sha": "3ab6cf5d66e18c1f58767263d2728eb55f33aae327e0cf99d7f368e9faaf59e9",
+   "prev_hash": "e33e3fd1e8ee420b0b515b5f29553be5b120860f288a31d3f3b0fbbd5a3f4c71",
+   "hash": "aa3e3f778bc59e9dfcdd6e3902b68a88f629c288e998fec5426bbb899e0c1527"
+  },
+  {
+   "seq": 9,
+   "ts": 1793944089.2559738,
+   "review_id": 6,
+   "action": "ack",
+   "decision": "",
+   "decision_key": "",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "acked",
+   "body_sha": "",
+   "prev_hash": "aa3e3f778bc59e9dfcdd6e3902b68a88f629c288e998fec5426bbb899e0c1527",
+   "hash": "1bc3adc2e4f30c7cdfa17c76ddf0b851e3f29506a4f6c8b9040e164520d5906a"
+  },
+  {
+   "seq": 10,
+   "ts": 1793944090.6507163,
+   "review_id": 6,
+   "action": "decide",
+   "decision": "approve",
+   "decision_key": "sandbox-calc2-review-6-approve-20261106",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "accepted",
+   "body_sha": "3ab6cf5d66e18c1f58767263d2728eb55f33aae327e0cf99d7f368e9faaf59e9",
+   "prev_hash": "1bc3adc2e4f30c7cdfa17c76ddf0b851e3f29506a4f6c8b9040e164520d5906a",
+   "hash": "0657bb23583fe04f531c602cdb2142dbc0ea5821ae1e3a6653867569cdcc3652"
+  },
+  {
+   "seq": 11,
+   "ts": 1793944150.6802037,
+   "review_id": 7,
+   "action": "ack",
+   "decision": "",
+   "decision_key": "",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "acked",
+   "body_sha": "",
+   "prev_hash": "0657bb23583fe04f531c602cdb2142dbc0ea5821ae1e3a6653867569cdcc3652",
+   "hash": "92caedc928f99a01a0e7cd303cafb7e2d5461e5a25cbd2f44a3ed92ef35fa16c"
+  },
+  {
+   "seq": 12,
+   "ts": 1793944151.9783561,
+   "review_id": 7,
+   "action": "decide",
+   "decision": "approve",
+   "decision_key": "sandbox-calc2-review-7-approve-20261106",
+   "actor": "api:client/sandbox-gpt",
+   "auth": "client_token",
+   "outcome": "accepted",
+   "body_sha": "3ab6cf5d66e18c1f58767263d2728eb55f33aae327e0cf99d7f368e9faaf59e9",
+   "prev_hash": "92caedc928f99a01a0e7cd303cafb7e2d5461e5a25cbd2f44a3ed92ef35fa16c",
+   "hash": "0aca75785746c1ab124bc1ff4c9d1b30cbb367696ed33c92acfc04404ecabfb9"
+  }
+ ],
+ "fc_review": [
+  {
+   "id": 1,
+   "project_id": "sandbox-tinycalc",
+   "task_id": "sandbox-tinycalc:add",
+   "kind": "blocked",
+   "status": "pending",
+   "decision": null
+  },
+  {
+   "id": 2,
+   "project_id": "sandbox-calc",
+   "task_id": "sandbox-calc:add",
+   "kind": "review",
+   "status": "decided",
+   "decision": "approve"
+  },
+  {
+   "id": 3,
+   "project_id": "sandbox-calc",
+   "task_id": "sandbox-calc:mul",
+   "kind": "review",
+   "status": "decided",
+   "decision": "approve"
+  },
+  {
+   "id": 4,
+   "project_id": "sandbox-calc",
+   "task_id": "sandbox-calc:cli",
+   "kind": "review",
+   "status": "decided",
+   "decision": "approve"
+  },
+  {
+   "id": 5,
+   "project_id": "sandbox-calc2",
+   "task_id": "sandbox-calc2:sub",
+   "kind": "review",
+   "status": "decided",
+   "decision": "approve"
+  },
+  {
+   "id": 6,
+   "project_id": "sandbox-calc2",
+   "task_id": "sandbox-calc2:div",
+   "kind": "review",
+   "status": "decided",
+   "decision": "approve"
+  },
+  {
+   "id": 7,
+   "project_id": "sandbox-calc2",
+   "task_id": "sandbox-calc2:cli2",
+   "kind": "review",
+   "status": "decided",
+   "decision": "approve"
+  }
+ ],
+ "fc_project_done": [
+  {
+   "project_id": "sandbox-calc",
+   "event_id": 19,
+   "evidence": "{\"spec_version\": 1, \"spec_sha\": \"f119784ba3101284\", \"checks\": [{\"argv\": [\"python3\", \"-c\", \"from tinycalc.add import add; from tinycalc.mul import mul; assert add(2, 3) == 5 and mul(4, 5) == 20\"], \"rc\": 0, \"passed\": true, \"output\": \"\"}, {\"argv\": [\"python3\", \"-m\", \"tinycalc.cli\", \"add\", \"2\", \"3\"], \"rc\": 0, \"passed\": true, \"output\": \"5\\n\"}], \"tasks\": [{\"key\": \"add\", \"state\": \"VERIFIED_DONE\", \"attempts\": 1}, {\"key\": \"mul\", \"state\": \"VERIFIED_DONE\", \"attempts\": 1}, {\"key\": \"cli\", \"state\": \"VERIFIED_DONE\", \"attempts\": 1}]}",
+   "ts": 1793939184.189019
+  },
+  {
+   "project_id": "sandbox-calc2",
+   "event_id": 29,
+   "evidence": "{\"spec_version\": 1, \"spec_sha\": \"ebd79cc011379613\", \"checks\": [{\"argv\": [\"python3\", \"-c\", \"from tinycalc.sub import sub; from tinycalc.div import div; assert sub(7, 2) == 5 and div(8, 2) == 4\"], \"rc\": 0, \"passed\": true, \"output\": \"\"}, {\"argv\": [\"python3\", \"-m\", \"tinycalc.cli\", \"sub\", \"7\", \"2\"], \"rc\": 0, \"passed\": true, \"output\": \"5\\n\"}], \"tasks\": [{\"key\": \"sub\", \"state\": \"VERIFIED_DONE\", \"attempts\": 1}, {\"key\": \"div\", \"state\": \"VERIFIED_DONE\", \"attempts\": 1}, {\"key\": \"cli2\", \"state\": \"VERIFIED_DONE\", \"attempts\": 1}]}",
+   "ts": 1793944158.367086
+  }
+ ],
+ "wake_route_chat_id_omitted": true
+}

@@ -1,0 +1,7 @@
+delivered wake for event 8 [route sandbox-calc] to <chat>: submitted_and_assistant_started_generating
+not delivered for event 12; stays pending (assistant_still_generating)
+delivered wake for event 17 [route sandbox-calc] to <chat>: submitted_and_assistant_started_generating
+delivered wake for event 19 [route sandbox-calc] to <chat>: submitted_and_assistant_started_generating
+delivered wake for event 20 [route sandbox-calc2] to <chat>: submitted_and_assistant_started_generating
+delivered wake for event 23 [route sandbox-calc2] to <chat>: submitted_and_assistant_started_generating
+delivered wake for event 28 [route sandbox-calc2] to <chat>: submitted_and_assistant_started_generating

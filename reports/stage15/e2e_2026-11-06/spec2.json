@@ -1,0 +1,87 @@
+{
+ "title": "tinycalc-2",
+ "goal": "Extend tinycalc with sub, div and matching CLI commands.",
+ "acceptance_criteria": [
+  "tinycalc.sub.sub(a, b) returns a - b",
+  "tinycalc.div.div(a, b) returns a / b and raises ValueError when b is 0",
+  "python3 -m tinycalc.cli sub 7 2 prints 5"
+ ],
+ "checks": [
+  [
+   "python3",
+   "-c",
+   "from tinycalc.sub import sub; from tinycalc.div import div; assert sub(7, 2) == 5 and div(8, 2) == 4"
+  ],
+  [
+   "python3",
+   "-m",
+   "tinycalc.cli",
+   "sub",
+   "7",
+   "2"
+  ]
+ ],
+ "scope": [
+  "tinycalc/"
+ ],
+ "do_not_touch": [
+  "README.md"
+ ],
+ "tasks": [
+  {
+   "key": "sub",
+   "title": "Implement sub",
+   "goal": "Create tinycalc/sub.py with sub(a, b).",
+   "acceptance_criteria": [
+    "sub(7, 2) == 5"
+   ],
+   "checks": [
+    [
+     "python3",
+     "-c",
+     "from tinycalc.sub import sub; assert sub(7, 2) == 5"
+    ]
+   ]
+  },
+  {
+   "key": "div",
+   "title": "Implement div",
+   "goal": "Create tinycalc/div.py with div(a, b) that raises ValueError when b is 0.",
+   "acceptance_criteria": [
+    "div(8, 2) == 4",
+    "div(1, 0) raises ValueError"
+   ],
+   "depends_on": [
+    "sub"
+   ],
+   "checks": [
+    [
+     "python3",
+     "-c",
+     "from tinycalc.div import div\ntry:\n    div(1, 0)\nexcept ValueError:\n    pass\nelse:\n    raise SystemExit(1)\nassert div(8, 2) == 4"
+    ]
+   ]
+  },
+  {
+   "key": "cli2",
+   "title": "Extend cli",
+   "goal": "Add sub and div commands to tinycalc/cli.py, keeping add and mul working.",
+   "acceptance_criteria": [
+    "python3 -m tinycalc.cli sub 7 2 prints 5"
+   ],
+   "depends_on": [
+    "div"
+   ],
+   "checks": [
+    [
+     "python3",
+     "-m",
+     "tinycalc.cli",
+     "sub",
+     "7",
+     "2"
+    ]
+   ]
+  }
+ ]
+}

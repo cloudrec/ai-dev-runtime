@@ -1,0 +1,7 @@
+7a82017 Add sub and div commands to tinycalc CLI
+de74779 Add div(a, b) function to tinycalc
+1298a4c Add sub(a, b) function to tinycalc
+7f1ea7e Add CLI entry point for tinycalc add/mul
+56183df Add mul(a, b) function to tinycalc
+2aef277 Add add(a, b) function to tinycalc
+20d26f4 sandbox baseline
