@@ -144,6 +144,7 @@ REQUIRED_SECTIONS = ("PROJECT", "CURRENT STATE", "COMPLETED", "HEAD", "TESTS",
 def _git_head(root: str) -> str:
     try:
         import subprocess
+        agent_privilege.require_root_work(root)
         out = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
                              capture_output=True, timeout=10)
         sha = out.stdout.decode().strip()

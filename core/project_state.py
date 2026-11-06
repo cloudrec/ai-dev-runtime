@@ -73,6 +73,8 @@ def _audit(conn, target: str, cwd: str, action: str, status: str, reason: str,
 def git_head(cwd: str) -> str:
     """Current HEAD of the project, or '' when it is not a repo / unreadable."""
     try:
+        from core import agent_privilege
+        agent_privilege.require_root_work(cwd)
         out = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
                              capture_output=True, timeout=10)
         sha = out.stdout.decode().strip()

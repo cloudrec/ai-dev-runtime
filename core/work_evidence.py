@@ -410,6 +410,7 @@ def _read(path: str) -> Optional[str]:
 
 def _git_head(root: str) -> str:
     try:
+        agent_privilege.require_root_work(root)
         r = subprocess.run(["git", "-C", root, "rev-parse", "HEAD"],
                            capture_output=True, text=True, timeout=10)
         return (r.stdout or "").strip() if r.returncode == 0 else ""
@@ -422,6 +423,7 @@ def _git_new_commits(root: str, since: str) -> list:
     if not since:
         return []
     try:
+        agent_privilege.require_root_work(root)
         r = subprocess.run(["git", "-C", root, "log", "--oneline", "--no-decorate",
                             f"{since}..HEAD"], capture_output=True, text=True, timeout=15)
         if r.returncode != 0:

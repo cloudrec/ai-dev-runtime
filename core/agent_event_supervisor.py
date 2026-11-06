@@ -607,6 +607,8 @@ class Ports:
         if not cwd or not os.path.isdir(cwd):
             return {}
         try:
+            from core import agent_privilege
+            agent_privilege.require_root_work(cwd)
             head = subprocess.run(["git", "-C", cwd, "log", "-1", "--format=%h %ct"],
                                   capture_output=True, text=True, timeout=5).stdout.split()
             dirty = subprocess.run(["git", "-C", cwd, "status", "--porcelain"],

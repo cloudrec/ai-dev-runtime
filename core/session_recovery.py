@@ -491,6 +491,17 @@ def _recover_inner(target: str, *, registry, conn, run_fn, sleep, now, explicit,
         return {"recovered": False, "reason": f"auth_mode:{safe['reason']}",
                 "owner_blocker": True}
     cmd = safe["cmd"]
+    from core import agent_privilege as _priv
+    try:
+        run_as = _priv.target()
+    except _priv.AgentPrivilegeError as e:
+        run_as, unusable = None, str(e)
+    else:
+        unusable = "project_not_usable" if run_as and not _priv.can_use_dir(run_as, cwd) else ""
+    if unusable:
+        _log(conn, target, "refuse", False, f"agent_run_as:{unusable}", {})
+        return {"recovered": False, "reason": f"agent_run_as:{unusable}",
+                "owner_blocker": True}
     run = run_fn or (lambda a: _tmux(a))
 
     # Revive the EXACT pane. respawn-pane reuses the existing window; only if the

@@ -163,6 +163,8 @@ def _git_head(root: Path) -> Optional[str]:
     if not binary:
         return None
     try:
+        from core import agent_privilege
+        agent_privilege.require_root_work(str(root))
         proc = subprocess.run(
             [binary, "-C", str(root), "log", "-1", "--pretty=%h %s"],
             capture_output=True,

@@ -27,6 +27,7 @@ import re
 import subprocess
 from typing import Optional
 
+from core import agent_privilege
 from core import permission_resolver as pr
 
 # Flags that make a push non-routine → always deny.
@@ -125,6 +126,7 @@ def parse_push(command: str) -> dict:
 def _git(cwd: str, *args: str, timeout: int = 12) -> tuple[int, str]:
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
     try:
+        agent_privilege.require_root_work(cwd)     # a denied check denies the push
         p = subprocess.run(["git", "-C", cwd, *args], stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, timeout=timeout, env=env)
         return p.returncode, p.stdout.decode("utf-8", "replace").strip()

@@ -55,6 +55,7 @@ import re
 import subprocess
 from typing import Optional
 
+from core import agent_privilege
 from core.control_plane.api import _c
 from core.control_plane.store import now_iso, now_ts
 
@@ -123,6 +124,7 @@ def _conn(conn=None):
 
 def _git(repo: str, args: list, timeout: int = 30) -> str:
     try:
+        agent_privilege.require_root_work(repo)
         out = subprocess.run(["git", "-C", repo] + args, capture_output=True,
                              text=True, timeout=timeout, shell=False)
         return (out.stdout or "").strip() if out.returncode == 0 else ""

@@ -887,3 +887,170 @@ def test_a_broken_setting_writes_no_task_file(sandbox, monkeypatch):
     with pytest.raises(OSError):
         os_task_queue._write_task_file(_task(), project)
     assert os.listdir(project) == []
+
+
+# ── root git stays out of an instance with agents under their own uid ───────
+def _root_git_sites(tree):
+    from core import agent_context_budget, agent_context_recovery, agent_event_supervisor
+    from core import context_budget, git_push_policy, project_state, project_supervisor
+    from core import work_evidence
+    from pathlib import Path
+    return [
+        (lambda: work_evidence._git_head(tree), ""),
+        (lambda: work_evidence._git_new_commits(tree, "abc"), []),
+        (lambda: project_supervisor._git(tree, ["log"]), ""),
+        (lambda: project_state.git_head(tree), ""),
+        (lambda: context_budget._git_head(tree), "unknown"),
+        (lambda: agent_context_budget._git(tree, "status"), ""),
+        (lambda: agent_event_supervisor.Ports.artifacts(None, tree), {}),
+        (lambda: agent_context_recovery._git_head(Path(tree)), None),
+        (lambda: git_push_policy.evaluate_push("git push", tree, {})["allowed"], False),
+    ]
+
+
+@real
+def test_no_root_git_site_spawns_under_the_setting(sandbox, monkeypatch):
+    _, project, _ = sandbox
+    os.mkdir(os.path.join(project, ".git"))
+    spawned = []
+    sites = _root_git_sites(project)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: spawned.append(a))
+    for call, unknown in sites:
+        assert call() == unknown
+    assert spawned == []
+
+
+@real
+def test_a_bad_setting_keeps_root_git_off_too(sandbox, monkeypatch):
+    _, project, _ = sandbox
+    os.mkdir(os.path.join(project, ".git"))
+    spawned = []
+    sites = _root_git_sites(project)
+    monkeypatch.setenv("AGENT_RUN_AS", "root")
+    monkeypatch.setattr(priv, "_lookup", lambda name: priv.Target("root", 0, 0, "/root"))
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: spawned.append(a))
+    for call, _unknown in sites:
+        call()
+    assert spawned == []
+
+
+@real
+def test_a_config_planted_in_a_shared_tree_runs_nothing_as_root(sandbox):
+    from core import agent_context_budget
+    _, project, _ = sandbox
+    tree = os.path.join(os.path.dirname(project), "shared")
+    os.mkdir(tree)
+    subprocess.run(["git", "init", "-q", tree], check=True, capture_output=True)
+    os.chmod(tree, 0o777)
+    marker = os.path.join(os.path.dirname(project), "ran-as-root")
+    hook = os.path.join(tree, "hook.sh")
+    with open(hook, "w") as fh:
+        fh.write(f'#!/bin/sh\ntouch "{marker}"\n')
+    os.chmod(hook, 0o755)
+    subprocess.run(["git", "-C", tree, "config", "core.fsmonitor", hook], check=True)
+    agent_context_budget.git_facts(tree)
+    assert not os.path.exists(marker)
+
+
+def test_a_new_root_git_site_has_to_be_guarded():
+    """Fullcycle runs through the host, as the agent. The rest are behind runtime.engine.run,
+    which calls require_root_work before any of them."""
+    behind_a_caller = {"core/git_bridge.py", "core/backup_engine.py",
+                       "runtime/context_builder.py", "core/fullcycle/engine.py"}
+    found = set()
+    for base in ("core", "runtime"):
+        for path in (ROOT / base).rglob("*.py"):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            if re.search(r'\[\s*"git"\s*,|which\("git"\)', text) and "require_root_work" not in text:
+                found.add(str(path.relative_to(ROOT)))
+    assert found <= behind_a_caller, found - behind_a_caller
+
+
+# ── the tree an agent gets has to be its own ────────────────────────────────
+@real
+def test_a_shared_root_tree_is_not_usable(sandbox):
+    t, project, _ = sandbox
+    tree = os.path.join(os.path.dirname(project), "shared")
+    os.mkdir(tree)
+    os.chmod(tree, 0o777)
+    assert priv.can_use_dir(t, tree) is False
+
+
+@real
+def test_an_agent_tree_is_usable_with_and_without_git(sandbox):
+    t, project, _ = sandbox
+    assert priv.can_use_dir(t, project) is True
+    git = os.path.join(project, ".git")
+    os.mkdir(git)
+    os.chown(git, t.uid, t.gid)
+    assert priv.can_use_dir(t, project) is True
+
+
+@real
+@pytest.mark.parametrize("kind", ["root_owned", "gitfile", "symlink"])
+def test_a_git_dir_that_is_not_the_agents_own_is_not_usable(sandbox, kind):
+    t, project, _ = sandbox
+    git = os.path.join(project, ".git")
+    if kind == "root_owned":
+        os.mkdir(git)
+    elif kind == "gitfile":
+        with open(git, "w") as fh:
+            fh.write("gitdir: /elsewhere\n")
+        os.chown(git, t.uid, t.gid)
+    else:
+        os.symlink("/tmp", git)
+        os.chown(git, t.uid, t.gid, follow_symlinks=False)
+    assert priv.can_use_dir(t, project) is False
+
+
+@real
+def test_resume_refuses_a_shared_root_tree(resume, sandbox):
+    _, project, _ = sandbox
+    tree = os.path.join(os.path.dirname(project), "shared")
+    os.mkdir(tree)
+    os.chmod(tree, 0o777)
+    r = ac.agent_resume(tree, session_name="uid-s")
+    assert r["refused"] == "agent_run_as:project_not_usable" and _started(resume) == []
+
+
+def _recover(monkeypatch, tree):
+    from core import agent_creation_policy as acp
+    from core import session_recovery as sr
+    import core.continuation_governor as cg
+    monkeypatch.setattr(sr, "control_probe",
+                        lambda: {"healthy": True, "reachable": True, "reason": "ok"})
+    monkeypatch.setattr(sr, "pane_state", lambda t: {"missing": True, "dead": True})
+    monkeypatch.setattr(sr, "_capture", lambda t, n=30: "")
+    monkeypatch.setattr(sr, "panes", lambda: [])
+    monkeypatch.setattr(sr, "verify_recovered", lambda t, c: {"ok": True, "checks": {}})
+    monkeypatch.setattr(sr, "has_authoritative_work",
+                        lambda t: {"open": True, "task_id": "t", "reason": "active_task"})
+    monkeypatch.setattr(cg, "load_config", lambda *a, **k: {})
+    monkeypatch.setattr(acp, "authorize", lambda *a, **k: {"ok": True, "reason": "test"})
+    monkeypatch.setattr(acp, "reserve", lambda *a, **k: None)
+    reg = {"sessions": {"p:0.0": {"target": "p:0.0", "session": "p", "cwd": tree,
+                                  "conversation_id": "c" * 8, "enabled": True}},
+           "limits": {"max_recoveries_per_target": 3, "window_secs": 60,
+                      "backoff_base_secs": 0}}
+    calls = []
+    res = sr.recover("p:0.0", registry=reg, sleep=lambda s: None, live_cwds=[],
+                     run_fn=lambda a: calls.append(list(a)) or (0, "", ""))
+    return res, calls
+
+
+@real
+def test_recovery_refuses_a_shared_root_tree(sandbox, monkeypatch):
+    _, project, _ = sandbox
+    tree = os.path.join(os.path.dirname(project), "shared")
+    os.mkdir(tree)
+    os.chmod(tree, 0o777)
+    res, calls = _recover(monkeypatch, tree)
+    assert res["reason"] == "agent_run_as:project_not_usable" and calls == []
+
+
+@real
+def test_recovery_still_starts_in_the_agents_own_tree(sandbox, monkeypatch):
+    t, project, _ = sandbox
+    res, calls = _recover(monkeypatch, project)
+    assert "agent_run_as" not in str(res.get("reason"))
+    assert len(calls) == 1 and f"--reuid={t.uid}" in " ".join(calls[0])

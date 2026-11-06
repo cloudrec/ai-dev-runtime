@@ -420,6 +420,7 @@ def can_rotate_again(agent_key: str, new_hash: str, cooldown_secs: int) -> bool:
 # ── compact, delta-based handoff document ───────────────────────────────────
 def _git(root: str, *args: str) -> str:
     try:
+        agent_privilege.require_root_work(root)
         out = subprocess.run(["git", "-C", root, *args], stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, timeout=8)
         return out.stdout.decode("utf-8", "replace").strip()

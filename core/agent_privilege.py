@@ -170,8 +170,26 @@ def child_env(t: Target, extra: Optional[dict] = None) -> dict:
     return env
 
 
+def _owns_tree(t: Target, path: str) -> bool:
+    """The tree and its .git are the agent's own. Root's git trusts a root-owned tree, so
+    a chmod instead of a chown hands the agent a config root would run."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != t.uid:
+            return False
+        git = os.lstat(os.path.join(path, ".git"))
+    except FileNotFoundError:
+        return os.path.lexists(path)
+    except OSError:
+        return False
+    return stat.S_ISDIR(git.st_mode) and git.st_uid == t.uid
+
+
 def can_use_dir(t: Target, path: str) -> bool:
-    """Asked of the target itself: root's view of a mode says nothing about it."""
+    """Owned by the target, then asked of the target itself: root's view of a mode says
+    nothing about it."""
+    if not _owns_tree(t, path):
+        return False
     argv = host_argv(t, ["test", "-d", path, "-a", "-r", path, "-a", "-w", path, "-a", "-x", path])
     try:
         return subprocess.run(argv, env=child_env(t), cwd="/", capture_output=True,
@@ -181,7 +199,8 @@ def can_use_dir(t: Target, path: str) -> bool:
 
 
 def require_root_work(path: str) -> None:
-    """For tooling that stays root: the job queue, deliver, release, validator and /run.
+    """For tooling that stays root: the job queue, deliver, release, validator, /run, and
+    every root git read of a project. A read still loads the repo's config.
     They run git, pytest and file walks, and no check of a tree holds: ownership, a `.git`
     file pointing elsewhere, one writable subdirectory, a symlink swapped after the check.
     Two audits broke each narrower rule. So with AGENT_RUN_AS in force they do not run at
