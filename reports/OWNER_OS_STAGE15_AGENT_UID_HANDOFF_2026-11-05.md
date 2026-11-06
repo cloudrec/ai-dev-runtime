@@ -35,5 +35,5 @@ See the full suite line in `reports/stage15/full_suite_de5ee45.txt`.
 
 ## Owner gates
 1. Whether to retry the audit, or decide without it. A narrower prompt may also be stopped. Defense Access in the Cyber Verification Program reduces these stops: https://support.claude.com/en/articles/14604842-real-time-cyber-safeguards-on-claude
-2. Create the user, install `claude` for it and log in, with an account chosen for this. Then `AGENT_RUN_AS=<user> tools/agent_uid_preflight.py --deny <mcp env> --project <dir>`.
+2. Create the user, install `claude` for it and log in, with an account chosen for this. Then `AGENT_RUN_AS=<user> AGENT_CONTROL_DB=<instance db> tools/agent_uid_preflight.py --deny <mcp env> --project <dir> --pin`. `AGENT_RUN_AS` without `AGENT_CONTROL_DB` refuses as `control_db_unset`. `--pin` writes `<db>.run_as`; remove it in cleanup.
 3. Gates 2, 4 and 5 of the E2E requirements report still stand.

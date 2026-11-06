@@ -658,7 +658,8 @@ def _last_user_text_from_tail(path: str) -> str:
         # of output since the human last spoke — measured on a live 41MB transcript where
         # the last user line sat beyond the window. Falling back to "" there would SILENTLY
         # change classification for exactly the longest-running agents, so pay the full
-        # read in that rare case and stay bit-identical to the old behaviour.
+        # read in that rare case and stay bit-identical to the old behaviour. Under
+        # AGENT_RUN_AS the read is bounded, and past the bound this returns "".
         with _privilege.open_regular(path, "rb") as fh:
             return _scan_back_for_user_text(fh.read())
     except Exception:  # noqa: BLE001

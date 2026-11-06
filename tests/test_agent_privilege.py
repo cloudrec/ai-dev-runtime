@@ -2,6 +2,7 @@
 `nobody` through real setpriv and a private tmux server. No live socket, DB or file."""
 from __future__ import annotations
 
+import errno
 import json
 import os
 import pathlib
@@ -1120,3 +1121,299 @@ def test_regular_agent_files_still_parse_under_the_setting(sandbox):
     got = ps.parse_plan(project)
     assert got["ok"] is True and "do one thing" in str(got)
     assert cg.parse_queue_yaml(plan)["reason"] == "no_machine_readable_block"
+
+
+# ── a stray setting cannot reach the live instance's pin ────────────────────
+@pytest.fixture
+def stand_in_db(tmp_path, monkeypatch):
+    """The default DB path, moved to tmp: a removed guard must not write beside the live DB."""
+    db = str(tmp_path / "default" / "agent_control.db")
+    os.makedirs(os.path.dirname(db))
+    monkeypatch.setattr(priv, "_DEFAULT_DB", db)
+    monkeypatch.setenv("AGENT_RUN_AS", "nobody")
+    monkeypatch.delenv("AGENT_CONTROL_DB", raising=False)
+    return db
+
+
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_the_setting_needs_its_instance_named(stand_in_db, monkeypatch, value):
+    if value is not None:
+        monkeypatch.setenv("AGENT_CONTROL_DB", value)
+    with pytest.raises(priv.AgentPrivilegeError, match="control_db_unset"):
+        priv.target()
+    assert os.listdir(os.path.dirname(stand_in_db)) == []
+
+
+def test_a_host_call_without_the_db_writes_no_pin(stand_in_db):
+    with pytest.raises(priv.AgentPrivilegeError, match="control_db_unset"):
+        priv.require_root_work("/tmp")
+    assert os.listdir(os.path.dirname(stand_in_db)) == []
+
+
+def test_a_pin_still_binds_a_process_with_neither_variable(stand_in_db, monkeypatch):
+    """The refusal is for a stray setting. An instance on the default path that was pinned
+    on purpose still holds its processes that carry nothing."""
+    monkeypatch.delenv("AGENT_RUN_AS")
+    with open(stand_in_db + ".run_as", "w") as fh:
+        fh.write("nobody\n")
+    os.chmod(stand_in_db + ".run_as", 0o644)
+    assert priv.run_as_name() == "nobody"
+
+
+def _preflight():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("agent_uid_preflight",
+                                                  ROOT / "tools" / "agent_uid_preflight.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _all_pass(mod, monkeypatch):
+    monkeypatch.setattr(mod, "_as_agent", lambda t, argv: 1 if argv[0] in ("docker", "sudo") else 0)
+    monkeypatch.setattr(mod, "_root_trusts", lambda t: [])
+
+
+# ── preflight can pin before anything starts ────────────────────────────────
+def test_preflight_pin_binds_a_process_without_the_variable(sandbox, monkeypatch, capsys):
+    mod = _preflight()
+    _all_pass(mod, monkeypatch)
+    assert mod.main(["--pin"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["pinned"] == priv._pin_path()
+    monkeypatch.delenv("AGENT_RUN_AS")
+    assert priv.run_as_name() == "nobody"
+
+
+def test_preflight_names_the_pin_path_without_pinning(sandbox, monkeypatch, capsys):
+    mod = _preflight()
+    _all_pass(mod, monkeypatch)
+    assert mod.main([]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["pin_path"] == priv._pin_path() and out["pinned"] is None
+    assert not os.path.lexists(priv._pin_path())
+
+
+def test_preflight_does_not_pin_a_failed_check(sandbox, monkeypatch, capsys):
+    mod = _preflight()
+    monkeypatch.setattr(mod, "_as_agent", lambda *a: 1)
+    assert mod.main(["--pin"]) == 1
+    assert not os.path.lexists(priv._pin_path())
+
+
+def test_preflight_refuses_a_stray_setting(stand_in_db, monkeypatch, capsys):
+    monkeypatch.setattr(priv, "_lookup", lambda n: priv.Target(n, 65534, 65534, "/nonexistent"))
+    assert _preflight().main(["--pin"]) == 1
+    assert "control_db_unset" in capsys.readouterr().out
+    assert os.listdir(os.path.dirname(stand_in_db)) == []
+
+
+# ── a directory of the path cannot redirect root ────────────────────────────
+ROOT_ONLY = '{"root_only": "' + SECRET + '"}'
+
+
+def _redirect(t, project, name):
+    """project/<name> as the agent's own link into a root-only directory holding `name`'s file."""
+    closed = os.path.join(os.path.dirname(project), "closed-" + name.strip("."))
+    os.makedirs(closed, mode=0o700)
+    link = os.path.join(project, name)
+    os.symlink(closed, link)
+    os.lchown(link, t.uid, t.gid)
+    return closed
+
+
+@real
+def test_an_agents_directory_link_does_not_reach_a_root_file(sandbox):
+    from core import project_supervisor as ps
+    t, project, _ = sandbox
+    closed = _redirect(t, project, ".owner-os")
+    with open(os.path.join(closed, os.path.basename(ps.HANDOFF_PATH)), "w") as fh:
+        fh.write(ROOT_ONLY)
+    assert ps.read_handoff(project) == {"_malformed": True}
+
+
+@real
+def test_settings_key_names_do_not_come_through_a_directory_link(sandbox):
+    t, project, _ = sandbox
+    closed = _redirect(t, project, ".claude")
+    with open(os.path.join(closed, "settings.json"), "w") as fh:
+        json.dump({"apiKeyHelper": "x", "env": {"ANTHROPIC_API_KEY": "y"}}, fh)
+    found = aam.settings_api_overrides(project, os.path.join(t.home, ".claude"))
+    assert not any("apiKeyHelper" in f or "ANTHROPIC_API_KEY" in f for f in found)
+
+
+@real
+def test_a_transcript_directory_link_reads_nothing(sandbox):
+    t, project, _ = sandbox
+    base = os.path.join(t.home, ".claude", "projects")
+    os.makedirs(base)
+    closed = os.path.join(os.path.dirname(project), "closed-transcripts")
+    os.makedirs(closed, mode=0o700)
+    with open(os.path.join(closed, "s.jsonl"), "w") as fh:
+        fh.write(json.dumps({"type": "user", "message": {"content": SECRET}}) + "\n")
+    link = os.path.join(base, project.replace("/", "-"))
+    os.symlink(closed, link)
+    os.lchown(link, t.uid, t.gid)
+    assert os_task_queue.transcript_messages(project) == []
+
+
+@real
+def test_a_link_deep_in_the_path_is_refused(sandbox):
+    t, project, secret = sandbox
+    deep = os.path.join(project, "a", "b")
+    os.makedirs(deep)
+    link = os.path.join(deep, "up")
+    os.symlink(os.path.dirname(secret), link)
+    os.lchown(link, t.uid, t.gid)
+    with pytest.raises(OSError):
+        priv.open_regular(os.path.join(link, os.path.basename(secret)))
+
+
+@real
+def test_dot_dot_after_an_agents_link_is_refused(sandbox):
+    t, project, secret = sandbox
+    os.makedirs(os.path.join(project, "x"))
+    link = os.path.join(project, "x", "l")
+    os.symlink(os.path.dirname(secret), link)
+    os.lchown(link, t.uid, t.gid)
+    with pytest.raises(OSError):
+        priv.open_regular(f"{link}/../{os.path.basename(secret)}")
+
+
+def test_a_roots_own_directory_link_still_works(sandbox, tmp_path):
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    (real_dir / "f.txt").write_text("fine")
+    (tmp_path / "abs").symlink_to(real_dir)
+    (tmp_path / "rel").symlink_to("real")
+    (tmp_path / "chain").symlink_to("abs")
+    for via in ("abs", "rel", "chain"):
+        with priv.open_regular(str(tmp_path / via / "f.txt")) as fh:
+            assert fh.read() == "fine"
+    with pytest.raises(OSError):
+        priv.open_regular(str(tmp_path / "abs"))           # the last component stays strict
+
+
+def test_a_link_loop_ends_in_a_refusal(sandbox, tmp_path):
+    (tmp_path / "a").symlink_to("b")
+    (tmp_path / "b").symlink_to("a")
+    with pytest.raises(OSError) as e:
+        priv.open_regular(str(tmp_path / "a" / "f"))
+    assert e.value.errno == errno.ELOOP
+
+
+def test_a_relative_path_and_dots_resolve(sandbox, tmp_path, monkeypatch):
+    (tmp_path / "d").mkdir()
+    (tmp_path / "f.txt").write_text("here")
+    monkeypatch.chdir(tmp_path)
+    for path in ("f.txt", "./f.txt", "d/../f.txt"):
+        with priv.open_regular(path) as fh:
+            assert fh.read() == "here"
+
+
+# ── an agent-sized file cannot fill root's memory ───────────────────────────
+@pytest.fixture
+def small_cap(monkeypatch):
+    monkeypatch.setattr(priv, "AGENT_FILE_MAX_BYTES", 4096)
+
+
+def _sparse(path, size):
+    with open(path, "wb") as fh:
+        fh.truncate(size)
+
+
+def test_a_read_past_the_cap_is_refused(sandbox, small_cap, tmp_path):
+    p = str(tmp_path / "big")
+    _sparse(p, 1 << 22)
+    with pytest.raises(OSError):
+        with priv.open_regular(p, "rb") as fh:
+            fh.read()
+    with pytest.raises(OSError):
+        with priv.open_regular(p, encoding="utf-8", errors="replace") as fh:
+            fh.read()
+    with pytest.raises(OSError):
+        with priv.open_regular(p) as fh:
+            for _ in fh:
+                pass
+
+
+def test_the_cap_counts_across_many_small_reads(sandbox, monkeypatch, tmp_path):
+    monkeypatch.setattr(priv, "AGENT_FILE_MAX_BYTES", 100000)
+    p = str(tmp_path / "big")
+    _sparse(p, 1 << 22)
+    with pytest.raises(OSError):
+        with priv.open_regular(p, "rb") as fh:
+            while fh.read(1000):
+                pass
+
+
+def test_a_file_grown_after_the_open_is_still_bounded(sandbox, small_cap, tmp_path):
+    p = str(tmp_path / "grows")
+    pathlib.Path(p).write_bytes(b"x" * 10)
+    with priv.open_regular(p, "rb") as fh:
+        _sparse(p, 1 << 22)
+        with pytest.raises(OSError):
+            fh.read()
+
+
+def test_a_file_at_the_cap_reads_whole(sandbox, small_cap, tmp_path):
+    p = str(tmp_path / "exact")
+    pathlib.Path(p).write_bytes(b"y" * 4096)
+    with priv.open_regular(p, "rb") as fh:
+        assert fh.read() == b"y" * 4096
+    with priv.open_regular(p) as fh:
+        assert fh.read() == "y" * 4096
+
+
+def test_the_tail_of_a_long_file_stays_readable(sandbox, small_cap, tmp_path):
+    p = tmp_path / "long"
+    p.write_bytes(b"a" * 100000 + b"\nlast\n")
+    with priv.open_regular(str(p), "rb") as fh:
+        fh.seek(-6, os.SEEK_END)
+        assert fh.tell() == 100000 and fh.read() == b"\nlast\n"
+
+
+def test_the_handle_closes(sandbox, tmp_path):
+    p = tmp_path / "f"
+    p.write_text("x")
+    before = len(os.listdir("/proc/self/fd"))
+    for mode in ("r", "rb"):
+        with priv.open_regular(str(p), mode) as fh:
+            fh.read()
+    assert len(os.listdir("/proc/self/fd")) == before
+
+
+@real
+@pytest.mark.parametrize("which", ["plan", "handoff", "checkpoint", "tail", "queue", "goals"])
+def test_root_readers_survive_a_sparse_file(sandbox, small_cap, which):
+    from core import context_budget as cb
+    from core import native_goals as ng
+    from core import project_supervisor as ps
+    t, project, _ = sandbox
+    size = 1 << 22
+    if which == "plan":
+        p = os.path.join(project, "PROJECT_PLAN.md")
+        _sparse(p, size)
+        assert ps.parse_plan(project)["ok"] is False
+    elif which == "handoff":
+        p = os.path.join(project, ps.HANDOFF_PATH)
+        os.makedirs(os.path.dirname(p))
+        _sparse(p, size)
+        assert ps.read_handoff(project) == {"_malformed": True}
+    elif which == "checkpoint":
+        p = os.path.join(project, "CONTEXT_CHECKPOINT.md")
+        _sparse(p, size)
+        assert cb.verify_checkpoint(p)["ok"] is False
+    elif which == "tail":
+        p = os.path.join(project, "t.jsonl")
+        _sparse(p, size)
+        assert ac._last_user_text_from_tail(p) == ""
+    elif which == "goals":
+        p = os.path.join(project, "g.jsonl")
+        _sparse(p, size)
+        assert ng.goal_state(project, "s", path=p)["active"] is False
+    else:
+        d = os.path.join(t.home, ".claude", "projects", project.replace("/", "-"))
+        os.makedirs(d)
+        _sparse(os.path.join(d, "s.jsonl"), size)
+        assert os_task_queue.transcript_messages(project) == []

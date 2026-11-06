@@ -19,7 +19,9 @@ tmux server hands its panes whatever the process that started it had.
 """
 from __future__ import annotations
 
+import errno
 import glob
+import io
 import os
 import pwd
 import re
@@ -33,6 +35,11 @@ from typing import Optional, Sequence
 _NAME_RE = re.compile(r"\A[a-z_][a-z0-9_-]{0,31}\Z")
 _PROBE_TIMEOUT = 10
 _LANG = "C.UTF-8"
+_DEFAULT_DB = "/root/ai-dev-runtime/agent_control.db"
+_MAX_LINK_HOPS = 40
+# Per open, in bytes actually read: a sparse file costs the agent nothing and root its memory.
+# Well above the 41MB seen on a live transcript. Seeking to a file's tail spends none of it.
+AGENT_FILE_MAX_BYTES = 256 * 1024 * 1024
 
 
 class AgentPrivilegeError(RuntimeError):
@@ -48,8 +55,7 @@ class Target:
 
 
 def _pin_path() -> str:
-    db = os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
-    return db + ".run_as"
+    return os.getenv("AGENT_CONTROL_DB", _DEFAULT_DB) + ".run_as"
 
 
 def _pinned() -> str:
@@ -105,7 +111,12 @@ def _lookup(name: str) -> Target:
 
 
 def resolve() -> Optional[Target]:
-    """The checks of target() without its pin, for a tool that only looks."""
+    """The checks of target() without its pin, for a tool that only looks.
+    The variable must come with its instance's DB. Without it the pin path falls back to the
+    default instance, so a tool run by hand in a shell holding only AGENT_RUN_AS would drop
+    the services of that instance to the agent's user."""
+    if os.getenv("AGENT_RUN_AS", "").strip() and not os.getenv("AGENT_CONTROL_DB", "").strip():
+        raise AgentPrivilegeError("control_db_unset")
     name = run_as_name()
     if not name:
         return None
@@ -244,22 +255,90 @@ def write_as_agent(path: str, content: str) -> bool:
     return True
 
 
-def open_regular(path: str, *args, **kwargs):
-    """open() for a file the agent may own: no symlink, and a FIFO cannot hang the caller.
-    Plain open() when AGENT_RUN_AS is unset, so a symlinked dotfile keeps working."""
+class _Capped(io.RawIOBase):
+    """A file that refuses past AGENT_FILE_MAX_BYTES read, counted on the reads themselves:
+    a size check beside the open would miss a file grown after it."""
+
+    def __init__(self, fd: int):
+        super().__init__()
+        self._fd, self._left = fd, AGENT_FILE_MAX_BYTES
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        return self._fd
+
+    def seek(self, pos: int, whence: int = os.SEEK_SET) -> int:
+        return os.lseek(self._fd, pos, whence)
+
+    def readinto(self, buf) -> int:
+        n = os.readv(self._fd, [memoryview(buf)[:self._left + 1]])
+        if n > self._left:
+            raise OSError(errno.EFBIG, "agent file over the read limit")
+        self._left -= n
+        return n
+
+    def close(self) -> None:
+        if not self.closed:
+            os.close(self._fd)
+        super().close()
+
+
+def _open_no_agent_links(path: str) -> int:
+    """Walk the path one directory handle at a time, so nothing can swap a component between
+    the check and the use. A link owned by root is followed: the agent can neither make nor
+    change one. Any other link in the path refuses, and so does a link as the last component."""
+    path = os.path.join(os.getcwd(), os.fspath(path))
+    for _ in range(_MAX_LINK_HOPS):
+        parts = [p for p in path.split("/") if p and p != "."]
+        if not parts:
+            raise IsADirectoryError(errno.EISDIR, "not a file", path)
+        at = os.open("/", os.O_PATH | os.O_DIRECTORY)
+        try:
+            for i, name in enumerate(parts[:-1]):
+                fd = os.open(name, os.O_PATH | os.O_NOFOLLOW, dir_fd=at)
+                st = os.fstat(fd)
+                if stat.S_ISDIR(st.st_mode):
+                    os.close(at)
+                    at = fd
+                    continue
+                os.close(fd)
+                if not stat.S_ISLNK(st.st_mode):
+                    raise NotADirectoryError(errno.ENOTDIR, "not a directory", path)
+                if st.st_uid != 0:
+                    raise OSError(errno.ELOOP, "link not owned by root", path)
+                path = os.path.join("/", *parts[:i], os.readlink(name, dir_fd=at),
+                                    *parts[i + 1:])
+                break
+            else:
+                return os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=at)
+        finally:
+            os.close(at)
+    raise OSError(errno.ELOOP, "too many links", path)
+
+
+def open_regular(path: str, mode: str = "r", encoding=None, errors=None):
+    """open() for a file the agent may own. Under the setting: no agent link anywhere in the
+    path, no FIFO to hang on, no more than AGENT_FILE_MAX_BYTES read. An over-long read
+    raises OSError from read() or iteration, not from here. Plain open() when AGENT_RUN_AS
+    is unset, so a symlinked dotfile keeps working."""
     if not run_as_name():
-        return open(path, *args, **kwargs)
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        return open(path, mode, encoding=encoding, errors=errors)
+    if mode not in ("r", "rb"):
+        raise ValueError(f"read only: {mode!r}")
+    fd = _open_no_agent_links(path)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise OSError(f"not a regular file: {path}")
-        return os.fdopen(fd, *args, **kwargs)
+        reader = io.BufferedReader(_Capped(fd))
     except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
+        os.close(fd)
         raise
+    return reader if mode == "rb" else io.TextIOWrapper(reader, encoding=encoding, errors=errors)
 
 
 def claude_home() -> str:

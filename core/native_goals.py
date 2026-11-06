@@ -88,6 +88,14 @@ def _transcript(cwd: str, session_id: str) -> str:
     return os.path.join(home, ".claude", "projects", enc, f"{session_id}.jsonl")
 
 
+def _lines(fh):
+    """A transcript over the read limit ends here, as a short file would."""
+    try:
+        yield from fh
+    except OSError:
+        return
+
+
 def goal_state(cwd: str, session_id: str, *, path: Optional[str] = None) -> dict:
     """Goal state from this session's own transcript (read-only; only goal records are
     parsed, never conversation text). Claude Code 2.1.310 records:
@@ -105,7 +113,7 @@ def goal_state(cwd: str, session_id: str, *, path: Optional[str] = None) -> dict
     except OSError:
         return st
     with fh:
-        for line in fh:
+        for line in _lines(fh):
             if "/goal</command-name>" not in line and '"goal_status"' not in line:
                 continue
             try:

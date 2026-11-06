@@ -3,7 +3,12 @@
 as the agent's uid, the way a real pane or check does. Prints names and yes or no, never a
 value. Exit 0 only when everything passes.
 
-    AGENT_RUN_AS=fc-agent tools/agent_uid_preflight.py --deny /opt/sandbox-mcp/.env
+    AGENT_RUN_AS=fc-agent AGENT_CONTROL_DB=<instance db> tools/agent_uid_preflight.py \\
+        --deny /opt/sandbox-mcp/.env --pin
+
+--pin writes the instance's pin once every check passes. Use it before the first start: a
+process of the instance without AGENT_RUN_AS that acts before any drop would otherwise see
+no setting and start the agent as root.
 """
 from __future__ import annotations
 
@@ -51,6 +56,7 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--deny", action="append", default=[], help="another path the agent must not reach")
     ap.add_argument("--project", help="project dir the agent must be able to use")
+    ap.add_argument("--pin", action="store_true", help="pin the setting if every check passes")
     a = ap.parse_args(argv)
     try:
         t = priv.resolve()
@@ -78,7 +84,16 @@ def main(argv=None) -> int:
     if a.project:
         checks["project_usable"] = priv.can_use_dir(t, a.project)
     ok = all(checks.values())
-    print(json.dumps({"ok": ok, "run_as": t.name, "absent": absent, "checks": checks}, indent=1))
+    pinned = None
+    if ok and a.pin:
+        try:
+            priv.target()
+            pinned = priv._pin_path()
+        except priv.AgentPrivilegeError as e:
+            print(json.dumps({"ok": False, "reason": f"agent_run_as:{e}"}))
+            return 1
+    print(json.dumps({"ok": ok, "run_as": t.name, "pin_path": priv._pin_path(), "pinned": pinned,
+                      "absent": absent, "checks": checks}, indent=1))
     return 0 if ok else 1
 
 
