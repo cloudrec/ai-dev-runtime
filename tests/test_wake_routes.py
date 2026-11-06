@@ -116,6 +116,41 @@ def test_an_unresolvable_route_offers_nothing_rather_than_borrowing_a_chat():
     assert p["pending"] is False and p["reason"] == "no_route_bound"
 
 
+def test_an_unrouted_wake_does_not_hold_back_the_queue_behind_it():
+    wr.bind_route("gone", PAY)
+    wr.bind_route("mess", MESS)
+    _decide(41, "gone", now=30_000.0)
+    _decide(42, "mess", now=30_000.0)
+    wr.unbind_route("gone")
+    p = wb.pending_wake(now=30_000.0)
+    assert p["pending"] is True and p["event_id"] == 42 and p["conversation"] == MESS
+
+
+def test_a_passed_over_wake_is_kept_and_goes_to_its_own_chat_once_bound():
+    wr.bind_route("gone", PAY)
+    wr.bind_route("mess", MESS)
+    _decide(41, "gone", now=30_000.0)
+    _decide(42, "mess", now=30_000.0)
+    wr.unbind_route("gone")
+    wb.acknowledge(42, now=30_000.0)
+    p = wb.pending_wake(now=30_000.0)
+    assert p["pending"] is False and p["reason"] == "no_route_bound"
+    assert p["event_id"] == 41 and p["route_key"] == "gone"
+    wr.bind_route("gone", PAY)
+    p = wb.pending_wake(now=30_000.0)
+    assert p["event_id"] == 41 and p["conversation"] == PAY
+
+
+def test_an_unrouted_wake_never_borrows_the_chat_of_the_one_behind_it():
+    wr.bind_route("gone", PAY)
+    wr.bind_route("mess", MESS)
+    _decide(41, "gone", now=30_000.0)
+    _decide(42, "mess", now=30_000.0)
+    wr.unbind_route("gone")
+    p = wb.pending_wake(now=30_000.0)
+    assert p["event_id"] != 41 and p["conversation"] != PAY
+
+
 # ── registry mechanics ─────────────────────────────────────────────────────
 def test_bind_is_idempotent_and_audited_once():
     assert wr.bind_route("mess", MESS)["action"] == "bind"

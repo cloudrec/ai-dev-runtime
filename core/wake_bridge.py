@@ -1923,7 +1923,7 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
             "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
             "ORDER BY COALESCE(a.actionable,0) DESC, a.id ASC "
             "LIMIT ?", (_CANDIDATE_SCAN_LIMIT,)).fetchall()
-        r = None
+        r = target = unrouted = None
         benched = None  # (event_id, retry_at, attempt, transient) for the head of line
         only = only_agents()
         for cand in candidates:
@@ -1942,8 +1942,26 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
                     if benched is None:
                         benched = (eid, retry_at, streak, fast_lane)
                     continue
-            r = cand
+            # Re-resolved with the SAME inputs the decision used - project AND agent
+            # ref. Passing only the project was a wrong-chat bug: event 9868 matched
+            # the agent registry through its agent ref at decision time (gaika-drop)
+            # and missed it here, so a wake decided for the project chat was
+            # delivered to the owner-os control chat. Fresh resolution is still the
+            # point (a rebind between decision and submission must take effect); it
+            # just has to be the same QUESTION, not a narrower one.
+            resolved = wake_routes.resolve(project_id=cand[2], agent_id=cand[4], conn=conn)
+            if not resolved.get("bound"):
+                # FAIL CLOSED per event: nothing is offered for it, and it never borrows
+                # another event's chat. It stays pending until bound or expired, but it
+                # does not hold back other routes: the sandbox queue stopped dead on one.
+                unrouted = unrouted or (int(cand[0]), resolved)
+                continue
+            r, target = cand, resolved
             break
+        if not r and unrouted:
+            eid, resolved = unrouted
+            return {"pending": False, "reason": resolved.get("reason", "no_route_bound"),
+                    "event_id": eid, "route_key": resolved.get("route_key")}
         if not r:
             result = {"pending": False, "reason": "nothing_to_wake_for",
                       "coalesced": coalesced["superseded_event_ids"]}
@@ -1953,19 +1971,6 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
                                "attempt": attempt, "transient_retry": transient,
                                "next_retry_in_secs": max(0, int(retry_at - now_))})
             return result
-        # FAIL CLOSED per event: an event whose route cannot be resolved offers nothing,
-        # rather than borrowing whichever chat another event would have used.
-        # Re-resolved with the SAME inputs the decision used - project AND agent
-        # ref. Passing only the project was a wrong-chat bug: event 9868 matched
-        # the agent registry through its agent ref at decision time (gaika-drop)
-        # and missed it here, so a wake decided for the project chat was
-        # delivered to the owner-os control chat. Fresh resolution is still the
-        # point (a rebind between decision and submission must take effect); it
-        # just has to be the same QUESTION, not a narrower one.
-        target = wake_routes.resolve(project_id=r[2], agent_id=r[4], conn=conn)
-        if not target.get("bound"):
-            return {"pending": False, "reason": target.get("reason", "no_route_bound"),
-                    "event_id": int(r[0]), "route_key": target.get("route_key")}
         event_id, actionable, project_id, event_type, agent_id = r
         return {"pending": True, "event_id": int(event_id), "actionable": bool(actionable),
                 "conversation": target["conversation"],
