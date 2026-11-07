@@ -544,3 +544,28 @@ def test_intake_refuses_under_agent_run_as(box, monkeypatch):
     with pytest.raises(specs.SpecError, match="intake_off_under_agent_run_as"):
         intake.start("calc", SPEC, by=BY)
     assert os.listdir(box) == []
+
+
+def test_project_acceptance_runs_api_checks_untrusted(box, monkeypatch):
+    from core import task_contract as tc
+    intake.start("calc", SPEC, by=BY)
+    e = fe.Engine("calc", _Adapter(), holder="t")
+    seen = []
+
+    class Stop(Exception):
+        pass
+
+    def run(checks, trusted):
+        seen.append(trusted)
+        raise Stop
+    monkeypatch.setattr(e, "_run_checks", run)
+    with pytest.raises(Stop):
+        e._project_step([{"state": tc.VERIFIED_DONE, "committed": 1, "key": "add"}])
+    assert seen == [False]
+
+
+def test_scope_root_refuses_an_alias_inside_the_root(box, no_reservations):
+    (box / "calc").mkdir()
+    (box / "alias").symlink_to(box / "calc")
+    r = acp.authorize(str(box / "alias"), "fc-calc", caller="fullcycle:engine", cfg=_cfg(box))
+    assert r["reason"] == "creation_scope_worktree_is_symlink"
