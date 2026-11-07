@@ -11,7 +11,7 @@ umask 022
 RUNTIME=/root/ai-dev-runtime
 SEO=/opt/seo
 LIVE_SHA=308ac8f
-TARGET_SHA=6b13d81
+TARGET_SHA=68895a0
 SEO_LIVE=5253d7c
 SEO_TARGET=0aa58b2
 ROOT=/opt/fc-projects
