@@ -1,0 +1,8 @@
+{"title":"wordstat","goal":"A tiny text statistics module with tests.",
+ "acceptance_criteria":["wordstat.count_words('a b  c') == 3","wordstat.top_word('a b a') == 'a'"],
+ "checks":[["python3","-m","pytest","-q","tests"]],
+ "tasks":[
+  {"key":"count","title":"count_words","goal":"Create wordstat.py with count_words(text) returning the number of whitespace-separated words, and tests/test_count.py with pytest tests for it, including the empty string.","acceptance_criteria":["count_words('a b  c') == 3","count_words('') == 0"],
+   "checks":[["python3","-m","pytest","-q","tests/test_count.py"]]},
+  {"key":"top","title":"top_word","goal":"Add top_word(text) to wordstat.py: the most frequent word, the first seen wins a tie. Add tests/test_top.py with pytest tests for it.","acceptance_criteria":["top_word('a b a') == 'a'","top_word('x y') == 'x'"],"depends_on":["count"],
+   "checks":[["python3","-m","pytest","-q","tests/test_top.py"]]}]}
