@@ -1,0 +1,7 @@
+{"title":"taskboard version","goal":"Expose the TaskBoard package version in one small module.",
+ "acceptance_criteria":["app.version.VERSION equals '0.2.0'"],
+ "checks":[["python3","-c","from app.version import VERSION; assert VERSION == '0.2.0'"]],
+ "scope":["app/version.py"],"do_not_touch":["README.md"],
+ "tasks":[{"key":"version","title":"Add version module","goal":"Create app/version.py with one constant: VERSION = '0.2.0'.",
+  "acceptance_criteria":["app.version.VERSION equals '0.2.0'"],
+  "checks":[["python3","-c","from app.version import VERSION; assert VERSION == '0.2.0'"]]}]}

@@ -45,3 +45,13 @@ Live accepts decisions by actor name. The new code refuses the shared token. So 
 ## Afterwards
 - Send one small review through the live chat to prove the path.
 - `AGENT_RUN_AS` on live is a separate decision: it needs a user per instance, `AGENT_CONTROL_DB` in every unit, and `project_supervisor` off.
+
+## Result, 2026-11-06
+Applied by the owner at 21:23Z with `--apply --reviewer-token-id 3`. Live `319012a`, seo `5253d7c`. After apply: three units active with 0 restarts, no error-level journal lines, shared token 403 on ack, 10 tmux sessions as before, `seo-backend-1` healthy with 0 restarts.
+Backup and rollback: `/root/ai-dev-runtime/backups/stage15-deploy-20261106T212256Z`.
+**Not proven: a real review decided through the live chat after deploy.** `AGENT_RUN_AS` stays off on live.
+
+## Live proof, 2026-11-07
+Project `owneros-taskboard-test`, task `version`: agent wrote `app/version.py`, checks passed, review 2 went to the bound chat, ChatGPT approved it, the engine applied the decision and committed `d22397c`. The audit row was not read by the session.
+Delay: the ChatGPT session on the live browser expired around 19:41 CET on 2026-11-06, before the deploy; cause not determined. Every wake failed for about 11.5 hours with no alert to the owner. After sign-in at 07:04 CET the queue drained by itself.
+**Open: no alert for an expired ChatGPT session.**
