@@ -594,6 +594,22 @@ def fullcycle_decision(review_id: int, req: FullcycleDecisionReq, request: Reque
                            feedback=req.feedback, next_tasks=req.next_tasks)
 
 
+class FullcycleProjectReq(BaseModel):
+    project_id: str
+    spec: dict
+
+
+@router.post("/fullcycle/projects")
+def fullcycle_project_start(req: FullcycleProjectReq, request: Request,
+                            _: bool = Depends(_auth)):
+    """Start a project from a spec, or add a spec version to an intake project. Same
+    authority as a review decision. The project gets its own new directory; its checks
+    are confined to a test runner; no push, no deploy."""
+    from core.fullcycle import intake
+    actor, _how = _reviewer_principal(request)
+    return _fullcycle_call(intake.start, req.project_id, req.spec, by=actor)
+
+
 @router.get("/fullcycle/projects/{project_id}")
 def fullcycle_project(project_id: str, _: bool = Depends(_auth)):
     from core.fullcycle import engine as fe

@@ -16,4 +16,12 @@
 hard_deny_dirs:                      # never created into automatically (payment agent; also denied by
                                      # session name); only a valid owner proof overrides
   - /opt/payment-orchestrator
-scopes: {}
+scopes:
+  # Projects the GPT tech lead starts through MCP (core/fullcycle/intake.py). Each direct
+  # subdirectory of `root` is one worktree; the session must be fc-<directory name>. Only
+  # the full-cycle worker may create here, never the API or MCP. Owner decision 2026-11-07.
+  fullcycle-intake:
+    callers: [fullcycle:engine]
+    session_prefix: fc-
+    root: /opt/fc-projects
+    max_concurrent: 2

@@ -84,7 +84,12 @@ def _offer_allowed(agent_id: str, only: set) -> bool:
     if not only:
         return True
     a = (agent_id or "").strip()
-    return bool(a) and (a in only or a.split(":", 1)[0] in only)
+    if not a:
+        return False
+    if a in only or a.split(":", 1)[0] in only:
+        return True
+    return any(o.endswith("*") and len(o) > 2 and "*" not in o[:-1] and a.startswith(o[:-1])
+               for o in only)
 # A decided-but-undelivered wake older than this is stale: "this agent is waiting NOW"
 # stops being true after hours of silence, and "read Owner OS" stops being useful once
 # the backlog it points at is ancient history. The 2026-08-15 incident this guards:

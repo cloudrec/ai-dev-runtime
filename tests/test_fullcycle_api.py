@@ -3,6 +3,8 @@ Auth is the router's normal bearer dependency, overridden here; the routes are t
 wrappers, so this proves the wiring and the error mapping, not the engine."""
 from __future__ import annotations
 
+import os
+
 import pytest
 
 fastapi = pytest.importorskip("fastapi")
@@ -142,3 +144,28 @@ def test_no_reviewer_is_authorized_by_default(client, monkeypatch):
     assert client.post(f"/api/v1/fullcycle/reviews/{rid}/decision",
                        json={"decision": "approve", "idempotency_key": "d1"},
                        headers=REVIEWER).status_code == 403
+
+
+INTAKE_SPEC = {"title": "calc", "goal": "g", "acceptance_criteria": ["ok"],
+               "tasks": [{"key": "add", "title": "a", "goal": "g", "acceptance_criteria": ["ok"]}]}
+
+
+def test_only_the_reviewer_may_start_a_project(client, tmp_path, monkeypatch):
+    root = tmp_path / "fc"
+    root.mkdir()
+    monkeypatch.setenv("FULLCYCLE_INTAKE_ROOT", str(root))
+    body = {"project_id": "calc", "spec": INTAKE_SPEC}
+    for hdr in (SHARED_TOKEN, {**SHARED_TOKEN, "X-Runtime-Actor": "gpt-reviewer"},
+                {"X-Test-Token": "client:someone-else"}):
+        assert client.post("/api/v1/fullcycle/projects", json=body, headers=hdr).status_code == 403
+    assert os.listdir(root) == []
+    r = client.post("/api/v1/fullcycle/projects", json=body, headers=REVIEWER)
+    assert r.status_code == 200 and r.json()["session"] == "fc-calc"
+    assert specs.get_spec("calc")["by"] == "api:client/gpt-reviewer"
+
+
+def test_project_start_errors_are_400(client, monkeypatch):
+    monkeypatch.delenv("FULLCYCLE_INTAKE_ROOT", raising=False)
+    r = client.post("/api/v1/fullcycle/projects", json={"project_id": "calc", "spec": INTAKE_SPEC},
+                    headers=REVIEWER)
+    assert r.status_code == 400 and "intake_disabled" in r.json()["detail"]

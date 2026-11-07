@@ -144,6 +144,15 @@ def _scope_for(project_dir: str, cfg: dict):
     for name, sc in scopes.items():
         if not isinstance(sc, dict):
             continue
+        base = sc.get("root")
+        if isinstance(base, str) and base:
+            if os.path.abspath(base) != _real(base):
+                return "creation_scope_root_is_symlink"
+            if os.path.dirname(real) == _real(base) and real != _real(base):
+                if os.path.abspath(project_dir) != real:
+                    return "creation_scope_worktree_is_symlink"
+                hits.append((name, sc, os.path.basename(real), real))
+            continue
         wts = sc.get("worktrees")
         if not isinstance(wts, dict):
             continue
@@ -161,6 +170,9 @@ def _scope_for(project_dir: str, cfg: dict):
 
 
 def scope_population(sc: dict, live_cwds: list) -> int:
+    base = sc.get("root")
+    if isinstance(base, str) and base:
+        return sum(1 for c in live_cwds if _under(c, base) and _real(c) != _real(base))
     wts = [w for w in (sc.get("worktrees") or {}).values() if isinstance(w, str) and w] \
         if isinstance(sc.get("worktrees"), dict) else []
     return sum(1 for c in live_cwds if any(_under(c, w) for w in wts))

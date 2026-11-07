@@ -2014,7 +2014,13 @@ def caller_class(actor: Optional[str], source: Optional[str] = None) -> str:
 def _allowlisted(session: str, target: str, caller: str) -> bool:
     for entry in automation_targets():
         tgt, _, who = entry.partition("@")
-        if tgt in (session, target) and (not who or who == caller):
+        if who and who != caller:
+            continue
+        if tgt in (session, target):
+            return True
+        # `fc-*@fullcycle:engine`: a prefix, only with a named caller and a real prefix
+        if who and tgt.endswith("*") and len(tgt) > 2 and "*" not in tgt[:-1] \
+                and session.startswith(tgt[:-1]):
             return True
     return False
 
@@ -2059,6 +2065,27 @@ def automation_decision(session: str, target: str, actor: Optional[str],
 
 
 _CONTROL_KEYS_RE = re.compile(r"^(Enter|C-u|C-m|Escape|[0-9])$")
+_TRUST_ASK = "Accessingworkspace:"
+_TRUST_YES = "Yes,Itrustthisfolder"
+
+
+def accept_folder_trust(session: str, folder: str, *, actor: str) -> dict:
+    """Answer claude's "trust this folder?" with yes, for a folder the CALLER made. Only
+    when the screen asks exactly that about exactly `folder`, and only for a caller the
+    automation policy allows to drive this session. Two keys: Down, Enter."""
+    target = f"{session}:0.0"
+    refusal = automation_refusal(session, target, actor, action="control_keys", cwd=folder)
+    if refusal:
+        audit("accept_folder_trust", target, accepted=False, refused=refusal, actor=actor)
+        return {"ok": False, "refused": refusal}
+    rc, out, _ = _tmux(["capture-pane", "-p", "-t", f"={session}:"])
+    flat = "".join(out.split()) if rc == 0 else ""
+    if _TRUST_ASK not in flat or _TRUST_YES not in flat or "".join(folder.split()) not in flat:
+        return {"ok": False, "reason": "no_trust_prompt_for_this_folder"}
+    for key in ("Down", "Enter"):
+        _tmux(["send-keys", "-t", f"={session}:", key])
+    audit("accept_folder_trust", target, accepted=True, actor=actor, cwd=folder)
+    return {"ok": True}
 
 
 def send_control_keys(target: str, keys: list, actor: Optional[str] = None,

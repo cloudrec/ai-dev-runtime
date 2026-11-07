@@ -57,11 +57,13 @@ def auth(wt, d, session, caller="api", live=(), **kw):
 
 # ── policy decisions ──────────────────────────────────────────────────────────
 
-def test_shipped_config_authorizes_nothing(monkeypatch, tmp_path):
+def test_shipped_config_authorizes_only_the_intake_worker(monkeypatch, tmp_path):
+    """Owner decision 2026-11-07: one scope, intake projects, the full-cycle worker only."""
     monkeypatch.delenv("AGENT_CREATION_CONFIG", raising=False)
     monkeypatch.delenv("AGENT_CREATION_POLICY", raising=False)
     shipped = acp.load_config()
-    assert shipped.get("scopes") == {}
+    assert list(shipped.get("scopes")) == ["fullcycle-intake"]
+    assert shipped["scopes"]["fullcycle-intake"]["callers"] == ["fullcycle:engine"]
     for caller in ("api", "unattributed", "session_recovery", "native_supervisor"):
         assert acp.authorize(str(tmp_path), "agent-x", caller=caller,
                              live_cwds=[])["reason"] == "creation_not_in_any_scope"

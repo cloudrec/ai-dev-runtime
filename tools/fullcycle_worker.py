@@ -38,6 +38,32 @@ def projects(raw: str) -> dict:
     return out
 
 
+def round_projects(wanted: dict, intake) -> dict:
+    """The configured projects, then every intake project not done yet (its adapter
+    starts and readies the agent itself, see `intake.adapter`)."""
+    out = dict(wanted)
+    try:
+        todo = intake.active()
+    except Exception as ex:  # noqa: BLE001 — the configured projects still run
+        _log(what="intake_error", error=f"{type(ex).__name__}: {ex}"[:300])
+        return out
+    for p in todo:
+        out.setdefault(p["id"], p)
+    return out
+
+
+def settle_intake(pid: str, result: dict, intake) -> None:
+    """Project done and no task left in flight: stop its agent, free the slot."""
+    tasks = result.get("tasks") or {}
+    if result.get("project") != "done" or not tasks:
+        return
+    if any(state not in ("VERIFIED_DONE", "CANCELLED") for state in tasks.values()):
+        return
+    for p in intake.projects():
+        if p["id"] == pid and intake.stop_agent(p):
+            _log(what="intake_agent_stopped", project=pid)
+
+
 def _log(**kw) -> None:
     print(json.dumps({"ts": round(time.time(), 1), **kw}, default=str), flush=True)
 
@@ -49,24 +75,35 @@ def main() -> int:
     from core.fullcycle import engine as fe
     from core.fullcycle.tmux_adapter import AgentControlAdapter
 
+    from core.fullcycle import intake
     wanted = projects(os.getenv("FULLCYCLE_PROJECTS", ""))
-    if not wanted:
-        _log(what="no_projects", hint="set FULLCYCLE_PROJECTS=<project_id>=<session>")
+    if not wanted and not intake.intake_root():
+        _log(what="no_projects", hint="set FULLCYCLE_PROJECTS=<project_id>=<session> "
+                                      "or FULLCYCLE_INTAKE_ROOT")
         return 2
     stop = {"now": False}
     signal.signal(signal.SIGTERM, lambda *_: stop.update(now=True))
     holder = f"fullcycle-worker:{socket.gethostname()}:{os.getpid()}"
     engines: dict = {}
     while not stop["now"]:
-        for pid, session in wanted.items():
+        for pid, session in round_projects(wanted, intake).items():
             try:
                 e = engines.get(pid)
                 if e is None:
-                    e = engines[pid] = fe.Engine(pid, AgentControlAdapter(session),
-                                                 holder=holder)
+                    a = intake.adapter(session) if isinstance(session, dict) \
+                        else AgentControlAdapter(session)
+                    e = engines[pid] = fe.Engine(pid, a, holder=holder)
+                if hasattr(e.adapter, "prepare"):
+                    ready = e.adapter.prepare()
+                    if ready.get("created") or not ready.get("ok"):
+                        _log(what="intake_agent", project=pid, **ready)
+                    if not ready.get("ok"):
+                        continue
                 r = e.tick()
                 if r.get("log") or r.get("skipped"):
                     _log(**{**r, "project": pid, "result": r.get("project")})
+                if pid not in wanted:
+                    settle_intake(pid, r, intake)
             except Exception as ex:  # noqa: BLE001 — logged, retried next round
                 engines.pop(pid, None)
                 _log(project=pid, what="error", error=f"{type(ex).__name__}: {ex}"[:500])

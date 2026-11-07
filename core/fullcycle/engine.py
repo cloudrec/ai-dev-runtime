@@ -537,6 +537,18 @@ class Engine:
     def _trusted(self, task: dict) -> bool:
         return task["origin"] == "spec"
 
+    def _spec_trusted(self) -> bool:
+        """The project's acceptance checks are trusted only when these exact checks were
+        written by a spec author who is neither the reviewer nor an API client (an
+        `add_tasks` version copies the owner's checks unchanged and keeps them trusted)."""
+        rows = self.conn.execute("SELECT by, body FROM fc_spec WHERE project_id=? "
+                                 "ORDER BY version", (self.project_id,)).fetchall()
+        if not rows:
+            return False
+        current = json.loads(rows[-1][1]).get("checks") or []
+        return any(not (by or "").startswith(("review:", "api:")) and
+                   (json.loads(body).get("checks") or []) == current for by, body in rows)
+
     # -- seeding --------------------------------------------------------------
     def add_task(self, t: dict, *, spec_version: int, origin: str) -> Optional[str]:
         """Idempotent per (project, key): a task key that exists is never re-created."""
@@ -565,7 +577,8 @@ class Engine:
 
     def _seed(self) -> None:
         """Tasks of the latest spec. A task's origin is WHO first put its key into the
-        spec — so a reviewer-added task re-seeded after a crash stays untrusted."""
+        spec — so a reviewer-added task re-seeded after a crash stays untrusted. A spec
+        stored by an API client (`api:…`, intake) is the reviewer's too, never trusted."""
         versions = self.conn.execute(
             "SELECT version, body, by FROM fc_spec WHERE project_id=? ORDER BY version",
             (self.project_id,)).fetchall()
@@ -579,7 +592,7 @@ class Engine:
         for t in json.loads(latest_body)["tasks"]:
             by = first_by[t["key"]]
             self.add_task(t, spec_version=latest_v,
-                          origin=by if by.startswith("review:") else "spec")
+                          origin=by if by.startswith(("review:", "api:")) else "spec")
 
     # -- dispatch -------------------------------------------------------------
     def _envelope(self, task: dict, attempt: int) -> TaskEnvelope:
@@ -1537,7 +1550,7 @@ class Engine:
         if any(t["state"] == tc.VERIFIED_DONE and not t["committed"] for t in tasks):
             return None
         s = specs.get_spec(self.project_id, conn=self.conn)
-        checks = self._run_checks(s["body"]["checks"], trusted=True)
+        checks = self._run_checks(s["body"]["checks"], trusted=self._spec_trusted())
         if checks and not all(c["passed"] for c in checks):
             n = self.conn.execute("SELECT COUNT(*) FROM fc_review WHERE project_id=? AND"
                                   " kind='project'", (self.project_id,)).fetchone()[0]
