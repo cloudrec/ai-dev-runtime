@@ -177,6 +177,24 @@ RUNTIME_WATCH_ENABLED = os.getenv("RUNTIME_WATCH_ENABLED", "1") not in ("0", "",
 RUNTIME_WATCH_EVERY_TICKS = int(os.getenv("RUNTIME_WATCH_EVERY_TICKS", "3"))
 
 
+CHATGPT_SESSION_WATCH_ENABLED = os.getenv("CHATGPT_SESSION_WATCH_ENABLED", "1") not in (
+    "0", "", "false")
+CHATGPT_SESSION_EVERY_TICKS = int(os.getenv("CHATGPT_SESSION_EVERY_TICKS", "15"))
+
+
+def watch_chatgpt_session() -> dict:
+    """Telegram the owner when the ChatGPT session on this browser is gone."""
+    from cdp_composer import auth_state
+    from core import chatgpt_session_watch
+    r = chatgpt_session_watch.check(auth_state)
+    if r["sent"]:
+        print(f"chatgpt-session: {r['status']}, owner told", flush=True)
+    elif r["error"]:
+        print(f"chatgpt-session: {r['status']}, send failed: {str(r['error'])[:120]}",
+              flush=True)
+    return r
+
+
 def watch_agents() -> dict:
     """One agent-watch pass: live tmux agents -> CTO events for owner-relevant
     transitions. Runs at the poll cadence (~20s) because a pane sitting at a permission
@@ -340,6 +358,11 @@ def main() -> None:
                     watch_closed_loop()
                 except Exception as e:  # noqa: BLE001
                     print(f"closed-loop-watch error: {str(e)[:160]}", flush=True)
+            if CHATGPT_SESSION_WATCH_ENABLED and n % CHATGPT_SESSION_EVERY_TICKS == 0:
+                try:
+                    watch_chatgpt_session()
+                except Exception as e:  # noqa: BLE001 — never breaks the tick
+                    print(f"chatgpt-session error: {str(e)[:160]}", flush=True)
             if n % DISCOVERY_EVERY_TICKS == 0:
                 discover_chats()
         except Exception as e:  # noqa: BLE001

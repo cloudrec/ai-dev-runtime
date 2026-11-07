@@ -660,6 +660,38 @@ _TURN_UNIT_JS = ("const u=(/^H[1-6]$/.test(e.tagName||'')&&e.hasAttribute('data-
 _TURN_IDS_ATTR = "data-chatgpt-search-message-ids"
 
 
+# The answer of /api/auth/session holds an access token. It stays inside the page: this
+# expression turns it into one word before anything crosses CDP.
+_AUTH_STATE_JS = ("fetch('/api/auth/session',{credentials:'include'})"
+                  ".then(function(r){return r.ok?r.json():null;})"
+                  ".then(function(j){if(!j)return 'unknown';return j.user?'in':'out';})"
+                  ".catch(function(){return 'unknown';})")
+
+
+def auth_state() -> str:
+    """Is the browser signed in to ChatGPT? `ok`, `logged_out`, `browser_down` or `unknown`.
+    Reads, never navigates or types. No open ChatGPT page is `unknown`: the next wake
+    opens one, and a fresh browser with no tab is not a lost session."""
+    try:
+        page = find_chatgpt_page(None)
+    except Exception:  # noqa: BLE001 — DevTools did not answer at all
+        return "browser_down"
+    if not page or not page.get("webSocketDebuggerUrl"):
+        return "unknown"
+    sess = None
+    try:
+        sess = _Session(page["webSocketDebuggerUrl"])
+        r = sess.call("Runtime.evaluate", {"expression": _AUTH_STATE_JS, "returnByValue": True,
+                                           "awaitPromise": True})
+    except Exception:  # noqa: BLE001 — one tab failing says nothing about the session
+        return "unknown"
+    finally:
+        if sess:
+            sess.close()
+    word = (r.get("result") or {}).get("value")
+    return {"in": "ok", "out": "logged_out"}.get(word, "unknown")
+
+
 class _Session:
     """Minimal CDP client. Sends commands, returns only what the caller asks for."""
 
