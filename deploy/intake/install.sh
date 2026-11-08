@@ -38,7 +38,11 @@ check() {
   [ -z "$(git -C $RUNTIME status --porcelain --untracked-files=no)" ] || die "live tree has edits"
   [ "$(git -C $SEO rev-parse --short=7 HEAD)" = "$SEO_LIVE" ] || die "seo is not at $SEO_LIVE"
   git -C $SEO merge-base --is-ancestor HEAD "$SEO_TARGET" || die "seo target is not a fast-forward"
-  [ -z "$(git -C $SEO status --porcelain --untracked-files=no)" ] || die "seo tree has edits"
+  # old unrelated edits in /opt/seo (nginx.conf, settings, reports) stay as they are;
+  # only an edit to a file this deploy changes stops it
+  seo_clash=$(comm -12 <(git -C $SEO diff --name-only HEAD | sort) \
+                       <(git -C $SEO diff --name-only HEAD "$SEO_TARGET" | sort))
+  [ -z "$seo_clash" ] || die "seo edits in deployed files: $seo_clash"
   for f in "$D_API" "$D_WORKER" "$D_WAKE"; do [ ! -e "$f" ] || die "$f exists already"; done
   [ ! -e "$ROOT" ] || [ -z "$(ls -A $ROOT)" ] || die "$ROOT exists and is not empty"
   for u in "${UNITS[@]}"; do systemctl is-active -q "$u" || die "$u is not active"; done
