@@ -158,6 +158,8 @@ def _copy_repo(source: dict, path: str, project_id: str, conn,
     os.mkdir(path, 0o755)         # ours from here on: removed again if the copy fails
     try:
         base = repos.make_copy(source["path"], path, project_id, _GITIGNORE)
+        if source.get("seed"):
+            repos.seed_copy(source["path"], path, source["seed"])
         for pid, proot, branch in merge_from or []:
             bundle = repos.branch_bundle(proot, branch, keep_raw=intake_root() or "")
             try:
@@ -547,6 +549,14 @@ def notice_text(project: dict, conn) -> str:
     lines += ["  " + x[:100] for x in log.splitlines()]
     if src and log:
         lines.append(f"Take it: git -C {src['source']} fetch {root} {src['branch']}")
+        full = _git_out(root, "rev-parse", "HEAD")
+        try:
+            from core.fullcycle import release
+            link = release.make_link(project["id"], full, conn=conn)
+        except Exception:  # noqa: BLE001 — a notice without a link is still a notice
+            link = None
+        if link:
+            lines.append(f"Выпустить (fast-forward {src['source']}, одноразово, 24 ч): {link}")
     lines.append("Nothing was pushed or deployed.")
     return "\n".join(lines)
 

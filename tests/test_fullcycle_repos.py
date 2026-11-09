@@ -56,7 +56,7 @@ def src(tmp_path):
 # -- the owner's list --------------------------------------------------------------------
 def test_allow_then_get_and_the_listing_shows_no_paths(box, src):
     repos.allow("shop", str(src))
-    assert repos.get("shop") == {"name": "shop", "path": str(src)}
+    assert repos.get("shop") == {"name": "shop", "path": str(src), "seed": []}
     assert repos.listing() == [{"repo": "shop", "usable": True}]
     assert oct(os.stat(repos.repos_file()).st_mode & 0o777) == "0o600"
 
@@ -525,3 +525,60 @@ def test_an_agent_owned_branch_is_read_by_the_agent_inside_its_sandbox(box, src,
                          capture_output=True, text=True)
     assert got.returncode == 0 and got.stdout.strip()
     assert os.lstat(box / "calc-all").st_uid == 65534          # handed over after the merge
+
+
+# -- seed: build output the tests need, copied into every copy --------------------------
+def _with_release(src):
+    (src / ".gitignore").write_text("release/\n")
+    _git(src, "add", ".gitignore")
+    _git(src, "commit", "-q", "-m", "ignore release")
+    rel = src / "release"
+    (rel / "sub").mkdir(parents=True)
+    (rel / "PROVENANCE.json").write_text('{"v": 1}\n')
+    (rel / "sub" / "pkg.zip").write_bytes(b"PK\x03\x04data")
+    return rel
+
+
+def test_a_seeded_path_lands_in_every_copy(box, src):
+    _with_release(src)
+    repos.allow("shop", str(src), seed=["release"])
+    intake.start("calc", SPEC, by=BY, repo="shop")
+    path = box / "calc"
+    assert (path / "release" / "PROVENANCE.json").read_text() == '{"v": 1}\n'
+    assert (path / "release" / "sub" / "pkg.zip").read_bytes() == b"PK\x03\x04data"
+    assert _git(path, "status", "--porcelain") == ""          # ignored, not a change
+
+
+def test_links_in_a_seed_are_not_copied(box, src):
+    rel = _with_release(src)
+    os.symlink("/etc/passwd", rel / "passwd")
+    os.symlink("/etc", rel / "etc-dir")
+    repos.allow("shop", str(src), seed=["release"])
+    intake.start("calc", SPEC, by=BY, repo="shop")
+    path = box / "calc" / "release"
+    assert not os.path.lexists(path / "passwd") and not os.path.lexists(path / "etc-dir")
+
+
+@pytest.mark.parametrize("bad,err", [("../etc", "seed_path_bad"), ("/etc", "seed_path_bad"),
+                                     (".git", "seed_path_bad"), ("nope", "seed_path_missing"),
+                                     ("a b", "seed_path_bad")])
+def test_bad_seed_paths_are_refused_when_allowed(box, src, bad, err):
+    with pytest.raises(repos.RepoError, match=err):
+        repos.allow("shop", str(src), seed=[bad])
+
+
+def test_a_seed_through_a_link_is_refused(box, src, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.symlink(outside, src / "release")
+    with pytest.raises(repos.RepoError, match="link"):
+        repos.allow("shop", str(src), seed=["release"])
+
+
+def test_a_seed_over_the_cap_refuses_and_leaves_nothing(box, src, monkeypatch):
+    _with_release(src)
+    repos.allow("shop", str(src), seed=["release"])
+    monkeypatch.setattr(repos, "SEED_MAX_BYTES", 5)
+    with pytest.raises(specs.SpecError, match="seed_too_big"):
+        intake.start("calc", SPEC, by=BY, repo="shop")
+    assert os.listdir(box) == []

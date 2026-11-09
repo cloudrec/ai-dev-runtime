@@ -107,7 +107,8 @@ def get(name: str) -> dict:
     why = check_source(entry["path"])
     if why:
         raise RepoError(f"repo_refused:{name}:{why}")
-    return {"name": name, "path": os.path.realpath(entry["path"])}
+    seed = [x for x in (entry.get("seed") or []) if isinstance(x, str)]
+    return {"name": name, "path": os.path.realpath(entry["path"]), "seed": seed}
 
 
 def listing() -> list:
@@ -138,16 +139,39 @@ def _write(repos: dict) -> None:
         raise
 
 
-def allow(name: str, path: str) -> dict:
+SEED_MAX_BYTES = 300 * 1024 * 1024
+_SEED_RE = re.compile(r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$")
+
+
+def check_seed(source: str, rel: str) -> Optional[str]:
+    """A path the owner wants in every copy although git does not hold it (build output the
+    tests read). Inside the repo, not .git, a real file or directory, no link on the way."""
+    if not _SEED_RE.match(rel or "") or ".." in rel.split("/") or rel.split("/")[0] == ".git":
+        return "seed_path_bad"
+    real = os.path.realpath(os.path.join(source, rel))
+    if real != os.path.join(os.path.realpath(source), rel):
+        return "seed_path_is_or_crosses_a_link"
+    if not os.path.exists(real):
+        return "seed_path_missing"
+    return None
+
+
+def allow(name: str, path: str, seed: Optional[list] = None) -> dict:
     if not NAME_RE.match(name or ""):
         raise RepoError("repo name must match " + NAME_RE.pattern)
     why = check_source(path)
     if why:
         raise RepoError(why)
+    seed = list(seed or [])
+    for rel in seed:
+        bad = check_seed(os.path.realpath(path), rel)
+        if bad:
+            raise RepoError(f"{bad}:{rel}")
     repos = load()
-    repos[name] = {"path": os.path.realpath(path), "added": round(time.time())}
+    repos[name] = {"path": os.path.realpath(path), "added": round(time.time()),
+                   **({"seed": seed} if seed else {})}
     _write(repos)
-    return {"repo": name, "path": repos[name]["path"]}
+    return {"repo": name, "path": repos[name]["path"], "seed": seed}
 
 
 def remove(name: str) -> bool:
@@ -176,6 +200,39 @@ def _git(cwd: str, *args: str, timeout: int = 300) -> str:
 
 def branch_for(project_id: str) -> str:
     return f"fullcycle/{project_id}"
+
+
+def seed_copy(source: str, path: str, seed: list) -> list:
+    """Copy each seed path from the source into the new copy, before the agent owns it.
+    Regular files and directories only: links, devices and sockets are skipped. Refuses
+    past SEED_MAX_BYTES. Returns what was copied."""
+    import shutil
+    total, done = 0, []
+    for rel in seed:
+        bad = check_seed(source, rel)
+        if bad:
+            raise RepoError(f"{bad}:{rel}")
+        src = os.path.join(os.path.realpath(source), rel)
+        dst = os.path.join(path, rel)
+        files = []
+        if os.path.isdir(src) and not os.path.islink(src):
+            for top, dirs, names in os.walk(src, followlinks=False):
+                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(top, d))]
+                files += [os.path.join(top, n) for n in names]
+        else:
+            files = [src]
+        for f in files:
+            st = os.lstat(f)
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            total += st.st_size
+            if total > SEED_MAX_BYTES:
+                raise RepoError(f"seed_too_big:{rel}")
+            out = os.path.join(dst, os.path.relpath(f, src)) if f != src else dst
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            shutil.copyfile(f, out, follow_symlinks=False)
+        done.append(rel)
+    return done
 
 
 def make_copy(source: str, path: str, project_id: str, exclude: str) -> str:

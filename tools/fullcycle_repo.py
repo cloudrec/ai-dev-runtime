@@ -2,7 +2,7 @@
 """Owner only: which repositories the ChatGPT tech lead may start full-cycle projects on.
 
     fullcycle_repo.py list
-    fullcycle_repo.py allow <name> <path>
+    fullcycle_repo.py allow <name> <path> [--seed <path in repo>]...
     fullcycle_repo.py remove <name>
 
 A project never runs in the repository itself: Owner OS copies its committed HEAD into
@@ -28,6 +28,9 @@ def main(argv=None) -> int:
     a = sub.add_parser("allow")
     a.add_argument("name")
     a.add_argument("path")
+    a.add_argument("--seed", action="append", default=[],
+                   help="a path git does not hold (build output the tests read) to copy into "
+                        "every project copy, e.g. --seed release")
     r = sub.add_parser("remove")
     r.add_argument("name")
     args = ap.parse_args(argv)
@@ -36,8 +39,9 @@ def main(argv=None) -> int:
         return 2
     try:
         if args.cmd == "allow":
-            got = repos.allow(args.name, args.path)
-            print(f"allowed: {got['repo']} -> {got['path']}")
+            got = repos.allow(args.name, args.path, seed=args.seed)
+            print(f"allowed: {got['repo']} -> {got['path']}"
+                  + (f", seeded with {', '.join(got['seed'])}" if got["seed"] else ""))
         elif args.cmd == "remove":
             print("removed" if repos.remove(args.name) else "not in the list")
         else:
