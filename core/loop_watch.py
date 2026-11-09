@@ -71,10 +71,14 @@ def undelivered_wakes(conn, now: float) -> dict:
     """A wake the bridge decided to send that has not reached the chat for too long."""
     if not _has(conn, "wake_audit"):
         return {}
+    # exactly what pending_wake would still offer: a wake already fired (wake_submitted) is
+    # latched and never offered again, so it is not waiting for delivery
+    latched = ("AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
+               if _has(conn, "wake_submitted") else "")
     r = conn.execute(
-        "SELECT MIN(ts), COUNT(*) FROM wake_audit WHERE decision='wake' AND "
-        "COALESCE(acknowledged,0)=0 AND superseded_by IS NULL AND ts < ?",
-        (now - UNDELIVERED_AFTER,)).fetchone()
+        "SELECT MIN(a.ts), COUNT(*) FROM wake_audit a WHERE a.decision='wake' AND "
+        "COALESCE(a.acknowledged,0)=0 AND a.superseded_by IS NULL " + latched +
+        "AND a.ts < ?", (now - UNDELIVERED_AFTER,)).fetchone()
     if not r or not r[1]:
         return {}
     last = None

@@ -20,6 +20,7 @@ def _db(tmp_path, monkeypatch):
 def _conn():
     conn, _ = fe.connect()
     wb._conn(conn)                                   # the bridge's tables and migrations
+    conn.execute(wb._SUBMIT_SCHEMA)                  # made lazily by the bridge
     return conn
 
 
@@ -160,3 +161,15 @@ def test_the_companion_runs_the_watch_with_the_owner_push(monkeypatch):
     wc.watch_loop()
     assert seen == ["x"]
     assert wc.LOOP_WATCH_ENABLED and wc.LOOP_WATCH_EVERY_TICKS > 0
+
+
+def test_a_fired_but_unverified_wake_is_not_waiting_for_delivery():
+    """Live, 2026-11-09: the first pass reported 12 wakes 71 days old; each had been fired
+    (wake_submitted) and is never offered again, exactly as pending_wake treats it."""
+    conn, told = _conn(), []
+    _wake(conn, 700, NOW - 6_000_000)
+    conn.execute("INSERT INTO wake_submitted (event_id, ts, at, source) VALUES (?,?,?,?)",
+                 (700, NOW - 6_000_000, "", "companion"))
+    conn.commit()
+    assert "undelivered_wakes" not in lw.check(notify=told.append, conn=conn, now=NOW,
+                                               run=Run())["problems"]
