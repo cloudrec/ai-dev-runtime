@@ -17,6 +17,8 @@ Environment=AGENT_AUTOMATION_POLICY=enforce
 Environment=AGENT_AUTOMATION_TARGETS=fc-*@fullcycle:engine
 Environment=FULLCYCLE_INTAKE_ROOT=/opt/fc-projects
 Environment=FULLCYCLE_TICK_SECS=20
+# reviews and questions from these projects must wake the ChatGPT chat (decided at emit time)
+Environment=WAKE_BRIDGE_ENABLED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/ai-runtime/fullcycle-telegram.env
