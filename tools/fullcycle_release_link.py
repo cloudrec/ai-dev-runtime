@@ -36,7 +36,25 @@ def head_of(root: str, branch: str) -> str:
     return r.stdout.strip()
 
 
+_FROM_UNIT = ("FULLCYCLE_INTAKE_ROOT", "FULLCYCLE_RELEASE_URL_BASE", "CONTROL_PLANE_DB")
+
+
+def _settings_from_unit(unit: str = "owner-os-fullcycle-intake") -> None:
+    """An owner's shell has none of the worker's settings: take the ones this needs from
+    the unit that makes the links, unless already set."""
+    try:
+        out = subprocess.run(["systemctl", "show", unit, "-p", "Environment", "--value"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return
+    for item in out.split():
+        k, _, v = item.partition("=")
+        if k in _FROM_UNIT and v and not os.getenv(k):
+            os.environ[k] = v
+
+
 def main(argv=None) -> int:
+    _settings_from_unit()
     args = list(sys.argv[1:] if argv is None else argv)
     if len(args) != 1:
         print(__doc__.strip(), file=sys.stderr)
