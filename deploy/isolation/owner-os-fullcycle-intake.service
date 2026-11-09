@@ -1,0 +1,28 @@
+[Unit]
+Description=Owner OS full-cycle worker for ChatGPT projects (agents sandboxed as fcagent)
+After=network.target
+
+[Service]
+WorkingDirectory=/root/ai-dev-runtime
+ExecStart=/root/ai-dev-runtime/venv/bin/python /root/ai-dev-runtime/tools/fullcycle_worker.py
+# Deliberately NO EnvironmentFile=configs/.env (see owner-os-fullcycle-worker.service).
+Environment=CONTROL_PLANE_DB=/root/ai-dev-runtime/control_plane.db
+# Its own instance: own agent DB and pin, own tmux server, agents as fcagent in a mount
+# namespace that shows them /opt/fc-projects and their home and hides the rest of /opt.
+Environment=AGENT_CONTROL_DB=/var/lib/owneros-fc/agent_control.db
+Environment=AGENT_RUN_AS=fcagent
+Environment=AGENT_SANDBOX_KEEP=/opt/fc-projects
+Environment=AGENT_TMUX_SOCKET=owneros-fc
+Environment=AGENT_AUTOMATION_POLICY=enforce
+Environment=AGENT_AUTOMATION_TARGETS=fc-*@fullcycle:engine
+Environment=FULLCYCLE_INTAKE_ROOT=/opt/fc-projects
+Environment=FULLCYCLE_TICK_SECS=20
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/ai-runtime/fullcycle-telegram.env
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
