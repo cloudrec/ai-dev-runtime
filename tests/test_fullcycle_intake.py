@@ -569,3 +569,86 @@ def test_scope_root_refuses_an_alias_inside_the_root(box, no_reservations):
     (box / "alias").symlink_to(box / "calc")
     r = acp.authorize(str(box / "alias"), "fc-calc", caller="fullcycle:engine", cfg=_cfg(box))
     assert r["reason"] == "creation_scope_worktree_is_symlink"
+
+
+# -- a pane the worker closed is not a crash (events 81605, 81620 on 2026-11-09) ----------
+_WORKING = "✻ Compacting… (esc to interrupt · 32.1k tokens)"
+
+
+class _Emit:
+    def __init__(self):
+        self.types = []
+
+    def __call__(self, source, etype, **kw):
+        self.types.append(etype)
+        return {"event_id": len(self.types)}
+
+
+def _watch_then_stop(box, monkeypatch, *, stop: bool):
+    from core import agent_watch as aw
+    (box / "calc").mkdir()
+    root = str(box / "calc")
+    target = "fc-calc:0.0"
+
+    def fake_tmux(args, stdin=None):
+        if args[0] == "list-panes":
+            fmt = args[args.index("-F") + 1]
+            return 0, (root if "path" in fmt else target) + "\n", ""
+        return 0, "", ""
+    monkeypatch.setattr(ac, "_tmux", fake_tmux)
+    emit = _Emit()
+    agent = {"target": target, "cwd": root, "claude_cwd": root, "alive": True,
+             "is_agent": True, "state": "working"}
+    aw.scan(agents=[agent], read_fn=lambda t: _WORKING, emit_fn=emit, now=1000.0)
+    if stop:
+        assert intake.stop_agent({"id": "calc", "root": root}) is True
+    for now in (1100.0, 1200.0, 1300.0):
+        aw.scan(agents=[], read_fn=lambda t: "", emit_fn=emit, now=now)
+    return emit.types
+
+
+def test_a_pane_stopped_by_the_worker_raises_no_crash(box, monkeypatch):
+    assert "agent_process_failed" not in _watch_then_stop(box, monkeypatch, stop=True)
+
+
+def test_the_same_pane_vanishing_on_its_own_is_still_a_crash(box, monkeypatch):
+    assert "agent_process_failed" in _watch_then_stop(box, monkeypatch, stop=False)
+
+
+def test_a_sweep_racing_the_stop_cannot_bring_the_alert_back(box, monkeypatch):
+    """A sweep that read the pane before the kill writes its row after the retire."""
+    from core import agent_watch as aw
+    _watch_then_stop(box, monkeypatch, stop=True)
+    emit = _Emit()
+    agent = {"target": "fc-calc:0.0", "cwd": "/x", "claude_cwd": "/x", "alive": True,
+             "is_agent": True, "state": "working"}
+    aw.scan(agents=[agent], read_fn=lambda t: _WORKING, emit_fn=emit, now=1400.0)
+    for now in (1500.0, 1600.0):
+        aw.scan(agents=[], read_fn=lambda t: "", emit_fn=emit, now=now)
+    assert "agent_process_failed" not in emit.types
+
+
+def test_a_failed_kill_leaves_the_pane_watched(box, monkeypatch):
+    from core import agent_watch as aw
+    (box / "calc").mkdir()
+    root = str(box / "calc")
+
+    def fake_tmux(args, stdin=None):
+        if args[0] == "list-panes":
+            fmt = args[args.index("-F") + 1]
+            return 0, (root if "path" in fmt else "fc-calc:0.0") + "\n", ""
+        return 1, "", "no server"
+    monkeypatch.setattr(ac, "_tmux", fake_tmux)
+    assert intake.stop_agent({"id": "calc", "root": root}) is False
+    assert aw.is_suppressed("fc-calc:0.0") is False
+
+
+def test_the_stopped_pane_stays_quiet_after_the_suppression_ends(box, monkeypatch):
+    import time as _t
+    from core import agent_watch as aw
+    _watch_then_stop(box, monkeypatch, stop=True)
+    emit = _Emit()
+    later = _t.time() + intake.UNWATCH_SECS + 3600
+    for now in (later, later + 100, later + 200):
+        aw.scan(agents=[], read_fn=lambda t: "", emit_fn=emit, now=now)
+    assert "agent_process_failed" not in emit.types

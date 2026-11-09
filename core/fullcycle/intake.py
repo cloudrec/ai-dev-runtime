@@ -202,12 +202,35 @@ def stop_agent(project: dict) -> bool:
     session = session_for(project["id"])
     if not _own_pane(project):
         return False
+    _, out, _ = ac._tmux(["list-panes", "-t", f"={session}:", "-F",
+                          "#{session_name}:#{window_index}.#{pane_index}"])
+    panes = [x.strip() for x in (out or "").splitlines() if x.strip()]
     rc, _, _ = ac._tmux(["kill-session", "-t", f"={session}"])
     if rc == 0:
         ac.audit("agent_stop", session, stopped=True, actor=ACTOR,
                  cwd=os.path.realpath(project["root"]),
                  reason="fullcycle_intake_project_done")
+        _unwatch(panes)
     return rc == 0
+
+
+# A pane the worker closed on purpose is not a crash. Without this, agent-watch saw the
+# pane vanish on its next sweeps and published `agent_process_failed` (critical, owner
+# action required) for every finished project (events 81605, 81620 on 2026-11-09).
+UNWATCH_SECS = 6 * 3600
+
+
+def _unwatch(panes: list) -> None:
+    try:
+        from core import agent_watch as aw
+        for target in panes:
+            aw.retire(target, reason="fullcycle_intake_project_done", by=ACTOR)
+            # a sweep that read the pane just before the kill can write its state back
+            # after the retire; the suppression keeps that stale row from alerting
+            aw.suppress(target, ttl_secs=UNWATCH_SECS,
+                        reason="fullcycle_intake_project_done", by=ACTOR)
+    except Exception:  # noqa: BLE001 — a missed unwatch costs a false alert, not the stop
+        pass
 
 
 # A claude that has just drawn its prompt can drop the first Enter: the task text then sits
