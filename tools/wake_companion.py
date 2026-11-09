@@ -207,6 +207,20 @@ CHATGPT_SESSION_WATCH_ENABLED = os.getenv("CHATGPT_SESSION_WATCH_ENABLED", "1") 
 CHATGPT_SESSION_EVERY_TICKS = int(os.getenv("CHATGPT_SESSION_EVERY_TICKS", "15"))
 
 
+LOOP_WATCH_ENABLED = os.getenv("LOOP_WATCH_ENABLED", "1") not in ("0", "", "false")
+LOOP_WATCH_EVERY_TICKS = int(os.getenv("LOOP_WATCH_EVERY_TICKS", "15"))
+
+
+def watch_loop() -> dict:
+    """The loop watching itself: silent stops become one Telegram line (core.loop_watch)."""
+    from core import loop_watch
+    from core.control_plane.delivery import _send_owner_push
+    r = loop_watch.check(notify=_send_owner_push)
+    for line in r["sent"]:
+        print(f"loop-watch: {line[:160]}", flush=True)
+    return r
+
+
 def watch_chatgpt_session() -> dict:
     """Telegram the owner when the ChatGPT session on this browser is gone."""
     from cdp_composer import auth_state
@@ -388,6 +402,11 @@ def main() -> None:
                     watch_chatgpt_session()
                 except Exception as e:  # noqa: BLE001 — never breaks the tick
                     print(f"chatgpt-session error: {str(e)[:160]}", flush=True)
+            if LOOP_WATCH_ENABLED and n % LOOP_WATCH_EVERY_TICKS == 0:
+                try:
+                    watch_loop()
+                except Exception as e:  # noqa: BLE001 — never breaks the tick
+                    print(f"loop-watch error: {str(e)[:160]}", flush=True)
             if n % DISCOVERY_EVERY_TICKS == 0:
                 discover_chats()
         except Exception as e:  # noqa: BLE001
