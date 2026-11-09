@@ -158,3 +158,19 @@ def test_a_link_whose_record_was_altered_is_refused(env):
     conn.close()
     with pytest.raises(rel.ReleaseError, match="link_invalid"):
         rel.preview(t)
+
+
+def test_the_owner_tool_makes_a_link_for_the_current_commit(env, capsys):
+    import importlib.util
+    src, proj, sha, _ = env
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        "frl", os.path.join(root, "tools", "fullcycle_release_link.py"))
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    if os.geteuid() != 0:
+        pytest.skip("owner tool needs root")
+    assert tool.main(["calc"]) == 0
+    link = capsys.readouterr().out.strip()
+    assert rel.preview(_token(link))["sha"] == sha
+    assert tool.main(["nope-x"]) == 1
