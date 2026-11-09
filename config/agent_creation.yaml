@@ -24,4 +24,4 @@ scopes:
     callers: [fullcycle:engine]
     session_prefix: fc-
     root: /opt/fc-projects
-    max_concurrent: 2
+    max_concurrent: 8

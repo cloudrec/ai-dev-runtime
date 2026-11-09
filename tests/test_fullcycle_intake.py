@@ -255,7 +255,7 @@ def test_the_shipped_config_scopes_intake_to_the_worker():
     cfg = acp.load_config(os.path.join(ROOT, "config", "agent_creation.yaml"))
     sc = cfg["scopes"]["fullcycle-intake"]
     assert sc["callers"] == ["fullcycle:engine"] and sc["session_prefix"] == "fc-"
-    assert sc["root"] == "/opt/fc-projects" and sc["max_concurrent"] == 2
+    assert sc["root"] == "/opt/fc-projects" and sc["max_concurrent"] == 8
 
 
 # -- allowlist and wake filter prefixes --------------------------------------------------
