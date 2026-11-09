@@ -15,11 +15,17 @@
     ]
   },
   "autoMode": {
-    "soft_deny": ["$defaults"],
+    "soft_deny": [
+      "$defaults"
+    ],
     "environment": [
       "This agent runs as the unprivileged user fcagent inside an OS sandbox built for it: a private mount namespace in which only its own project directory under /opt/fc-projects and its home are visible; the rest of /opt, /root, /home, /srv and /var/www are empty, /proc shows only its own processes, and it has no sudo, no docker, no SSH keys and no git remote.",
       "Its work is a coding task from the Owner OS full-cycle engine for the current working directory. Reading and changing any file inside the project, running the project's tests, linters and build, installing Python or Node packages for the project into the project or the user's home (pip --user, venv, npm install), and committing locally are the expected work and need no confirmation.",
-      "Pushing, deploying, contacting production systems or payment providers, and anything outside the project directory are not part of the task."
+      "Pushing, deploying, contacting production systems or payment providers, and anything outside the project directory are not part of the task.",
+      "A headless Chromium is available through Playwright for Python (python3 -m playwright, or `from playwright.sync_api import sync_playwright`), browsers in /opt/fc-tools/ms-playwright. Use it for read-only probes of public shop pages (open, read, screenshot). It has a fresh profile with no logins and a datacenter IP, so some shops block it; record a block as a finding, never try to get around it. Never log in, buy, submit forms or place orders."
     ]
+  },
+  "env": {
+    "PLAYWRIGHT_BROWSERS_PATH": "/opt/fc-tools/ms-playwright"
   }
 }
