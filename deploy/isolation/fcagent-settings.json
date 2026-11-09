@@ -1,0 +1,25 @@
+{
+  "theme": "dark",
+  "model": "sonnet",
+  "skipAutoPermissionPrompt": true,
+  "permissions": {
+    "defaultMode": "auto",
+    "deny": [
+      "Bash(git push:*)",
+      "Bash(git remote add:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)",
+      "Bash(rsync:*)",
+      "Bash(sudo:*)",
+      "Bash(su:*)"
+    ]
+  },
+  "autoMode": {
+    "soft_deny": ["$defaults"],
+    "environment": [
+      "This agent runs as the unprivileged user fcagent inside an OS sandbox built for it: a private mount namespace in which only its own project directory under /opt/fc-projects and its home are visible; the rest of /opt, /root, /home, /srv and /var/www are empty, /proc shows only its own processes, and it has no sudo, no docker, no SSH keys and no git remote.",
+      "Its work is a coding task from the Owner OS full-cycle engine for the current working directory. Reading and changing any file inside the project, running the project's tests, linters and build, installing Python or Node packages for the project into the project or the user's home (pip --user, venv, npm install), and committing locally are the expected work and need no confirmation.",
+      "Pushing, deploying, contacting production systems or payment providers, and anything outside the project directory are not part of the task."
+    ]
+  }
+}

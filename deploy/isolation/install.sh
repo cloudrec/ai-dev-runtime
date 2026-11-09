@@ -88,6 +88,9 @@ apply() {
       --deny /root/ai-dev-runtime/configs/.env --deny /etc/ai-runtime/fullcycle-telegram.env \
     || { rm -rf "$PF"; die "preflight failed: nothing switched yet"; }
   rm -rf "$PF"
+  # the agent's claude: auto mode like the other agents, never push/ssh, told it is sandboxed
+  [ -f "$H/.claude/settings.json" ] && cp -a "$H/.claude/settings.json" "$BACKUP/fcagent-settings.json"
+  install -o $U -g $U -m 600 "$HERE/fcagent-settings.json" "$H/.claude/settings.json"
   git -C $RUNTIME merge -q --ff-only "$TARGET_SHA"
 
   # the API hands new project trees to fcagent
