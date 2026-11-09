@@ -1874,6 +1874,7 @@ _WS_RE = re.compile(r"\s+")
 # agent's paste-detection window or the Enter is swallowed as part of the pasted block
 # (measured 2026-09-24: the old gap was ~18 ms). Tunable for a slow or loaded host.
 _SUBMIT_SETTLE_SECS = float(os.getenv("AGENT_SEND_SUBMIT_SETTLE_SECS", "0.25"))
+_SUBMIT_RETRY_PAUSES = (0.4, 1.5, 3.0)
 
 
 def _first_line(text: str) -> str:
@@ -2270,10 +2271,15 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     # once more (a bare Enter can never duplicate the message) and re-check.
     consumed = _prompt_consumed(resolved, text, cwd=pane.get("claude_cwd") or "")
     submit_retried = False
-    if rc_enter == 0 and not consumed:
+    # A claude that has just started drops Enter for a few seconds (2026-11-09: a task sent
+    # to a new agent sat in its input box after two). Retries back off; an Enter on an
+    # empty input box sends nothing, so a retry cannot duplicate the message.
+    for pause in _SUBMIT_RETRY_PAUSES:
+        if rc_enter != 0 or consumed:
+            break
         submit_retried = True
         rc_enter, _, enter_err = _tmux(["send-keys", "-t", resolved, "Enter"])
-        time.sleep(_SUBMIT_SETTLE_SECS + 0.4)
+        time.sleep(_SUBMIT_SETTLE_SECS + pause)
         consumed = _prompt_consumed(resolved, text, cwd=pane.get("claude_cwd") or "")
     rc_after, after, _ = _tmux(["capture-pane", "-p", "-t", resolved, "-S", "-5"])
     pane_changed = (rc_before == 0 and rc_after == 0 and before != after)
@@ -2305,8 +2311,8 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
     if rc_enter != 0:
         result["error"] = enter_err.strip()[:200]
     elif not consumed and not queued:
-        result["reason"] = ("the message is still in the agent's input box after two "
-                            "Enter keystrokes — it was delivered to the pane but NOT "
+        result["reason"] = ("the message is still in the agent's input box after "
+                            f"{1 + len(_SUBMIT_RETRY_PAUSES)} Enter keystrokes — it was delivered to the pane but NOT "
                             "submitted, so no turn will start")
     result["authorized_by"] = authorized_by
     _record_delivery(key, resolved, action, result, actor=actor, source=source,

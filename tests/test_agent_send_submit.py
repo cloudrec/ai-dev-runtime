@@ -138,7 +138,23 @@ def test_a_second_enter_is_pressed_once_and_rescues_a_missed_submit(wired, monke
     monkeypatch.setattr(ac, "_tmux", t)
     r = ac._deliver_locked(PANE, "hello there", "agent_send", "k5")
     assert r["submitted"] is True and r["submit_retried"] is True
-    assert len(t.argv("send-keys")) == 2, "exactly one retry — a bare Enter cannot duplicate"
+    assert len(t.argv("send-keys")) == 2, "stops retrying once the prompt is consumed"
+
+
+def test_a_new_agent_that_drops_two_enters_still_gets_the_message(wired, monkeypatch):
+    """2026-11-09: a task sent to a just-started claude sat in its input box."""
+    t = _Tmux(pending_after=("hello there", "hello there", "hello there", ""))
+    monkeypatch.setattr(ac, "_tmux", t)
+    r = ac._deliver_locked(PANE, "hello there", "agent_send", "k5b")
+    assert r["submitted"] is True and len(t.argv("send-keys")) == 4
+
+
+def test_retries_are_bounded(wired, monkeypatch):
+    t = _Tmux(pending_after=("hello there",))
+    monkeypatch.setattr(ac, "_tmux", t)
+    r = ac._deliver_locked(PANE, "hello there", "agent_send", "k5c")
+    assert r["submitted"] is False
+    assert len(t.argv("send-keys")) == 1 + len(ac._SUBMIT_RETRY_PAUSES)
 
 
 def test_a_consumed_prompt_needs_no_retry(wired, monkeypatch):
