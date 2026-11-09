@@ -169,3 +169,30 @@ def test_project_start_errors_are_400(client, monkeypatch):
     r = client.post("/api/v1/fullcycle/projects", json={"project_id": "calc", "spec": INTAKE_SPEC},
                     headers=REVIEWER)
     assert r.status_code == 400 and "intake_disabled" in r.json()["detail"]
+
+
+def test_repo_listing_needs_the_reviewer_and_shows_no_paths(client, tmp_path, monkeypatch):
+    from core.fullcycle import repos
+    monkeypatch.setenv("FULLCYCLE_REPOS_FILE", str(tmp_path / "etc" / "repos.json"))
+    root = tmp_path / "fc-root"
+    root.mkdir()
+    monkeypatch.setenv("FULLCYCLE_INTAKE_ROOT", str(root))
+    s = tmp_path / "work" / "shop"
+    s.mkdir(parents=True)
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(s)], check=True)
+    subprocess.run(["git", "-C", str(s), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "--allow-empty", "-m", "a"], check=True)
+    repos.allow("shop", str(s))
+    assert client.get("/api/v1/fullcycle/repos", headers=SHARED_TOKEN).status_code == 403
+    r = client.get("/api/v1/fullcycle/repos", headers=REVIEWER)
+    assert r.status_code == 200 and r.json() == {"repos": [{"repo": "shop", "usable": True}]}
+    assert str(s) not in r.text
+    body = {"project_id": "calc", "spec": INTAKE_SPEC, "repo": "shop"}
+    assert client.post("/api/v1/fullcycle/projects", json=body,
+                       headers=SHARED_TOKEN).status_code == 403
+    r = client.post("/api/v1/fullcycle/projects", json=body, headers=REVIEWER)
+    assert r.status_code == 200 and r.json()["branch"] == "fullcycle/calc"
+    r = client.post("/api/v1/fullcycle/projects", headers=REVIEWER,
+                    json={"project_id": "other", "spec": INTAKE_SPEC, "repo": "nope"})
+    assert r.status_code == 400 and "repo_not_allowed" in r.json()["detail"]

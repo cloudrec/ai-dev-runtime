@@ -75,6 +75,50 @@ def _new_repo(path: str) -> None:
     _git(path, "commit", "-q", "-m", "baseline")
 
 
+_SOURCE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fc_intake_source (
+    project_id TEXT PRIMARY KEY, repo TEXT, source TEXT, base_sha TEXT, branch TEXT, ts REAL
+)"""
+
+
+def _source_table(conn) -> None:
+    conn.execute(_SOURCE_SCHEMA)
+
+
+def source_of(project_id: str, conn=None) -> Optional[dict]:
+    """Where an intake project came from: an allowed repository, or None for a new one."""
+    conn, own = specs.conn_with_schema(conn)
+    try:
+        _source_table(conn)
+        r = conn.execute("SELECT repo, source, base_sha, branch FROM fc_intake_source "
+                         "WHERE project_id=?", (project_id,)).fetchone()
+        return dict(zip(("repo", "source", "base_sha", "branch"), r)) if r else None
+    finally:
+        if own:
+            conn.close()
+
+
+def _copy_repo(source: dict, path: str, project_id: str, conn) -> None:
+    """The project's own repository, from an allowed one: see core.fullcycle.repos."""
+    import shutil
+    import time as _time
+    from core import agent_privilege
+    from core.fullcycle import repos
+    try:
+        agent_privilege.require_root_work(path)
+    except agent_privilege.AgentPrivilegeError as e:
+        raise specs.SpecError(f"intake_off_under_agent_run_as:{e}")
+    os.mkdir(path, 0o755)         # ours from here on: removed again if the copy fails
+    try:
+        base = repos.make_copy(source["path"], path, project_id, _GITIGNORE)
+    except (repos.RepoError, OSError, subprocess.SubprocessError) as e:
+        shutil.rmtree(path, ignore_errors=True)
+        raise specs.SpecError(f"repo_copy_failed:{e}")
+    conn.execute("INSERT OR REPLACE INTO fc_intake_source VALUES (?,?,?,?,?,?)",
+                 (project_id, source["name"], source["path"], base,
+                  repos.branch_for(project_id), _time.time()))
+
+
 def projects(conn=None) -> list:
     """Every intake project, as stored."""
     root = intake_root()
@@ -108,9 +152,11 @@ def active(conn=None) -> list:
             conn.close()
 
 
-def start(project_id: str, spec: dict, *, by: str, conn=None) -> dict:
+def start(project_id: str, spec: dict, *, by: str, repo: Optional[str] = None,
+          conn=None) -> dict:
     """Create the project and store its spec, or add a new spec version to an intake
-    project that exists. Raises SpecError with the reason."""
+    project that exists. With `repo`, the project starts from a copy of that owner-allowed
+    repository (core.fullcycle.repos) instead of an empty one. Raises SpecError."""
     root = intake_root()
     if not root:
         raise specs.SpecError("intake_disabled")
@@ -129,20 +175,35 @@ def start(project_id: str, spec: dict, *, by: str, conn=None) -> dict:
                     f"check refused in {where}: {why}. Checks run a test runner on project "
                     f"files, e.g. [\"python3\", \"-m\", \"pytest\", \"-q\", \"tests/\"]; "
                     f"no inline code, nothing outside the project")
+    source = None
+    if repo is not None:
+        from core.fullcycle import repos
+        try:
+            source = repos.get(repo)
+        except repos.RepoError as e:
+            raise specs.SpecError(str(e))
     conn, own = specs.conn_with_schema(conn)
     try:
+        _source_table(conn)
         existing = specs.get_project(project_id, conn=conn)
         if existing and not is_intake(existing, root):
             raise specs.SpecError("project_exists_outside_intake")
         if existing and _done(project_id, conn):
             raise specs.SpecError("project_done:use_a_new_project_id")
+        if existing and repo is not None:
+            had = source_of(project_id, conn=conn)
+            if not had or had["repo"] != repo:
+                raise specs.SpecError("project_exists_with_another_source")
         created = False
         if not existing:
             if len(active(conn)) >= max_active():
                 raise specs.SpecError(f"intake_at_max_active:{max_active()}")
             if os.path.lexists(path):
                 raise specs.SpecError("intake_directory_exists")
-            _new_repo(path)
+            if source:
+                _copy_repo(source, path, project_id, conn)
+            else:
+                _new_repo(path)
             created = True
         refused = gates.check_project_root(path)
         if refused:
@@ -150,8 +211,12 @@ def start(project_id: str, spec: dict, *, by: str, conn=None) -> dict:
         p = specs.create_project(project_id, name=body.get("title") or project_id,
                                  root=path, executor="claude", conn=conn)
         s = specs.put_spec(project_id, body, by=by, conn=conn)
-        return {"ok": True, "project": p, "created": created, "spec_version": s["version"],
-                "session": session_for(project_id)}
+        out = {"ok": True, "project": p, "created": created, "spec_version": s["version"],
+               "session": session_for(project_id)}
+        src = source_of(project_id, conn=conn)
+        if src:
+            out.update(repo=src["repo"], branch=src["branch"], base_sha=src["base_sha"])
+        return out
     finally:
         if own:
             conn.close()
@@ -329,3 +394,118 @@ def adapter(project: dict):
             return {"ok": bool(r.get("ok")), "reason": r.get("reason")}
 
     return IntakeAdapter(project)
+
+
+# -- the owner hears when a project is finished ----------------------------------------
+_NOTICE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fc_intake_notice (
+    project_id TEXT PRIMARY KEY, state TEXT, attempts INTEGER DEFAULT 0, ts REAL,
+    receipt TEXT DEFAULT '', error TEXT DEFAULT ''
+)"""
+NOTICE_MAX_ATTEMPTS = 5
+NOTICE_RETRY_SECS = 120
+_DONE_STATES = ("VERIFIED_DONE", "CANCELLED")
+
+
+def _notice_table(conn) -> None:
+    fresh = not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND "
+                             "name='fc_intake_notice'").fetchone()
+    conn.execute(_NOTICE_SCHEMA)
+    if fresh:
+        # projects finished before this existed were seen by the owner already
+        import time as _time
+        for p in projects(conn):
+            if _done(p["id"], conn):
+                conn.execute("INSERT OR IGNORE INTO fc_intake_notice (project_id, state, ts) "
+                             "VALUES (?,?,?)", (p["id"], "preexisting", _time.time()))
+        conn.commit()
+
+
+def _git_out(cwd: str, *args: str) -> str:
+    try:
+        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
+                           timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def notice_text(project: dict, conn) -> str:
+    """What the owner reads on the phone. Facts from the engine and from git only."""
+    from core.fullcycle import engine as fe
+    st = fe.project_status(project["id"], conn=conn)
+    tasks = st.get("tasks") or []
+    done = [t for t in tasks if t["state"] == "VERIFIED_DONE"]
+    cancelled = [t for t in tasks if t["state"] == "CANCELLED"]
+    rows = conn.execute("SELECT decision, COUNT(*) FROM fc_review WHERE project_id=? AND "
+                        "decision IS NOT NULL GROUP BY decision", (project["id"],)).fetchall()
+    decisions = ", ".join(f"{d} {n}" for d, n in sorted(rows)) or "none"
+    src = source_of(project["id"], conn=conn)
+    root = project["root"]
+    base = src["base_sha"] if src else \
+        (_git_out(root, "rev-list", "--max-parents=0", "HEAD").splitlines() or [""])[0]
+    log = _git_out(root, "log", "--no-decorate", "--format=%h %s", "-n", "12",
+                   f"{base}..HEAD") if base else ""
+    head = _git_out(root, "rev-parse", "--short", "HEAD")
+    mark = "✅" if tasks and not cancelled else "⚠️"
+    lines = [f"{mark} Full Cycle: {project['id']} finished",
+             f"Tasks: {len(done)} done, {len(cancelled)} cancelled, of {len(tasks)}"]
+    lines += [f"  {t['key']}: {t['state']}" for t in tasks[:15]]
+    lines.append(f"Reviews: {decisions}")
+    lines.append(f"Checks: passed for every done task (engine-run)" if done else
+                 "Checks: no task passed")
+    if src:
+        lines.append(f"Repo: {src['repo']}, from {src['base_sha'][:7]}, "
+                     f"branch {src['branch']} at {head}")
+    else:
+        lines.append(f"New repo: {root}, head {head}")
+    lines.append("Commits:" if log else "Commits: none")
+    lines += ["  " + x[:100] for x in log.splitlines()]
+    if src and log:
+        lines.append(f"Take it: git -C {src['source']} fetch {root} {src['branch']}")
+    lines.append("Nothing was pushed or deployed.")
+    return "\n".join(lines)
+
+
+def notify_finished(send=None, conn=None, now: Optional[float] = None) -> list:
+    """Tell the owner once about each finished intake project: done, and no task left
+    in flight. Retries a failed send a few times, then gives up and records why."""
+    import time as _time
+    if send is None:
+        from core.control_plane.delivery import _send_owner_push as send
+    from core.fullcycle import engine as fe
+    now = now if now is not None else _time.time()
+    conn, own = fe.connect(conn)
+    out = []
+    try:
+        if not intake_root():
+            return out
+        _notice_table(conn)
+        for p in projects(conn):
+            if not _done(p["id"], conn):
+                continue
+            row = conn.execute("SELECT state, attempts, ts FROM fc_intake_notice WHERE "
+                               "project_id=?", (p["id"],)).fetchone()
+            if row and (row[0] in ("sent", "preexisting", "gave_up") or
+                        now - (row[2] or 0) < NOTICE_RETRY_SECS):
+                continue
+            states = [t["state"] for t in fe.project_status(p["id"], conn=conn)["tasks"]]
+            if not states or any(s not in _DONE_STATES for s in states):
+                continue
+            attempts = (row[1] if row else 0) + 1
+            try:
+                ok, receipt, err = send(notice_text(p, conn))
+            except Exception as e:  # noqa: BLE001 — a failed notice never stops the worker
+                ok, receipt, err = False, None, f"{type(e).__name__}: {e}"
+            state = "sent" if ok else ("gave_up" if attempts >= NOTICE_MAX_ATTEMPTS
+                                       else "retry")
+            conn.execute("INSERT OR REPLACE INTO fc_intake_notice VALUES (?,?,?,?,?,?)",
+                         (p["id"], state, attempts, now, receipt or "",
+                          (err or "")[:300]))
+            conn.commit()
+            out.append({"project": p["id"], "state": state, "attempts": attempts,
+                        **({"error": (err or "")[:160]} if not ok else {})})
+    finally:
+        if own:
+            conn.close()
+    return out

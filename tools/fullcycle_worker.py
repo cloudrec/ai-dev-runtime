@@ -64,6 +64,15 @@ def settle_intake(pid: str, result: dict, intake) -> None:
             _log(what="intake_agent_stopped", project=pid)
 
 
+def notify_round(intake) -> None:
+    """The owner's Telegram notice for each finished intake project, once."""
+    try:
+        for n in intake.notify_finished():
+            _log(what="intake_notice", **n)
+    except Exception as ex:  # noqa: BLE001 — never stops the loop
+        _log(what="intake_notice", state="error", error=f"{type(ex).__name__}: {ex}"[:300])
+
+
 def _log(**kw) -> None:
     print(json.dumps({"ts": round(time.time(), 1), **kw}, default=str), flush=True)
 
@@ -107,6 +116,7 @@ def main() -> int:
             except Exception as ex:  # noqa: BLE001 — logged, retried next round
                 engines.pop(pid, None)
                 _log(project=pid, what="error", error=f"{type(ex).__name__}: {ex}"[:500])
+        notify_round(intake)
         if args.once:
             break
         for _ in range(int(TICK_SECS * 10)):

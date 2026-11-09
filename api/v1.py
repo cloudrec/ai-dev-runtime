@@ -597,17 +597,27 @@ def fullcycle_decision(review_id: int, req: FullcycleDecisionReq, request: Reque
 class FullcycleProjectReq(BaseModel):
     project_id: str
     spec: dict
+    repo: Optional[str] = None
 
 
 @router.post("/fullcycle/projects")
 def fullcycle_project_start(req: FullcycleProjectReq, request: Request,
                             _: bool = Depends(_auth)):
     """Start a project from a spec, or add a spec version to an intake project. Same
-    authority as a review decision. The project gets its own new directory; its checks
-    are confined to a test runner; no push, no deploy."""
+    authority as a review decision. The project gets its own new directory, empty or a
+    copy of an owner-allowed repo with no remote; its checks are confined to a test
+    runner; no push, no deploy."""
     from core.fullcycle import intake
     actor, _how = _reviewer_principal(request)
-    return _fullcycle_call(intake.start, req.project_id, req.spec, by=actor)
+    return _fullcycle_call(intake.start, req.project_id, req.spec, by=actor, repo=req.repo)
+
+
+@router.get("/fullcycle/repos")
+def fullcycle_repos(request: Request, _: bool = Depends(_auth)):
+    """The repos the owner allowed projects on: names and whether usable, no paths."""
+    from core.fullcycle import repos
+    _reviewer_principal(request)
+    return {"repos": repos.listing()}
 
 
 @router.get("/fullcycle/projects/{project_id}")
