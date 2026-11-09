@@ -265,3 +265,13 @@ def test_the_default_server_keeps_its_error_on_a_broken_socket(monkeypatch):
         1, "", "error connecting to /tmp/tmux-0/default (No such file or directory)"))
     with pytest.raises(ac.AgentControlError):
         ac.agent_list()
+
+
+def test_sandboxed_argv_refuses_without_a_keep_list(box):
+    """The API runs an agent-side read with an explicit keep list; none means no sandbox,
+    and that is a refusal, never a plain setpriv."""
+    t, _, keep = box
+    with pytest.raises(priv.AgentPrivilegeError, match="sandbox_keep_unset"):
+        priv.sandboxed_argv(t, "", ["true"])
+    argv = priv.sandboxed_argv(t, keep, ["true"])
+    assert argv[0].endswith("unshare") and keep in argv and argv[-1] == "true"

@@ -423,3 +423,105 @@ def test_the_hand_over_does_not_walk_through_a_directory_link(box, src, tmp_path
     intake.start("calc", SPEC, by=BY, repo="shop")
     assert os.path.islink(box / "calc" / "dir-link")
     assert os.lstat(outside).st_uid == 0 and os.lstat(outside / "keep.txt").st_uid == 0
+
+
+# -- integration: other projects' branches brought into a new copy ----------------------
+def _project_commit(box, pid, fname, text):
+    path = box / pid
+    (path / fname).write_text(text)
+    _git(path, "add", fname)
+    _git(path, "commit", "-q", "-m", f"{pid}: {fname}")
+    return _git(path, "rev-parse", "HEAD")
+
+
+def test_an_integration_copy_holds_each_projects_branch(box, src, monkeypatch):
+    monkeypatch.setenv("FULLCYCLE_INTAKE_MAX_ACTIVE", "10")
+    repos.allow("shop", str(src))
+    intake.start("calc-a", SPEC, by=BY, repo="shop")
+    intake.start("calc-b", SPEC, by=BY, repo="shop")
+    a = _project_commit(box, "calc-a", "a.py", "a = 1\n")
+    b = _project_commit(box, "calc-b", "b.py", "b = 2\n")
+    r = intake.start("calc-all", SPEC, by=BY, repo="shop", merge_from=["calc-a", "calc-b"])
+    assert r["merge_branches"] == ["fullcycle-in/calc-a", "fullcycle-in/calc-b"]
+    path = box / "calc-all"
+    assert _git(path, "rev-parse", "fullcycle-in/calc-a") == a
+    assert _git(path, "rev-parse", "fullcycle-in/calc-b") == b
+    assert _git(path, "branch", "--show-current") == "fullcycle/calc-all"
+    assert not (path / "a.py").exists()              # brought in, not merged: that is a task
+    assert _git(path, "remote") == ""
+
+
+@pytest.mark.parametrize("merge_from,err", [
+    (["calc"], "distinct other"), (["nope-x"], "merge_from_unknown_project"),
+    (["calc-a", "calc-a"], "merge_from"), (["Bad"], "merge_from"),
+    ([f"p{i:03d}" for i in range(intake.MERGE_FROM_MAX + 1)], "merge_from")])
+def test_bad_merge_lists_refuse_before_anything_is_made(box, src, merge_from, err):
+    repos.allow("shop", str(src))
+    intake.start("calc-a", SPEC, by=BY, repo="shop")
+    before = sorted(os.listdir(box))
+    with pytest.raises(specs.SpecError, match=err):
+        intake.start("calc", SPEC, by=BY, repo="shop", merge_from=merge_from)
+    assert sorted(os.listdir(box)) == before
+
+
+def test_merge_from_needs_the_same_repo_and_a_new_project(box, src, tmp_path, monkeypatch):
+    monkeypatch.setenv("FULLCYCLE_INTAKE_MAX_ACTIVE", "10")
+    repos.allow("shop", str(src))
+    other = tmp_path / "work" / "blog"
+    other.mkdir()
+    _git(other, "init", "-q")
+    _git(other, "commit", "-q", "--allow-empty", "-m", "a")
+    repos.allow("blog", str(other))
+    intake.start("calc-a", SPEC, by=BY, repo="shop")
+    intake.start("blog-a", SPEC, by=BY, repo="blog")
+    intake.start("plain", SPEC, by=BY)
+    with pytest.raises(specs.SpecError, match="merge_from_other_repo"):
+        intake.start("calc-all", SPEC, by=BY, repo="shop", merge_from=["blog-a"])
+    with pytest.raises(specs.SpecError, match="merge_from_unknown_project"):
+        intake.start("calc-all", SPEC, by=BY, repo="shop", merge_from=["plain"])
+    with pytest.raises(specs.SpecError, match="merge_from_needs_repo"):
+        intake.start("calc-all", SPEC, by=BY, merge_from=["calc-a"])
+    with pytest.raises(specs.SpecError, match="only_when_the_project_is_made"):
+        intake.start("calc-a", SPEC, by=BY, repo="shop", merge_from=["blog-a"])
+
+
+@needs_root
+def test_an_agent_owned_branch_is_read_by_the_agent_inside_its_sandbox(box, src, tmp_path,
+                                                                       monkeypatch):
+    """Root never opens the agent's repository: the bundle comes from the agent's side."""
+    import pwd
+    import shutil as _sh
+    if not (_sh.which("unshare") and _sh.which("setpriv")):
+        pytest.skip("needs unshare and setpriv")
+    os.chmod(tmp_path, 0o755)
+    home = tmp_path / "nobody-home"
+    home.mkdir()
+    real = pwd.getpwuid
+
+    class P:
+        def __init__(self, p):
+            self.pw_name, self.pw_uid, self.pw_gid, self.pw_dir = (p.pw_name, p.pw_uid,
+                                                                   p.pw_gid, str(home))
+    monkeypatch.setattr(pwd, "getpwuid",
+                        lambda uid: P(real(uid)) if uid == real(65534).pw_uid else real(uid))
+    monkeypatch.setenv("FULLCYCLE_INTAKE_RUN_AS", "nobody")
+    repos.allow("shop", str(src))
+    intake.start("calc-a", SPEC, by=BY, repo="shop")
+    for d in (tmp_path, box):
+        os.chmod(d, 0o755)
+    ran = []
+    real_popen = repos.subprocess.Popen
+
+    def spy(argv, **kw):
+        ran.append(list(argv))
+        return real_popen(argv, **kw)
+    monkeypatch.setattr(repos.subprocess, "Popen", spy)
+    intake.start("calc-all", SPEC, by=BY, repo="shop", merge_from=["calc-a"])
+    (bundle,) = [a for a in ran if "bundle" in a]
+    assert bundle[0].endswith("unshare") and "--reuid=65534" in bundle
+    assert "core.hooksPath=/dev/null" in bundle
+    got = subprocess.run(["git", "-c", "safe.directory=*", "-C", str(box / "calc-all"),
+                          "rev-parse", "--verify", "fullcycle-in/calc-a"],
+                         capture_output=True, text=True)
+    assert got.returncode == 0 and got.stdout.strip()
+    assert os.lstat(box / "calc-all").st_uid == 65534          # handed over after the merge

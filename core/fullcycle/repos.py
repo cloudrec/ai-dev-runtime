@@ -193,3 +193,57 @@ def make_copy(source: str, path: str, project_id: str, exclude: str) -> str:
     with open(os.path.join(path, ".git", "info", "exclude"), "a", encoding="utf-8") as f:
         f.write(exclude)
     return base
+
+
+# -- integration: bring other projects' branches into a new copy ------------------------
+BUNDLE_MAX = 512 * 1024 * 1024
+_NO_CONFIG_EXEC = ("-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null")
+
+
+def branch_bundle(project_root: str, branch: str, *, keep_raw: str) -> str:
+    """A git bundle of `branch` from another intake project, as a root-owned temp file.
+
+    A project tree the sandboxed agent owns is read by that agent, inside its sandbox, with
+    git's config-run hooks off; the bundle comes back on stdout, size-capped, so root never
+    opens the agent's repository and no directory is shared. A root-owned tree (made before
+    isolation) is read by root."""
+    import pwd
+    from core import agent_privilege as priv
+    st = os.lstat(project_root)
+    if not os.path.isdir(project_root) or os.path.islink(project_root):
+        raise RepoError("merge_source_not_a_directory")
+    argv = ["git", *_NO_CONFIG_EXEC, "-C", project_root, "bundle", "create", "-", branch]
+    env = None
+    if st.st_uid != 0:
+        p = pwd.getpwuid(st.st_uid)
+        if p.pw_uid == 0 or p.pw_gid == 0:
+            raise RepoError("merge_source_owner_unsafe")
+        t = priv.Target(p.pw_name, p.pw_uid, p.pw_gid, p.pw_dir)
+        argv, env = priv.sandboxed_argv(t, keep_raw, argv), priv.child_env(t)
+    fd, out = tempfile.mkstemp(prefix=".fc-merge-", suffix=".bundle")
+    size = 0
+    try:
+        with os.fdopen(fd, "wb") as f:
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    env=env, cwd="/")
+            try:
+                while True:
+                    chunk = proc.stdout.read(1 << 20)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > BUNDLE_MAX:
+                        proc.kill()
+                        raise RepoError("merge_source_bundle_too_big")
+                    f.write(chunk)
+                err = proc.stderr.read().decode("utf-8", "replace")
+                rc = proc.wait(timeout=300)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+        if rc != 0 or size == 0:
+            raise RepoError(f"merge_source_bundle_failed:{err.strip()[:160]}")
+        return out
+    except BaseException:
+        os.unlink(out)
+        raise

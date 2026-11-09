@@ -195,9 +195,11 @@ exec "$@"
 """
 
 
-def sandbox_keep(t: Target) -> list:
-    """Paths the dropped agent keeps; [] when the sandbox is off. Raises on a bad setting."""
-    raw = os.getenv("AGENT_SANDBOX_KEEP", "").strip()
+def sandbox_keep(t: Target, raw: Optional[str] = None) -> list:
+    """Paths the dropped agent keeps; [] when the sandbox is off. Raises on a bad setting.
+    `raw` overrides AGENT_SANDBOX_KEEP for a process that is not itself the sandboxed
+    instance but has to run something as its agent (the API reading a project branch)."""
+    raw = (os.getenv("AGENT_SANDBOX_KEEP", "") if raw is None else raw).strip()
     if not raw:
         return []
     keep = [p for p in raw.split(":") if p] + [t.home]
@@ -210,8 +212,8 @@ def sandbox_keep(t: Target) -> list:
     return [os.path.normpath(p) for p in keep]
 
 
-def sandbox_prefix(t: Target) -> list:
-    keep = sandbox_keep(t)
+def sandbox_prefix(t: Target, keep_raw: Optional[str] = None) -> list:
+    keep = sandbox_keep(t, keep_raw)
     if not keep:
         return []
     unshare = shutil.which("unshare", path="/usr/bin:/bin")
@@ -242,6 +244,16 @@ def pane_prefix(t: Target) -> list:
     sets USER, LOGNAME and SHELL from the target; TERM survives."""
     return [*_setpriv(t), "--reset-env", "env", f"PATH={_path(t)}", f"HOME={t.home}",
             f"LANG={_LANG}"]
+
+
+def sandboxed_argv(t: Target, keep_raw: str, argv: Sequence[str]) -> list:
+    """argv run as `t` inside the sandbox kept to `keep_raw`, from a process whose own
+    environment carries no AGENT_RUN_AS. Refuses rather than run unsandboxed."""
+    prefix = sandbox_prefix(t, keep_raw)
+    if not prefix:
+        raise AgentPrivilegeError("sandbox_keep_unset")
+    return [*prefix, _setpriv_bin(), f"--reuid={t.uid}", f"--regid={t.gid}", "--clear-groups",
+            "--no-new-privs", "--inh-caps=-all", "--bounding-set=-all", *argv]
 
 
 def host_argv(t: Target, argv: Sequence[str]) -> list:

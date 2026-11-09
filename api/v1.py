@@ -598,6 +598,7 @@ class FullcycleProjectReq(BaseModel):
     project_id: str
     spec: dict
     repo: Optional[str] = None
+    merge_from: Optional[list[str]] = None
 
 
 @router.post("/fullcycle/projects")
@@ -609,7 +610,8 @@ def fullcycle_project_start(req: FullcycleProjectReq, request: Request,
     runner; no push, no deploy."""
     from core.fullcycle import intake
     actor, _how = _reviewer_principal(request)
-    return _fullcycle_call(intake.start, req.project_id, req.spec, by=actor, repo=req.repo)
+    return _fullcycle_call(intake.start, req.project_id, req.spec, by=actor, repo=req.repo,
+                           merge_from=req.merge_from)
 
 
 @router.get("/fullcycle/brief")

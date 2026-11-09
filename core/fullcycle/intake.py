@@ -129,7 +129,23 @@ def _hand_to_agent(path: str) -> None:
             os.lchown(os.path.join(top, n), uid, gid)
 
 
-def _copy_repo(source: dict, path: str, project_id: str, conn) -> None:
+def _merge_sources(merge_from: list, repo: Optional[str], conn) -> list:
+    """[(project_id, root, branch)] for projects started on the same repo."""
+    out = []
+    root = intake_root()
+    for pid in merge_from:
+        p = specs.get_project(pid, conn=conn)
+        src = source_of(pid, conn=conn)
+        if not p or not is_intake(p, root) or not src:
+            raise specs.SpecError(f"merge_from_unknown_project:{pid}")
+        if src["repo"] != repo:
+            raise specs.SpecError(f"merge_from_other_repo:{pid}")
+        out.append((pid, p["root"], src["branch"]))
+    return out
+
+
+def _copy_repo(source: dict, path: str, project_id: str, conn,
+               merge_from: Optional[list] = None) -> None:
     """The project's own repository, from an allowed one: see core.fullcycle.repos."""
     import shutil
     import time as _time
@@ -142,7 +158,15 @@ def _copy_repo(source: dict, path: str, project_id: str, conn) -> None:
     os.mkdir(path, 0o755)         # ours from here on: removed again if the copy fails
     try:
         base = repos.make_copy(source["path"], path, project_id, _GITIGNORE)
-    except (repos.RepoError, OSError, subprocess.SubprocessError) as e:
+        for pid, proot, branch in merge_from or []:
+            bundle = repos.branch_bundle(proot, branch, keep_raw=intake_root() or "")
+            try:
+                repos._git(path, "fetch", "-q", "--no-tags", bundle,
+                           f"{branch}:refs/heads/fullcycle-in/{pid}")
+            finally:
+                os.unlink(bundle)
+    except (repos.RepoError, OSError, subprocess.SubprocessError,
+            agent_privilege.AgentPrivilegeError) as e:
         shutil.rmtree(path, ignore_errors=True)
         raise specs.SpecError(f"repo_copy_failed:{e}")
     conn.execute("INSERT OR REPLACE INTO fc_intake_source VALUES (?,?,?,?,?,?)",
@@ -183,8 +207,11 @@ def active(conn=None) -> list:
             conn.close()
 
 
+MERGE_FROM_MAX = 20
+
+
 def start(project_id: str, spec: dict, *, by: str, repo: Optional[str] = None,
-          conn=None) -> dict:
+          merge_from: Optional[list] = None, conn=None) -> dict:
     """Create the project and store its spec, or add a new spec version to an intake
     project that exists. With `repo`, the project starts from a copy of that owner-allowed
     repository (core.fullcycle.repos) instead of an empty one. Raises SpecError."""
@@ -194,6 +221,15 @@ def start(project_id: str, spec: dict, *, by: str, repo: Optional[str] = None,
     if not by.startswith(BY_PREFIX):
         raise specs.SpecError("intake_needs_an_authenticated_client")
     run_as_owner()                     # a bad setting refuses before anything is made
+    merge_from = list(merge_from or [])
+    if merge_from:
+        if repo is None:
+            raise specs.SpecError("merge_from_needs_repo")
+        if len(merge_from) > MERGE_FROM_MAX or len(set(merge_from)) != len(merge_from) or \
+                project_id in merge_from or \
+                not all(isinstance(m, str) and ID_RE.match(m) for m in merge_from):
+            raise specs.SpecError(f"merge_from: up to {MERGE_FROM_MAX} distinct other "
+                                  "project ids")
     if not ID_RE.match(project_id or ""):
         raise specs.SpecError(f"project id must match {ID_RE.pattern}")
     body = specs.validate_spec(spec)
@@ -222,6 +258,8 @@ def start(project_id: str, spec: dict, *, by: str, repo: Optional[str] = None,
             raise specs.SpecError("project_exists_outside_intake")
         if existing and _done(project_id, conn):
             raise specs.SpecError("project_done:use_a_new_project_id")
+        if existing and merge_from:
+            raise specs.SpecError("merge_from_only_when_the_project_is_made")
         if existing and repo is not None:
             had = source_of(project_id, conn=conn)
             if not had or had["repo"] != repo:
@@ -233,7 +271,8 @@ def start(project_id: str, spec: dict, *, by: str, repo: Optional[str] = None,
             if os.path.lexists(path):
                 raise specs.SpecError("intake_directory_exists")
             if source:
-                _copy_repo(source, path, project_id, conn)
+                _copy_repo(source, path, project_id, conn,
+                           merge_from=_merge_sources(merge_from, repo, conn))
             else:
                 _new_repo(path)
             created = True
@@ -249,6 +288,8 @@ def start(project_id: str, spec: dict, *, by: str, repo: Optional[str] = None,
         src = source_of(project_id, conn=conn)
         if src:
             out.update(repo=src["repo"], branch=src["branch"], base_sha=src["base_sha"])
+        if merge_from:
+            out["merge_branches"] = [f"fullcycle-in/{m}" for m in merge_from]
         return out
     finally:
         if own:
