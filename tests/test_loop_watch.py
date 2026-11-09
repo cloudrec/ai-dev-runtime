@@ -173,3 +173,22 @@ def test_a_fired_but_unverified_wake_is_not_waiting_for_delivery():
     conn.commit()
     assert "undelivered_wakes" not in lw.check(notify=told.append, conn=conn, now=NOW,
                                                run=Run())["problems"]
+
+
+def test_a_wake_the_canary_filter_passes_over_is_not_waiting(monkeypatch):
+    """Live after the first fix: wakes for agents outside WAKE_BRIDGE_ONLY_AGENTS are never
+    offered by design; counting them kept a false alarm on."""
+    conn, told = _conn(), []
+    monkeypatch.setenv("WAKE_BRIDGE_ONLY_AGENTS", "fc-*")
+    conn.execute("INSERT INTO wake_audit (ts, at, event_id, decision, reason, acknowledged, "
+                 "agent_id) VALUES (?,?,?,?,?,?,?)",
+                 (NOW - lw.UNDELIVERED_AFTER - 60, "", 800, "wake", "", 0, "other-agent:0.0"))
+    conn.commit()
+    assert "undelivered_wakes" not in lw.check(notify=told.append, conn=conn, now=NOW,
+                                               run=Run())["problems"]
+    conn.execute("INSERT INTO wake_audit (ts, at, event_id, decision, reason, acknowledged, "
+                 "agent_id) VALUES (?,?,?,?,?,?,?)",
+                 (NOW - lw.UNDELIVERED_AFTER - 60, "", 801, "wake", "", 0, "fc-gaika-ua"))
+    conn.commit()
+    assert "undelivered_wakes" in lw.check(notify=told.append, conn=conn, now=NOW,
+                                           run=Run())["problems"]

@@ -72,13 +72,18 @@ def undelivered_wakes(conn, now: float) -> dict:
     if not _has(conn, "wake_audit"):
         return {}
     # exactly what pending_wake would still offer: a wake already fired (wake_submitted) is
-    # latched and never offered again, so it is not waiting for delivery
+    # latched and never offered again, and a wake for an agent outside the canary filter
+    # (WAKE_BRIDGE_ONLY_AGENTS) is passed over by design, so neither is waiting for delivery
+    from core import wake_bridge as wb
     latched = ("AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
                if _has(conn, "wake_submitted") else "")
-    r = conn.execute(
-        "SELECT MIN(a.ts), COUNT(*) FROM wake_audit a WHERE a.decision='wake' AND "
+    rows = conn.execute(
+        "SELECT a.ts, COALESCE(a.agent_id,'') FROM wake_audit a WHERE a.decision='wake' AND "
         "COALESCE(a.acknowledged,0)=0 AND a.superseded_by IS NULL " + latched +
-        "AND a.ts < ?", (now - UNDELIVERED_AFTER,)).fetchone()
+        "AND a.ts < ?", (now - UNDELIVERED_AFTER,)).fetchall()
+    only = wb.only_agents()
+    waiting = [ts for ts, agent in rows if wb._offer_allowed(agent, only)]
+    r = (min(waiting), len(waiting)) if waiting else None
     if not r or not r[1]:
         return {}
     last = None
