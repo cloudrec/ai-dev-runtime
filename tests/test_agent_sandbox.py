@@ -221,3 +221,26 @@ def test_other_users_processes_and_their_arguments_are_invisible(box):
         assert os.path.exists(f"/proc/{sleeper.pid}/cmdline")      # the host still sees it
     finally:
         sleeper.kill()
+
+
+@real
+def test_hidden_dirs_cannot_be_opened_and_tmp_is_writable(box):
+    t, base, keep = box
+    r = _run(t, "for d in /root /srv /var/www /opt; do test -r $d && echo $d:R || echo $d:-; done;"
+                " ls /opt >/dev/null 2>&1 && echo LS || echo NOLS;"
+                " echo hi > /tmp/a && cat /tmp/a; echo hi > /var/tmp/b && echo VT;"
+                f" test -w {keep}/p1 && echo KEEPW")
+    out = r.stdout.split()
+    assert "/root:-" in out and "/srv:-" in out, r.stdout + r.stderr
+    assert "hi" in out and "VT" in out and "KEEPW" in out
+
+
+def test_hidden_modes():
+    keep = ["/opt/fc-projects", "/home/fcagent"]
+    assert priv._hidden_mode("/tmp", keep) == "1777"
+    assert priv._hidden_mode("/var/tmp", keep) == "1777"
+    assert priv._hidden_mode("/opt", keep) == "0711"
+    assert priv._hidden_mode("/home", keep) == "0711"
+    assert priv._hidden_mode("/root", keep) == "0700"
+    assert priv._hidden_mode("/var/www", keep) == "0700"
+    assert priv._hidden_mode("/op", ["/opt/x"]) == "0700"

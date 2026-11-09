@@ -179,7 +179,8 @@ while [ "$1" != "--hide" ]; do
 done
 shift
 while [ "$1" != "--" ]; do
-  if [ -d "$1" ]; then /usr/bin/mount -t tmpfs -o mode=0755,nosuid,nodev agent-sandbox "$1"; fi
+  d=${1%:*}; m=${1##*:}
+  if [ -d "$d" ]; then /usr/bin/mount -t tmpfs -o "mode=$m,nosuid,nodev" agent-sandbox "$d"; fi
   shift
 done
 shift
@@ -217,7 +218,19 @@ def sandbox_prefix(t: Target) -> list:
     if not unshare or not os.path.exists("/usr/bin/mount"):
         raise AgentPrivilegeError("sandbox_unavailable")
     return [unshare, "--mount", "--propagation", "private", "--", "/bin/sh", "-c",
-            _SANDBOX_SCRIPT, "agent-sandbox", *keep, "--hide", *SANDBOX_HIDE, "--"]
+            _SANDBOX_SCRIPT, "agent-sandbox", *keep, "--hide",
+            *(f"{d}:{_hidden_mode(d, keep)}" for d in SANDBOX_HIDE), "--"]
+
+
+def _hidden_mode(d: str, keep: list) -> str:
+    """The empty tmpfs over a hidden directory: temp dirs as usual (sticky, world-writable);
+    a directory on the way to a kept path can be passed through but not listed; the rest
+    cannot be entered at all."""
+    if d in ("/tmp", "/var/tmp"):
+        return "1777"
+    if any(k.startswith(d.rstrip("/") + "/") for k in keep):
+        return "0711"
+    return "0700"
 
 
 def _path(t: Target) -> str:
