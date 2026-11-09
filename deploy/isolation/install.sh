@@ -8,6 +8,7 @@
 #                           logs that claude in (see the printed line)
 #   install.sh --apply      switches ChatGPT projects to the sandboxed worker; prints rollback
 set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 umask 022
 
 RUNTIME=/root/ai-dev-runtime

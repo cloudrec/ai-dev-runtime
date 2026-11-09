@@ -2,6 +2,7 @@
 # Undo deploy/isolation/install.sh --apply: ChatGPT projects back on the live worker, as root.
 # Leaves user fcagent and its login in place (userdel -r fcagent removes them).
 set -uo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RUNTIME=/root/ai-dev-runtime
 D_W=/etc/systemd/system/owner-os-fullcycle-worker.service.d
 [ "$(id -u)" = 0 ] || { echo "run as root" >&2; exit 1; }
