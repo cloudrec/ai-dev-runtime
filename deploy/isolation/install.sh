@@ -38,7 +38,8 @@ user_ok() {   # exists, not root, no extra groups, home as expected
 
 check() {
   local head; head=$(git -C $RUNTIME rev-parse --short=7 HEAD)
-  [ "$head" = "$LIVE_SHA" ] || [ "$head" = "$TARGET_SHA" ] || die "live is not at $LIVE_SHA"
+  # b7c3521: an earlier --apply fast-forwarded before its preflight failed (inert code)
+  case "$head" in "$LIVE_SHA"|b7c3521|"$TARGET_SHA") ;; *) die "live is not at $LIVE_SHA";; esac
   git -C $RUNTIME merge-base --is-ancestor HEAD "$TARGET_SHA" || die "target is not a fast-forward"
   [ -z "$(git -C $RUNTIME status --porcelain --untracked-files=no)" ] || die "live tree has edits"
   for b in unshare setpriv mount; do command -v $b >/dev/null || die "$b missing"; done
@@ -76,14 +77,18 @@ apply() {
   cp -a "$D_API" "$BACKUP/" ; cp -a "$D_W"/98-fullcycle-intake.conf "$D_W"/99-fullcycle-telegram.conf "$BACKUP/" 2>/dev/null || true
   trap 'echo; echo "FAILED. Rollback: bash '"$HERE"'/rollback.sh" >&2' ERR
 
-  git -C $RUNTIME merge -q --ff-only "$TARGET_SHA"
-  # preflight as the agent, through the sandbox, pins the setting for this instance
+  # preflight first, from the target code unpacked aside: as the agent, through the
+  # sandbox; it pins the setting for this instance. Live is not touched until it passes.
+  PF=$(mktemp -d /root/.isolation-preflight.XXXXXX)
+  git -C $RUNTIME archive "$TARGET_SHA" core tools config | tar -x -C "$PF"
   AGENT_RUN_AS=$U AGENT_CONTROL_DB=$STATE/agent_control.db AGENT_SANDBOX_KEEP=$ROOT \
-    $PY $RUNTIME/tools/agent_uid_preflight.py --pin \
+    $PY "$PF/tools/agent_uid_preflight.py" --pin \
       --deny /opt/payment-orchestrator --deny /opt/payorch-wt-tabpay \
       --deny /opt/payorch-wt-mulenrefund --deny /opt/seo/.env \
       --deny /root/ai-dev-runtime/configs/.env --deny /etc/ai-runtime/fullcycle-telegram.env \
-    || die "preflight failed: nothing switched yet"
+    || { rm -rf "$PF"; die "preflight failed: nothing switched yet"; }
+  rm -rf "$PF"
+  git -C $RUNTIME merge -q --ff-only "$TARGET_SHA"
 
   # the API hands new project trees to fcagent
   printf '[Service]\nEnvironment=FULLCYCLE_INTAKE_ROOT=%s\nEnvironment=FULLCYCLE_INTAKE_RUN_AS=%s\n' \
