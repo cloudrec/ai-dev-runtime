@@ -659,6 +659,36 @@ def fullcycle_release_do(token: str, _: bool = Depends(_auth)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/fullcycle/owner-page/{key}")
+def fullcycle_owner_page(key: str, _: bool = Depends(_auth)):
+    """The owner's phone page data (core.fullcycle.owner_page); the key is the owner's."""
+    from core.fullcycle import owner_page
+    try:
+        owner_page.check(key)
+    except owner_page.PageError:
+        raise HTTPException(status_code=404, detail="not found")
+    return owner_page.snapshot()
+
+
+@router.post("/fullcycle/owner-page/{key}/release/{project_id}")
+def fullcycle_owner_page_release(key: str, project_id: str, _: bool = Depends(_auth)):
+    from core.control_plane.delivery import _send_owner_push
+    from core.fullcycle import owner_page
+    try:
+        return owner_page.release_from_page(key, project_id, notify=_send_owner_push)
+    except owner_page.PageError:
+        raise HTTPException(status_code=404, detail="not found")
+
+
+@router.post("/fullcycle/owner-page/{key}/dismiss/{project_id}")
+def fullcycle_owner_page_dismiss(key: str, project_id: str, _: bool = Depends(_auth)):
+    from core.fullcycle import owner_page
+    try:
+        return owner_page.dismiss_from_page(key, project_id)
+    except owner_page.PageError:
+        raise HTTPException(status_code=404, detail="not found")
+
+
 @router.get("/fullcycle/repos")
 def fullcycle_repos(request: Request, _: bool = Depends(_auth)):
     """The repos the owner allowed projects on: names and whether usable, no paths."""

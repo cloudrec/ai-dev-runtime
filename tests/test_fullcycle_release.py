@@ -71,13 +71,44 @@ def test_the_link_releases_once_by_fast_forward(env):
     assert rel.preview(_token(link))["used"] is True
 
 
-def test_a_tampered_or_foreign_link_is_refused(env):
+def test_a_guessed_or_altered_link_is_refused(env):
     _, _, sha, _ = env
     t = _token(rel.make_link("calc", sha))
-    body, sig = t.split(".")
-    for bad in (body + "." + sig[:-2] + "AA", body[:-2] + "AA." + sig, "x.y", ""):
+    assert len(rel.make_link("calc", sha)) < 80                  # fits a terminal line
+    for bad in (t[:-1] + ("A" if t[-1] != "A" else "B"), "A" * 22, "x.y", ""):
         with pytest.raises(rel.ReleaseError, match="link_invalid"):
             rel.release(bad)
+
+
+def _long_token(env, sha, now=None):
+    """The first format, already in the owner's hands: still honoured."""
+    import base64
+    import hashlib
+    import hmac
+    import json
+    import time
+    from core.fullcycle import engine as fe
+    _, _, _, key = env
+    k = key.read_bytes().strip()
+    b64 = lambda b: base64.urlsafe_b64encode(b).decode().rstrip("=")
+    body = b64(json.dumps({"p": "calc", "s": sha, "e": int((now or time.time()) + 3600),
+                           "n": "n0nce"}, separators=(",", ":")).encode())
+    conn, _o = fe.connect()
+    rel._conn(conn)
+    conn.execute("INSERT INTO fc_release_link (nonce, project_id, sha, made_ts) VALUES "
+                 "(?,?,?,?)", ("n0nce", "calc", sha, time.time()))
+    conn.commit()
+    conn.close()
+    return body + "." + b64(hmac.new(k, body.encode(), hashlib.sha256).digest())
+
+
+def test_a_long_link_from_before_still_works_and_is_checked(env):
+    src, _, sha, _ = env
+    t = _long_token(env, sha)
+    body, sig = t.split(".")
+    with pytest.raises(rel.ReleaseError, match="link_invalid"):
+        rel.release(body + "." + sig[:-2] + "AA")
+    assert rel.release(t)["ok"] and _git(src, "rev-parse", "HEAD") == sha
 
 
 def test_an_expired_link_is_refused(env):
@@ -148,16 +179,24 @@ def test_the_api_routes_need_the_runtime_token():
     assert c.post("/api/v1/fullcycle/release/x.y").status_code in (401, 403, 503)
 
 
-def test_a_link_whose_record_was_altered_is_refused(env):
+def test_a_long_link_whose_record_was_altered_is_refused(env):
     from core.fullcycle import engine as fe
     _, _, sha, _ = env
-    t = _token(rel.make_link("calc", sha))
+    t = _long_token(env, sha)
     conn, _o = fe.connect()
-    conn.execute("UPDATE fc_release_link SET sha=?", ("0" * 40,))
+    conn.execute("UPDATE fc_release_link SET sha=? WHERE nonce='n0nce'", ("0" * 40,))
     conn.commit()
     conn.close()
     with pytest.raises(rel.ReleaseError, match="link_invalid"):
         rel.preview(t)
+
+
+def test_release_project_spends_a_fresh_link_and_records_it(env):
+    src, _, sha, _ = env
+    assert rel.released("calc") is None
+    r = rel.release_project("calc")
+    assert r["ok"] and _git(src, "rev-parse", "HEAD") == sha
+    assert rel.released("calc")["sha"] == sha
 
 
 def test_the_owner_tool_makes_a_link_for_the_current_commit(env, capsys):

@@ -67,7 +67,7 @@ def main(argv=None) -> int:
     if not p or not src:
         print(f"STOP: {pid} is not a project started on an allowed repo", file=sys.stderr)
         return 1
-    link = release.make_link(pid, head_of(p["root"], src["branch"]))
+    link = release.make_link(pid, release.head_of(pid))
     if not link:
         print("STOP: release links are off (no key or no FULLCYCLE_RELEASE_URL_BASE)",
               file=sys.stderr)

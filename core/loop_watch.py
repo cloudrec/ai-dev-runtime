@@ -148,6 +148,36 @@ def worker_errors(conn, now: float, run=subprocess.run) -> dict:
 CHECKS = (unwoken_reviews, undelivered_wakes, workers_down, worker_errors)
 
 
+def owner_digest(conn, notify, now: float, sent: list) -> Optional[str]:
+    """What waits for the owner, sent whenever that list changes (and not more often than
+    every DIGEST_GAP), with the owner page link. Returns the text sent, if any."""
+    from core.fullcycle import owner_page
+    _conn(conn)                                  # its own table, also when called alone
+    items = owner_page.todo(conn)
+    keys = ",".join(sorted(i["key"] for i in items))
+    row = conn.execute("SELECT alert_ts, text FROM loop_watch WHERE key='digest'").fetchone()
+    if row and row[1] == keys:
+        return None
+    if row and now - (row[0] or 0) < DIGEST_GAP:
+        return None
+    if not items and not row:
+        return None
+    link = owner_page.url()
+    text = ("📋 Owner OS, нужно от тебя:\n" + "\n".join(f"• {i['text']}" for i in items)
+            if items else "📋 Owner OS: от тебя сейчас ничего не нужно.")
+    if link:
+        text += f"\nСтраница: {link}"
+    if _send(notify, text, sent):
+        conn.execute("INSERT OR REPLACE INTO loop_watch VALUES (?,?,?,?,?)",
+                     ("digest", now, now, 0, keys))
+        conn.commit()
+        return text
+    return None
+
+
+DIGEST_GAP = 600
+
+
 def check(*, notify: Callable[[str], object], conn=None, now: Optional[float] = None,
           checks=None, run=subprocess.run) -> dict:
     """One pass. Returns {"problems": {...}, "sent": [...]}."""
@@ -180,6 +210,11 @@ def check(*, notify: Callable[[str], object], conn=None, now: Optional[float] = 
                 if _send(notify, f"✅ Owner OS: прошло — {str(row[4])[:200]}", sent):
                     conn.execute("UPDATE loop_watch SET active=0 WHERE key=?", (key,))
         conn.commit()
+        if checks is None:
+            try:
+                owner_digest(conn, notify, now, sent)
+            except Exception as e:  # noqa: BLE001 — the digest never stops the watch
+                problems["check_failed:owner_digest"] = f"сводка упала: {e}"[:200]
         return {"problems": problems, "sent": sent}
     finally:
         if own:

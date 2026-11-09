@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS fc_release_link (
     nonce TEXT PRIMARY KEY, project_id TEXT, sha TEXT, made_ts REAL, used_ts REAL,
     result TEXT
 )"""
+# A long signed token broke across lines in the owner's terminal (2026-11-09). The link now
+# carries a short random id (128 bits, itself the capability); the row holds the rest.
+_SHORT_RE = __import__("re").compile(r"^[A-Za-z0-9_-]{20,32}$")
 
 
 class ReleaseError(Exception):
@@ -68,6 +71,8 @@ def _conn(conn=None):
     from core.fullcycle import engine as fe
     conn, own = fe.connect(conn)
     conn.execute(_NONCE_SCHEMA)
+    if "link_id" not in {r[1] for r in conn.execute("PRAGMA table_info(fc_release_link)")}:
+        conn.execute("ALTER TABLE fc_release_link ADD COLUMN link_id TEXT")
     return conn, own
 
 
@@ -78,24 +83,32 @@ def make_link(project_id: str, sha: str, *, conn=None, now: Optional[float] = No
         return None
     now = now if now is not None else time.time()
     nonce = secrets.token_urlsafe(12)
-    body = _b64(json.dumps({"p": project_id, "s": sha, "e": int(now + RELEASE_TTL),
-                            "n": nonce}, separators=(",", ":")).encode())
-    sig = _b64(hmac.new(key, body.encode(), hashlib.sha256).digest())
+    link_id = secrets.token_urlsafe(16)
     conn, own = _conn(conn)
     try:
-        conn.execute("INSERT INTO fc_release_link (nonce, project_id, sha, made_ts) "
-                     "VALUES (?,?,?,?)", (nonce, project_id, sha, now))
+        conn.execute("INSERT INTO fc_release_link (nonce, project_id, sha, made_ts, link_id) "
+                     "VALUES (?,?,?,?,?)", (nonce, project_id, sha, now, link_id))
         conn.commit()
     finally:
         if own:
             conn.close()
-    return f"{base}/{body}.{sig}"
+    return f"{base}/{link_id}"
 
 
 def _claims(token: str, *, conn, now: float) -> dict:
     key = _key()
     if not key:
         raise ReleaseError("release_links_off")
+    if _SHORT_RE.match(token or ""):
+        row = conn.execute("SELECT project_id, sha, used_ts, result, nonce, made_ts FROM "
+                           "fc_release_link WHERE link_id=?", (token,)).fetchone()
+        if not row:
+            raise ReleaseError("link_invalid")
+        if now > float(row[5] or 0) + RELEASE_TTL:
+            raise ReleaseError("link_expired")
+        return {"project": row[0], "sha": row[1], "used": row[2] is not None,
+                "result": json.loads(row[3]) if row[3] else None, "nonce": row[4],
+                "expires": int(float(row[5]) + RELEASE_TTL)}
     try:
         body, sig = (token or "").split(".", 1)
         want = _b64(hmac.new(key, body.encode(), hashlib.sha256).digest())
@@ -208,3 +221,51 @@ def _do_release(c: dict, conn, repos, intake, agent_privilege) -> dict:
         raise ReleaseError(f"{branch}_has_commits_the_project_does_not:start_a_new_integration")
     _git(into, "merge", "-q", "--ff-only", sha)
     return {"ok": True, "into": into, "branch": branch, "sha": sha, "was": head}
+
+
+def head_of(project_id: str, *, conn=None) -> str:
+    """The project branch's commit, read by the tree's owner inside its sandbox (root
+    never opens an agent's repository)."""
+    import pwd
+    from core import agent_privilege as priv
+    from core.fullcycle import intake
+    p, src = specs.get_project(project_id, conn=conn), intake.source_of(project_id, conn=conn)
+    if not p or not src:
+        raise ReleaseError("not_a_repo_project")
+    root = p["root"]
+    argv = ["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-C", root,
+            "rev-parse", "--verify", f"{src['branch']}^{{commit}}"]
+    env = None
+    st = os.lstat(root)
+    if st.st_uid != 0:
+        pw = pwd.getpwuid(st.st_uid)
+        t = priv.Target(pw.pw_name, pw.pw_uid, pw.pw_gid, pw.pw_dir)
+        argv, env = priv.sandboxed_argv(t, intake.intake_root() or "", argv), priv.child_env(t)
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env, cwd="/")
+    if r.returncode != 0 or len(r.stdout.strip()) != 40:
+        raise ReleaseError(f"cannot_read_branch:{r.stderr.strip()[:120]}")
+    return r.stdout.strip()
+
+
+def release_project(project_id: str, *, conn=None, notify=None) -> dict:
+    """The owner pressed Release on the owner page (already authenticated): a link for
+    the branch's current commit, spent at once, through the same checks."""
+    link = make_link(project_id, head_of(project_id, conn=conn), conn=conn)
+    if not link:
+        raise ReleaseError("release_links_off")
+    return release(link.rsplit("/", 1)[1], conn=conn, notify=notify)
+
+
+def released(project_id: str, *, conn=None) -> Optional[dict]:
+    """The last successful release of this project, if any."""
+    conn, own = _conn(conn)
+    try:
+        for (res,) in conn.execute("SELECT result FROM fc_release_link WHERE project_id=? AND "
+                                   "result IS NOT NULL ORDER BY used_ts DESC", (project_id,)):
+            d = json.loads(res)
+            if d.get("ok"):
+                return d
+        return None
+    finally:
+        if own:
+            conn.close()

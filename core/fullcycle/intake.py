@@ -275,6 +275,11 @@ def start(project_id: str, spec: dict, *, by: str, repo: Optional[str] = None,
             if source:
                 _copy_repo(source, path, project_id, conn,
                            merge_from=_merge_sources(merge_from, repo, conn))
+                if merge_from:
+                    conn.execute("CREATE TABLE IF NOT EXISTS fc_intake_merge (into_id TEXT, "
+                                 "from_id TEXT, PRIMARY KEY (into_id, from_id))")
+                    conn.executemany("INSERT OR IGNORE INTO fc_intake_merge VALUES (?,?)",
+                                     [(project_id, m) for m in merge_from])
             else:
                 _new_repo(path)
             created = True
