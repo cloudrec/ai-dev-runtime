@@ -638,6 +638,27 @@ def fullcycle_note(req: TechleadNoteReq, request: Request, _: bool = Depends(_au
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/fullcycle/release/{token}")
+def fullcycle_release_preview(token: str, _: bool = Depends(_auth)):
+    """What a one-time release link would release (core.fullcycle.release). Spends nothing."""
+    from core.fullcycle import release
+    try:
+        return release.preview(token)
+    except release.ReleaseError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/fullcycle/release/{token}")
+def fullcycle_release_do(token: str, _: bool = Depends(_auth)):
+    """The owner pressed Release on the link's page: spend it, fast-forward the repo."""
+    from core.control_plane.delivery import _send_owner_push
+    from core.fullcycle import release
+    try:
+        return release.release(token, notify=_send_owner_push)
+    except release.ReleaseError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/fullcycle/repos")
 def fullcycle_repos(request: Request, _: bool = Depends(_auth)):
     """The repos the owner allowed projects on: names and whether usable, no paths."""
