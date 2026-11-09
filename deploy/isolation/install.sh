@@ -13,7 +13,7 @@ umask 022
 
 RUNTIME=/root/ai-dev-runtime
 LIVE_SHA=db9319e
-TARGET_SHA=b7c3521
+TARGET_SHA=13d99da
 U=fcagent
 H=/home/$U
 ROOT=/opt/fc-projects
