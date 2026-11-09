@@ -218,6 +218,8 @@ def watch_loop() -> dict:
     r = loop_watch.check(notify=_send_owner_push)
     for line in r["sent"]:
         print(f"loop-watch: {line[:160]}", flush=True)
+    keys = sorted(r["problems"])
+    print(f"loop-watch pass: {'active ' + ', '.join(keys) if keys else 'ok'}", flush=True)
     return r
 
 
