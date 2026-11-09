@@ -60,6 +60,14 @@ from core.fullcycle.executor import (CRASHED, DONE, UNKNOWN, WAITING_PERMISSION,
 from core.fullcycle.hosts import ExecutionHost, LocalHost
 
 SOURCE = "fullcycle"
+def _tell_owner(text: str) -> None:
+    try:
+        from core.control_plane.delivery import _send_owner_push
+        _send_owner_push(text)
+    except Exception:  # noqa: BLE001 — a missed push never stops the engine
+        pass
+
+
 REVIEW_EVENT = "task_completed"          # a completion-class trigger in core.wake_bridge
 OWNER_EVENT = "owner_decision_required"
 MAX_ATTEMPTS = int(os.getenv("FULLCYCLE_MAX_ATTEMPTS", "3"))
@@ -165,7 +173,15 @@ class EngineError(RuntimeError):
 
 _MIGRATIONS = (("fc_task", "unknown_polls", "INTEGER DEFAULT 0"),
                ("fc_escalation", "idle_since", "REAL"),
-               ("fc_escalation", "idle_fp", "TEXT"))
+               ("fc_escalation", "idle_fp", "TEXT"),
+               ("fc_review", "reminders", "INTEGER DEFAULT 0"),
+               ("fc_review", "reminded_ts", "REAL"))
+
+# A review the tech lead has not decided is asked again: the first wake can be lost (a chat
+# at its cap, a browser down, a unit without the wake switch: 2026-11-09, seven gaika
+# questions sat unanswered for an hour). After the last reminder the owner hears once.
+REVIEW_REMIND_SECS = int(os.getenv("FULLCYCLE_REVIEW_REMIND_SECS", "1200"))
+REVIEW_REMIND_MAX = int(os.getenv("FULLCYCLE_REVIEW_REMIND_MAX", "6"))
 
 
 def connect(conn=None):
@@ -487,6 +503,33 @@ class Engine:
         _offer_to_wake_bridge(eid, type_, severity, owner, project_id=self.project_id,
                               agent_id=agent, correlation_id=corr, conn=self.conn)
         return eid
+
+    def _remind_reviews(self) -> None:
+        now = self.clock()
+        rows = self.conn.execute(
+            "SELECT r.id, r.task_id, r.attempt, r.kind, r.created_ts, COALESCE(r.reminders,0),"
+            " r.reminded_ts, t.key FROM fc_review r JOIN fc_task t ON t.id = r.task_id"
+            " WHERE r.project_id=? AND r.status='pending' AND r.decision IS NULL",
+            (self.project_id,)).fetchall()
+        for rid, _tid, attempt, kind, created, n, last, key in rows:
+            since = last or created or now
+            if n >= REVIEW_REMIND_MAX or now - since < REVIEW_REMIND_SECS:
+                continue
+            n += 1
+            self.conn.execute("UPDATE fc_review SET reminders=?, reminded_ts=? WHERE id=?",
+                              (n, now, rid))
+            self.conn.commit()
+            last_one = n >= REVIEW_REMIND_MAX
+            eid = self._event(REVIEW_EVENT, _tid, {
+                "fullcycle": kind, "review_id": rid, "project": self.project_id, "task": key,
+                "attempt": attempt, "reminder": n, "waiting_s": int(now - (created or now)),
+                "decide_with": {"review_id": rid, "decisions": list(REVIEW_DECISIONS[kind])}},
+                owner=last_one, dedup_key=f"fullcycle:review:{rid}:remind:{n}")
+            self._note("review_reminded", task=key, review_id=rid, reminder=n, event_id=eid)
+            if last_one:
+                _tell_owner(f"⏳ Full Cycle: {self.project_id} / {key} ждёт ответа техлида "
+                            f"{int((now - (created or now)) // 60)} мин, напоминаний {n}. "
+                            f"Ревью {rid}. Загляни в чат ChatGPT.")
 
     def _lead(self) -> None:
         """Renew the lease; raise if another engine holds it."""
@@ -1608,6 +1651,7 @@ class Engine:
             self._lead()
             self._seed()
             self._apply_decisions()
+            self._remind_reviews()
             self._commit_pending()
             self._owner_answers()
             for t in self._tasks():
