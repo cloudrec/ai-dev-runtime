@@ -3,7 +3,7 @@
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RUNTIME=/root/ai-dev-runtime; SEO=/opt/seo
-LIVE_SHA=f9cde5c; TARGET_SHA=743077b; SEO_LIVE=d1aa013; SEO_TARGET=59e5b1a
+LIVE_SHA=f9cde5c; TARGET_SHA=cbc219a; SEO_LIVE=d1aa013; SEO_TARGET=59e5b1a
 KEY=/etc/ai-runtime/release-link.key
 D=/etc/systemd/system/owner-os-fullcycle-intake.service.d/20-release-link.conf
 BASE=https://seoseo.cheap/api/owner/fc-release
