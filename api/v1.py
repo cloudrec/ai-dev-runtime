@@ -680,6 +680,17 @@ def fullcycle_owner_page_release(key: str, project_id: str, _: bool = Depends(_a
         raise HTTPException(status_code=404, detail="not found")
 
 
+@router.post("/fullcycle/owner-page/{key}/publish-{mode}/{project_id}")
+def fullcycle_owner_page_publish(key: str, mode: str, project_id: str,
+                                 _: bool = Depends(_auth)):
+    from core.control_plane.delivery import _send_owner_push
+    from core.fullcycle import owner_page
+    try:
+        return owner_page.publish_from_page(key, project_id, mode, notify=_send_owner_push)
+    except owner_page.PageError:
+        raise HTTPException(status_code=404, detail="not found")
+
+
 @router.post("/fullcycle/owner-page/{key}/dismiss/{project_id}")
 def fullcycle_owner_page_dismiss(key: str, project_id: str, _: bool = Depends(_auth)):
     from core.fullcycle import owner_page

@@ -158,3 +158,82 @@ def test_an_unsent_digest_is_tried_again(env, done_status):
     told = []
     assert lw.owner_digest(conn, told.append, 1001.0, []) is not None
     conn.close()
+
+
+# ── publish: Push or PR after a release ─────────────────────────────────────────────
+@pytest.fixture
+def released(env, done_status, tmp_path):
+    root, src = env
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    _git(src, "remote", "add", "origin", str(origin))
+    _git(src, "push", "-q", "origin", "main")
+    _finish(root, "calc")
+    key = owner_page.rotate()
+    assert owner_page.release_from_page(key, "calc")["ok"]
+    return src, origin, key
+
+
+def test_push_sends_the_released_commit_and_never_forces(released):
+    src, origin, key = released
+    (p,) = owner_page.snapshot()["projects"]
+    assert p["published"] == {"mode": None}
+    r = owner_page.publish_from_page(key, "calc", "push")
+    assert r["ok"], r
+    assert _git(origin, "rev-parse", "main") == _git(src, "rev-parse", "main")
+    (p,) = owner_page.snapshot()["projects"]
+    assert p["published"]["mode"] == "push"
+    again = owner_page.publish_from_page(key, "calc", "push")
+    assert again["ok"] and again.get("note") == "already there"
+
+
+def test_push_refuses_when_origin_has_other_commits(released, tmp_path):
+    src, origin, key = released
+    other = tmp_path / "other"
+    subprocess.run(["git", "clone", "-q", "-b", "main", str(origin), str(other)], check=True)
+    (other / "theirs.py").write_text("t = 1\n")
+    _git(other, "add", ".")
+    _git(other, "commit", "-q", "-m", "someone else")
+    _git(other, "push", "-q", "origin", "main")
+    theirs = _git(origin, "rev-parse", "main")
+    r = owner_page.publish_from_page(key, "calc", "push")
+    assert r["ok"] is False and "lacks" in r["reason"]
+    assert _git(origin, "rev-parse", "main") == theirs
+
+
+def test_pr_pushes_a_branch_and_asks_gh(released, monkeypatch):
+    src, origin, key = released
+    real = subprocess.run
+    seen = []
+
+    def run(argv, **kw):
+        if argv[0] == "gh":
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "https://github.com/x/y/pull/7\n", "")
+        return real(argv, **kw)
+    r = rel.publish("calc", "pr", run=run)
+    assert r["ok"] and r["url"].endswith("/pull/7") and r["ref"] == "owneros/calc"
+    assert _git(origin, "rev-parse", "owneros/calc") == _git(src, "rev-parse", "main")
+    assert seen[0][:3] == ["gh", "pr", "create"] and "--base" in seen[0]
+    assert _git(origin, "rev-parse", "main") != _git(src, "rev-parse", "main")  # main untouched
+
+
+def test_nothing_is_published_before_a_release(env, done_status):
+    root, _ = env
+    _finish(root, "calc")
+    key = owner_page.rotate()
+    r = owner_page.publish_from_page(key, "calc", "push")
+    assert r["ok"] is False and r["reason"] == "not_released_yet"
+
+
+def test_publish_needs_the_key_and_a_known_mode(released):
+    _, _, key = released
+    with pytest.raises(owner_page.PageError):
+        owner_page.publish_from_page("x" * 43, "calc", "push")
+    with pytest.raises(owner_page.PageError):
+        owner_page.publish_from_page(key, "calc", "force")
+
+
+def test_publish_itself_refuses_an_unknown_mode(released):
+    with pytest.raises(rel.ReleaseError, match="bad_mode"):
+        rel.publish("calc", "force")

@@ -128,9 +128,20 @@ def _projects(conn) -> list:
                           all(t["state"] in ("VERIFIED_DONE", "CANCELLED") for t in tasks)
                           and not rel and pid not in via and pid not in dismissed,
             "dismissed": pid in dismissed, "in_released_integration": pid in via,
-            "released": ({"into": rel.get("into"), "sha": rel.get("sha", "")[:12]}
-                         if rel else None)})
+            "released": ({"into": rel.get("into"), "sha": rel.get("sha", "")[:12],
+                          "branch": rel.get("branch")} if rel else None),
+            "published": _published_view(pid, rel, conn)})
     return out
+
+
+def _published_view(pid: str, rel: Optional[dict], conn) -> Optional[dict]:
+    if not rel:
+        return None
+    from core.fullcycle import release
+    pub = release.published(pid, conn=conn)
+    if pub and pub.get("sha") == rel.get("sha"):
+        return {"mode": pub.get("mode"), "ref": pub.get("ref"), "url": pub.get("url")}
+    return {"mode": None}
 
 
 def _loop_problems(conn) -> list:
@@ -182,6 +193,17 @@ def dismiss_finished(by: str = "owner") -> list:
     for pid in out:
         dismiss(pid, by=by)
     return out
+
+
+def publish_from_page(given: str, project_id: str, mode: str, notify=None) -> dict:
+    from core.fullcycle import release
+    check(given)
+    if not specs.KEY_RE.match(project_id or "") or mode not in release.PUBLISH_MODES:
+        raise PageError("bad_request")
+    try:
+        return release.publish(project_id, mode, notify=notify)
+    except release.ReleaseError as e:
+        return {"ok": False, "reason": str(e)}
 
 
 def release_from_page(given: str, project_id: str, notify=None) -> dict:

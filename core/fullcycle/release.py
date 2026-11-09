@@ -269,3 +269,102 @@ def released(project_id: str, *, conn=None) -> Optional[dict]:
     finally:
         if own:
             conn.close()
+
+
+# ── publish: the owner presses Push or PR on the owner page ──────────────────────────
+_PUBLISH_SCHEMA = """
+CREATE TABLE IF NOT EXISTS fc_publish (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT, mode TEXT, sha TEXT, ts REAL,
+    result TEXT
+)"""
+PUBLISH_MODES = ("push", "pr")
+
+
+def published(project_id: str, *, conn=None) -> Optional[dict]:
+    conn, own = _conn(conn)
+    try:
+        conn.execute(_PUBLISH_SCHEMA)
+        for (res,) in conn.execute("SELECT result FROM fc_publish WHERE project_id=? ORDER BY "
+                                   "id DESC", (project_id,)):
+            d = json.loads(res)
+            if d.get("ok"):
+                return d
+        return None
+    finally:
+        if own:
+            conn.close()
+
+
+def publish(project_id: str, mode: str, *, conn=None, notify=None,
+            run=subprocess.run) -> dict:
+    """Send what was released to the repository's origin. push: the released branch,
+    fast-forward only, never forced. pr: a branch owneros/<project> and a pull request into
+    the released branch (gh). Only after a successful release, only the released commit."""
+    from core import agent_privilege
+    from core.fullcycle import intake, repos
+    if mode not in PUBLISH_MODES:
+        raise ReleaseError("bad_mode")
+    conn, own = _conn(conn)
+    try:
+        conn.execute(_PUBLISH_SCHEMA)
+        rel = released(project_id, conn=conn)
+        src = intake.source_of(project_id, conn=conn)
+        if not rel or not src:
+            raise ReleaseError("not_released_yet")
+        into = repos.get(src["repo"])["path"]          # still allowed, not payment, ...
+        agent_privilege.require_root_work(into)
+        sha, branch = rel["sha"], rel["branch"]
+        try:
+            out = _publish(into, sha, branch, project_id, mode, run)
+        except (ReleaseError, OSError, subprocess.SubprocessError) as e:
+            out = {"ok": False, "reason": str(e)[:240]}
+        out.update(mode=mode, sha=sha)
+        conn.execute("INSERT INTO fc_publish (project_id, mode, sha, ts, result) VALUES "
+                     "(?,?,?,?,?)", (project_id, mode, sha, time.time(), json.dumps(out)))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+    if notify:
+        try:
+            notify(("📤 Опубликовано: " if out["ok"] else "⛔ Не опубликовано: ")
+                   + f"{project_id} ({mode}) " + (out.get("url") or out.get("ref") or "")
+                   + ("" if out["ok"] else f" — {out['reason']}"))
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
+def _run(run, argv, cwd, timeout=120) -> str:
+    r = run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise ReleaseError(f"{argv[0]} {argv[1] if len(argv) > 1 else ''}: "
+                           f"{(r.stderr or r.stdout or '').strip()[:180]}")
+    return (r.stdout or "").strip()
+
+
+def _publish(into: str, sha: str, branch: str, pid: str, mode: str, run) -> dict:
+    remote = _run(run, ["git", "remote", "get-url", "--push", "origin"], into)
+    if not remote:
+        raise ReleaseError("no_origin")
+    if mode == "push":
+        line = _run(run, ["git", "ls-remote", "--heads", "origin", branch], into)
+        theirs = line.split()[0] if line else ""
+        if theirs and theirs != sha:
+            ok = run(["git", "merge-base", "--is-ancestor", theirs, sha], cwd=into,
+                     capture_output=True, timeout=60).returncode == 0
+            if not ok:
+                raise ReleaseError(f"origin/{branch}_has_commits_this_release_lacks")
+        if theirs == sha:
+            return {"ok": True, "ref": f"origin/{branch}", "note": "already there"}
+        _run(run, ["git", "push", "origin", f"{sha}:refs/heads/{branch}"],  # never forced
+             into, timeout=300)
+        return {"ok": True, "ref": f"origin/{branch}"}
+    head = f"owneros/{pid}"
+    _run(run, ["git", "push", "origin", f"{sha}:refs/heads/{head}"], into, timeout=300)
+    url = _run(run, ["gh", "pr", "create", "--head", head, "--base", branch,
+                     "--title", f"Owner OS: {pid}",
+                     "--body", f"Released by the owner from Owner OS full cycle ({pid}, "
+                               f"{sha[:12]}). Reviewed task by task by the tech lead."],
+               into, timeout=120)
+    return {"ok": True, "ref": head, "url": url.splitlines()[-1] if url else ""}
