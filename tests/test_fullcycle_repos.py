@@ -347,3 +347,79 @@ def test_no_root_git_on_a_repo_under_agent_run_as(box, src, monkeypatch):
         intake.start("calc", SPEC, by=BY, repo="shop")
     assert not [a for a in ran if a and a[0] and a[0][0] == "git"]
     assert os.listdir(box) == []
+
+
+# -- the sandboxed worker's projects belong to its agent user ----------------------------
+needs_root = pytest.mark.skipif(os.geteuid() != 0, reason="chown needs root")
+
+
+@needs_root
+def test_a_new_tree_is_handed_to_the_agent_user_whole(box, src, monkeypatch):
+    import pwd
+    n = pwd.getpwnam("nobody")
+    os.symlink("/etc/passwd", src / "passwd-link")
+    _git(src, "add", "passwd-link")
+    _git(src, "commit", "-q", "-m", "a link")
+    monkeypatch.setenv("FULLCYCLE_INTAKE_RUN_AS", "nobody")
+    repos.allow("shop", str(src))
+    intake.start("calc", SPEC, by=BY, repo="shop")
+    intake.start("plain", SPEC, by=BY)
+    for root in (box / "calc", box / "plain"):
+        for top, dirs, files in os.walk(root):
+            for name in [top] + [os.path.join(top, x) for x in dirs + files]:
+                assert os.lstat(name).st_uid == n.pw_uid, name
+    assert os.stat("/etc/passwd").st_uid == 0          # the link was not followed
+    assert os.lstat(src / "app.py").st_uid == 0          # the source stays root's
+
+
+@pytest.mark.parametrize("who,err", [("no-such-user-x", "unknown_user"), ("root", "is_root")])
+def test_a_bad_agent_user_refuses_before_anything_is_made(box, monkeypatch, who, err):
+    monkeypatch.setenv("FULLCYCLE_INTAKE_RUN_AS", who)
+    with pytest.raises(specs.SpecError, match=err):
+        intake.start("calc", SPEC, by=BY)
+    assert os.listdir(box) == []
+
+
+def test_unset_leaves_trees_as_they_were(box, monkeypatch):
+    monkeypatch.delenv("FULLCYCLE_INTAKE_RUN_AS", raising=False)
+    intake.start("calc", SPEC, by=BY)
+    assert os.lstat(box / "calc").st_uid == os.geteuid()
+
+
+def test_the_notice_runs_git_as_the_agent_in_a_sandboxed_worker(box, monkeypatch):
+    from core import agent_privilege as priv
+    t = priv.Target("nobody", 65534, 65534, "/nonexistent")
+    monkeypatch.setattr(priv, "target", lambda: t)
+    seen = []
+
+    class R:
+        returncode, stdout = 0, "abc"
+    monkeypatch.setattr(intake.subprocess, "run", lambda argv, **k: seen.append(argv) or R())
+    intake._git_out("/x", "rev-parse", "HEAD")
+    assert seen[0][0].endswith("setpriv") or seen[0][0].endswith("unshare")
+    assert "--reuid=65534" in seen[0] and seen[0][-3:] == ["--no-pager", "rev-parse", "HEAD"]
+
+
+def test_the_notice_runs_no_git_when_the_setting_is_broken(box, monkeypatch):
+    from core import agent_privilege as priv
+
+    def broken():
+        raise priv.AgentPrivilegeError("pin_unsafe")
+    monkeypatch.setattr(priv, "target", broken)
+    monkeypatch.setattr(intake.subprocess, "run", lambda *a, **k: pytest.fail("ran git"))
+    assert intake._git_out("/x", "log") == ""
+
+
+@needs_root
+def test_the_hand_over_does_not_walk_through_a_directory_link(box, src, tmp_path, monkeypatch):
+    outside = tmp_path / "root-only"
+    outside.mkdir()
+    (outside / "keep.txt").write_text("root's\n")
+    os.symlink(str(outside), src / "dir-link")
+    _git(src, "add", "dir-link")
+    _git(src, "commit", "-q", "-m", "a dir link")
+    monkeypatch.setenv("FULLCYCLE_INTAKE_RUN_AS", "nobody")
+    repos.allow("shop", str(src))
+    intake.start("calc", SPEC, by=BY, repo="shop")
+    assert os.path.islink(box / "calc" / "dir-link")
+    assert os.lstat(outside).st_uid == 0 and os.lstat(outside / "keep.txt").st_uid == 0

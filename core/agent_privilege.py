@@ -153,8 +153,71 @@ def _setpriv_bin() -> Optional[str]:
 
 
 def _setpriv(t: Target) -> list:
-    return [_setpriv_bin(), f"--reuid={t.uid}", f"--regid={t.gid}", "--clear-groups",
-            "--no-new-privs", "--inh-caps=-all", "--bounding-set=-all"]
+    return [*sandbox_prefix(t), _setpriv_bin(), f"--reuid={t.uid}", f"--regid={t.gid}",
+            "--clear-groups", "--no-new-privs", "--inh-caps=-all", "--bounding-set=-all"]
+
+
+# ── what a dropped agent can see ────────────────────────────────────────────────────
+# A uid alone hides little here: /opt is world-readable, and so is most of what lives in it,
+# payment code and its .env files included (measured 2026-11-09 as `nobody`). With
+# AGENT_SANDBOX_KEEP set, every drop first enters a private mount namespace where the
+# directories below are empty tmpfs, except the kept paths (the instance's project root,
+# and the agent's home) bound back in place. Mounts made there never reach the host.
+# The namespace is entered by root and left by exec, so the pane's process ends as the
+# agent itself (pane_problem checks that pid). /proc there is a fresh mount with
+# hidepid=invisible: the agent sees its own processes only.
+SANDBOX_HIDE = ("/opt", "/srv", "/mnt", "/media", "/home", "/root", "/var/www",
+                "/var/backups", "/tmp", "/var/tmp")
+_SANDBOX_PATH_RE = re.compile(r"\A/[A-Za-z0-9._/-]+\Z")
+_SANDBOX_SCRIPT = r"""
+set -eu
+stage=$(/usr/bin/mktemp -d /run/agent-sandbox.XXXXXX)
+n=0; kept=""
+while [ "$1" != "--hide" ]; do
+  /usr/bin/mkdir -p "$stage/$n"; /usr/bin/mount --bind "$1" "$stage/$n"
+  kept="$kept $n:$1"; n=$((n+1)); shift
+done
+shift
+while [ "$1" != "--" ]; do
+  if [ -d "$1" ]; then /usr/bin/mount -t tmpfs -o mode=0755,nosuid,nodev agent-sandbox "$1"; fi
+  shift
+done
+shift
+for e in $kept; do
+  i=${e%%:*}; k=${e#*:}
+  /usr/bin/mkdir -p "$k"; /usr/bin/mount --bind "$stage/$i" "$k"; /usr/bin/umount "$stage/$i"
+done
+# its own view of /proc: other users' processes, and the secrets some keep in their
+# arguments (seen 2026-11-09), are invisible; the host's /proc is unchanged
+/usr/bin/mount -t proc -o hidepid=invisible,nosuid,nodev,noexec agent-sandbox-proc /proc
+exec "$@"
+"""
+
+
+def sandbox_keep(t: Target) -> list:
+    """Paths the dropped agent keeps; [] when the sandbox is off. Raises on a bad setting."""
+    raw = os.getenv("AGENT_SANDBOX_KEEP", "").strip()
+    if not raw:
+        return []
+    keep = [p for p in raw.split(":") if p] + [t.home]
+    for p in keep:
+        if not _SANDBOX_PATH_RE.match(p) or ".." in p.split("/") or \
+                os.path.realpath(p) != os.path.normpath(p) or not os.path.isdir(p):
+            raise AgentPrivilegeError("sandbox_keep_unsafe")
+        if os.path.normpath(p) in ("/", *SANDBOX_HIDE):
+            raise AgentPrivilegeError("sandbox_keep_too_broad")
+    return [os.path.normpath(p) for p in keep]
+
+
+def sandbox_prefix(t: Target) -> list:
+    keep = sandbox_keep(t)
+    if not keep:
+        return []
+    unshare = shutil.which("unshare", path="/usr/bin:/bin")
+    if not unshare or not os.path.exists("/usr/bin/mount"):
+        raise AgentPrivilegeError("sandbox_unavailable")
+    return [unshare, "--mount", "--propagation", "private", "--", "/bin/sh", "-c",
+            _SANDBOX_SCRIPT, "agent-sandbox", *keep, "--hide", *SANDBOX_HIDE, "--"]
 
 
 def _path(t: Target) -> str:

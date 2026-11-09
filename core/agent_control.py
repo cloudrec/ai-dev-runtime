@@ -235,6 +235,19 @@ def _tmux_bin() -> Optional[str]:
     return shutil.which("tmux")
 
 
+_SOCKET_RE = re.compile(r"\A[a-z][a-z0-9-]{0,31}\Z")
+
+
+def tmux_socket() -> str:
+    """AGENT_TMUX_SOCKET: this instance's own tmux server (tmux -L). An instance whose agents
+    run sandboxed keeps them off the server the root services enumerate, so no root reader
+    ever walks into an agent's tree. Empty: the default server. A bad name refuses."""
+    raw = os.getenv("AGENT_TMUX_SOCKET", "").strip()
+    if raw and not _SOCKET_RE.match(raw):
+        raise AgentControlError("AGENT_TMUX_SOCKET must match " + _SOCKET_RE.pattern)
+    return raw
+
+
 def _tmux(args: list[str], stdin: Optional[bytes] = None) -> tuple[int, str, str]:
     """Run one tmux command as an argv list. The single seam tests replace."""
     binary = _tmux_bin()
@@ -244,6 +257,11 @@ def _tmux(args: list[str], stdin: Optional[bytes] = None) -> tuple[int, str, str
     # ai-runtime.service dies with the service (2026-09-22: needrestart restarted the
     # daemon and took every pane with it). tmux_launch moves it into its own scope.
     argv = tmux_launch.wrap_argv([binary, *args])
+    sock = tmux_socket()
+    if sock:
+        # after the scope wrapper decided: it reads args[0] to spot a new server
+        i = argv.index(binary)
+        argv[i + 1:i + 1] = ["-L", sock]
     proc = subprocess.run(argv, input=stdin, stdout=subprocess.PIPE,
                           stderr=subprocess.PIPE, timeout=_TMUX_TIMEOUT)
     return proc.returncode, proc.stdout.decode("utf-8", "replace"), proc.stderr.decode("utf-8", "replace")

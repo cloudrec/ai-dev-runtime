@@ -98,6 +98,37 @@ def source_of(project_id: str, conn=None) -> Optional[dict]:
             conn.close()
 
 
+def run_as_owner() -> Optional[tuple]:
+    """FULLCYCLE_INTAKE_RUN_AS: the user the sandboxed worker runs these agents as, so the
+    process that makes a project (the API, root, without AGENT_RUN_AS) can hand the tree
+    over. (uid, gid), or None when unset. Root or an unknown user refuses."""
+    import pwd
+    name = os.getenv("FULLCYCLE_INTAKE_RUN_AS", "").strip()
+    if not name:
+        return None
+    try:
+        p = pwd.getpwnam(name)
+    except KeyError:
+        raise specs.SpecError("intake_run_as_unknown_user")
+    if p.pw_uid == 0 or p.pw_gid == 0:
+        raise specs.SpecError("intake_run_as_is_root")
+    return p.pw_uid, p.pw_gid
+
+
+def _hand_to_agent(path: str) -> None:
+    """Give a tree root just made, before any agent ran in it, to the agent's user. The
+    sandboxed worker refuses a tree that is not the agent's own (agent_privilege._owns_tree);
+    root never runs git in it again after this."""
+    owner = run_as_owner()
+    if not owner:
+        return
+    uid, gid = owner
+    for top, dirs, files in os.walk(path, followlinks=False):
+        os.lchown(top, uid, gid)
+        for n in dirs + files:
+            os.lchown(os.path.join(top, n), uid, gid)
+
+
 def _copy_repo(source: dict, path: str, project_id: str, conn) -> None:
     """The project's own repository, from an allowed one: see core.fullcycle.repos."""
     import shutil
@@ -162,6 +193,7 @@ def start(project_id: str, spec: dict, *, by: str, repo: Optional[str] = None,
         raise specs.SpecError("intake_disabled")
     if not by.startswith(BY_PREFIX):
         raise specs.SpecError("intake_needs_an_authenticated_client")
+    run_as_owner()                     # a bad setting refuses before anything is made
     if not ID_RE.match(project_id or ""):
         raise specs.SpecError(f"project id must match {ID_RE.pattern}")
     body = specs.validate_spec(spec)
@@ -205,6 +237,7 @@ def start(project_id: str, spec: dict, *, by: str, repo: Optional[str] = None,
             else:
                 _new_repo(path)
             created = True
+            _hand_to_agent(path)
         refused = gates.check_project_root(path)
         if refused:
             raise specs.SpecError(refused)
@@ -422,9 +455,19 @@ def _notice_table(conn) -> None:
 
 
 def _git_out(cwd: str, *args: str) -> str:
+    """git in a project tree. In a sandboxed worker it runs as the agent: the tree is the
+    agent's, and root git would load its config."""
+    from core import agent_privilege as priv
+    argv, env = ["git", *args], None
     try:
-        r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True,
-                           timeout=30)
+        t = priv.target()
+    except priv.AgentPrivilegeError:
+        return ""
+    if t:
+        argv, env = priv.host_argv(t, ["git", "--no-pager", *args]), priv.child_env(t)
+    try:
+        r = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=30,
+                           env=env)
     except (OSError, subprocess.SubprocessError):
         return ""
     return r.stdout.strip() if r.returncode == 0 else ""
