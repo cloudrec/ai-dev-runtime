@@ -12,8 +12,15 @@ die() { echo "STOP: $*" >&2; exit 1; }
 tmux has-session -t "=$S" 2>/dev/null && die "session $S exists already"
 
 # 1. the code, as root's own copy (no hard links into the sandboxed agent's tree)
+#    git runs as fcagent inside its own tree and writes a bundle; root clones the bundle,
+#    so root git never opens the sandboxed agent's repository
 if [ ! -d "$DIR" ]; then
-  git -c safe.directory="$SRC" clone -q --no-hardlinks "$SRC" "$DIR"
+  B=$(mktemp -u /tmp/fruit-XXXXXX.bundle)
+  setpriv --reuid="$(id -u fcagent)" --regid="$(id -g fcagent)" --clear-groups \
+    env -i PATH=/usr/bin:/bin HOME=/home/fcagent git -C "$SRC" bundle create -q "$B" HEAD main
+  git clone -q -b main "$B" "$DIR"
+  git -C "$DIR" remote remove origin
+  rm -f "$B"
 fi
 echo "code: $DIR at $(git -C $DIR log -1 --format='%h %s' | cut -c1-80)"
 
