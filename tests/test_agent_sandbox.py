@@ -244,3 +244,24 @@ def test_hidden_modes():
     assert priv._hidden_mode("/root", keep) == "0700"
     assert priv._hidden_mode("/var/www", keep) == "0700"
     assert priv._hidden_mode("/op", ["/opt/x"]) == "0700"
+
+
+@pytest.mark.skipif(not shutil.which("tmux"), reason="needs tmux")
+def test_an_own_server_that_does_not_exist_yet_is_an_empty_inventory(monkeypatch):
+    """The sandboxed worker's first agent: before it, the instance's tmux server does not
+    exist, and its inventory must read as empty, not as an error (2026-11-09: every tick
+    failed and no agent was ever started)."""
+    from core import agent_control as ac
+    monkeypatch.setenv("AGENT_TMUX_SOCKET", f"owneros-never-{os.getpid()}")
+    inv = ac.agent_list()
+    assert inv["agents"] == [] and inv["tmux_running"] is False
+
+
+@pytest.mark.skipif(not shutil.which("tmux"), reason="needs tmux")
+def test_the_default_server_keeps_its_error_on_a_broken_socket(monkeypatch):
+    from core import agent_control as ac
+    monkeypatch.delenv("AGENT_TMUX_SOCKET", raising=False)
+    monkeypatch.setattr(ac, "_tmux", lambda args, stdin=None: (
+        1, "", "error connecting to /tmp/tmux-0/default (No such file or directory)"))
+    with pytest.raises(ac.AgentControlError):
+        ac.agent_list()

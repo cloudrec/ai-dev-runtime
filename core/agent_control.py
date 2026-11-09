@@ -1539,7 +1539,12 @@ def agent_list() -> dict:
     """Inventory every tmux pane and the Claude agents running in them."""
     rc, out, err = _tmux(["list-panes", "-a", "-F", _PANE_FORMAT])
     if rc != 0:
-        if "no server running" in (err or "").lower():
+        e = (err or "").lower()
+        # With AGENT_TMUX_SOCKET the instance's own server does not exist until its first
+        # agent: tmux then says "error connecting to <socket> (No such file or directory)".
+        no_own_server = bool(tmux_socket()) and "error connecting to" in e and \
+            "no such file or directory" in e
+        if "no server running" in e or no_own_server:
             # An inventory we could not read is UNKNOWN, not empty. This branch used to
             # return a plain empty-but-successful inventory, and all twenty callers —
             # discovery, the stall doctor, the supervisor, the continuation watchdog —
