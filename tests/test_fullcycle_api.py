@@ -196,3 +196,18 @@ def test_repo_listing_needs_the_reviewer_and_shows_no_paths(client, tmp_path, mo
     r = client.post("/api/v1/fullcycle/projects", headers=REVIEWER,
                     json={"project_id": "other", "spec": INTAKE_SPEC, "repo": "nope"})
     assert r.status_code == 400 and "repo_not_allowed" in r.json()["detail"]
+
+
+def test_brief_and_notes_need_the_reviewer(client):
+    for hdr in (SHARED_TOKEN, {"X-Test-Token": "client:someone-else"}):
+        assert client.get("/api/v1/fullcycle/brief", headers=hdr).status_code == 403
+        assert client.post("/api/v1/fullcycle/notes", json={"topic": "a", "text": "b"},
+                           headers=hdr).status_code == 403
+    r = client.post("/api/v1/fullcycle/notes", json={"topic": "plan", "text": "stage 1"},
+                    headers=REVIEWER)
+    assert r.status_code == 200 and r.json()["ok"]
+    b = client.get("/api/v1/fullcycle/brief", headers=REVIEWER)
+    assert b.status_code == 200 and b.json()["notes"][-1]["text"] == "stage 1"
+    bad = client.post("/api/v1/fullcycle/notes", json={"topic": "", "text": "x"},
+                      headers=REVIEWER)
+    assert bad.status_code == 400

@@ -612,6 +612,30 @@ def fullcycle_project_start(req: FullcycleProjectReq, request: Request,
     return _fullcycle_call(intake.start, req.project_id, req.spec, by=actor, repo=req.repo)
 
 
+@router.get("/fullcycle/brief")
+def fullcycle_brief(request: Request, _: bool = Depends(_auth)):
+    """Everything a new tech-lead chat needs to carry on: open projects, recent ones, notes."""
+    from core.fullcycle import brief
+    _reviewer_principal(request)
+    return brief.brief()
+
+
+class TechleadNoteReq(BaseModel):
+    topic: str
+    text: str
+
+
+@router.post("/fullcycle/notes")
+def fullcycle_note(req: TechleadNoteReq, request: Request, _: bool = Depends(_auth)):
+    """The tech lead's own memory across chats: plans, choices, what the owner agreed."""
+    from core.fullcycle import brief
+    actor, _how = _reviewer_principal(request)
+    try:
+        return brief.add_note(req.topic, req.text, by=actor)
+    except brief.BriefError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/fullcycle/repos")
 def fullcycle_repos(request: Request, _: bool = Depends(_auth)):
     """The repos the owner allowed projects on: names and whether usable, no paths."""

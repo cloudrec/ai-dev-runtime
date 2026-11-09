@@ -165,9 +165,34 @@ def tick(wb) -> dict:
     else:
         print(f"not delivered for event {p['event_id']}; stays pending "
               f"({res.get('reason')})", flush=True)
+    rotated = None
+    if res.get("conversation_full"):
+        rotated = rotate_full_chat(p["conversation"])
     return {"acted": True, "ok": ok, "event_id": p["event_id"],
             "conversation": p["conversation"], "route_key": p.get("route_key", ""),
-            "reason": res.get("reason")}
+            "reason": res.get("reason"), **({"rotated": rotated} if rotated else {})}
+
+
+def rotate_full_chat(conversation: str) -> dict:
+    """The chat showed ChatGPT's length cap: open a new one, move its routes there. The
+    pending wake stays pending and goes to the new chat on the next tick."""
+    try:
+        from cdp_composer import new_chat_home, start_new_chat
+        from core import chat_rotation
+        from core.control_plane.delivery import _send_owner_push
+        home = new_chat_home(conversation)
+        r = chat_rotation.rotate(
+            conversation,
+            new_chat=lambda msg: start_new_chat(msg, home=home, source="chat-rotation"),
+            notify=_send_owner_push)
+    except Exception as e:  # noqa: BLE001 — the loop must never die on this
+        r = {"ok": False, "reason": f"{type(e).__name__}: {e}"[:200]}
+    if r.get("ok"):
+        print(f"chat-rotation: {conversation} full -> {r['new']} "
+              f"(routes {', '.join(r.get('moved') or [])})", flush=True)
+    else:
+        print(f"chat-rotation: {conversation} full, not rotated ({r.get('reason')})", flush=True)
+    return r
 
 
 AGENT_WATCH_ENABLED = os.getenv("AGENT_WATCH_ENABLED", "1") not in ("0", "", "false")

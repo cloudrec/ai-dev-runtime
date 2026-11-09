@@ -1173,6 +1173,75 @@ def list_sidebar_conversations(limit: int = 100) -> dict:
             s.close()
 
 
+_CONVERSATION_URL_RE = re.compile(
+    r"^https://(chatgpt\.com|chat\.openai\.com)/(g/g-p-[A-Za-z0-9-]+/)?c/[A-Za-z0-9-]+/?$")
+_NEW_CHAT_HOME_RE = re.compile(r"^https://chatgpt\.com/(g/g-p-[A-Za-z0-9-]+/project/?)?$")
+_LOCATION_JS = "location.href"
+
+
+def is_conversation_url(url: str) -> bool:
+    """One real conversation: /c/<id>, optionally inside a ChatGPT project. A client-side
+    placeholder (`/c/WEB:...`) is not one."""
+    return bool(_CONVERSATION_URL_RE.match((url or "").strip()))
+
+
+def new_chat_home(conversation_url: str) -> str:
+    """Where a new chat that continues `conversation_url` starts: the same ChatGPT project
+    when the old chat was in one, else the site root."""
+    m = re.match(r"^https://chatgpt\.com/(g/g-p-[A-Za-z0-9-]+)/c/", conversation_url or "")
+    return f"https://chatgpt.com/{m.group(1)}/project" if m else "https://chatgpt.com/"
+
+
+def start_new_chat(phrase: str, *, home: str = "https://chatgpt.com/",
+                   source: str = "new-chat", event_id: Optional[int] = None,
+                   wait_url_secs: float = 90.0, sleep=None) -> dict:
+    """Open a tab of its own on the new-chat page, send `phrase` there, and wait until the
+    chat has its real URL. {"ok", "url", "reason"}. The tab is created here and nowhere
+    else, so the phrase cannot land in an existing conversation."""
+    import time as _t
+    sleep = sleep or _t.sleep
+    if not _NEW_CHAT_HOME_RE.match(home or ""):
+        return {"ok": False, "url": None, "reason": "bad_new_chat_home"}
+    fresh = _create_tab(home)
+    if not fresh or not fresh.get("webSocketDebuggerUrl"):
+        return {"ok": False, "url": None, "reason": "new_tab_not_created"}
+    for _ in range(15):
+        if page_responsive(fresh):
+            break
+        sleep(2)
+    else:
+        _reap(fresh.get("id", ""))
+        return {"ok": False, "url": None, "reason": "new_tab_unresponsive"}
+    res = _attempt(home, phrase, source=source, event_id=event_id, target=fresh)
+    if not res.get("ok"):
+        if not str(res.get("reason", "")).startswith(("user_turn_", "assistant_")):
+            _reap(fresh.get("id", ""))          # nothing was sent: leave no stray tab
+        return {"ok": False, "url": None, "reason": f"send:{res.get('reason')}"}
+    url, waited = None, 0.0
+    while waited <= wait_url_secs:
+        s = None
+        try:
+            s = _Session(fresh["webSocketDebuggerUrl"])
+            r = s.call("Runtime.evaluate", {"expression": _LOCATION_JS, "returnByValue": True})
+            href = ((r.get("result") or {}).get("value") or "").split("?")[0].split("#")[0]
+            if is_conversation_url(href):
+                url = href.rstrip("/")
+                break
+        except Exception:  # noqa: BLE001 — the page may be mid-navigation
+            pass
+        finally:
+            if s:
+                try:
+                    s.close()
+                except Exception:  # noqa: BLE001
+                    pass
+        sleep(3)
+        waited += 3
+    if not url:
+        return {"ok": False, "url": None, "reason": "sent_but_no_conversation_url", "sent": True}
+    return {"ok": True, "url": url, "reason": res.get("reason")}
+
+
 def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown",
                   event_id: Optional[int] = None, claim: bool = True,
                   actionable: bool = False, route_key: str = "") -> dict:
@@ -1188,6 +1257,11 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
     """
     # FAIL CLOSED at the single choke point. Any caller — companion, operator, a script —
     # must claim the slot, so no path can submit outside the global cooldown.
+    if not is_conversation_url(conversation_url):
+        # find_target matches by prefix: the bare site URL matches EVERY ChatGPT tab, and a
+        # probe sent to it on 2026-11-09 landed in the owner-os chat. A new chat goes
+        # through start_new_chat, which owns its tab.
+        return {"ok": False, "reason": "not_a_conversation_url"}
     if claim:
         try:
             import sys as _sys
@@ -1430,7 +1504,7 @@ def _verify_after_cdp_error(target: dict, reason: str, *, source: str, event_id,
 
 
 def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
-             event_id: Optional[int] = None) -> dict:
+             event_id: Optional[int] = None, target: Optional[dict] = None) -> dict:
     """The submission itself, once the slot is claimed. Split out so that every exit path
     below is recorded by exactly one caller instead of each remembering to do it."""
     # FAIL FAST on a starving browser, before any session is opened. Under the 2026-08-30
@@ -1442,7 +1516,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
     _bd = browser_degraded()
     if _bd.get("degraded"):
         return {"ok": False, "reason": f"browser_degraded:{_bd.get('reason')}"}
-    target = find_target(conversation_url)
+    target = target or find_target(conversation_url)
     if not target:
         # The page may simply be on another ChatGPT URL (a restart lands on the root). Take
         # the ChatGPT tab and navigate it to the BOUND conversation. The URL is the owner's
