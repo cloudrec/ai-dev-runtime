@@ -284,3 +284,14 @@ def test_an_old_owner_gate_on_a_tree_clean_by_now_just_sends_the_task(fc):
     e.tick()
     assert h.wait_for(lambda: len(h.agent_log(log)) == 1, 10)
     assert not [r for r in fe.pending_reviews("tinycalc") if r["kind"] == "dirty"]
+
+
+@needs_tmux
+def test_deny_after_the_dialog_went_away_presses_nothing(fc, monkeypatch):
+    e, a, log, root = fc({"add": ["hang"]})
+    seen, pressed = _at_dialog(e, a, log, monkeypatch, "rm -rf build")
+    fe.submit_decision(_review("permission")["review_id"], "reject", key="k1", by="gpt",
+                       feedback="no")
+    seen["obs"] = Observation(WORKING, {})
+    e.tick()
+    assert pressed == []
