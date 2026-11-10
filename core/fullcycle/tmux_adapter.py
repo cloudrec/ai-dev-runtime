@@ -89,6 +89,16 @@ class AgentControlAdapter(ExecutorAdapter):
         self.target, self.actor, self.ac = target, actor, ac
         self.host = host or LocalHost()
 
+    def answer_permission(self, handle: dict, *, allow: bool) -> dict:
+        # "1" = yes for THIS command only (never "2", don't ask again); Escape = no
+        target = (handle or {}).get("target") or self.target
+        try:
+            r = self.ac.send_control_keys(target, ["1" if allow else "Escape"],
+                                          actor=self.actor, source="fullcycle:lead")
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "reason": f"{type(e).__name__}: {e}"[:200]}
+        return {"ok": bool(r.get("sent")), "reason": r.get("refused") or ""}
+
     def health(self) -> dict:
         try:
             st = self.ac.agent_status(self.target, actor=self.actor)

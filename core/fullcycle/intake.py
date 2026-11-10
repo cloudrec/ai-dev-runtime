@@ -441,6 +441,7 @@ def adapter(project: dict):
     class IntakeAdapter(AgentControlAdapter):
         name = "intake"
         owns_agent = True
+        lead_resolves_gates = True    # its own sandboxed copy and agent
 
         def __init__(self, p: dict):
             super().__init__(session_for(p["id"]), actor=ACTOR)

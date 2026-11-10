@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -164,7 +165,43 @@ _TRIGGERS = (
 
 REVIEW_DECISIONS = {"review": ("approve", "reject"),
                     "blocked": ("answer", "cancel"),
-                    "project": ("add_tasks", "escalate")}
+                    "project": ("add_tasks", "escalate"),
+                    # technical stops the tech lead lifts instead of the owner, only where
+                    # the engine owns the copy and the agent (adapter.lead_resolves_gates):
+                    # leftovers in the tree before a first dispatch, and an agent's
+                    # permission dialog. approve = keep / allow once, reject = discard / deny
+                    "dirty": ("approve", "reject", "cancel"),
+                    "permission": ("approve", "reject", "cancel")}
+
+# After the tech lead allowed a dialog, the same dialog read again within this many seconds
+# is the screen not yet redrawn, not a new question.
+LEAD_ALLOW_GRACE = 30
+
+# A permission dialog naming one of these programs never goes to the tech lead: the owner
+# decides. (The agent's own settings deny most of them outright; this is the second wall.)
+_OWNER_ONLY_PROGRAMS = frozenset((
+    "ssh", "scp", "rsync", "sftp", "sudo", "su", "doas", "pkexec", "docker", "podman",
+    "kubectl", "systemctl", "service", "crontab", "twine", "gh", "curl", "wget", "nc",
+    "ncat", "telnet", "socat", "chown", "chmod", "mount", "umount", "iptables", "ufw",
+    "nsenter", "unshare", "chroot", "setcap"))
+_PUBLISHERS = frozenset(("npm", "yarn", "pnpm", "cargo", "poetry"))
+
+
+def owner_only_command(command: str) -> bool:
+    """Does this command touch anything only the owner may allow (push, network, privilege,
+    publish)? Unparsable or empty = yes (fail closed)."""
+    words = [w for w in re.split(r"[\s;&|()`<>]+", command or "") if w]
+    if not words:
+        return True
+    names = [os.path.basename(w.strip("'\"")) for w in words]
+    for i, n in enumerate(names):
+        if n in _OWNER_ONLY_PROGRAMS or n.startswith("$") or "$(" in words[i]:
+            return True
+        if n == "git" and "push" in names[i + 1:]:
+            return True
+        if n in _PUBLISHERS and "publish" in names[i + 1:]:
+            return True
+    return False
 
 
 class EngineError(RuntimeError):
@@ -716,6 +753,9 @@ class Engine:
         refusal = self._refusal(task, attempt)
         if refusal:
             self._set(task, redispatch=0)
+            if refusal.startswith("dirty_worktree:") and self._to_lead(
+                    task, "dirty", refusal, self._dirty_payload(task, refusal)):
+                return False
             self._owner(task, refusal)
             return False
         key = f"fullcycle:{task['id']}:{attempt}"
@@ -1029,12 +1069,160 @@ class Engine:
         elif st == tc.VERIFICATION_FAILED:
             self._retry(task, why="verification_failed")
         elif st == tc.BLOCKED and not task["gate_id"]:
-            if not self._review_for(task, "blocked"):
+            if self._lead_gate_open(task):
+                pass                             # the tech lead's dirty/permission review
+            elif not self._review_for(task, "blocked"):
                 # crashed between BLOCKED and the review request
                 result = self.adapter.collect(task["handle"]) or {}
                 self._request_review(task, "blocked", self._agent_blocked_payload(result))
         elif st == tc.OWNER_DECISION and not task["gate_id"]:
             self._open_gate(task, task["last_reason"] or "owner_decision_without_gate")
+
+    # -- technical stops the tech lead lifts ---------------------------------------
+    def _lead_gate_open(self, task: dict) -> bool:
+        return bool(self.conn.execute(
+            "SELECT 1 FROM fc_review WHERE project_id=? AND task_id=? AND attempt=? AND"
+            " kind IN ('dirty','permission') AND applied=0",
+            (self.project_id, task["id"], task["attempt"])).fetchone())
+
+    def _to_lead(self, task: dict, kind: str, reason: str, payload: dict) -> bool:
+        """Send a technical stop to the tech lead instead of the owner. Only where the
+        engine owns the copy and the agent, and once per (task, attempt, kind): a second
+        stop of the same kind in the same attempt goes to the owner (fail closed)."""
+        if not (getattr(self.adapter, "lead_resolves_gates", False) and self.commit_on_approve):
+            return False
+        if self._review_for(task, kind):
+            return False
+        self._move(task, tc.BLOCKED)
+        self._set(task, last_reason=reason)
+        self._request_review(task, kind, payload)
+        self._note("lead_gate", task=task["key"], kind=kind, reason=reason)
+        return True
+
+    def _lead_takes_dirty_gates(self) -> None:
+        """A leftovers gate opened for the owner (before the tech lead could take these, or
+        while it could not) goes to the tech lead where it now can: the owner's gate is
+        closed, and a tree that is clean by now is simply sent."""
+        if not (getattr(self.adapter, "lead_resolves_gates", False) and self.commit_on_approve):
+            return
+        for task in self._tasks():
+            if task["state"] != tc.OWNER_DECISION or not task["gate_id"] or \
+                    not str(task["last_reason"] or "").startswith("dirty_worktree:") or \
+                    self._review_for(task, "dirty"):
+                continue
+            self._lead()
+            cur = self.conn.execute("UPDATE owner_gate SET state='resolved' WHERE id=? AND"
+                                    " state='open'", (task["gate_id"],))
+            self.conn.commit()
+            if cur.rowcount != 1:
+                continue                              # answered meanwhile: _owner_answers
+            self._set(task, gate_id="")
+            dirty = self._changed_files()
+            if dirty == []:
+                self._note("dirty_gate_clean_now", task=task["key"])
+                self._request_dispatch(task, task["attempt"] + 1)
+            elif dirty is None or not self._to_lead(
+                    task, "dirty", "dirty_worktree:" + ",".join(dirty[:5]),
+                    self._dirty_payload(task, "")):
+                self._owner(task, task["last_reason"])
+
+    def _dirty_payload(self, task: dict, reason: str) -> dict:
+        files = self._changed_files() or []
+        return {"title": task["body"]["title"], "task": task["key"],
+                "stop": "The project copy has changes no task committed (usually the work "
+                        "of a cancelled task), so this task cannot start from a clean tree.",
+                "changed_files": files[:200], "diff": self._review_diff(),
+                "how": "approve = keep them: Owner OS commits them as they are, then sends "
+                       "this task. reject (feedback: why) = discard them: saved as a patch "
+                       "under .fullcycle/leftovers/, then the tree is reset to HEAD and the "
+                       "task is sent. cancel = cancel this task."}
+
+    def _permission_payload(self, task: dict, command: str, gate: dict) -> dict:
+        return {"title": task["body"]["title"], "task": task["key"],
+                "stop": "The agent stopped at a permission dialog in its sandbox.",
+                "command": untrusted("COMMAND", command or "(not isolated)"),
+                "classified_safe": gate.get("classified_safe"),
+                "category": gate.get("category"), "notice": UNTRUSTED_NOTICE,
+                "how": "approve = allow this one command once. reject (feedback: what to do "
+                       "instead) = deny; the agent is interrupted and gets your feedback. "
+                       "cancel = cancel this task. Push, network, privilege and publish "
+                       "commands never come here: they go to the owner."}
+
+    def _keep_leftovers(self, task: dict) -> Optional[str]:
+        rc, out, err = self._git("add", "-A", "--", ".")
+        if rc == 0:
+            rc, out, err = self._git("reset", "-q", "--", ".fullcycle")
+        if rc != 0:
+            return "git_add_failed:" + (out + err).strip()[-160:]
+        if self._git("diff", "--cached", "--quiet")[0] == 0:
+            return None
+        rc, out, err = self.host.run(
+            ["git", "-C", self.root, "-c", "user.name=Owner OS fullcycle",
+             "-c", "user.email=fullcycle@localhost", "commit", "-q", "--no-verify", "-m",
+             f"fullcycle: leftovers kept before {task['key']} (tech lead)"], timeout=60)
+        return None if rc == 0 else "git_commit_failed:" + (out + err).strip()[-160:]
+
+    def _discard_leftovers(self, task: dict) -> Optional[str]:
+        rc, out, err = self._git("add", "-A", "--", ".")
+        if rc == 0:
+            rc, out, err = self._git("reset", "-q", "--", ".fullcycle")
+        if rc != 0:
+            return "git_add_failed:" + (out + err).strip()[-160:]
+        rc, patch, err = self._git("diff", "--cached", "--binary", "--no-ext-diff",
+                                   "--no-textconv", "HEAD")
+        if rc != 0:
+            return "git_diff_failed:" + err.strip()[-160:]
+        if patch:
+            path = os.path.join(self.root, ".fullcycle", "leftovers",
+                                f"{task['key']}-{int(self.clock())}.patch")
+            try:
+                self.host.write_file(path, patch)
+            except Exception as e:  # noqa: BLE001 — never discard what was not saved
+                self._git("reset", "-q")
+                return f"save_failed:{type(e).__name__}"
+        for argv in (("reset", "-q", "--hard", "HEAD"), ("clean", "-fdq", "--", ".")):
+            rc, out, err = self._git(*argv)
+            if rc != 0:
+                return f"git_{argv[0]}_failed:" + (out + err).strip()[-160:]
+        return None
+
+    def _apply_lead_gate(self, task: dict, kind: str, decision: str, review: dict) -> None:
+        if decision == "cancel":
+            if kind == "permission":
+                self.adapter.answer_permission(task["handle"], allow=False)
+            self._move(task, tc.CANCELLED, evidence={"review": review})
+            return
+        if kind == "dirty":
+            why = (self._keep_leftovers if decision == "approve" else
+                   self._discard_leftovers)(task)
+            if why:
+                self._owner(task, f"leftovers_{decision}_failed:{why}")
+                return
+            self._note("leftovers_" + ("kept" if decision == "approve" else "discarded"),
+                       task=task["key"])
+            self._request_dispatch(task, task["attempt"] + 1)
+            return
+        # permission: answer the dialog only if it is still the one the lead saw
+        obs = self.adapter.poll(task["handle"])
+        still = obs.state == WAITING_PERMISSION
+        if decision == "approve":
+            r = self.adapter.answer_permission(task["handle"], allow=True) if still else \
+                {"ok": True, "reason": "dialog_gone"}
+            if not r.get("ok"):
+                self._owner(task, "agent_permission_prompt",
+                            {"lead_approved": True, "send_failed": r.get("reason")})
+                return
+            self._move(task, tc.WORKING)
+            self._set(task, last_reason="permission_allowed_by_lead", handle={
+                **(task["handle"] or {}), "lead_allowed": {
+                    "command": obs.detail.get("command", "") if still else "",
+                    "ts": self.clock()}})
+            return
+        if still:
+            self.adapter.answer_permission(task["handle"], allow=False)
+        self._move(task, tc.WORKING)
+        self._retry(task, why="permission_denied", feedback=(
+            "Your command was denied by the tech lead. Tech lead: " + review["feedback"]))
 
     def _verify_current(self, task: dict) -> None:
         self._move(task, tc.VERIFYING)
@@ -1363,7 +1551,16 @@ class Engine:
                     "The previous attempt ended because the agent process exited. "
                     "Continue from the current state of the workdir."))
         elif obs.state == WAITING_PERMISSION:
-            gate = gates.check_permission_prompt(obs.detail.get("command", ""), root=self.root)
+            command = obs.detail.get("command", "")
+            allowed = (task["handle"] or {}).get("lead_allowed") or {}
+            if allowed.get("command") == command and \
+                    self.clock() - float(allowed.get("ts") or 0) < LEAD_ALLOW_GRACE:
+                return               # the dialog just answered, not yet off the screen
+            gate = gates.check_permission_prompt(command, root=self.root)
+            if not owner_only_command(command) and self._to_lead(
+                    task, "permission", "agent_permission_prompt",
+                    self._permission_payload(task, command, gate)):
+                return
             self._owner(task, "agent_permission_prompt", {"permission": gate})
         else:                                            # WORKING or UNKNOWN: still waiting
             if obs.state == UNKNOWN:
@@ -1395,6 +1592,14 @@ class Engine:
                 self._apply_project_decision(rid, decision, body)
             elif task is None or task["attempt"] != attempt:
                 applied = False                         # stale: nothing to apply to
+            elif kind in ("dirty", "permission"):
+                if task["state"] == tc.BLOCKED and not task["gate_id"]:
+                    # applied first: a dispatch below opens no second review in this loop
+                    self.conn.execute("UPDATE fc_review SET applied=1 WHERE id=?", (rid,))
+                    self.conn.commit()
+                    self._apply_lead_gate(task, kind, decision, review)
+                else:
+                    applied = False
             elif kind == "review" and task["state"] == tc.VERIFYING:
                 if decision == "approve":
                     self._move(task, tc.VERIFIED_DONE, evidence={
@@ -1654,6 +1859,7 @@ class Engine:
             self._remind_reviews()
             self._commit_pending()
             self._owner_answers()
+            self._lead_takes_dirty_gates()
             for t in self._tasks():
                 if t["state"] not in tc.TERMINAL and t["state"] != tc.CREATED:
                     self._lead()

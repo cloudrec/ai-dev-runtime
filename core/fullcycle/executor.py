@@ -80,6 +80,10 @@ class ExecutorAdapter(ABC):
     name: str = "abstract"
     #: can this adapter restart its own agent after a crash?
     owns_agent: bool = False
+    #: may the tech lead (not only the owner) lift this adapter's technical stops: leftovers
+    #: in the tree before a first dispatch, and the agent's permission dialog? Only for an
+    #: agent and a copy the engine owns (a sandboxed intake project).
+    lead_resolves_gates: bool = False
 
     @abstractmethod
     def health(self) -> dict: ...
@@ -96,6 +100,10 @@ class ExecutorAdapter(ABC):
 
     def restart(self, handle: dict) -> dict:
         return {"ok": False, "reason": "adapter_does_not_own_agent"}
+
+    def answer_permission(self, handle: dict, *, allow: bool) -> dict:
+        """Press "yes, once" (allow) or Escape (deny) in the agent's permission dialog."""
+        return {"ok": False, "reason": "adapter_cannot_answer_permission"}
 
     def quiescent(self, handle: dict) -> Optional[bool]:
         """Is the agent provably NOT working on anything (idle at its prompt, or its
