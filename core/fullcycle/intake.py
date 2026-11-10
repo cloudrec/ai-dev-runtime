@@ -209,6 +209,45 @@ def active(conn=None) -> list:
             conn.close()
 
 
+def working(conn=None) -> list:
+    """Intake projects that hold a slot: not done and with work in hand (see needs_agent).
+    One whose tasks are all cancelled, or that waits only on a decision, holds none — it
+    once kept new projects from starting at all (8 abandoned of 8 on 2026-11-10)."""
+    from core.fullcycle import engine as fe
+    conn, own = specs.conn_with_schema(conn)
+    try:
+        out = []
+        for p in active(conn):
+            try:
+                st = fe.project_status(p["id"], conn=conn)
+            except Exception:  # noqa: BLE001 — unreadable: count it (fail closed)
+                out.append(p)
+                continue
+            if not st["tasks"] or needs_agent(_Rows(st["tasks"])):
+                out.append(p)
+        return out
+    finally:
+        if own:
+            conn.close()
+
+
+class _Rows:
+    """What needs_agent reads of an engine, from stored task rows."""
+
+    def __init__(self, tasks: list):
+        self.tasks = [{**t, "redispatch": t.get("redispatch", 0)} for t in tasks]
+
+    def _tasks(self) -> list:
+        return self.tasks
+
+    def _in_flight(self, t: dict) -> bool:
+        from core.fullcycle import engine as fe
+        if t["state"] in ("VERIFIED_DONE", "CANCELLED", "CREATED"):
+            return False
+        return not (t["state"] == "OWNER_DECISION" and str(t["last_reason"] or "")
+                    .startswith(fe.Engine._TASK_SCOPED_REFUSALS))
+
+
 MERGE_FROM_MAX = 20
 
 
@@ -268,7 +307,7 @@ def start(project_id: str, spec: dict, *, by: str, repo: Optional[str] = None,
                 raise specs.SpecError("project_exists_with_another_source")
         created = False
         if not existing:
-            if len(active(conn)) >= max_active():
+            if len(working(conn)) >= max_active():
                 raise specs.SpecError(f"intake_at_max_active:{max_active()}")
             if os.path.lexists(path):
                 raise specs.SpecError("intake_directory_exists")

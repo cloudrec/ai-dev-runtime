@@ -736,3 +736,18 @@ def test_a_send_whose_agent_cannot_start_says_agent_not_running(monkeypatch):
     r = ad.submit(env, "k1")
     assert r["ok"] is False and r["reason"] == "agent_not_running" and called == []
     assert r["handle"]["key"] == "k1"
+
+
+def test_a_project_waiting_only_on_a_decision_holds_no_start_slot(box, monkeypatch):
+    monkeypatch.setenv("FULLCYCLE_INTAKE_MAX_ACTIVE", "1")
+    intake.start("one", SPEC, by=BY)
+    (p,) = intake.projects()
+    e = fe.Engine("one", intake.adapter(p), holder="t")
+    e._seed()                                   # a task to send: it holds the slot
+    with pytest.raises(specs.SpecError, match="max_active"):
+        intake.start("two", SPEC, by=BY)
+    (t,) = e._tasks()
+    e._owner(t, "dirty_worktree:x")             # now it only waits on a decision
+    assert [x["id"] for x in intake.working()] == []
+    assert intake.start("two", SPEC, by=BY)["created"]
+    assert {x["id"] for x in intake.active()} == {"one", "two"}   # still ticked
