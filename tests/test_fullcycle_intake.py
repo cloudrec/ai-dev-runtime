@@ -652,3 +652,87 @@ def test_the_stopped_pane_stays_quiet_after_the_suppression_ends(box, monkeypatc
     for now in (later, later + 100, later + 200):
         aw.scan(agents=[], read_fn=lambda t: "", emit_fn=emit, now=now)
     assert "agent_process_failed" not in emit.types
+
+
+# -- an agent only while the project needs it (slots) ---------------------------------------
+class _E:
+    """Just what needs_agent reads of an engine."""
+
+    def __init__(self, tasks, parked=()):
+        self.tasks, self.parked = tasks, set(parked)
+
+    def _tasks(self):
+        return self.tasks
+
+    def _in_flight(self, t):
+        return t["state"] not in ("VERIFIED_DONE", "CANCELLED", "CREATED") and \
+            t["key"] not in self.parked
+
+
+def _t(key, state, reason="", redispatch=0):
+    return {"key": key, "state": state, "last_reason": reason, "redispatch": redispatch}
+
+
+@pytest.mark.parametrize("tasks,parked,needed", [
+    ([_t("a", "WORKING")], (), True),
+    ([_t("a", "AGENT_DONE")], (), True),
+    ([_t("a", "VERIFYING")], (), True),
+    ([_t("a", "VERIFICATION_FAILED")], (), True),
+    ([_t("a", "VERIFIED_DONE"), _t("b", "CREATED")], (), True),
+    ([_t("a", "BLOCKED", "agent_permission_prompt")], (), True),
+    ([_t("a", "OWNER_DECISION", "stall_hold_timeout:resend")], (), True),
+    ([_t("a", "BLOCKED", "blocked_answered", redispatch=2)], (), True),
+    # nothing to do: all finished, or waiting only on a decision
+    ([_t("a", "VERIFIED_DONE"), _t("b", "CANCELLED")], (), False),
+    ([_t("a", "CANCELLED"), _t("b", "OWNER_DECISION", "dirty_worktree:x"),
+      _t("c", "CREATED")], (), False),
+    ([_t("a", "BLOCKED", "max_attempts_3:blocked_answered")], (), False),
+    ([_t("a", "BLOCKED", "dirty_worktree:x")], (), False),
+    # a parked task does not hold the executor: the next one is sent
+    ([_t("a", "OWNER_DECISION", "permission_denied:check_x"), _t("b", "CREATED")],
+     ("a",), True),
+    ([], (), False),
+])
+def test_needs_agent(tasks, parked, needed):
+    assert intake.needs_agent(_E(tasks, parked)) is needed
+
+
+def test_needs_agent_on_a_real_engine(box, monkeypatch):
+    intake.start("calc", SPEC, by=BY)
+    (p,) = intake.projects()
+    e = fe.Engine("calc", intake.adapter(p), holder="t")
+    e._seed()
+    assert intake.needs_agent(e) is True                       # a task to send
+    (t,) = e._tasks()
+    e._owner(t, "dirty_worktree:x")
+    assert intake.needs_agent(e) is False
+
+
+def test_worker_parks_an_alive_agent_it_does_not_need(capsys):
+    fi = FakeIntake([{"id": "calc"}, {"id": "tb"}], alive=("fc-calc",))
+    worker.park_intake("calc", fi)
+    worker.park_intake("tb", fi)                               # none running: nothing
+    assert fi.stopped == ["calc"]
+    assert "intake_agent_parked" in capsys.readouterr().out
+
+
+def test_a_send_to_a_parked_project_starts_its_agent_first(monkeypatch):
+    a = Agents(monkeypatch, alive=False)
+    ad = intake.adapter(P)
+    monkeypatch.setattr(type(ad).__mro__[1], "submit",
+                        lambda self, env, key: {"ok": True, "handle": {"key": key}})
+    env = type("Env", (), {"task_id": "calc:add", "attempt": 2})()
+    assert ad.submit(env, "k2")["ok"] is True
+    assert a.started == 1 and "k2" in ad.sent and ad.fresh
+
+
+def test_a_send_whose_agent_cannot_start_says_agent_not_running(monkeypatch):
+    Agents(monkeypatch, alive=False, create=False)
+    ad = intake.adapter(P)
+    called = []
+    monkeypatch.setattr(type(ad).__mro__[1], "submit",
+                        lambda self, env, key: called.append(key) or {"ok": True})
+    env = type("Env", (), {"task_id": "calc:add", "attempt": 1})()
+    r = ad.submit(env, "k1")
+    assert r["ok"] is False and r["reason"] == "agent_not_running" and called == []
+    assert r["handle"]["key"] == "k1"

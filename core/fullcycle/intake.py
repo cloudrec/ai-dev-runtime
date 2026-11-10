@@ -434,6 +434,29 @@ def ensure_agent(project: dict, *, wait: float = 90.0, sleep=None, clock=None) -
         sleep(3)
 
 
+# Gate reasons under which an attempt may still be alive in the pane (a dialog on screen,
+# a held resend): the agent must not be stopped under them.
+_LIVE_GATES = ("agent_permission_prompt", "stall_hold_timeout")
+_AGENT_STATES = ("WORKING", "AGENT_DONE", "VERIFYING", "VERIFICATION_FAILED")
+
+
+def needs_agent(engine) -> bool:
+    """Does this project need its agent now? Yes while a task is sent, being verified or
+    reviewed, about to be sent, or waiting at a live dialog; no while everything is
+    finished or waits only on a decision (the tech lead's or the owner's). An agent that
+    is not needed is stopped, so a stuck or abandoned project never holds one of the
+    FULLCYCLE intake slots; the next send starts it again (IntakeAdapter.submit)."""
+    tasks = engine._tasks()
+    holding = [t for t in tasks if engine._in_flight(t)]
+    for t in holding:
+        if t["redispatch"] or t["state"] in _AGENT_STATES or \
+                str(t["last_reason"] or "").startswith(_LIVE_GATES):
+            return True
+    if holding:
+        return False                 # the executor is held by a task waiting on a decision
+    return any(t["state"] == "CREATED" or t["redispatch"] for t in tasks)
+
+
 def adapter(project: dict):
     """The engine's adapter for an intake project: it owns the agent."""
     from core.fullcycle.tmux_adapter import AgentControlAdapter
@@ -458,6 +481,13 @@ def adapter(project: dict):
             return r
 
         def submit(self, env, idempotency_key: str) -> dict:
+            if not agent_alive(session_for(self.project["id"])):
+                # parked while nothing needed it (see needs_agent): start it for this send
+                r = self.prepare()
+                if not r.get("ok"):
+                    return {"ok": False, "already": False, "reason": "agent_not_running",
+                            "handle": {"target": self.target, "task_id": env.task_id,
+                                       "attempt": env.attempt, "key": idempotency_key}}
             r = super().submit(env, idempotency_key)
             if r.get("ok"):
                 self.sent.add(idempotency_key)

@@ -64,6 +64,14 @@ def settle_intake(pid: str, result: dict, intake) -> None:
             _log(what="intake_agent_stopped", project=pid)
 
 
+def park_intake(pid: str, intake) -> None:
+    """Nothing for this project's agent to do now: stop it so it holds no slot."""
+    for p in intake.projects():
+        if p["id"] == pid and intake.agent_alive(intake.session_for(pid)) and \
+                intake.stop_agent(p):
+            _log(what="intake_agent_parked", project=pid)
+
+
 def notify_round(intake) -> None:
     """The owner's Telegram notice for each finished intake project, once."""
     try:
@@ -102,7 +110,9 @@ def main() -> int:
                     a = intake.adapter(session) if isinstance(session, dict) \
                         else AgentControlAdapter(session)
                     e = engines[pid] = fe.Engine(pid, a, holder=holder)
-                if hasattr(e.adapter, "prepare"):
+                if hasattr(e.adapter, "prepare") and not intake.needs_agent(e):
+                    park_intake(pid, intake)          # free the slot; tick still runs
+                elif hasattr(e.adapter, "prepare"):
                     ready = e.adapter.prepare()
                     if ready.get("created") or not ready.get("ok"):
                         _log(what="intake_agent", project=pid, **ready)
