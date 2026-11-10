@@ -70,10 +70,43 @@ def clean_handoff(raw) -> tuple:
     return text, ",".join(problems)
 
 
+_OPTION = re.compile(r"^\s*(?:❯\s*)?(\d)\.\s+(.+?)\s*$")
+_KEEPS_ALLOWING = re.compile(r"don.t ask|keep allow|always|from now on|session|\ball\b", re.I)
+_READ_START = re.compile(r"^\s*Read\((.*)$")
+
+
+def one_time_yes(tail: str) -> Optional[str]:
+    """The key of the dialog's "yes, this time only" option, or None. An option that
+    keeps allowing ("don't ask again", "keep allowing any reads", "this session") never
+    counts: answering one dialog must not change what the agent may do later."""
+    opts = [m.groups() for m in map(_OPTION.match, (tail or "").splitlines()[-20:]) if m]
+    for key, text in opts:
+        if text.lower().startswith("yes") and not _KEEPS_ALLOWING.search(text):
+            return key
+    return None
+
+
+def _read_request(tail: str) -> str:
+    """"Read(<path>)" of a file-read dialog; a long path wraps over several rows."""
+    lines = (tail or "").splitlines()
+    for i, ln in enumerate(lines):
+        m = _READ_START.match(ln)
+        if not m:
+            continue
+        text = m.group(1).strip()
+        for nxt in lines[i + 1:i + 6]:
+            if ")" in text:
+                break
+            text += nxt.strip()
+        return f"Read({text}" if text.endswith(")") and text.count(")") == 1 else ""
+    return ""
+
+
 def _permission(tail: str) -> Optional[Observation]:
     if _pr.is_permission_prompt(tail):
-        return Observation(WAITING_PERMISSION,
-                           {"command": _pr.extract_pending_command(tail) or ""})
+        command = _pr.extract_pending_command(tail) or _read_request(tail)
+        return Observation(WAITING_PERMISSION, {"command": command or "",
+                                                "yes_key": one_time_yes(tail)})
     return None
 
 
@@ -89,11 +122,15 @@ class AgentControlAdapter(ExecutorAdapter):
         self.target, self.actor, self.ac = target, actor, ac
         self.host = host or LocalHost()
 
-    def answer_permission(self, handle: dict, *, allow: bool) -> dict:
-        # "1" = yes for THIS command only (never "2", don't ask again); Escape = no
+    def answer_permission(self, handle: dict, *, allow: bool,
+                          key: Optional[str] = None) -> dict:
+        # allow: the key of the dialog's one-time yes (one_time_yes), never a guess and
+        # never an option that keeps allowing; Escape = no
+        if allow and not (isinstance(key, str) and key.isdigit() and len(key) == 1):
+            return {"ok": False, "reason": "no_one_time_yes"}
         target = (handle or {}).get("target") or self.target
         try:
-            r = self.ac.send_control_keys(target, ["1" if allow else "Escape"],
+            r = self.ac.send_control_keys(target, [key if allow else "Escape"],
                                           actor=self.actor, source="fullcycle:lead")
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "reason": f"{type(e).__name__}: {e}"[:200]}

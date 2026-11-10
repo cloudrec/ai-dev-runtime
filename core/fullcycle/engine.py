@@ -187,9 +187,19 @@ _OWNER_ONLY_PROGRAMS = frozenset((
 _PUBLISHERS = frozenset(("npm", "yarn", "pnpm", "cargo", "poetry"))
 
 
+LEAD_READ_ROOT = "/opt/fc-projects/"
+_TOOL_REQUEST = re.compile(r"^([A-Z]\w*)\((.*)\)$", re.S)
+
+
 def owner_only_command(command: str) -> bool:
     """Does this command touch anything only the owner may allow (push, network, privilege,
-    publish)? Unparsable or empty = yes (fail closed)."""
+    publish)? Unparsable or empty = yes (fail closed). A file read ("Read(<path>)") is the
+    tech lead's only inside the project copies."""
+    m = _TOOL_REQUEST.match((command or "").strip())
+    if m:                         # a tool request, not a shell command
+        path = m.group(2)
+        return not (m.group(1) == "Read" and path.startswith("/") and "(" not in path
+                    and os.path.normpath(path).startswith(LEAD_READ_ROOT))
     words = [w for w in re.split(r"[\s;&|()`<>]+", command or "") if w]
     if not words:
         return True
@@ -1126,6 +1136,34 @@ class Engine:
                     self._dirty_payload(task, "")):
                 self._owner(task, task["last_reason"])
 
+    def _lead_takes_permission_gates(self) -> None:
+        """A permission dialog that went to the owner only because it could not be read
+        then (e.g. a file read outside the copy) goes to the tech lead where it now can:
+        same dialog still on screen, a one-time yes on it, nothing owner-only in it."""
+        if not (getattr(self.adapter, "lead_resolves_gates", False) and self.commit_on_approve):
+            return
+        for task in self._tasks():
+            if task["state"] != tc.OWNER_DECISION or not task["gate_id"] or \
+                    task["last_reason"] != "agent_permission_prompt" or \
+                    self._review_for(task, "permission"):
+                continue
+            obs = self.adapter.poll(task["handle"])
+            command = obs.detail.get("command", "")
+            if obs.state != WAITING_PERMISSION or not obs.detail.get("yes_key") or \
+                    owner_only_command(command):
+                continue
+            self._lead()
+            cur = self.conn.execute("UPDATE owner_gate SET state='resolved' WHERE id=? AND"
+                                    " state='open'", (task["gate_id"],))
+            self.conn.commit()
+            if cur.rowcount != 1:
+                continue                              # answered meanwhile: _owner_answers
+            self._set(task, gate_id="")
+            gate = gates.check_permission_prompt(command, root=self.root)
+            if not self._to_lead(task, "permission", "agent_permission_prompt",
+                                 self._permission_payload(task, command, gate)):
+                self._owner(task, "agent_permission_prompt", {"permission": gate})
+
     def _dirty_payload(self, task: dict, reason: str) -> dict:
         files = self._changed_files() or []
         return {"title": task["body"]["title"], "task": task["key"],
@@ -1143,7 +1181,7 @@ class Engine:
                 "command": untrusted("COMMAND", command or "(not isolated)"),
                 "classified_safe": gate.get("classified_safe"),
                 "category": gate.get("category"), "notice": UNTRUSTED_NOTICE,
-                "how": "approve = allow this one command once. reject (feedback: what to do "
+                "how": "approve = allow this one command (or file read) once. reject (feedback: what to do "
                        "instead) = deny; the agent is interrupted and gets your feedback. "
                        "cancel = cancel this task. Push, network, privilege and publish "
                        "commands never come here: they go to the owner."}
@@ -1206,7 +1244,10 @@ class Engine:
         obs = self.adapter.poll(task["handle"])
         still = obs.state == WAITING_PERMISSION
         if decision == "approve":
-            r = self.adapter.answer_permission(task["handle"], allow=True) if still else \
+            # only the dialog's one-time "yes", never an option that keeps allowing
+            key = obs.detail.get("yes_key") if still else None
+            r = (self.adapter.answer_permission(task["handle"], allow=True, key=key) if key
+                 else {"ok": False, "reason": "no_one_time_yes"}) if still else \
                 {"ok": True, "reason": "dialog_gone"}
             if not r.get("ok"):
                 self._owner(task, "agent_permission_prompt",
@@ -1557,7 +1598,7 @@ class Engine:
                     self.clock() - float(allowed.get("ts") or 0) < LEAD_ALLOW_GRACE:
                 return               # the dialog just answered, not yet off the screen
             gate = gates.check_permission_prompt(command, root=self.root)
-            if not owner_only_command(command) and self._to_lead(
+            if obs.detail.get("yes_key") and not owner_only_command(command) and self._to_lead(
                     task, "permission", "agent_permission_prompt",
                     self._permission_payload(task, command, gate)):
                 return
@@ -1860,6 +1901,7 @@ class Engine:
             self._commit_pending()
             self._owner_answers()
             self._lead_takes_dirty_gates()
+            self._lead_takes_permission_gates()
             for t in self._tasks():
                 if t["state"] not in tc.TERMINAL and t["state"] != tc.CREATED:
                     self._lead()

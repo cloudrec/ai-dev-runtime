@@ -101,7 +101,7 @@ class ExecutorAdapter(ABC):
     def restart(self, handle: dict) -> dict:
         return {"ok": False, "reason": "adapter_does_not_own_agent"}
 
-    def answer_permission(self, handle: dict, *, allow: bool) -> dict:
+    def answer_permission(self, handle: dict, *, allow: bool, key: Optional[str] = None) -> dict:
         """Press "yes, once" (allow) or Escape (deny) in the agent's permission dialog."""
         return {"ok": False, "reason": "adapter_cannot_answer_permission"}
 

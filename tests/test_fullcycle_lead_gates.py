@@ -159,13 +159,18 @@ def test_still_dirty_after_the_lead_goes_to_the_owner(fc, monkeypatch):
 
 
 # ── permission dialog ─────────────────────────────────────────────────────────
-def _at_dialog(e, a, log, monkeypatch, command):
+def _at_dialog(e, a, log, monkeypatch, command, yes_key="1"):
     h.wait_for(lambda: e.tick() and len(h.agent_log(log)) == 1, 15)
-    seen = {"obs": Observation(WAITING_PERMISSION, {"command": command})}
+    seen = {"obs": Observation(WAITING_PERMISSION, {"command": command, "yes_key": yes_key}),
+            "keys": []}
     monkeypatch.setattr(a, "poll", lambda handle: seen["obs"])
     pressed = []
-    monkeypatch.setattr(a, "answer_permission",
-                        lambda handle, allow: pressed.append(allow) or {"ok": True})
+
+    def answer(handle, allow, key=None):
+        seen["keys"].append(key)
+        pressed.append(allow)
+        return {"ok": True}
+    monkeypatch.setattr(a, "answer_permission", answer)
     e.tick()
     return seen, pressed
 
@@ -232,7 +237,7 @@ def test_a_second_dialog_in_the_same_attempt_goes_to_the_owner(fc, monkeypatch):
     seen, pressed = _at_dialog(e, a, log, monkeypatch, "npm test")
     fe.submit_decision(_review("permission")["review_id"], "approve", key="k1", by="gpt")
     e.tick()
-    seen["obs"] = Observation(WAITING_PERMISSION, {"command": "npm run lint"})
+    seen["obs"] = Observation(WAITING_PERMISSION, {"command": "npm run lint", "yes_key": "1"})
     e.tick()
     t = _task(e, "add")
     assert t["state"] == tc.OWNER_DECISION and t["gate_id"]
@@ -295,3 +300,145 @@ def test_deny_after_the_dialog_went_away_presses_nothing(fc, monkeypatch):
     seen["obs"] = Observation(WORKING, {})
     e.tick()
     assert pressed == []
+
+
+# ── one-time yes only; file reads inside the project copies ───────────────────
+READ_DIALOG = """\
+────────────────────────────────────────────────────────────────────────────────
+ Read outside the working directories
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Read(/opt/fc-projects/gaika-ua-silpo-probe/probes/ua/silpo-readonly-probe-2026
+ -11-10.md)
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Auto mode and the sandbox read outside the working directories without asking.
+
+ Allow this read outside the working directories?
+ ❯ 1. Yes, and keep allowing any reads outside the working directories
+   2. No, and block reads outside the working directories from now on
+   3. No, and ask again next time
+   4. Yes, but ask again next time
+
+ Esc to cancel · Tab to amend
+"""
+
+BASH_DIALOG = """\
+ Bash command
+
+   npm test
+   Run the tests
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for npm test commands in /opt/fc-projects/x
+   3. No, and tell Claude what to do differently (esc)
+"""
+
+
+def test_a_file_read_dialog_is_read_with_its_one_time_yes():
+    from core.fullcycle import tmux_adapter as ta
+    o = ta._permission(READ_DIALOG)
+    assert o.state == WAITING_PERMISSION
+    assert o.detail == {"command": "Read(/opt/fc-projects/gaika-ua-silpo-probe/probes/ua/"
+                                   "silpo-readonly-probe-2026-11-10.md)", "yes_key": "4"}
+    assert not fe.owner_only_command(o.detail["command"])
+
+
+def test_a_bash_dialog_one_time_yes_is_1():
+    from core.fullcycle import tmux_adapter as ta
+    assert ta._permission(BASH_DIALOG).detail == {"command": "npm test", "yes_key": "1"}
+
+
+@pytest.mark.parametrize("options", [
+    ["1. Yes, and keep allowing any reads", "2. No"],
+    ["1. Yes, and don't ask again", "2. No"],
+    ["1. Yes, allow all edits during this session", "2. No"],
+    ["1. Always allow", "2. No"],
+    ["1. No"],
+])
+def test_no_option_that_keeps_allowing_is_a_one_time_yes(options):
+    from core.fullcycle import tmux_adapter as ta
+    assert ta.one_time_yes("Do you want to proceed?\n" + "\n".join(options)) is None
+
+
+@pytest.mark.parametrize("command", [
+    "Read(/etc/shadow)", "Read(/opt/fc-projects/../../etc/passwd)",
+    "Read(/root/.ssh/id_ed25519)", "Read(/opt/fc-projectsX/a)", "Read(relative/path)", "Write(/opt/fc-projects/a)",
+    "Edit(/opt/fc-projects/a)", "WebFetch(https://x)", "Read(/opt/fc-projects)"])
+def test_reads_outside_the_project_copies_stay_with_the_owner(command):
+    assert fe.owner_only_command(command)
+
+
+def test_the_adapter_never_presses_yes_without_the_one_time_key():
+    from core.fullcycle import tmux_adapter as ta
+    sent = []
+
+    class AC:
+        def send_control_keys(self, target, keys, **kw):
+            sent.append(keys)
+            return {"sent": True}
+    a = ta.AgentControlAdapter("fc-x", ac=AC())
+    for key in (None, "", "12", "Enter", 4):
+        assert a.answer_permission({}, allow=True, key=key)["ok"] is False
+    assert sent == []
+    assert a.answer_permission({}, allow=True, key="4")["ok"] is True
+    assert a.answer_permission({}, allow=False)["ok"] is True
+    assert sent == [["4"], ["Escape"]]
+
+
+@needs_tmux
+def test_approve_presses_the_dialogs_one_time_yes(fc, monkeypatch):
+    e, a, log, root = fc({"add": ["hang"]})
+    seen, pressed = _at_dialog(e, a, log, monkeypatch,
+                               "Read(/opt/fc-projects/other/report.md)", yes_key="4")
+    rv = _review("permission")
+    assert "/opt/fc-projects/other/report.md" in rv["payload"]["command"]
+    fe.submit_decision(rv["review_id"], "approve", key="k1", by="gpt")
+    e.tick()
+    assert pressed == [True] and seen["keys"] == ["4"]
+    assert _task(e, "add")["state"] == tc.WORKING
+
+
+@needs_tmux
+def test_a_dialog_without_a_one_time_yes_goes_to_the_owner(fc, monkeypatch):
+    e, a, log, root = fc({"add": ["hang"]})
+    _at_dialog(e, a, log, monkeypatch, "npm test", yes_key=None)
+    t = _task(e, "add")
+    assert t["state"] == tc.OWNER_DECISION and t["gate_id"]
+    assert not [r for r in fe.pending_reviews("tinycalc") if r["kind"] == "permission"]
+
+
+@needs_tmux
+def test_an_old_owner_gate_on_a_readable_dialog_moves_to_the_tech_lead(fc, monkeypatch):
+    e, a, log, root = fc({"add": ["hang"]})
+    seen, pressed = _at_dialog(e, a, log, monkeypatch, "", yes_key="4")   # unread then
+    t = _task(e, "add")
+    gate = t["gate_id"]
+    assert t["state"] == tc.OWNER_DECISION and gate
+    seen["obs"] = Observation(WAITING_PERMISSION, {
+        "command": "Read(/opt/fc-projects/other/report.md)", "yes_key": "4"})
+    e.tick()
+    t = _task(e, "add")
+    assert t["state"] == tc.BLOCKED and not t["gate_id"]
+    assert e.conn.execute("SELECT state FROM owner_gate WHERE id=?", (gate,)).fetchone()[0] \
+        == "resolved"
+    fe.submit_decision(_review("permission")["review_id"], "approve", key="k1", by="gpt")
+    e.tick()
+    assert seen["keys"] == ["4"] and _task(e, "add")["state"] == tc.WORKING
+
+
+@needs_tmux
+@pytest.mark.parametrize("obs", [
+    Observation(WAITING_PERMISSION, {"command": "Read(/etc/passwd)", "yes_key": "4"}),
+    Observation(WAITING_PERMISSION, {"command": "Read(/opt/fc-projects/o/r.md)",
+                                     "yes_key": None}),
+    Observation(WORKING, {}),
+])
+def test_an_old_owner_gate_stays_when_the_lead_may_not_take_it(fc, monkeypatch, obs):
+    e, a, log, root = fc({"add": ["hang"]})
+    seen, pressed = _at_dialog(e, a, log, monkeypatch, "", yes_key="4")
+    gate = _task(e, "add")["gate_id"]
+    seen["obs"] = obs
+    e.tick()
+    t = _task(e, "add")
+    assert t["gate_id"] == gate and t["state"] == tc.OWNER_DECISION
+    assert not [r for r in fe.pending_reviews("tinycalc") if r["kind"] == "permission"]
