@@ -3,6 +3,7 @@
 # Site file: /opt/clients-help-landing/GAIKA_city_superapp_site_RU_UK_EN_EMBEDDED.html (2026-09-28), copied as index.html.
 # Cert: self-signed origin cert, same pattern as 3dthings.store (Cloudflare proxies in front).
 set -euo pipefail
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 SRC=/opt/clients-help-landing/GAIKA_city_superapp_site_RU_UK_EN_EMBEDDED.html
 WEB=/var/www/gaika; CONF=/etc/nginx/sites-available/gaika.tech
 CRT=/etc/ssl/certs/gaika.crt; KEY=/etc/ssl/private/gaika.key
