@@ -1,0 +1,1 @@
+YOUR MARKETS: Hungary (kifli - reuse the Rohlik/Knuspr cart family code, auchan-hu), then the Baltics (barbora-lv, barbora-ee, rimi lt, rimi-lv, rimi-ee; Barbora and Rimi are one platform each across the three countries, build once, configure per country). Worktree /opt/gaika-worktrees/hu-balt-cart, branch feat/hu-balt-cart-20261111.

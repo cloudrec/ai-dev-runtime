@@ -1,0 +1,1 @@
+YOUR MARKETS: NL dirk, ES ahorramas, GB abelandcole, US thrive, CA costco-ca (cart only if the shop has an online cart without login; if it needs an account to add, write that in the OWNER-TEST sheet and stop on that shop). Worktree /opt/gaika-worktrees/west-cart, branch feat/west-cart-20261111.
