@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Owner runs this: move the live GAIKA services code (/opt/gaika) to a trunk SHA (default bab51fec: + Aldi UK hold, myTime.de, Costco).
+# Owner runs this: move the live GAIKA services code (/opt/gaika) to a trunk SHA (default 10a2f7be: Aldi UK hold, myTime.de, NL shops held, robots on redirects).
 # Gains: crawl holds (Ahorramás, Linella, Condis, Lidl ES, Polski Koszyk, Collect&Go), non-image reject,
 # 512/160 WebP copies for new images, 8 new crawlers. Plan: /opt/gaika-worktrees/trunk/reports/GAIKA_SERVICES_UPDATE_PLAN_2026-11-11.md
 set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-CODE=/opt/gaika; FROM=2b83ee79; TO=${1:-bab51fec}; V=/opt/gaika-worktrees/ru/var
+CODE=/opt/gaika; FROM=2b83ee79; TO=${1:-10a2f7be}; V=/opt/gaika-worktrees/ru/var
 UNITS="gaika-refresh gaika-images gaika-dist-server gaika-log-receiver"
 die() { echo "STOP: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root"
