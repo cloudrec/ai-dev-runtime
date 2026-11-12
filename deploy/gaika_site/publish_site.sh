@@ -9,7 +9,8 @@ die() { echo "STOP: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root"
 SRC=$(dirname "$(readlink -f "$0")")/www; DST=/var/www/gaika
 [ -f "$SRC/index.html" ] && [ -f "$SRC/assets/i18n.js" ] && [ -f "$SRC/assets/markets.js" ] || die "incomplete $SRC"
-if grep -rqE '(src|href)="https?://' "$SRC"/*.html; then die "external reference in the pages"; fi
+# only allowed external link: the owner's Telegram contact (owner, 2026-11-12)
+if grep -ohE '(src|href)="https?://[^"]*"' "$SRC"/*.html | grep -qv '^href="https://t.me/tehnonom"$'; then die "external reference in the pages"; fi
 if grep -qE 'fetch\(|XMLHttpRequest|sendBeacon|WebSocket|eval\(' "$SRC"/assets/*.js; then die "network/eval code in scripts"; fi
 B="$DST.bak-$(date +%Y%m%d-%H%M)"
 cp -a "$DST" "$B"
