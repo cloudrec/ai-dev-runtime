@@ -12,9 +12,17 @@ SRC=$(dirname "$(readlink -f "$0")")/www; DST=/var/www/gaika
 # only allowed external link: the owner's Telegram contact (owner, 2026-11-12)
 if grep -ohE '(src|href)="https?://[^"]*"' "$SRC"/*.html | grep -qv '^href="https://t.me/tehnonom"$'; then die "external reference in the pages"; fi
 if grep -qE 'fetch\(|XMLHttpRequest|sendBeacon|WebSocket|eval\(' "$SRC"/assets/*.js; then die "network/eval code in scripts"; fi
+# cache-busting: Cloudflare and browsers keep assets for hours, so every asset
+# reference gets ?v=<content hash>; the pages themselves are not cached.
+STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
+cp -a "$SRC/." "$STAGE/"
+for a in "$STAGE"/assets/*; do
+  n=$(basename "$a"); h=$(md5sum "$a" | cut -c1-10)
+  sed -i "s#assets/$n\"#assets/$n?v=$h\"#g" "$STAGE"/*.html
+done
 B="$DST.bak-$(date +%Y%m%d-%H%M)"
 cp -a "$DST" "$B"
-rsync -a --delete "$SRC/" "$DST/"
+rsync -a --delete "$STAGE/" "$DST/"
 chmod -R a+rX "$DST"
 for p in / /retailers.html /assets/styles.css /assets/app.js /assets/i18n.js /assets/markets.js; do
   c=$(curl -s -o /dev/null -w '%{http_code}' --resolve gaika.tech:443:127.0.0.1 -k "https://gaika.tech$p")
