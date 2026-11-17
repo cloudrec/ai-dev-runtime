@@ -652,9 +652,12 @@ def _resolution_reason(conn, *, event_id: int, target: str,
             return "agent_parked_completed"
         # backlog #338: the agent declared a dependency/terminal wait ("Ждём захваты
         # либо новое задание"). Re-waking it cannot help; its first stop was announced.
+        # Bounded by the wait's TTL: past it, a frozen pane is re-woken and escalated.
         # Self-limiting: agent_watch clears wait_since when the pane goes back to work or
         # stops for a different reason (question, plain blocker, crash).
-        if cls == "quiescent" and _dependency_wait(conn, target, now):
+        # `idle` too: an unchanged pane after its announced stop is reclassified idle
+        # (no_signal) on the next sweep, which is exactly when the re-wakes came.
+        if cls in ("quiescent", "idle") and _dependency_wait(conn, target, now):
             return "agent_dependency_wait"
         # The premise of a prompt wake is that a question is on screen. When agent_watch
         # has since reclassified the pane away from `owner_prompt`/`blocker`, that premise

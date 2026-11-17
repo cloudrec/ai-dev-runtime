@@ -198,11 +198,50 @@ def test_review5_a_pane_that_leaves_drops_its_wait():
                         (T,)).fetchone()[0] is None
 
 
-def test_review7_the_supervisor_is_told_and_untold():
+def test_review7_no_external_wait_is_declared_so_stall_doctor_still_sees_the_pane():
     from core import native_supervisor as ns
+    from core import stall_doctor as sd
     emit, t = _Emit(), 1000.0
     _turn(emit, _wait(1), t)
     conn = aw._conn(None)[0]
-    assert ns.in_external_wait(T, conn=conn, now=t + 500)
-    _turn(emit, _plain(2), t + 2000)
-    assert not ns.in_external_wait(T, conn=conn, now=t + 2500)
+    assert not ns.in_external_wait(T, conn=conn, now=t + 500)
+    assert not sd.in_declared_external_wait(T, conn=conn, now=t + 500)
+
+
+def test_reviewA_a_frozen_pane_past_the_ttl_is_not_reparked_and_can_escalate():
+    from core import closed_loop_wake as clw
+    emit, t = _Emit(), 1000.0
+    _turn(emit, _wait(1), t)
+    conn = aw._conn(None)[0]
+    since = conn.execute("SELECT wait_since FROM agent_watch_state WHERE target=?",
+                         (T,)).fetchone()[0]
+    late = t + aw.WAIT_TTL_SECS + 100
+    for k in range(3):                              # the same frozen pane, sweep after sweep
+        _sweep(emit, _wait(1), late + 60 * k)
+    assert conn.execute("SELECT wait_since FROM agent_watch_state WHERE target=?",
+                        (T,)).fetchone()[0] == since          # never renewed
+    assert clw._dependency_wait(conn, T, since + 60)
+    assert not clw._dependency_wait(conn, T, late + 300)      # re-wake/escalation resume
+    assert len(emit.calls) == 1
+
+
+def test_reviewA_a_restatement_after_the_ttl_is_announced_once_then_parks_again():
+    emit, t = _Emit(), 1000.0
+    _turn(emit, _wait(1), t)
+    late = t + aw.WAIT_TTL_SECS + 100
+    _turn(emit, _wait(2), late)
+    assert len(emit.calls) == 2
+    _turn(emit, _wait(3), late + 1000)
+    assert len(emit.calls) == 2
+
+
+def test_closed_loop_resolves_on_the_idle_pane_after_the_announced_wait(monkeypatch):
+    from core import closed_loop_wake as clw
+    emit, t = _Emit(), 1000.0
+    _turn(emit, _wait(1), t)
+    _sweep(emit, _wait(1), t + 1000)               # unchanged pane: reclassified idle
+    conn = aw._conn(None)[0]
+    assert conn.execute("SELECT cls FROM agent_watch_state WHERE target=?",
+                        (T,)).fetchone()[0] == "idle"
+    assert clw._resolution_reason(conn, event_id=1, target=T, agents=[],
+                                  now=t + 1100) == "agent_dependency_wait"

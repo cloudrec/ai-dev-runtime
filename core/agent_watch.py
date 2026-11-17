@@ -143,7 +143,10 @@ _STATE_COLUMNS = (("miss_count", "INTEGER DEFAULT 0"),
                   ("wait_since", "REAL"),
                   # first and last sweep seen `working` since the wait was declared: how
                   # much real work happened, to tell a new task from a quick restatement
-                  ("work_since", "REAL"), ("work_last", "REAL"))
+                  ("work_since", "REAL"), ("work_last", "REAL"),
+                  # the digest a wait lapsed on (TTL): that same frozen pane is never
+                  # re-parked, so closed_loop can re-wake and escalate it as before
+                  ("wait_lapsed_digest", "TEXT"))
 
 
 def _migrate_state(conn) -> None:
@@ -759,24 +762,23 @@ def _check_crash_loop(conn, emit_fn, *, project: str, target: str, now: float) -
 def _clear_dependency_wait(conn, target: str) -> None:
     conn.execute("UPDATE agent_watch_state SET wait_since=NULL, work_since=NULL, "
                  "work_last=NULL WHERE target=?", (target,))
-    try:
-        from core import native_supervisor as _ns
-        _ns.clear_external_wait(target, conn=conn)
-    except Exception:  # noqa: BLE001 — never breaks the sweep
-        pass
 
 
-def _declare_dependency_wait(conn, target: str, now: float, evidence: str) -> None:
-    conn.execute("UPDATE agent_watch_state SET wait_since=? WHERE target=?", (now, target))
-    try:
-        # the supervisor's idle sweep stops nudging for the same bounded time; it is the
-        # same record a scheduled park writes, and it expires on its own
-        from core import native_supervisor as _ns
-        _ns.mark_external_wait(target, reason="dependency_wait", by="agent_watch",
-                               evidence=evidence[:200], ttl_secs=WAIT_TTL_SECS,
-                               conn=conn, now=now)
-    except Exception:  # noqa: BLE001
-        pass
+def _declare_dependency_wait(conn, target: str, now: float, digest: str,
+                             announced: bool = False) -> bool:
+    """Park, unless this very pane state already outlived a wait (frozen past the TTL).
+
+    Deliberately NOT a `native_external_wait` declaration: that record makes stall_doctor
+    skip the pane entirely, including a new task left unsubmitted in the composer, and
+    closed_loop resolve any watch on it (2026-11-17 review). The supervisor's bounded
+    idle nudges are cheaper than a hidden new task."""
+    row = conn.execute("SELECT wait_lapsed_digest FROM agent_watch_state WHERE target=?",
+                       (target,)).fetchone()
+    if not announced and row and row[0] and row[0] == digest:
+        return False                    # this very pane state already outlived a wait
+    conn.execute("UPDATE agent_watch_state SET wait_since=?, wait_lapsed_digest=NULL "
+                 "WHERE target=?", (now, target))
+    return True
 
 
 def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
@@ -942,6 +944,9 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                     rearm = "wait_ttl_lapsed"
             if rearm:
                 _clear_dependency_wait(conn, target)
+                if rearm == "wait_ttl_lapsed":
+                    conn.execute("UPDATE agent_watch_state SET wait_lapsed_digest=? "
+                                 "WHERE target=?", (dg, target))
                 wait_since = None
             if dep_wait and wait_since is not None:
                 # the same declared wait, re-stated: not news (#338)
@@ -974,9 +979,8 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             if already:
                 overdue = (REMINDER_SECS and cls in ("owner_prompt", "blocker")
                            and (now - float(n_ts or 0)) >= REMINDER_SECS)
-                if dep_wait:            # announced already: from now on a durable wait
-                    _declare_dependency_wait(conn, target, now, _final_message(tail))
-                    overdue = False
+                if dep_wait and _declare_dependency_wait(conn, target, now, dg):
+                    overdue = False     # announced already: from now on a durable wait
                 if not overdue:
                     skipped.append({"target": target, "why": "already_notified"})
                     conn.commit()
@@ -1014,8 +1018,8 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 "UPDATE agent_watch_state SET notified_cls=?, notified_digest=?, "
                 "notified_at=?, notified_ts=?, emissions=emissions+1 WHERE target=?",
                 (cls, dg, now_iso(), now, target))
-            if dep_wait:
-                _declare_dependency_wait(conn, target, now, _final_message(tail))
+            if dep_wait:                # just announced: a fresh wait starts now
+                _declare_dependency_wait(conn, target, now, dg, announced=True)
             if cls == "crashed":
                 _check_crash_loop(conn, emit_fn, project=project, target=target, now=now)
             conn.commit()
