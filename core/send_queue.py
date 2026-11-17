@@ -267,9 +267,8 @@ def drain(now: Optional[float] = None, send: Optional[Callable] = None) -> list:
         for rid, key, target, pane_id, pane_pid, text, actor, source in rows:
             if target in busy_targets:
                 continue                           # one at a time per agent, in order
-            claimed = conn.execute("UPDATE send_queue SET status='delivering', claimed_ts=?, "
-                                   "attempts=attempts+1 WHERE id=? AND status='queued'",
-                                   (now, rid)).rowcount
+            claimed = conn.execute("UPDATE send_queue SET status='delivering', claimed_ts=? "
+                                   "WHERE id=? AND status='queued'", (now, rid)).rowcount
             conn.commit()
             if not claimed:
                 continue                           # another drainer took it
@@ -293,7 +292,8 @@ def drain(now: Optional[float] = None, send: Optional[Callable] = None) -> list:
                 busy_targets.add(target)
                 continue
             # the point of no blind return: from here a crash leaves `unknown`
-            conn.execute("UPDATE send_queue SET send_started_ts=? WHERE id=?", (now, rid))
+            conn.execute("UPDATE send_queue SET send_started_ts=?, attempts=attempts+1 "
+                         "WHERE id=?", (now, rid))
             conn.commit()
             r = send(target, text, idempotency_key=key, actor=actor or None,
                      source=f"{source or ''}|send_queue"[:200])
