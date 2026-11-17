@@ -9,6 +9,11 @@
 
 **Also live since 16:56Z:** the WEST dependency-wait wordings and the changed-task-identity re-arm. See `reports/OWNER_OS_ACCEPTANCE_2026-11-17.md`.
 
+**On branches, not live (automated instruction, awaiting release authorisation):**
+- runtime `de94158`: a completed hand-over is announced once; a `stage_done` hand-over is not re-woken. `--check` OK.
+- seo `39603fb` (branch `owneros/log-redact-20261117`): URL secrets redacted from the access log. `deploy/seo_log_redact/install.sh --check` OK.
+- Report: `reports/OWNER_OS_REWAKE_FIX_2026-11-17.md`.
+
 **Open for the owner:**
 - refresh or reconnect the ChatGPT connector: its tool list is stale, so `queue_if_busy` is not visible in the chat;
 - rotate the MCP token (checklist in the acceptance report, section 7);
