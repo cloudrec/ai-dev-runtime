@@ -164,7 +164,17 @@ def worker_errors(conn, now: float, run=subprocess.run) -> dict:
     return out
 
 
-CHECKS = (unwoken_reviews, undelivered_wakes, workers_down, worker_errors)
+def offer_mode_invalid(conn, now: float) -> dict:
+    """An unrecognised WAKE_BRIDGE_OFFER offers nothing (fail closed): say so loudly."""
+    from core import wake_bridge as wb
+    mode = wb.offer_mode()
+    if mode in wb.OFFER_MODES:
+        return {}
+    return {"offer_mode_invalid": f"WAKE_BRIDGE_OFFER={mode[:40]!r} не распознан: "
+                                  f"ChatGPT не получает ни одного уведомления."}
+
+
+CHECKS = (unwoken_reviews, undelivered_wakes, workers_down, worker_errors, offer_mode_invalid)
 
 
 def owner_digest(conn, notify, now: float, sent: list) -> Optional[str]:

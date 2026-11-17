@@ -51,7 +51,10 @@ case "${1:-}" in
     B=$RUNTIME/backups/adaptive-offer-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$B"
     echo "$h" > "$B/live_sha"; cp -p $ENVF "$B/env"
     cp -p $DROPDIR/99-tech-lead-hears.conf "$B/" 2>/dev/null || true
-    trap 'rm -rf "$T"; echo "FAILED mid-apply. Rollback: $HERE/rollback.sh $B" >&2' ERR
+    # live restrictions not yet in git (the vtb deny) survive a failed apply and a rollback
+    mkdir -p "$B/live"; for f in $DIRTY; do cp -p "$RUNTIME/$f" "$B/live/$(basename "$f")"; echo "$f" >> "$B/live/LIST"; done
+    restore_live() { [ -f "$B/live/LIST" ] && while read -r f; do cp -p "$B/live/$(basename "$f")" "$RUNTIME/$f"; done < "$B/live/LIST"; true; }
+    trap 'restore_live; rm -rf "$T"; echo "FAILED mid-apply (live restrictions restored). Rollback: $HERE/rollback.sh $B" >&2' ERR
     for f in $DIRTY; do git -C $RUNTIME checkout -q HEAD -- "$f"; done   # same text arrives next line
     git -C $RUNTIME merge -q --ff-only "$TARGET_SHA"
     grep -qE '^WAKE_BRIDGE_IDENTITY=' $ENVF && sed -i 's/^WAKE_BRIDGE_IDENTITY=.*/WAKE_BRIDGE_IDENTITY=1/' $ENVF \

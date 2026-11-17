@@ -192,10 +192,13 @@ def identity_verdict(agent_id: str, project_id: str = "", conn=None,
             row = None
         if row and row[0]:
             root = os.path.realpath(row[0])
-            base = os.path.realpath(os.getenv("FULLCYCLE_INTAKE_ROOT", "/opt/fc-projects"))
             if _payment_name(root) or _payment_dirs([root]):
-                return ID_PAYMENT
-            if root.startswith(base.rstrip("/") + "/"):
+                return ID_PAYMENT                # payment for any agent naming it
+            # a project id vouches only for the project's own agent (fc-<dir>) or the
+            # engine itself (no agent): any other agent naming an fc project stays unknown
+            base = os.path.realpath(os.getenv("FULLCYCLE_INTAKE_ROOT", "/opt/fc-projects"))
+            own = f"fc-{os.path.basename(root)}"
+            if a.split(":", 1)[0] in ("", own) and root.startswith(base.rstrip("/") + "/"):
                 return ID_OK
     return ID_UNKNOWN
 
@@ -1050,6 +1053,13 @@ def record(decision: dict, *, event_id: int, severity: str = "", event_type: str
                 # a Full Cycle project's identity comes from its recorded root
                 panes = None if os.getenv("WAKE_BRIDGE_IDENTITY", "") == "1" else {}
                 ident = identity_verdict(agent_id, project_id, conn=conn, panes=panes)
+                # a re-decision never launders an earlier verdict: the stricter one holds
+                rank = {ID_PAYMENT: 2, ID_UNKNOWN: 1, ID_OK: 0}
+                for (prev,) in conn.execute(
+                        "SELECT COALESCE(offer_identity,'') FROM wake_audit WHERE event_id=?",
+                        (int(event_id),)).fetchall():
+                    if rank.get(prev, -1) > rank.get(ident, -1):
+                        ident = prev
             except Exception:  # noqa: BLE001 — unknown, never a crash of the emitter
                 ident = ID_UNKNOWN
         cur = conn.execute(

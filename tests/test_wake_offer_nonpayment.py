@@ -286,3 +286,37 @@ def test_live_policy_denies_every_known_payment_dir():
     for d in ("/opt/payment-orchestrator", "/opt/vtb_old", "/opt/vtb_old/app"):
         assert acp.hard_denied(d, "vtb", cfg), d
     assert not acp.hard_denied("/opt/vtb_older", "x", cfg)
+
+
+# ── re-review findings ───────────────────────────────────────────────────────
+def test_B_a_redecision_keeps_the_stricter_recorded_identity(monkeypatch):
+    monkeypatch.setenv("WAKE_BRIDGE_IDENTITY", "1")
+    conn, _ = wb._conn(None)
+    _wake(971, "renamed:0.0", 1000.0)                    # payment cwd at first decision
+    monkeypatch.setattr(wb, "pane_cwds", lambda: {"renamed": ["/opt/ordinary"]})
+    d = {"wake": True, "reason": "redecided", "route_key": "owner-os"}
+    wb.record(d, event_id=971, severity="critical", agent_id="renamed:0.0",
+              event_type="work_stopped_incomplete", now=1100.0)
+    got = {r[0] for r in conn.execute(
+        "SELECT offer_identity FROM wake_audit WHERE event_id=971")}
+    assert got == {"payment"}
+
+
+def test_C_loop_watch_raises_an_unknown_offer_mode(monkeypatch):
+    conn, _ = wb._conn(None)
+    assert lw.offer_mode_invalid(conn, 1.0) == {}
+    monkeypatch.setenv("WAKE_BRIDGE_OFFER", "nonpaymnet")
+    assert "offer_mode_invalid" in lw.offer_mode_invalid(conn, 1.0)
+    assert lw.offer_mode_invalid in lw.CHECKS
+
+
+def test_D_an_fc_project_id_vouches_only_for_its_own_agent(monkeypatch):
+    monkeypatch.setenv("FULLCYCLE_INTAKE_ROOT", "/opt/fc-projects")
+    conn, _ = wb._conn(None)
+    conn.execute("CREATE TABLE IF NOT EXISTS fc_project (id TEXT PRIMARY KEY, name TEXT, "
+                 "root TEXT, executor TEXT, created_at TEXT, created_ts REAL)")
+    conn.execute("INSERT INTO fc_project (id, root) VALUES ('calc','/opt/fc-projects/calc')")
+    conn.commit()
+    assert wb.identity_verdict("fc-calc:0.0", "calc", conn=conn, panes={}) == wb.ID_OK
+    assert wb.identity_verdict("", "calc", conn=conn, panes={}) == wb.ID_OK
+    assert wb.identity_verdict("x:0.0", "calc", conn=conn, panes={}) == wb.ID_UNKNOWN
