@@ -78,3 +78,15 @@ def test_a_decided_review_is_never_reminded(waiting):
     clock.offset = 10 * fe.REVIEW_REMIND_SECS
     e.tick()
     assert _reminders() == [] and told == []
+
+
+def test_a_reminder_of_a_pending_review_is_not_retired_as_decided(waiting):
+    """2026-11-17 live: reminders 82925/82938/82961/82985 of pending review 137 were
+    expired as fullcycle_review_already_decided, because the reminder's event id differs
+    from the review's announcing event id. A reminder is newer: it must ring."""
+    from core import wake_bridge as wb
+    e, clock, told = waiting
+    clock.offset = fe.REVIEW_REMIND_SECS + 1
+    e.tick()
+    (rid,) = [i for i, _t, p, _o in _events(fe.REVIEW_EVENT) if "reminder" in json.loads(p)]
+    assert not wb._fullcycle_review_closed(e.conn, rid)

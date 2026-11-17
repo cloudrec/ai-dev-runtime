@@ -1745,8 +1745,11 @@ def _fullcycle_review_closed(conn, event_id: int) -> bool:
             return False
         row = conn.execute("SELECT status, event_id FROM fc_review WHERE id=?",
                            (int(rid),)).fetchone()
+        # closed only when the review was re-announced by a NEWER event. A reminder is a
+        # newer event about the same pending review: it must ring (2026-11-17: `!=` here
+        # retired 11 of 13 reminders as "already decided").
         return bool(row) and (row[0] != "pending" or (row[1] is not None
-                                                      and int(row[1]) != int(event_id)))
+                                                      and int(row[1]) > int(event_id)))
     except Exception:  # noqa: BLE001 — no fc tables: not a review request
         return False
 
