@@ -1265,14 +1265,16 @@ def test_only_agents_offers_only_the_canary_and_leaves_backlog_untouched(monkeyp
     wb.acknowledge(703)
     assert wb.pending_wake(now=3002.0)["pending"] is False   # nothing else is ever offered
     monkeypatch.delenv("WAKE_BRIDGE_ONLY_AGENTS")
-    assert wb.pending_wake(now=3003.0)["event_id"] == 701    # passed over, never consumed
+    # passed over, never consumed; the payment agent's 701 never reaches this non-payment
+    # chat in any mode (2026-11-17 security review: fallback routes)
+    assert wb.pending_wake(now=3003.0)["event_id"] == 702
 
 
 def test_only_agents_unset_is_normal_oldest_first(monkeypatch):
     monkeypatch.delenv("WAKE_BRIDGE_ONLY_AGENTS", raising=False)
     _backlog()
     assert wb.only_agents() == set()
-    assert wb.pending_wake(now=3001.0)["event_id"] == 701
+    assert wb.pending_wake(now=3001.0)["event_id"] == 702    # 701: payment, non-payment chat
 
 
 def test_only_agents_matching_is_exact_session_not_prefix(monkeypatch):

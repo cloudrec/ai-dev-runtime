@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+# Undo install.sh --apply: previous drop-in, configs/.env and live commit; restart the same units.
 set -euo pipefail
 RUNTIME=/root/ai-dev-runtime; B=${1:?backup dir}; DROP=/etc/systemd/system/owner-os-wake-companion.service.d
-[ -f "$B/live_sha" ] || { echo "STOP: not a backup dir" >&2; exit 1; }
+UNITS="ai-runtime owner-os-wake-companion owner-os-fullcycle-worker owner-os-fullcycle-intake"
+[ -f "$B/live_sha" ] && [ -f "$B/env" ] || { echo "STOP: not a backup dir" >&2; exit 1; }
 if [ -f "$B/99-tech-lead-hears.conf" ]; then cp -p "$B/99-tech-lead-hears.conf" $DROP/; else rm -f $DROP/99-tech-lead-hears.conf; fi
+cp -p "$B/env" $RUNTIME/configs/.env
 git -C $RUNTIME reset -q --keep "$(cat "$B/live_sha")"
-systemctl daemon-reload; systemctl restart owner-os-wake-companion
+systemctl daemon-reload; systemctl restart $UNITS
 echo "ROLLED BACK: live $(git -C $RUNTIME rev-parse --short HEAD)"

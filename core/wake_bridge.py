@@ -91,13 +91,21 @@ def _offer_allowed(agent_id: str, only: set) -> bool:
     return any(o.endswith("*") and len(o) > 2 and "*" not in o[:-1] and a.startswith(o[:-1])
                for o in only)
 # ── who may be offered to the tech lead (2026-11-17) ──────────────────────────
-# Payment work is never offered, in any mode, judged by every identity we hold: the agent's
-# session, the event's project, the route (decision-time and delivery-time) and the live
-# pane's directory — so an alias, a renamed session or a payment cwd stays out.
-# WAKE_BRIDGE_OFFER=nonpayment additionally offers any agent outside the explicit list,
-# but only on authoritative identity: a `session:w.p` target whose live pane is found with
-# a known cwd. Anything unknown, ambiguous or missing is passed over (fail closed).
+# Two rules, applied wherever a wake is selected (pending_wake, coalescing, loop_watch):
+#
+#  1. In EVERY mode a payment event never reaches a non-payment chat. An event is payment
+#     when its session, project or route is payment-named, or its decision-time identity
+#     (`offer_identity`, stored by `record`) was payment. A chat is payment when its route
+#     key is payment-named or its conversation URL is bound under such a key.
+#  2. With a filter configured, payment events are not offered at all. The filter is
+#     WAKE_BRIDGE_ONLY_AGENTS (explicit list) and/or WAKE_BRIDGE_OFFER=nonpayment, which
+#     offers an unlisted agent only on authoritative identity: its live pane's cwd now, or,
+#     when the pane is gone (crash, exit), the identity recorded when the event was decided.
+#     Unknown, ambiguous or missing identity is passed over. Any other WAKE_BRIDGE_OFFER
+#     value offers nothing (a typo must never open the gate).
 _TARGET_RE = re.compile(r"^([A-Za-z0-9_.-]{1,80}):(\d{1,3})\.(\d{1,3})$")
+OFFER_MODES = ("", "nonpayment")
+ID_OK, ID_PAYMENT, ID_UNKNOWN = "ok", "payment", "unknown"
 
 
 def offer_mode() -> str:
@@ -113,8 +121,8 @@ def _payment_name(text: str) -> bool:
 
 
 def pane_cwds() -> Optional[dict]:
-    """{session: [cwd, ...]} for every live pane on this host's agent tmux socket, or
-    None when tmux cannot be read (then nothing is offered on identity)."""
+    """{session: [cwd, ...]} for every live pane on this process's agent tmux socket, or
+    None when tmux cannot be read."""
     import subprocess
     sock = os.getenv("AGENT_TMUX_SOCKET", "").strip()
     argv = ["tmux"] + (["-L", sock] if sock else []) + [
@@ -134,6 +142,19 @@ def pane_cwds() -> Optional[dict]:
     return panes
 
 
+def _payment_dirs(cwds: list, session: str = "") -> bool:
+    """Any cwd payment by name or under a hard-deny dir. A policy without a
+    `hard_deny_dirs` list is unreadable: fail closed."""
+    try:
+        from core import agent_creation_policy as acp
+        cfg = acp.load_config()
+        if not isinstance(cfg.get("hard_deny_dirs"), list):
+            return True
+        return any(acp.hard_denied(c, session, cfg) for c in cwds)
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def payment_identity(agent_id: str, project_id: str = "", route_key: str = "",
                      cwds: Optional[list] = None) -> bool:
     session = (agent_id or "").strip().split(":", 1)[0]
@@ -144,32 +165,85 @@ def payment_identity(agent_id: str, project_id: str = "", route_key: str = "",
         from core import agent_control as ac
         if session.lower() in ac.AUTOMATION_HARD_DENY:
             return True
-        from core import agent_creation_policy as acp
-        cfg = acp.load_config()
-        return any(acp.hard_denied(c, session, cfg) for c in (cwds or []) if c)
-    except Exception:  # noqa: BLE001 — fail closed
+    except Exception:  # noqa: BLE001
         return True
+    cwds = [c for c in (cwds or []) if c]
+    return bool(cwds) and _payment_dirs(cwds, session)
+
+
+def identity_verdict(agent_id: str, project_id: str = "", conn=None,
+                     panes: Optional[dict] = None) -> str:
+    """ok | payment | unknown, from what is authoritative at decision time: the agent's
+    live pane cwd on this process's socket, else a Full Cycle project's own root."""
+    a = (agent_id or "").strip()
+    if payment_identity(a, project_id):
+        return ID_PAYMENT
+    m = _TARGET_RE.match(a)
+    if m:
+        panes = pane_cwds() if panes is None else panes
+        cwds = (panes or {}).get(m.group(1))
+        if cwds and all(cwds):
+            return ID_PAYMENT if payment_identity(a, project_id, "", cwds) else ID_OK
+    if project_id and conn is not None:
+        try:
+            row = conn.execute("SELECT root FROM fc_project WHERE id=?",
+                               (project_id,)).fetchone()
+        except Exception:  # noqa: BLE001 — no fc tables
+            row = None
+        if row and row[0]:
+            root = os.path.realpath(row[0])
+            base = os.path.realpath(os.getenv("FULLCYCLE_INTAKE_ROOT", "/opt/fc-projects"))
+            if _payment_name(root) or _payment_dirs([root]):
+                return ID_PAYMENT
+            if root.startswith(base.rstrip("/") + "/"):
+                return ID_OK
+    return ID_UNKNOWN
+
+
+def payment_conversations(conn) -> set:
+    try:
+        return {r[1] for r in conn.execute("SELECT route_key, conversation FROM wake_route")
+                if r[1] and _payment_name(r[0] or "")}
+    except Exception:  # noqa: BLE001
+        return set()
 
 
 def offer_allowed(agent_id: str, project_id: str = "", route_key: str = "",
                   only: Optional[set] = None, panes: Optional[dict] = None,
-                  mode: Optional[str] = None) -> bool:
+                  mode: Optional[str] = None, stored: str = "") -> bool:
+    """Rule 2 (no route): may this event be offered at all?"""
     only = only_agents() if only is None else only
     mode = offer_mode() if mode is None else mode
+    if mode not in OFFER_MODES:
+        return False                    # unknown mode: fail closed
+    if not mode and not only:
+        return True                     # no filter: rule 1 alone applies (offerable)
     a = (agent_id or "").strip()
+    if stored == ID_PAYMENT or payment_identity(a, project_id, route_key):
+        return False
     m = _TARGET_RE.match(a)
     cwds = (panes or {}).get(m.group(1)) if (m and panes is not None) else None
-    if mode != "nonpayment" and not only:
-        return True                    # no filter configured at all: unchanged behaviour
-    if payment_identity(a, project_id, route_key, cwds):
-        return False
-    if mode != "nonpayment":
-        return _offer_allowed(a, only)  # the explicit list
+    if cwds and all(cwds):              # live identity wins over the stored one
+        if payment_identity(a, project_id, route_key, cwds):
+            return False
+        if mode == "nonpayment":
+            return True
     if only and _offer_allowed(a, only):
-        return True                    # explicitly listed (fc-* and the like)
-    if not m or panes is None or not cwds or not all(cwds):
-        return False                   # unknown, ambiguous or missing identity
-    return True
+        return True                     # explicitly listed by the owner
+    return mode == "nonpayment" and stored == ID_OK and not cwds
+
+
+def offerable(conn, agent_id: str, project_id: str, stored: str, resolved: dict,
+              only: set, panes: Optional[dict], mode: str, pay_chats: set) -> bool:
+    """Both rules, for a wake whose route was resolved for delivery."""
+    rk = (resolved.get("route_key") or "").strip()
+    chat_is_payment = _payment_name(rk) or (resolved.get("conversation") in pay_chats)
+    event_is_payment = stored == ID_PAYMENT or payment_identity(agent_id, project_id)
+    if event_is_payment and not chat_is_payment:
+        return False                    # rule 1, every mode
+    if (mode or only or mode not in OFFER_MODES) and chat_is_payment:
+        return False                    # filtered: no payment chat is rung
+    return offer_allowed(agent_id, project_id, rk, only, panes, mode, stored)
 
 
 # A decided-but-undelivered wake older than this is stale: "this agent is waiting NOW"
@@ -576,6 +650,9 @@ _AUDIT_COLUMNS = (
     # before this column are NULL and are counted as owner-os traffic, which is
     # what they overwhelmingly were.
     ("route_key", "TEXT"),
+    # Decision-time identity (ok | payment | unknown) for the offer filter: a crashed
+    # agent's pane is gone at delivery time, its recorded identity is not.
+    ("offer_identity", "TEXT"),
     # task 211: the agent ref, persisted alongside project_id for the same reason —
     # the wake TEXT is composed fresh at delivery time and needs it there.
     ("agent_id", "TEXT"),
@@ -966,15 +1043,24 @@ def record(decision: dict, *, event_id: int, severity: str = "", event_type: str
     actionable = bool(decision.get("actionable", is_actionable(event_type)))
     conn, own = _conn(conn)
     try:
+        ident = ""
+        if decision.get("wake") or decision.get("reason") == "cooldown_active":
+            try:
+                # live panes only where the unit opts in (it owns a tmux socket);
+                # a Full Cycle project's identity comes from its recorded root
+                panes = None if os.getenv("WAKE_BRIDGE_IDENTITY", "") == "1" else {}
+                ident = identity_verdict(agent_id, project_id, conn=conn, panes=panes)
+            except Exception:  # noqa: BLE001 — unknown, never a crash of the emitter
+                ident = ID_UNKNOWN
         cur = conn.execute(
             "INSERT INTO wake_audit (ts,at,event_id,correlation_id,severity,decision,reason,"
-            "event_type,actionable,project_id,agent_id,route_key) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "event_type,actionable,project_id,agent_id,route_key,offer_identity) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, now_iso(), int(event_id), correlation_id, severity,
              "wake" if decision.get("wake") else "skip", str(decision.get("reason"))[:160],
              (event_type or "").strip(), 1 if actionable else 0,
              (project_id or "").strip(), (agent_id or "").strip()[:200],
-             (decision.get("route_key") or "").strip()))
+             (decision.get("route_key") or "").strip(), ident))
         conn.commit()
         return int(cur.lastrowid)
     finally:
@@ -1995,7 +2081,16 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         # Fold the generic backlog down to its newest member PER ROUTE first: N generic
         # wakes for one chat are one instruction, but wakes for different chats are not
         # copies of each other and are never folded across routes.
-        coalesced = coalesce_generic_backlog(conn=conn, now=now)
+        only = only_agents()
+        mode = offer_mode()
+        filtered = bool(only or mode)
+        panes = pane_cwds() if mode == "nonpayment" else {}
+        pay_chats = payment_conversations(conn)
+
+        def keep(agent, project, ident, resolved):
+            return offerable(conn, agent, project, ident, resolved, only, panes, mode,
+                             pay_chats)
+        coalesced = coalesce_generic_backlog(conn=conn, now=now, keep=keep)
         # Actionable first, then oldest — the only ordering change. Within a class the old
         # oldest-first behaviour is untouched, so nothing is starved, it is merely outranked.
         conn.execute(_DELIVERY_SCHEMA)
@@ -2007,20 +2102,19 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         candidates = conn.execute(
             "SELECT a.event_id, COALESCE(a.actionable,0), "
             "COALESCE(a.project_id,''), COALESCE(a.event_type,''), "
-            "COALESCE(a.agent_id,'') FROM wake_audit a "
+            "COALESCE(a.agent_id,''), COALESCE(a.offer_identity,'') FROM wake_audit a "
             "WHERE a.decision='wake' AND a.acknowledged=0 "
             "AND a.superseded_by IS NULL AND NOT EXISTS "
             "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
             "ORDER BY COALESCE(a.actionable,0) DESC, a.id ASC "
-            "LIMIT ?", (_CANDIDATE_SCAN_LIMIT,)).fetchall()
+            # passed-over rows are never consumed: scan further when a filter is on so
+            # they cannot crowd a deliverable wake out of the window
+            "LIMIT ?", (_CANDIDATE_SCAN_LIMIT * (10 if filtered else 1),)).fetchall()
         r = target = unrouted = None
         benched = None  # (event_id, retry_at, attempt, transient) for the head of line
-        only = only_agents()
-        mode = offer_mode()
-        panes = pane_cwds() if mode == "nonpayment" else {}
         for cand in candidates:
             eid = int(cand[0])
-            if not offer_allowed(cand[4], cand[2], "", only, panes, mode):
+            if not offer_allowed(cand[4], cand[2], "", only, panes, mode, cand[5]):
                 continue                      # passed over, never consumed
             last = conn.execute(
                 "SELECT ts, delivered FROM wake_delivery WHERE event_id=? "
@@ -2048,9 +2142,9 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
                 # does not hold back other routes: the sandbox queue stopped dead on one.
                 unrouted = unrouted or (int(cand[0]), resolved)
                 continue
-            if (only or mode == "nonpayment") and \
-                    payment_identity(cand[4], cand[2], resolved.get("route_key") or ""):
-                continue                      # filtered: a payment chat is never rung
+            if not offerable(conn, cand[4], cand[2], cand[5], resolved, only, panes, mode,
+                             pay_chats):
+                continue                      # payment never reaches a non-payment chat
             r, target = cand, resolved
             break
         if not r and unrouted:
@@ -2066,7 +2160,7 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
                                "attempt": attempt, "transient_retry": transient,
                                "next_retry_in_secs": max(0, int(retry_at - now_))})
             return result
-        event_id, actionable, project_id, event_type, agent_id = r
+        event_id, actionable, project_id, event_type, agent_id = r[:5]
         return {"pending": True, "event_id": int(event_id), "actionable": bool(actionable),
                 "conversation": target["conversation"],
                 "phrase": compose_phrase(event_id=event_id, event_type=event_type,
@@ -2084,7 +2178,16 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
             conn.close()
 
 
-def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
+def _route_conversation(conn, key: str) -> str:
+    try:
+        row = conn.execute("SELECT conversation FROM wake_route WHERE route_key=?",
+                           (key,)).fetchone()
+        return (row[0] or "") if row else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def coalesce_generic_backlog(conn=None, now: Optional[float] = None, keep=None) -> dict:
     """Fold every pending GENERIC wake but the newest into that newest one, PER ROUTE.
 
     The phrase is fixed and carries no event content — it says "go read Owner OS". So N
@@ -2156,7 +2259,8 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
         # eligible to try again.
         rows = conn.execute(
             "SELECT a.id, a.event_id, COALESCE(a.project_id,''), "
-            "COALESCE(a.route_key,''), COALESCE(a.agent_id,''), a.decision FROM wake_audit a "
+            "COALESCE(a.route_key,''), COALESCE(a.agent_id,''), a.decision, "
+            "COALESCE(a.offer_identity,'') FROM wake_audit a "
             "LEFT JOIN event e ON e.id = a.event_id "
             "WHERE (a.decision='wake' OR (a.decision='skip' AND a.reason='cooldown_active')) "
             "AND (e.ts_epoch IS NULL OR e.ts_epoch > ?) "
@@ -2166,7 +2270,7 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
             "AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
             "ORDER BY a.id ASC", (now - MAX_WAKE_AGE_SECS,)).fetchall()
         groups: dict = {}
-        for aid, eid, project, stored_route, agent_ref, decision in rows:
+        for aid, eid, project, stored_route, agent_ref, decision, ident in rows:
             # Group by the RESOLVED route, not the raw project key. Two sessions of
             # one project (payorch-live-buttons, payorch-monitor-clean) resolve to a
             # single chat, so grouping on the raw key would leave them unfolded and
@@ -2183,6 +2287,11 @@ def coalesce_generic_backlog(conn=None, now: Optional[float] = None) -> dict:
                         "route_key") or wake_routes.route_key_for_event(project)
                 except Exception:  # noqa: BLE001 - grouping must never break the drain
                     key = wake_routes.route_key_for_event(project)
+            # only what would actually be offered may absorb or be absorbed: a filtered
+            # row kept as survivor would silently swallow every deliverable sibling
+            if keep is not None and not keep(agent_ref, project, ident, {
+                    "route_key": key, "conversation": _route_conversation(conn, key)}):
+                continue
             groups.setdefault(key, []).append((aid, eid, decision))
         superseded, kept = [], []
         reason = "coalesced_into_newest_generic_wake"

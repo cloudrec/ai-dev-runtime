@@ -78,14 +78,30 @@ def undelivered_wakes(conn, now: float) -> dict:
     latched = ("AND NOT EXISTS (SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
                if _has(conn, "wake_submitted") else "")
     rows = conn.execute(
-        "SELECT a.ts, COALESCE(a.agent_id,''), COALESCE(a.project_id,'') FROM wake_audit a "
+        "SELECT a.ts, COALESCE(a.agent_id,''), COALESCE(a.project_id,''), "
+        "COALESCE(a.offer_identity,'') FROM wake_audit a "
         "WHERE a.decision='wake' AND "
         "COALESCE(a.acknowledged,0)=0 AND a.superseded_by IS NULL " + latched +
         "AND a.ts < ?", (now - UNDELIVERED_AFTER,)).fetchall()
+    # the same predicate pending_wake applies, route resolution included
+    from core import wake_routes
     only, mode = wb.only_agents(), wb.offer_mode()
     panes = wb.pane_cwds() if mode == "nonpayment" else {}
-    waiting = [ts for ts, agent, proj in rows
-               if wb.offer_allowed(agent, proj, "", only, panes, mode)]
+    pay_chats = wb.payment_conversations(conn)
+    waiting = []
+    for ts, agent, proj, ident in rows:
+        try:
+            resolved = wake_routes.resolve(project_id=proj, agent_id=agent, conn=conn)
+        except Exception:  # noqa: BLE001
+            continue
+        if resolved.get("bound"):
+            ok = wb.offerable(conn, agent, proj, ident, resolved, only, panes, mode,
+                              pay_chats)
+        else:               # unrouted: stuck too, if it would be offered at all
+            ok = ident != wb.ID_PAYMENT and not wb.payment_identity(agent, proj) and \
+                wb.offer_allowed(agent, proj, "", only, panes, mode, ident)
+        if ok:
+            waiting.append(ts)
     r = (min(waiting), len(waiting)) if waiting else None
     if not r or not r[1]:
         return {}

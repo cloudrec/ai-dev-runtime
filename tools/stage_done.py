@@ -37,7 +37,8 @@ def _env_flags() -> None:
             for line in fh:
                 k, _, v = line.strip().partition("=")
                 if k in ("WAKE_BRIDGE_ENABLED", "WAKE_BRIDGE_KILL_SWITCH",
-                         "AGENT_AUTOMATION_TARGETS", "AGENT_AUTOMATION_OPEN_CALLERS"):
+                         "AGENT_AUTOMATION_TARGETS", "AGENT_AUTOMATION_OPEN_CALLERS",
+                         "WAKE_BRIDGE_IDENTITY"):
                     os.environ.setdefault(k, v.strip().strip('"').strip("'"))
     except OSError:
         pass

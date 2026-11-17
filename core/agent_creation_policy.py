@@ -130,8 +130,11 @@ def _under(path: str, root: str) -> bool:
 # CloudPayments, and any session/path with a standalone "pay" word (autonomy-pay-sonnet).
 # One list for every consumer (send policy, creation, grants, repos), so a new payment
 # name is closed everywhere at once. Owner rule: automation never touches payment work.
-PAYMENT_WORDS = ("payment", "payorch", "pay-orch", "pay_orch", "blagopay", "cloudpayments")
+PAYMENT_WORDS = ("payment", "payorch", "pay-orch", "pay_orch", "blagopay", "cloudpayments",
+                 "yookassa", "antilopay", "paritypay", "платеж", "платёж", "оплат")
 _WORD_SPLIT = re.compile(r"[^a-z0-9]+")
+# a word that is or ends in "pay", or "pay" plus digits: pay, pay2, autonomypay, antilopay
+_PAY_WORD = re.compile(r"^(?:[a-z]*pay|pay\d+)$")
 
 
 def payment_marked(text: str) -> bool:
@@ -140,7 +143,7 @@ def payment_marked(text: str) -> bool:
         return False
     if any(w in low for w in PAYMENT_WORDS):
         return True
-    return "pay" in _WORD_SPLIT.split(low)
+    return any(_PAY_WORD.match(w) for w in _WORD_SPLIT.split(low) if w)
 
 
 def hard_denied(project_dir: str, session: str, cfg: dict) -> bool:
