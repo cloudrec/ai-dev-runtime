@@ -40,3 +40,18 @@ The full log is in `reports/OWNER_OS_LOOP_2026-11-17.md`.
 - **Stray SQLite file** named `"  "` in the worktree. A safety check blocked its removal, so the owner should remove it. Its contents were never read. Root cause: a blank AGENT_CONTROL_DB, now refused.
 - **seo undismiss button:** branch `owneros/undismiss-20261117` (2cc6051) needs an image rebuild.
 - **Known limit:** the send queue can re-type a message if the process crashes after typing but before agent_control records the delivery.
+
+## Final evidence, b69f206
+| Check | Result |
+|---|---|
+| Full suite, forward | 5355 passed, 0 failed, EXIT 0 |
+| Full suite, reversed | 5355 passed, 0 failed, EXIT 0 (fresh worktree) |
+| Opus review pass 7 (#338 final delta) | release-ready |
+| Opus review pass 9 (send queue fixes) | release-ready; one optional low item: compare text_sha on a duplicate |
+| Installer `--check` | live 3423f4d → b69f206 |
+
+`--check` pane classification:
+- PAYMENT, never offered: payorch-ha-fresh, autonomy-pay-sonnet, vtb.
+- Offered: every other pane.
+
+An earlier reversed run was invalid and is not counted: I removed its worktree while the run was still going.
