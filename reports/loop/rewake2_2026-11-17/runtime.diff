@@ -1,0 +1,463 @@
+diff --git a/core/agent_watch.py b/core/agent_watch.py
+index af750ca..5b68097 100644
+--- a/core/agent_watch.py
++++ b/core/agent_watch.py
+@@ -146,7 +146,10 @@ _STATE_COLUMNS = (("miss_count", "INTEGER DEFAULT 0"),
+                   ("work_since", "REAL"), ("work_last", "REAL"),
+                   # the digest a wait lapsed on (TTL): that same frozen pane is never
+                   # re-parked, so closed_loop can re-wake and escalate it as before
+-                  ("wait_lapsed_digest", "TEXT"))
++                  ("wait_lapsed_digest", "TEXT"),
++                  # when the tech lead/owner last delivered a task (note_task_delivered):
++                  # a stage_done older than that belongs to the previous task
++                  ("task_ts", "REAL"))
+ 
+ 
+ def _migrate_state(conn) -> None:
+@@ -163,7 +166,13 @@ _OWNER_PROMPT_RE = re.compile(
+     r"(do you want to proceed|do you want to|would you like to proceed"
+     r"|\(y/n\)|\by/n\b|yes/no"
+     r"|❯?\s*1\.\s*yes[\s\S]{0,200}?\bno\b"
+-    r"|разрешить\?|продолжить\?|подтверд)", re.IGNORECASE)
++    r"|разрешить\?|продолжить\?"
++    # Only a REQUEST for confirmation. The bare stem also matched the agent's own
++    # statements: "Подтвердится на деле, когда…" (event 88295, this pane's release
++    # report) made a finished report an owner prompt, which then kept the stage_done
++    # watch 88292 from resolving and was re-woken and escalated (88313/88318, again 88326
++    # after compaction left the line on screen).
++    r"|подтверд(?:и|ите|ить|ишь)\b|подтвержда(?:ете|ешь)\b[^.!\n]*\?)", re.IGNORECASE)
+ # Work explicitly at rest, waiting for someone: paused / awaiting instructions / blocked.
+ # A PROVIDER usage window is exhausted. This is neither a failure nor a finish: the
+ # agent is alive, did not crash, did not complete, and no owner action helps — the window
+@@ -311,7 +320,9 @@ _DEP_WAIT_RE = re.compile(
+     r"жд[ёе]м (?:авторизованн\w* )?захват|"
+     # WEST, 2026-11-17 (events 87094, 87495): the same terminal wait, worded as a state
+     r"only (?:genuine |real )?(?:owner )?captures? remain|"
+-    r"standing by until (?:the )?(?:owner )?captures? (?:arrive|land|come in))", re.IGNORECASE)
++    r"standing by until (?:the )?(?:owner )?captures? (?:arrive|land|come in)|"
++    # HU, 2026-11-17 (event 88281): "I'm standing by for captures or a re-review request"
++    r"standing by for (?:the )?(?:owner )?captures?)", re.IGNORECASE)
+ _ERRORISH_RE = re.compile(r"(error|exception|traceback|failed|ошибк|сбой|упал)", re.I)
+ REARM_WORK_SECS = int(os.getenv("AGENT_WATCH_REARM_WORK_SECS", "300"))
+ WAIT_TTL_SECS = int(os.getenv("AGENT_WATCH_DEPENDENCY_WAIT_TTL_SECS", str(4 * 3600)))
+@@ -819,9 +830,9 @@ def note_task_delivered(target: str, *, conn=None, now: Optional[float] = None)
+         cur = conn.execute(
+             "UPDATE agent_watch_state SET wait_since=NULL, work_since=NULL, work_last=NULL, "
+             "wait_lapsed_digest=NULL, notified_cls='', notified_digest='', "
+-            "cls='working', digest='' "
++            "cls='working', digest='', task_ts=? "
+             "WHERE target=? OR target LIKE ? ESCAPE '\\'",
+-            (t, session.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + ":%"))
++            (now if now is not None else now_ts(), t, session.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + ":%"))
+         conn.commit()
+         return cur.rowcount or 0
+     except Exception:  # noqa: BLE001 — a fresh DB without the table: nothing to re-arm
+@@ -831,6 +842,33 @@ def note_task_delivered(target: str, *, conn=None, now: Optional[float] = None)
+             conn.close()
+ 
+ 
++# A stop the agent already announced itself with tools/stage_done.py (2026-11-17, after
++# de94158: HU 88277->88281, WEST 88284->88302, PL 88298->88303). The stage_done
++# `task_completed` woke the tech lead; five minutes later the same rest was announced again
++# as `work_stopped_incomplete`, and THAT watch, being no `task_completed`, was re-woken and
++# escalated (88309/88316, 88314/88321, 88315/88322). The stage hand-over covers the rest
++# when it belongs to the turn that ended in it:
++#   * after the last task the tech lead/owner delivered (`task_ts`): an older stage
++#     belongs to the previous task;
++#   * at most REARM_WORK_SECS before the pane's final output (`digest_since`), the same
++#     bound that tells real new work from a restatement.
++# Only for `quiescent` (a question, a blocker, a crash or a completion keep their path),
++# never with an error line in the final message, and it parks exactly like a declared
++# wait: a delivered task, real work, a different stop or the TTL re-arm it.
++def _stage_done_covers(conn, target: str, *, digest_since, task_ts) -> bool:
++    if digest_since is None:
++        return False
++    since = max(float(digest_since) - REARM_WORK_SECS, float(task_ts or 0))
++    try:
++        r = conn.execute(
++            "SELECT 1 FROM event WHERE agent_id=? AND type='task_completed' "
++            "AND source='agent_stage_done' AND ts_epoch>=? LIMIT 1",
++            (target, since)).fetchone()
++    except Exception:  # noqa: BLE001 — no event table: nothing is covered
++        return False
++    return bool(r)
++
++
+ def _declare_dependency_wait(conn, target: str, now: float, digest: str,
+                              announced: bool = False) -> bool:
+     """Park, unless this very pane state already outlived a wait (frozen past the TTL).
+@@ -900,7 +938,8 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
+                 continue
+             row = conn.execute(
+                 "SELECT cls,digest,notified_cls,notified_digest,notified_ts,digest_since,"
+-                "wait_since,work_since,work_last FROM agent_watch_state WHERE target=?",
++                "wait_since,work_since,work_last,task_ts FROM agent_watch_state "
++                "WHERE target=?",
+                 (target,)).fetchone()
+             prev_cls = row[0] if row else ""
+             # How long this pane has looked EXACTLY like this. The digest is computed
+@@ -993,6 +1032,11 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
+             if cls not in _EVENT_FOR:
+                 skipped.append({"target": target, "why": f"class_{cls}"})
+                 continue
++            stage_handoff = (cls == "quiescent" and bool(a.get("alive"))
++                             and not _ERRORISH_RE.search(_final_message(tail))
++                             and _stage_done_covers(
++                                 conn, target, digest_since=digest_since,
++                                 task_ts=row[9] if row else None))
+             dep_wait = (cls == "quiescent" and bool(a.get("alive"))
+                         and declares_dependency_wait(tail))
+             wait_since = row[6] if row else None
+@@ -1020,6 +1064,16 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
+                 skipped.append({"target": target, "why": "dependency_wait_parked"})
+                 conn.commit()
+                 continue
++            if stage_handoff and _declare_dependency_wait(conn, target, now, dg):
++                # announced already, by the agent's own stage_done: record it as this
++                # rest's notification and park, without a second wake
++                conn.execute(
++                    "UPDATE agent_watch_state SET notified_cls=?, notified_digest=?, "
++                    "notified_at=?, notified_ts=? WHERE target=?",
++                    (cls, dg, now_iso(), now, target))
++                skipped.append({"target": target, "why": "stage_done_handoff"})
++                conn.commit()
++                continue
+             # At rest is the END STATE of an agent whose Full Cycle project is done: the
+             # engine's verified, reviewer-approved record outranks the pane's wording.
+             # Only the at-rest classes — a question, a blocker or a crash still emits.
+diff --git a/core/closed_loop_wake.py b/core/closed_loop_wake.py
+index 8c19339..6c4106c 100644
+--- a/core/closed_loop_wake.py
++++ b/core/closed_loop_wake.py
+@@ -669,7 +669,8 @@ def _resolution_reason(conn, *, event_id: int, target: str,
+         # were re-woken and escalated for exactly this). Only while the pane is at rest: a
+         # pane working again, a crash or a question keeps its own watch, and a NEW stage
+         # or task is a new event with a fresh watch.
+-        if cls in ("quiescent", "idle") and _stage_done_handoff(conn, event_id):
++        if cls in ("quiescent", "idle") and (_stage_done_handoff(conn, event_id)
++                                             or _stage_done_rest(conn, event_id, target)):
+             return "stage_done_handoff"
+         # The premise of a prompt wake is that a question is on screen. When agent_watch
+         # has since reclassified the pane away from `owner_prompt`/`blocker`, that premise
+@@ -723,6 +724,34 @@ def _stage_done_handoff(conn, event_id: int) -> bool:
+     return bool(r) and r[0] == "task_completed" and r[1] == "agent_stage_done"
+ 
+ 
++def _stage_done_rest(conn, event_id: int, target: str) -> bool:
++    """A `work_stopped_incomplete` about the very rest the agent handed over with
++    tools/stage_done.py (HU 88277->88281, WEST 88284->88302, PL 88298->88303). New code
++    no longer announces such a rest (agent_watch `stage_done_handoff`), but a watch opened
++    before the release, or by a sweep that raced the stage_done, must not be re-woken and
++    escalated either. Same evidence as agent_watch: a stage_done after the last delivered
++    task and at most REARM_WORK_SECS before the pane's unchanged final output. Never when
++    the announced excerpt carries an error: a failure keeps waking."""
++    from core import agent_watch as _aw
++    try:
++        r = conn.execute("SELECT type, payload FROM event WHERE id=?",
++                         (int(event_id),)).fetchone()
++        if not r or r[0] != "work_stopped_incomplete":
++            return False
++        try:
++            excerpt = (json.loads(r[1] or "{}") or {}).get("excerpt") or ""
++        except Exception:  # noqa: BLE001 — unreadable payload: claim nothing
++            return False
++        if _aw._ERRORISH_RE.search(str(excerpt)):
++            return False
++        st = conn.execute("SELECT digest_since, task_ts FROM agent_watch_state "
++                          "WHERE target=?", (target,)).fetchone()
++    except Exception:  # noqa: BLE001 — older DB: claims nothing
++        return False
++    return bool(st) and _aw._stage_done_covers(conn, target, digest_since=st[0],
++                                               task_ts=st[1])
++
++
+ def _event_type(conn, event_id: int) -> str:
+     try:
+         r = conn.execute("SELECT type FROM event WHERE id=?", (int(event_id),)).fetchone()
+diff --git a/tests/test_watchdog_rewake_after_release.py b/tests/test_watchdog_rewake_after_release.py
+new file mode 100644
+index 0000000..c037556
+--- /dev/null
++++ b/tests/test_watchdog_rewake_after_release.py
+@@ -0,0 +1,281 @@
++"""Recurring watchdog wakes after the de94158 release (2026-11-17 20:00Z).
++
++Replays, on synthetic panes and DBs only, the three live chains:
++* HU 88281 -> 88309/88316, WEST 88302 -> 88314/88321 (and PL 88303 -> 88315/88322): the
++  agent handed its stage over with tools/stage_done.py; five minutes later agent_watch
++  announced the same rest again as `work_stopped_incomplete`, and that watch, not being a
++  `task_completed`, was re-woken and escalated.
++* owneros-autonomy-loop 88292/88295 -> 88312/88313/88317/88318 (and 88326): the release
++  report said "Подтвердится на деле…"; the bare stem `подтверд` made it an owner prompt,
++  which re-woke itself and kept the stage_done watch from resolving.
++Timings are the live ones (stage_done 30-150 s before the final output; quiescence 300 s).
++"""
++from __future__ import annotations
++
++import json
++
++import pytest
++
++from core import agent_watch as aw
++from core import closed_loop_wake as clw
++
++HU = "gaika-country-hu:0.0"
++WEST = "gaika-country-west:0.0"
++LOOP = "owneros-autonomy-loop:0.0"
++WORK = "✻ Working… (12s · esc to interrupt)\n● Обновляю сканер\n"
++CHROME = ("\n✻ Baked for 5s\n\n────────────\n❯ {draft}\n────────────\n"
++          "  ⏵⏵ accept edits on · ✔ Update installed · /restart to apply\n")
++
++
++def _pane(text, draft=""):
++    return f"● {text}" + CHROME.format(draft=draft)
++
++
++H_HU = _pane("I did not touch RU's quarantine work. The frozen candidate is unchanged. "
++             "I ran no new tests, made no network calls, did not push. I'm standing by "
++             "for captures or a re-review request.")
++H_WEST = _pane("What it needs: a planner rule that compares price within a freshness "
++               "window. That is a planner change, outside this task, and RU should decide "
++               "on it.")
++R_88295 = _pane("Техлиду сообщил (событие 88292). Подтвердится на деле, когда очередной "
++                "агент закончит и передаст работу: должно прийти одно уведомление.")
++UNFINISHED = _pane("Сделал шаг 3 из 5: обновил план корзины, тесты прошли.")
++FAILED = _pane("API Error: 529 overloaded. Request ID: req_synthetic.")
++
++
++@pytest.fixture(autouse=True)
++def _iso(tmp_path, monkeypatch):
++    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
++    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
++    monkeypatch.setenv("AGENT_CONTROL_AUDIT", str(tmp_path / "audit.jsonl"))
++
++
++PARKED = ("agent_dependency_wait", "stage_done_handoff")
++
++
++def _old_code_state(target):
++    """What de94158 left behind: the stop announced, no declared wait."""
++    conn, own = clw._conn(None)
++    conn.execute("UPDATE agent_watch_state SET wait_since=NULL, notified_cls='quiescent' "
++                 "WHERE target=?", (target,))
++    conn.commit()
++    if own:
++        conn.close()
++
++
++class _Emit:
++    def __init__(self):
++        self.calls = []
++
++    def __call__(self, source, etype, **kw):
++        self.calls.append({"type": etype, **kw})
++        return {"event_id": 9000 + len(self.calls)}
++
++
++def _sweep(emit, tail, now, target, state="idle"):
++    a = {"target": target, "cwd": "/opt/x", "claude_cwd": "/opt/x", "alive": True,
++         "is_agent": True, "state": state}
++    return aw.scan(agents=[a], read_fn=lambda t: tail, emit_fn=emit, now=now)
++
++
++def _event(event_id, etype, ts, target, source="agent_watch", payload=None):
++    conn, own = clw._conn(None)
++    try:
++        conn.execute("INSERT INTO event (id, ts, ts_epoch, source, type, agent_id, payload) "
++                     "VALUES (?, 'x', ?, ?, ?, ?, ?)",
++                     (event_id, ts, source, etype, target, json.dumps(payload or {})))
++        conn.commit()
++    finally:
++        if own:
++            conn.close()
++
++
++def _turn(emit, tail, t0, target, stage_done_at=None, stage_id=None, work_secs=150):
++    """A turn that works `work_secs`, optionally runs stage_done at `stage_done_at`, prints
++    its final message and rests past the quiescence window."""
++    _sweep(emit, WORK, t0, target, state="working")
++    if stage_done_at is not None:
++        _event(stage_id, "task_completed", stage_done_at, target, source="agent_stage_done")
++    _sweep(emit, WORK + " ", t0 + work_secs, target, state="working")
++    _sweep(emit, tail, t0 + work_secs + 1, target)
++    return _sweep(emit, tail, t0 + work_secs + 2 + aw.QUIESCENT_SECS, target)
++
++
++def _slo(event_id, etype, t, target, n=4):
++    clw.register_delivery(event_id=event_id, target=target, project_id="p",
++                          event_type=etype, now=t)
++    slo, out = _Emit(), []
++    for k in range(1, n + 1):
++        out.append(clw.slo_scan(now=t + k * (clw.WAKE_LOOP_SLO_SECS + 1), emit_fn=slo))
++    return out, slo
++
++
++# ── chain 1: a stage_done hand-over announced a second time ─────────────────────────────
++@pytest.mark.parametrize("target,tail,lead", [(HU, H_HU, 90), (WEST, H_WEST, 143)])
++def test_a_stage_done_rest_is_not_announced_again(target, tail, lead):
++    emit, t = _Emit(), 10_000.0
++    r = _turn(emit, tail, t, target, stage_done_at=t + 151 - lead, stage_id=1)
++    assert emit.calls == [], emit.calls
++    assert {"target": target, "why": "stage_done_handoff"} in r["skipped"]
++    for i in range(1, 40):                          # the pane just sits there
++        _sweep(emit, tail, t + 600 + 60 * i, target)
++    assert emit.calls == []
++
++
++@pytest.mark.parametrize("target,tail", [(HU, H_HU), (WEST, H_WEST)])
++def test_the_stage_done_watch_itself_is_resolved_not_escalated(target, tail):
++    emit, t = _Emit(), 10_000.0
++    _turn(emit, tail, t, target, stage_done_at=t + 100, stage_id=88277)
++    out, slo = _slo(88277, "task_completed", t + 200, target)
++    assert slo.calls == [] and all(not r["rewoken"] for r in out), out
++    assert out[0]["deregistered"][0]["reason"] in PARKED
++
++
++@pytest.mark.parametrize("target,tail", [(HU, H_HU), (WEST, H_WEST)])
++def test_a_watch_opened_before_the_release_is_resolved(target, tail):
++    """88281/88302 were already announced (old code, or a sweep that raced stage_done)."""
++    emit, t = _Emit(), 10_000.0
++    _turn(emit, tail, t, target, stage_done_at=t + 100, stage_id=88277)
++    _event(88281, "work_stopped_incomplete", t + 452, target,
++           payload={"class": "quiescent", "excerpt": tail[-200:]})
++    for i in range(1, 30):                          # the restart: new connections, same DB
++        _sweep(emit, tail, t + 460 + 60 * i, target)
++    _old_code_state(target)
++    out, slo = _slo(88281, "work_stopped_incomplete", t + 500, target)
++    assert slo.calls == [], slo.calls
++    assert out[0]["deregistered"][0]["reason"] == "stage_done_handoff"
++
++
++def test_without_stage_done_the_same_stop_still_rewakes_and_escalates():
++    emit, t = _Emit(), 10_000.0
++    _turn(emit, H_WEST, t, WEST)
++    assert [c["type"] for c in emit.calls] == ["work_stopped_incomplete"]
++    _event(88302, "work_stopped_incomplete", t + 452, WEST,
++           payload={"excerpt": H_WEST[-200:]})
++    out, _ = _slo(88302, "work_stopped_incomplete", t + 500, WEST)
++    assert any(r["rewoken"] for r in out) and any(r["escalated"] for r in out), out
++
++
++def test_a_stage_done_older_than_the_new_work_does_not_cover_the_stop():
++    emit, t = _Emit(), 10_000.0
++    _turn(emit, UNFINISHED, t, WEST, stage_done_at=t - 2000, stage_id=1, work_secs=900)
++    assert [c["type"] for c in emit.calls] == ["work_stopped_incomplete"]
++
++
++@pytest.mark.parametrize("delay", [30, 500])
++def test_a_task_delivered_after_stage_done_makes_the_next_stop_news(delay):
++    """Even a quick task stopping within the stage_done window is the next task's news."""
++    emit, t = _Emit(), 10_000.0
++    _sweep(emit, WORK, t, WEST, state="working")
++    _event(1, "task_completed", t + 10, WEST, source="agent_stage_done")
++    _sweep(emit, H_WEST, t + 20, WEST)
++    _sweep(emit, H_WEST, t + 21 + aw.QUIESCENT_SECS, WEST)
++    assert emit.calls == []
++    t1 = t + 21 + aw.QUIESCENT_SECS + delay
++    aw.note_task_delivered(WEST, now=t1)            # the tech lead sends the next task
++    _sweep(emit, UNFINISHED, t1 + 5, WEST)          # finished between two sweeps
++    _sweep(emit, UNFINISHED, t1 + 6 + aw.QUIESCENT_SECS, WEST)
++    assert [c["type"] for c in emit.calls] == ["work_stopped_incomplete"]
++
++
++def test_a_task_delivered_inside_the_stage_done_window_is_news():
++    """The tech lead answers the stage at once; the agent finishes the new task in seconds,
++    so its stop sits well inside REARM_WORK_SECS of the old stage_done."""
++    emit, t = _Emit(), 10_000.0
++    _sweep(emit, WORK, t, WEST, state="working")
++    _event(1, "task_completed", t + 10, WEST, source="agent_stage_done")
++    _sweep(emit, H_WEST, t + 20, WEST)
++    aw.note_task_delivered(WEST, now=t + 60)
++    _sweep(emit, UNFINISHED, t + 70, WEST)
++    _sweep(emit, UNFINISHED, t + 71 + aw.QUIESCENT_SECS, WEST)
++    assert [c["type"] for c in emit.calls] == ["work_stopped_incomplete"]
++
++
++def test_a_failure_after_stage_done_is_announced_and_keeps_waking():
++    emit, t = _Emit(), 10_000.0
++    _turn(emit, FAILED, t, WEST, stage_done_at=t + 100, stage_id=1)
++    assert len(emit.calls) == 1
++    _event(700, "work_stopped_incomplete", t + 452, WEST,
++           payload={"excerpt": "API Error: 529 overloaded."})
++    out, _ = _slo(700, "work_stopped_incomplete", t + 500, WEST)
++    assert any(r["rewoken"] for r in out), out
++
++
++def test_another_agents_stage_done_does_not_cover_this_pane():
++    emit, t = _Emit(), 10_000.0
++    _event(1, "task_completed", t + 100, HU, source="agent_stage_done")
++    _turn(emit, H_WEST, t, WEST)
++    assert len(emit.calls) == 1
++
++
++def test_a_task_completed_from_another_emitter_does_not_cover():
++    emit, t = _Emit(), 10_000.0
++    _event(2, "task_completed", t + 100, WEST, source="runtime_job")
++    _turn(emit, H_WEST, t, WEST, stage_done_at=None)
++    assert len(emit.calls) == 1
++
++
++def test_a_crash_after_stage_done_is_announced():
++    emit, t = _Emit(), 10_000.0
++    _turn(emit, H_WEST, t, WEST, stage_done_at=t + 100, stage_id=1)
++    a = {"target": WEST, "alive": False, "is_agent": True, "state": ""}
++    aw.scan(agents=[a], read_fn=lambda _t: "", emit_fn=emit, now=t + 900)
++    assert [c["type"] for c in emit.calls] == ["agent_process_failed"]
++
++
++# ── chain 2: a statement read as an owner prompt ─────────────────────────────────────────
++def test_88295_a_statement_with_the_stem_is_not_an_owner_prompt():
++    c = aw.classify(R_88295, state="idle", prev_cls="working", quiet_secs=400)
++    assert c["cls"] != "owner_prompt", c
++
++
++@pytest.mark.parametrize("text", ["Подтвердите деплой?", "Подтвердить выкатку?",
++                                  "Подтверди, пожалуйста, деплой.",
++                                  "Подтверждаете отключение старой ветки?"])
++def test_a_real_confirmation_request_is_still_an_owner_prompt(text):
++    c = aw.classify(_pane(text), state="idle", prev_cls="working", quiet_secs=400)
++    assert c["cls"] == "owner_prompt", c
++
++
++@pytest.mark.parametrize("text", ["Подтвердилось: 9 из 9 строк скрыты.",
++                                  "Владелец подтвердил деплой, выкатил.",
++                                  "Тесты подтвердили фикс."])
++def test_past_and_future_statements_are_not_prompts(text):
++    c = aw.classify(_pane(text), state="idle", prev_cls="working", quiet_secs=400)
++    assert c["cls"] != "owner_prompt", c
++
++
++def test_88292_88295_replay_no_rewake_no_escalation():
++    emit, t = _Emit(), 10_000.0
++    r = _turn(emit, R_88295, t, LOOP, stage_done_at=t + 140, stage_id=88292)
++    assert emit.calls == [], emit.calls                # neither prompt nor second stop
++    assert {"target": LOOP, "why": "stage_done_handoff"} in r["skipped"]
++    out, slo = _slo(88292, "task_completed", t + 200, LOOP)
++    assert slo.calls == [], slo.calls
++    assert out[0]["deregistered"][0]["reason"] in PARKED
++
++
++# ── stale, unsubmitted composer text (owner draft or the CLI's suggested prompt) ───────
++@pytest.mark.parametrize("draft", ["Подтвердите деплой?", "что дальше делаем?",
++                                   "do you want to proceed (y/n)",
++                                   "1. Yes", "Подтвердите\n  деплой de94158?"])
++def test_composer_text_is_never_read_as_the_agents_prompt(draft):
++    c = aw.classify(_pane("Готово. Ветка на месте.", draft=draft), state="idle",
++                    prev_cls="working", quiet_secs=400)
++    assert c["cls"] != "owner_prompt", (draft, c)
++
++
++def test_composer_text_is_left_alone_and_not_submitted():
++    """The watcher only reads: a scan with an owner draft in the composer emits at most
++    one event and never types into the pane (read_fn is the only pane access)."""
++    emit, t = _Emit(), 10_000.0
++    tail = _pane("Сделал шаг 3 из 5.", draft="Подтвердите деплой?")
++    _turn(emit, tail, t, WEST)
++    assert [c["type"] for c in emit.calls] == ["work_stopped_incomplete"]
++    assert "Подтвердите" not in emit.calls[0]["payload"]["excerpt"]
++
++
++# ── the HU wording itself ────────────────────────────────────────────────────────────────
++def test_hu_standing_by_for_captures_is_a_declared_wait():
++    assert aw.declares_dependency_wait(H_HU)
++    assert not aw.declares_dependency_wait(_pane("Standing by for captures failed: error."))

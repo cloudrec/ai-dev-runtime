@@ -1,0 +1,4 @@
+base de94158: new file 13 failed / 18 passed (reproduces live chains)
+head ee9f1fa: new file 31 passed; focused 542 passed
+mutants: 10/10 killed
+full suite ee9f1fa: 5457 passed, 4 skipped, EXIT 0
