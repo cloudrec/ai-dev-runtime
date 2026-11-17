@@ -8,7 +8,10 @@ from core import agent_watcher as w
 
 
 def _iso(delta_secs: float) -> str:
-    return (datetime.now(timezone.utc) + timedelta(seconds=delta_secs)).isoformat(timespec="seconds")
+    # relative to the same fixed NOW the tests pass in: wall-clock "now" drifted away from
+    # the import-time NOW when this file ran late in a long (e.g. reversed) suite run
+    return (datetime.fromtimestamp(NOW, timezone.utc) + timedelta(seconds=delta_secs)
+            ).isoformat(timespec="seconds")
 
 
 def _task(status="dispatched", dispatched_secs_ago=600, tid=7):
