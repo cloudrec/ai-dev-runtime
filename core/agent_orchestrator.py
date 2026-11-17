@@ -110,7 +110,7 @@ def budget_locked() -> bool:
 
 # ── persistence ─────────────────────────────────────────────────────────────
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"), timeout=10)
+    conn = sqlite3.connect(__import__("core.control_db", fromlist=["x"]).control_db_path(), timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS agent_orchestrator (
         agent_key TEXT PRIMARY KEY, session TEXT, project TEXT, approved_goal TEXT,
         current_task TEXT, phase TEXT, state TEXT, last_fresh_activity_ts REAL,
@@ -165,7 +165,7 @@ def _upsert(rec: dict) -> None:
 
 
 def _phase_text_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"), timeout=10)
+    conn = sqlite3.connect(__import__("core.control_db", fromlist=["x"]).control_db_path(), timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS agent_phase_text (
         session TEXT, phase_id TEXT, approved_task_text TEXT, updated_at TEXT,
         PRIMARY KEY (session, phase_id))""")

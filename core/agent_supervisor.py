@@ -48,7 +48,7 @@ def heartbeat() -> None:
     import sqlite3
     from datetime import datetime, timezone
     try:
-        conn = sqlite3.connect(os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"),
+        conn = sqlite3.connect(__import__("core.control_db", fromlist=["x"]).control_db_path(),
                                timeout=5)
         try:
             conn.execute("CREATE TABLE IF NOT EXISTS supervisor_heartbeat ("

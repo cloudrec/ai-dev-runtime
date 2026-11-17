@@ -60,7 +60,7 @@ def load_config(path: Optional[str] = None) -> dict:
 
 def _state_base() -> str:
     return os.getenv("AGENT_CREATION_STATE",
-                     os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+                     __import__("core.control_db", fromlist=["x"]).control_db_path()
                      + ".creation")
 
 

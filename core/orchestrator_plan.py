@@ -33,7 +33,7 @@ def _ts() -> float:
 
 
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"), timeout=10)
+    conn = sqlite3.connect(__import__("core.control_db", fromlist=["x"]).control_db_path(), timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS orchestrator_goal (
         id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT, status TEXT,
         created_at TEXT, updated_at TEXT)""")

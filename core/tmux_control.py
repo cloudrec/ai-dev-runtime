@@ -85,7 +85,7 @@ def socket_path() -> str:
 
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(
-        os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"), timeout=10)
+        __import__("core.control_db", fromlist=["x"]).control_db_path(), timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS tmux_control_audit (
         ts TEXT, ts_epoch REAL, action TEXT, ok INTEGER, reason TEXT, detail TEXT)""")
     conn.commit()

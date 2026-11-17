@@ -2095,7 +2095,7 @@ def _delivered_to_since(session: str, since: float) -> bool:
     """Did Owner OS type anything into this agent after `since` (agent_control's
     delivery record)? Unreadable counts as yes: it must never hide later work."""
     import sqlite3
-    path = os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+    path = __import__("core.control_db", fromlist=["x"]).control_db_path()
     if not os.path.exists(path):
         return False                      # no delivery record exists at all
     try:

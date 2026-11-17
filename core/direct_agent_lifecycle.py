@@ -68,7 +68,7 @@ EVENT_INTERRUPTED = "agent_process_failed"   # death/interruption — never comp
 # ── persistence: last observation + emitted-completion flag (restart-safe) ───
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(
-        os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"), timeout=10)
+        __import__("core.control_db", fromlist=["x"]).control_db_path(), timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS direct_agent_lifecycle (
         target TEXT PRIMARY KEY, conversation_id TEXT, cwd TEXT, state TEXT,
         alive INTEGER, first_idle_ts REAL, last_seen_ts REAL,

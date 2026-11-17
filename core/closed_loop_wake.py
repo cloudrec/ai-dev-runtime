@@ -987,7 +987,7 @@ def _automation_sent_since(target: str, notified_event_id: int, conn) -> bool:
                            (notified_event_id,)).fetchone()
         if not row or row[0] is None:
             return False
-        path = os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+        path = __import__("core.control_db", fromlist=["x"]).control_db_path()
         ac = _sq.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
         try:
             hit = ac.execute(

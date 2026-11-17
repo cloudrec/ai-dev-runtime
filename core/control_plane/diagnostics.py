@@ -720,7 +720,7 @@ def cto_cursor_report(*, now: Optional[float] = None, stale_after_secs: float = 
 
 
 def _ac_db() -> str:
-    return os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+    return __import__("core.control_db", fromlist=["x"]).control_db_path()
 
 
 # The consumer reads `agent_orchestrator.status()`, which lists commander events with

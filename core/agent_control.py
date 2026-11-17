@@ -161,8 +161,11 @@ def _allowed_sessions() -> Optional[set[str]]:
     return {s.strip() for s in raw.split(",") if s.strip()}
 
 
+from core.control_db import DEFAULT_CONTROL_DB, control_db_path  # noqa: E402,F401
+
+
 def _db_path() -> str:
-    return os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+    return control_db_path()
 
 
 def _audit_path() -> str:

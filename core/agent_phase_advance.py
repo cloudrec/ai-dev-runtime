@@ -45,7 +45,7 @@ def _hash(text: str) -> str:
 
 # ── persistence ─────────────────────────────────────────────────────────────
 def _db() -> sqlite3.Connection:
-    conn = sqlite3.connect(os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"), timeout=10)
+    conn = sqlite3.connect(__import__("core.control_db", fromlist=["x"]).control_db_path(), timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS agent_phase_advance (
         session TEXT, phase_id TEXT, task_hash TEXT, status TEXT, verified_working INTEGER,
         error TEXT, dispatched_at TEXT, updated_ts REAL,

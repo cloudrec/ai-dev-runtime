@@ -67,7 +67,7 @@ def _now_iso() -> str:
 # ── persistence ──────────────────────────────────────────────────────────────
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(
-        os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"), timeout=10)
+        __import__("core.control_db", fromlist=["x"]).control_db_path(), timeout=10)
     conn.execute("""CREATE TABLE IF NOT EXISTS context_budget_state (
         target TEXT PRIMARY KEY, conversation_id TEXT, size_bytes INTEGER,
         est_tokens INTEGER, state TEXT, safe_boundary INTEGER, over_soft INTEGER,

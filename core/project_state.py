@@ -37,7 +37,7 @@ DEFAULT_FRESHNESS_SECS = int(os.getenv("PROJECT_STATE_FRESHNESS_SECS", str(24 * 
 
 
 def _db_path() -> str:
-    return os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+    return __import__("core.control_db", fromlist=["x"]).control_db_path()
 
 
 def _now_iso() -> str:

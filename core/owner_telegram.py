@@ -54,7 +54,7 @@ def send_approval_request(gid: str, summary: str, spec_hash: str, code: str,
 
 
 def _offset_path() -> str:
-    return os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db") + \
+    return __import__("core.control_db", fromlist=["x"]).control_db_path() + \
         ".telegram_offset"
 
 

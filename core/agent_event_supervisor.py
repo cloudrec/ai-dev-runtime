@@ -634,8 +634,7 @@ class Ports:
         import sqlite3
         from datetime import datetime
         try:
-            c = sqlite3.connect(os.getenv("AGENT_CONTROL_DB",
-                                          "/root/ai-dev-runtime/agent_control.db"), timeout=5)
+            c = sqlite3.connect(__import__("core.control_db", fromlist=["x"]).control_db_path(), timeout=5)
             try:
                 names = {r[0] for r in c.execute("SELECT name FROM sqlite_master")}
                 if "deliveries" in names and c.execute(

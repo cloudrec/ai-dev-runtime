@@ -115,7 +115,7 @@ def _now_iso() -> str:
 # ── persistence (restart-safe) ───────────────────────────────────────────────
 def _db() -> sqlite3.Connection:
     conn = sqlite3.connect(
-        os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db"), timeout=10)
+        __import__("core.control_db", fromlist=["x"]).control_db_path(), timeout=10)
     # idempotency + attempt ledger, one row per (target, conversation, step)
     conn.execute("""CREATE TABLE IF NOT EXISTS cw_step (
         idkey TEXT PRIMARY KEY, target TEXT, conversation_id TEXT, step_hash TEXT,
