@@ -199,3 +199,9 @@ Not applied. Live is still 3423f4d, with the vtb deny edit and the widened compa
 
 ## Release 2 (owner: "передай техлиду и делай")
 - seo ae60962 -> 97cb001 (owner page "Вернуть в список", cherry-pick of 2cc6051), 52 focused tests passed; `deploy/seo_undismiss/install.sh --check`/`--apply` rc=0, backend healthy, MCP queue contract still present. Rollback: `deploy/seo_undismiss/rollback.sh`.
+
+## Release 3 (owner: "деплой 8052c40")
+- `TARGET_SHA=8052c40 deploy/adaptive_offer/install.sh --check` then `--apply`, both rc=0. Live 8052c40, services active, runtime healthy, queue flag still set.
+- Verified the live code: the WEST wording is detected; `note_task_delivered` is present.
+- `loop_watch.check` with the companion environment reports no problems. Run from a plain shell without `WAKE_BRIDGE_OFFER`, it falsely lists the payment wakes as undelivered; those are withheld by design.
+- Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261117T165639Z`.
