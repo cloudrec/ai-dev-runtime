@@ -1,0 +1,8 @@
+runtime de94158 full suite: ========== 5426 passed, 4 skipped, 31 warnings in 1419.63s (0:23:39) ===========
+EXIT=0
+runtime focused (7 files): 331 passed
+seo 39603fb focused (disposable PG, internal net): 229 passed, 1 skipped, 35 warnings in 17.10s; only skip: test_security DNS
+seo 39603fb full (disposable PG): 48 failed, 1082 passed, 3 skipped, 40 warnings in 70.42s (0:01:10)
+seo 97cb001 base full (same method): 48 failed, 1070 passed, 3 skipped, 40 warnings in 65.35s (0:01:05)
+failure lists base vs candidate: IDENTICAL (48, none in MCP/owner/logging)
+seo e2e gunicorn UvicornWorker dummy token: with filter 0 occurrences, control without filter 1

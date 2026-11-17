@@ -1,0 +1,80 @@
+diff --git a/core/agent_watch.py b/core/agent_watch.py
+index 0f09f2c..af750ca 100644
+--- a/core/agent_watch.py
++++ b/core/agent_watch.py
+@@ -333,9 +333,39 @@ def _final_message(tail: str) -> str:
+     return " ".join(out)
+ 
+ 
++# A finished turn that explicitly HANDS the next move to the owner or the tech lead
++# (2026-11-17: ai-terminal 87669 "Решения от вас: …", fruit 87835 "Остаётся от вас: …",
++# owneros-autonomy-loop 88186 "… скажи мне «дал»"). Nothing the agent can do moves it
++# on, so it is parked exactly like a dependency wait: announced once, then re-armed by a
++# delivered task, real work, a different stop or the TTL. Only a quiescent stop (an owner
++# gate worded as a blocker or a prompt keeps its reminders), only the final message, never
++# with an error line, never when the agent says it carries on, never on a negation.
++_HANDOFF_RE = re.compile(
++    r"((?:решени[еяй]|действи[еяй]|ответ\w*|остаётся|остается|осталось|нужно|нужен|нужна|"
++    r"требуется)\s+от\s+(?:вас|тебя|владельца|техлида)(?!\s+не\b)|"
++    r"за\s+(?:тобой|вами)\s+(?:остаётся|остается|решение|выбор)|"
++    r"скажи(?:те)?\s+мне\b|"
++    r"(?:decisions?|actions?|input|go-ahead)\s+(?:is\s+|are\s+)?(?:needed\s+|required\s+)?"
++    r"from\s+(?:you|the\s+owner|the\s+tech\s+lead)\b|"
++    r"\bover\s+to\s+you\b|\byour\s+(?:call|decision|move)\b)", re.IGNORECASE)
++_CARRYING_ON_RE = re.compile(
++    r"(продолжаю|продолжу|continuing|i(?:'|’)?ll\s+continue|will\s+continue|"
++    r"дальше\s+(?:сделаю|делаю))", re.IGNORECASE)
++
++
++def declares_handoff(tail: str) -> bool:
++    msg = _final_message(tail)
++    return (bool(msg) and not _ERRORISH_RE.search(msg) and not _CARRYING_ON_RE.search(msg)
++            and bool(_HANDOFF_RE.search(msg)))
++
++
+ def declares_dependency_wait(tail: str) -> bool:
++    """A declared wait the agent itself cannot end: an external dependency (#338) or an
++    explicit hand-over of the next move (`declares_handoff`)."""
+     msg = _final_message(tail)
+-    return bool(msg) and not _ERRORISH_RE.search(msg) and bool(_DEP_WAIT_RE.search(msg))
++    if not msg or _ERRORISH_RE.search(msg):
++        return False
++    return bool(_DEP_WAIT_RE.search(msg)) or declares_handoff(tail)
+ 
+ 
+ _BLOCKER_RE = re.compile(
+diff --git a/core/closed_loop_wake.py b/core/closed_loop_wake.py
+index 569b98d..8c19339 100644
+--- a/core/closed_loop_wake.py
++++ b/core/closed_loop_wake.py
+@@ -663,6 +663,14 @@ def _resolution_reason(conn, *, event_id: int, target: str,
+                 conn, event_id) in _SETTLED_RESOLVABLE_TYPES and _dependency_wait(
+                     conn, target, now):
+             return "agent_dependency_wait"
++        # The agent formally handed its stage over (tools/stage_done.py emits
++        # `task_completed` from `agent_stage_done`): the next move is the reviewer's, so an
++        # agent pane that does not move is the expected state, not a stall (88001, 87778
++        # were re-woken and escalated for exactly this). Only while the pane is at rest: a
++        # pane working again, a crash or a question keeps its own watch, and a NEW stage
++        # or task is a new event with a fresh watch.
++        if cls in ("quiescent", "idle") and _stage_done_handoff(conn, event_id):
++            return "stage_done_handoff"
+         # The premise of a prompt wake is that a question is on screen. When agent_watch
+         # has since reclassified the pane away from `owner_prompt`/`blocker`, that premise
+         # is GONE, and re-waking and escalating to critical chases a question nobody is
+@@ -706,6 +714,15 @@ _SETTLED_RESOLVABLE_TYPES = frozenset({"task_completed", "work_stopped_incomplet
+                                        "agent_turn_stopped"})
+ 
+ 
++def _stage_done_handoff(conn, event_id: int) -> bool:
++    try:
++        r = conn.execute("SELECT type, source FROM event WHERE id=?",
++                         (int(event_id),)).fetchone()
++    except Exception:  # noqa: BLE001
++        return False
++    return bool(r) and r[0] == "task_completed" and r[1] == "agent_stage_done"
++
++
+ def _event_type(conn, event_id: int) -> str:
+     try:
+         r = conn.execute("SELECT type FROM event WHERE id=?", (int(event_id),)).fetchone()

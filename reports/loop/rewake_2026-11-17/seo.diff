@@ -1,0 +1,166 @@
+diff --git a/backend/main.py b/backend/main.py
+index 011df2b..e88c194 100644
+--- a/backend/main.py
++++ b/backend/main.py
+@@ -11,6 +11,11 @@ from fastapi.middleware.cors import CORSMiddleware
+ 
+ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+ 
++# Secrets in URL paths (MCP connector, owner links) never reach the access log.
++from services.log_redaction import install as _install_log_redaction  # noqa: E402
++
++_install_log_redaction()
++
+ from config import settings  # noqa: E402
+ from database import init_db  # noqa: E402
+ 
+diff --git a/backend/services/log_redaction.py b/backend/services/log_redaction.py
+new file mode 100644
+index 0000000..c85235c
+--- /dev/null
++++ b/backend/services/log_redaction.py
+@@ -0,0 +1,56 @@
++"""Keep secrets that travel in URLs out of the access log.
++
++Three routes carry a credential in the PATH: the ChatGPT MCP connector
++(`/api/mcp/c/<token>`), the owner's release link (`/api/owner/fc-release/<token>`) and
++the owner's project page (`/api/owner/fc-page/<key>/...`). uvicorn writes every request
++line to `uvicorn.access` (gunicorn's UvicornWorker routes it to stdout), so `docker logs`
++held the live connector token. A filter on the access loggers rewrites the request line
++before any handler sees it; query values with a secret-looking name are blanked too.
++"""
++from __future__ import annotations
++
++import logging
++import re
++
++REDACTED = "<redacted>"
++_SECRET_PATH = re.compile(
++    r"(/api/mcp/c/|/api/owner/fc-release/|/api/owner/fc-page/)[^/?#\s\"']+")
++_SECRET_QUERY = re.compile(
++    r"([?&](?:token|access_token|key|secret|password|ptok|api_key)=)[^&#\s\"']*",
++    re.IGNORECASE)
++ACCESS_LOGGERS = ("uvicorn.access", "gunicorn.access", "uvicorn.error", "gunicorn.error")
++
++
++def redact(text: str) -> str:
++    if not isinstance(text, str) or "/" not in text and "=" not in text:
++        return text
++    return _SECRET_QUERY.sub(r"\1" + REDACTED, _SECRET_PATH.sub(r"\1" + REDACTED, text))
++
++
++class SecretPathFilter(logging.Filter):
++    """Never drops a record; only rewrites its message and string arguments."""
++
++    def filter(self, record: logging.LogRecord) -> bool:
++        try:
++            if isinstance(record.msg, str):
++                record.msg = redact(record.msg)
++            if isinstance(record.args, tuple):
++                record.args = tuple(redact(a) if isinstance(a, str) else a
++                                    for a in record.args)
++            elif isinstance(record.args, dict):
++                record.args = {k: redact(v) if isinstance(v, str) else v
++                               for k, v in record.args.items()}
++        except Exception:  # noqa: BLE001 — logging must never fail a request
++            pass
++        return True
++
++
++_FILTER = SecretPathFilter()
++
++
++def install() -> None:
++    """Idempotent: attach the filter to every access/error logger."""
++    for name in ACCESS_LOGGERS:
++        lg = logging.getLogger(name)
++        if _FILTER not in lg.filters:
++            lg.addFilter(_FILTER)
+diff --git a/backend/tests/test_log_redaction.py b/backend/tests/test_log_redaction.py
+new file mode 100644
+index 0000000..07c052d
+--- /dev/null
++++ b/backend/tests/test_log_redaction.py
+@@ -0,0 +1,82 @@
++"""The access log never carries a secret from a URL path or query (synthetic dummies)."""
++from __future__ import annotations
++
++import io
++import logging
++
++import pytest
++
++from services import log_redaction as lr
++
++DUMMY = "mcp_DUMMYdummy0000SyntheticTokenNotReal_abc123"
++PAGE = "pagekey-DUMMY-0000-not-real"
++
++
++@pytest.mark.parametrize("line", [
++    f'172.20.0.6:59644 - "POST /api/mcp/c/{DUMMY} HTTP/1.1" 200',
++    f'1.2.3.4:1 - "GET /api/mcp/c/{DUMMY}?x=1 HTTP/1.1" 200',
++    f'1.2.3.4:1 - "GET /api/owner/fc-release/{PAGE} HTTP/1.1" 200',
++    f'1.2.3.4:1 - "POST /api/owner/fc-page/{PAGE}/undismiss/proj-1 HTTP/1.1" 200',
++    f'1.2.3.4:1 - "GET /api/health?token={DUMMY}&a=b HTTP/1.1" 200',
++    f'1.2.3.4:1 - "GET /x?API_KEY={DUMMY} HTTP/1.1" 200',
++])
++def test_redact_removes_the_secret(line):
++    out = lr.redact(line)
++    assert DUMMY not in out and PAGE not in out
++    assert lr.REDACTED in out
++
++
++def test_redact_keeps_the_rest_of_the_line():
++    out = lr.redact(f'1.2.3.4:1 - "POST /api/owner/fc-page/{PAGE}/undismiss/proj-1 HTTP/1.1" 200')
++    assert out == '1.2.3.4:1 - "POST /api/owner/fc-page/<redacted>/undismiss/proj-1 HTTP/1.1" 200'
++    plain = '1.2.3.4:1 - "GET /api/health?page=2 HTTP/1.1" 200'
++    assert lr.redact(plain) == plain
++
++
++def _capture(name):
++    buf = io.StringIO()
++    h = logging.StreamHandler(buf)
++    h.setFormatter(logging.Formatter("%(message)s"))
++    lg = logging.getLogger(name)
++    lg.addHandler(h)
++    lg.setLevel(logging.INFO)
++    lg.propagate = False
++    return buf, lg, h
++
++
++@pytest.mark.parametrize("name", ["uvicorn.access", "gunicorn.access", "uvicorn.error"])
++def test_installed_filter_redacts_a_real_access_record(name):
++    lr.install()
++    lr.install()                                  # idempotent
++    buf, lg, h = _capture(name)
++    try:
++        # uvicorn's own call shape: '%s - "%s %s HTTP/%s" %d'
++        lg.info('%s - "%s %s HTTP/%s" %d', "172.20.0.6:59644", "POST",
++                f"/api/mcp/c/{DUMMY}", "1.1", 200)
++        lg.info(f"Exception in ASGI application for /api/owner/fc-page/{PAGE}")
++    finally:
++        lg.removeHandler(h)
++    out = buf.getvalue()
++    assert DUMMY not in out and PAGE not in out, out
++    assert '"POST /api/mcp/c/<redacted> HTTP/1.1" 200' in out
++    assert sum(1 for f in lg.filters if isinstance(f, lr.SecretPathFilter)) == 1
++
++
++def test_a_broken_record_is_never_dropped():
++    rec = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, "%s %d", ("a", 1), None)
++    assert lr.SecretPathFilter().filter(rec) is True
++    rec2 = logging.LogRecord("uvicorn.access", logging.INFO, __file__, 1, object(), None, None)
++    assert lr.SecretPathFilter().filter(rec2) is True
++
++
++def test_main_installs_the_filter_on_import():
++    """In a fresh interpreter: importing the app alone must attach the filter."""
++    import os
++    import subprocess
++    import sys
++    backend = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++    code = ("import logging, main; from services.log_redaction import SecretPathFilter as F; "
++            "print(any(isinstance(f, F) for f in logging.getLogger('uvicorn.access').filters))")
++    r = subprocess.run([sys.executable, "-c", code], cwd=backend, capture_output=True,
++                       text=True, timeout=120)
++    assert r.stdout.strip().splitlines()[-1:] == ["True"], (r.stdout[-500:], r.stderr[-1500:])
