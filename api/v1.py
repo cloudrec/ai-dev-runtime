@@ -525,7 +525,8 @@ def agents_send_queue_reconcile(idempotency_key: str, req: SendQueueReconcileReq
     """Settle an `unknown` send (outcome: delivered | abandon | requeue), attributed."""
     from core import send_queue
     actor, _src = caller_identity(request, x_runtime_actor)
-    return send_queue.reconcile(idempotency_key, req.outcome, by=actor or "api")
+    return send_queue.reconcile(idempotency_key, req.outcome, by=actor or "api",
+                                actor=actor or "")
 
 
 @router.delete("/agents/send-queue/{idempotency_key}")

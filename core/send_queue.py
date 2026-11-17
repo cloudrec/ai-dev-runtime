@@ -234,10 +234,31 @@ def _recover_lost_claims(conn, now: float) -> None:
     conn.commit()
 
 
+def _reconcile_refusal(row: dict, outcome: str, actor: Optional[str]) -> str:
+    """The caller must be allowed to command this agent today (payment hard-deny
+    included); a requeue also needs the very pane the message was meant for."""
+    from core import agent_control as ac
+    try:
+        pane = ac._pane_is_live_agent(row["target"])
+    except ac.AgentControlError:
+        return "target_gone" if outcome == "requeue" else ""
+    refusal, _ = ac.automation_decision(
+        pane.get("session") or row["target"].split(":")[0], pane["target"], actor,
+        action="agent_send", cwd=pane.get("claude_cwd") or pane.get("cwd"))
+    if refusal:
+        return refusal
+    if outcome == "requeue" and ((pane.get("pane_id") or "") != (row["pane_id"] or "")
+                                 or pane.get("pid") != row["pane_pid"]):
+        return "target_identity_changed"
+    return ""
+
+
 def reconcile(idempotency_key: str, outcome: str, *, by: str,
-              now: Optional[float] = None) -> dict:
+              actor: Optional[str] = None, now: Optional[float] = None) -> dict:
     """Settle an `unknown` row explicitly. outcome: delivered | abandon | requeue.
-    `requeue` accepts the duplicate risk on the record of who decided."""
+    Needs the caller's own authority over the target (as a send would), so a payment
+    agent's row cannot be requeued by anyone. `requeue` accepts the duplicate risk on
+    the record of who decided; delivery re-runs every check again."""
     from core import agent_control as ac
     now = time.time() if now is None else now
     if outcome not in ("delivered", "abandon", "requeue") or not (by or "").strip():
@@ -248,6 +269,11 @@ def reconcile(idempotency_key: str, outcome: str, *, by: str,
         if not row or row["status"] != "unknown":
             return {"ok": False, "refused": "not_unknown",
                     "status": row["status"] if row else "unknown_key"}
+        why = _reconcile_refusal(row, outcome, actor if actor is not None else row["actor"])
+        if why:
+            ac.audit("send_queue_reconcile", row["target"], idempotency_key, outcome=outcome,
+                     actor=by, refused=why)
+            return {"ok": False, "refused": why}
         settled = _settle_from_record(idempotency_key)
         if settled:                            # evidence appeared: it decides
             _finish(conn, row["id"], settled[0], settled[1], now, {"reconciled_by": by})

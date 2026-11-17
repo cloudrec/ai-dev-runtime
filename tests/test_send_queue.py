@@ -378,3 +378,43 @@ def test_a_long_unknown_raises_a_loop_watch_problem():
     p = lw.send_queue_unknown(None, LATER + sq.UNKNOWN_ALARM_SECS + 10)
     assert "u1" in p["send_queue_unknown"]
     assert lw.send_queue_unknown in lw.CHECKS
+
+
+# ── reconcile needs the caller's own authority (2026-11-17) ─────────────────
+def _unknown(key, target="worker-a:0.0"):
+    sq.enqueue(target, key, idempotency_key=key, actor=GPT, now=1000.0)
+    _force(key, started=1000.0)
+    sq.drain(now=LATER, send=Sent())
+    assert sq.status(key)["status"] == "unknown"
+
+
+def test_reconcile_refuses_a_caller_without_authority(monkeypatch):
+    _unknown("a1")
+    monkeypatch.delenv("AGENT_AUTOMATION_OPEN_CALLERS")
+    for outcome in ("requeue", "abandon", "delivered"):
+        assert sq.reconcile("a1", outcome, by="x", actor=GPT)["refused"] == \
+            "automation_target_not_allowlisted"
+    assert sq.status("a1")["status"] == "unknown"
+
+
+def test_reconcile_never_touches_a_target_that_became_payment_work():
+    _unknown("a2")
+    PANES["worker-a"]["cwd"] = "/opt/payment-orchestrator"
+    assert sq.reconcile("a2", "requeue", by="lead", actor=GPT)["refused"] == \
+        "hard_denied_target"
+
+
+def test_reconcile_requeue_needs_the_same_pane():
+    _unknown("a3")
+    PANES["worker-a"]["pid"] = 4242
+    assert sq.reconcile("a3", "requeue", by="lead", actor=GPT)["refused"] == \
+        "target_identity_changed"
+    assert sq.reconcile("a3", "abandon", by="lead", actor=GPT)["status"] == "cancelled"
+
+
+def test_reconcile_refusals_are_audited(tmp_path):
+    _unknown("a4")
+    del PANES["worker-a"]
+    assert sq.reconcile("a4", "requeue", by="lead", actor=GPT)["refused"] == "target_gone"
+    audit = (tmp_path / "audit.jsonl").read_text()
+    assert "send_queue_reconcile" in audit and "target_gone" in audit
