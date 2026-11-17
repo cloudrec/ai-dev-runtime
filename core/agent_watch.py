@@ -287,26 +287,49 @@ def parse_park_until(text: str, now: Optional[float] = None) -> Optional[float]:
     return None
 
 
-# backlog #338 (HU/WEST, 2026-11-17): an agent at rest that SAYS it waits on someone else
-# or for a new task. Each turn re-states the wait in new words, so the digest moves and
-# every restatement became a fresh event, re-wake and escalation. The first such stop is
-# announced; after that the wait is a durable state, re-armed only by real progress (the
-# pane goes back to work) or a different kind of stop. Questions on screen
-# (owner_prompt) and crashes are never parked.
+# backlog #338 (HU/WEST, 2026-11-17): an agent at rest whose LAST MESSAGE says it waits
+# for a dependency or for a new task. Each turn re-stated the wait in new words, so the
+# digest moved and every restatement became a fresh event, re-wake and escalation.
+#
+# Deliberately narrow (2026-11-17 security review):
+#   * only the `quiescent` class parks. A blocker (an owner gate keeps reminding), a
+#     `completed` (a short task's result must reach the tech lead), a question on screen
+#     and a crash are always announced, and each re-arms;
+#   * only explicit dependency/new-task phrases, never a bare "жду"/"ожидаю"/"waiting
+#     for owner approval" (those are owner gates);
+#   * only the agent's final message (after its last "●" bullet), and never a line that
+#     looks like an error, so tool output or a quoted log cannot mute an agent;
+#   * bounded: WAIT_TTL_SECS after it was declared the wait lapses and is announced again;
+#     it also lapses when the pane leaves the inventory (a reused name inherits nothing).
 _DEP_WAIT_RE = re.compile(
-    r"(dependency wait|waiting (?:for|on) (?:the |a |an )?(?:owner|tech lead|techlead|"
-    r"merge|review|approval|captures?|dependency|new task|next task|ru\b|another)|"
-    r"blocked on (?:the )?(?:owner|merge|dependency|review)|\bnext: wait for\b|"
-    r"\bжд[ёе]м\b|\bжду\b|\bожида(?:ю|ем)\b|либо нов(?:ое|ую) задани|до нов(?:ой|ого) "
-    r"задач|нового задания)", re.IGNORECASE)
-_DEP_WAIT_CLASSES = frozenset({"quiescent", "blocker", "completed"})
-# Work of at least this long between two declared waits is a new task (re-arm); a quick
-# turn that only re-states the wait (someone pinged, the agent said "still waiting") is not.
+    r"(dependency wait|wait(?:ing)? for (?:a |the )?(?:new|next) task|"
+    r"wait(?:ing)? for (?:the )?(?:owner )?captures?|\bnext: wait for (?:owner )?captures?|"
+    r"либо нов(?:ое|ую) задани|до нов(?:ой|ого) задач|жд[ёе]м нов(?:ое|ую|ого) задани|"
+    r"жд[ёе]м (?:авторизованн\w* )?захват)", re.IGNORECASE)
+_ERRORISH_RE = re.compile(r"(error|exception|traceback|failed|ошибк|сбой|упал)", re.I)
 REARM_WORK_SECS = int(os.getenv("AGENT_WATCH_REARM_WORK_SECS", "300"))
+WAIT_TTL_SECS = int(os.getenv("AGENT_WATCH_DEPENDENCY_WAIT_TTL_SECS", str(4 * 3600)))
+
+
+def _final_message(tail: str) -> str:
+    """The agent's last message: from its last "●" bullet to the prompt/status lines."""
+    lines = (tail or "").splitlines()
+    start = max((i for i, ln in enumerate(lines) if ln.lstrip().startswith("●")),
+                default=None)
+    if start is None:
+        return ""
+    out = []
+    for ln in lines[start:]:
+        st = ln.strip()
+        if st.startswith(("✻", "❯", "─", "⏵", "※")) or "esc to interrupt" in st:
+            break
+        out.append(st.lstrip("● "))
+    return " ".join(out)
 
 
 def declares_dependency_wait(tail: str) -> bool:
-    return bool(_DEP_WAIT_RE.search(_bottom_lines_text(tail, 14)))
+    msg = _final_message(tail)
+    return bool(msg) and not _ERRORISH_RE.search(msg) and bool(_DEP_WAIT_RE.search(msg))
 
 
 _BLOCKER_RE = re.compile(
@@ -733,6 +756,29 @@ def _check_crash_loop(conn, emit_fn, *, project: str, target: str, now: float) -
     return (ev or {}).get("event_id")
 
 
+def _clear_dependency_wait(conn, target: str) -> None:
+    conn.execute("UPDATE agent_watch_state SET wait_since=NULL, work_since=NULL, "
+                 "work_last=NULL WHERE target=?", (target,))
+    try:
+        from core import native_supervisor as _ns
+        _ns.clear_external_wait(target, conn=conn)
+    except Exception:  # noqa: BLE001 — never breaks the sweep
+        pass
+
+
+def _declare_dependency_wait(conn, target: str, now: float, evidence: str) -> None:
+    conn.execute("UPDATE agent_watch_state SET wait_since=? WHERE target=?", (now, target))
+    try:
+        # the supervisor's idle sweep stops nudging for the same bounded time; it is the
+        # same record a scheduled park writes, and it expires on its own
+        from core import native_supervisor as _ns
+        _ns.mark_external_wait(target, reason="dependency_wait", by="agent_watch",
+                               evidence=evidence[:200], ttl_secs=WAIT_TTL_SECS,
+                               conn=conn, now=now)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
          emit_fn: Optional[Callable] = None, conn=None,
          now: Optional[float] = None) -> dict:
@@ -878,26 +924,30 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             if cls not in _EVENT_FOR:
                 skipped.append({"target": target, "why": f"class_{cls}"})
                 continue
-            dep_wait = (cls in _DEP_WAIT_CLASSES and bool(a.get("alive"))
+            dep_wait = (cls == "quiescent" and bool(a.get("alive"))
                         and declares_dependency_wait(tail))
-            wait_since = row[6] if row and len(row) > 6 else None
-            if wait_since is not None and row[7] is not None and row[8] is not None:
-                worked = float(row[8]) - float(row[7])
-                conn.execute("UPDATE agent_watch_state SET work_since=NULL, work_last=NULL "
-                             "WHERE target=?", (target,))
-                if worked >= REARM_WORK_SECS:   # real work happened: a new task, re-arm
-                    conn.execute("UPDATE agent_watch_state SET wait_since=NULL WHERE "
-                                 "target=?", (target,))
-                    wait_since = None
+            wait_since = row[6] if row else None
+            rearm = None
+            if wait_since is not None:
+                worked = (float(row[8]) - float(row[7])
+                          if row[7] is not None and row[8] is not None else 0.0)
+                if row[7] is not None:
+                    conn.execute("UPDATE agent_watch_state SET work_since=NULL, "
+                                 "work_last=NULL WHERE target=?", (target,))
+                if not dep_wait:
+                    rearm = "different_stop"   # completed, blocker, question, crash, plain
+                elif worked >= REARM_WORK_SECS:
+                    rearm = "new_task_worked"
+                elif now - float(wait_since) >= WAIT_TTL_SECS:
+                    rearm = "wait_ttl_lapsed"
+            if rearm:
+                _clear_dependency_wait(conn, target)
+                wait_since = None
             if dep_wait and wait_since is not None:
                 # the same declared wait, re-stated: not news (#338)
                 skipped.append({"target": target, "why": "dependency_wait_parked"})
                 conn.commit()
                 continue
-            if not dep_wait and wait_since is not None:
-                # a different kind of stop (a question, a plain blocker, a crash) re-arms
-                conn.execute("UPDATE agent_watch_state SET wait_since=NULL, work_since=NULL,"
-                             " work_last=NULL WHERE target=?", (target,))
             # At rest is the END STATE of an agent whose Full Cycle project is done: the
             # engine's verified, reviewer-approved record outranks the pane's wording.
             # Only the at-rest classes — a question, a blocker or a crash still emits.
@@ -925,8 +975,7 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 overdue = (REMINDER_SECS and cls in ("owner_prompt", "blocker")
                            and (now - float(n_ts or 0)) >= REMINDER_SECS)
                 if dep_wait:            # announced already: from now on a durable wait
-                    conn.execute("UPDATE agent_watch_state SET wait_since=? WHERE target=?",
-                                 (now, target))
+                    _declare_dependency_wait(conn, target, now, _final_message(tail))
                     overdue = False
                 if not overdue:
                     skipped.append({"target": target, "why": "already_notified"})
@@ -963,9 +1012,10 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 dedup_window_secs=(REMINDER_SECS or 86400), conn=conn)
             conn.execute(
                 "UPDATE agent_watch_state SET notified_cls=?, notified_digest=?, "
-                "notified_at=?, notified_ts=?, emissions=emissions+1, wait_since=? "
-                "WHERE target=?",
-                (cls, dg, now_iso(), now, now if dep_wait else None, target))
+                "notified_at=?, notified_ts=?, emissions=emissions+1 WHERE target=?",
+                (cls, dg, now_iso(), now, target))
+            if dep_wait:
+                _declare_dependency_wait(conn, target, now, _final_message(tail))
             if cls == "crashed":
                 _check_crash_loop(conn, emit_fn, project=project, target=target, now=now)
             conn.commit()
@@ -978,6 +1028,12 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
         if present:
             conn.execute("UPDATE agent_watch_state SET miss_count=0 WHERE target IN (%s)"
                          % ",".join("?" * len(present)), tuple(present))
+            # a declared wait belongs to the pane that declared it, not to its name
+            for (gone,) in conn.execute(
+                    "SELECT target FROM agent_watch_state WHERE wait_since IS NOT NULL "
+                    "AND target NOT IN (%s)" % ",".join("?" * len(present)),
+                    tuple(present)).fetchall():
+                _clear_dependency_wait(conn, gone)
         for target, prev_cls, n_cls, misses in conn.execute(
                 "SELECT target, cls, notified_cls, COALESCE(miss_count,0) "
                 "FROM agent_watch_state").fetchall():

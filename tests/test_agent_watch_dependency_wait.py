@@ -56,9 +56,21 @@ _settle = _turn
 
 def test_the_phrase_detector():
     assert aw.declares_dependency_wait(_wait(1))
-    assert aw.declares_dependency_wait("Next: wait for owner captures (IKI).\n❯ \n")
-    assert aw.declares_dependency_wait("This is a normal dependency wait, not a failure.\n")
+    assert aw.declares_dependency_wait("● Next: wait for owner captures (IKI).\n❯ \n")
+    assert aw.declares_dependency_wait("● Готово, ждём новое задание.\n❯ \n")
     assert not aw.declares_dependency_wait(_plain(1))
+    # owner gates are not dependency waits: they must keep reminding
+    for gate in ("● Жду подтверждения владельца на деплой.\n❯ \n",
+                 "● Waiting for owner approval to deploy.\n❯ \n",
+                 "● Ожидаю решения техлида.\n❯ \n"):
+        assert not aw.declares_dependency_wait(gate), gate
+    # only the agent's final message counts, and never an error line
+    assert not aw.declares_dependency_wait(
+        "● Ждём новое задание.\n✻ Baked\n● Запустил тесты: 3 failed.\n❯ \n")
+    assert not aw.declares_dependency_wait(
+        "● Error: ждём новое задание от сервера, соединение упало.\n❯ \n")
+    assert not aw.declares_dependency_wait(
+        "$ tail log\nждём новое задание (из лога)\n❯ \n")
 
 
 def test_a_declared_wait_is_announced_once_and_restatements_are_not_news():
@@ -66,7 +78,7 @@ def test_a_declared_wait_is_announced_once_and_restatements_are_not_news():
     _settle(emit, _wait(1), t)
     assert [c["type"] for c in emit.calls] == ["work_stopped_incomplete"]
     for i in range(2, 8):                      # each turn re-states the wait in new words
-        t += 3600
+        t += 1800                              # all within the wait's TTL
         r = _settle(emit, _wait(i), t)
         assert any(s["why"] == "dependency_wait_parked" for s in r["skipped"]), r
     assert len(emit.calls) == 1
@@ -116,6 +128,81 @@ def test_closed_loop_does_not_rewake_a_declared_wait():
     emit, t = _Emit(), 1000.0
     _turn(emit, _wait(1), t)
     conn = aw._conn(None)[0]
-    assert clw._dependency_wait(conn, T)
+    assert clw._dependency_wait(conn, T, t + 600)
     _turn(emit, _plain(2), t + 2000)                        # a plain stop: re-armed
-    assert not clw._dependency_wait(conn, T)
+    assert not clw._dependency_wait(conn, T, t + 2600)
+
+
+
+# ── 2026-11-17 security review of #338 ──────────────────────────────────────
+def _types(emit):
+    return [c["type"] for c in emit.calls]
+
+
+def test_review1_an_owner_gate_blocker_keeps_reminding():
+    emit, t = _Emit(), 1000.0
+    gate = "● Жду подтверждения владельца на деплой. Нужно ваше решение.\n✻ Baked\n\n❯ \n"
+    _turn(emit, gate, t)
+    n = len(emit.calls)
+    assert n >= 1
+    _sweep(emit, gate, t + 400 + aw.REMINDER_SECS + 1)
+    assert len(emit.calls) == n + 1, _types(emit)          # hourly reminder still fires
+
+
+def test_review2_a_short_tasks_completion_is_announced_inside_a_wait():
+    emit, t = _Emit(), 1000.0
+    _turn(emit, _wait(1), t)
+    done = "● Готово: исправил тест и закоммитил. Ждём новое задание.\n✻ Baked\n\n❯ \n"
+    _turn(emit, done, t + 2000, work_secs=60)
+    assert len(emit.calls) == 2, _types(emit)
+
+
+def test_review3_a_wait_then_a_blocker_rearms():
+    emit, t = _Emit(), 1000.0
+    _turn(emit, _wait(1), t)
+    blocker = "● Не могу продолжить: нужен доступ к репозиторию, жду инструкций.\n❯ \n"
+    _turn(emit, blocker, t + 2000)
+    assert len(emit.calls) == 2, _types(emit)
+    _turn(emit, _wait(3), t + 4000)                         # and the next wait is news again
+    assert len(emit.calls) == 3, _types(emit)
+
+
+def test_review4_a_wait_lapses_after_its_ttl():
+    emit, t = _Emit(), 1000.0
+    _turn(emit, _wait(1), t)
+    _turn(emit, _wait(2), t + 1000)
+    assert len(emit.calls) == 1
+    _turn(emit, _wait(3), t + aw.WAIT_TTL_SECS + 10)
+    assert len(emit.calls) == 2
+
+
+def test_review4_closed_loop_stops_resolving_after_the_ttl():
+    from core import closed_loop_wake as clw
+    emit, t = _Emit(), 1000.0
+    _turn(emit, _wait(1), t)
+    conn = aw._conn(None)[0]
+    since = conn.execute("SELECT wait_since FROM agent_watch_state WHERE target=?",
+                         (T,)).fetchone()[0]
+    assert clw._dependency_wait(conn, T, since + 10)
+    assert not clw._dependency_wait(conn, T, since + aw.WAIT_TTL_SECS + 1)
+
+
+def test_review5_a_pane_that_leaves_drops_its_wait():
+    emit, t = _Emit(), 1000.0
+    _turn(emit, _wait(1), t)
+    other = {"target": "other:0.0", "cwd": "/x", "claude_cwd": "/x", "alive": True,
+             "is_agent": True, "state": "idle"}
+    aw.scan(agents=[other], read_fn=lambda _t: "", emit_fn=emit, now=t + 1000)
+    conn = aw._conn(None)[0]
+    assert conn.execute("SELECT wait_since FROM agent_watch_state WHERE target=?",
+                        (T,)).fetchone()[0] is None
+
+
+def test_review7_the_supervisor_is_told_and_untold():
+    from core import native_supervisor as ns
+    emit, t = _Emit(), 1000.0
+    _turn(emit, _wait(1), t)
+    conn = aw._conn(None)[0]
+    assert ns.in_external_wait(T, conn=conn, now=t + 500)
+    _turn(emit, _plain(2), t + 2000)
+    assert not ns.in_external_wait(T, conn=conn, now=t + 2500)

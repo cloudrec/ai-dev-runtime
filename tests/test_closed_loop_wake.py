@@ -2033,7 +2033,7 @@ def _set_wait(conn, target, cls, wait_since):
 
 
 def test_a_declared_dependency_wait_is_not_rewoken_or_escalated(conn):
-    _set_wait(conn, "gaika-country-hu:0.0", "quiescent", NOW - 10)
+    _set_wait(conn, "gaika-country-hu:0.0", "quiescent", NOW + clw.WAKE_LOOP_SLO_SECS - 10)
     emit = _Emit()
     clw.register_delivery(event_id=338, target="gaika-country-hu:0.0", project_id="hu",
                           event_type="work_stopped_incomplete", conn=conn, now=NOW)
@@ -2050,3 +2050,13 @@ def test_without_a_declared_wait_the_same_stop_is_still_rewoken(conn):
                           event_type="work_stopped_incomplete", conn=conn, now=NOW)
     r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
     assert r["rewoken"], r
+
+
+def test_a_declared_wait_on_a_blocker_does_not_resolve_its_watch(conn):
+    """Only a quiescent wait is a dependency wait; an owner-gate blocker keeps its watch."""
+    _set_wait(conn, "gaika-country-hu:0.0", "blocker", NOW + clw.WAKE_LOOP_SLO_SECS - 10)
+    emit = _Emit()
+    clw.register_delivery(event_id=340, target="gaika-country-hu:0.0", project_id="hu",
+                          event_type="agent_waiting_input", conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not any(d.get("reason") == "agent_dependency_wait" for d in r["deregistered"])
