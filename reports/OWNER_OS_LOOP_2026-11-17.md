@@ -196,3 +196,6 @@ Not applied. Live is still 3423f4d, with the vtb deny edit and the widened compa
   - the same key again: `duplicate:true`, the text appears once in the pane;
   - `loop_watch.check`: no problems.
 - No payment target was called; payment exclusion stays proven by the tests and by `--check`.
+
+## Release 2 (owner: "передай техлиду и делай")
+- seo ae60962 -> 97cb001 (owner page "Вернуть в список", cherry-pick of 2cc6051), 52 focused tests passed; `deploy/seo_undismiss/install.sh --check`/`--apply` rc=0, backend healthy, MCP queue contract still present. Rollback: `deploy/seo_undismiss/rollback.sh`.
