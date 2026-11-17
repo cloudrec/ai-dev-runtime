@@ -185,3 +185,14 @@ Evidence:
 
 ## Live
 Not applied. Live is still 3423f4d, with the vtb deny edit and the widened companion list. The owner's direct word is needed; the tech-lead API instruction was explicitly not counted as approval.
+
+## Release 2026-11-17 (owner's direct word: "деплой d052832, seo и очередь")
+- Runtime: `TARGET_SHA=d052832 deploy/adaptive_offer/install.sh --check` rc=0, `--apply` rc=0. Live d052832. Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261117T144358Z`.
+- SEO: `deploy/seo_send_queue/install.sh --check` then `--apply`; deployed branch fast-forwarded 6114af8 -> ae60962, backend image rebuilt, only the backend container recreated, healthy. Rollback: `deploy/seo_send_queue/rollback.sh` (image `seo-backend:rollback-pre-send-queue`).
+- Queue: `/etc/systemd/system/ai-runtime.service.d/99-send-queue.conf` (`SEND_QUEUE_ENABLED=1`), ai-runtime restarted and healthy. Undo: remove the file, daemon-reload, restart ai-runtime.
+- Live check through the real seo MCP handlers against the live runtime, with a disposable non-payment tmux pane `sq-probe` (/var/tmp/sq-probe, removed afterwards):
+  - unknown target: refused, nothing created;
+  - busy target: `queued:true, delivered:false`; delivered once when the pane went idle (attempts 1);
+  - the same key again: `duplicate:true`, the text appears once in the pane;
+  - `loop_watch.check`: no problems.
+- No payment target was called; payment exclusion stays proven by the tests and by `--check`.
