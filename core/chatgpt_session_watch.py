@@ -69,7 +69,26 @@ def decide(state: dict, status: str, now: float) -> Optional[str]:
     last = float(state.get("last_sent") or 0)
     if state.get("alerted") and now - last < REMINDER_SECS:
         return None
-    return _TEXT.get(status, _TEXT[BROWSER_DOWN])
+    text = _TEXT.get(status, _TEXT[BROWSER_DOWN])
+    link = login_url() if status == LOGGED_OUT else ""
+    return f"{text}\nВойти: {link}" if link else text
+
+
+def login_url() -> str:
+    """The owner's view of the wake browser (noVNC, tailnet only), set by the operator.
+    Only an http(s) URL without credentials is used; anything else is dropped, so a
+    misconfiguration can never put a secret into a Telegram message."""
+    from urllib.parse import urlsplit
+    raw = os.getenv("CHATGPT_SESSION_LOGIN_URL", "").strip()
+    try:
+        u = urlsplit(raw)
+    except ValueError:
+        return ""
+    if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password:
+        return ""
+    if "password" in (u.query or "").lower():
+        return ""
+    return raw
 
 
 def check(probe: Callable[[], str], send: Optional[Callable[[str], tuple]] = None,

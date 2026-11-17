@@ -204,3 +204,42 @@ def test_companion_reports_a_failed_send(monkeypatch, capsys):
                                                "error": "chat not found"})
     wc.watch_chatgpt_session()
     assert "send failed: chat not found" in capsys.readouterr().out
+
+
+# ── login link (owner opens the wake browser over the tailnet and logs in by hand) ──
+LINK = "http://polyinput-server.example.ts.net:6080/vnc.html?autoconnect=1&resize=remote"
+
+
+def _alert(status, monkeypatch, url):
+    if url is None:
+        monkeypatch.delenv("CHATGPT_SESSION_LOGIN_URL", raising=False)
+    else:
+        monkeypatch.setenv("CHATGPT_SESSION_LOGIN_URL", url)
+    state = {"streak": w.FAIL_THRESHOLD}
+    return w.decide(state, status, 1000.0)
+
+
+def test_logged_out_alert_carries_the_login_link(monkeypatch):
+    msg = _alert(w.LOGGED_OUT, monkeypatch, LINK)
+    assert msg.startswith(w._TEXT[w.LOGGED_OUT]) and msg.endswith("Войти: " + LINK)
+
+
+def test_no_link_configured_keeps_the_old_text(monkeypatch):
+    assert _alert(w.LOGGED_OUT, monkeypatch, None) == w._TEXT[w.LOGGED_OUT]
+    assert _alert(w.LOGGED_OUT, monkeypatch, "  ") == w._TEXT[w.LOGGED_OUT]
+
+
+def test_browser_down_gets_no_login_link(monkeypatch):
+    """Logging in cannot fix a dead browser; the link would only mislead."""
+    assert _alert(w.BROWSER_DOWN, monkeypatch, LINK) == w._TEXT[w.BROWSER_DOWN]
+
+
+@pytest.mark.parametrize("bad", [
+    "http://user:secret@host.example.ts.net:6080/vnc.html",
+    "http://host.example.ts.net:6080/vnc.html?password=hunter2",
+    "javascript:alert(1)",
+    "file:///home/owneros/.vncpasswd",
+    "host.example.ts.net:6080",
+])
+def test_a_link_that_could_carry_a_secret_or_is_not_web_is_dropped(monkeypatch, bad):
+    assert _alert(w.LOGGED_OUT, monkeypatch, bad) == w._TEXT[w.LOGGED_OUT]
