@@ -60,3 +60,6 @@ All of this is on the branch. Live is not changed until the owner says "депл
 - A second block was found: the companion's canary filter `WAKE_BRIDGE_ONLY_AGENTS`. A new drop-in `99-tech-lead-hears.conf` adds `gaika-country-*` and `owneros-*`. Payment agents are still left out. The first wakes from gaika-country-hu (87048) and owneros-fable-audit (87046) were delivered.
 - Rollback: `deploy/open_callers/rollback.sh /root/ai-dev-runtime/backups/open-callers-20261117T063150Z`. It also removes the drop-in.
 - Not deployed: the seo undismiss button needs an seo image rebuild (branch owneros/undismiss-20261117). The CLI undismiss is live.
+
+# Owner rule, 2026-11-17 ("вариант 1", said by the owner directly in the GAIKA tech-lead session)
+The ChatGPT tech lead's word counts as the owner's word for deploying or restarting live Owner OS and GAIKA services. These stay the owner's alone: payment (payorch, payment servers, blagopay), money and paid runs, and permissions. A deploy always goes through an installer with --check and rollback.
