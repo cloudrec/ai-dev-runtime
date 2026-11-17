@@ -90,6 +90,88 @@ def _offer_allowed(agent_id: str, only: set) -> bool:
         return True
     return any(o.endswith("*") and len(o) > 2 and "*" not in o[:-1] and a.startswith(o[:-1])
                for o in only)
+# ── who may be offered to the tech lead (2026-11-17) ──────────────────────────
+# Payment work is never offered, in any mode, judged by every identity we hold: the agent's
+# session, the event's project, the route (decision-time and delivery-time) and the live
+# pane's directory — so an alias, a renamed session or a payment cwd stays out.
+# WAKE_BRIDGE_OFFER=nonpayment additionally offers any agent outside the explicit list,
+# but only on authoritative identity: a `session:w.p` target whose live pane is found with
+# a known cwd. Anything unknown, ambiguous or missing is passed over (fail closed).
+_TARGET_RE = re.compile(r"^([A-Za-z0-9_.-]{1,80}):(\d{1,3})\.(\d{1,3})$")
+
+
+def offer_mode() -> str:
+    return os.getenv("WAKE_BRIDGE_OFFER", "").strip().lower()
+
+
+def _payment_name(text: str) -> bool:
+    try:
+        from core import agent_creation_policy as acp
+        return acp.payment_marked(text)
+    except Exception:  # noqa: BLE001 — policy unreadable: treat as payment
+        return True
+
+
+def pane_cwds() -> Optional[dict]:
+    """{session: [cwd, ...]} for every live pane on this host's agent tmux socket, or
+    None when tmux cannot be read (then nothing is offered on identity)."""
+    import subprocess
+    sock = os.getenv("AGENT_TMUX_SOCKET", "").strip()
+    argv = ["tmux"] + (["-L", sock] if sock else []) + [
+        "list-panes", "-a", "-F", "#{session_name}\t#{pane_current_path}"]
+    env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+    try:
+        out = subprocess.run(argv, capture_output=True, text=True, timeout=5, env=env)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    panes: dict = {}
+    for line in out.stdout.splitlines():
+        sess, _, cwd = line.partition("\t")
+        if sess:
+            panes.setdefault(sess, []).append(cwd.strip())
+    return panes
+
+
+def payment_identity(agent_id: str, project_id: str = "", route_key: str = "",
+                     cwds: Optional[list] = None) -> bool:
+    session = (agent_id or "").strip().split(":", 1)[0]
+    for name in (session, project_id, route_key):
+        if name and _payment_name(name):
+            return True
+    try:
+        from core import agent_control as ac
+        if session.lower() in ac.AUTOMATION_HARD_DENY:
+            return True
+        from core import agent_creation_policy as acp
+        cfg = acp.load_config()
+        return any(acp.hard_denied(c, session, cfg) for c in (cwds or []) if c)
+    except Exception:  # noqa: BLE001 — fail closed
+        return True
+
+
+def offer_allowed(agent_id: str, project_id: str = "", route_key: str = "",
+                  only: Optional[set] = None, panes: Optional[dict] = None,
+                  mode: Optional[str] = None) -> bool:
+    only = only_agents() if only is None else only
+    mode = offer_mode() if mode is None else mode
+    a = (agent_id or "").strip()
+    m = _TARGET_RE.match(a)
+    cwds = (panes or {}).get(m.group(1)) if (m and panes is not None) else None
+    if mode != "nonpayment" and not only:
+        return True                    # no filter configured at all: unchanged behaviour
+    if payment_identity(a, project_id, route_key, cwds):
+        return False
+    if mode != "nonpayment":
+        return _offer_allowed(a, only)  # the explicit list
+    if only and _offer_allowed(a, only):
+        return True                    # explicitly listed (fc-* and the like)
+    if not m or panes is None or not cwds or not all(cwds):
+        return False                   # unknown, ambiguous or missing identity
+    return True
+
+
 # A decided-but-undelivered wake older than this is stale: "this agent is waiting NOW"
 # stops being true after hours of silence, and "read Owner OS" stops being useful once
 # the backlog it points at is ancient history. The 2026-08-15 incident this guards:
@@ -1934,10 +2016,12 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         r = target = unrouted = None
         benched = None  # (event_id, retry_at, attempt, transient) for the head of line
         only = only_agents()
+        mode = offer_mode()
+        panes = pane_cwds() if mode == "nonpayment" else {}
         for cand in candidates:
             eid = int(cand[0])
-            if not _offer_allowed(cand[4], only):
-                continue                      # canary filter: passed over, never consumed
+            if not offer_allowed(cand[4], cand[2], "", only, panes, mode):
+                continue                      # passed over, never consumed
             last = conn.execute(
                 "SELECT ts, delivered FROM wake_delivery WHERE event_id=? "
                 "ORDER BY id DESC LIMIT 1", (eid,)).fetchone()
@@ -1964,6 +2048,9 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
                 # does not hold back other routes: the sandbox queue stopped dead on one.
                 unrouted = unrouted or (int(cand[0]), resolved)
                 continue
+            if (only or mode == "nonpayment") and \
+                    payment_identity(cand[4], cand[2], resolved.get("route_key") or ""):
+                continue                      # filtered: a payment chat is never rung
             r, target = cand, resolved
             break
         if not r and unrouted:
