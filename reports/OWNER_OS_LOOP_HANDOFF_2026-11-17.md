@@ -55,3 +55,38 @@ The full log is in `reports/OWNER_OS_LOOP_2026-11-17.md`.
 - Offered: every other pane.
 
 An earlier reversed run was invalid and is not counted: I removed its worktree while the run was still going.
+
+## Stage 6: send-queue MCP contract and crash window (automated tech-lead instruction, event 87705)
+**Runtime:**
+| Commit | Change |
+|---|---|
+| a4a33de | No blind replay. `send_started_ts` is committed before typing. A lost claim is re-queued only if sending never started; otherwise it is settled from agent_control's own record, and with no record it becomes `unknown`, which is never retried automatically. `reconcile()` (delivered, abandon or requeue; attributed; recorded evidence wins) is the explicit exit. |
+| 8a3965d | Path-safe keys. loop_watch raises `send_queue_unknown` when a row stays unknown for more than 30 min. |
+
+Guarantee: at most one send happens automatically. Exactly-once is not claimed.
+
+**seo** (branch `owneros/mcp-send-queue-20261117`, from live 6114af8):
+- 8ae6df3: `agent_send` gains `queue_if_busy` (default false) and `queue_ttl_secs`. An old payload is forwarded byte-identical. New tools: `agent_send_queue_status`, `agent_send_queue_cancel` and `agent_send_queue_reconcile`.
+- ae60962: keys must start with a letter or digit, since `..` in a path segment collapses to another route.
+- Tests in the image container: 1049 passed. The failure set is identical to base 6114af8 (68 rows, all caused by no database inside the offline container).
+
+**E2E** (`tools/e2e/send_queue_e2e.sh`): seo MCP handlers over real HTTP to a disposable runtime with synthetic panes. It passed twice. The second run (`reports/loop/e2e_send_queue_2026-11-17/run2_8a3965d.txt`) hit a real kill during a claim: the row recovered after 120 s and was delivered exactly once. The runs cover:
+- queue disabled by default;
+- an old client unchanged;
+- a queued send reporting queued, not delivered;
+- a reused key with a different text refused;
+- a synthetic payment target refused;
+- cancel;
+- a restart with a message still queued, delivered exactly once.
+
+**Tests at 8a3965d:**
+- forward: 5369 passed, 0 failed, EXIT 0;
+- reversed: 5369 passed, 0 failed, EXIT 0;
+- crash-boundary mutants: all killed.
+
+**Opus review pass 10:** release-ready after the key-regex fix, which is done.
+
+**Release:** nothing is live. This needs the owner's direct word in this session.
+- runtime: `TARGET_SHA=8a3965d deploy/adaptive_offer/install.sh --check` and `--apply`;
+- seo: rebuild the image from the merged branch (seo memory: rebuild to deploy);
+- turn the queue on with `SEND_QUEUE_ENABLED=1`.
