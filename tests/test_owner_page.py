@@ -237,3 +237,29 @@ def test_publish_needs_the_key_and_a_known_mode(released):
 def test_publish_itself_refuses_an_unknown_mode(released):
     with pytest.raises(rel.ReleaseError, match="bad_mode"):
         rel.publish("calc", "force")
+
+
+def test_undismiss_puts_a_dismissed_project_back_on_the_list(env, done_status):
+    root, _ = env
+    _finish(root, "calc")
+    key = owner_page.rotate()
+    owner_page.dismiss_from_page(key, "calc")
+    assert owner_page.todo() == []
+    assert owner_page.undismiss_from_page(key, "calc") == {"ok": True, "was_dismissed": True}
+    by = {p["project"]: p for p in owner_page.snapshot()["projects"]}
+    assert by["calc"]["releasable"] and not by["calc"]["dismissed"]
+    assert owner_page.todo()
+    assert owner_page.undismiss("calc") is False                  # nothing to undo twice
+    with pytest.raises(owner_page.PageError):
+        owner_page.undismiss_from_page("x" * 43, "calc")          # wrong key: refused
+
+
+def test_undismiss_cli(env, done_status, monkeypatch, capsys):
+    import tools.owner_page as cli
+    root, _ = env
+    _finish(root, "calc")
+    owner_page.dismiss("calc", by="test")
+    monkeypatch.setattr(cli.os, "geteuid", lambda: 0)
+    assert cli.main(["undismiss", "calc"]) == 0
+    assert "back on the list" in capsys.readouterr().out
+    assert cli.main(["undismiss"]) == 2

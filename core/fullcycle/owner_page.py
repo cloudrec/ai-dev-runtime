@@ -91,6 +91,22 @@ def dismiss(project_id: str, *, by: str, conn=None) -> None:
             conn.close()
 
 
+def undismiss(project_id: str, conn=None) -> bool:
+    """Undo `dismiss`: the project is back on the to-do list if it is still releasable.
+    True when it had been dismissed."""
+    from core.fullcycle import engine as fe
+    conn, own = fe.connect(conn)
+    try:
+        _tables(conn)
+        n = conn.execute("DELETE FROM fc_release_dismissed WHERE project_id=?",
+                         (project_id,)).rowcount
+        conn.commit()
+        return bool(n)
+    finally:
+        if own:
+            conn.close()
+
+
 def _merged_into_released(conn, released_ids: set) -> set:
     """Projects brought into an integration (merge_from) that was released."""
     try:
@@ -185,6 +201,13 @@ def dismiss_from_page(given: str, project_id: str) -> dict:
         raise PageError("bad_project")
     dismiss(project_id, by="owner-page")
     return {"ok": True}
+
+
+def undismiss_from_page(given: str, project_id: str) -> dict:
+    check(given)
+    if not specs.KEY_RE.match(project_id or ""):
+        raise PageError("bad_project")
+    return {"ok": True, "was_dismissed": undismiss(project_id)}
 
 
 def dismiss_finished(by: str = "owner") -> list:

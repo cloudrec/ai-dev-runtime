@@ -4,6 +4,7 @@
     owner_page.py url       print the link (makes the key on first use)
     owner_page.py rotate    new key: the old link stops working at once
     owner_page.py dismiss-finished   every project releasable now: not to be released alone
+    owner_page.py undismiss <project>   back on the list (undo a dismiss)
 """
 from __future__ import annotations
 
@@ -33,13 +34,18 @@ def _base_from_unit() -> None:
 
 def main(argv=None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
-    if args not in (["url"], ["rotate"], ["dismiss-finished"]):
+    if args not in (["url"], ["rotate"], ["dismiss-finished"]) and \
+            not (len(args) == 2 and args[0] == "undismiss"):
         print(__doc__.strip(), file=sys.stderr)
         return 2
     if os.geteuid() != 0:
         print("STOP: run as root", file=sys.stderr)
         return 2
     _base_from_unit()
+    if args[0] == "undismiss":
+        was = owner_page.undismiss(args[1])
+        print(f"{args[1]}: back on the list" if was else f"{args[1]}: was not dismissed")
+        return 0
     if args == ["dismiss-finished"]:
         for pid in owner_page.dismiss_finished():
             print(f"not to be released on its own: {pid}")

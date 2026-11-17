@@ -700,6 +700,15 @@ def fullcycle_owner_page_dismiss(key: str, project_id: str, _: bool = Depends(_a
         raise HTTPException(status_code=404, detail="not found")
 
 
+@router.post("/fullcycle/owner-page/{key}/undismiss/{project_id}")
+def fullcycle_owner_page_undismiss(key: str, project_id: str, _: bool = Depends(_auth)):
+    from core.fullcycle import owner_page
+    try:
+        return owner_page.undismiss_from_page(key, project_id)
+    except owner_page.PageError:
+        raise HTTPException(status_code=404, detail="not found")
+
+
 @router.get("/fullcycle/repos")
 def fullcycle_repos(request: Request, _: bool = Depends(_auth)):
     """The repos the owner allowed projects on: names and whether usable, no paths."""
