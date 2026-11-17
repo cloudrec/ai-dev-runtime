@@ -220,3 +220,8 @@ Not applied. Live is still 3423f4d, with the vtb deny edit and the widened compa
 - Rollback: `deploy/browser_login/rollback.sh /root/ai-dev-runtime/backups/browser-login-20261117T175155Z`.
 - Owner decisions: no MCP token rotation; no Tailscale on the phone (login from the Windows PCs on the tailnet).
 - Owner 2026-11-17 ("убери пароль с браузера"): x11vnc now runs with `-nopw` and VNC stays on localhost only; the password file is removed. RFB offers type 1. Tailnet-only noVNC is the guard; local users could already drive the browser over CDP on localhost. The installer is updated to match.
+
+## Release 5 (owner: "деплой de94158 и логи seo")
+- Runtime `de94158` via `deploy/adaptive_offer/install.sh`, `--check`/`--apply` rc=0, services active. The hand-over detector is live. `loop_watch` (companion env): no problems. Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261117T195918Z`.
+- seo `39603fb` via `deploy/seo_log_redact/install.sh`, `--check`/`--apply` rc=0, backend healthy, queue tools and undismiss intact.
+- Live access log, counted only: 9 connector lines since the restart, all 9 `<redacted>`, 0 with a raw token. A dummy-token probe did not appear either. Rollback: `deploy/seo_log_redact/rollback.sh`.
