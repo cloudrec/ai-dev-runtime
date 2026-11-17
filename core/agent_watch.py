@@ -333,9 +333,39 @@ def _final_message(tail: str) -> str:
     return " ".join(out)
 
 
-def declares_dependency_wait(tail: str) -> bool:
+# A finished turn that explicitly HANDS the next move to the owner or the tech lead
+# (2026-11-17: ai-terminal 87669 "Решения от вас: …", fruit 87835 "Остаётся от вас: …",
+# owneros-autonomy-loop 88186 "… скажи мне «дал»"). Nothing the agent can do moves it
+# on, so it is parked exactly like a dependency wait: announced once, then re-armed by a
+# delivered task, real work, a different stop or the TTL. Only a quiescent stop (an owner
+# gate worded as a blocker or a prompt keeps its reminders), only the final message, never
+# with an error line, never when the agent says it carries on, never on a negation.
+_HANDOFF_RE = re.compile(
+    r"((?:решени[еяй]|действи[еяй]|ответ\w*|остаётся|остается|осталось|нужно|нужен|нужна|"
+    r"требуется)\s+от\s+(?:вас|тебя|владельца|техлида)(?!\s+не\b)|"
+    r"за\s+(?:тобой|вами)\s+(?:остаётся|остается|решение|выбор)|"
+    r"скажи(?:те)?\s+мне\b|"
+    r"(?:decisions?|actions?|input|go-ahead)\s+(?:is\s+|are\s+)?(?:needed\s+|required\s+)?"
+    r"from\s+(?:you|the\s+owner|the\s+tech\s+lead)\b|"
+    r"\bover\s+to\s+you\b|\byour\s+(?:call|decision|move)\b)", re.IGNORECASE)
+_CARRYING_ON_RE = re.compile(
+    r"(продолжаю|продолжу|continuing|i(?:'|’)?ll\s+continue|will\s+continue|"
+    r"дальше\s+(?:сделаю|делаю))", re.IGNORECASE)
+
+
+def declares_handoff(tail: str) -> bool:
     msg = _final_message(tail)
-    return bool(msg) and not _ERRORISH_RE.search(msg) and bool(_DEP_WAIT_RE.search(msg))
+    return (bool(msg) and not _ERRORISH_RE.search(msg) and not _CARRYING_ON_RE.search(msg)
+            and bool(_HANDOFF_RE.search(msg)))
+
+
+def declares_dependency_wait(tail: str) -> bool:
+    """A declared wait the agent itself cannot end: an external dependency (#338) or an
+    explicit hand-over of the next move (`declares_handoff`)."""
+    msg = _final_message(tail)
+    if not msg or _ERRORISH_RE.search(msg):
+        return False
+    return bool(_DEP_WAIT_RE.search(msg)) or declares_handoff(tail)
 
 
 _BLOCKER_RE = re.compile(

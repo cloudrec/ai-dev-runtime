@@ -663,6 +663,14 @@ def _resolution_reason(conn, *, event_id: int, target: str,
                 conn, event_id) in _SETTLED_RESOLVABLE_TYPES and _dependency_wait(
                     conn, target, now):
             return "agent_dependency_wait"
+        # The agent formally handed its stage over (tools/stage_done.py emits
+        # `task_completed` from `agent_stage_done`): the next move is the reviewer's, so an
+        # agent pane that does not move is the expected state, not a stall (88001, 87778
+        # were re-woken and escalated for exactly this). Only while the pane is at rest: a
+        # pane working again, a crash or a question keeps its own watch, and a NEW stage
+        # or task is a new event with a fresh watch.
+        if cls in ("quiescent", "idle") and _stage_done_handoff(conn, event_id):
+            return "stage_done_handoff"
         # The premise of a prompt wake is that a question is on screen. When agent_watch
         # has since reclassified the pane away from `owner_prompt`/`blocker`, that premise
         # is GONE, and re-waking and escalating to critical chases a question nobody is
@@ -704,6 +712,15 @@ def _resolution_reason(conn, *, event_id: int, target: str,
 
 _SETTLED_RESOLVABLE_TYPES = frozenset({"task_completed", "work_stopped_incomplete",
                                        "agent_turn_stopped"})
+
+
+def _stage_done_handoff(conn, event_id: int) -> bool:
+    try:
+        r = conn.execute("SELECT type, source FROM event WHERE id=?",
+                         (int(event_id),)).fetchone()
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(r) and r[0] == "task_completed" and r[1] == "agent_stage_done"
 
 
 def _event_type(conn, event_id: int) -> str:
