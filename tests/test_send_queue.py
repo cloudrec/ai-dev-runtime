@@ -256,3 +256,107 @@ def test_an_attempt_neither_submitted_nor_refused_is_closed_not_retried():
                                      "reason": "not_submitted"}]
     sq.drain(send=limbo)
     assert len(calls) == 1
+
+
+# ── crash at each boundary: no blind replay (2026-11-17) ────────────────────
+def _force(key, *, started, claimed=1000.0):
+    conn = sq._conn()
+    conn.execute("UPDATE send_queue SET status='delivering', claimed_ts=?, "
+                 "send_started_ts=? WHERE idempotency_key=?", (claimed, started, key))
+    conn.commit()
+
+
+LATER = 1000.0 + sq.CLAIM_STALE_SECS + 5
+
+
+def test_crash_after_claim_before_sending_is_requeued_and_sent_once():
+    sq.enqueue("worker-a:0.0", "x", idempotency_key="c1", actor=GPT, now=1000.0)
+    _force("c1", started=None)
+    sent = Sent()
+    assert sq.drain(now=LATER, send=sent) == [{"key": "c1", "status": "delivered"}]
+    assert len(sent.calls) == 1
+
+
+def test_crash_after_sending_started_without_a_record_is_unknown_never_replayed():
+    sq.enqueue("worker-a:0.0", "x", idempotency_key="c2", actor=GPT, now=1000.0)
+    _force("c2", started=1000.0)
+    sent = Sent()
+    sq.drain(now=LATER, send=sent)
+    sq.drain(now=LATER + 100, send=sent)
+    assert sent.calls == [] and sq.status("c2")["status"] == "unknown"
+
+
+def test_crash_after_the_record_settles_from_evidence(monkeypatch):
+    sq.enqueue("worker-a:0.0", "x", idempotency_key="c3", actor=GPT, now=1000.0)
+    _force("c3", started=1000.0)
+    monkeypatch.setattr(ac, "_seen_delivery", lambda k: {"submitted": True})
+    sent = Sent()
+    sq.drain(now=LATER, send=sent)
+    st = sq.status("c3")
+    assert sent.calls == [] and st["status"] == "delivered"
+    assert st["last_reason"] == "delivered_per_record"
+
+
+def test_a_crash_inside_send_leaves_unknown(monkeypatch):
+    sq.enqueue("worker-a:0.0", "x", idempotency_key="c4", actor=GPT, now=1000.0)
+
+    def boom(*a, **k):
+        raise RuntimeError("process killed mid-send")
+    with pytest.raises(RuntimeError):
+        sq.drain(now=1000.0, send=boom)
+    sent = Sent()
+    sq.drain(now=LATER, send=sent)
+    assert sent.calls == [] and sq.status("c4")["status"] == "unknown"
+
+
+def test_reconcile_is_explicit_attributed_and_evidence_wins(monkeypatch):
+    for k in ("r1", "r2", "r3"):
+        sq.enqueue("worker-a:0.0", k, idempotency_key=k, actor=GPT, now=1000.0)
+        _force(k, started=1000.0)
+    sq.drain(now=LATER, send=Sent())
+    assert sq.reconcile("r1", "requeue", by="")["refused"] == "bad_reconcile_request"
+    assert sq.reconcile("r1", "requeue", by="tech-lead")["status"] == "queued"
+    sent = Sent()
+    sq.drain(now=LATER + 1, send=sent)
+    assert [c[2] for c in sent.calls] == ["r1"]
+    assert sq.reconcile("r2", "abandon", by="tech-lead")["status"] == "cancelled"
+    monkeypatch.setattr(ac, "_seen_delivery", lambda k: {"submitted": True})
+    assert sq.reconcile("r3", "requeue", by="tech-lead")["status"] == "delivered"
+    assert sq.reconcile("r3", "requeue", by="x")["refused"] == "not_unknown"
+
+
+# ── over HTTP: old clients unchanged, new fields work ────────────────────────
+@pytest.fixture
+def client():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from api import v1
+    app = FastAPI()
+    app.include_router(v1.router)
+    app.dependency_overrides[v1._auth] = lambda: True
+    return TestClient(app)
+
+
+H = {"X-Runtime-Actor": "chatgpt-tech-lead"}
+
+
+def test_http_old_client_without_new_fields_behaves_as_before(client):
+    BUSY.add("worker-a")
+    r = client.post("/api/v1/agents/send", json={"target": "worker-a:0.0", "text": "x",
+                                                 "idempotency_key": "h0"}, headers=H).json()
+    assert r["refused"] == "working" and "send_queue" not in r
+
+
+def test_http_queue_status_cancel_and_reconcile(client):
+    BUSY.add("worker-a")
+    r = client.post("/api/v1/agents/send", json={
+        "target": "worker-a:0.0", "text": "x", "idempotency_key": "h1",
+        "queue_if_busy": True}, headers=H).json()
+    if r.get("refused") == "automation_target_not_allowlisted":
+        pytest.skip("caller identity is not an api: actor in this harness")
+    assert r["queued"] and not r["delivered"] and not r["submitted"]
+    assert client.get("/api/v1/agents/send-queue/h1").json()["status"] == "queued"
+    assert client.delete("/api/v1/agents/send-queue/h1", headers=H).json()["cancelled"]
+    assert client.post("/api/v1/agents/send-queue/h1/reconcile", json={"outcome": "requeue"},
+                       headers=H).json()["refused"] == "not_unknown"

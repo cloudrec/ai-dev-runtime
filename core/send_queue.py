@@ -9,9 +9,14 @@ such a message durably and delivers it once the agent is idle — through the SA
 Guarantees:
   * idempotent: one row per idempotency key; the same key with other text, or a key
     already used by a direct send, is refused; delivery reuses the key, so a replay after
-    agent_control recorded the delivery is a no-op. Known limit: a crash in the short
-    window after the text was typed and before agent_control recorded it can type it
-    again on replay (agent_control records after submitting);
+    agent_control recorded the delivery is a no-op;
+  * no blind replay: `send_started_ts` is committed right before anything is typed. A
+    claim lost in a crash is re-queued only if it never started sending; otherwise it is
+    settled from agent_control's own delivery record (positive evidence), and with no
+    record it becomes `unknown` (needs reconciliation) — never retried automatically.
+    `reconcile()` is the explicit, attributed way out. Guarantee: at most once
+    automatically; exactly once is not claimed (a crash between typing and the record
+    leaves `unknown` for a decision instead of a duplicate);
   * honest receipts: "delivered" only when agent_control's own record says submitted;
     an attempt that ends neither submitted nor refused is closed as refused
     (not_submitted), never retried under the same key;
@@ -41,6 +46,7 @@ TTL_SECS = int(os.getenv("SEND_QUEUE_TTL_SECS", "1800"))
 MAX_TTL_SECS = 6 * 3600
 CLAIM_STALE_SECS = 120          # a claim older than this was lost in a crash: re-queue
 TERMINAL = ("delivered", "refused", "expired", "cancelled")
+# `unknown`: a send started and its outcome could not be proven; held for reconcile()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS send_queue (
@@ -52,7 +58,7 @@ CREATE TABLE IF NOT EXISTS send_queue (
     created_ts REAL, expires_ts REAL,
     status TEXT NOT NULL DEFAULT 'queued',
     claimed_ts REAL, attempts INTEGER DEFAULT 0, last_reason TEXT DEFAULT '',
-    done_ts REAL, receipt TEXT DEFAULT ''
+    done_ts REAL, receipt TEXT DEFAULT '', send_started_ts REAL
 )
 """
 
@@ -61,6 +67,9 @@ def _conn():
     from core.control_db import control_db_path
     conn = sqlite3.connect(control_db_path(), timeout=10)
     conn.execute(_SCHEMA)
+    have = {r[1] for r in conn.execute("PRAGMA table_info(send_queue)")}
+    if "send_started_ts" not in have:
+        conn.execute("ALTER TABLE send_queue ADD COLUMN send_started_ts REAL")
     return conn
 
 
@@ -170,6 +179,73 @@ def _finish(conn, rid: int, st: str, reason: str, now: float, receipt: Optional[
     conn.commit()
 
 
+def _settle_from_record(key: str):
+    """(status, reason) from agent_control's own delivery record, or None without one."""
+    from core import agent_control as ac
+    prior = ac._seen_delivery(key)
+    if prior is None:
+        return None
+    if prior.get("submitted") or prior.get("delivered"):
+        return "delivered", "delivered_per_record"
+    if prior.get("refused"):
+        return "refused", str(prior["refused"])[:200]
+    return "refused", "not_submitted_per_record"
+
+
+def _recover_lost_claims(conn, now: float) -> None:
+    lost = conn.execute("SELECT id, idempotency_key, send_started_ts FROM send_queue "
+                        "WHERE status='delivering' AND claimed_ts < ?",
+                        (now - CLAIM_STALE_SECS,)).fetchall()
+    # evidence first, writes after: _seen_delivery uses its own connection
+    evidence = {key: _settle_from_record(key) for _rid, key, started in lost
+                if started is not None}
+    for rid, key, started in lost:
+        if started is None:                    # nothing was typed: hold again
+            conn.execute("UPDATE send_queue SET status='queued', claimed_ts=NULL, "
+                         "last_reason='claim_lost_before_send' WHERE id=?", (rid,))
+            continue
+        settled = evidence.get(key)
+        if settled:
+            _finish(conn, rid, settled[0], settled[1], now, {"recovered": True})
+        else:                                  # typed or not: unprovable — never replay
+            conn.execute("UPDATE send_queue SET status='unknown', claimed_ts=NULL, "
+                         "last_reason='send_outcome_unknown', done_ts=? WHERE id=?",
+                         (now, rid))
+    conn.commit()
+
+
+def reconcile(idempotency_key: str, outcome: str, *, by: str,
+              now: Optional[float] = None) -> dict:
+    """Settle an `unknown` row explicitly. outcome: delivered | abandon | requeue.
+    `requeue` accepts the duplicate risk on the record of who decided."""
+    from core import agent_control as ac
+    now = time.time() if now is None else now
+    if outcome not in ("delivered", "abandon", "requeue") or not (by or "").strip():
+        return {"ok": False, "refused": "bad_reconcile_request"}
+    conn = _conn()
+    try:
+        row = _row(conn, idempotency_key)
+        if not row or row["status"] != "unknown":
+            return {"ok": False, "refused": "not_unknown",
+                    "status": row["status"] if row else "unknown_key"}
+        settled = _settle_from_record(idempotency_key)
+        if settled:                            # evidence appeared: it decides
+            _finish(conn, row["id"], settled[0], settled[1], now, {"reconciled_by": by})
+        elif outcome == "requeue":
+            conn.execute("UPDATE send_queue SET status='queued', claimed_ts=NULL, "
+                         "send_started_ts=NULL, done_ts=NULL, last_reason=? WHERE id=?",
+                         (f"requeued_by:{by}"[:200], row["id"]))
+            conn.commit()
+        else:
+            _finish(conn, row["id"], "delivered" if outcome == "delivered" else "cancelled",
+                    f"reconciled_{outcome}_by:{by}", now, {"reconciled_by": by})
+        ac.audit("send_queue_reconcile", row["target"], idempotency_key, outcome=outcome,
+                 actor=by)
+        return {"ok": True, **_public(_row(conn, idempotency_key))}
+    finally:
+        conn.close()
+
+
 def drain(now: Optional[float] = None, send: Optional[Callable] = None) -> list:
     """One pass: deliver what can be delivered now. Safe to run from several processes:
     a row is claimed atomically before anything is sent."""
@@ -179,8 +255,7 @@ def drain(now: Optional[float] = None, send: Optional[Callable] = None) -> list:
     conn = _conn()
     out = []
     try:
-        conn.execute("UPDATE send_queue SET status='queued', claimed_ts=NULL "
-                     "WHERE status='delivering' AND claimed_ts < ?", (now - CLAIM_STALE_SECS,))
+        _recover_lost_claims(conn, now)
         conn.execute("UPDATE send_queue SET status='expired', done_ts=?, "
                      "last_reason='expired_before_delivery' "
                      "WHERE status='queued' AND expires_ts <= ?", (now, now))
@@ -217,11 +292,16 @@ def drain(now: Optional[float] = None, send: Optional[Callable] = None) -> list:
                 conn.commit()
                 busy_targets.add(target)
                 continue
+            # the point of no blind return: from here a crash leaves `unknown`
+            conn.execute("UPDATE send_queue SET send_started_ts=? WHERE id=?", (now, rid))
+            conn.commit()
             r = send(target, text, idempotency_key=key, actor=actor or None,
                      source=f"{source or ''}|send_queue"[:200])
             if r.get("refused") in ("working", "shell_running", "queued_messages_pending"):
+                # refused before typing anything: safe to hold again
                 conn.execute("UPDATE send_queue SET status='queued', claimed_ts=NULL, "
-                             "last_reason='agent_busy' WHERE id=?", (rid,))
+                             "send_started_ts=NULL, last_reason='agent_busy' WHERE id=?",
+                             (rid,))
                 conn.commit()
                 busy_targets.add(target)
                 continue
