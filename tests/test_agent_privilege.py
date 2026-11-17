@@ -1417,3 +1417,11 @@ def test_root_readers_survive_a_sparse_file(sandbox, small_cap, which):
         os.makedirs(d)
         _sparse(os.path.join(d, "s.jsonl"), size)
         assert os_task_queue.transcript_messages(project) == []
+
+
+def test_dropped_agents_get_no_session_bus():
+    """2026-11-17: 214 dbus-daemons leaked under fcagent, one autolaunched bus per agent
+    start that outlived the agent. A set, unusable address stops the autolaunch."""
+    t = priv.Target(name="fcagent", uid=1001, gid=1001, home="/home/fcagent")
+    assert "DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null" in priv.pane_prefix(t)
+    assert priv.child_env(t)["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/dev/null"

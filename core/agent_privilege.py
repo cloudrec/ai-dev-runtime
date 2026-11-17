@@ -235,6 +235,11 @@ def _hidden_mode(d: str, keep: list) -> str:
     return "0700"
 
 
+# No session bus for a dropped agent: without one, claude's keyring probe autolaunched a
+# private dbus-daemon per start that outlived the agent (214 leaked on 2026-11-17).
+_NO_DBUS = "unix:path=/dev/null"   # parsed by libdbus and gio alike; connects nowhere
+
+
 def _path(t: Target) -> str:
     return f"{t.home}/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
@@ -243,7 +248,7 @@ def pane_prefix(t: Target) -> list:
     """argv prefix for a tmux pane. --reset-env drops the tmux server's environment and
     sets USER, LOGNAME and SHELL from the target; TERM survives."""
     return [*_setpriv(t), "--reset-env", "env", f"PATH={_path(t)}", f"HOME={t.home}",
-            f"LANG={_LANG}"]
+            f"LANG={_LANG}", f"DBUS_SESSION_BUS_ADDRESS={_NO_DBUS}"]
 
 
 def sandboxed_argv(t: Target, keep_raw: str, argv: Sequence[str]) -> list:
@@ -265,7 +270,8 @@ def child_env(t: Target, extra: Optional[dict] = None) -> dict:
     """The whole environment of a dropped child. `extra` is the caller's, minus API variables."""
     from core.agent_auth_mode import is_api_env_var
     env = {k: v for k, v in (extra or {}).items() if not is_api_env_var(k)}
-    env.update(PATH=_path(t), HOME=t.home, USER=t.name, LOGNAME=t.name, LANG=_LANG)
+    env.update(PATH=_path(t), HOME=t.home, USER=t.name, LOGNAME=t.name, LANG=_LANG,
+               DBUS_SESSION_BUS_ADDRESS=_NO_DBUS)
     return env
 
 
