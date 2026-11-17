@@ -1,0 +1,31 @@
+# read-only live evidence, 2026-11-17T15:13:17Z
+seo HEAD: 97cb001 branch feat/social-stage4-telegram-wordpress-20260720
+seo-backend-1: healthy created=2026-11-17T15:01:48.679932508Z
+agent_send props: ['idempotency_key', 'queue_if_busy', 'queue_ttl_secs', 'target', 'text']
+queue tools: ['agent_send_queue_status', 'agent_send_queue_cancel', 'agent_send_queue_reconcile']
+catalog fingerprint: cdfef6ad182f9b8d
+since container start: POST connector=5 GET stream=0 tools/list=0
+runtime HEAD: d052832; health 200
+
+cooldown, last 7 days: events skipped actionable_cooldown_active:
+total=110|later_woken=110|superseded=57
+
+HU/WEST events 2026-11-17 (id type agent decision reason):
+87093|work_stopped_incomplete|gaika-country-hu:0.0|skip|actionable_cooldown_active
+87093|work_stopped_incomplete|gaika-country-hu:0.0|wake|actionable_waiting_transition
+87094|work_stopped_incomplete|gaika-country-west:0.0|skip|actionable_cooldown_active
+87094|work_stopped_incomplete|gaika-country-west:0.0|wake|actionable_waiting_transition
+87144|work_stopped_incomplete|gaika-country-west:0.0|skip|actionable_cooldown_active
+87144|work_stopped_incomplete|gaika-country-west:0.0|wake|actionable_waiting_transition
+87176|wake_loop_no_progress|gaika-country-west:0.0|skip|actionable_cooldown_active
+87176|wake_loop_no_progress|gaika-country-west:0.0|wake|actionable_waiting_transition
+87219|wake_loop_stalled|gaika-country-west:0.0|skip|actionable_cooldown_active
+87219|wake_loop_stalled|gaika-country-west:0.0|wake|actionable_waiting_transition
+87495|work_stopped_incomplete|gaika-country-west:0.0|wake|actionable_waiting_transition
+87524|wake_loop_no_progress|gaika-country-west:0.0|wake|actionable_waiting_transition
+87555|wake_loop_stalled|gaika-country-west:0.0|wake|actionable_waiting_transition
+87893|work_stopped_incomplete|gaika-country-hu:0.0|skip|actionable_cooldown_active
+87893|work_stopped_incomplete|gaika-country-hu:0.0|wake|actionable_waiting_transition
+87896|wake_loop_no_progress|gaika-country-hu:0.0|skip|actionable_cooldown_active
+87896|wake_loop_no_progress|gaika-country-hu:0.0|wake|actionable_waiting_transition
+87904|wake_loop_stalled|gaika-country-hu:0.0|wake|actionable_waiting_transition

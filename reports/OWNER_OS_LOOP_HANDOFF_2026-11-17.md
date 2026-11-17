@@ -1,5 +1,18 @@
 # Owner OS loop: handoff, 2026-11-17
 
+## Current state (canonical; everything below is history)
+**Live** (released on the owner's direct word):
+- **Runtime** `d052832`, rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261117T144358Z`.
+- **SEO** `97cb001` (MCP send-queue contract + owner-page undismiss button), rollbacks: `deploy/seo_undismiss/rollback.sh`, then `deploy/seo_send_queue/rollback.sh`.
+- **Queue**: `SEND_QUEUE_ENABLED=1` via `/etc/systemd/system/ai-runtime.service.d/99-send-queue.conf`. To undo, remove the file and restart ai-runtime.
+
+**On the branch, not live:** the WEST dependency-wait wordings and the changed-task-identity re-arm. See `reports/OWNER_OS_ACCEPTANCE_2026-11-17.md`.
+
+**Open for the owner:**
+- refresh or reconnect the ChatGPT connector: its tool list is stale, so `queue_if_busy` is not visible in the chat;
+- rotate the MCP token (checklist in the acceptance report, section 7);
+- the session login link, which needs a new access path.
+
 **Branch:** `owneros/autonomy-loop-20261117`.
 
 **Live:** `/root/ai-dev-runtime` runs 3423f4d, plus two edits:
