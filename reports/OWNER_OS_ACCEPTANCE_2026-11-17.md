@@ -69,7 +69,9 @@ Mutation check, on a scratch copy and never near the live tree. Every mutant is 
 - unescaped `LIKE`: 1 failed;
 - any caller re-arms: 1 failed.
 
-Focused suites (new file, #338, closed loop, wake bridge, send queue): 287 passed. Log: `reports/loop/acceptance_2026-11-17/focused_tests.txt`. Full suite: see the handoff.
+Focused suites (new file, #338, closed loop, wake bridge, send queue): 287 passed. Log: `reports/loop/acceptance_2026-11-17/focused_tests.txt`.
+
+Full suite at 8052c40: forward 5392 passed, 4 skipped, EXIT 0; reversed (fresh worktree) 5392 passed, 4 skipped, EXIT 0. Logs: `full_suite_forward.txt`, `full_suite_reversed.txt` in the same folder.
 
 ## 5. Why the chat's `agent_send` schema lacks `queue_if_busy`
 The live server does advertise it (section 1). The chat is working from a cached tool list:
