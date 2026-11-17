@@ -53,3 +53,10 @@ All of this is on the branch. Live is not changed until the owner says "депл
 
 ## Known red test
 `tests/test_stage15_f2_spawn_env.py::test_r1_nothing_this_repo_sets_for_the_cli_is_dropped` fails because of NODE_ENV in `deploy/gaika_services/install.sh` (branch commit 78633db, not from this step). Narrowing the test was refused as weakening a security check. Fix it at the source or decide separately.
+
+# Deploy, 2026-11-17 ~07:32 CET (owner: "деплой, обновляй сам")
+- Live went from be3cbd3 to 3423f4d through `deploy/open_callers/install.sh --apply`. `AGENT_AUTOMATION_OPEN_CALLERS=api` is set in configs/.env. ai-runtime, the companion and both fullcycle workers were restarted: all are active with 0 restarts.
+- Checked on live with `automation_decision` for the tech lead: serverwarden, owneros-autonomy-loop and gaika-country-hu are open. payorch-ha-fresh, autonomy-pay-sonnet and /opt/blagopay-* are refused as `hard_denied_target`.
+- A second block was found: the companion's canary filter `WAKE_BRIDGE_ONLY_AGENTS`. A new drop-in `99-tech-lead-hears.conf` adds `gaika-country-*` and `owneros-*`. Payment agents are still left out. The first wakes from gaika-country-hu (87048) and owneros-fable-audit (87046) were delivered.
+- Rollback: `deploy/open_callers/rollback.sh /root/ai-dev-runtime/backups/open-callers-20261117T063150Z`. It also removes the drop-in.
+- Not deployed: the seo undismiss button needs an seo image rebuild (branch owneros/undismiss-20261117). The CLI undismiss is live.
