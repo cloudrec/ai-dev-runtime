@@ -68,3 +68,41 @@ The ChatGPT tech lead's word counts as the owner's word for deploying or restart
 - The drop-in `99-tech-lead-hears.conf` now also lists ai-terminal-restore, bitwhite-maxbitwhite, fruit-migration, lootboxes-sonnet, mess-telegram-connector, serverwarden-livefire and vtb. The companion was restarted and is active.
 - Delivered after the change: lootboxes-sonnet (87025), fruit-migration (87047) and gaika-country-west (87094) to the owner-os chat, and serverwarden-livefire (87105) to the hostsecure chat. The payment wakes 87120 (autonomy-pay-sonnet) and 87121 (payorch-ha-fresh) were not delivered.
 - Limit: the filter is a list of names, so a new non-payment agent session has to be added to the drop-in. The previous version is in backups/open-callers-20261117T063150Z/companion-99-v1.conf.
+
+# Stage 3: identity-based non-payment offering (automated tech-lead instruction, event 87109)
+An automated instruction was received from the tech lead through the Owner OS API.
+
+## Receipt (control_plane.db, wake_delivery / wake_audit)
+| event | agent | delivered (UTC) | route | ack |
+|---|---|---|---|---|
+| 87025 | lootboxes-sonnet | 06:58:12 | owner-os | 1 |
+| 87047 | fruit-migration | 07:00:29 | owner-os | 1 |
+| 87094 | gaika-country-west | 07:04:00 | owner-os | 1 |
+| 87109 | owneros-autonomy-loop | 07:05:45 | owner-os | 1 |
+
+## Built (branch only; live is unchanged apart from the vtb deny below)
+| Commit | Change |
+|---|---|
+| 400e23f | `WAKE_BRIDGE_OFFER=nonpayment` offers any agent on authoritative identity (an exact `session:w.p` with a live pane cwd). |
+| 8b360ac | Fixes for independent security review findings #1–#10: unknown mode offers nothing; decision-time `offer_identity` stored; coalescing only within the offerable set; a payment event never reaches a non-payment chat (route key or conversation URL); config with no `hard_deny_dirs` fails closed; wider payment words; wider scan; loop_watch uses the same predicate; installer lists commits/files and every pane cwd, and verifies the env. |
+| 1a03f47 | NODE_ENV removed at its source (`deploy/gaika_services/install.sh`). The GAIKA daemons import node built-ins only, so this changes nothing at runtime. |
+| 3bbb4b4 | `/opt/vtb_old` added to `hard_deny_dirs`. |
+| — | Mutants: 8 of 8 killed, plus 1 equivalent (the explicit unknown-mode return is redundant). |
+
+## Live safety fix (restriction only), 2026-11-17 07:34Z
+`install.sh --check` printed every pane's cwd, which showed that `vtb` (`/opt/vtb_old`, QR certificate payments via Bakai Bank) is payment work with no payment word in its name or path. Two changes were made on live, both backed up in `backups/vtb-payment-deny-20261117T073405Z`:
+- `/opt/vtb_old` was added to the live `config/agent_creation.yaml` `hard_deny_dirs`.
+- `vtb` was removed from the companion filter, and the companion was restarted.
+
+Verification:
+- `automation_decision(vtb)` now returns `hard_denied_target`.
+- The audit for today shows no `agent_send`/`agent_answer` to vtb, only 427 reads.
+- No wake from vtb was delivered.
+
+Borderline, left open, owner to judge: bitwhite (crypto exchange backend), mess (messenger with a wallet), lootboxes (prototype storefront). They are products, not payment infrastructure.
+
+## Not done in this stage
+- Durable queue for sends to a busy agent. Today a busy agent refuses with "retry", and the message is not kept.
+- E2E toy project.
+
+Both are next.
