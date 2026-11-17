@@ -33,6 +33,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import time
 from typing import Callable, Optional
 
@@ -125,8 +126,27 @@ def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
+# Payment work by name, wherever it runs: payorch-*, blagopay-*, payment-orchestrator,
+# CloudPayments, and any session/path with a standalone "pay" word (autonomy-pay-sonnet).
+# One list for every consumer (send policy, creation, grants, repos), so a new payment
+# name is closed everywhere at once. Owner rule: automation never touches payment work.
+PAYMENT_WORDS = ("payment", "payorch", "pay-orch", "pay_orch", "blagopay", "cloudpayments")
+_WORD_SPLIT = re.compile(r"[^a-z0-9]+")
+
+
+def payment_marked(text: str) -> bool:
+    low = (text or "").strip().lower()
+    if not low:
+        return False
+    if any(w in low for w in PAYMENT_WORDS):
+        return True
+    return "pay" in _WORD_SPLIT.split(low)
+
+
 def hard_denied(project_dir: str, session: str, cfg: dict) -> bool:
     if (session or "").strip().lower() in HARD_DENY_SESSIONS:
+        return True
+    if payment_marked(session) or payment_marked(project_dir):
         return True
     dirs = cfg.get("hard_deny_dirs")
     return isinstance(dirs, list) and any(_under(project_dir, d) for d in dirs

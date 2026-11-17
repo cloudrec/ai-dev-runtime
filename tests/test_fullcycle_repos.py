@@ -66,7 +66,7 @@ def test_a_repo_not_in_the_list_is_refused(box, src):
         repos.get("shop")
 
 
-@pytest.mark.parametrize("word", ["payment-orchestrator", "payorch-ha", "PayOrch"])
+@pytest.mark.parametrize("word", ["payment-orchestrator", "payorch-ha", "PayOrch", "blagopay-edge-rollout", "autonomy-pay-x"])
 def test_money_dirs_by_name_are_refused(box, tmp_path, word):
     p = tmp_path / word
     p.mkdir()

@@ -140,7 +140,7 @@ def test_scope_without_max_concurrent_refuses(wt):
     assert auth(wt, wt["ru"], "gaika-ru")["reason"] == "creation_scope_missing_max_concurrent"
 
 
-def test_payment_agent_is_hard_denied_even_inside_a_scope_or_with_policy_off(wt, monkeypatch):
+def test_money_agent_is_hard_denied_even_inside_a_scope_or_with_policy_off(wt, monkeypatch):
     cfg = yaml.safe_load(wt["cfg"].read_text())
     cfg["scopes"]["gaika"]["worktrees"]["pay"] = wt["pay"]
     wt["cfg"].write_text(yaml.safe_dump(cfg))

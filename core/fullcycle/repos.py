@@ -31,7 +31,6 @@ from core.fullcycle import gates
 
 DEFAULT_FILE = "/etc/ai-runtime/fullcycle-repos.json"
 NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,30}$")
-_PAYMENT_WORDS = ("payment", "payorch", "pay-orch", "pay_orch")
 
 
 class RepoError(Exception):
@@ -78,8 +77,8 @@ def check_source(path: str) -> Optional[str]:
     real = os.path.realpath(path)
     if real != os.path.normpath(os.path.abspath(path)):
         return "repo_path_is_symlink"
-    low = real.lower()
-    if any(w in low for w in _PAYMENT_WORDS):
+    from core import agent_creation_policy as acp
+    if acp.payment_marked(real) or acp.payment_marked(path):
         return "repo_payment_denied"
     refused = gates.check_project_root(real)
     if refused:

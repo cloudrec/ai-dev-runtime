@@ -2028,6 +2028,25 @@ def automation_targets() -> set:
             if t.strip() and t.strip().split("@", 1)[0] not in ("*", "")}
 
 
+def open_callers() -> set:
+    """Caller classes (AGENT_AUTOMATION_OPEN_CALLERS, e.g. `api`) that may type into ANY
+    agent that is not payment work — by session name or by directory. Empty = none.
+    The payment checks run first and still refuse; only an owner proof overrides them."""
+    raw = os.getenv("AGENT_AUTOMATION_OPEN_CALLERS", "")
+    return {c.strip() for c in raw.split(",") if c.strip() and c.strip() != "*"}
+
+
+def _payment_session(session: str) -> bool:
+    s = (session or "").strip().lower()
+    if s in AUTOMATION_HARD_DENY:
+        return True
+    try:
+        from core import agent_creation_policy as _acp
+        return _acp.payment_marked(s)
+    except Exception:  # noqa: BLE001 — policy module broken: fail closed
+        return True
+
+
 def caller_class(actor: Optional[str], source: Optional[str] = None) -> str:
     a = (actor or "").strip()
     if a.startswith(_AUTOMATED_ACTOR_PREFIX):
@@ -2064,8 +2083,7 @@ def automation_decision(session: str, target: str, actor: Optional[str],
     if owner_proven:
         return "", "owner_proof"      # this exact command carries a verified owner proof
     sess = (session or "").strip()
-    if sess.lower() in AUTOMATION_HARD_DENY or \
-            (target or "").strip().split(":")[0].lower() in AUTOMATION_HARD_DENY:
+    if _payment_session(sess) or _payment_session((target or "").strip().split(":")[0]):
         return "hard_denied_target", ""
     if cwd:
         # by WHERE the pane runs, not only its name: a renamed session in the payment
@@ -2080,6 +2098,12 @@ def automation_decision(session: str, target: str, actor: Optional[str],
         return "", "policy_off"
     if _allowlisted(sess, (target or "").strip(), caller_class(actor)):
         return "", "allowlist"
+    if caller_class(actor) in open_callers():
+        # owner 2026-11-17: the GPT tech lead drives every agent except payment work.
+        # Needs a known cwd so the payment-directory check above actually ran.
+        if not (cwd or "").strip():
+            return "open_caller_needs_cwd", ""
+        return "", "open_caller"
     if action in ("agent_send", "agent_answer"):
         from core import automation_grants as _ag
         gid = _ag.allows_send(sess, action, actor or "", cwd=cwd)
@@ -2675,7 +2699,7 @@ def agent_stop(target: str, confirm: bool = False, idempotency_key: Optional[str
     if prior is not None:
         return {**prior, "duplicate": True, "stopped": False}
 
-    if (pane.get("session") or "").strip().lower() in AUTOMATION_HARD_DENY:
+    if _payment_session(pane.get("session") or ""):
         why = verify_owner_proof(owner_proof, "agent_stop", target, "") \
             if owner_proof is not None else "hard_denied_target"
         if why:

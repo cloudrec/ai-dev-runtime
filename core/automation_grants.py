@@ -51,6 +51,14 @@ ACTIONS = frozenset({"send", "answer", "create"})
 MAX_FAILED_APPROVALS = 5               # per 15 min, then approvals lock (brute force)
 _SCRYPT = {"n": 2 ** 14, "r": 8, "p": 1, "maxmem": 64 * 1024 * 1024, "dklen": 32}
 HARD_DENY_SESSIONS = frozenset({"payorch-ha-fresh"})
+
+
+def _payment_name(session: str) -> bool:
+    try:
+        from core import agent_creation_policy as acp
+        return acp.payment_marked(session)
+    except Exception:  # noqa: BLE001 — fail closed
+        return True
 MAX_TTL_SECS = int(os.getenv("GRANT_MAX_TTL_SECS", str(7 * 86400)))
 PENDING_TTL_SECS = 900
 _SESSION_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -133,7 +141,7 @@ def validate_spec(spec: dict) -> dict:
     for t in targets:
         if not _SESSION_RE.match(t):
             raise GrantError(f"target {t!r} must be an exact tmux session name (no wildcard)")
-        if t.lower() in HARD_DENY_SESSIONS:
+        if t.lower() in HARD_DENY_SESSIONS or _payment_name(t):
             raise GrantError("the payment agent cannot be granted (owner proof per command)")
     create = None
     if "create" in actions:
@@ -388,7 +396,7 @@ def allows_send(session: str, action: str, actor: str, now: Optional[float] = No
         return None
     act = {"agent_send": "send", "agent_answer": "answer"}.get(action)
     sess = (session or "").strip()
-    if not act or sess.lower() in HARD_DENY_SESSIONS:
+    if not act or sess.lower() in HARD_DENY_SESSIONS or _payment_name(sess):
         return None
     for g in _active(time.time() if now is None else now):
         spec = g["spec"]

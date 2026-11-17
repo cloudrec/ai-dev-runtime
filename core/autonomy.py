@@ -6,7 +6,8 @@ never disagree about who is in the loop.
 
 Permitted: a session on the automation allowlist (AGENT_AUTOMATION_TARGETS, `session` or
 `session@caller`), or one named by an ACTIVE automation grant (its targets, or the session
-prefix it creates). Never a payment hard-denied session. Fails closed.
+prefix it creates), or any session at all while an open caller class is configured
+(AGENT_AUTOMATION_OPEN_CALLERS). Never a payment session. Fails closed.
 """
 from __future__ import annotations
 
@@ -22,8 +23,10 @@ def permitted(agent_id: str) -> bool:
         return False
     try:
         from core import agent_control as ac
-        if session in ac.AUTOMATION_HARD_DENY:
+        if ac._payment_session(session):
             return False
+        if ac.open_callers():
+            return True             # the tech lead may drive every non-payment agent
         names = {t.split("@", 1)[0].lower() for t in ac.automation_targets()}
     except Exception:  # noqa: BLE001
         names = set()

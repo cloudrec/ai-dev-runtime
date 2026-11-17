@@ -173,12 +173,18 @@ def test_renaming_a_worktree_away_takes_it_out_of_scope(gaika, fake_tmux):
 
 # ── deny boundaries ────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("d,denied", [("/opt/payment-orchestrator", True),
-                                      ("/opt/payment-orchestrator/sub", True),
-                                      ("/opt/payment-orchestrator-evil", False),
-                                      ("/opt/payment", False)])
+@pytest.mark.parametrize("d,denied", [("/opt/vault-core", True),
+                                      ("/opt/vault-core/sub", True),
+                                      ("/opt/vault-core-evil", False),
+                                      ("/opt/vault", False)])
 def test_hard_deny_dir_boundaries(d, denied):
-    assert acp.hard_denied(d, "x", {"hard_deny_dirs": ["/opt/payment-orchestrator"]}) is denied
+    assert acp.hard_denied(d, "x", {"hard_deny_dirs": ["/opt/vault-core"]}) is denied
+
+
+@pytest.mark.parametrize("d", ["/opt/payment-orchestrator-evil", "/opt/payment",
+                               "/opt/blagopay-edge-rollout", "/opt/payorch-wt-tabpay"])
+def test_payment_named_dirs_are_denied_without_a_config_entry(d):
+    assert acp.hard_denied(d, "x", {"hard_deny_dirs": ["/opt/payment-orchestrator"]})
 
 
 def test_payment_agent_name_is_denied_for_the_local_controller_too(gaika, fake_tmux):
