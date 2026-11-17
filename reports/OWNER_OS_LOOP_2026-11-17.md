@@ -219,3 +219,4 @@ Not applied. Live is still 3423f4d, with the vtb deny edit and the widened compa
   - RFB offers only security type 2 (password).
 - Rollback: `deploy/browser_login/rollback.sh /root/ai-dev-runtime/backups/browser-login-20261117T175155Z`.
 - Owner decisions: no MCP token rotation; no Tailscale on the phone (login from the Windows PCs on the tailnet).
+- Owner 2026-11-17 ("убери пароль с браузера"): x11vnc now runs with `-nopw` and VNC stays on localhost only; the password file is removed. RFB offers type 1. Tailnet-only noVNC is the guard; local users could already drive the browser over CDP on localhost. The installer is updated to match.

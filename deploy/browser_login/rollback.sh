@@ -7,7 +7,7 @@ CDROP=/etc/systemd/system/owner-os-wake-companion.service.d/99-session-login-lin
 tailscale serve --http="$PORT" off >/dev/null 2>&1 || true
 if [ -f "$BK/50-passwdfile.conf" ]; then cp -p "$BK/50-passwdfile.conf" "$XDROP"; else rm -f "$XDROP"; fi
 if [ -f "$BK/99-session-login-link.conf" ]; then cp -p "$BK/99-session-login-link.conf" "$CDROP"; else rm -f "$CDROP"; fi
-if [ -f "$BK/vncpasswd.txt.prev" ]; then cp -p "$BK/vncpasswd.txt.prev" /home/owneros/.vncpasswd.txt; else rm -f /home/owneros/.vncpasswd.txt; fi
+rm -f /home/owneros/.vncpasswd.txt
 systemctl daemon-reload
 systemctl restart owner-os-x11vnc owner-os-wake-companion
 echo "rolled back: noVNC local only, x11vnc on its original -rfbauth file, no login link"
