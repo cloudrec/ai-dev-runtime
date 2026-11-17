@@ -90,3 +90,32 @@ Guarantee: at most one send happens automatically. Exactly-once is not claimed.
 - runtime: `TARGET_SHA=8a3965d deploy/adaptive_offer/install.sh --check` and `--apply`;
 - seo: rebuild the image from the merged branch (seo memory: rebuild to deploy);
 - turn the queue on with `SEND_QUEUE_ENABLED=1`.
+
+## Stage 7 (automated tech-lead instruction, event 87806)
+SHAs:
+- **Runtime code:** d052832 (branch head a105f6e: docs only after the code).
+- **SEO:** `owneros/mcp-send-queue-20261117` @ **ae60962**. Diff from live: `git -C /opt/seo-send-queue diff 6114af8 ae60962`.
+
+Changes in this stage:
+- **d052832, reconcile authority:**
+  - every outcome needs the caller's own policy permission on the live target, including the payment hard-deny;
+  - requeue needs the same pane (pane id + pid);
+  - refusals are audited.
+- **SEO tests on disposable PostgreSQL:**
+  - Setup: an `--internal` docker network, synthetic data, `init_db` schema.
+  - Results: base 48 failed / 1059 passed; candidate 48 failed / 1069 passed. The failure lists are identical and all outside MCP; the 18 offline errors are gone.
+  - Focused MCP, auth, ownership and owner-page suites with the full repo mounted: 216 passed. The only skip is DNS.
+- **Compatibility and rollback matrix:** `reports/OWNER_OS_RUNTIME_SEO_COMPAT_2026-11-17.md`. Old runtime + new SEO was checked: unknown fields are ignored, so the reply is never a false `queued`.
+
+Test runs at d617a0d (code d052832):
+- forward: 5373 passed, 0 failed, EXIT 0;
+- reversed: 5373 passed, 0 failed, EXIT 0;
+- E2E PASS (third run).
+
+Opus review pass 11: release-ready. Its two wording notes are applied in the matrix.
+
+Installer `--check` at d052832: live 3423f4d → d052832; payorch-ha-fresh, autonomy-pay-sonnet and vtb are classed PAYMENT.
+
+The queue flag is unset on live, so the queue is off.
+
+Release: nothing applied. The owner's direct word in this session is needed for each step: runtime apply, SEO image rebuild, `SEND_QUEUE_ENABLED=1`. After a release, validate with one disposable synthetic project through the real MCP.
