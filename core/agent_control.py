@@ -2351,7 +2351,8 @@ def _deliver_locked(target: str, text: str, action: str, idempotency_key: Option
 
 def agent_send(target: str, text: str, idempotency_key: Optional[str] = None,
                actor: Optional[str] = None, source: Optional[str] = None,
-               allow_queue: bool = False, owner_proof: Optional[dict] = None) -> dict:
+               allow_queue: bool = False, owner_proof: Optional[dict] = None,
+               queue_if_busy: bool = False, queue_ttl_secs: Optional[int] = None) -> dict:
     """Send a message to an existing agent. Never creates one.
 
     REFUSES while the agent is mid-turn, because Claude Code does not reject a
@@ -2372,6 +2373,18 @@ def agent_send(target: str, text: str, idempotency_key: Optional[str] = None,
     with _DELIVER_LOCK:
         if not allow_queue:
             busy = _busy_for_send(target)
+            if busy and queue_if_busy and owner_proof is None:
+                # durable: delivered when idle, every check re-run then (core.send_queue);
+                # never with an owner proof — proofs are single-use and short-lived
+                from core import send_queue as _sq
+                r = _sq.enqueue(target, text, idempotency_key=idempotency_key or "",
+                                actor=actor, source=source, ttl_secs=queue_ttl_secs)
+                return {"target": target, "action": "agent_send", "delivered": False,
+                        "submitted": False, "busy": busy, "send_queue": r,
+                        "queued": bool(r.get("queued")), "refused": r.get("refused"),
+                        "reason": f"agent is {busy}; message held in the send queue"
+                                  if r.get("queued") else
+                                  f"agent is {busy}; not queued: {r.get('refused')}"}
             if busy:
                 audit("agent_send", target, idempotency_key, delivered=False,
                       refused=busy, actor=actor, source=source)

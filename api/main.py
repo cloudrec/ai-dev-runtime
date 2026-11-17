@@ -157,6 +157,18 @@ async def _start_native_owner_os():
 
 
 @app.on_event("startup")
+async def _start_send_queue():
+    # Durable queue for messages to a busy agent (core/send_queue.py). The loop always
+    # runs and drains only while SEND_QUEUE_ENABLED=1, read per tick.
+    import asyncio
+    try:
+        from core.send_queue import run_loop as _sq_loop
+        asyncio.create_task(_sq_loop())
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"send queue not started: {e}")
+
+
+@app.on_event("startup")
 async def _start_continuation_watchdog():
     # Server-side direct-agent continuation watchdog: submits a documented SAFE next
     # step for an approved idle agent and PROVES the submission (submitted + pane

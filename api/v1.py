@@ -491,6 +491,8 @@ class AgentSendReq(BaseModel):
     target: str
     text: str
     idempotency_key: Optional[str] = None
+    queue_if_busy: bool = False
+    queue_ttl_secs: Optional[int] = None
 
 
 @router.post("/agents/send")
@@ -501,7 +503,23 @@ def agents_send(req: AgentSendReq, request: Request,
     actor, source = caller_identity(request, x_runtime_actor)
     return _agent_call(agent_control.agent_send, req.target, req.text, req.idempotency_key,
                        actor=actor, source=source,
-                       owner_proof=owner_proof_from_header(x_owner_proof))
+                       owner_proof=owner_proof_from_header(x_owner_proof),
+                       queue_if_busy=req.queue_if_busy, queue_ttl_secs=req.queue_ttl_secs)
+
+
+@router.get("/agents/send-queue/{idempotency_key}")
+def agents_send_queue_status(idempotency_key: str, _: bool = Depends(_auth)):
+    from core import send_queue
+    return send_queue.status(idempotency_key)
+
+
+@router.delete("/agents/send-queue/{idempotency_key}")
+def agents_send_queue_cancel(idempotency_key: str, request: Request,
+                             x_runtime_actor: Optional[str] = Header(None),
+                             _: bool = Depends(_auth)):
+    from core import send_queue
+    actor, _src = caller_identity(request, x_runtime_actor)
+    return send_queue.cancel(idempotency_key, by=actor or "api")
 
 
 @router.post("/agents/answer")
