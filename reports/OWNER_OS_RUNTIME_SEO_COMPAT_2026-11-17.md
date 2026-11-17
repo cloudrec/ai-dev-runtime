@@ -24,10 +24,10 @@ Safe order: **runtime first** (queue still off), then the **SEO image**, then tu
 | Step | Undo |
 |---|---|
 | Runtime apply | `deploy/adaptive_offer/rollback.sh <backup>`. It restores the previous SHA, `configs/.env` and the companion drop-in, and re-applies the live vtb deny (it refuses to finish without it). |
-| Queue on | Remove `SEND_QUEUE_ENABLED=1` and restart ai-runtime. Queued rows stay in the DB, undelivered, and expire; `status` reports them as expired. |
+| Queue on | Remove `SEND_QUEUE_ENABLED=1` and restart ai-runtime. Queued rows stay in the DB, undelivered, and expire; `status` reports them as expired. Rows in `unknown` do not expire: they stay `unknown`, and loop_watch flags them after 30 min. |
 | SEO image | Re-tag the previous image (`seo-backend:rollback-*` pattern, as in earlier deploys) and recreate the backend container. |
 
-Payment deny is identical in every cell. It is enforced in the runtime at enqueue, at delivery and at reconcile; SEO only forwards.
+Payment deny is identical in every cell. It is enforced in the runtime at enqueue, at delivery and at reconcile; SEO only forwards. One exception: if the target pane is gone, `reconcile` outcomes `delivered` or `abandon` skip the authority check. They only change a receipt; nothing is sent.
 
 ## Evidence (runtime d052832 / SEO ae60962)
 ### SEO suite (disposable PostgreSQL)
