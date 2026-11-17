@@ -31,7 +31,6 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$CODE
 Environment=GAIKA_VAR_DIR=$V
-Environment=NODE_ENV=production
 ExecStart=$3
 Restart=always
 RestartSec=30
