@@ -42,6 +42,9 @@ import sqlite3
 import time
 from typing import Callable, Optional
 
+import re as _re
+KEY_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")   # safe as a URL path segment
+UNKNOWN_ALARM_SECS = int(os.getenv("SEND_QUEUE_UNKNOWN_ALARM_SECS", "1800"))
 TTL_SECS = int(os.getenv("SEND_QUEUE_TTL_SECS", "1800"))
 MAX_TTL_SECS = 6 * 3600
 CLAIM_STALE_SECS = 120          # a claim older than this was lost in a crash: re-queue
@@ -105,6 +108,8 @@ def enqueue(target: str, text: str, *, idempotency_key: str, actor: Optional[str
     key = (idempotency_key or "").strip()
     if not key:
         return {"queued": False, "refused": "idempotency_key_required"}
+    if not KEY_RE.match(key):
+        return {"queued": False, "refused": "idempotency_key_invalid"}
     if not (text or "").strip():
         return {"queued": False, "refused": "empty_text"}
     ttl = max(1, min(int(ttl_secs or TTL_SECS), MAX_TTL_SECS))
@@ -139,6 +144,21 @@ def enqueue(target: str, text: str, *, idempotency_key: str, actor: Optional[str
             return {**_public(prior), "duplicate": True}
         ac.audit("send_queued", resolved, key, actor=actor, source=source)
         return _public(_row(conn, key))
+    finally:
+        conn.close()
+
+
+def stale_unknown(now: Optional[float] = None) -> list:
+    """Keys whose send outcome has been unknown for longer than UNKNOWN_ALARM_SECS."""
+    now = time.time() if now is None else now
+    try:
+        conn = _conn()
+    except Exception:  # noqa: BLE001 — misconfigured DB: nothing to report from here
+        return []
+    try:
+        return [r[0] for r in conn.execute(
+            "SELECT idempotency_key FROM send_queue WHERE status='unknown' AND done_ts < ?",
+            (now - UNKNOWN_ALARM_SECS,)).fetchall()]
     finally:
         conn.close()
 

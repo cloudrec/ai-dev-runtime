@@ -174,7 +174,18 @@ def offer_mode_invalid(conn, now: float) -> dict:
                                   f"ChatGPT не получает ни одного уведомления."}
 
 
-CHECKS = (unwoken_reviews, undelivered_wakes, workers_down, worker_errors, offer_mode_invalid)
+def send_queue_unknown(conn, now: float) -> dict:
+    """A queued message whose delivery could not be proven waits for reconcile()."""
+    from core import send_queue as sq
+    keys = sq.stale_unknown(now)
+    if not keys:
+        return {}
+    return {"send_queue_unknown": f"{len(keys)} сообщений в очереди без подтверждения доставки "
+                                  f"(нужен reconcile): {', '.join(keys[:5])}"[:300]}
+
+
+CHECKS = (unwoken_reviews, undelivered_wakes, workers_down, worker_errors, offer_mode_invalid,
+          send_queue_unknown)
 
 
 def owner_digest(conn, notify, now: float, sent: list) -> Optional[str]:

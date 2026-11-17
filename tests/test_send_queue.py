@@ -360,3 +360,21 @@ def test_http_queue_status_cancel_and_reconcile(client):
     assert client.delete("/api/v1/agents/send-queue/h1", headers=H).json()["cancelled"]
     assert client.post("/api/v1/agents/send-queue/h1/reconcile", json={"outcome": "requeue"},
                        headers=H).json()["refused"] == "not_unknown"
+
+
+@pytest.mark.parametrize("key", [".", "..", "a/b", ".x", "-x", "k" * 200])
+def test_keys_must_be_safe_path_segments(key):
+    assert sq.enqueue("worker-a:0.0", "x", idempotency_key=key, actor=GPT)["refused"] == \
+        "idempotency_key_invalid"
+
+
+def test_a_long_unknown_raises_a_loop_watch_problem():
+    from core import loop_watch as lw
+    sq.enqueue("worker-a:0.0", "x", idempotency_key="u1", actor=GPT, now=1000.0)
+    _force("u1", started=1000.0)
+    sq.drain(now=LATER, send=Sent())
+    assert sq.status("u1")["status"] == "unknown"
+    assert lw.send_queue_unknown(None, LATER + 10) == {}
+    p = lw.send_queue_unknown(None, LATER + sq.UNKNOWN_ALARM_SECS + 10)
+    assert "u1" in p["send_queue_unknown"]
+    assert lw.send_queue_unknown in lw.CHECKS
