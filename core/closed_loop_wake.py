@@ -657,7 +657,11 @@ def _resolution_reason(conn, *, event_id: int, target: str,
         # stops for a different reason (question, plain blocker, crash).
         # `idle` too: an unchanged pane after its announced stop is reclassified idle
         # (no_signal) on the next sweep, which is exactly when the re-wakes came.
-        if cls in ("quiescent", "idle") and _dependency_wait(conn, target, now):
+        # Only watches about an agent STOPPING: a failure or a question raised by another
+        # emitter (hooks) while the pane merely looks idle keeps waking.
+        if cls in ("quiescent", "idle") and _event_type(
+                conn, event_id) in _SETTLED_RESOLVABLE_TYPES and _dependency_wait(
+                    conn, target, now):
             return "agent_dependency_wait"
         # The premise of a prompt wake is that a question is on screen. When agent_watch
         # has since reclassified the pane away from `owner_prompt`/`blocker`, that premise

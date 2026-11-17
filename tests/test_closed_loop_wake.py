@@ -2034,6 +2034,10 @@ def _set_wait(conn, target, cls, wait_since):
 
 def test_a_declared_dependency_wait_is_not_rewoken_or_escalated(conn):
     _set_wait(conn, "gaika-country-hu:0.0", "quiescent", NOW + clw.WAKE_LOOP_SLO_SECS - 10)
+    conn.execute("INSERT INTO event (id, ts, ts_epoch, source, type, agent_id) VALUES "
+                 "(338, 'x', ?, 'agent_watch', 'work_stopped_incomplete', "
+                 "'gaika-country-hu:0.0')", (NOW,))
+    conn.commit()
     emit = _Emit()
     clw.register_delivery(event_id=338, target="gaika-country-hu:0.0", project_id="hu",
                           event_type="work_stopped_incomplete", conn=conn, now=NOW)

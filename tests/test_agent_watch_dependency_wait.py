@@ -243,5 +243,25 @@ def test_closed_loop_resolves_on_the_idle_pane_after_the_announced_wait(monkeypa
     conn = aw._conn(None)[0]
     assert conn.execute("SELECT cls FROM agent_watch_state WHERE target=?",
                         (T,)).fetchone()[0] == "idle"
-    assert clw._resolution_reason(conn, event_id=1, target=T, agents=[],
+    conn.execute("INSERT INTO event (id, ts, ts_epoch, source, type, agent_id) "
+                 "VALUES (?,?,?,?,?,?)", (900, "x", t + 400, "agent_watch",
+                                          "work_stopped_incomplete", T))
+    conn.commit()
+    assert clw._resolution_reason(conn, event_id=900, target=T, agents=[],
                                   now=t + 1100) == "agent_dependency_wait"
+
+
+def test_review6_a_failure_or_question_watch_during_a_wait_still_wakes():
+    from core import closed_loop_wake as clw
+    emit, t = _Emit(), 1000.0
+    _turn(emit, _wait(1), t)
+    _sweep(emit, _wait(1), t + 1000)               # unchanged pane: idle, wait live
+    conn = aw._conn(None)[0]
+    for eid, etype in ((901, "agent_process_failed"), (902, "agent_prompt_needs_response"),
+                       (903, "agent_waiting_input")):
+        conn.execute("INSERT INTO event (id, ts, ts_epoch, source, type, agent_id) "
+                     "VALUES (?,?,?,?,?,?)", (eid, "x", t + 1050, "hook", etype, T))
+    conn.commit()
+    for eid in (901, 902, 903):
+        assert clw._resolution_reason(conn, event_id=eid, target=T, agents=[],
+                                      now=t + 1100) != "agent_dependency_wait", eid
