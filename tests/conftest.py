@@ -66,6 +66,15 @@ os.environ["OWNEROS_NATIVE_SESSIONS"] = "0"
 # the process level covers every call site, including ones added later that forget.
 os.environ["OWNEROS_HOOK_DIAG"] = os.path.join(_TEST_DB_DIR, "owneros_hook_diag.jsonl")
 
+# Same hazard, third door (2026-11-17). The hook loads the service config into its own
+# process. Run in-process by tests, it read the LIVE configs/.env and left every key in
+# os.environ for the rest of the suite — secrets included — and once live set
+# AGENT_AUTOMATION_OPEN_CALLERS=api, unrelated wake-phrase tests flipped. Tests get an
+# empty stand-in; the ones covering the loader point it at their own file.
+_EMPTY_RUNTIME_ENV = os.path.join(_TEST_DB_DIR, "runtime.env")
+open(_EMPTY_RUNTIME_ENV, "a").close()
+os.environ["OWNEROS_RUNTIME_ENV"] = _EMPTY_RUNTIME_ENV
+
 # Same hazard, second door. `closed_loop_wake._transcript_advanced` reads the session
 # transcripts under ~/.claude/projects to answer "did this agent write anything since the
 # wake?", which on this host is the operator's REAL transcript directory. Three existing
@@ -142,3 +151,21 @@ def _no_live_browser():
     assert not _live_cdp_attempts, (
         f"test reached the live browser's CDP port {_live_cdp_attempts}; "
         "stub browser_degraded/find_target/_create_tab/_http instead")
+
+
+# Policy switches must never outlive the test that set them: a leaked
+# AGENT_AUTOMATION_OPEN_CALLERS or WAKE_BRIDGE_* silently changes every later test.
+_POLICY_ENV_PREFIXES = ("AGENT_AUTOMATION", "WAKE_BRIDGE")
+
+
+@pytest.fixture(autouse=True)
+def _policy_env_does_not_leak(request):
+    before = {k: v for k, v in os.environ.items() if k.startswith(_POLICY_ENV_PREFIXES)}
+    yield
+    after = {k: v for k, v in os.environ.items() if k.startswith(_POLICY_ENV_PREFIXES)}
+    if after != before:
+        for k in set(after) - set(before):
+            del os.environ[k]
+        os.environ.update(before)
+        pytest.fail(f"{request.node.nodeid} leaked policy env: "
+                    f"{sorted(set(after.items()) ^ set(before.items()))}", pytrace=False)

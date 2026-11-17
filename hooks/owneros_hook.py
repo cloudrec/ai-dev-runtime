@@ -38,7 +38,9 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
-_RUNTIME_ENV = "/root/ai-dev-runtime/configs/.env"
+_DEFAULT_RUNTIME_ENV = "/root/ai-dev-runtime/configs/.env"
+# Overridable only so a test run never loads the live service config into its process.
+_RUNTIME_ENV = os.environ.get("OWNEROS_RUNTIME_ENV") or _DEFAULT_RUNTIME_ENV
 
 
 def _load_runtime_env() -> None:

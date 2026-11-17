@@ -188,9 +188,9 @@ def test_3_broad_or_containing_roots_are_refused(tmp_path, monkeypatch):
         f"project_root_contains_denied:{inner}"
 
 
-def test_3_a_root_containing_a_payment_dir_is_refused(tmp_path, monkeypatch):
+def test_3_a_root_holding_a_denied_dir_is_refused(tmp_path, monkeypatch):
     from core import agent_creation_policy as acp
-    pay = tmp_path / "proj" / "payments"
+    pay = tmp_path / "proj" / "vault"          # a denied dir by config, not by name
     pay.mkdir(parents=True)
     monkeypatch.setattr(acp, "load_config", lambda: {"hard_deny_dirs": [str(pay)]})
     assert gates.check_project_root(str(tmp_path / "proj")) == \

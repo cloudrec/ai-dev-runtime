@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+
+import pytest
 import subprocess
 import sys
 import tempfile
@@ -155,24 +157,48 @@ def test_a_teammate_name_is_preferred_as_the_agent_identity():
     assert _identity({"teammate_name": "worker-a", "cwd": "/opt/x"})["agent"] == "worker-a"
 
 
-def test_the_hook_loads_the_runtime_env_so_the_wake_bridge_is_actually_enabled(monkeypatch):
+@pytest.fixture
+def runtime_env(tmp_path, monkeypatch):
+    """A stand-in for configs/.env, and the process environment restored afterwards.
+
+    2026-11-17: these tests read the LIVE /root/ai-dev-runtime/configs/.env and left every
+    key in os.environ for the rest of the run (secrets included). When live gained
+    AGENT_AUTOMATION_OPEN_CALLERS=api, unrelated wake-phrase tests started failing."""
+    import importlib
+    mod = importlib.import_module("hooks.owneros_hook")
+    env = tmp_path / ".env"
+    env.write_text("# service config\nWAKE_BRIDGE_ENABLED=1\nSOME_KEY='v'\n")
+    monkeypatch.setattr(mod, "_RUNTIME_ENV", str(env))
+    saved = dict(os.environ)
+    yield mod
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+def test_the_hook_loads_the_runtime_env_so_the_wake_bridge_is_actually_enabled(
+        runtime_env, monkeypatch):
     """First live run: two real agent_waiting_input events from native Notification hooks,
     both recorded durably and both with NO wake decision — the bridge read
     WAKE_BRIDGE_ENABLED as unset in the bare hook process. The event log was right and the
     doorbell never rang."""
-    import importlib
     monkeypatch.delenv("WAKE_BRIDGE_ENABLED", raising=False)
-    mod = importlib.import_module("hooks.owneros_hook")
-    mod._load_runtime_env()
-    assert os.environ.get("WAKE_BRIDGE_ENABLED"), "the bridge must be enabled in-process"
+    monkeypatch.delenv("SOME_KEY", raising=False)
+    runtime_env._load_runtime_env()
+    assert os.environ.get("WAKE_BRIDGE_ENABLED") == "1", "the bridge must be enabled in-process"
+    assert os.environ.get("SOME_KEY") == "v"
 
 
-def test_an_explicit_environment_always_wins_over_the_file(monkeypatch):
-    """Tests and hand-runs must never be silently overridden by the service config."""
+def test_the_hook_reads_the_live_runtime_env_path_unless_overridden():
     import importlib
-    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "0")
     mod = importlib.import_module("hooks.owneros_hook")
-    mod._load_runtime_env()
+    assert mod._DEFAULT_RUNTIME_ENV == "/root/ai-dev-runtime/configs/.env"
+    assert mod._RUNTIME_ENV == os.environ["OWNEROS_RUNTIME_ENV"] != mod._DEFAULT_RUNTIME_ENV
+
+
+def test_an_explicit_environment_always_wins_over_the_file(runtime_env, monkeypatch):
+    """Tests and hand-runs must never be silently overridden by the service config."""
+    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "0")
+    runtime_env._load_runtime_env()
     assert os.environ["WAKE_BRIDGE_ENABLED"] == "0"
 
 
