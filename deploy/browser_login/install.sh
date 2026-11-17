@@ -22,7 +22,8 @@ systemctl is-active -q owner-os-x11vnc owner-os-novnc || die "x11vnc/novnc not a
 [ -f /usr/share/novnc/vnc.html ] || die "noVNC web files missing"
 tailscale serve status --json | python3 -c "import json,sys; d=json.load(sys.stdin) or {}; sys.exit(1 if '$PORT' in (d.get('TCP') or {}) else 0)" \
   || echo "note: tailnet port $PORT is already served (re-apply)"
-tailscale funnel status 2>/dev/null | grep -q ":$PORT" && die "port $PORT is on FUNNEL (public) - refusing"
+public() { tailscale serve status --json | python3 -c "import json,sys; d=json.load(sys.stdin) or {}; sys.exit(0 if any(k.endswith(':$PORT') and v for k, v in (d.get('AllowFunnel') or {}).items()) else 1)"; }
+public && die "port $PORT is on FUNNEL (public) - refusing"
 grep -q 'login_url' "$RT/core/chatgpt_session_watch.py" || die "runtime lacks login_url (deploy the runtime first)"
 grep -qE '^TELEGRAM_(BOT_TOKEN|CHAT_ID)=' "$RT/configs/.env" || die "Telegram not configured"
 echo "ok: noVNC -> tailnet only at $URL; x11vnc gets -passwdfile; companion gets the link"
@@ -73,5 +74,5 @@ sleep 3
 systemctl is-active -q owner-os-x11vnc owner-os-wake-companion owner-os-chromium || die "a unit is not active - run rollback.sh $BK"
 code=$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://$HOST:$PORT/vnc.html")
 [ "$code" = 200 ] || die "noVNC over tailnet answered $code - run rollback.sh $BK"
-tailscale funnel status 2>/dev/null | grep -q ":$PORT" && die "unexpectedly public - run rollback.sh $BK"
+public && die "unexpectedly public - run rollback.sh $BK"
 echo "DONE: $URL (tailnet only); rollback: $(dirname "$0")/rollback.sh $BK"

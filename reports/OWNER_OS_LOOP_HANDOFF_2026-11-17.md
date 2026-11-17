@@ -2,7 +2,8 @@
 
 ## Current state (canonical; everything below is history)
 **Live** (released on the owner's direct word):
-- **Runtime** `8052c40`, rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261117T165639Z`.
+- **Runtime** `56f5ad4`, rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261117T175137Z`.
+- **Session login link**: noVNC on the tailnet only, rollback `deploy/browser_login/rollback.sh /root/ai-dev-runtime/backups/browser-login-20261117T175155Z`.
 - **SEO** `97cb001` (MCP send-queue contract + owner-page undismiss button), rollbacks: `deploy/seo_undismiss/rollback.sh`, then `deploy/seo_send_queue/rollback.sh`.
 - **Queue**: `SEND_QUEUE_ENABLED=1` via `/etc/systemd/system/ai-runtime.service.d/99-send-queue.conf`. To undo, remove the file and restart ai-runtime.
 

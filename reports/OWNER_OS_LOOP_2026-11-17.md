@@ -205,3 +205,17 @@ Not applied. Live is still 3423f4d, with the vtb deny edit and the widened compa
 - Verified the live code: the WEST wording is detected; `note_task_delivered` is present.
 - `loop_watch.check` with the companion environment reports no problems. Run from a plain shell without `WAKE_BRIDGE_OFFER`, it falsely lists the payment wakes as undelivered; those are withheld by design.
 - Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261117T165639Z`.
+
+## Release 4: login link for an expired ChatGPT session (owner: "открывать браузер")
+- Runtime `56f5ad4`: the logged-out alert carries the link. Full suite 5400 passed, EXIT 0. Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261117T175137Z`.
+- `deploy/browser_login/install.sh --apply`:
+  - noVNC is served on the tailnet only, at `http://polyinput-server.tail9bce4e.ts.net:6080/vnc.html?autoconnect=1&resize=remote`;
+  - a fresh 8-character VNC password was written to a 600 file read by x11vnc through `-passwdfile`, and sent to the owner by Telegram only;
+  - the companion env holds `CHATGPT_SESSION_LOGIN_URL`.
+- Its final public-exposure check gave a false positive: `tailscale funnel status` also lists tailnet-only serves. The check now reads `AllowFunnel` from the serve JSON, and `--check` passes.
+- Verified:
+  - tailnet 200, public IP no answer, `AllowFunnel` empty;
+  - VNC ports on localhost only;
+  - RFB offers only security type 2 (password).
+- Rollback: `deploy/browser_login/rollback.sh /root/ai-dev-runtime/backups/browser-login-20261117T175155Z`.
+- Owner decisions: no MCP token rotation; no Tailscale on the phone (login from the Windows PCs on the tailnet).
