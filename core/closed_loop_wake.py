@@ -669,7 +669,8 @@ def _resolution_reason(conn, *, event_id: int, target: str,
         # were re-woken and escalated for exactly this). Only while the pane is at rest: a
         # pane working again, a crash or a question keeps its own watch, and a NEW stage
         # or task is a new event with a fresh watch.
-        if cls in ("quiescent", "idle") and _stage_done_handoff(conn, event_id):
+        if cls in ("quiescent", "idle") and (_stage_done_handoff(conn, event_id)
+                                             or _stage_done_rest(conn, event_id, target)):
             return "stage_done_handoff"
         # The premise of a prompt wake is that a question is on screen. When agent_watch
         # has since reclassified the pane away from `owner_prompt`/`blocker`, that premise
@@ -721,6 +722,34 @@ def _stage_done_handoff(conn, event_id: int) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return bool(r) and r[0] == "task_completed" and r[1] == "agent_stage_done"
+
+
+def _stage_done_rest(conn, event_id: int, target: str) -> bool:
+    """A `work_stopped_incomplete` about the very rest the agent handed over with
+    tools/stage_done.py (HU 88277->88281, WEST 88284->88302, PL 88298->88303). New code
+    no longer announces such a rest (agent_watch `stage_done_handoff`), but a watch opened
+    before the release, or by a sweep that raced the stage_done, must not be re-woken and
+    escalated either. Same evidence as agent_watch: a stage_done after the last delivered
+    task and at most REARM_WORK_SECS before the pane's unchanged final output. Never when
+    the announced excerpt carries an error: a failure keeps waking."""
+    from core import agent_watch as _aw
+    try:
+        r = conn.execute("SELECT type, payload FROM event WHERE id=?",
+                         (int(event_id),)).fetchone()
+        if not r or r[0] != "work_stopped_incomplete":
+            return False
+        try:
+            excerpt = (json.loads(r[1] or "{}") or {}).get("excerpt") or ""
+        except Exception:  # noqa: BLE001 — unreadable payload: claim nothing
+            return False
+        if _aw._ERRORISH_RE.search(str(excerpt)):
+            return False
+        st = conn.execute("SELECT digest_since, task_ts FROM agent_watch_state "
+                          "WHERE target=?", (target,)).fetchone()
+    except Exception:  # noqa: BLE001 — older DB: claims nothing
+        return False
+    return bool(st) and _aw._stage_done_covers(conn, target, digest_since=st[0],
+                                               task_ts=st[1])
 
 
 def _event_type(conn, event_id: int) -> str:

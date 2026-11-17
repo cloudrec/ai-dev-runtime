@@ -146,7 +146,10 @@ _STATE_COLUMNS = (("miss_count", "INTEGER DEFAULT 0"),
                   ("work_since", "REAL"), ("work_last", "REAL"),
                   # the digest a wait lapsed on (TTL): that same frozen pane is never
                   # re-parked, so closed_loop can re-wake and escalate it as before
-                  ("wait_lapsed_digest", "TEXT"))
+                  ("wait_lapsed_digest", "TEXT"),
+                  # when the tech lead/owner last delivered a task (note_task_delivered):
+                  # a stage_done older than that belongs to the previous task
+                  ("task_ts", "REAL"))
 
 
 def _migrate_state(conn) -> None:
@@ -163,7 +166,13 @@ _OWNER_PROMPT_RE = re.compile(
     r"(do you want to proceed|do you want to|would you like to proceed"
     r"|\(y/n\)|\by/n\b|yes/no"
     r"|❯?\s*1\.\s*yes[\s\S]{0,200}?\bno\b"
-    r"|разрешить\?|продолжить\?|подтверд)", re.IGNORECASE)
+    r"|разрешить\?|продолжить\?"
+    # Only a REQUEST for confirmation. The bare stem also matched the agent's own
+    # statements: "Подтвердится на деле, когда…" (event 88295, this pane's release
+    # report) made a finished report an owner prompt, which then kept the stage_done
+    # watch 88292 from resolving and was re-woken and escalated (88313/88318, again 88326
+    # after compaction left the line on screen).
+    r"|подтверд(?:и|ите|ить|ишь)\b|подтвержда(?:ете|ешь)\b[^.!\n]*\?)", re.IGNORECASE)
 # Work explicitly at rest, waiting for someone: paused / awaiting instructions / blocked.
 # A PROVIDER usage window is exhausted. This is neither a failure nor a finish: the
 # agent is alive, did not crash, did not complete, and no owner action helps — the window
@@ -311,7 +320,9 @@ _DEP_WAIT_RE = re.compile(
     r"жд[ёе]м (?:авторизованн\w* )?захват|"
     # WEST, 2026-11-17 (events 87094, 87495): the same terminal wait, worded as a state
     r"only (?:genuine |real )?(?:owner )?captures? remain|"
-    r"standing by until (?:the )?(?:owner )?captures? (?:arrive|land|come in))", re.IGNORECASE)
+    r"standing by until (?:the )?(?:owner )?captures? (?:arrive|land|come in)|"
+    # HU, 2026-11-17 (event 88281): "I'm standing by for captures or a re-review request"
+    r"standing by for (?:the )?(?:owner )?captures?)", re.IGNORECASE)
 _ERRORISH_RE = re.compile(r"(error|exception|traceback|failed|ошибк|сбой|упал)", re.I)
 REARM_WORK_SECS = int(os.getenv("AGENT_WATCH_REARM_WORK_SECS", "300"))
 WAIT_TTL_SECS = int(os.getenv("AGENT_WATCH_DEPENDENCY_WAIT_TTL_SECS", str(4 * 3600)))
@@ -819,9 +830,9 @@ def note_task_delivered(target: str, *, conn=None, now: Optional[float] = None) 
         cur = conn.execute(
             "UPDATE agent_watch_state SET wait_since=NULL, work_since=NULL, work_last=NULL, "
             "wait_lapsed_digest=NULL, notified_cls='', notified_digest='', "
-            "cls='working', digest='' "
+            "cls='working', digest='', task_ts=? "
             "WHERE target=? OR target LIKE ? ESCAPE '\\'",
-            (t, session.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + ":%"))
+            (now if now is not None else now_ts(), t, session.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + ":%"))
         conn.commit()
         return cur.rowcount or 0
     except Exception:  # noqa: BLE001 — a fresh DB without the table: nothing to re-arm
@@ -829,6 +840,33 @@ def note_task_delivered(target: str, *, conn=None, now: Optional[float] = None) 
     finally:
         if own:
             conn.close()
+
+
+# A stop the agent already announced itself with tools/stage_done.py (2026-11-17, after
+# de94158: HU 88277->88281, WEST 88284->88302, PL 88298->88303). The stage_done
+# `task_completed` woke the tech lead; five minutes later the same rest was announced again
+# as `work_stopped_incomplete`, and THAT watch, being no `task_completed`, was re-woken and
+# escalated (88309/88316, 88314/88321, 88315/88322). The stage hand-over covers the rest
+# when it belongs to the turn that ended in it:
+#   * after the last task the tech lead/owner delivered (`task_ts`): an older stage
+#     belongs to the previous task;
+#   * at most REARM_WORK_SECS before the pane's final output (`digest_since`), the same
+#     bound that tells real new work from a restatement.
+# Only for `quiescent` (a question, a blocker, a crash or a completion keep their path),
+# never with an error line in the final message, and it parks exactly like a declared
+# wait: a delivered task, real work, a different stop or the TTL re-arm it.
+def _stage_done_covers(conn, target: str, *, digest_since, task_ts) -> bool:
+    if digest_since is None:
+        return False
+    since = max(float(digest_since) - REARM_WORK_SECS, float(task_ts or 0))
+    try:
+        r = conn.execute(
+            "SELECT 1 FROM event WHERE agent_id=? AND type='task_completed' "
+            "AND source='agent_stage_done' AND ts_epoch>=? LIMIT 1",
+            (target, since)).fetchone()
+    except Exception:  # noqa: BLE001 — no event table: nothing is covered
+        return False
+    return bool(r)
 
 
 def _declare_dependency_wait(conn, target: str, now: float, digest: str,
@@ -900,7 +938,8 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 continue
             row = conn.execute(
                 "SELECT cls,digest,notified_cls,notified_digest,notified_ts,digest_since,"
-                "wait_since,work_since,work_last FROM agent_watch_state WHERE target=?",
+                "wait_since,work_since,work_last,task_ts FROM agent_watch_state "
+                "WHERE target=?",
                 (target,)).fetchone()
             prev_cls = row[0] if row else ""
             # How long this pane has looked EXACTLY like this. The digest is computed
@@ -993,6 +1032,11 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             if cls not in _EVENT_FOR:
                 skipped.append({"target": target, "why": f"class_{cls}"})
                 continue
+            stage_handoff = (cls == "quiescent" and bool(a.get("alive"))
+                             and not _ERRORISH_RE.search(_final_message(tail))
+                             and _stage_done_covers(
+                                 conn, target, digest_since=digest_since,
+                                 task_ts=row[9] if row else None))
             dep_wait = (cls == "quiescent" and bool(a.get("alive"))
                         and declares_dependency_wait(tail))
             wait_since = row[6] if row else None
@@ -1018,6 +1062,16 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             if dep_wait and wait_since is not None:
                 # the same declared wait, re-stated: not news (#338)
                 skipped.append({"target": target, "why": "dependency_wait_parked"})
+                conn.commit()
+                continue
+            if stage_handoff and _declare_dependency_wait(conn, target, now, dg):
+                # announced already, by the agent's own stage_done: record it as this
+                # rest's notification and park, without a second wake
+                conn.execute(
+                    "UPDATE agent_watch_state SET notified_cls=?, notified_digest=?, "
+                    "notified_at=?, notified_ts=? WHERE target=?",
+                    (cls, dg, now_iso(), now, target))
+                skipped.append({"target": target, "why": "stage_done_handoff"})
                 conn.commit()
                 continue
             # At rest is the END STATE of an agent whose Full Cycle project is done: the
