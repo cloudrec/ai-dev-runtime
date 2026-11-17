@@ -63,3 +63,8 @@ All of this is on the branch. Live is not changed until the owner says "депл
 
 # Owner rule, 2026-11-17 ("вариант 1", said by the owner directly in the GAIKA tech-lead session)
 The ChatGPT tech lead's word counts as the owner's word for deploying or restarting live Owner OS and GAIKA services. These stay the owner's alone: payment (payorch, payment servers, blagopay), money and paid runs, and permissions. A deploy always goes through an installer with --check and rollback.
+
+# Filter widened to every non-payment agent (owner 2026-11-17 "добавь остальных агентов тоже, кроме платёжных")
+- The drop-in `99-tech-lead-hears.conf` now also lists ai-terminal-restore, bitwhite-maxbitwhite, fruit-migration, lootboxes-sonnet, mess-telegram-connector, serverwarden-livefire and vtb. The companion was restarted and is active.
+- Delivered after the change: lootboxes-sonnet (87025), fruit-migration (87047) and gaika-country-west (87094) to the owner-os chat, and serverwarden-livefire (87105) to the hostsecure chat. The payment wakes 87120 (autonomy-pay-sonnet) and 87121 (payorch-ha-fresh) were not delivered.
+- Limit: the filter is a list of names, so a new non-payment agent session has to be added to the drop-in. The previous version is in backups/open-callers-20261117T063150Z/companion-99-v1.conf.
