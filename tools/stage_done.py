@@ -51,6 +51,37 @@ def _permitted(session: str) -> bool:
     return autonomy.permitted(session)
 
 
+def _ancestors(pid: int, limit: int = 64) -> list:
+    out = []
+    while pid > 1 and len(out) < limit:
+        out.append(pid)
+        try:
+            with open(f"/proc/{pid}/stat", encoding="utf-8") as fh:
+                pid = int(fh.read().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return out
+
+
+def _pane_by_ancestry() -> str:
+    """The tmux pane whose shell is an ancestor of this process — authoritative even
+    when TMUX_PANE was dropped by a subshell (`env -u TMUX`, sudo, a script's clean env)."""
+    import subprocess
+    try:
+        out = subprocess.run(["tmux", "list-panes", "-a", "-F",
+                              "#{pane_pid} #{session_name}:#{window_index}.#{pane_index}"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    panes = {}
+    for line in out.splitlines():
+        pid, _, target = line.partition(" ")
+        if pid.isdigit() and target:
+            panes[int(pid)] = target
+    hits = [panes[p] for p in _ancestors(os.getpid()) if p in panes]
+    return hits[0] if hits else ""
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--summary", required=True)
@@ -82,7 +113,18 @@ def main(argv=None) -> int:
                            capture_output=True, text=True, timeout=5).stdout.strip()
         if t:
             os.environ["OWNEROS_AGENT_TARGET"] = t
+    if not os.environ.get("OWNEROS_AGENT_TARGET"):
+        t = _pane_by_ancestry()
+        if t:
+            os.environ["OWNEROS_AGENT_TARGET"] = t
     ident = hook._identity({"cwd": a.cwd, "session_id": os.environ.get("CLAUDE_SESSION_ID", "")})
+    if ident["agent"] in ("", "session:"):
+        # no pane and no session id: the old path emitted for agent "session:" and was
+        # refused as not permitted, which read as a policy refusal instead of what it is
+        print(json.dumps({"ok": False, "reason": "no_agent_identity",
+                          "hint": "run inside the agent's tmux pane (TMUX_PANE) or set "
+                                  "OWNEROS_AGENT_TARGET=session:window.pane"}))
+        return 4
     session = ident["agent"].split(":", 1)[0]
     if not _permitted(session):
         print(json.dumps({"ok": False, "reason": "agent_not_permitted_for_autonomy",

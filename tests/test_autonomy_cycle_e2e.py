@@ -395,3 +395,33 @@ def test_a_finished_project_leaves_the_watchdog_quiet(cycle):
         c["engine"].tick()
         assert c["companion"].tick(wb)["acted"] is False
     assert len(c["browser"].submissions) == n
+
+
+# ── 2026-11-17: an empty identity is named, never emitted as agent "session:" ──
+def test_stage_done_without_any_identity_refuses_by_name(cycle, monkeypatch):
+    c = cycle
+    monkeypatch.delenv("OWNEROS_AGENT_TARGET", raising=False)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
+    sd = _load("stage_done_sandbox_noid", "tools/stage_done.py")
+    monkeypatch.setattr(sd, "_pane_by_ancestry", lambda: "")
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = sd.main(["--cwd", c["root"], "--summary", "s", "--ref", "b@1"])
+    out = json.loads(buf.getvalue().strip().splitlines()[-1])
+    assert rc == 4 and out["reason"] == "no_agent_identity", out
+
+
+def test_stage_done_finds_its_pane_by_process_ancestry(monkeypatch):
+    import subprocess
+    sd = _load("stage_done_sandbox_anc", "tools/stage_done.py")
+    monkeypatch.setattr(sd, "_ancestors", lambda pid, limit=64: [999, 500, 42])
+
+    class R:
+        stdout = "7 other:0.0\n500 sandbox-agent:0.0\n42 outer:1.0\n"
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: R())
+    assert sd._pane_by_ancestry() == "sandbox-agent:0.0"     # the nearest ancestor pane
+    monkeypatch.setattr(sd, "_ancestors", lambda pid, limit=64: [999])
+    assert sd._pane_by_ancestry() == ""
