@@ -38,9 +38,18 @@ def test_every_core_reader_goes_through_the_validator():
     import re
     root = pathlib.Path(__file__).resolve().parents[1] / "core"
     raw = re.compile(r'getenv\(\s*"AGENT_CONTROL_DB"')
-    # agent_privilege validates the value itself (blank -> control_db_unset);
-    # owner_status.AC_DB is an unused constant kept for its test's monkeypatch
-    exempt = {"control_db.py", "agent_privilege.py", "owner_status.py"}
+    # agent_privilege validates the value itself (blank/relative -> control_db_unset)
+    exempt = {"control_db.py", "agent_privilege.py"}
     offenders = [str(f.relative_to(root)) for f in root.rglob("*.py")
                  if f.name not in exempt and raw.search(f.read_text())]
     assert offenders == [], offenders
+
+
+def test_the_privilege_pin_never_lands_beside_the_cwd(monkeypatch, tmp_path):
+    from core import agent_privilege as priv
+    monkeypatch.chdir(tmp_path)
+    for bad in ("  ", "rel.db"):
+        monkeypatch.setenv("AGENT_CONTROL_DB", bad)
+        with pytest.raises(priv.AgentPrivilegeError):
+            priv._pin_path()
+    assert os.listdir(tmp_path) == []

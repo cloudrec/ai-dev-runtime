@@ -7,9 +7,16 @@ such a message durably and delivers it once the agent is idle — through the SA
 `agent_send`, so every check runs again at delivery time.
 
 Guarantees:
-  * idempotent: one row per idempotency key; the same key with other text is refused;
-    delivery reuses the key, so agent_control's own delivery record can never send twice
-    (a crash between claim and receipt re-queues the row, and the replay is a no-op);
+  * idempotent: one row per idempotency key; the same key with other text, or a key
+    already used by a direct send, is refused; delivery reuses the key, so a replay after
+    agent_control recorded the delivery is a no-op. Known limit: a crash in the short
+    window after the text was typed and before agent_control recorded it can type it
+    again on replay (agent_control records after submitting);
+  * honest receipts: "delivered" only when agent_control's own record says submitted;
+    an attempt that ends neither submitted nor refused is closed as refused
+    (not_submitted), never retried under the same key;
+  * off unless enabled: with SEND_QUEUE_ENABLED != 1 nothing is queued (the caller is
+    told send_queue_disabled), so no message can sit in a queue nobody drains;
   * bound to the agent it was meant for: the pane's tmux id and process id are recorded
     at enqueue time, and a queued message is never delivered to a pane that is no longer
     that process (a renamed/reused session name, a restarted agent) — it is refused;
@@ -84,6 +91,8 @@ def enqueue(target: str, text: str, *, idempotency_key: str, actor: Optional[str
     """Queue `text` for `target`. Refuses (never queues) what policy refuses now."""
     from core import agent_control as ac
     now = time.time() if now is None else now
+    if os.getenv("SEND_QUEUE_ENABLED", "") != "1":
+        return {"queued": False, "refused": "send_queue_disabled"}
     key = (idempotency_key or "").strip()
     if not key:
         return {"queued": False, "refused": "idempotency_key_required"}
@@ -97,6 +106,8 @@ def enqueue(target: str, text: str, *, idempotency_key: str, actor: Optional[str
             if prior["text_sha"] != _sha(text):
                 return {"queued": False, "refused": "idempotency_key_reused_with_other_text"}
             return {**_public(prior), "duplicate": True}
+        if ac._seen_delivery(key) is not None:
+            return {"queued": False, "refused": "idempotency_key_already_used"}
         try:
             pane = ac._pane_is_live_agent(target)
         except ac.AgentControlError as e:
@@ -137,11 +148,17 @@ def cancel(idempotency_key: str, *, by: str = "", now: Optional[float] = None) -
         conn.close()
 
 
-def status(idempotency_key: str) -> dict:
+def status(idempotency_key: str, now: Optional[float] = None) -> dict:
+    now = time.time() if now is None else now
     conn = _conn()
     try:
         row = _row(conn, idempotency_key)
-        return _public(row) if row else {"status": "unknown"}
+        if not row:
+            return {"status": "unknown"}
+        out = _public(row)
+        if row["status"] == "queued" and now >= float(row["expires_ts"] or 0):
+            out.update(status="expired", queued=False)   # the next drain closes it so
+        return out
     finally:
         conn.close()
 
@@ -208,17 +225,20 @@ def drain(now: Optional[float] = None, send: Optional[Callable] = None) -> list:
                 conn.commit()
                 busy_targets.add(target)
                 continue
-            if r.get("refused"):
-                _finish(conn, rid, "refused", str(r["refused"]), now, r)
-                out.append({"key": key, "status": "refused", "reason": r["refused"]})
-            elif r.get("delivered") or r.get("submitted") or r.get("duplicate"):
-                _finish(conn, rid, "delivered", "delivered", now, r)
-                out.append({"key": key, "status": "delivered"})
+            if r.get("duplicate"):
+                prior = ac._seen_delivery(key) or {}
+                ok = bool(prior.get("submitted") or prior.get("delivered"))
+                st, why = ("delivered", "delivered") if ok else ("refused",
+                                                                "idempotency_key_used")
+            elif r.get("refused"):
+                st, why = "refused", str(r["refused"])
+            elif r.get("delivered") or r.get("submitted"):
+                st, why = "delivered", "delivered"
             else:
-                conn.execute("UPDATE send_queue SET status='queued', claimed_ts=NULL, "
-                             "last_reason=? WHERE id=?",
-                             (str(r.get("reason") or "not_delivered")[:200], rid))
-                conn.commit()
+                st, why = "refused", "not_submitted"
+            _finish(conn, rid, st, why, now, r)
+            out.append({"key": key, "status": st} if st == "delivered"
+                       else {"key": key, "status": st, "reason": why})
             busy_targets.add(target)
         return out
     finally:

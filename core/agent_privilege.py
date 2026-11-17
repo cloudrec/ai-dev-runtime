@@ -55,7 +55,13 @@ class Target:
 
 
 def _pin_path() -> str:
-    return os.getenv("AGENT_CONTROL_DB", _DEFAULT_DB) + ".run_as"
+    raw = os.environ.get("AGENT_CONTROL_DB")
+    if raw is None:
+        return _DEFAULT_DB + ".run_as"
+    if not raw.strip() or not os.path.isabs(raw.strip()) or raw != raw.strip():
+        # a blank/relative value would put the pin beside whatever cwd the process has
+        raise AgentPrivilegeError("control_db_unset")
+    return raw + ".run_as"
 
 
 def _pinned() -> str:

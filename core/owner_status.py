@@ -15,7 +15,11 @@ import time
 from typing import Optional
 
 CP_DB = os.getenv("CONTROL_PLANE_DB", "/root/ai-dev-runtime/control_plane.db")
-AC_DB = os.getenv("AGENT_CONTROL_DB", "/root/ai-dev-runtime/agent_control.db")
+try:                                   # validated; never a blank/relative path at import
+    from core.control_db import control_db_path as _cdb
+    AC_DB = _cdb()
+except ValueError:
+    AC_DB = None
 
 
 # Projects the owner has DELIBERATELY excluded from Owner OS. Their stalls are policy, not

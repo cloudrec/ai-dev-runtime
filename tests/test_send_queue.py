@@ -20,6 +20,7 @@ def env(tmp_path, monkeypatch):
     cfg.write_text("hard_deny_dirs:\n  - /opt/payment-orchestrator\n")
     monkeypatch.setenv("AGENT_CREATION_CONFIG", str(cfg))
     monkeypatch.setenv("AGENT_AUTOMATION_OPEN_CALLERS", "api")
+    monkeypatch.setenv("SEND_QUEUE_ENABLED", "1")
     monkeypatch.delenv("AGENT_AUTOMATION_TARGETS", raising=False)
     monkeypatch.delenv("AGENT_AUTOMATION_POLICY", raising=False)
     PANES.clear()
@@ -171,7 +172,8 @@ def test_concurrent_drains_send_once():
 
 def test_a_claim_lost_in_a_crash_is_requeued_and_the_replay_is_deduplicated(env):
     sq.enqueue("worker-a:0.0", "hello", idempotency_key="kz", actor=GPT, now=1000.0)
-    first = ac.agent_send("worker-a:0.0", "hello", idempotency_key="kz", actor=GPT)
+    first = ac.agent_send("worker-a:0.0", "hello", idempotency_key="kz", actor=GPT,
+                          source="x|send_queue")      # the drainer's send, then a crash
     assert first.get("delivered") or first.get("submitted"), first   # sent, then "crash":
     conn = sq._conn()
     conn.execute("UPDATE send_queue SET status='delivering', claimed_ts=1000 "
@@ -209,3 +211,48 @@ def test_a_row_claimed_by_another_drainer_is_never_sent_twice():
         return {"delivered": True}
     sq.drain(send=send)
     assert sorted(sent) == ["a", "b"], sent
+
+
+# ── 2026-11-17 eighth review ────────────────────────────────────────────────
+def test_with_the_queue_off_nothing_is_held(monkeypatch):
+    monkeypatch.delenv("SEND_QUEUE_ENABLED")
+    BUSY.add("worker-a")
+    r = ac.agent_send("worker-a:0.0", "x", idempotency_key="koff", actor=GPT,
+                      queue_if_busy=True)
+    assert not r["queued"] and r["refused"] == "send_queue_disabled"
+    assert sq.status("koff")["status"] == "unknown"
+
+
+def test_status_reports_expiry_before_any_drain():
+    sq.enqueue("worker-a:0.0", "x", idempotency_key="kt", actor=GPT, ttl_secs=60, now=1000.0)
+    assert sq.status("kt", now=1030.0)["status"] == "queued"
+    assert sq.status("kt", now=1100.0)["status"] == "expired"
+
+
+def test_a_key_already_used_by_a_direct_send_is_not_queued():
+    ac.agent_send("worker-a:0.0", "direct", idempotency_key="kd", actor=GPT)
+    assert sq.enqueue("worker-a:0.0", "queued text", idempotency_key="kd",
+                      actor=GPT)["refused"] == "idempotency_key_already_used"
+
+
+def test_a_duplicate_that_never_submitted_is_not_a_delivery(monkeypatch):
+    sq.enqueue("worker-a:0.0", "x", idempotency_key="kn", actor=GPT)
+    monkeypatch.setattr(ac, "_seen_delivery", lambda k: {"submitted": False})
+
+    def dup(target, text, **kw):
+        return {"duplicate": True, "delivered": False}
+    out = sq.drain(send=dup)
+    assert out == [{"key": "kn", "status": "refused", "reason": "idempotency_key_used"}]
+
+
+def test_an_attempt_neither_submitted_nor_refused_is_closed_not_retried():
+    sq.enqueue("worker-a:0.0", "x", idempotency_key="kq", actor=GPT)
+    calls = []
+
+    def limbo(target, text, **kw):
+        calls.append(1)
+        return {"delivered": False, "submitted": False}
+    assert sq.drain(send=limbo) == [{"key": "kq", "status": "refused",
+                                     "reason": "not_submitted"}]
+    sq.drain(send=limbo)
+    assert len(calls) == 1
