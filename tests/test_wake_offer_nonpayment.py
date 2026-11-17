@@ -273,3 +273,16 @@ def test_r9_loop_watch_does_not_alarm_on_a_wake_whose_route_is_payment(monkeypat
     import core.wake_routes as wr
     monkeypatch.setattr(wr, "resolve", wb.wake_routes.resolve)
     assert lw.undelivered_wakes(conn, 1000.0 + lw.UNDELIVERED_AFTER + 10) == {}
+
+
+def test_live_policy_denies_every_known_payment_dir():
+    """2026-11-17: /opt/vtb_old (QR payments via Bakai Bank) carried no payment word in
+    its session or path; it is denied by the policy's hard_deny_dirs."""
+    import pathlib
+    import yaml
+    from core import agent_creation_policy as acp
+    cfg = yaml.safe_load((pathlib.Path(__file__).resolve().parents[1] / "config" /
+                          "agent_creation.yaml").read_text())
+    for d in ("/opt/payment-orchestrator", "/opt/vtb_old", "/opt/vtb_old/app"):
+        assert acp.hard_denied(d, "vtb", cfg), d
+    assert not acp.hard_denied("/opt/vtb_older", "x", cfg)

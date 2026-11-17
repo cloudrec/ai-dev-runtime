@@ -14,7 +14,13 @@ die() { echo "STOP: $*" >&2; exit 1; }
 [ "$(id -u)" = 0 ] || die "run as root"
 h=$(git -C $RUNTIME rev-parse HEAD)
 git -C $RUNTIME merge-base --is-ancestor HEAD "$TARGET_SHA" || die "not a fast-forward from ${h:0:7}"
-[ -z "$(git -C $RUNTIME status --porcelain --untracked-files=no)" ] || die "live tree has edits"
+# the one allowed live edit: config/agent_creation.yaml already carrying the target's text
+# (vtb payment deny, 2026-11-17); anything else stops
+DIRTY=$(git -C $RUNTIME status --porcelain --untracked-files=no | awk '{print $2}')
+for f in $DIRTY; do
+  [ "$f" = config/agent_creation.yaml ] && \
+    git -C $RUNTIME show "$TARGET_SHA:$f" | cmp -s - "$RUNTIME/$f" || die "live tree has edits: $f"
+done
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 
 check() {
@@ -46,6 +52,7 @@ case "${1:-}" in
     echo "$h" > "$B/live_sha"; cp -p $ENVF "$B/env"
     cp -p $DROPDIR/99-tech-lead-hears.conf "$B/" 2>/dev/null || true
     trap 'rm -rf "$T"; echo "FAILED mid-apply. Rollback: $HERE/rollback.sh $B" >&2' ERR
+    for f in $DIRTY; do git -C $RUNTIME checkout -q HEAD -- "$f"; done   # same text arrives next line
     git -C $RUNTIME merge -q --ff-only "$TARGET_SHA"
     grep -qE '^WAKE_BRIDGE_IDENTITY=' $ENVF && sed -i 's/^WAKE_BRIDGE_IDENTITY=.*/WAKE_BRIDGE_IDENTITY=1/' $ENVF \
       || echo 'WAKE_BRIDGE_IDENTITY=1' >> $ENVF

@@ -16,6 +16,7 @@
 hard_deny_dirs:                      # never created into automatically (payment agent; also denied by
                                      # session name); only a valid owner proof overrides
   - /opt/payment-orchestrator
+  - /opt/vtb_old                      # QR payments via Bakai Bank (payment work, 2026-11-17)
 scopes:
   # Projects the GPT tech lead starts through MCP (core/fullcycle/intake.py). Each direct
   # subdirectory of `root` is one worktree; the session must be fc-<directory name>. Only
