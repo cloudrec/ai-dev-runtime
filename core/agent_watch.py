@@ -308,7 +308,10 @@ _DEP_WAIT_RE = re.compile(
     r"(dependency wait|wait(?:ing)? for (?:a |the )?(?:new|next) task|"
     r"wait(?:ing)? for (?:the )?(?:owner )?captures?|\bnext: wait for (?:owner )?captures?|"
     r"либо нов(?:ое|ую) задани|до нов(?:ой|ого) задач|жд[ёе]м нов(?:ое|ую|ого) задани|"
-    r"жд[ёе]м (?:авторизованн\w* )?захват)", re.IGNORECASE)
+    r"жд[ёе]м (?:авторизованн\w* )?захват|"
+    # WEST, 2026-11-17 (events 87094, 87495): the same terminal wait, worded as a state
+    r"only (?:genuine |real )?(?:owner )?captures? remain|"
+    r"standing by until (?:the )?(?:owner )?captures? (?:arrive|land|come in))", re.IGNORECASE)
 _ERRORISH_RE = re.compile(r"(error|exception|traceback|failed|ошибк|сбой|упал)", re.I)
 REARM_WORK_SECS = int(os.getenv("AGENT_WATCH_REARM_WORK_SECS", "300"))
 WAIT_TTL_SECS = int(os.getenv("AGENT_WATCH_DEPENDENCY_WAIT_TTL_SECS", str(4 * 3600)))
@@ -762,6 +765,40 @@ def _check_crash_loop(conn, emit_fn, *, project: str, target: str, now: float) -
 def _clear_dependency_wait(conn, target: str) -> None:
     conn.execute("UPDATE agent_watch_state SET wait_since=NULL, work_since=NULL, "
                  "work_last=NULL WHERE target=?", (target,))
+
+
+def note_task_delivered(target: str, *, conn=None, now: Optional[float] = None) -> int:
+    """A message from the tech lead/owner (API caller) was delivered to this agent: its
+    next stop answers THAT message, so it is news even when it looks like the last one.
+
+    Without this, a task finished between two sweeps was never observed `working`, so
+    nothing re-armed: the stop stayed `already_notified` (same class, digest adopted
+    silently) or `dependency_wait_parked` (it re-stated its wait), and the result of the
+    new task never reached the chat. Clears the declared wait and the notification for
+    the pane (`name:0.0`) and any row of the same session, and records the pane as
+    working: a delivered message is the proof of a turn, and the at-rest classifier only
+    calls a stop `quiescent` after a `working` observation (a turn shorter than one sweep
+    was otherwise `idle`, and announced to nobody). Internal nudges are not API sends and
+    never call this, so the #338 suppression of watchdog re-wakes stands."""
+    t = (target or "").strip()
+    if not t:
+        return 0
+    session = t.split(":", 1)[0]
+    conn, own = _conn(conn)
+    try:
+        cur = conn.execute(
+            "UPDATE agent_watch_state SET wait_since=NULL, work_since=NULL, work_last=NULL, "
+            "wait_lapsed_digest=NULL, notified_cls='', notified_digest='', "
+            "cls='working', digest='' "
+            "WHERE target=? OR target LIKE ? ESCAPE '\\'",
+            (t, session.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + ":%"))
+        conn.commit()
+        return cur.rowcount or 0
+    except Exception:  # noqa: BLE001 — a fresh DB without the table: nothing to re-arm
+        return 0
+    finally:
+        if own:
+            conn.close()
 
 
 def _declare_dependency_wait(conn, target: str, now: float, digest: str,

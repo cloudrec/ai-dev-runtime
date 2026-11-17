@@ -2393,9 +2393,27 @@ def agent_send(target: str, text: str, idempotency_key: Optional[str] = None,
                         "reason": f"agent is {busy}; a message sent now would be queued "
                                   f"behind the active turn instead of executed — retry "
                                   f"when it is idle or waiting"}
-        return _deliver(text=text, target=target, action="agent_send",
-                        idempotency_key=idempotency_key, actor=actor, source=source,
-                        owner_proof=owner_proof)
+        res = _deliver(text=text, target=target, action="agent_send",
+                       idempotency_key=idempotency_key, actor=actor, source=source,
+                       owner_proof=owner_proof)
+    _note_task_delivered(target, actor, source, res)
+    return res
+
+
+def _note_task_delivered(target: str, actor: Optional[str], source: Optional[str],
+                         res: dict) -> None:
+    """A message from the API caller (tech lead / owner, direct or from the send queue)
+    reached the pane: re-arm agent_watch so the agent's answer is announced even if it
+    finishes between two sweeps. Internal senders (watchdogs, orchestrator) never count,
+    so their nudges cannot undo a declared dependency wait. Never fails the send."""
+    if not (isinstance(res, dict) and res.get("delivered") is True
+            and caller_class(actor, source) == "api"):
+        return
+    try:
+        from core import agent_watch as _aw
+        _aw.note_task_delivered(target)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def agent_answer(target: str, text: str, idempotency_key: Optional[str] = None,
