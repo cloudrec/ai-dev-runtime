@@ -136,7 +136,14 @@ _STATE_COLUMNS = (("miss_count", "INTEGER DEFAULT 0"),
                   # every sweep, so it measures "last looked at", not "how long this
                   # pane has been unchanged" — and the second is the only thing that
                   # can tell a pause between turns from a pane that has stopped.
-                  ("digest_since", "REAL"))
+                  ("digest_since", "REAL"),
+                  # backlog #338: when the agent declared a dependency/terminal wait
+                  # ("Ждём захваты либо новое задание", "normal dependency wait"). While
+                  # set, re-statements of the wait are not new events.
+                  ("wait_since", "REAL"),
+                  # first and last sweep seen `working` since the wait was declared: how
+                  # much real work happened, to tell a new task from a quick restatement
+                  ("work_since", "REAL"), ("work_last", "REAL"))
 
 
 def _migrate_state(conn) -> None:
@@ -278,6 +285,28 @@ def parse_park_until(text: str, now: Optional[float] = None) -> Optional[float]:
         except Exception:  # noqa: BLE001 — an unparseable park is simply not a park
             continue
     return None
+
+
+# backlog #338 (HU/WEST, 2026-11-17): an agent at rest that SAYS it waits on someone else
+# or for a new task. Each turn re-states the wait in new words, so the digest moves and
+# every restatement became a fresh event, re-wake and escalation. The first such stop is
+# announced; after that the wait is a durable state, re-armed only by real progress (the
+# pane goes back to work) or a different kind of stop. Questions on screen
+# (owner_prompt) and crashes are never parked.
+_DEP_WAIT_RE = re.compile(
+    r"(dependency wait|waiting (?:for|on) (?:the |a |an )?(?:owner|tech lead|techlead|"
+    r"merge|review|approval|captures?|dependency|new task|next task|ru\b|another)|"
+    r"blocked on (?:the )?(?:owner|merge|dependency|review)|\bnext: wait for\b|"
+    r"\bжд[ёе]м\b|\bжду\b|\bожида(?:ю|ем)\b|либо нов(?:ое|ую) задани|до нов(?:ой|ого) "
+    r"задач|нового задания)", re.IGNORECASE)
+_DEP_WAIT_CLASSES = frozenset({"quiescent", "blocker", "completed"})
+# Work of at least this long between two declared waits is a new task (re-arm); a quick
+# turn that only re-states the wait (someone pinged, the agent said "still waiting") is not.
+REARM_WORK_SECS = int(os.getenv("AGENT_WATCH_REARM_WORK_SECS", "300"))
+
+
+def declares_dependency_wait(tail: str) -> bool:
+    return bool(_DEP_WAIT_RE.search(_bottom_lines_text(tail, 14)))
 
 
 _BLOCKER_RE = re.compile(
@@ -755,8 +784,9 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 skipped.append({"target": target, "why": "unreadable"})
                 continue
             row = conn.execute(
-                "SELECT cls,digest,notified_cls,notified_digest,notified_ts,digest_since "
-                "FROM agent_watch_state WHERE target=?", (target,)).fetchone()
+                "SELECT cls,digest,notified_cls,notified_digest,notified_ts,digest_since,"
+                "wait_since,work_since,work_last FROM agent_watch_state WHERE target=?",
+                (target,)).fetchone()
             prev_cls = row[0] if row else ""
             # How long this pane has looked EXACTLY like this. The digest is computed
             # below from the same bottom region classify reads, so comparing against the
@@ -834,6 +864,10 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                     pass
                 conn.execute("UPDATE agent_watch_state SET notified_cls='', "
                              "notified_digest='' WHERE target=?", (target,))
+            if cls == "working" and row and row[6] is not None:
+                # inside a declared wait: measure the work, decide at the next stop
+                conn.execute("UPDATE agent_watch_state SET work_since=COALESCE(work_since,?),"
+                             " work_last=? WHERE target=?", (now, now, target))
             # RECOVERY RECONCILES THE RECORD. A pane announced crashed that is now
             # observed ALIVE (event 5123: payorch declared dead at 09:11, visibly
             # working minutes later) must not leave a critical crash alert standing
@@ -844,6 +878,26 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             if cls not in _EVENT_FOR:
                 skipped.append({"target": target, "why": f"class_{cls}"})
                 continue
+            dep_wait = (cls in _DEP_WAIT_CLASSES and bool(a.get("alive"))
+                        and declares_dependency_wait(tail))
+            wait_since = row[6] if row and len(row) > 6 else None
+            if wait_since is not None and row[7] is not None and row[8] is not None:
+                worked = float(row[8]) - float(row[7])
+                conn.execute("UPDATE agent_watch_state SET work_since=NULL, work_last=NULL "
+                             "WHERE target=?", (target,))
+                if worked >= REARM_WORK_SECS:   # real work happened: a new task, re-arm
+                    conn.execute("UPDATE agent_watch_state SET wait_since=NULL WHERE "
+                                 "target=?", (target,))
+                    wait_since = None
+            if dep_wait and wait_since is not None:
+                # the same declared wait, re-stated: not news (#338)
+                skipped.append({"target": target, "why": "dependency_wait_parked"})
+                conn.commit()
+                continue
+            if not dep_wait and wait_since is not None:
+                # a different kind of stop (a question, a plain blocker, a crash) re-arms
+                conn.execute("UPDATE agent_watch_state SET wait_since=NULL, work_since=NULL,"
+                             " work_last=NULL WHERE target=?", (target,))
             # At rest is the END STATE of an agent whose Full Cycle project is done: the
             # engine's verified, reviewer-approved record outranks the pane's wording.
             # Only the at-rest classes — a question, a blocker or a crash still emits.
@@ -870,6 +924,10 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             if already:
                 overdue = (REMINDER_SECS and cls in ("owner_prompt", "blocker")
                            and (now - float(n_ts or 0)) >= REMINDER_SECS)
+                if dep_wait:            # announced already: from now on a durable wait
+                    conn.execute("UPDATE agent_watch_state SET wait_since=? WHERE target=?",
+                                 (now, target))
+                    overdue = False
                 if not overdue:
                     skipped.append({"target": target, "why": "already_notified"})
                     conn.commit()
@@ -905,8 +963,9 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                 dedup_window_secs=(REMINDER_SECS or 86400), conn=conn)
             conn.execute(
                 "UPDATE agent_watch_state SET notified_cls=?, notified_digest=?, "
-                "notified_at=?, notified_ts=?, emissions=emissions+1 WHERE target=?",
-                (cls, dg, now_iso(), now, target))
+                "notified_at=?, notified_ts=?, emissions=emissions+1, wait_since=? "
+                "WHERE target=?",
+                (cls, dg, now_iso(), now, now if dep_wait else None, target))
             if cls == "crashed":
                 _check_crash_loop(conn, emit_fn, project=project, target=target, now=now)
             conn.commit()

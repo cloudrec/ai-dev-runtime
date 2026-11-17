@@ -2018,3 +2018,35 @@ def test_an_error_in_the_rule_keeps_alerting(monkeypatch):
             raise RuntimeError("boom")
     monkeypatch.setattr(clw, "_PROMPTING_CLASSES", _Boom())
     assert _run(conn, 5501.0) == ["wake_loop_no_progress"]
+
+
+# ── backlog #338 (2026-11-17, HU/WEST): a declared dependency wait is not a stall ──
+def _set_wait(conn, target, cls, wait_since):
+    _set_cls(conn, target, cls)
+    try:
+        conn.execute("ALTER TABLE agent_watch_state ADD COLUMN wait_since REAL")
+    except Exception:  # noqa: BLE001 — already there
+        pass
+    conn.execute("UPDATE agent_watch_state SET wait_since=? WHERE target=?",
+                 (wait_since, target))
+    conn.commit()
+
+
+def test_a_declared_dependency_wait_is_not_rewoken_or_escalated(conn):
+    _set_wait(conn, "gaika-country-hu:0.0", "quiescent", NOW - 10)
+    emit = _Emit()
+    clw.register_delivery(event_id=338, target="gaika-country-hu:0.0", project_id="hu",
+                          event_type="work_stopped_incomplete", conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert not r["rewoken"] and not r["escalated"]
+    assert r["deregistered"][0]["reason"] == "agent_dependency_wait"
+    assert emit.calls == []
+
+
+def test_without_a_declared_wait_the_same_stop_is_still_rewoken(conn):
+    _set_wait(conn, "gaika-country-hu:0.0", "quiescent", None)
+    emit = _Emit()
+    clw.register_delivery(event_id=339, target="gaika-country-hu:0.0", project_id="hu",
+                          event_type="work_stopped_incomplete", conn=conn, now=NOW)
+    r = clw.slo_scan(conn=conn, now=NOW + clw.WAKE_LOOP_SLO_SECS + 1, emit_fn=emit)
+    assert r["rewoken"], r

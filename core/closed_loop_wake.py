@@ -650,6 +650,12 @@ def _resolution_reason(conn, *, event_id: int, target: str,
         # fresh watch regardless.
         if cls == "completed":
             return "agent_parked_completed"
+        # backlog #338: the agent declared a dependency/terminal wait ("Ждём захваты
+        # либо новое задание"). Re-waking it cannot help; its first stop was announced.
+        # Self-limiting: agent_watch clears wait_since when the pane goes back to work or
+        # stops for a different reason (question, plain blocker, crash).
+        if cls in ("quiescent", "blocker") and _dependency_wait(conn, target):
+            return "agent_dependency_wait"
         # The premise of a prompt wake is that a question is on screen. When agent_watch
         # has since reclassified the pane away from `owner_prompt`/`blocker`, that premise
         # is GONE, and re-waking and escalating to critical chases a question nobody is
@@ -873,6 +879,19 @@ def _progress_since(conn, target: str, since_ts: float) -> bool:
     if row and row[0]:
         return True
     return _transcript_advanced(conn, target, since_ts)
+
+
+def _dependency_wait(conn, target: str) -> bool:
+    """agent_watch holds a declared dependency wait for this agent (any filed name)."""
+    for ident in _identities(conn, target):
+        try:
+            row = conn.execute("SELECT wait_since FROM agent_watch_state WHERE target=?",
+                               (ident,)).fetchone()
+        except Exception:  # noqa: BLE001 — older DB without the column: claims nothing
+            return False
+        if row and row[0] is not None:
+            return True
+    return False
 
 
 def slo_scan(*, conn=None, now: Optional[float] = None,
