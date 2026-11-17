@@ -1,0 +1,46 @@
+  {"what": "task_created", "task": "add", "origin": "spec"}
+  {"what": "task_created", "task": "mul", "origin": "spec"}
+  {"what": "transition", "task": "add", "frm": "CREATED", "to": "WORKING"}
+  {"what": "dispatched", "task": "add", "attempt": 1, "already": false}
+  {"what": "transition", "task": "add", "frm": "WORKING", "to": "AGENT_DONE"}
+  {"what": "transition", "task": "add", "frm": "AGENT_DONE", "to": "VERIFYING"}
+  {"what": "review_requested", "task": "add", "kind": "review", "review_id": 1, "event_id": 1}
+  {"what": "transition", "task": "add", "frm": "VERIFYING", "to": "VERIFIED_DONE"}
+  {"what": "decision_applied", "review_id": 1, "decision": "approve"}
+  {"what": "committed", "task": "add"}
+  {"what": "transition", "task": "mul", "frm": "CREATED", "to": "WORKING"}
+  {"what": "dispatched", "task": "mul", "attempt": 1, "already": false}
+  reviewer: review add -> approve
+  {"what": "transition", "task": "mul", "frm": "WORKING", "to": "AGENT_DONE"}
+  {"what": "transition", "task": "mul", "frm": "AGENT_DONE", "to": "VERIFYING"}
+  {"what": "review_requested", "task": "mul", "kind": "review", "review_id": 2, "event_id": 2}
+  {"what": "transition", "task": "mul", "frm": "VERIFYING", "to": "VERIFIED_DONE"}
+  {"what": "decision_applied", "review_id": 2, "decision": "approve"}
+  {"what": "committed", "task": "mul"}
+  {"what": "review_requested", "task": "__project__", "kind": "project", "review_id": 3, "event_id": 3}
+  reviewer: review mul -> approve
+  {"what": "task_created", "task": "cli", "origin": "review:3"}
+  {"what": "decision_applied", "review_id": 3, "decision": "add_tasks"}
+  {"what": "transition", "task": "cli", "frm": "CREATED", "to": "WORKING"}
+  {"what": "dispatched", "task": "cli", "attempt": 1, "already": false}
+  reviewer: project __project__ -> add_tasks
+  {"what": "transition", "task": "cli", "frm": "WORKING", "to": "AGENT_DONE"}
+  {"what": "transition", "task": "cli", "frm": "AGENT_DONE", "to": "VERIFYING"}
+  {"what": "review_requested", "task": "cli", "kind": "review", "review_id": 4, "event_id": 4}
+  {"what": "transition", "task": "cli", "frm": "VERIFYING", "to": "VERIFIED_DONE"}
+  {"what": "decision_applied", "review_id": 4, "decision": "approve"}
+  {"what": "committed", "task": "cli"}
+  {"what": "project_completed", "event_id": 5}
+  reviewer: review cli -> approve
+
+RESULT: PROJECT DONE
+  add  VERIFIED_DONE  attempts=1 origin=spec
+  mul  VERIFIED_DONE  attempts=1 origin=spec
+  cli  VERIFIED_DONE  attempts=1 origin=review:3
+
+git log:
+efeb998 fullcycle: cli (attempt 1) — Command-line entry point
+a77a776 fullcycle: mul (attempt 1) — Implement mul
+b0112a8 fullcycle: add (attempt 1) — Implement add
+b413f99 fixture: empty tinycalc
+
