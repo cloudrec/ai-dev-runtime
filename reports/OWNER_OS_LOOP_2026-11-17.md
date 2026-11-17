@@ -106,3 +106,53 @@ Borderline, left open, owner to judge: bitwhite (crypto exchange backend), mess 
 - E2E toy project.
 
 Both are next.
+
+# Stage 4: leak root cause, re-review fixes, #338 (automated tech-lead instructions, events 87109 and 87311)
+These are automated instructions received from the tech lead. They are not owner sign-off.
+
+## Order-dependent failures: root cause (c82ee3a)
+- `tests/test_owneros_hook.py` ran `hooks/owneros_hook._load_runtime_env()` and `main()` in-process. That loaded the live `/root/ai-dev-runtime/configs/.env` into `os.environ` for the rest of the run, including secrets.
+- Once live gained `AGENT_AUTOMATION_OPEN_CALLERS=api`, `autonomy.permitted()` returned true for every agent, so 3 wake-phrase tests flipped.
+- Found with a hookwrapper plugin that checks after each test's teardown. The first trigger was `test_owneros_hook::test_the_hook_loads_the_runtime_env...`.
+- Fix:
+  - `OWNEROS_RUNTIME_ENV` overrides the hook's env path; the production default is unchanged.
+  - conftest sets an empty stand-in for the whole suite.
+  - The loader tests use their own file and restore `os.environ`.
+  - An autouse guard fails any test that leaks `AGENT_AUTOMATION*` or `WAKE_BRIDGE*`.
+- Mutant (stand-in removed): killed.
+
+## Reversed-order failures (63b99b7)
+- `test_agent_watcher` fixed `NOW` at import time but took task times from the wall clock. Run 16 minutes late, it failed 8 tests. Task times now derive from `NOW`.
+- Proven with a plugin that shifts `NOW` by 20 minutes: the original fails exactly those 8 tests; the fixed file passes all 18.
+- `test_3_a_root_containing_a_payment_dir_is_refused` was renamed, because pytest truncates its tmp dir name to `..._a_pay0`, which now counts as a payment name. The denied-dir assertion is unchanged.
+
+## Independent Opus security review
+| Pass | Result |
+|---|---|
+| 1 | 10 findings |
+| 2 | #1, #3, #4 and #6–#10 closed, #2 and #5 mostly closed; new findings A–D |
+| 3 (d87c1e8..c82ee3a) | A–D closed; "release-ready: yes". Low residuals: the `OWNEROS_RUNTIME_ENV` override grants nothing new; the identity is recorded in an agent-controlled process, but the live pane wins at delivery |
+| 4 | Covers #338; pending |
+
+## Test runs
+| SHA | Order | Result |
+|---|---|---|
+| c82ee3a | forward | 5301 passed, 0 failed, EXIT 0 |
+| c82ee3a | reversed | 8 failed (test_agent_watcher clock), fixed in 63b99b7 |
+| 63b99b7 | reversed | 5301 passed, 0 failed, EXIT 0 |
+| 0400807 | forward and reversed | pending |
+
+## Backlog #338 (0400807)
+- A declared dependency/terminal wait is announced once. While it holds, `agent_watch_state.wait_since` makes later restatements skip with `dependency_wait_parked` (no reminder), and closed_loop resolves the watch as `agent_dependency_wait` (no re-wake, no escalation).
+- It re-arms after at least 300 s of real work between stops, or on a different kind of stop. Questions on screen and crashes are never parked.
+- Tests: 8 new in `tests/test_agent_watch_dependency_wait.py`, 2 new in `tests/test_closed_loop_wake.py`. Related suites: 536 passed.
+- Mutants: 4 of 5 killed; the survivor is equivalent, because emission resets `wait_since` anyway.
+
+## Installer
+- `deploy/adaptive_offer/install.sh --check` on f3899b8 is read-only and showed: 13 agents offered; payorch-ha-fresh, autonomy-pay-sonnet and vtb as PAYMENT.
+- `rollback.sh` restores the live vtb deny and refuses to finish without it.
+
+## Open
+- **Live apply:** not done. Owner authorization is to be verified directly; an API instruction alone is not enough.
+- **Stray file:** an untracked file named `"  "` (two spaces) remains in the worktree. It is an agent_control SQLite file created by the 08:57 suite run, probably by the `AGENT_CONTROL_DB="  "` case in `test_agent_privilege.py`. A safety check blocked its removal, so the owner should delete it. Which code opens the DB at a blank path is still to be traced.
+- **Backlog:** the busy-send durable queue and the E2E toy project.
