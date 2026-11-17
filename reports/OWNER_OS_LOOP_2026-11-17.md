@@ -156,3 +156,32 @@ These are automated instructions received from the tech lead. They are not owner
 - **Live apply:** not done. Owner authorization is to be verified directly; an API instruction alone is not enough.
 - **Stray file:** an untracked file named `"  "` (two spaces) remains in the worktree. It is an agent_control SQLite file created by the 08:57 suite run, probably by the `AGENT_CONTROL_DB="  "` case in `test_agent_privilege.py`. A safety check blocked its removal, so the owner should delete it. Which code opens the DB at a blank path is still to be traced.
 - **Backlog:** the busy-send durable queue and the E2E toy project.
+
+# Stage 4 final, fca9ea9
+## #338 after reviews 4–6
+The fourth review (not release-ready) found 7 issues; the fifth found 2 more (A/B); the sixth found 1 more. The design is now:
+- **Which stops can park:** only the `quiescent` class, and only on explicit dependency/new-task phrases in the agent's final message (never on error lines).
+- **What still alerts:** blockers keep their hourly reminder; completed stops, questions and crashes are always announced, and each of them re-arms.
+- **TTL:** 4 h, honoured by closed_loop on `quiescent` and `idle` panes. A frozen pane is never renewed. Once the TTL lapses, re-wake and escalation return.
+- **No `native_external_wait`:** stall_doctor still sees a new task left unsubmitted in the composer.
+- **Which watches are resolved:** only stop watches (`task_completed`, `work_stopped_incomplete`, `agent_turn_stopped`). Failure and question watches raised by hooks keep waking.
+- **Other agents:** a pane that leaves the inventory loses its wait. Payment rules are untouched.
+
+Evidence:
+- Mutants on the new branches: all killed except the lapsed-digest guard, which is equivalent because it is unreachable after an `idle` reclassification and is kept as a defence.
+- Review 6 found only the event-type gate (fixed in fca9ea9). The fixed state was not re-reviewed.
+
+## Tests at fca9ea9 (verify worktree)
+| Order | Result |
+|---|---|
+| forward | 5323 passed, 0 failed, EXIT 0 (14:22) |
+| reversed | 5323 passed, 0 failed, EXIT 0 (17:57) |
+
+## Installer `--check` at fca9ea9
+- Read-only, live 3423f4d → fca9ea9.
+- 17 commits; the files are config, policy, agent_watch, closed_loop, loop_watch, wake_bridge, deploy, tests and the report.
+- Panes: payorch-ha-fresh, autonomy-pay-sonnet and vtb show PAYMENT. Two new test sessions appeared, `sec45ea83-ws` and `sec7068eb-long`, the second with a cwd containing `$(touch …)`. The check prints that cwd from Python and never evaluates it.
+- Rollback: `deploy/adaptive_offer/rollback.sh <backup>` restores the drop-in, `configs/.env`, the old SHA and the live vtb deny. It refuses to finish without the vtb deny.
+
+## Live
+Not applied. Live is still 3423f4d, with the vtb deny edit and the widened companion list. The owner's direct word is needed; the tech-lead API instruction was explicitly not counted as approval.
