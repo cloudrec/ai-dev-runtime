@@ -27,3 +27,29 @@ Live tree /root/ai-dev-runtime at be3cbd3. Branch owneros/autonomy-loop-20261117
 - **Stuck project gaika-published-risk-test since 2026-11-10.** The agent pane shows "API Error: Connection lost mid-response" and the agent sits idle at the prompt. Review 137 (stalled, blocked) is still pending, and its reminders were dropped by the bug above. The agent has held a slot for 6 days.
 - **dbus-daemon leak.** There are 214 dbus-daemon processes owned by fcagent, about 2 per agent start, and none are reaped.
 - Side note: the fleet-health unit failed because payment servers ru_prod and fi_edge are down. I did not touch them.
+
+# Step 2, 2026-11-17 (branch work)
+
+All of this is on the branch. Live is not changed until the owner says "деплой".
+
+## What changed
+
+| Commit | What |
+|---|---|
+| aeeee38 | **ChatGPT may send to any agent except payment work.** It gets `agent_send`/`agent_answer` to every agent once `AGENT_AUTOMATION_OPEN_CALLERS=api` is set. A single `payment_marked()` rule closes payorch, blagopay, payment, cloudpayments and any standalone "pay" word. It applies to send, stop, grants, creation and fullcycle repos, checked by session name and by directory. Before this change, only payorch-ha-fresh and /opt/payment-orchestrator were closed. |
+| 2dc3888 | **Reminders of a pending review are delivered.** The check was `!=`; it is now "a newer event re-announced it". A regression test is added and was proven to fail without the fix. |
+| c2982a0 | Installer `deploy/open_callers/install.sh --check / --apply` and `rollback.sh`. `stage_done` now reads the flag. |
+| 136bcf0 | Sandboxed agents run with `DBUS_SESSION_BUS_ADDRESS=unix:path=/dev/null`, so no bus is autolaunched. This could not be reproduced on the stand; check it after deploy by counting new fcagent dbus-daemons. |
+| 8de400d (+ seo 2cc6051, branch owneros/undismiss-20261117) | **undismiss.** It is available as a core function, an API route, the CLI command `tools/owner_page.py undismiss <pid>`, and a "Вернуть в список" button on the page. |
+
+## Item status
+
+1. Isolation: proven (step 1).
+2. Extra wakes: `agent_dead` is gone under isolation. `project_completed` is kept on purpose: it is the "project handed in, plan the next step" signal.
+3. Session expiry: needs an owner decision (see the report).
+4. Crash alerts: none were seen, because agent-watch does not see the fc socket. A stall is caught by the engine (a blocked review after 2 h), and now that reminders reach ChatGPT, that path works.
+5. undismiss: done.
+6. blagopay: closed by name and by directory everywhere. It was never on the allowed-repos list.
+
+## Known red test
+`tests/test_stage15_f2_spawn_env.py::test_r1_nothing_this_repo_sets_for_the_cli_is_dropped` fails because of NODE_ENV in `deploy/gaika_services/install.sh` (branch commit 78633db, not from this step). Narrowing the test was refused as weakening a security check. Fix it at the source or decide separately.
