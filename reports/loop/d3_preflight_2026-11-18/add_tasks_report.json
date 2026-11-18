@@ -1,0 +1,10 @@
+[{"key": "report",
+  "title": "Summary report and docs",
+  "goal": "Add report(text) -> dict with keys words, chars, longest built on the existing functions, tests/test_report.py covering empty and normal text, and README.md describing all functions. Do not change or remove existing tests.",
+  "acceptance_criteria": ["report() agrees with word_count, char_count and longest_word",
+                          "tests/test_report.py passes and all earlier tests still pass",
+                          "README.md describes the actual behaviour"],
+  "checks": [["python3", "-m", "unittest", "discover", "-s", "tests", "-v"],
+             ["python3", "-m", "unittest", "tests.test_report", "-v"]],
+  "scope": ["textstats.py", "tests/test_report.py", "README.md"],
+  "depends_on": ["char-stats"]}]

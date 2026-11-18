@@ -1,0 +1,33 @@
+{
+  "title": "Disposable Full Cycle acceptance: reject, rework, add_tasks",
+  "goal": "Exercise the review loop on a fresh offline Python text-statistics library: one rejection with rework, a regression check, and a task added at project review. The plan is intentionally incomplete: the project check runs tests/test_report.py, which no initial task may create; the tech lead adds the task `report` with add_tasks at the project review. Exactly one project agent; no network, no deployment, no external resources.",
+  "acceptance_criteria": [
+    "Task word-count is rejected once on purpose at review, reworked as attempt 2 from the reviewer's feedback, then approved",
+    "Every later task keeps all earlier tests passing (regression)",
+    "Task report is added by an add_tasks decision at the project review and then approved",
+    "All unittest checks pass; only scoped files change",
+    "No secrets, money, network or production interaction"
+  ],
+  "checks": [["python3", "-m", "unittest", "discover", "-s", "tests", "-v"],
+             ["python3", "-m", "unittest", "tests.test_report", "-v"]],
+  "scope": ["textstats.py", "tests/", "README.md"],
+  "do_not_touch": ["Any files outside the disposable project", "Production services",
+                   "Credentials", "Other projects and agents"],
+  "tasks": [
+    {"key": "word-count",
+     "title": "Word counting",
+     "goal": "Create textstats.py with a pure function word_count(text: str) -> int that counts words separated by spaces, and tests/__init__.py (empty) plus tests/test_word_count.py using standard library unittest.",
+     "acceptance_criteria": ["Empty string returns 0", "Single and multiple space-separated words are counted",
+                             "No network or third-party dependencies"],
+     "checks": [["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]],
+     "scope": ["textstats.py", "tests/__init__.py", "tests/test_word_count.py"]},
+    {"key": "char-stats",
+     "title": "Character statistics",
+     "goal": "Add char_count(text, include_spaces=True) -> int and longest_word(text) -> str to textstats.py (longest_word returns '' for no words; on ties the first one). Add tests/test_char_stats.py. Do not change or remove existing tests.",
+     "acceptance_criteria": ["Both functions tested including empty input and ties",
+                             "All earlier tests retained and passing"],
+     "checks": [["python3", "-m", "unittest", "discover", "-s", "tests", "-v"]],
+     "scope": ["textstats.py", "tests/test_char_stats.py"],
+     "depends_on": ["word-count"]}
+  ]
+}
