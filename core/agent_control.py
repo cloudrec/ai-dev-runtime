@@ -1357,6 +1357,53 @@ def live_status_region(tail: str) -> str:
     return tail or ""
 
 
+def active_via_footer_only(output_tail: str) -> bool:
+    """Is a pane's ACTIVE reading resting on footer text alone?
+
+    True only for the two text-only paths of `classify_state`: a background-shell count
+    with no foreground marker and no `· done HH:MM` stamp (1a), or a `· N monitors`
+    footer (5). Anything with foreground evidence — a spinner timer, "esc to interrupt",
+    streaming tokens — is False. Pure; the caller supplies every liveness fact."""
+    tail = (output_tail or "")[-1500:]
+    region = live_status_region(tail)
+    if _FOREGROUND_ACTIVE_RE.search(region):
+        return False
+    if _STATE_ACTIVE_RUN_RE.search(region) and not _TURN_DONE_RE.search(region):
+        return True
+    return bool(_STATE_BACKGROUND_MONITOR_RE.search(tail[-_MONITOR_FOOTER_TAIL:]))
+
+
+def background_live(claude_pid) -> Optional[bool]:
+    """Does this Claude process have any live child process (a shell, a monitor, a
+    subprocess)? Children of EVERY thread count, not only the main one. None when the
+    answer cannot be read — callers treat None as live."""
+    try:
+        pid = int(claude_pid)
+        tasks = os.listdir(f"/proc/{pid}/task")
+    except (TypeError, ValueError, OSError):
+        return None
+    try:
+        for tid in tasks:
+            with open(f"/proc/{pid}/task/{tid}/children") as fh:
+                if fh.read().split():
+                    return True
+    except OSError:
+        return None
+    return False
+
+
+def transcript_idle_secs(cwd: str) -> Optional[float]:
+    """Seconds since this project's Claude transcript was last written. None when there
+    is no transcript or it cannot be read — callers treat None as recently active."""
+    try:
+        files = _privilege.transcripts(cwd) if cwd else []
+        if not files:
+            return None
+        return max(0.0, time.time() - max(os.path.getmtime(f) for f in files))
+    except Exception:  # noqa: BLE001 — unknown is not idle
+        return None
+
+
 def classify_state(alive: bool, is_agent: bool, output_tail: str, prev_tail: str | None = None,
                    *, pending_input: str = "", shell_running: bool = False,
                    recently_active: bool = False) -> str:

@@ -479,6 +479,11 @@ _QUIESCENT_STATES = frozenset({"idle", "waiting_input", "unknown", ""})
 # quietness is treated as a stop. Long enough that an ordinary pause between turns never
 # trips it; short enough that a silent stop is not indefinite.
 QUIESCENT_SECS = int(os.getenv("AGENT_WATCH_QUIESCENT_SECS", "300"))
+# An ACTIVE inventory state that rests on footer text alone ("· 1 shell" with no done
+# stamp, "· 1 monitor") may be demoted to a stop only after the pane has been frozen this
+# long AND the process and transcript both prove nothing runs (see `_stale_active`).
+# Far above QUIESCENT_SECS: a long quiet build or watch is ordinary work.
+STALE_ACTIVE_SECS = int(os.getenv("AGENT_WATCH_STALE_ACTIVE_SECS", "1800"))
 # Inventory states in which a decision menu is credible.
 _PROMPT_STATES = frozenset({"waiting_owner", "waiting_input", "idle", "unknown", ""})
 # A numbered choice menu — "1. <option> ... 2. <option>" — whatever the option wording.
@@ -625,7 +630,7 @@ def _iso_local(ts: float) -> str:
 
 def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool = True,
              prev_cls: str = "", quiet_secs: float = 0.0,
-             now: Optional[float] = None) -> dict:
+             now: Optional[float] = None, stale_active: bool = False) -> dict:
     """(inventory state, current bottom region) -> one class.
 
     The structured `agent_list` state is trusted FIRST: an agent the inventory calls
@@ -641,6 +646,12 @@ def classify(tail: str, *, state: str = "", alive: bool = True, is_agent: bool =
     st = (state or "").strip()
     region = _bottom_region(tail)
     if st in _ACTIVE_STATES:
+        # The one exit from an active state: the caller has PROVEN (process, transcript,
+        # footer-only evidence) that nothing runs, and the pane has been frozen for the
+        # stale bound. A stop, never a finish; `stale_active` defaults off.
+        if stale_active and quiet_secs >= STALE_ACTIVE_SECS:
+            return {"cls": "quiescent",
+                    "reason": f"stale_active_footer_{int(quiet_secs)}s"}
         return {"cls": "working", "reason": f"inventory_state_{st}"}
     if _CRASH_RE.search(_bottom_lines_text(tail)):
         return {"cls": "crashed", "reason": "crash_text"}
@@ -897,6 +908,39 @@ def _declare_dependency_wait(conn, target: str, now: float, digest: str,
     return True
 
 
+def _live_facts(agent: dict) -> dict:
+    """Process and transcript facts for one pane. Separate so tests inject them."""
+    from core import agent_control
+    return {"background_live": agent_control.background_live(agent.get("claude_pid")),
+            "transcript_idle_secs": agent_control.transcript_idle_secs(
+                agent.get("claude_cwd") or agent.get("cwd") or "")}
+
+
+def _stale_active(agent: dict, tail: str, *, now: float) -> bool:
+    """Is an ACTIVE pane's activity provably stale UI text?
+
+    Every condition must hold; any unknown answers False (live, no wake):
+      * the inventory state is active and its evidence is footer text alone;
+      * the pane's foreground runs no command (a real command is real work);
+      * the Claude process has no live child process;
+      * the transcript has not been written for STALE_ACTIVE_SECS.
+    Read-only: it never stops, restarts or types into anything."""
+    from core import agent_control
+    if not agent.get("alive") or (agent.get("state") or "") not in _ACTIVE_STATES:
+        return False
+    if not agent_control.active_via_footer_only(tail):
+        return False
+    if agent_control._pane_shell_running(agent):
+        return False
+    try:
+        facts = _live_facts(agent)
+    except Exception:  # noqa: BLE001 — unknown is live
+        return False
+    idle = facts.get("transcript_idle_secs")
+    return (facts.get("background_live") is False
+            and idle is not None and idle >= STALE_ACTIVE_SECS)
+
+
 def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
          emit_fn: Optional[Callable] = None, conn=None,
          now: Optional[float] = None) -> dict:
@@ -961,9 +1005,11 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
             dg_now = digest_of(_bottom_region(tail)) if a.get("alive") else "gone"
             quiet_secs = (now - prev_since) if (prev_since is not None
                                                 and prev_digest == dg_now) else 0.0
+            stale = (quiet_secs >= STALE_ACTIVE_SECS
+                     and _stale_active(a, tail, now=now))
             c = classify(tail, state=a.get("state", ""), alive=bool(a.get("alive")),
                          is_agent=bool(a.get("is_agent")), prev_cls=prev_cls,
-                         quiet_secs=quiet_secs, now=now)
+                         quiet_secs=quiet_secs, now=now, stale_active=stale)
             cls = c["cls"]
             # A stated park is only half the fix: the pane stops being announced as
             # stopped (no `_EVENT_FOR` entry, so nothing is emitted), but the native
