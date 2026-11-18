@@ -144,3 +144,8 @@ Reject, rework and `add_tasks` remain **untested live**. The acceptance report i
 - Schema: two new tables, created on first use.
 - The companion restarts with the deploy.
 - Rollback: through the backup the installer prints.
+
+## Released 2026-11-18 08:09:02Z (owner's direct word "деплой 2883d2b")
+- `install.sh --check` clean (payment panes never offered), then `--apply`: live 0a0c456 → 2883d2b.
+- Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T080902Z`.
+- Units active (ai-runtime, wake-companion, fullcycle-intake, fullcycle-worker). Tables `wake_send_intent` and `wake_send_intent_audit` were created on the first tick. 0 companion errors; `loop_watch.check`: 0 problems.
