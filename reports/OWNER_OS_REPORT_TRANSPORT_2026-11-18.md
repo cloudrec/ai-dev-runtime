@@ -66,3 +66,11 @@ Trigger: an automated instruction was received. Branch `owneros/report-transport
 - Evidence: `reports/loop/report_transport_2026-11-18/{seo.diff, results.txt}`.
 
 **Release, when authorised:** merge 1065b32 onto the deployed seo line, rebuild the backend image, then restart seo-backend. Rollback is the previous image. After that, one live `agent_report` read from the tech lead should show `text`.
+
+## Released 1065b32 (owner's direct word "деплой 1065b32")
+- Installer `deploy/seo_report_text/install.sh`: `--check` clean (only mcp_server.py and the new test), then `--apply`. Deployed seo branch fast-forwarded 39603fb → 1065b32, backend image rebuilt, backend healthy, post-check "report text payload installed".
+- Rollback: `deploy/seo_report_text/rollback.sh` (image `seo-backend:rollback-pre-report-text`).
+- Live proof pending: one `agent_report` read with `path` from the tech lead.
+
+## ServerWarden chat switched (owner's direct word, 16:39:50Z)
+Route `hostsecure` rebound from 6afbff8d… to https://chatgpt.com/c/6afd9cb3-41ec-83ed-91ae-d64c941a14bc (`rebind_chat.py --by owner`, verified). Backup: `/root/ai-dev-runtime/.ai-runtime-backups/wake_target/wake_target_20261118T163942Z.sql`. Before the switch, the old chat received and answered every wake (10 in 2 h); the new chat had no route, which is why it stayed silent.
