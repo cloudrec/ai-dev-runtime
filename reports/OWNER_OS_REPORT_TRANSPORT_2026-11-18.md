@@ -34,3 +34,35 @@ Optionally, the tools/call envelope can carry the report text as a second `{"typ
 
 ## Next
 Implement in an seo DEV branch, run its suite, then rebuild and deploy on a word. Until then, the tech lead gets report text by asking the agent.
+
+## Implemented in DEV: seo 1065b32 (not built, not deployed)
+Trigger: an automated instruction was received. Branch `owneros/report-transport-20261118` in worktree `/opt/seo-report-transport`, base 39603fb (the live seo line). Not pushed.
+
+**Change** (`backend/services/mcp_server.py`, report-specific; the tools/call envelope is not touched):
+- `agent_report` with `path` returns `{project_dir, path, truncated, text, chars}`. There is no top-level `content` key.
+- Unchanged:
+  - the listing (no `path`), which passes through as before;
+  - runtime refusals and errors, which pass through untouched;
+  - `project_dir required`;
+  - redaction and bounding, which stay in the runtime (`agent_report_read`); the text is not altered.
+- The tool description now says the text is in `text`. This changes the catalog fingerprint, so clients get `listChanged`.
+- Rejected: global `structuredContent` or a second text item. Not needed for this defect.
+
+**Verification of the collision** (synthetic; the real ChatGPT client is not observable):
+- A strict stand-in client drops an object with a non-list `content` to `{}`.
+- On the released shape (15 524 chars), the text is present in the envelope, but the client keeps `{}`.
+- The listing shape survives.
+- This shows the mechanism, not ChatGPT's code. A live read after deploy is the real proof.
+
+**Tests:** new `tests/test_mcp_agent_report_transport.py`, 12 tests.
+- Text sizes through the real `dispatch_rpc` envelope, serialized to the wire: short ASCII, short Unicode, 16 000-char Unicode and 300 000-char Unicode with emoji.
+- Truncation and redaction marker pass-through, listing unchanged, refusal untouched, missing `project_dir`, odd shapes, description.
+- On base 39603fb: 7 fail, 5 pass. The 5 are the defect demo and the unchanged behaviours.
+- Targeted MCP suites: 76 passed.
+- Full seo suite in a throwaway `seo-backend` container with no network:
+  - fix: 1074 passed, 50 failed, 18 errors;
+  - base: 1062 passed, 50 failed, 18 errors;
+  - **the failure set is identical** (sqlite tables missing in this runner, e.g. `editorial_pass`). No new failure.
+- Evidence: `reports/loop/report_transport_2026-11-18/{seo.diff, results.txt}`.
+
+**Release, when authorised:** merge 1065b32 onto the deployed seo line, rebuild the backend image, then restart seo-backend. Rollback is the previous image. After that, one live `agent_report` read from the tech lead should show `text`.

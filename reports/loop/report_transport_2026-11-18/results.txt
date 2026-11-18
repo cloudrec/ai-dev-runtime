@@ -1,0 +1,82 @@
+seo branch owneros/report-transport-20261118 @ 1065b32, base 39603fb
+runner: docker run --rm --network none, image seo-backend, copy of backend/
+
+== targeted (fix) ==
+tests/test_mcp_agent_report_transport.py test_mcp_agent_tools.py test_mcp.py test_mcp_list_changed.py: 76 passed
+
+== new tests on base 39603fb ==
+7 failed, 5 passed
+
+== full suite ==
+fix : 50 failed, 1074 passed, 3 skipped, 40 warnings, 18 errors in 69.40s (0:01:09)
+base: 50 failed, 1062 passed, 3 skipped, 40 warnings, 18 errors in 64.78s (0:01:04)
+failure set identical on both (diff empty): 68 pre-existing fails/errors
+
+ERROR tests/test_editorial_naturalness.py::test_bundle_seed
+ERROR tests/test_editorial_naturalness.py::test_diff_approval_flow
+ERROR tests/test_editorial_naturalness.py::test_intentional_typo_and_bypass_prohibited
+ERROR tests/test_editorial_naturalness.py::test_locale_aware_rules
+ERROR tests/test_editorial_naturalness.py::test_no_ai_detection_score
+ERROR tests/test_editorial_naturalness.py::test_owner_evidence_only_verified
+ERROR tests/test_editorial_naturalness.py::test_preservation_and_no_fabrication
+ERROR tests/test_editorial_naturalness.py::test_protected_change_not_auto
+ERROR tests/test_editorial_naturalness.py::test_revision_history
+ERROR tests/test_paid_growth.py::test_account_crud_masking_verify_no_limit
+ERROR tests/test_paid_growth.py::test_adapter_conformance
+ERROR tests/test_paid_growth.py::test_budget_estimates_labeled
+ERROR tests/test_paid_growth.py::test_compliance_preflight
+ERROR tests/test_paid_growth.py::test_creative_from_bundle
+ERROR tests/test_paid_growth.py::test_export_package
+ERROR tests/test_paid_growth.py::test_paid_rehearsal_e2e
+ERROR tests/test_paid_growth.py::test_registry_is_honest
+ERROR tests/test_paid_growth.py::test_tracking_readiness
+FAILED tests/test_content_intake_pipeline.py::test_audio_without_provider_awaiting
+FAILED tests/test_content_intake_pipeline.py::test_cancel_and_manual_retry
+FAILED tests/test_content_intake_pipeline.py::test_extract_job_completes_and_dedup
+FAILED tests/test_content_intake_pipeline.py::test_one_failure_does_not_block_others
+FAILED tests/test_content_intake_pipeline.py::test_pasted_transcript_still_works_immediately
+FAILED tests/test_content_intake_pipeline.py::test_retention_cleanup_removes_expired
+FAILED tests/test_content_intake_pipeline.py::test_store_dedup_size_and_delete
+FAILED tests/test_content_intake_pipeline.py::test_transcribe_with_mocked_provider
+FAILED tests/test_niche_radar.py::test_compute_enrichment
+FAILED tests/test_rehearsal.py::test_provider_config_vault_masks_and_mock_tests
+FAILED tests/test_rehearsal.py::test_readiness_center_and_checklist_export
+FAILED tests/test_rehearsal.py::test_rehearsal_full_path_and_cleanup
+FAILED tests/test_rehearsal.py::test_rehearsal_idempotent_rerun
+FAILED tests/test_rehearsal.py::test_rehearsal_makes_no_external_http_call
+FAILED tests/test_social_phase8c.py::test_bulk_pause_resume_cancel
+FAILED tests/test_social_phase8c.py::test_dead_letter_and_retry
+FAILED tests/test_social_phase8c.py::test_fanout_idempotent_and_batched
+FAILED tests/test_social_phase8c.py::test_one_account_failure_does_not_block_others
+FAILED tests/test_social_phase8d.py::test_dup_check_exact_and_near_and_clear
+FAILED tests/test_social_phase8d.py::test_dup_check_is_scoped_per_account
+FAILED tests/test_social_phase8d.py::test_graph_nests_region_language_platform
+FAILED tests/test_social_phase8d.py::test_noop_edit_does_not_bump_revision_or_stale
+FAILED tests/test_social_phase8d.py::test_source_edit_marks_older_variants_stale
+FAILED tests/test_social_phase8d.py::test_variation_report_flags_too_similar_siblings
+FAILED tests/test_social_phase8e.py::test_crisis_switch_by_topic
+FAILED tests/test_social_phase8e.py::test_emergency_global_pause_blocks
+FAILED tests/test_social_phase8e.py::test_first_post_only_requires_then_allows
+FAILED tests/test_social_phase8e.py::test_resolve_strictest_policy_wins
+FAILED tests/test_social_phase8f.py::test_assert_access_enforces_action_and_client
+FAILED tests/test_social_phase8f.py::test_effective_role_respects_client_scope
+FAILED tests/test_social_phase8f.py::test_scoped_member_cannot_see_other_client
+FAILED tests/test_social_phase8g.py::test_preflight_broken_link_and_permission_loss
+FAILED tests/test_social_phase8g.py::test_preflight_char_limit_and_hashtags_and_media
+FAILED tests/test_social_phase8g.py::test_preflight_clean_pass_and_banned_phrase
+FAILED tests/test_social_phase8g.py::test_preflight_missing_disclosure_from_db_profile
+FAILED tests/test_social_phase8g.py::test_preflight_regulated_is_warn_not_error
+FAILED tests/test_social_phase8i.py::test_deterministic_assignment_and_holdout
+FAILED tests/test_social_phase8i.py::test_winner_gated_by_min_sample
+FAILED tests/test_social_phase8j.py::test_ingest_idempotent_and_draft_never_sends
+FAILED tests/test_social_phase8j.py::test_listening_brief_is_separate_and_never_posts
+FAILED tests/test_social_phase8k.py::test_marketplace_upsert_and_manual_export
+FAILED tests/test_social_phase8k.py::test_search_submit_dry_run_idempotent
+FAILED tests/test_social_phase8l.py::test_detects_accepted_but_missing_and_lost_callback
+FAILED tests/test_social_phase8l.py::test_events_are_append_only_latest_wins_in_summary
+FAILED tests/test_social_phase8l.py::test_no_duplicate_repost_requires_new_revision
+FAILED tests/test_social_phase8m.py::test_dashboard_counts_and_cost_and_media_cache
+FAILED tests/test_social_phase8n.py::test_idempotent_import_bulk_ops_and_dr_masking
+FAILED tests/test_source_factory.py::test_audio_without_provider_stays_pending
+FAILED tests/test_source_factory.py::test_full_factory_flow
+FAILED tests/test_source_factory.py::test_generate_requires_normalized_source

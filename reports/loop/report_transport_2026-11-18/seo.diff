@@ -1,0 +1,198 @@
+diff --git a/backend/services/mcp_server.py b/backend/services/mcp_server.py
+index 18c0a1c..d0653ff 100644
+--- a/backend/services/mcp_server.py
++++ b/backend/services/mcp_server.py
+@@ -520,9 +520,29 @@ async def _t_agent_report(db, p):
+     if not project_dir:
+         return {"error": "project_dir required"}
+     params = {"project_dir": project_dir, "limit": p.get("limit", 20)}
+-    if p.get("path"):
+-        params["path"] = p["path"]
+-    return await runtime_client.agent_get("/report", params)
++    if not p.get("path"):
++        return await runtime_client.agent_get("/report", params)
++    params["path"] = p["path"]
++    return _report_read_payload(await runtime_client.agent_get("/report", params))
++
++
++def _report_read_payload(result):
++    """Carry a read report's text under `text`, never under a top-level `content`.
++
++    The runtime answers a read with {project_dir, path, truncated, content: <str>}. In an
++    MCP tool result `content` is the protocol's item list; a payload whose top-level
++    `content` is a string was the only one of its kind, and ChatGPT showed it as `{}` while
++    the listing (no such key) worked. The text itself is unchanged (already bounded and
++    redacted by the runtime); refusals and errors pass through untouched.
++    """
++    if not isinstance(result, dict) or "error" in result or "content" not in result:
++        return result
++    out = {k: v for k, v in result.items() if k != "content"}
++    text = result["content"]
++    out["text"] = text
++    if isinstance(text, str):
++        out["chars"] = len(text)
++    return out
+ 
+ 
+ async def _t_agent_stop(db, p):
+@@ -909,7 +929,7 @@ TOOLS: dict = {
+                              "duplicate Claude processes. Params: project_dir, conversation_id, session_name."},
+     "agent_report": {"scope": "read", "fn": _t_agent_report,
+                      "desc": "List report/status files + timestamps for a project from allowlisted directories, "
+-                             "or read one with `path`. Params: project_dir, limit, path."},
++                             "or read one with `path` (its text comes back in `text`). Params: project_dir, limit, path."},
+     "agent_stop": {"scope": "write", "fn": _t_agent_stop,
+                    "desc": "Stop an agent. DESTRUCTIVE: requires confirm=true and an unambiguous target; refuses "
+                            "ambiguous targets and kills only the resolved pane. Params: target, confirm, "
+diff --git a/backend/tests/test_mcp_agent_report_transport.py b/backend/tests/test_mcp_agent_report_transport.py
+new file mode 100644
+index 0000000..b06a37b
+--- /dev/null
++++ b/backend/tests/test_mcp_agent_report_transport.py
+@@ -0,0 +1,146 @@
++"""agent_report read over MCP: the report text must survive the tools/call envelope.
++
++Found 2026-11-18: the tech lead's ChatGPT saw `Object.keys(result) == []` for
++`agent_report` with `path`, while the listing worked. The runtime and this server both
++returned the text; the read payload was the only tool result with a top-level `content`
++key holding a string. `content` is the MCP result's item list, so a client that treats a
++parsed object carrying `content` as a tool result finds no item list and keeps nothing.
++
++The client below is a synthetic stand-in for that behaviour (the real ChatGPT client is not
++observable from here). All fixtures are synthetic; no runtime, network or database.
++"""
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++
++from services import mcp_server as mcp
++
++READ = {"project_dir": "/opt/demo", "path": "docs/HANDOFF.md"}
++
++
++def _strict_client(envelope: dict) -> dict:
++    """Unwrap a tools/call result the way the failing client is believed to.
++
++    Parse the first text item; if the parsed object itself looks like an MCP result (has
++    `content`), keep only its well-formed items: anything else is dropped to `{}`.
++    """
++    parsed = json.loads(envelope["content"][0]["text"])
++    if isinstance(parsed, dict) and "content" in parsed:
++        items = parsed["content"]
++        if not (isinstance(items, list) and all(isinstance(i, dict) and "type" in i for i in items)):
++            return {}
++    return parsed
++
++
++def _runtime_read(text: str, truncated: bool = False) -> dict:
++    """The runtime's /agents/report read shape (core.agent_control.agent_report_read)."""
++    return {"project_dir": "/opt/demo", "path": "docs/HANDOFF.md",
++            "truncated": truncated, "content": text}
++
++
++@pytest.fixture
++def runtime(monkeypatch):
++    from services import runtime_client
++    stub = SimpleNamespace(agent_get=AsyncMock(), agent_post=AsyncMock())
++    monkeypatch.setattr(runtime_client, "agent_get", stub.agent_get)
++    monkeypatch.setattr(runtime_client, "agent_post", stub.agent_post)
++    return stub
++
++
++@pytest.fixture
++def no_audit(monkeypatch):
++    monkeypatch.setattr(mcp, "audit", AsyncMock())
++
++
++async def _rpc(params: dict) -> dict:
++    return await mcp.dispatch_rpc(MagicMock(), SimpleNamespace(id=1, scopes=["read"]),
++                                  "tools/call", {"name": "agent_report", "arguments": params})
++
++
++TEXTS = [
++    pytest.param("short", id="short-ascii"),
++    pytest.param("Отчёт: ✅ готово — 測試 🚀\n" * 3, id="short-unicode"),
++    pytest.param(("# Раздел\nстрока с юникодом ✓ " * 700)[:16_000], id="16k-unicode"),
++    pytest.param("ж🙂x" * 100_000, id="300k-unicode"),
++]
++
++
++# ── the defect, on the old payload shape ────────────────────────────────────
++def test_old_payload_shape_is_lost_by_the_strict_client():
++    """The released shape: the text arrives in the envelope but the client keeps nothing."""
++    envelope = {"content": [{"type": "text", "text": json.dumps(_runtime_read("x" * 15_524))}],
++                "isError": False}
++    assert "x" * 15_524 in envelope["content"][0]["text"]
++    assert _strict_client(envelope) == {}
++
++
++def test_listing_shape_survives_the_strict_client():
++    listing = {"project_dir": "/opt/demo", "reports": [{"path": "docs/A.md"}], "count": 1}
++    envelope = {"content": [{"type": "text", "text": json.dumps(listing)}], "isError": False}
++    assert _strict_client(envelope) == listing
++
++
++# ── the fix, through the real dispatch_rpc envelope ─────────────────────────
++@pytest.mark.asyncio
++@pytest.mark.parametrize("text", TEXTS)
++async def test_read_text_survives_the_serialized_envelope(runtime, no_audit, text):
++    runtime.agent_get.return_value = _runtime_read(text)
++    envelope = await _rpc(READ)
++
++    assert envelope["isError"] is False
++    assert [i["type"] for i in envelope["content"]] == ["text"]
++    wire = json.dumps(envelope)                       # what actually goes over HTTP
++    seen = _strict_client(json.loads(wire))
++    assert seen["text"] == text
++    assert seen["chars"] == len(text)
++    assert "content" not in seen
++    assert seen["path"] == "docs/HANDOFF.md" and seen["truncated"] is False
++    runtime.agent_get.assert_awaited_once_with(
++        "/report", {"project_dir": "/opt/demo", "limit": 20, "path": "docs/HANDOFF.md"})
++
++
++@pytest.mark.asyncio
++async def test_truncation_flag_and_runtime_redaction_pass_through_unchanged(runtime, no_audit):
++    redacted = "token=[REDACTED] rest of the report"
++    runtime.agent_get.return_value = _runtime_read(redacted, truncated=True)
++    seen = _strict_client(await _rpc(READ))
++    assert seen["text"] == redacted and seen["truncated"] is True
++
++
++@pytest.mark.asyncio
++async def test_listing_is_unchanged(runtime, no_audit):
++    listing = {"project_dir": "/opt/demo", "reports": [{"path": "docs/A.md", "mtime": 1}],
++               "count": 1}
++    runtime.agent_get.return_value = listing
++    seen = _strict_client(await _rpc({"project_dir": "/opt/demo", "limit": 5}))
++    assert seen == listing
++    runtime.agent_get.assert_awaited_once_with("/report", {"project_dir": "/opt/demo", "limit": 5})
++
++
++@pytest.mark.asyncio
++async def test_runtime_refusal_passes_through_untouched(runtime, no_audit):
++    refusal = {"error": "report path 'x' is outside the allowed report directories", "ok": False}
++    runtime.agent_get.return_value = refusal
++    assert _strict_client(await _rpc({**READ, "path": "x"})) == refusal
++
++
++@pytest.mark.asyncio
++async def test_missing_project_dir_is_still_refused_without_the_runtime(runtime, no_audit):
++    seen = _strict_client(await _rpc({"path": "docs/A.md"}))
++    assert seen == {"error": "project_dir required"}
++    runtime.agent_get.assert_not_awaited()
++
++
++def test_payload_helper_leaves_odd_shapes_alone():
++    assert mcp._report_read_payload({"reports": []}) == {"reports": []}
++    assert mcp._report_read_payload("raw") == "raw"
++    assert mcp._report_read_payload({"error": "x", "content": "y"}) == {"error": "x", "content": "y"}
++
++
++def test_description_tells_the_client_where_the_text_is():
++    desc = {t["name"]: t["description"] for t in mcp.tool_schemas()}["agent_report"]
++    assert "`text`" in desc
