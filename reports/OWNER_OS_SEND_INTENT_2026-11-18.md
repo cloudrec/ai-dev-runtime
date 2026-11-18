@@ -194,3 +194,8 @@ The owner's word "делай сверку перед новым будильни
   - Full suite: 5538 passed, 4 skipped, EXIT 0.
 
 **Release, when authorised:** `TARGET_SHA=758ebe4 deploy/adaptive_offer/install.sh --check`, then `--apply`. No schema change.
+
+## Released 758ebe4: 2026-11-18 10:21:42Z (owner's direct word "деплой 758ebe4")
+- `--check` clean (payment panes never offered), then `--apply`: live 5edb575 → 758ebe4. No schema change.
+- Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T102142Z`.
+- Units active (ai-runtime, wake-companion, fullcycle-intake, fullcycle-worker); 0 companion errors in the first minute.
