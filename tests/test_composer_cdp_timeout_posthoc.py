@@ -66,7 +66,9 @@ class _Hung(_S):
 
 
 @pytest.fixture(autouse=True)
-def _quiet(monkeypatch):
+def _quiet(monkeypatch, tmp_path):
+    # the send intent is durable: each test gets its own control-plane DB
+    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     import time as _time
     monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
     monkeypatch.setattr(cdp, "ASSISTANT_SETTLE_SECS", 0)
@@ -143,19 +145,25 @@ def test_a_virtualized_chat_proves_the_turn_by_id(wire):
     assert r["ok"] is False and latched == [8]
 
 
-def test_no_evidence_keeps_the_old_verdict_and_does_not_latch(wire):
-    """Nothing landed: the event must stay retryable, exactly as before."""
+def test_no_evidence_after_dispatch_is_indeterminate_and_never_resent(wire):
+    """Changed 2026-11-18 (D1, event 88629). This used to stay retryable, and the retry
+    re-sent a wake that had in fact been clicked. Dispatched with no proof either way is
+    now indeterminate: latched, never re-sent blindly, settled later by reconciliation.
+    The reason is unchanged; the attempt's own composer-cleared latch was not reached."""
     latched, _ = wire(_Hung("boolean"), _after(turns=0, assistant=0))
     r = cdp.submit_phrase(URL, "PHRASE", event_id=9, claim=False)
     assert r == {"ok": False, "reason": REASON}
     assert latched == []
+    wb = cdp._wb()
+    assert wb.send_intent(9)["state"] == "indeterminate" and wb.was_submitted(9)
 
 
-def test_a_page_that_still_does_not_answer_keeps_the_old_verdict(wire):
+def test_a_page_that_still_does_not_answer_is_indeterminate(wire):
     latched, _ = wire(_Hung("boolean"), WebSocketTimeoutException("still hung"))
     r = cdp.submit_phrase(URL, "PHRASE", event_id=10, claim=False)
     assert r == {"ok": False, "reason": REASON}
-    assert latched == []
+    wb = cdp._wb()
+    assert wb.send_intent(10)["state"] == "indeterminate" and wb.was_submitted(10)
 
 
 def test_an_existing_latch_is_never_undone_by_a_failed_recheck(wire):

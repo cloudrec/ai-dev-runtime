@@ -2071,6 +2071,7 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
         # proof", not "it definitely did not arrive" — and only the latter would justify
         # sending a second copy into the owner's chat.
         conn.execute(_SUBMIT_SCHEMA)
+        _intent_tables(conn)
         # Stale or proven-invalid wakes are retired BEFORE anything else is considered —
         # a days-old actionable event must never be selected fresh just because delivery
         # only now started working again.
@@ -2116,6 +2117,10 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
             "WHERE a.decision='wake' AND a.acknowledged=0 "
             "AND a.superseded_by IS NULL AND NOT EXISTS "
             "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
+            # an earlier send of this event that is in flight, died mid-way or could
+            # not be resolved is never offered again; only a PROVEN not_sent is
+            "AND NOT EXISTS (SELECT 1 FROM wake_send_intent i "
+            "                WHERE i.event_id=a.event_id AND i.state != 'not_sent') "
             "ORDER BY COALESCE(a.actionable,0) DESC, a.id ASC "
             # passed-over rows are never consumed: scan further when a filter is on so
             # they cannot crowd a deliverable wake out of the window
@@ -2612,6 +2617,273 @@ def last_delivery(event_id: Optional[int] = None, conn=None) -> Optional[dict]:
         return {"at": r[0], "source": r[1], "event_id": int(r[2]),
                 "delivered": bool(r[3]), "reason": r[4], "conversation": r[5],
                 "route_key": r[6]}
+    finally:
+        if own:
+            conn.close()
+
+
+# ── send intent: the durable record that a send was about to fire ───────────
+# `wake_submitted` latches only once the page is SEEN to take the phrase (composer
+# cleared). The click happens before that, so a CDP timeout or a process death between
+# the click and the latch left an event that may be in the chat with no record of it,
+# and the next tick offered it again: 2026-11-18 event 88629, attempt 1 timed out after
+# dispatch (07:15:15Z), attempt 2 re-sent it at 07:21:30Z (and 74760, 2026-10-29).
+#
+# The intent row is written and COMMITTED before anything is typed. Its state is one of
+#   intent         about to type/send; an attempt in flight, or one that died mid-way
+#   not_sent       PROVEN not in the chat (nothing dispatched, or our phrase still sits
+#                  in the composer and no user turn carries it): the event may be retried
+#   indeterminate  dispatched, no proof either way: latched, never re-sent blindly
+#   landed         a user turn carries this event's marker, the assistant not yet seen
+#   delivered      the assistant answered it (at send time, or reconciled later)
+# Any state but not_sent blocks a new send of the event.
+SEND_STATES = ("intent", "not_sent", "indeterminate", "landed", "delivered")
+# An `intent` older than this belongs to an attempt that cannot still be running (the
+# longest attempt is page wait + user turn + assistant start + settle + post-hoc check,
+# about 130 s): its process died or hung, so the send is ambiguous.
+INTENT_STALE_SECS = int(os.getenv("WAKE_INTENT_STALE_SECS", "300"))
+# Reconciliation looks at an unresolved send no earlier than this after it, and then at
+# most this often, at most this many times.
+RECONCILE_MIN_AGE_SECS = int(os.getenv("WAKE_RECONCILE_MIN_AGE_SECS", "60"))
+RECONCILE_INTERVAL_SECS = int(os.getenv("WAKE_RECONCILE_INTERVAL_SECS", "120"))
+RECONCILE_MAX_LOOKS = int(os.getenv("WAKE_RECONCILE_MAX_LOOKS", "20"))
+
+_INTENT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wake_send_intent (
+    event_id INTEGER PRIMARY KEY, ts REAL, at TEXT, source TEXT, conversation TEXT,
+    state TEXT NOT NULL, reason TEXT, updated_ts REAL, attempts INTEGER DEFAULT 1,
+    user_id_before TEXT, looks INTEGER DEFAULT 0, looked_ts REAL
+)
+"""
+_INTENT_AUDIT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS wake_send_intent_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, at TEXT, event_id INTEGER,
+    from_state TEXT, to_state TEXT, reason TEXT
+)
+"""
+
+
+def wake_marker(event_id) -> str:
+    """The exact text by which a sent phrase names its event (see `compose_phrase`).
+    Unique per event, system-authored, never pane text."""
+    return f"[Owner OS wake] event={int(event_id)} "
+
+
+def _intent_tables(conn) -> None:
+    conn.execute(_INTENT_SCHEMA)
+    conn.execute(_INTENT_AUDIT_SCHEMA)
+
+
+def _intent_move(conn, event_id: int, frm: Optional[str], to: str, reason: str,
+                 now: float) -> None:
+    conn.execute("INSERT INTO wake_send_intent_audit (ts,at,event_id,from_state,to_state,"
+                 "reason) VALUES (?,?,?,?,?,?)",
+                 (now, now_iso(), int(event_id), frm, to, str(reason)[:160]))
+
+
+def send_intent(event_id, conn=None) -> Optional[dict]:
+    if not event_id:
+        return None
+    conn, own = _c(conn)
+    try:
+        _intent_tables(conn)
+        r = conn.execute("SELECT state, reason, ts, attempts, conversation, user_id_before, "
+                         "looks, looked_ts FROM wake_send_intent WHERE event_id=?",
+                         (int(event_id),)).fetchone()
+        if not r:
+            return None
+        return {"event_id": int(event_id), "state": r[0], "reason": r[1] or "",
+                "ts": float(r[2] or 0), "attempts": int(r[3] or 0),
+                "conversation": r[4] or "", "user_id_before": r[5],
+                "looks": int(r[6] or 0), "looked_ts": r[7]}
+    finally:
+        if own:
+            conn.close()
+
+
+def begin_send(event_id, *, source: str = "", conversation: str = "",
+               user_id_before=None, conn=None, now: Optional[float] = None) -> dict:
+    """Record, durably and BEFORE anything is typed, that this event is about to be sent.
+
+    Refused while an earlier send of the same event is unresolved or happened
+    (`intent`, `indeterminate`, `landed`, `delivered`), and once it is latched: that is
+    what stops a second copy after a crash, a timeout or a concurrent attempt. Allowed for
+    a new event and after a PROVEN `not_sent`."""
+    if not event_id:
+        return {"ok": True, "reason": "no_event"}
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        _intent_tables(conn)
+        conn.execute(_SUBMIT_SCHEMA)
+        began = not conn.in_transaction
+        if began:
+            conn.execute("BEGIN IMMEDIATE")      # one writer decides, even across processes
+        try:
+            row = conn.execute("SELECT state, attempts FROM wake_send_intent WHERE event_id=?",
+                               (int(event_id),)).fetchone()
+            latched = conn.execute("SELECT 1 FROM wake_submitted WHERE event_id=?",
+                                   (int(event_id),)).fetchone() is not None
+            if latched or (row and row[0] != "not_sent"):
+                if began:
+                    conn.rollback()
+                return {"ok": False,
+                        "reason": f"send_already_{'latched' if latched else row[0]}"}
+            if row:
+                conn.execute("UPDATE wake_send_intent SET ts=?, at=?, source=?, "
+                             "conversation=?, state='intent', reason='', updated_ts=?, "
+                             "attempts=attempts+1, user_id_before=?, looks=0, looked_ts=NULL "
+                             "WHERE event_id=?",
+                             (now, now_iso(), source, (conversation or "")[:200], now,
+                              user_id_before, int(event_id)))
+            else:
+                conn.execute("INSERT INTO wake_send_intent (event_id,ts,at,source,"
+                             "conversation,state,reason,updated_ts,attempts,user_id_before) "
+                             "VALUES (?,?,?,?,?,'intent','',?,1,?)",
+                             (int(event_id), now, now_iso(), source,
+                              (conversation or "")[:200], now, user_id_before))
+            _intent_move(conn, int(event_id), row[0] if row else None, "intent", source, now)
+            conn.commit()
+        except Exception:
+            if began:
+                conn.rollback()
+            raise
+        return {"ok": True, "reason": "intent_recorded"}
+    finally:
+        if own:
+            conn.close()
+
+
+# Which moves are allowed. Never back to `intent` (only `begin_send` does that, from
+# not_sent), never from `delivered`, and `not_sent` only from states with no latch.
+_MOVES = {
+    "intent": {"not_sent", "indeterminate", "landed", "delivered"},
+    "indeterminate": {"not_sent", "landed", "delivered"},
+    "landed": {"delivered"},
+    "not_sent": set(),
+    "delivered": set(),
+}
+
+
+def finish_send(event_id, state: str, reason: str = "", conn=None,
+                now: Optional[float] = None) -> bool:
+    """Move a send to its outcome. `indeterminate`, `landed` and `delivered` also latch
+    `wake_submitted`, so every existing no-resend rule applies to them. Returns whether the
+    move was made (an illegal move is refused, never forced)."""
+    if not event_id or state not in SEND_STATES or state == "intent":
+        return False
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        _intent_tables(conn)
+        conn.execute(_SUBMIT_SCHEMA)
+        row = conn.execute("SELECT state FROM wake_send_intent WHERE event_id=?",
+                           (int(event_id),)).fetchone()
+        if not row or state not in _MOVES.get(row[0], set()):
+            return False
+        if state == "not_sent" and conn.execute(
+                "SELECT 1 FROM wake_submitted WHERE event_id=?",
+                (int(event_id),)).fetchone() is not None and row[0] == "intent":
+            # the page was SEEN to take the phrase in this attempt: never "not sent"
+            return False
+        conn.execute("UPDATE wake_send_intent SET state=?, reason=?, updated_ts=? "
+                     "WHERE event_id=?", (state, str(reason)[:160], now, int(event_id)))
+        _intent_move(conn, int(event_id), row[0], state, reason, now)
+        if state in ("indeterminate", "landed", "delivered"):
+            conn.execute("INSERT OR IGNORE INTO wake_submitted (event_id,ts,at,source) "
+                         "VALUES (?,?,?,?)", (int(event_id), now, now_iso(),
+                                              f"send_{state}"))
+        conn.commit()
+        return True
+    finally:
+        if own:
+            conn.close()
+
+
+def retract_unsent(event_id, proof: str, conn=None, now: Optional[float] = None) -> bool:
+    """An `indeterminate` send PROVEN not to be in the chat (reconciliation saw the
+    phrase still in the composer and no user turn carrying its marker, with the
+    pre-send newest turn still on the page). Only then is the latch lifted, so the event
+    is offered again, once more, through every ordinary filter. Audited."""
+    if not event_id or not proof:
+        return False
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        _intent_tables(conn)
+        conn.execute(_SUBMIT_SCHEMA)
+        row = conn.execute("SELECT state FROM wake_send_intent WHERE event_id=?",
+                           (int(event_id),)).fetchone()
+        if not row or row[0] != "indeterminate":
+            return False
+        conn.execute("UPDATE wake_send_intent SET state='not_sent', reason=?, updated_ts=? "
+                     "WHERE event_id=?", (str(proof)[:160], now, int(event_id)))
+        _intent_move(conn, int(event_id), "indeterminate", "not_sent", proof, now)
+        conn.execute("DELETE FROM wake_submitted WHERE event_id=?", (int(event_id),))
+        conn.commit()
+        return True
+    finally:
+        if own:
+            conn.close()
+
+
+def unresolved_sends(conn=None, now: Optional[float] = None, limit: int = 3) -> list:
+    """Sends to reconcile now. A stale `intent` (its attempt died) is first made
+    `indeterminate` and latched; then `indeterminate` and `landed` sends inside the wake
+    age window, old enough and not looked at recently, oldest first."""
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        _intent_tables(conn)
+        stale = conn.execute("SELECT event_id FROM wake_send_intent WHERE state='intent' "
+                             "AND ts < ?", (now - INTENT_STALE_SECS,)).fetchall()
+        converted = set()
+        for (eid,) in stale:
+            if finish_send(eid, "indeterminate", "attempt_died_after_intent", conn=conn,
+                           now=now):
+                converted.add(int(eid))
+        rows = conn.execute(
+            "SELECT event_id, conversation, user_id_before, state, looks FROM "
+            "wake_send_intent WHERE state IN ('indeterminate','landed') AND ts >= ? "
+            "AND ts <= ? AND looks < ? AND (looked_ts IS NULL OR looked_ts <= ?) "
+            "ORDER BY ts ASC LIMIT ?",
+            (now - MAX_WAKE_AGE_SECS, now - RECONCILE_MIN_AGE_SECS, RECONCILE_MAX_LOOKS,
+             now - RECONCILE_INTERVAL_SECS, int(limit))).fetchall()
+        return [{"event_id": int(r[0]), "conversation": r[1] or "", "user_id_before": r[2],
+                 "state": r[3], "looks": int(r[4] or 0),
+                 "stale_converted": int(r[0]) in converted}
+                for r in rows]
+    finally:
+        if own:
+            conn.close()
+
+
+def note_reconcile_look(event_id, conn=None, now: Optional[float] = None) -> None:
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        _intent_tables(conn)
+        conn.execute("UPDATE wake_send_intent SET looks=looks+1, looked_ts=? WHERE event_id=?",
+                     (now, int(event_id)))
+        conn.commit()
+    finally:
+        if own:
+            conn.close()
+
+
+def wake_context(event_id, conn=None) -> Optional[dict]:
+    """What the decision recorded about a wake: enough to register its watch."""
+    conn, own = _conn(conn)
+    try:
+        r = conn.execute("SELECT COALESCE(agent_id,''), COALESCE(project_id,''), "
+                         "COALESCE(route_key,''), COALESCE(event_type,''), "
+                         "COALESCE(actionable,0) FROM wake_audit WHERE event_id=? "
+                         "AND decision='wake' ORDER BY id DESC LIMIT 1",
+                         (int(event_id),)).fetchone()
+        if not r:
+            return None
+        return {"agent_id": r[0], "project_id": r[1], "route_key": r[2],
+                "event_type": r[3], "actionable": bool(r[4])}
     finally:
         if own:
             conn.close()

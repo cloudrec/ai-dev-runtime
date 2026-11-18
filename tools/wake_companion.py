@@ -254,6 +254,36 @@ CLOSED_LOOP_WATCH_ENABLED = os.getenv("CLOSED_LOOP_WATCH_ENABLED", "1") not in (
     "0", "", "false")
 
 
+SEND_RECONCILE_ENABLED = os.getenv("WAKE_SEND_RECONCILE_ENABLED", "1") not in ("0", "", "false")
+
+
+def reconcile_sends(wb) -> list:
+    """Settle wake sends that ended without proof, read-only, from the chat itself
+    (`cdp_composer.reconcile_sends`). A send whose attempt DIED (crash, restart) never
+    reached the watch registration in `tick`, so it is registered here, unverified,
+    exactly as a latched-but-unverified send is: the watchdog's single re-wake and
+    escalation stay the way an unheard stop is surfaced."""
+    from cdp_composer import reconcile_sends as _reconcile
+    out = _reconcile()
+    for r in out:
+        if r.get("converted"):
+            try:
+                row = wb.wake_context(r["event_id"])
+                if row and row.get("actionable"):
+                    from core import closed_loop_wake
+                    closed_loop_wake.register_delivery(
+                        event_id=r["event_id"], target=row.get("agent_id", ""),
+                        project_id=row.get("project_id", ""),
+                        route_key=row.get("route_key", ""),
+                        event_type=row.get("event_type", ""), verified=False)
+            except Exception:  # noqa: BLE001
+                pass
+        if r.get("verdict") not in ("unchanged", "no_page") or r.get("converted"):
+            print(f"wake send reconcile: event {r['event_id']} -> {r['verdict']}"
+                  f"{' (attempt had died)' if r.get('converted') else ''}", flush=True)
+    return out
+
+
 def watch_closed_loop() -> dict:
     """One SLO-watchdog pass: a wake that was delivered (real user turn confirmed) but
     produced no observed progress gets re-woken once, then escalated. Task 211 — the
@@ -369,6 +399,11 @@ def main() -> None:
             print(f"worker registration failed: {str(e)[:120]}", flush=True)
         try:
             tick(wb)
+            if SEND_RECONCILE_ENABLED:
+                try:
+                    reconcile_sends(wb)
+                except Exception as e:  # noqa: BLE001 — never breaks the tick
+                    print(f"send-reconcile error: {str(e)[:160]}", flush=True)
             if CONTROL_GUARD_ENABLED:
                 try:
                     watch_control_plane()

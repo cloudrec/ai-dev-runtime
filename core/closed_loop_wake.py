@@ -867,6 +867,22 @@ def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
             conn.close()
 
 
+def mark_delivery_verified(event_id: int, conn=None) -> bool:
+    """A watched wake whose delivery was unproven at send time and is now proven (a late
+    receipt from wake send reconciliation). Only the audit column changes; the watch
+    keeps its clock, so re-wake and escalation timing are untouched."""
+    conn, own = _conn(conn)
+    try:
+        cur = conn.execute("UPDATE wake_loop_watch SET delivery_verified=1 "
+                           "WHERE event_id=? AND COALESCE(delivery_verified,0)=0",
+                           (int(event_id),))
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        if own:
+            conn.close()
+
+
 def _transcript_advanced(conn, target: str, since_ts: float) -> bool:
     """Has this agent's session transcript been written since `since_ts`?
 

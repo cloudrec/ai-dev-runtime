@@ -1281,7 +1281,9 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
 
     # The claim is spent from here on, so every outcome past this line is a delivery attempt
     # and is recorded as one — success and failure alike.
-    res = _attempt(conversation_url, phrase, source=source, event_id=event_id)
+    track: dict = {}
+    res = _attempt(conversation_url, phrase, source=source, event_id=event_id, track=track)
+    _settle_send(event_id, track, res)
     # A WEDGED conversation never clears on its own: the stop control stays up, no send
     # control is offered, and every future wake to this chat fails identically. That is a
     # permanent route outage, so it earns the one recovery this module already has —
@@ -1315,11 +1317,91 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
         target = find_target(conversation_url)
         fresh = recover_wedged_tab(target, conversation_url) if target else None
         if fresh:
-            res = _attempt(conversation_url, phrase, source=source, event_id=event_id)
+            track = {}
+            res = _attempt(conversation_url, phrase, source=source, event_id=event_id,
+                           track=track)
+            _settle_send(event_id, track, res)
             res[flag] = True
         _log_recovery(event_id, trigger, target, fresh, res)
     return _record_delivery(source, event_id, res,
                             conversation=conversation_url, route_key=route_key)
+
+
+def _settle_send(event_id, track: dict, res: dict) -> None:
+    """Close this attempt's intent with what is KNOWN, never more:
+      delivered      the assistant started (the ordinary proof);
+      not_sent       nothing was dispatched, or the page showed our phrase still unsent;
+      indeterminate  dispatched with no proof either way. Latched: never re-sent
+                     blindly; reconciliation (`reconcile_sends`) settles it later.
+    A failure to record leaves the intent open, which blocks a resend and is made
+    indeterminate once stale: it fails toward silence-with-a-record, never a duplicate."""
+    if not event_id or not track.get("intent"):
+        return
+    if res.get("ok"):
+        state = "delivered"
+    elif not track.get("dispatched") or res.get("proven_not_sent"):
+        state = "not_sent"
+    else:
+        state = "indeterminate"
+    res.pop("proven_not_sent", None)     # internal; callers match the result exactly
+    try:
+        _wb().finish_send(event_id, state, str(res.get("reason", "")))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def reconcile_sends(limit: int = 3) -> list:
+    """Settle sends that ended without proof (a CDP timeout, a died attempt), from the
+    chat itself, read-only: nothing is typed, clicked or navigated.
+
+      marker in a user turn, an assistant turn after it -> delivered (a late receipt):
+          recorded, acknowledged, its watch marked verified;
+      marker in a user turn, no answer yet -> landed; still never re-sent;
+      marker still in the composer, in no user turn -> proven not sent: the latch is
+          lifted and the event is offered again through every ordinary filter;
+      anything else (no tab, page silent, phrase nowhere) -> unchanged: still
+          indeterminate, still watched, abandoned visibly when it ages out."""
+    wb = _wb()
+    out = []
+    for u in wb.unresolved_sends(limit=limit):
+        eid = u["event_id"]
+        wb.note_reconcile_look(eid)
+        target = find_target(u["conversation"]) if u["conversation"] else None
+        if not target or not page_responsive(target):
+            out.append({"event_id": eid, "verdict": "no_page",
+                        "converted": u["stale_converted"]})
+            continue
+        s = None
+        try:
+            s = _Session(target["webSocketDebuggerUrl"])
+            ev = send_evidence(s, eid)
+        except Exception:  # noqa: BLE001
+            ev = None
+        finally:
+            if s:
+                s.close()
+        verdict = "unchanged"
+        if ev and ev["found"] and ev["answered"]:
+            if wb.finish_send(eid, "delivered", "reconciled_assistant_answered"):
+                wb.record_delivery("reconcile", event_id=eid, delivered=True,
+                                   reason="reconciled_assistant_answered",
+                                   conversation=u["conversation"])
+                wb.acknowledge(eid)
+                try:
+                    from core import closed_loop_wake as _clw
+                    _clw.mark_delivery_verified(eid)
+                except Exception:  # noqa: BLE001
+                    pass
+                verdict = "delivered"
+        elif ev and ev["found"]:
+            if u["state"] == "indeterminate" and wb.finish_send(eid, "landed",
+                                                                "reconciled_turn_found"):
+                verdict = "landed"
+        elif _proven_unsent(ev):
+            if wb.retract_unsent(eid, "reconciled_phrase_still_in_composer"):
+                verdict = "not_sent"
+        out.append({"event_id": eid, "verdict": verdict, "converted": u["stale_converted"]})
+    return out
 
 
 def _log_recovery(event_id, trigger: str, target, fresh, res: dict) -> None:
@@ -1446,6 +1528,55 @@ def _await_assistant(s, asst_before: int, asst_id_before) -> dict:
             "reason": f"user_turn_landed_but_assistant_never_started_in_{ASSISTANT_START_SECS}s"}
 
 
+def _wb():
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+    from core import wake_bridge as _w
+    return _w
+
+
+_SEND_EVIDENCE_JS = """(function(m, us, asl, cs){
+  const users=[...document.querySelectorAll(us)];
+  let mine=null;
+  for (const e of users) { if ((e.textContent||'').includes(m)) mine=e; }
+  let answered=false;
+  if (mine) {
+    for (const a of document.querySelectorAll(asl)) {
+      if (mine.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING) {
+        answered=true; break; }
+    }
+  }
+  const c=document.querySelector(cs);
+  return JSON.stringify({found: !!mine, answered: answered,
+                         in_composer: !!c && (c.textContent||'').includes(m)});
+})(%s, %s, %s, %s)"""
+
+
+def send_evidence(s, event_id) -> Optional[dict]:
+    """Where is THIS event's phrase now? Three bits about the marker this module itself
+    wrote (`[Owner OS wake] event=<id> `), never any other text: is it in a user turn,
+    is an assistant turn after that one, is it still in the composer. None when the page
+    cannot say, which is never evidence of anything."""
+    try:
+        marker = _wb().wake_marker(event_id)
+        expr = _SEND_EVIDENCE_JS % (json.dumps(marker), json.dumps(USER_TURN_SEL),
+                                    json.dumps(ASSISTANT_TURN_SEL), json.dumps(COMPOSER_SEL))
+        r = s.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
+        v = json.loads(((r.get("result") or {}).get("value")) or "null")
+        if not isinstance(v, dict) or not all(isinstance(v.get(k), bool)
+                                              for k in ("found", "answered", "in_composer")):
+            return None
+        return v
+    except Exception:  # noqa: BLE001 — unreadable: no evidence
+        return None
+
+
+def _proven_unsent(ev: Optional[dict]) -> bool:
+    """Our phrase is still in the composer and no user turn carries it. Sending empties
+    the composer, so a phrase still sitting there was not submitted."""
+    return bool(ev) and ev["in_composer"] is True and ev["found"] is False
+
+
 # How long a FRESH session may look for proof after the attempt's own session failed
 # mid-verification. Bounded so a still-hung page costs one window, not a stalled loop.
 POSTHOC_VERIFY_SECS = int(os.getenv("WAKE_POSTHOC_VERIFY_SECS", "20"))
@@ -1490,6 +1621,8 @@ def _verify_after_cdp_error(target: dict, reason: str, *, source: str, event_id,
             if started:
                 return _settled(s2, f"submitted_and_assistant_started_after_{reason}")
             if time.time() >= deadline:
+                if event_id and _proven_unsent(send_evidence(s2, event_id)):
+                    return {"ok": False, "reason": reason, "proven_not_sent": True}
                 break
             time.sleep(2)
     except Exception:  # noqa: BLE001 — still unreachable: the attempt's verdict stands
@@ -1504,7 +1637,8 @@ def _verify_after_cdp_error(target: dict, reason: str, *, source: str, event_id,
 
 
 def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
-             event_id: Optional[int] = None, target: Optional[dict] = None) -> dict:
+             event_id: Optional[int] = None, target: Optional[dict] = None,
+             track: Optional[dict] = None) -> dict:
     """The submission itself, once the slot is claimed. Split out so that every exit path
     below is recorded by exactly one caller instead of each remembering to do it."""
     # FAIL FAST on a starving browser, before any session is opened. Under the 2026-08-30
@@ -1513,6 +1647,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
     # `cdp_error:WebSocketTimeoutException` — true, but it blames the socket for a
     # shortage of memory. Checking first costs one cheap browser-level call and makes the
     # attempt honest. Fail-open: only a browser that is measurably degraded is refused.
+    track = track if track is not None else {}
     _bd = browser_degraded()
     if _bd.get("degraded"):
         return {"ok": False, "reason": f"browser_degraded:{_bd.get('reason')}"}
@@ -1707,6 +1842,21 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                 "if(e){e.textContent='';e.dispatchEvent(new Event('input',{bubbles:true}));}})()"
                 % json.dumps(COMPOSER_SEL)})
 
+        # DURABLE INTENT, committed before anything is typed. From here a crash, a hung
+        # page or a second attempt can no longer turn into a second copy in the chat:
+        # the event stays blocked until this send is resolved (see wake_bridge).
+        if event_id:
+            step = "send_intent"
+            try:
+                bi = _wb().begin_send(event_id, source=source,
+                                      conversation=conversation_url,
+                                      user_id_before=last_id_before)
+            except Exception as e:  # noqa: BLE001 — no durable record: do not send
+                return {"ok": False, "reason": f"send_intent_unavailable:{type(e).__name__}"}
+            if not bi.get("ok"):
+                return {"ok": False, "reason": f"send_intent_refused:{bi.get('reason')}"}
+            track["intent"] = True
+
         # The ONLY string ever sent into the page.
         step = "insert_phrase"
         s.call("Input.insertText", {"text": phrase})
@@ -1722,6 +1872,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
             f"(function(){{const b=document.querySelector({SEND_SEL!r});"
             f"return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';}})()")
         dispatched = True
+        track["dispatched"] = True
         step = "post_send_verify"
         if enabled is True:
             s.call("Runtime.evaluate",
@@ -1740,12 +1891,14 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # a flat count (virtualized long chat) — says the conversation kept the message.
         import time
         cleared = False
+        last_answer = None
         for _ in range(max(1, USER_TURN_SECS)):
             time.sleep(1)
             if not cleared:
-                cleared = s.boolean(
+                last_answer = s.boolean(
                     f"(function(){{const c=document.querySelector({COMPOSER_SEL!r});"
-                    f"return !c || c.textContent.length === 0;}})()") is True
+                    f"return !c || c.textContent.length === 0;}})()")
+                cleared = last_answer is True
                 if cleared:
                     # THE LATCH BOUNDARY. A cleared composer means the page took the
                     # phrase — from here on it may be in the chat, so this event must
@@ -1786,7 +1939,10 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
                     f"(function(){{const c=document.querySelector({COMPOSER_SEL!r});"
                     f"if(c){{c.innerHTML='';"
                     f"c.dispatchEvent(new Event('input',{{bubbles:true}}));}}}})()"})
-            return {"ok": False, "reason": "composer_did_not_clear_after_send"}
+            # Proven only when the page ANSWERED "still holds text"; an unreadable page
+            # (None) proves nothing, so that send stays indeterminate.
+            return {"ok": False, "reason": "composer_did_not_clear_after_send",
+                    **({"proven_not_sent": True} if last_answer is False else {})}
         # The composer emptied and nothing arrived. This is the exact shape of the silent
         # failure this check exists for: it must NOT be acknowledged, so the wake stays
         # pending and is retried after the cooldown.
