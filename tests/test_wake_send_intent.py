@@ -55,16 +55,17 @@ def _iso(tmp_path, monkeypatch):
     monkeypatch.setattr(cdp, "page_responsive", lambda t, timeout=8.0: True)
     monkeypatch.setattr(cdp, "find_target",
                         lambda url: {"webSocketDebuggerUrl": "ws://x", "url": URL, "id": "t1"})
-    wb = cdp._wb()
-    monkeypatch.setattr(wb, "RECONCILE_MIN_AGE_SECS", 0)
-    monkeypatch.setattr(wb, "RECONCILE_INTERVAL_SECS", 0)
+    from core import wake_bridge as wb
+    monkeypatch.setattr(wb, "RECONCILE_MIN_AGE_SECS", 0, raising=False)
+    monkeypatch.setattr(wb, "RECONCILE_INTERVAL_SECS", 0, raising=False)
     wb.bind_chat(URL)
     yield
 
 
 @pytest.fixture
 def wb():
-    return cdp._wb()
+    from core import wake_bridge as _w
+    return _w
 
 
 def _db():
@@ -72,7 +73,8 @@ def _db():
 
 
 def _state(eid):
-    i = cdp._wb().send_intent(eid)
+    from core import wake_bridge as _w
+    i = _w.send_intent(eid)
     return i and i["state"]
 
 
@@ -96,7 +98,10 @@ class _Page(_S):
     def call(self, method, params=None):
         expr = (params or {}).get("expression", "")
         if method == "Input.insertText":
-            self.intent_at_insert = _state(_EID[0])
+            try:
+                self.intent_at_insert = _state(_EID[0])
+            except AttributeError:            # a checkout without send intents
+                self.intent_at_insert = None
             if self.boom == "insert":
                 raise WebSocketTimeoutException("timed out")
         if method == "Runtime.evaluate" and ".click()" in expr:
@@ -164,13 +169,13 @@ def test_a_timeout_after_the_click_with_a_silent_page_is_never_sent_again(monkey
     _wire(monkeypatch, _hung(), WebSocketTimeoutException("still hung"))
     r = _send(88629)
     assert r == {"ok": False, "reason": TIMEOUT}, r
-    assert _state(88629) == "indeterminate"
     assert wb.was_submitted(88629), "latched: every no-resend rule applies"
     second = _Page({"n": 1}, [True] * 6)
     _wire(monkeypatch, second)
     r2 = _send(88629)
-    assert r2["reason"].startswith("send_intent_refused:"), r2
     assert second.inserted == [], "nothing typed on the second attempt"
+    assert r2["reason"].startswith("send_intent_refused:"), r2
+    assert _state(88629) == "indeterminate"
 
 
 def test_a_timeout_after_the_click_with_no_evidence_either_way_is_indeterminate(monkeypatch,
@@ -305,7 +310,8 @@ def test_a_send_seen_taken_is_never_not_sent(wb):
 
 # ── D2: reconciliation (late receipt) ───────────────────────────────────────────────────
 def _indeterminate(monkeypatch, eid, actionable=True):
-    d = wb_ = cdp._wb()
+    from core import wake_bridge as wb_
+    d = wb_
     dec = wb_.should_wake(event_id=eid, severity="high", now=1000.0)
     wb_.record({**dec, "actionable": actionable}, event_id=eid, severity="high",
                event_type="task_completed", agent_id="fc-acc:0.0", now=1000.0)
