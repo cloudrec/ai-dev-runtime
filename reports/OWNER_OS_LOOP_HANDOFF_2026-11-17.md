@@ -9,6 +9,8 @@
 
 **Also live since 16:56Z:** the WEST dependency-wait wordings and the changed-task-identity re-arm. See `reports/OWNER_OS_ACCEPTANCE_2026-11-17.md`.
 
+**On the branch, not live (2026-11-18):** c1f629f, a task typed into tmux after stage_done re-arms the stop; plus a Full Cycle acceptance proposal (`reports/OWNER_OS_DIRECT_TASK_REARM_2026-11-18.md`).
+
 **Released 2026-11-18 04:16Z:** a stage_done rest is not announced again as a stop, and only requests count as an owner confirmation prompt (`reports/OWNER_OS_REWAKE_AFTER_RELEASE_2026-11-17.md`).
 
 **Released 2026-11-17 20:00Z:** completed hand-overs are announced once, and `stage_done` hand-overs are not re-woken (`reports/OWNER_OS_REWAKE_FIX_2026-11-17.md`).

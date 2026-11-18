@@ -1,0 +1,4 @@
+base ee9f1fa: new file 4 failed / 15 passed (the blind spot)
+head c1f629f: new file 20 passed; focused 604 passed
+mutants: 10/10 killed (one by hand)
+full suite c1f629f: 5477 passed, 4 skipped, EXIT 0
