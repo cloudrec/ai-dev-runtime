@@ -225,3 +225,12 @@ Not applied. Live is still 3423f4d, with the vtb deny edit and the widened compa
 - Runtime `de94158` via `deploy/adaptive_offer/install.sh`, `--check`/`--apply` rc=0, services active. The hand-over detector is live. `loop_watch` (companion env): no problems. Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261117T195918Z`.
 - seo `39603fb` via `deploy/seo_log_redact/install.sh`, `--check`/`--apply` rc=0, backend healthy, queue tools and undismiss intact.
 - Live access log, counted only: 9 connector lines since the restart, all 9 `<redacted>`, 0 with a raw token. A dummy-token probe did not appear either. Rollback: `deploy/seo_log_redact/rollback.sh`.
+
+## Release 6 (2026-11-18 04:16Z, owner's direct word "деплой ee9f1fa")
+- `TARGET_SHA=ee9f1fa deploy/adaptive_offer/install.sh`: `--check`, then `--apply`, rc=0. Live de94158 → ee9f1fa.
+- Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T041628Z`.
+- Verified:
+  - services active, health 200;
+  - loop_watch (companion env) `{}`;
+  - live pattern: "Подтвердится" is not a prompt, "Подтвердите деплой?" is;
+  - `agent_watch_state.task_ts` migrated on the first sweep (04:18Z).

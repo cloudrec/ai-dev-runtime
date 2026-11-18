@@ -2,12 +2,14 @@
 
 ## Current state (canonical; everything below is history)
 **Live** (released on the owner's direct word):
-- **Runtime** `de94158`, rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261117T195918Z`.
+- **Runtime** `ee9f1fa` (2026-11-18 04:16Z, owner's word), rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T041628Z`.
 - **Session login link**: noVNC on the tailnet only, rollback `deploy/browser_login/rollback.sh /root/ai-dev-runtime/backups/browser-login-20261117T175155Z`.
 - **SEO** `39603fb` (send-queue contract, undismiss button, access-log redaction), rollbacks in order: `deploy/seo_log_redact/rollback.sh`, `deploy/seo_undismiss/rollback.sh`, `deploy/seo_send_queue/rollback.sh`.
 - **Queue**: `SEND_QUEUE_ENABLED=1` via `/etc/systemd/system/ai-runtime.service.d/99-send-queue.conf`. To undo, remove the file and restart ai-runtime.
 
 **Also live since 16:56Z:** the WEST dependency-wait wordings and the changed-task-identity re-arm. See `reports/OWNER_OS_ACCEPTANCE_2026-11-17.md`.
+
+**Released 2026-11-18 04:16Z:** a stage_done rest is not announced again as a stop, and only requests count as an owner confirmation prompt (`reports/OWNER_OS_REWAKE_AFTER_RELEASE_2026-11-17.md`).
 
 **Released 2026-11-17 20:00Z:** completed hand-overs are announced once, and `stage_done` hand-overs are not re-woken (`reports/OWNER_OS_REWAKE_FIX_2026-11-17.md`).
 
