@@ -11,6 +11,8 @@
 
 **Full Cycle acceptance `acc-20261118` (2026-11-18): PASS.** The project was done in about 9 minutes, with one agent (now stopped), 0 wake chains and all watches resolved. Open transport defects: D1, a possible duplicate send after a CDP timeout between the click and the latch; D2, frequent post-send CDP timeouts; D3, the `add_tasks` path was not exercised live. The project directory is kept until a cleanup go. See `reports/OWNER_OS_FULLCYCLE_ACCEPTANCE_2026-11-18.md`.
 
+**New candidate (2026-11-18, DEV, not live):** `2883d2b`, wake-send correctness (D1/D2). It adds a durable send intent before typing; an ambiguous send is never re-sent blindly; proven not-sent, indeterminate and delivered are kept apart; late receipts are reconciled read-only. Tests: 28 of 29 new tests fail on 0a0c456; mutants 17/17 killed; full suite 5522 passed. D3 (reject, rework, `add_tasks`) is still untested live; transport is not claimed fully accepted. See `reports/OWNER_OS_SEND_INTENT_2026-11-18.md`.
+
 **Superseded (2026-11-18):** c1f629f (kept on `owneros/candidate-c1f629f`), a task typed into tmux after stage_done re-arms the stop; plus a Full Cycle acceptance proposal (`reports/OWNER_OS_DIRECT_TASK_REARM_2026-11-18.md`).
 
 **Released 2026-11-18 04:16Z:** a stage_done rest is not announced again as a stop, and only requests count as an owner confirmation prompt (`reports/OWNER_OS_REWAKE_AFTER_RELEASE_2026-11-17.md`).

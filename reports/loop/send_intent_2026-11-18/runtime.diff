@@ -1,0 +1,1124 @@
+diff --git a/core/closed_loop_wake.py b/core/closed_loop_wake.py
+index 6c4106c..81e9571 100644
+--- a/core/closed_loop_wake.py
++++ b/core/closed_loop_wake.py
+@@ -867,6 +867,22 @@ def register_delivery(*, event_id: int, target: str = "", project_id: str = "",
+             conn.close()
+ 
+ 
++def mark_delivery_verified(event_id: int, conn=None) -> bool:
++    """A watched wake whose delivery was unproven at send time and is now proven (a late
++    receipt from wake send reconciliation). Only the audit column changes; the watch
++    keeps its clock, so re-wake and escalation timing are untouched."""
++    conn, own = _conn(conn)
++    try:
++        cur = conn.execute("UPDATE wake_loop_watch SET delivery_verified=1 "
++                           "WHERE event_id=? AND COALESCE(delivery_verified,0)=0",
++                           (int(event_id),))
++        conn.commit()
++        return cur.rowcount > 0
++    finally:
++        if own:
++            conn.close()
++
++
+ def _transcript_advanced(conn, target: str, since_ts: float) -> bool:
+     """Has this agent's session transcript been written since `since_ts`?
+ 
+diff --git a/core/wake_bridge.py b/core/wake_bridge.py
+index e2dc3e3..f2ac5ee 100644
+--- a/core/wake_bridge.py
++++ b/core/wake_bridge.py
+@@ -2071,6 +2071,7 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
+         # proof", not "it definitely did not arrive" — and only the latter would justify
+         # sending a second copy into the owner's chat.
+         conn.execute(_SUBMIT_SCHEMA)
++        _intent_tables(conn)
+         # Stale or proven-invalid wakes are retired BEFORE anything else is considered —
+         # a days-old actionable event must never be selected fresh just because delivery
+         # only now started working again.
+@@ -2116,6 +2117,10 @@ def pending_wake(conn=None, now: Optional[float] = None) -> dict:
+             "WHERE a.decision='wake' AND a.acknowledged=0 "
+             "AND a.superseded_by IS NULL AND NOT EXISTS "
+             "(SELECT 1 FROM wake_submitted s WHERE s.event_id=a.event_id) "
++            # an earlier send of this event that is in flight, died mid-way or could
++            # not be resolved is never offered again; only a PROVEN not_sent is
++            "AND NOT EXISTS (SELECT 1 FROM wake_send_intent i "
++            "                WHERE i.event_id=a.event_id AND i.state != 'not_sent') "
+             "ORDER BY COALESCE(a.actionable,0) DESC, a.id ASC "
+             # passed-over rows are never consumed: scan further when a filter is on so
+             # they cannot crowd a deliverable wake out of the window
+@@ -2615,3 +2620,270 @@ def last_delivery(event_id: Optional[int] = None, conn=None) -> Optional[dict]:
+     finally:
+         if own:
+             conn.close()
++
++
++# ── send intent: the durable record that a send was about to fire ───────────
++# `wake_submitted` latches only once the page is SEEN to take the phrase (composer
++# cleared). The click happens before that, so a CDP timeout or a process death between
++# the click and the latch left an event that may be in the chat with no record of it,
++# and the next tick offered it again: 2026-11-18 event 88629, attempt 1 timed out after
++# dispatch (07:15:15Z), attempt 2 re-sent it at 07:21:30Z (and 74760, 2026-10-29).
++#
++# The intent row is written and COMMITTED before anything is typed. Its state is one of
++#   intent         about to type/send; an attempt in flight, or one that died mid-way
++#   not_sent       PROVEN not in the chat (nothing dispatched, or our phrase still sits
++#                  in the composer and no user turn carries it): the event may be retried
++#   indeterminate  dispatched, no proof either way: latched, never re-sent blindly
++#   landed         a user turn carries this event's marker, the assistant not yet seen
++#   delivered      the assistant answered it (at send time, or reconciled later)
++# Any state but not_sent blocks a new send of the event.
++SEND_STATES = ("intent", "not_sent", "indeterminate", "landed", "delivered")
++# An `intent` older than this belongs to an attempt that cannot still be running (the
++# longest attempt is page wait + user turn + assistant start + settle + post-hoc check,
++# about 130 s): its process died or hung, so the send is ambiguous.
++INTENT_STALE_SECS = int(os.getenv("WAKE_INTENT_STALE_SECS", "300"))
++# Reconciliation looks at an unresolved send no earlier than this after it, and then at
++# most this often, at most this many times.
++RECONCILE_MIN_AGE_SECS = int(os.getenv("WAKE_RECONCILE_MIN_AGE_SECS", "60"))
++RECONCILE_INTERVAL_SECS = int(os.getenv("WAKE_RECONCILE_INTERVAL_SECS", "120"))
++RECONCILE_MAX_LOOKS = int(os.getenv("WAKE_RECONCILE_MAX_LOOKS", "20"))
++
++_INTENT_SCHEMA = """
++CREATE TABLE IF NOT EXISTS wake_send_intent (
++    event_id INTEGER PRIMARY KEY, ts REAL, at TEXT, source TEXT, conversation TEXT,
++    state TEXT NOT NULL, reason TEXT, updated_ts REAL, attempts INTEGER DEFAULT 1,
++    user_id_before TEXT, looks INTEGER DEFAULT 0, looked_ts REAL
++)
++"""
++_INTENT_AUDIT_SCHEMA = """
++CREATE TABLE IF NOT EXISTS wake_send_intent_audit (
++    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, at TEXT, event_id INTEGER,
++    from_state TEXT, to_state TEXT, reason TEXT
++)
++"""
++
++
++def wake_marker(event_id) -> str:
++    """The exact text by which a sent phrase names its event (see `compose_phrase`).
++    Unique per event, system-authored, never pane text."""
++    return f"[Owner OS wake] event={int(event_id)} "
++
++
++def _intent_tables(conn) -> None:
++    conn.execute(_INTENT_SCHEMA)
++    conn.execute(_INTENT_AUDIT_SCHEMA)
++
++
++def _intent_move(conn, event_id: int, frm: Optional[str], to: str, reason: str,
++                 now: float) -> None:
++    conn.execute("INSERT INTO wake_send_intent_audit (ts,at,event_id,from_state,to_state,"
++                 "reason) VALUES (?,?,?,?,?,?)",
++                 (now, now_iso(), int(event_id), frm, to, str(reason)[:160]))
++
++
++def send_intent(event_id, conn=None) -> Optional[dict]:
++    if not event_id:
++        return None
++    conn, own = _c(conn)
++    try:
++        _intent_tables(conn)
++        r = conn.execute("SELECT state, reason, ts, attempts, conversation, user_id_before, "
++                         "looks, looked_ts FROM wake_send_intent WHERE event_id=?",
++                         (int(event_id),)).fetchone()
++        if not r:
++            return None
++        return {"event_id": int(event_id), "state": r[0], "reason": r[1] or "",
++                "ts": float(r[2] or 0), "attempts": int(r[3] or 0),
++                "conversation": r[4] or "", "user_id_before": r[5],
++                "looks": int(r[6] or 0), "looked_ts": r[7]}
++    finally:
++        if own:
++            conn.close()
++
++
++def begin_send(event_id, *, source: str = "", conversation: str = "",
++               user_id_before=None, conn=None, now: Optional[float] = None) -> dict:
++    """Record, durably and BEFORE anything is typed, that this event is about to be sent.
++
++    Refused while an earlier send of the same event is unresolved or happened
++    (`intent`, `indeterminate`, `landed`, `delivered`), and once it is latched: that is
++    what stops a second copy after a crash, a timeout or a concurrent attempt. Allowed for
++    a new event and after a PROVEN `not_sent`."""
++    if not event_id:
++        return {"ok": True, "reason": "no_event"}
++    now = now if now is not None else now_ts()
++    conn, own = _c(conn)
++    try:
++        _intent_tables(conn)
++        conn.execute(_SUBMIT_SCHEMA)
++        began = not conn.in_transaction
++        if began:
++            conn.execute("BEGIN IMMEDIATE")      # one writer decides, even across processes
++        try:
++            row = conn.execute("SELECT state, attempts FROM wake_send_intent WHERE event_id=?",
++                               (int(event_id),)).fetchone()
++            latched = conn.execute("SELECT 1 FROM wake_submitted WHERE event_id=?",
++                                   (int(event_id),)).fetchone() is not None
++            if latched or (row and row[0] != "not_sent"):
++                if began:
++                    conn.rollback()
++                return {"ok": False,
++                        "reason": f"send_already_{'latched' if latched else row[0]}"}
++            if row:
++                conn.execute("UPDATE wake_send_intent SET ts=?, at=?, source=?, "
++                             "conversation=?, state='intent', reason='', updated_ts=?, "
++                             "attempts=attempts+1, user_id_before=?, looks=0, looked_ts=NULL "
++                             "WHERE event_id=?",
++                             (now, now_iso(), source, (conversation or "")[:200], now,
++                              user_id_before, int(event_id)))
++            else:
++                conn.execute("INSERT INTO wake_send_intent (event_id,ts,at,source,"
++                             "conversation,state,reason,updated_ts,attempts,user_id_before) "
++                             "VALUES (?,?,?,?,?,'intent','',?,1,?)",
++                             (int(event_id), now, now_iso(), source,
++                              (conversation or "")[:200], now, user_id_before))
++            _intent_move(conn, int(event_id), row[0] if row else None, "intent", source, now)
++            conn.commit()
++        except Exception:
++            if began:
++                conn.rollback()
++            raise
++        return {"ok": True, "reason": "intent_recorded"}
++    finally:
++        if own:
++            conn.close()
++
++
++# Which moves are allowed. Never back to `intent` (only `begin_send` does that, from
++# not_sent), never from `delivered`, and `not_sent` only from states with no latch.
++_MOVES = {
++    "intent": {"not_sent", "indeterminate", "landed", "delivered"},
++    "indeterminate": {"not_sent", "landed", "delivered"},
++    "landed": {"delivered"},
++    "not_sent": set(),
++    "delivered": set(),
++}
++
++
++def finish_send(event_id, state: str, reason: str = "", conn=None,
++                now: Optional[float] = None) -> bool:
++    """Move a send to its outcome. `indeterminate`, `landed` and `delivered` also latch
++    `wake_submitted`, so every existing no-resend rule applies to them. Returns whether the
++    move was made (an illegal move is refused, never forced)."""
++    if not event_id or state not in SEND_STATES or state == "intent":
++        return False
++    now = now if now is not None else now_ts()
++    conn, own = _c(conn)
++    try:
++        _intent_tables(conn)
++        conn.execute(_SUBMIT_SCHEMA)
++        row = conn.execute("SELECT state FROM wake_send_intent WHERE event_id=?",
++                           (int(event_id),)).fetchone()
++        if not row or state not in _MOVES.get(row[0], set()):
++            return False
++        if state == "not_sent" and conn.execute(
++                "SELECT 1 FROM wake_submitted WHERE event_id=?",
++                (int(event_id),)).fetchone() is not None and row[0] == "intent":
++            # the page was SEEN to take the phrase in this attempt: never "not sent"
++            return False
++        conn.execute("UPDATE wake_send_intent SET state=?, reason=?, updated_ts=? "
++                     "WHERE event_id=?", (state, str(reason)[:160], now, int(event_id)))
++        _intent_move(conn, int(event_id), row[0], state, reason, now)
++        if state in ("indeterminate", "landed", "delivered"):
++            conn.execute("INSERT OR IGNORE INTO wake_submitted (event_id,ts,at,source) "
++                         "VALUES (?,?,?,?)", (int(event_id), now, now_iso(),
++                                              f"send_{state}"))
++        conn.commit()
++        return True
++    finally:
++        if own:
++            conn.close()
++
++
++def retract_unsent(event_id, proof: str, conn=None, now: Optional[float] = None) -> bool:
++    """An `indeterminate` send PROVEN not to be in the chat (reconciliation saw the
++    phrase still in the composer and no user turn carrying its marker, with the
++    pre-send newest turn still on the page). Only then is the latch lifted, so the event
++    is offered again, once more, through every ordinary filter. Audited."""
++    if not event_id or not proof:
++        return False
++    now = now if now is not None else now_ts()
++    conn, own = _c(conn)
++    try:
++        _intent_tables(conn)
++        conn.execute(_SUBMIT_SCHEMA)
++        row = conn.execute("SELECT state FROM wake_send_intent WHERE event_id=?",
++                           (int(event_id),)).fetchone()
++        if not row or row[0] != "indeterminate":
++            return False
++        conn.execute("UPDATE wake_send_intent SET state='not_sent', reason=?, updated_ts=? "
++                     "WHERE event_id=?", (str(proof)[:160], now, int(event_id)))
++        _intent_move(conn, int(event_id), "indeterminate", "not_sent", proof, now)
++        conn.execute("DELETE FROM wake_submitted WHERE event_id=?", (int(event_id),))
++        conn.commit()
++        return True
++    finally:
++        if own:
++            conn.close()
++
++
++def unresolved_sends(conn=None, now: Optional[float] = None, limit: int = 3) -> list:
++    """Sends to reconcile now. A stale `intent` (its attempt died) is first made
++    `indeterminate` and latched; then `indeterminate` and `landed` sends inside the wake
++    age window, old enough and not looked at recently, oldest first."""
++    now = now if now is not None else now_ts()
++    conn, own = _c(conn)
++    try:
++        _intent_tables(conn)
++        stale = conn.execute("SELECT event_id FROM wake_send_intent WHERE state='intent' "
++                             "AND ts < ?", (now - INTENT_STALE_SECS,)).fetchall()
++        converted = set()
++        for (eid,) in stale:
++            if finish_send(eid, "indeterminate", "attempt_died_after_intent", conn=conn,
++                           now=now):
++                converted.add(int(eid))
++        rows = conn.execute(
++            "SELECT event_id, conversation, user_id_before, state, looks FROM "
++            "wake_send_intent WHERE state IN ('indeterminate','landed') AND ts >= ? "
++            "AND ts <= ? AND looks < ? AND (looked_ts IS NULL OR looked_ts <= ?) "
++            "ORDER BY ts ASC LIMIT ?",
++            (now - MAX_WAKE_AGE_SECS, now - RECONCILE_MIN_AGE_SECS, RECONCILE_MAX_LOOKS,
++             now - RECONCILE_INTERVAL_SECS, int(limit))).fetchall()
++        return [{"event_id": int(r[0]), "conversation": r[1] or "", "user_id_before": r[2],
++                 "state": r[3], "looks": int(r[4] or 0),
++                 "stale_converted": int(r[0]) in converted}
++                for r in rows]
++    finally:
++        if own:
++            conn.close()
++
++
++def note_reconcile_look(event_id, conn=None, now: Optional[float] = None) -> None:
++    now = now if now is not None else now_ts()
++    conn, own = _c(conn)
++    try:
++        _intent_tables(conn)
++        conn.execute("UPDATE wake_send_intent SET looks=looks+1, looked_ts=? WHERE event_id=?",
++                     (now, int(event_id)))
++        conn.commit()
++    finally:
++        if own:
++            conn.close()
++
++
++def wake_context(event_id, conn=None) -> Optional[dict]:
++    """What the decision recorded about a wake: enough to register its watch."""
++    conn, own = _conn(conn)
++    try:
++        r = conn.execute("SELECT COALESCE(agent_id,''), COALESCE(project_id,''), "
++                         "COALESCE(route_key,''), COALESCE(event_type,''), "
++                         "COALESCE(actionable,0) FROM wake_audit WHERE event_id=? "
++                         "AND decision='wake' ORDER BY id DESC LIMIT 1",
++                         (int(event_id),)).fetchone()
++        if not r:
++            return None
++        return {"agent_id": r[0], "project_id": r[1], "route_key": r[2],
++                "event_type": r[3], "actionable": bool(r[4])}
++    finally:
++        if own:
++            conn.close()
+diff --git a/tests/test_composer_cdp_timeout_posthoc.py b/tests/test_composer_cdp_timeout_posthoc.py
+index 9e5d04a..4f8a911 100644
+--- a/tests/test_composer_cdp_timeout_posthoc.py
++++ b/tests/test_composer_cdp_timeout_posthoc.py
+@@ -66,7 +66,9 @@ class _Hung(_S):
+ 
+ 
+ @pytest.fixture(autouse=True)
+-def _quiet(monkeypatch):
++def _quiet(monkeypatch, tmp_path):
++    # the send intent is durable: each test gets its own control-plane DB
++    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+     import time as _time
+     monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
+     monkeypatch.setattr(cdp, "ASSISTANT_SETTLE_SECS", 0)
+@@ -143,19 +145,25 @@ def test_a_virtualized_chat_proves_the_turn_by_id(wire):
+     assert r["ok"] is False and latched == [8]
+ 
+ 
+-def test_no_evidence_keeps_the_old_verdict_and_does_not_latch(wire):
+-    """Nothing landed: the event must stay retryable, exactly as before."""
++def test_no_evidence_after_dispatch_is_indeterminate_and_never_resent(wire):
++    """Changed 2026-11-18 (D1, event 88629). This used to stay retryable, and the retry
++    re-sent a wake that had in fact been clicked. Dispatched with no proof either way is
++    now indeterminate: latched, never re-sent blindly, settled later by reconciliation.
++    The reason is unchanged; the attempt's own composer-cleared latch was not reached."""
+     latched, _ = wire(_Hung("boolean"), _after(turns=0, assistant=0))
+     r = cdp.submit_phrase(URL, "PHRASE", event_id=9, claim=False)
+     assert r == {"ok": False, "reason": REASON}
+     assert latched == []
++    wb = cdp._wb()
++    assert wb.send_intent(9)["state"] == "indeterminate" and wb.was_submitted(9)
+ 
+ 
+-def test_a_page_that_still_does_not_answer_keeps_the_old_verdict(wire):
++def test_a_page_that_still_does_not_answer_is_indeterminate(wire):
+     latched, _ = wire(_Hung("boolean"), WebSocketTimeoutException("still hung"))
+     r = cdp.submit_phrase(URL, "PHRASE", event_id=10, claim=False)
+     assert r == {"ok": False, "reason": REASON}
+-    assert latched == []
++    wb = cdp._wb()
++    assert wb.send_intent(10)["state"] == "indeterminate" and wb.was_submitted(10)
+ 
+ 
+ def test_an_existing_latch_is_never_undone_by_a_failed_recheck(wire):
+diff --git a/tests/test_wake_send_intent.py b/tests/test_wake_send_intent.py
+new file mode 100644
+index 0000000..1e98422
+--- /dev/null
++++ b/tests/test_wake_send_intent.py
+@@ -0,0 +1,447 @@
++"""A wake send whose outcome is ambiguous is never re-sent blindly, and never called
++delivered without evidence (D1/D2, 2026-11-18 Full Cycle acceptance).
++
++Event 88629: attempt 1 clicked send at ~07:15:00Z, then the page stopped answering CDP
++(`cdp_error:WebSocketTimeoutException` at `post_send_verify`). The latch (`wake_submitted`)
++is set only once the composer is SEEN cleared, so nothing recorded that the phrase may be
++in the chat, and attempt 2 re-sent it at 07:21:30Z. 88652 and 88629 also show the other
++half: a send that landed stays "not delivered" forever when the page is silent during
++verification, because nothing ever looks again.
++
++Every page here is a synthetic fake; no browser, chat or live DB is touched.
++"""
++from __future__ import annotations
++
++import importlib.util
++import json
++import os
++import sqlite3
++
++import pytest
++
++os.environ.setdefault("WAKE_ASSISTANT_SETTLE_SECS", "0")
++
++_HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++_spec = importlib.util.spec_from_file_location(
++    "cdp_composer_send_intent", os.path.join(_HERE, "tools", "cdp_composer.py"))
++cdp = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(cdp)
++_fspec = importlib.util.spec_from_file_location(
++    "cdp_composer_fake_page_send_intent", os.path.join(_HERE, "tests", "test_cdp_composer.py"))
++_fake = importlib.util.module_from_spec(_fspec)
++_fspec.loader.exec_module(_fake)
++_S = _fake._S
++
++URL = "https://chatgpt.com/c/send-intent-chat"
++TIMEOUT = "cdp_error:WebSocketTimeoutException"
++
++
++class WebSocketTimeoutException(Exception):
++    """Same class name as websocket-client's, so the recorded reason matches live."""
++
++
++@pytest.fixture(autouse=True)
++def _iso(tmp_path, monkeypatch):
++    monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
++    monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
++    monkeypatch.setenv("WAKE_BRIDGE_ENABLED", "1")
++    monkeypatch.setenv("WAKE_BRIDGE_KILL_SWITCH", "0")
++    import time as _time
++    monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
++    monkeypatch.setattr(cdp, "ASSISTANT_SETTLE_SECS", 0)
++    monkeypatch.setattr(cdp, "POSTHOC_VERIFY_SECS", 0)
++    monkeypatch.setattr(cdp, "browser_degraded",
++                        lambda *a, **k: {"degraded": False, "reason": "ok", "pages": 3})
++    monkeypatch.setattr(cdp, "page_responsive", lambda t, timeout=8.0: True)
++    monkeypatch.setattr(cdp, "find_target",
++                        lambda url: {"webSocketDebuggerUrl": "ws://x", "url": URL, "id": "t1"})
++    from core import wake_bridge as wb
++    monkeypatch.setattr(wb, "RECONCILE_MIN_AGE_SECS", 0, raising=False)
++    monkeypatch.setattr(wb, "RECONCILE_INTERVAL_SECS", 0, raising=False)
++    wb.bind_chat(URL)
++    yield
++
++
++@pytest.fixture
++def wb():
++    from core import wake_bridge as _w
++    return _w
++
++
++def _db():
++    return sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
++
++
++def _state(eid):
++    from core import wake_bridge as _w
++    i = _w.send_intent(eid)
++    return i and i["state"]
++
++
++def _deliveries(eid):
++    with _db() as c:
++        return c.execute("SELECT delivered, reason, source FROM wake_delivery WHERE event_id=? "
++                         "ORDER BY id", (eid,)).fetchall()
++
++
++class _Page(_S):
++    """A fake page that also answers the send-evidence probe (three booleans about our
++    own marker), and can stop answering CDP at a chosen moment."""
++
++    def __init__(self, *a, boom: str = "", evidence=None, **kw):
++        super().__init__(*a, **kw)
++        self.boom = boom
++        self.clicked = False
++        self.evidence = evidence
++        self.intent_at_insert = None
++
++    def call(self, method, params=None):
++        expr = (params or {}).get("expression", "")
++        if method == "Input.insertText":
++            try:
++                self.intent_at_insert = _state(_EID[0])
++            except AttributeError:            # a checkout without send intents
++                self.intent_at_insert = None
++            if self.boom == "insert":
++                raise WebSocketTimeoutException("timed out")
++        if method == "Runtime.evaluate" and ".click()" in expr:
++            self.clicked = True
++            if self.boom == "click":
++                raise WebSocketTimeoutException("timed out")
++        if method == "Runtime.evaluate" and "compareDocumentPosition" in expr:
++            if self.evidence is None:
++                return {}
++            return {"result": {"value": json.dumps(self.evidence)}}
++        return super().call(method, params)
++
++    def boolean(self, expression):
++        if self.clicked and self.boom == "after_click":
++            raise WebSocketTimeoutException("timed out")
++        return super().boolean(expression)
++
++
++_EID = [0]
++
++
++def _wire(monkeypatch, *sessions):
++    queue = list(sessions)
++    opened = []
++
++    def _session(ws):
++        opened.append(ws)
++        s = queue.pop(0)
++        if isinstance(s, Exception):
++            raise s
++        return s
++
++    monkeypatch.setattr(cdp, "_Session", _session)
++    return opened
++
++
++def _send(eid):
++    _EID[0] = eid
++    return cdp.submit_phrase(URL, f"[Owner OS wake] event={eid} trigger=x. PHRASE",
++                             event_id=eid, claim=False)
++
++
++def _hung(boom="after_click"):
++    return _Page({"n": 1}, [True] * 6, boom=boom)
++
++
++def _after(**evidence):
++    """The page once it answers again: no new turn, nothing streaming, and the evidence."""
++    ev = {"found": False, "answered": False, "in_composer": False, **evidence}
++    return _Page({"n": 1}, [], turns=[0] * 4, streaming=[0], assistant=[0], evidence=ev)
++
++
++# ── D1: the 88629 shape ─────────────────────────────────────────────────────────────────
++def test_the_intent_is_durable_before_anything_is_typed(monkeypatch):
++    page = _Page({"n": 1}, [True] * 6)
++    _wire(monkeypatch, page)
++    r = _send(101)
++    assert r["ok"] is True, r
++    assert page.intent_at_insert == "intent", "committed before Input.insertText"
++    assert _state(101) == "delivered"
++
++
++def test_a_timeout_after_the_click_with_a_silent_page_is_never_sent_again(monkeypatch, wb):
++    """88629. Fails on the old code: nothing latched, so the next tick re-sent it."""
++    _wire(monkeypatch, _hung(), WebSocketTimeoutException("still hung"))
++    r = _send(88629)
++    assert r == {"ok": False, "reason": TIMEOUT}, r
++    assert wb.was_submitted(88629), "latched: every no-resend rule applies"
++    second = _Page({"n": 1}, [True] * 6)
++    _wire(monkeypatch, second)
++    r2 = _send(88629)
++    assert second.inserted == [], "nothing typed on the second attempt"
++    assert r2["reason"].startswith("send_intent_refused:"), r2
++    assert _state(88629) == "indeterminate"
++
++
++def test_a_timeout_after_the_click_with_no_evidence_either_way_is_indeterminate(monkeypatch,
++                                                                                 wb):
++    """The page answers again, but shows neither our turn nor our phrase in the composer:
++    the send may have been lost or not; it is NOT resent and NOT called delivered."""
++    _wire(monkeypatch, _hung(), _after())
++    r = _send(102)
++    assert r["ok"] is False
++    assert _state(102) == "indeterminate" and wb.was_submitted(102)
++    assert all(d == 0 for d, _, _ in _deliveries(102)) or _deliveries(102) == []
++
++
++def test_a_timeout_on_the_click_itself_is_indeterminate_not_unsent(monkeypatch, wb):
++    """The click may have reached the page before the socket died."""
++    _wire(monkeypatch, _hung("click"), WebSocketTimeoutException("still hung"))
++    _send(103)
++    assert _state(103) == "indeterminate" and wb.was_submitted(103)
++
++
++def test_our_phrase_still_in_the_composer_proves_it_was_not_sent(monkeypatch, wb):
++    """Sending empties the composer; the phrase still sitting there, in no user turn, is
++    proof. Retryable, exactly once more, and the retry goes through."""
++    _wire(monkeypatch, _hung(), _after(in_composer=True))
++    r = _send(104)
++    assert r == {"ok": False, "reason": TIMEOUT}, r
++    assert _state(104) == "not_sent" and not wb.was_submitted(104)
++    _wire(monkeypatch, _Page({"n": 1}, [True] * 6))
++    assert _send(104)["ok"] is True
++    assert _state(104) == "delivered"
++    assert wb.send_intent(104)["attempts"] == 2
++
++
++def test_our_phrase_in_the_composer_but_also_in_a_turn_is_not_unsent(monkeypatch, wb):
++    _wire(monkeypatch, _hung(), _after(in_composer=True, found=True))
++    _send(105)
++    assert _state(105) == "indeterminate" and wb.was_submitted(105)
++
++
++def test_a_timeout_before_the_click_is_proven_not_sent(monkeypatch, wb):
++    _wire(monkeypatch, _hung("insert"))
++    r = _send(106)
++    assert r == {"ok": False, "reason": TIMEOUT}
++    assert _state(106) == "not_sent" and not wb.was_submitted(106)
++
++
++def test_a_composer_that_answered_still_full_is_proven_not_sent(monkeypatch, wb):
++    page = _Page({"n": 1}, [True, True, True] + [False] * 40, turns=[0] + [1] * 40)
++    _wire(monkeypatch, page)
++    r = _send(107)
++    assert r == {"ok": False, "reason": "composer_did_not_clear_after_send"}
++    assert _state(107) == "not_sent"
++
++
++def test_a_composer_that_never_answered_is_not_proof_of_anything(monkeypatch, wb):
++    """`None` from the page used to read as "still holds text, provably not sent"."""
++    page = _Page({"n": 1}, [True, True, True] + [None] * 40, turns=[0] + [1] * 40)
++    _wire(monkeypatch, page)
++    r = _send(108)
++    assert r == {"ok": False, "reason": "composer_did_not_clear_after_send"}
++    assert _state(108) == "indeterminate" and wb.was_submitted(108)
++
++
++def test_a_result_dict_is_unchanged_for_callers(monkeypatch):
++    _wire(monkeypatch, _Page({"n": 1}, [True] * 6))
++    r = _send(109)
++    assert set(r) <= {"ok", "reason", "conversation_full"}, r
++
++
++# ── crash, restart, duplicate ───────────────────────────────────────────────────────────
++def test_a_crash_after_the_intent_blocks_a_resend_and_is_made_indeterminate(monkeypatch, wb):
++    """The process dies between the intent and any outcome (simulated: the intent is
++    written and nothing else). A restarted companion must not send it again."""
++    assert wb.begin_send(110, source="companion", conversation=URL)["ok"]
++    page = _Page({"n": 1}, [True] * 6)
++    _wire(monkeypatch, page)
++    assert _send(110)["reason"] == "send_intent_refused:send_already_intent"
++    assert page.inserted == []
++    now = wb.send_intent(110)["ts"]
++    assert wb.unresolved_sends(now=now + wb.INTENT_STALE_SECS - 1) == []
++    due = wb.unresolved_sends(now=now + wb.INTENT_STALE_SECS + 1)
++    assert [(d["event_id"], d["stale_converted"]) for d in due] == [(110, True)]
++    assert _state(110) == "indeterminate" and wb.was_submitted(110)
++
++
++def test_a_crashed_send_is_not_offered_again(monkeypatch, wb):
++    d = wb.should_wake(event_id=111, severity="critical", now=1000.0)
++    wb.record(d, event_id=111, severity="critical", now=1000.0)
++    assert wb.pending_wake(now=1001.0)["event_id"] == 111
++    wb.begin_send(111, source="companion", conversation=URL)
++    assert wb.pending_wake(now=1002.0).get("event_id") != 111
++    wb.finish_send(111, "not_sent", "proven")
++    assert wb.pending_wake(now=1003.0)["event_id"] == 111, "only a proven not_sent returns"
++
++
++def test_two_attempts_racing_for_one_event_send_once(wb):
++    a = wb.begin_send(112, source="companion", conversation=URL)
++    b = wb.begin_send(112, source="operator", conversation=URL)
++    assert a["ok"] is True and b["ok"] is False
++
++
++def test_a_latched_event_cannot_get_a_new_intent(wb):
++    wb.mark_submitted(113, source="companion")
++    assert wb.begin_send(113, conversation=URL)["reason"] == "send_already_latched"
++
++
++def test_no_durable_record_means_no_send(monkeypatch, wb):
++    def boom(*a, **k):
++        raise sqlite3.OperationalError("database is locked")
++    monkeypatch.setattr(wb, "begin_send", boom)
++    page = _Page({"n": 1}, [True] * 6)
++    _wire(monkeypatch, page)
++    r = _send(114)
++    assert r == {"ok": False, "reason": "send_intent_unavailable:OperationalError"}
++    assert page.inserted == []
++
++
++def test_moves_never_go_backwards(wb):
++    wb.begin_send(115, conversation=URL)
++    assert wb.finish_send(115, "delivered", "ok")
++    assert not wb.finish_send(115, "not_sent", "x")
++    assert not wb.finish_send(115, "indeterminate", "x")
++    assert not wb.retract_unsent(115, "x")
++    assert _state(115) == "delivered"
++
++
++def test_a_send_seen_taken_is_never_not_sent(wb):
++    wb.begin_send(116, conversation=URL)
++    wb.mark_submitted(116, source="companion")       # composer seen cleared
++    assert not wb.finish_send(116, "not_sent", "x")
++
++
++# ── D2: reconciliation (late receipt) ───────────────────────────────────────────────────
++def _indeterminate(monkeypatch, eid, actionable=True):
++    from core import wake_bridge as wb_
++    d = wb_
++    dec = wb_.should_wake(event_id=eid, severity="high", now=1000.0)
++    wb_.record({**dec, "actionable": actionable}, event_id=eid, severity="high",
++               event_type="task_completed", agent_id="fc-acc:0.0", now=1000.0)
++    _wire(monkeypatch, _hung(), WebSocketTimeoutException("still hung"))
++    _send(eid)
++    assert _state(eid) == "indeterminate"
++    return d
++
++
++def test_a_late_receipt_is_recorded_as_delivered(monkeypatch, wb):
++    """The 88652 shape: the assistant did answer; the ledger now says so, with proof."""
++    _indeterminate(monkeypatch, 120)
++    from core import closed_loop_wake as clw
++    clw.register_delivery(event_id=120, target="fc-acc:0.0", verified=False)
++    _wire(monkeypatch, _after(found=True, answered=True))
++    out = cdp.reconcile_sends()
++    assert out == [{"event_id": 120, "verdict": "delivered", "converted": False}]
++    assert _state(120) == "delivered"
++    assert (1, "reconciled_assistant_answered", "reconcile") in _deliveries(120)
++    with _db() as c:
++        assert c.execute("SELECT acknowledged FROM wake_audit WHERE event_id=120 "
++                         "AND decision='wake'").fetchone()[0] == 1
++        assert c.execute("SELECT delivery_verified FROM wake_loop_watch "
++                         "WHERE event_id=120").fetchone()[0] == 1
++
++
++def test_a_landed_turn_without_an_answer_is_not_delivered(monkeypatch, wb):
++    _indeterminate(monkeypatch, 121)
++    _wire(monkeypatch, _after(found=True))
++    assert cdp.reconcile_sends()[0]["verdict"] == "landed"
++    assert _state(121) == "landed" and wb.was_submitted(121)
++    assert not any(d for d, _, _ in _deliveries(121))
++    _wire(monkeypatch, _after(found=True, answered=True))
++    assert cdp.reconcile_sends()[0]["verdict"] == "delivered"
++
++
++def test_reconciliation_can_prove_not_sent_and_reoffer_once(monkeypatch, wb):
++    _indeterminate(monkeypatch, 122)
++    _wire(monkeypatch, _after(in_composer=True))
++    assert cdp.reconcile_sends()[0]["verdict"] == "not_sent"
++    assert _state(122) == "not_sent" and not wb.was_submitted(122)
++    assert wb.pending_wake(now=1001.0)["event_id"] == 122
++    with _db() as c:
++        moves = c.execute("SELECT from_state, to_state, reason FROM wake_send_intent_audit "
++                          "WHERE event_id=122 ORDER BY id").fetchall()
++    assert moves[-1] == ("indeterminate", "not_sent", "reconciled_phrase_still_in_composer")
++
++
++@pytest.mark.parametrize("page", ["no_tab", "silent", "unreadable", "nowhere"])
++def test_without_evidence_reconciliation_changes_nothing(monkeypatch, wb, page):
++    _indeterminate(monkeypatch, 123)
++    if page == "no_tab":
++        monkeypatch.setattr(cdp, "find_target", lambda url: None)
++    elif page == "silent":
++        _wire(monkeypatch, WebSocketTimeoutException("hung"))
++    elif page == "unreadable":
++        _wire(monkeypatch, _Page({"n": 1}, [], evidence=None))
++    else:
++        _wire(monkeypatch, _after())
++    out = cdp.reconcile_sends()
++    assert out[0]["verdict"] in ("unchanged", "no_page")
++    assert _state(123) == "indeterminate" and wb.was_submitted(123)
++    assert not any(d for d, _, _ in _deliveries(123))
++
++
++def test_unreadable_evidence_is_never_evidence():
++    class P:
++        def __init__(self, v):
++            self.v = v
++
++        def call(self, m, p=None):
++            return {"result": {"value": self.v}}
++    assert cdp.send_evidence(P(json.dumps({"found": 1, "answered": 0,
++                                           "in_composer": 0})), 1) is None
++    assert cdp.send_evidence(P("not json"), 1) is None
++    assert cdp.send_evidence(P(None), 1) is None
++    ok = {"found": True, "answered": False, "in_composer": False}
++    assert cdp.send_evidence(P(json.dumps(ok)), 1) == ok
++
++
++def test_the_probe_asks_only_about_our_own_marker():
++    seen = []
++
++    class P:
++        def call(self, m, p=None):
++            seen.append(p["expression"])
++            return {}
++    cdp.send_evidence(P(), 4242)
++    assert json.dumps("[Owner OS wake] event=4242 ") in seen[0]
++    assert "JSON.stringify({found:" in seen[0], "only three booleans come back"
++
++
++def test_reconciliation_is_bounded(monkeypatch, wb):
++    _indeterminate(monkeypatch, 124)
++    monkeypatch.setattr(wb, "RECONCILE_MAX_LOOKS", 2)
++    for _ in range(4):
++        _wire(monkeypatch, _after())
++        cdp.reconcile_sends()
++    assert wb.send_intent(124)["looks"] == 2
++    monkeypatch.setattr(wb, "RECONCILE_INTERVAL_SECS", 3600)
++    assert wb.unresolved_sends() == []
++
++
++def test_an_unresolved_send_still_ages_out_visibly(monkeypatch, wb):
++    """Explicit unresolved-notification record: an indeterminate send that is never
++    proven is abandoned with a reason, as every latched send is."""
++    _indeterminate(monkeypatch, 125)
++    out = wb.record_abandoned_wakes(now=1000.0 + wb.MAX_WAKE_AGE_SECS + 10)
++    assert [o["event_id"] for o in out] == [125]
++    assert out[0]["reason"] == "submitted_delivery_unproven"
++
++
++def test_a_died_attempt_gets_its_watch_from_the_companion(monkeypatch, wb):
++    """A crash skipped `tick`'s watch registration; reconciliation adds it, unverified."""
++    import importlib
++    import sys
++    sys.path.insert(0, os.path.join(_HERE, "tools"))
++    comp = importlib.import_module("wake_companion")
++    dec = wb.should_wake(event_id=126, severity="high", now=1000.0)
++    wb.record({**dec, "actionable": True}, event_id=126, severity="high",
++              event_type="task_completed", agent_id="fc-acc:0.0", now=1000.0)
++    wb.begin_send(126, source="companion", conversation=URL)
++    with _db() as c:
++        c.execute("UPDATE wake_send_intent SET ts=ts-? WHERE event_id=126",
++                  (wb.INTENT_STALE_SECS + 5,))
++    monkeypatch.setitem(sys.modules, "cdp_composer", cdp)
++    _wire(monkeypatch, _after())
++    out = comp.reconcile_sends(wb)
++    assert out == [{"event_id": 126, "verdict": "unchanged", "converted": True}]
++    with _db() as c:
++        row = c.execute("SELECT target, delivery_verified FROM wake_loop_watch "
++                        "WHERE event_id=126").fetchone()
++    assert row == ("fc-acc:0.0", 0)
+diff --git a/tools/cdp_composer.py b/tools/cdp_composer.py
+index d4f18cd..467c8d0 100644
+--- a/tools/cdp_composer.py
++++ b/tools/cdp_composer.py
+@@ -1281,7 +1281,9 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
+ 
+     # The claim is spent from here on, so every outcome past this line is a delivery attempt
+     # and is recorded as one — success and failure alike.
+-    res = _attempt(conversation_url, phrase, source=source, event_id=event_id)
++    track: dict = {}
++    res = _attempt(conversation_url, phrase, source=source, event_id=event_id, track=track)
++    _settle_send(event_id, track, res)
+     # A WEDGED conversation never clears on its own: the stop control stays up, no send
+     # control is offered, and every future wake to this chat fails identically. That is a
+     # permanent route outage, so it earns the one recovery this module already has —
+@@ -1315,13 +1317,93 @@ def submit_phrase(conversation_url: str, phrase: str, *, source: str = "unknown"
+         target = find_target(conversation_url)
+         fresh = recover_wedged_tab(target, conversation_url) if target else None
+         if fresh:
+-            res = _attempt(conversation_url, phrase, source=source, event_id=event_id)
++            track = {}
++            res = _attempt(conversation_url, phrase, source=source, event_id=event_id,
++                           track=track)
++            _settle_send(event_id, track, res)
+             res[flag] = True
+         _log_recovery(event_id, trigger, target, fresh, res)
+     return _record_delivery(source, event_id, res,
+                             conversation=conversation_url, route_key=route_key)
+ 
+ 
++def _settle_send(event_id, track: dict, res: dict) -> None:
++    """Close this attempt's intent with what is KNOWN, never more:
++      delivered      the assistant started (the ordinary proof);
++      not_sent       nothing was dispatched, or the page showed our phrase still unsent;
++      indeterminate  dispatched with no proof either way. Latched: never re-sent
++                     blindly; reconciliation (`reconcile_sends`) settles it later.
++    A failure to record leaves the intent open, which blocks a resend and is made
++    indeterminate once stale: it fails toward silence-with-a-record, never a duplicate."""
++    if not event_id or not track.get("intent"):
++        return
++    if res.get("ok"):
++        state = "delivered"
++    elif not track.get("dispatched") or res.get("proven_not_sent"):
++        state = "not_sent"
++    else:
++        state = "indeterminate"
++    res.pop("proven_not_sent", None)     # internal; callers match the result exactly
++    try:
++        _wb().finish_send(event_id, state, str(res.get("reason", "")))
++    except Exception:  # noqa: BLE001
++        pass
++
++
++def reconcile_sends(limit: int = 3) -> list:
++    """Settle sends that ended without proof (a CDP timeout, a died attempt), from the
++    chat itself, read-only: nothing is typed, clicked or navigated.
++
++      marker in a user turn, an assistant turn after it -> delivered (a late receipt):
++          recorded, acknowledged, its watch marked verified;
++      marker in a user turn, no answer yet -> landed; still never re-sent;
++      marker still in the composer, in no user turn -> proven not sent: the latch is
++          lifted and the event is offered again through every ordinary filter;
++      anything else (no tab, page silent, phrase nowhere) -> unchanged: still
++          indeterminate, still watched, abandoned visibly when it ages out."""
++    wb = _wb()
++    out = []
++    for u in wb.unresolved_sends(limit=limit):
++        eid = u["event_id"]
++        wb.note_reconcile_look(eid)
++        target = find_target(u["conversation"]) if u["conversation"] else None
++        if not target or not page_responsive(target):
++            out.append({"event_id": eid, "verdict": "no_page",
++                        "converted": u["stale_converted"]})
++            continue
++        s = None
++        try:
++            s = _Session(target["webSocketDebuggerUrl"])
++            ev = send_evidence(s, eid)
++        except Exception:  # noqa: BLE001
++            ev = None
++        finally:
++            if s:
++                s.close()
++        verdict = "unchanged"
++        if ev and ev["found"] and ev["answered"]:
++            if wb.finish_send(eid, "delivered", "reconciled_assistant_answered"):
++                wb.record_delivery("reconcile", event_id=eid, delivered=True,
++                                   reason="reconciled_assistant_answered",
++                                   conversation=u["conversation"])
++                wb.acknowledge(eid)
++                try:
++                    from core import closed_loop_wake as _clw
++                    _clw.mark_delivery_verified(eid)
++                except Exception:  # noqa: BLE001
++                    pass
++                verdict = "delivered"
++        elif ev and ev["found"]:
++            if u["state"] == "indeterminate" and wb.finish_send(eid, "landed",
++                                                                "reconciled_turn_found"):
++                verdict = "landed"
++        elif _proven_unsent(ev):
++            if wb.retract_unsent(eid, "reconciled_phrase_still_in_composer"):
++                verdict = "not_sent"
++        out.append({"event_id": eid, "verdict": verdict, "converted": u["stale_converted"]})
++    return out
++
++
+ def _log_recovery(event_id, trigger: str, target, fresh, res: dict) -> None:
+     """One journal line per tab recovery: what triggered it, whether a fresh tab was
+     obtained, and what the single retry returned. Tab ids are CDP handles, not content."""
+@@ -1446,6 +1528,55 @@ def _await_assistant(s, asst_before: int, asst_id_before) -> dict:
+             "reason": f"user_turn_landed_but_assistant_never_started_in_{ASSISTANT_START_SECS}s"}
+ 
+ 
++def _wb():
++    import sys as _sys
++    _sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
++    from core import wake_bridge as _w
++    return _w
++
++
++_SEND_EVIDENCE_JS = """(function(m, us, asl, cs){
++  const users=[...document.querySelectorAll(us)];
++  let mine=null;
++  for (const e of users) { if ((e.textContent||'').includes(m)) mine=e; }
++  let answered=false;
++  if (mine) {
++    for (const a of document.querySelectorAll(asl)) {
++      if (mine.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING) {
++        answered=true; break; }
++    }
++  }
++  const c=document.querySelector(cs);
++  return JSON.stringify({found: !!mine, answered: answered,
++                         in_composer: !!c && (c.textContent||'').includes(m)});
++})(%s, %s, %s, %s)"""
++
++
++def send_evidence(s, event_id) -> Optional[dict]:
++    """Where is THIS event's phrase now? Three bits about the marker this module itself
++    wrote (`[Owner OS wake] event=<id> `), never any other text: is it in a user turn,
++    is an assistant turn after that one, is it still in the composer. None when the page
++    cannot say, which is never evidence of anything."""
++    try:
++        marker = _wb().wake_marker(event_id)
++        expr = _SEND_EVIDENCE_JS % (json.dumps(marker), json.dumps(USER_TURN_SEL),
++                                    json.dumps(ASSISTANT_TURN_SEL), json.dumps(COMPOSER_SEL))
++        r = s.call("Runtime.evaluate", {"expression": expr, "returnByValue": True})
++        v = json.loads(((r.get("result") or {}).get("value")) or "null")
++        if not isinstance(v, dict) or not all(isinstance(v.get(k), bool)
++                                              for k in ("found", "answered", "in_composer")):
++            return None
++        return v
++    except Exception:  # noqa: BLE001 — unreadable: no evidence
++        return None
++
++
++def _proven_unsent(ev: Optional[dict]) -> bool:
++    """Our phrase is still in the composer and no user turn carries it. Sending empties
++    the composer, so a phrase still sitting there was not submitted."""
++    return bool(ev) and ev["in_composer"] is True and ev["found"] is False
++
++
+ # How long a FRESH session may look for proof after the attempt's own session failed
+ # mid-verification. Bounded so a still-hung page costs one window, not a stalled loop.
+ POSTHOC_VERIFY_SECS = int(os.getenv("WAKE_POSTHOC_VERIFY_SECS", "20"))
+@@ -1490,6 +1621,8 @@ def _verify_after_cdp_error(target: dict, reason: str, *, source: str, event_id,
+             if started:
+                 return _settled(s2, f"submitted_and_assistant_started_after_{reason}")
+             if time.time() >= deadline:
++                if event_id and _proven_unsent(send_evidence(s2, event_id)):
++                    return {"ok": False, "reason": reason, "proven_not_sent": True}
+                 break
+             time.sleep(2)
+     except Exception:  # noqa: BLE001 — still unreachable: the attempt's verdict stands
+@@ -1504,7 +1637,8 @@ def _verify_after_cdp_error(target: dict, reason: str, *, source: str, event_id,
+ 
+ 
+ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
+-             event_id: Optional[int] = None, target: Optional[dict] = None) -> dict:
++             event_id: Optional[int] = None, target: Optional[dict] = None,
++             track: Optional[dict] = None) -> dict:
+     """The submission itself, once the slot is claimed. Split out so that every exit path
+     below is recorded by exactly one caller instead of each remembering to do it."""
+     # FAIL FAST on a starving browser, before any session is opened. Under the 2026-08-30
+@@ -1513,6 +1647,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
+     # `cdp_error:WebSocketTimeoutException` — true, but it blames the socket for a
+     # shortage of memory. Checking first costs one cheap browser-level call and makes the
+     # attempt honest. Fail-open: only a browser that is measurably degraded is refused.
++    track = track if track is not None else {}
+     _bd = browser_degraded()
+     if _bd.get("degraded"):
+         return {"ok": False, "reason": f"browser_degraded:{_bd.get('reason')}"}
+@@ -1707,6 +1842,21 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
+                 "if(e){e.textContent='';e.dispatchEvent(new Event('input',{bubbles:true}));}})()"
+                 % json.dumps(COMPOSER_SEL)})
+ 
++        # DURABLE INTENT, committed before anything is typed. From here a crash, a hung
++        # page or a second attempt can no longer turn into a second copy in the chat:
++        # the event stays blocked until this send is resolved (see wake_bridge).
++        if event_id:
++            step = "send_intent"
++            try:
++                bi = _wb().begin_send(event_id, source=source,
++                                      conversation=conversation_url,
++                                      user_id_before=last_id_before)
++            except Exception as e:  # noqa: BLE001 — no durable record: do not send
++                return {"ok": False, "reason": f"send_intent_unavailable:{type(e).__name__}"}
++            if not bi.get("ok"):
++                return {"ok": False, "reason": f"send_intent_refused:{bi.get('reason')}"}
++            track["intent"] = True
++
+         # The ONLY string ever sent into the page.
+         step = "insert_phrase"
+         s.call("Input.insertText", {"text": phrase})
+@@ -1722,6 +1872,7 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
+             f"(function(){{const b=document.querySelector({SEND_SEL!r});"
+             f"return !!b && !b.disabled && b.getAttribute('aria-disabled') !== 'true';}})()")
+         dispatched = True
++        track["dispatched"] = True
+         step = "post_send_verify"
+         if enabled is True:
+             s.call("Runtime.evaluate",
+@@ -1740,12 +1891,14 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
+         # a flat count (virtualized long chat) — says the conversation kept the message.
+         import time
+         cleared = False
++        last_answer = None
+         for _ in range(max(1, USER_TURN_SECS)):
+             time.sleep(1)
+             if not cleared:
+-                cleared = s.boolean(
++                last_answer = s.boolean(
+                     f"(function(){{const c=document.querySelector({COMPOSER_SEL!r});"
+-                    f"return !c || c.textContent.length === 0;}})()") is True
++                    f"return !c || c.textContent.length === 0;}})()")
++                cleared = last_answer is True
+                 if cleared:
+                     # THE LATCH BOUNDARY. A cleared composer means the page took the
+                     # phrase — from here on it may be in the chat, so this event must
+@@ -1786,7 +1939,10 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
+                     f"(function(){{const c=document.querySelector({COMPOSER_SEL!r});"
+                     f"if(c){{c.innerHTML='';"
+                     f"c.dispatchEvent(new Event('input',{{bubbles:true}}));}}}})()"})
+-            return {"ok": False, "reason": "composer_did_not_clear_after_send"}
++            # Proven only when the page ANSWERED "still holds text"; an unreadable page
++            # (None) proves nothing, so that send stays indeterminate.
++            return {"ok": False, "reason": "composer_did_not_clear_after_send",
++                    **({"proven_not_sent": True} if last_answer is False else {})}
+         # The composer emptied and nothing arrived. This is the exact shape of the silent
+         # failure this check exists for: it must NOT be acknowledged, so the wake stays
+         # pending and is retried after the cooldown.
+diff --git a/tools/wake_companion.py b/tools/wake_companion.py
+index 436af25..ed9ef3d 100644
+--- a/tools/wake_companion.py
++++ b/tools/wake_companion.py
+@@ -254,6 +254,36 @@ CLOSED_LOOP_WATCH_ENABLED = os.getenv("CLOSED_LOOP_WATCH_ENABLED", "1") not in (
+     "0", "", "false")
+ 
+ 
++SEND_RECONCILE_ENABLED = os.getenv("WAKE_SEND_RECONCILE_ENABLED", "1") not in ("0", "", "false")
++
++
++def reconcile_sends(wb) -> list:
++    """Settle wake sends that ended without proof, read-only, from the chat itself
++    (`cdp_composer.reconcile_sends`). A send whose attempt DIED (crash, restart) never
++    reached the watch registration in `tick`, so it is registered here, unverified,
++    exactly as a latched-but-unverified send is: the watchdog's single re-wake and
++    escalation stay the way an unheard stop is surfaced."""
++    from cdp_composer import reconcile_sends as _reconcile
++    out = _reconcile()
++    for r in out:
++        if r.get("converted"):
++            try:
++                row = wb.wake_context(r["event_id"])
++                if row and row.get("actionable"):
++                    from core import closed_loop_wake
++                    closed_loop_wake.register_delivery(
++                        event_id=r["event_id"], target=row.get("agent_id", ""),
++                        project_id=row.get("project_id", ""),
++                        route_key=row.get("route_key", ""),
++                        event_type=row.get("event_type", ""), verified=False)
++            except Exception:  # noqa: BLE001
++                pass
++        if r.get("verdict") not in ("unchanged", "no_page") or r.get("converted"):
++            print(f"wake send reconcile: event {r['event_id']} -> {r['verdict']}"
++                  f"{' (attempt had died)' if r.get('converted') else ''}", flush=True)
++    return out
++
++
+ def watch_closed_loop() -> dict:
+     """One SLO-watchdog pass: a wake that was delivered (real user turn confirmed) but
+     produced no observed progress gets re-woken once, then escalated. Task 211 — the
+@@ -369,6 +399,11 @@ def main() -> None:
+             print(f"worker registration failed: {str(e)[:120]}", flush=True)
+         try:
+             tick(wb)
++            if SEND_RECONCILE_ENABLED:
++                try:
++                    reconcile_sends(wb)
++                except Exception as e:  # noqa: BLE001 — never breaks the tick
++                    print(f"send-reconcile error: {str(e)[:160]}", flush=True)
+             if CONTROL_GUARD_ENABLED:
+                 try:
+                     watch_control_plane()

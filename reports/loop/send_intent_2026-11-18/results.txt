@@ -1,0 +1,7 @@
+candidate 2883d2b (code f0619bc + test-only follow-up), base live 0a0c456
+new tests/test_wake_send_intent.py: base 0a0c456 28 failed / 1 passed; head 29 passed
+  88629 replay on base: was_submitted(88629) == False (event re-offerable after a post-click timeout)
+changed tests/test_composer_cdp_timeout_posthoc.py: 2 tests re-pinned (D1 old behaviour -> indeterminate + latched); 11 passed
+mutants: 17/17 killed (scratch worktree; pending_ignores_intent run by hand after a pattern miss)
+related suites (composer, wake_bridge, companion, delivery, closed loop, rotation, session watch, e2e): 597 passed
+full suite 2883d2b: 5522 passed, 4 skipped, EXIT 0 (962 s)
