@@ -4,7 +4,9 @@
 **Live** (released on the owner's direct word):
 - **Runtime** `758ebe4` (2026-11-18 10:21:42Z, owner's direct word "деплой 758ebe4": a chat's unresolved sends are reconciled read-only before the next wake is typed), rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T102142Z`. Before it: 5edb575 (backup `adaptive-offer-20261118T084323Z`), 2883d2b (`…T080902Z`), 0a0c456 (`…T065653Z`), ee9f1fa (`…T041628Z`).
 - **Session login link**: noVNC on the tailnet only, rollback `deploy/browser_login/rollback.sh /root/ai-dev-runtime/backups/browser-login-20261117T175155Z`.
-- **SEO** `39603fb` (send-queue contract, undismiss button, access-log redaction), rollbacks in order: `deploy/seo_log_redact/rollback.sh`, `deploy/seo_undismiss/rollback.sh`, `deploy/seo_send_queue/rollback.sh`.
+- **SEO** `1065b32` (2026-11-18 ~16:34Z, owner's direct word "деплой 1065b32"; deployed branch pushed on the owner's word): `agent_report` read returns the report under `text` plus `chars`, with no top-level `content`. Rollback: `deploy/seo_report_text/rollback.sh`. **Live acceptance:** an automated instruction reported that the tech lead's `agent_report(/opt/hostsecure, docs/LEAD_REVIEW_HANDOFF.md)` now returns valid JSON with `text` of length 27709, `chars=27709` and the expected report prefix. The `{}` defect is resolved for this real case. See `reports/OWNER_OS_REPORT_TRANSPORT_2026-11-18.md`.
+- **SEO before that** `39603fb` (send-queue contract, undismiss button, access-log redaction), rollbacks in order: `deploy/seo_log_redact/rollback.sh`, `deploy/seo_undismiss/rollback.sh`, `deploy/seo_send_queue/rollback.sh`.
+- **Route** `hostsecure` → https://chatgpt.com/c/6afd9cb3-41ec-83ed-91ae-d64c941a14bc (owner's direct word, 16:39:50Z). Backup: `.ai-runtime-backups/wake_target/wake_target_20261118T163942Z.sql`.
 - **Queue**: `SEND_QUEUE_ENABLED=1` via `/etc/systemd/system/ai-runtime.service.d/99-send-queue.conf`. To undo, remove the file and restart ai-runtime.
 
 **Also live since 16:56Z:** the WEST dependency-wait wordings and the changed-task-identity re-arm. See `reports/OWNER_OS_ACCEPTANCE_2026-11-17.md`.
