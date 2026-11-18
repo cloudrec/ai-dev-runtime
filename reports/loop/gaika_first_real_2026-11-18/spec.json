@@ -1,0 +1,26 @@
+{
+  "title": "GAIKA: catalog archive walk skips non-directory entries",
+  "goal": "tests/project-doc-counts.test.mjs walks var/catalog and opens <entry>/products.ndjson for every entry not ending in .json. Live var/catalog also holds plain files such as refresh-queue.json.post-reconcile-20261117T152856Z (and its .keys), left by the archive migration. Opening <file>/products.ndjson throws ENOTDIR, which is not caught (only ENOENT is), so the ROADMAP cross-cutting blockers test fails wherever the archives exist. Make every var/catalog walk in this test file count only directories, and add a regression test that proves a non-directory entry is skipped without needing the real 2 GB archives. Work from the live code 1181e47d. No deploy, no change to var/, no network.",
+  "acceptance_criteria": [
+    "Every var/catalog walk in tests/project-doc-counts.test.mjs ignores non-directory entries (by file type, not by name pattern)",
+    "A regression test builds a temporary catalog with one shop directory holding products.ndjson and plain files named like refresh-queue.json.post-reconcile-<stamp> and .keys, and fails on the old logic with ENOTDIR",
+    "No assertion is weakened or removed; skips without archives stay as they are",
+    "Only test files change; no product code, var/ or docs change"
+  ],
+  "checks": [["node", "--test", "tests/project-doc-counts.test.mjs"]],
+  "scope": ["tests/"],
+  "do_not_touch": ["var/", "Production services and /opt/gaika itself", "Credentials",
+                   "Other projects and agents", "Payment code"],
+  "tasks": [
+    {"key": "catalog-walk-dirs",
+     "title": "Skip non-directory entries when walking var/catalog",
+     "goal": "Fix the var/catalog walks in tests/project-doc-counts.test.mjs to count directories only, and add the regression test described in the project goal. A small shared helper under tests/ is fine.",
+     "acceptance_criteria": [
+       "Reproduction: with var/catalog/atb/products.ndjson and a plain file var/catalog/refresh-queue.snapshot present, the blockers test no longer throws ENOTDIR",
+       "The new regression test passes and would fail on the old filter",
+       "node --test tests/project-doc-counts.test.mjs passes"
+     ],
+     "checks": [["node", "--test", "tests/project-doc-counts.test.mjs"]],
+     "scope": ["tests/"]}
+  ]
+}
