@@ -1350,6 +1350,60 @@ def _settle_send(event_id, track: dict, res: dict) -> None:
         pass
 
 
+def _apply_evidence(wb, u: dict, ev: Optional[dict], source: str = "reconcile") -> str:
+    """One unresolved send, one piece of evidence, one verdict (see `reconcile_sends`)."""
+    eid = u["event_id"]
+    if ev and ev["found"] and ev["answered"]:
+        if wb.finish_send(eid, "delivered", "reconciled_assistant_answered"):
+            wb.record_delivery(source, event_id=eid, delivered=True,
+                               reason="reconciled_assistant_answered",
+                               conversation=u["conversation"])
+            wb.acknowledge(eid)
+            try:
+                from core import closed_loop_wake as _clw
+                _clw.mark_delivery_verified(eid)
+            except Exception:  # noqa: BLE001
+                pass
+            return "delivered"
+    elif ev and ev["found"]:
+        if u["state"] == "indeterminate" and wb.finish_send(eid, "landed",
+                                                            "reconciled_turn_found"):
+            return "landed"
+    elif _proven_unsent(ev):
+        if wb.retract_unsent(eid, "reconciled_phrase_still_in_composer"):
+            return "not_sent"
+    return "unchanged"
+
+
+# Unresolved sends to the same chat looked at right before a new wake is typed into it.
+PRESEND_RECONCILE_LIMIT = int(os.getenv("WAKE_PRESEND_RECONCILE_LIMIT", "3"))
+
+
+def _reconcile_before_send(s, conversation_url: str, event_id) -> list:
+    """The last moment an earlier unresolved send to THIS chat can still be proven.
+
+    ChatGPT mounts only the newest turns (live 2026-11-18: two user turns), so the wake
+    typed next pushes an older one out and its evidence is gone for good: event 88803
+    was pushed out by the next wakes to the same chat before any look could see it. On
+    the page this attempt already holds, read-only, BEFORE the composer guard can clear a
+    stranded phrase of ours. Never blocks the send: any error is no evidence."""
+    out = []
+    try:
+        wb = _wb()
+        for u in wb.unresolved_sends_in(conversation_url, exclude=event_id,
+                                        limit=PRESEND_RECONCILE_LIMIT):
+            wb.note_reconcile_look(u["event_id"])
+            verdict = _apply_evidence(wb, u, send_evidence(s, u["event_id"]),
+                                      source="reconcile_presend")
+            out.append({"event_id": u["event_id"], "verdict": verdict})
+            if verdict != "unchanged":
+                print(f"wake send reconcile (before event {event_id}): event "
+                      f"{u['event_id']} -> {verdict}", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def reconcile_sends(limit: int = 3) -> list:
     """Settle sends that ended without proof (a CDP timeout, a died attempt), from the
     chat itself, read-only: nothing is typed, clicked or navigated.
@@ -1380,26 +1434,7 @@ def reconcile_sends(limit: int = 3) -> list:
         finally:
             if s:
                 s.close()
-        verdict = "unchanged"
-        if ev and ev["found"] and ev["answered"]:
-            if wb.finish_send(eid, "delivered", "reconciled_assistant_answered"):
-                wb.record_delivery("reconcile", event_id=eid, delivered=True,
-                                   reason="reconciled_assistant_answered",
-                                   conversation=u["conversation"])
-                wb.acknowledge(eid)
-                try:
-                    from core import closed_loop_wake as _clw
-                    _clw.mark_delivery_verified(eid)
-                except Exception:  # noqa: BLE001
-                    pass
-                verdict = "delivered"
-        elif ev and ev["found"]:
-            if u["state"] == "indeterminate" and wb.finish_send(eid, "landed",
-                                                                "reconciled_turn_found"):
-                verdict = "landed"
-        elif _proven_unsent(ev):
-            if wb.retract_unsent(eid, "reconciled_phrase_still_in_composer"):
-                verdict = "not_sent"
+        verdict = _apply_evidence(wb, u, ev)
         out.append({"event_id": eid, "verdict": verdict, "converted": u["stale_converted"]})
     return out
 
@@ -1730,6 +1765,9 @@ def _attempt(conversation_url: str, phrase: str, *, source: str = "unknown",
         # refusing on it would silence working routes. Success still needs the full proof
         # below; the notice is carried into every post-send verdict (`_full_verdict`) so a
         # failure on a capped chat names its cause and a success says the chat is at cap.
+        if event_id:
+            step = "presend_reconcile"
+            _reconcile_before_send(s, conversation_url, event_id)
         step = "pre_send_baselines"
         full_before = conversation_is_full(s) is True
         n = s.count(COMPOSER_SEL)

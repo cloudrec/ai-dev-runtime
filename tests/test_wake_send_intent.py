@@ -94,12 +94,15 @@ class _Page(_S):
         self.clicked = False
         self.evidence = evidence
         self.intent_at_insert = None
+        self.probed = []
+        self.states_at_insert = {}
 
     def call(self, method, params=None):
         expr = (params or {}).get("expression", "")
         if method == "Input.insertText":
             try:
                 self.intent_at_insert = _state(_EID[0])
+                self.states_at_insert = {e: _state(e) for e in _WATCH}
             except AttributeError:            # a checkout without send intents
                 self.intent_at_insert = None
             if self.boom == "insert":
@@ -108,10 +111,21 @@ class _Page(_S):
             self.clicked = True
             if self.boom == "click":
                 raise WebSocketTimeoutException("timed out")
+        if method == "Runtime.evaluate" and "e.textContent=''" in expr:
+            self.composer_cleared = True     # the draft guard cleared our stranded phrase
         if method == "Runtime.evaluate" and "compareDocumentPosition" in expr:
-            if self.evidence is None:
+            ev = self.evidence
+            if getattr(self, "composer_cleared", False) and isinstance(ev, dict):
+                ev = {k: ({**v, "in_composer": False} if isinstance(v, dict) else v)
+                      for k, v in ev.items()}
+            if isinstance(ev, dict) and all(isinstance(k, int) for k in ev):
+                # per event: the probe names its marker
+                ev = next((v for k, v in ev.items()
+                           if json.dumps(f"[Owner OS wake] event={k} ") in expr), None)
+            self.probed.append(expr)
+            if ev is None:
                 return {}
-            return {"result": {"value": json.dumps(self.evidence)}}
+            return {"result": {"value": json.dumps(ev)}}
         return super().call(method, params)
 
     def boolean(self, expression):
@@ -121,6 +135,7 @@ class _Page(_S):
 
 
 _EID = [0]
+_WATCH: list = []
 
 
 def _wire(monkeypatch, *sessions):
@@ -445,3 +460,113 @@ def test_a_died_attempt_gets_its_watch_from_the_companion(monkeypatch, wb):
         row = c.execute("SELECT target, delivery_verified FROM wake_loop_watch "
                         "WHERE event_id=126").fetchone()
     assert row == ("fc-acc:0.0", 0)
+
+
+# ── reconciliation right before the next wake to the same chat ─────────────────────────
+OTHER = "https://chatgpt.com/c/another-chat"
+
+
+def _healthy(evidence=None):
+    return _Page({"n": 1}, [True] * 6, evidence=evidence)
+
+
+@pytest.fixture
+def watch():
+    _WATCH.clear()
+    yield _WATCH
+    _WATCH.clear()
+
+
+def test_an_earlier_send_is_proven_before_the_next_wake_pushes_it_out(monkeypatch, wb,
+                                                                       watch):
+    """The 88803 shape: an indeterminate send, then the next wake to the same chat. The
+    earlier one is settled on that page BEFORE the new phrase is typed."""
+    _indeterminate(monkeypatch, 130)
+    watch.append(130)
+    page = _healthy({130: {"found": True, "answered": True, "in_composer": False}})
+    _wire(monkeypatch, page)
+    assert _send(131)["ok"] is True
+    assert page.states_at_insert[130] == "delivered", "settled before typing"
+    assert (1, "reconciled_assistant_answered", "reconcile_presend") in _deliveries(130)
+    assert _state(131) == "delivered"
+
+
+def test_a_stranded_phrase_is_proven_unsent_before_the_composer_guard_clears_it(
+        monkeypatch, wb, watch):
+    _indeterminate(monkeypatch, 132)
+    watch.append(132)
+    page = _healthy({132: {"found": False, "answered": False, "in_composer": True}})
+    _wire(monkeypatch, page)
+    assert _send(133)["ok"] is True
+    assert page.states_at_insert[132] == "not_sent"
+    assert not wb.was_submitted(132), "offered again, once, through every filter"
+
+
+def test_a_landed_send_is_recorded_but_never_resent(monkeypatch, wb):
+    _indeterminate(monkeypatch, 134)
+    page = _healthy({134: {"found": True, "answered": False, "in_composer": False}})
+    _wire(monkeypatch, page)
+    _send(135)
+    assert _state(134) == "landed" and wb.was_submitted(134)
+
+
+def test_only_sends_to_the_same_chat_are_looked_at(monkeypatch, wb):
+    _indeterminate(monkeypatch, 136)
+    with _db() as c:
+        c.execute("UPDATE wake_send_intent SET conversation=? WHERE event_id=136", (OTHER,))
+    page = _healthy({136: {"found": True, "answered": True, "in_composer": False}})
+    _wire(monkeypatch, page)
+    _send(137)
+    assert page.probed == [] and _state(136) == "indeterminate"
+
+
+def test_the_event_being_sent_is_not_reconciled_against_itself(wb):
+    wb.begin_send(138, conversation=URL)
+    wb.finish_send(138, "indeterminate", "x")
+    assert wb.unresolved_sends_in(URL, exclude=138) == []
+    assert [u["event_id"] for u in wb.unresolved_sends_in(URL, exclude=139)] == [138]
+
+
+def test_no_evidence_leaves_it_alone_and_the_new_wake_still_goes(monkeypatch, wb):
+    _indeterminate(monkeypatch, 140)
+    page = _healthy(None)                  # probe unreadable
+    _wire(monkeypatch, page)
+    assert _send(141)["ok"] is True
+    assert _state(140) == "indeterminate" and len(page.probed) == 1
+    assert wb.send_intent(140)["looks"] >= 1
+
+
+def test_a_reconcile_failure_never_blocks_the_new_wake(monkeypatch, wb):
+    _indeterminate(monkeypatch, 142)
+
+    def boom(*a, **k):
+        raise sqlite3.OperationalError("locked")
+    monkeypatch.setattr(wb, "unresolved_sends_in", boom)
+    _wire(monkeypatch, _healthy())
+    assert _send(143)["ok"] is True
+    assert _state(142) == "indeterminate"
+
+
+def test_the_presend_look_is_bounded(monkeypatch, wb):
+    for e in (150, 151, 152, 153, 154):
+        _indeterminate(monkeypatch, e)
+    monkeypatch.setattr(cdp, "PRESEND_RECONCILE_LIMIT", 2)
+    page = _healthy({})
+    _wire(monkeypatch, page)
+    _send(155)
+    assert len(page.probed) == 2
+
+
+def test_the_look_comes_before_the_draft_guard_clears_our_stranded_phrase(monkeypatch,
+                                                                          wb, watch):
+    """Order matters: the guard clears a stranded phrase of ours before typing. Looked at
+    after that, the proof is gone and the earlier event stays indeterminate forever."""
+    _indeterminate(monkeypatch, 160)
+    watch.append(160)
+    page = _healthy({160: {"found": False, "answered": False, "in_composer": True}})
+    page.composer_dirty = True
+    page.composer_is_ours = True
+    _wire(monkeypatch, page)
+    assert _send(161)["ok"] is True
+    assert page.composer_cleared is True
+    assert page.states_at_insert[160] == "not_sent"

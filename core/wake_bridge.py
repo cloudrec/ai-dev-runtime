@@ -2887,3 +2887,28 @@ def wake_context(event_id, conn=None) -> Optional[dict]:
     finally:
         if own:
             conn.close()
+
+
+def unresolved_sends_in(conversation: str, *, exclude=None, conn=None,
+                        now: Optional[float] = None, limit: int = 3) -> list:
+    """Unresolved sends to ONE chat, newest first, for a look right before the next wake
+    is typed there. No min-age, interval or look cap: this is the last moment the page
+    still shows them (see `cdp_composer._reconcile_before_send`)."""
+    if not conversation:
+        return []
+    now = now if now is not None else now_ts()
+    conn, own = _c(conn)
+    try:
+        _intent_tables(conn)
+        rows = conn.execute(
+            "SELECT event_id, conversation, user_id_before, state, looks FROM "
+            "wake_send_intent WHERE state IN ('indeterminate','landed') AND conversation=? "
+            "AND event_id != ? AND ts >= ? ORDER BY ts DESC LIMIT ?",
+            ((conversation or "")[:200], int(exclude or 0), now - MAX_WAKE_AGE_SECS,
+             int(limit))).fetchall()
+        return [{"event_id": int(r[0]), "conversation": r[1] or "", "user_id_before": r[2],
+                 "state": r[3], "looks": int(r[4] or 0), "stale_converted": False}
+                for r in rows]
+    finally:
+        if own:
+            conn.close()
