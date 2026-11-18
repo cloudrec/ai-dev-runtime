@@ -149,3 +149,20 @@ Reject, rework and `add_tasks` remain **untested live**. The acceptance report i
 - `install.sh --check` clean (payment panes never offered), then `--apply`: live 0a0c456 → 2883d2b.
 - Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T080902Z`.
 - Units active (ai-runtime, wake-companion, fullcycle-intake, fullcycle-worker). Tables `wake_send_intent` and `wake_send_intent_audit` were created on the first tick. 0 companion errors; `loop_watch.check`: 0 problems.
+
+## Follow-up found live: 5edb575 (not deployed)
+**Defect.** On the first send after the release (event 88803, `user_turn_not_observed_after_send` → `indeterminate`), the first reconcile look found nothing. The probe read each role match's own text, but in the current UI the user role sits on a hidden `<h4 data-conversation-role>` ("You said:"), and the message is in the turn DIV around it.
+
+**Effect on live 2883d2b:**
+- Reconciliation can prove nothing, so it changes nothing (safe).
+- The not-sent proof rests on "phrase still in the composer" alone. A sent phrase empties the composer, so a wrong retract would need the phrase both sent and still there.
+- Sends that are verified at send time are unaffected: 88807 and 88811 are `delivered`.
+
+**Fix.** Each match is read as its turn unit, as `_TURN_UNIT_JS` already does. An assistant turn counts only after that unit, not inside it.
+
+**Tests.** The real probe expression is executed in node on a minimal DOM (`tests/test_wake_send_evidence_js.py`, 7 tests):
+- the 3 heading cases fail on 2883d2b;
+- 2 of 2 mutants killed;
+- full suite: 5529 passed, 4 skipped, EXIT 0.
+
+**Release, when authorised:** `TARGET_SHA=5edb575 deploy/adaptive_offer/install.sh --check`, then `--apply`. No schema change.

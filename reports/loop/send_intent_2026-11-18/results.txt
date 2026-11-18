@@ -5,3 +5,9 @@ changed tests/test_composer_cdp_timeout_posthoc.py: 2 tests re-pinned (D1 old be
 mutants: 17/17 killed (scratch worktree; pending_ignores_intent run by hand after a pattern miss)
 related suites (composer, wake_bridge, companion, delivery, closed loop, rotation, session watch, e2e): 597 passed
 full suite 2883d2b: 5522 passed, 4 skipped, EXIT 0 (962 s)
+
+follow-up 5edb575 (probe reads a role heading as its turn; found live on event 88803 after the 2883d2b release)
+new tests/test_wake_send_evidence_js.py (real probe executed in node on a minimal DOM): 7 passed; on 2883d2b 3 of the then 6 fail (heading UI)
+probe mutants: unit-mapping removed -> 4 fail; contained-by guard removed -> 1 fails (2/2 killed)
+related suites: 492 passed
+full suite 5edb575: 5529 passed, 4 skipped, EXIT 0 (1149 s)
