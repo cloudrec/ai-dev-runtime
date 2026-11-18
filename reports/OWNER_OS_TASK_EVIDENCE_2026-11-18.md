@@ -130,3 +130,9 @@ On abort: stop the agent and record the evidence.
 3. Remove `/opt/fc-projects/acc-<yyyymmdd>`.
 
 Nothing in production is changed, so there is nothing to roll back.
+
+## Released 2026-11-18 06:56:54Z (owner's direct word "деплой 0a0c456")
+- `install.sh --check` clean (payment panes never offered), then `--apply`: live ee9f1fa → 0a0c456.
+- Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T065653Z`.
+- Units active: ai-runtime, wake-companion, fullcycle-intake, fullcycle-worker. First sweep on new code 06:57:54Z added the four `tr_*` columns; 0 tracebacks; `loop_watch.check`: 0 problems.
+- Unrelated: `owner-os-fleet-health` failed at 06:55:53Z (before the release): two remote servers timed out.
