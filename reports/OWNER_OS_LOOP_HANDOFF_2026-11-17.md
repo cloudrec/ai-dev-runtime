@@ -2,7 +2,7 @@
 
 ## Current state (canonical; everything below is history)
 **Live** (released on the owner's direct word):
-- **Runtime** `2883d2b` (2026-11-18 08:09Z, owner's word: durable wake-send intent, D1/D2), rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T080902Z`. Before it, 0a0c456 (backup `adaptive-offer-20261118T065653Z`), and before that ee9f1fa (rollback backup `adaptive-offer-20261118T041628Z`).
+- **Runtime** `5edb575` (2026-11-18 08:43Z, owner's word: reconcile probe reads a role heading as its turn), rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T084323Z`. Before it, 2883d2b (durable wake-send intent, backup `adaptive-offer-20261118T080902Z`), then 0a0c456 (backup `adaptive-offer-20261118T065653Z`), and before that ee9f1fa (rollback backup `adaptive-offer-20261118T041628Z`).
 - **Session login link**: noVNC on the tailnet only, rollback `deploy/browser_login/rollback.sh /root/ai-dev-runtime/backups/browser-login-20261117T175155Z`.
 - **SEO** `39603fb` (send-queue contract, undismiss button, access-log redaction), rollbacks in order: `deploy/seo_log_redact/rollback.sh`, `deploy/seo_undismiss/rollback.sh`, `deploy/seo_send_queue/rollback.sh`.
 - **Queue**: `SEND_QUEUE_ENABLED=1` via `/etc/systemd/system/ai-runtime.service.d/99-send-queue.conf`. To undo, remove the file and restart ai-runtime.

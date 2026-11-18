@@ -166,3 +166,15 @@ Reject, rework and `add_tasks` remain **untested live**. The acceptance report i
 - full suite: 5529 passed, 4 skipped, EXIT 0.
 
 **Release, when authorised:** `TARGET_SHA=5edb575 deploy/adaptive_offer/install.sh --check`, then `--apply`. No schema change.
+
+## Released 5edb575: 2026-11-18 08:43:23Z (owner's direct word "деплой 5edb575")
+- `--check` clean (only `tools/cdp_composer.py`; payment panes never offered), then `--apply`.
+- Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T084323Z`.
+- Units active, 0 companion errors.
+- Since 2883d2b: 19 sends `delivered` at send time, and 1 `indeterminate` (88803).
+
+Live probe check (the companion's own three-bit probe, run once by hand on 88803's tab; only booleans and counts were read):
+- The fixed probe now sees wake markers in user turns: 2 of the 2 mounted user turns carry one.
+- But the page mounts only the 2 newest user turns. 88803 was pushed out by later wakes to the same chat before any fixed look, so it cannot be proven. It stays `indeterminate` (no resend) and will be abandoned visibly after `MAX_WAKE_AGE_SECS`.
+
+**Remaining risk.** Reconciliation must look before later sends to the same chat push the turn out of the page. Proposed next step, not done: reconcile a conversation's unresolved sends right before a new wake is typed into it.
