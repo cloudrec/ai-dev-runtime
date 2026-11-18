@@ -1535,14 +1535,21 @@ def _wb():
     return _w
 
 
+# A role match may be the turn's hidden heading (`<h4 data-conversation-role>`, the
+# 2026-10-29 UI, see `_TURN_UNIT_JS`): its own text is "You said:", the message is in the
+# turn DIV around it. So each match is read as its turn unit, and an assistant turn counts
+# only when it FOLLOWS that unit and is not inside it.
 _SEND_EVIDENCE_JS = """(function(m, us, asl, cs){
-  const users=[...document.querySelectorAll(us)];
+  const unit=(e)=>(/^H[1-6]$/.test(e.tagName||'')&&e.hasAttribute('data-conversation-role')
+                   &&e.parentElement)?e.parentElement:e;
   let mine=null;
-  for (const e of users) { if ((e.textContent||'').includes(m)) mine=e; }
+  for (const e of document.querySelectorAll(us)) {
+    const u=unit(e); if ((u.textContent||'').includes(m)) mine=u; }
   let answered=false;
   if (mine) {
     for (const a of document.querySelectorAll(asl)) {
-      if (mine.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING) {
+      const p=mine.compareDocumentPosition(unit(a));
+      if ((p & Node.DOCUMENT_POSITION_FOLLOWING) && !(p & Node.DOCUMENT_POSITION_CONTAINED_BY)) {
         answered=true; break; }
     }
   }
