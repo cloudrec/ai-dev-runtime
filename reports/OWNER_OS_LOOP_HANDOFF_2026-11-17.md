@@ -2,14 +2,36 @@
 
 ## Current state (canonical; everything below is history)
 **Live** (released on the owner's direct word):
-- **Runtime** `5edb575` (2026-11-18 08:43Z, owner's word: reconcile probe reads a role heading as its turn), rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T084323Z`. Before it, 2883d2b (durable wake-send intent, backup `adaptive-offer-20261118T080902Z`), then 0a0c456 (backup `adaptive-offer-20261118T065653Z`), and before that ee9f1fa (rollback backup `adaptive-offer-20261118T041628Z`).
+- **Runtime** `758ebe4` (2026-11-18 10:21:42Z, owner's direct word "деплой 758ebe4": a chat's unresolved sends are reconciled read-only before the next wake is typed), rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T102142Z`. Before it: 5edb575 (backup `adaptive-offer-20261118T084323Z`), 2883d2b (`…T080902Z`), 0a0c456 (`…T065653Z`), ee9f1fa (`…T041628Z`).
 - **Session login link**: noVNC on the tailnet only, rollback `deploy/browser_login/rollback.sh /root/ai-dev-runtime/backups/browser-login-20261117T175155Z`.
 - **SEO** `39603fb` (send-queue contract, undismiss button, access-log redaction), rollbacks in order: `deploy/seo_log_redact/rollback.sh`, `deploy/seo_undismiss/rollback.sh`, `deploy/seo_send_queue/rollback.sh`.
 - **Queue**: `SEND_QUEUE_ENABLED=1` via `/etc/systemd/system/ai-runtime.service.d/99-send-queue.conf`. To undo, remove the file and restart ai-runtime.
 
 **Also live since 16:56Z:** the WEST dependency-wait wordings and the changed-task-identity re-arm. See `reports/OWNER_OS_ACCEPTANCE_2026-11-17.md`.
 
-**Full Cycle acceptance `acc-20261118` (2026-11-18): PASS.** The project was done in about 9 minutes, with one agent (now stopped), 0 wake chains and all watches resolved. Open transport defects: D1, a possible duplicate send after a CDP timeout between the click and the latch; D2, frequent post-send CDP timeouts; D3, the `add_tasks` path was not exercised live. The project directory is kept until a cleanup go. See `reports/OWNER_OS_FULLCYCLE_ACCEPTANCE_2026-11-18.md`.
+**Full Cycle acceptances (2026-11-18): both PASS; the tech lead accepted them from MCP state.**
+- `acc-20261118`: 2 tasks, one agent, 0 wake chains (`reports/OWNER_OS_FULLCYCLE_ACCEPTANCE_2026-11-18.md`).
+- `acc-d3`: reject → rework (word-count, attempt 2) → regression → **add_tasks** at the project review (spec v2, task `report`) → done, event 89028 (`reports/OWNER_OS_FULLCYCLE_D3_ACCEPTANCE_2026-11-18.md`). D3 is proven live.
+- Transport in acc-d3: 3 of 3 sends delivered at the first attempt, 0 duplicates, 0 loop events. 89028 and 89029 were each delivered at attempt 1 (`submitted_and_assistant_started_generating`, one `wake_send` row each).
+- Cleanup: both directories were removed at 10:39Z and 10:41Z. The owner's direct word in this pane was "удаляй оба учебных проекта", typed by the owner and not an automated message. Evidence was captured first (`reports/loop/acceptance_cleanup_2026-11-18/`), and the DB rows are kept. No further deletion.
+
+**Pre-send reconcile (758ebe4), live status: unexercised.**
+- Checked read-only at 10:44Z: all 11 sends since the deploy were `delivered`, and 0 became `indeterminate`.
+- The only unresolved send is 88803, from before the deploy. It is in a chat that has received no wake since the deploy, and its periodic looks are capped (20 of 20).
+- It is abandoned visibly at about 11:10Z (`MAX_WAKE_AGE_SECS`). No failure was induced.
+- The synthetic evidence stays: `tests/test_wake_send_intent.py`, 38 tests (7 pre-send tests fail on 5edb575); mutants 6/6 killed; full suite 5538 passed, 4 skipped.
+- Polling has stopped.
+
+**Known risks:**
+- An `indeterminate` send is never resent, so a really lost send costs latency through the watch re-wake and escalation.
+- The pre-send look needs the later send to target the same chat.
+- The cause of D2 (post-send CDP timeouts) is still unmeasured.
+- The add_tasks route through `next_tasks` on a task approve is untested live.
+
+**Next steps:**
+- Note the first live `wake send reconcile (before event …)` journal line when it happens.
+- Measure D2 if timeouts recur.
+- No deploy is pending.
 
 **Released 2026-11-18 08:09Z:** `2883d2b`, wake-send correctness (D1/D2). It adds a durable send intent before typing; an ambiguous send is never re-sent blindly; proven not-sent, indeterminate and delivered are kept apart; late receipts are reconciled read-only. Tests: 28 of 29 new tests fail on 0a0c456; mutants 17/17 killed; full suite 5522 passed. D3 (reject, rework, `add_tasks`) is still untested live; transport is not claimed fully accepted. See `reports/OWNER_OS_SEND_INTENT_2026-11-18.md`.
 
@@ -143,3 +165,10 @@ Installer `--check` at d052832: live 3423f4d → d052832; payorch-ha-fresh, auto
 The queue flag is unset on live, so the queue is off.
 
 Release: nothing applied. The owner's direct word in this session is needed for each step: runtime apply, SEO image rebuild, `SEND_QUEUE_ENABLED=1`. After a release, validate with one disposable synthetic project through the real MCP.
+
+## Session retirement (2026-11-18 10:46Z)
+- Background monitors of this session: none running. The acc-d3 watcher ended on project done; nothing polls.
+- Live units have no dependency on this session.
+- The pane `owneros-autonomy-loop` holds only this Claude session. It is safe to close or `/clear` at this boundary; the tmux session name is unchanged.
+- Worktree: clean apart from the stray `"  "` file (never read; owner removes it). Branch `owneros/autonomy-loop-20261117`, not pushed (push is the owner's decision).
+- Start here next time: the "Current state" section above.
