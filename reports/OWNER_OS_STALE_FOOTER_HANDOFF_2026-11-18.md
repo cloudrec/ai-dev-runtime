@@ -82,3 +82,39 @@ This is by design: "a long-running shell or monitor stays working no matter how 
 
 ## Clean-session prompt
 "Owner OS DEV task: implement reports/OWNER_OS_STALE_FOOTER_HANDOFF_2026-11-18.md in a new worktree from origin/owneros/autonomy-loop-20261117 (runtime live 758ebe4). Tests first (the 11 above), then the fix and the mutants, then the full suite, then stage_done. No deploy, push, route or permission change; no payment panes. Keep the intake race (reports/OWNER_OS_INTAKE_RACE_HANDOFF_2026-11-18.md) separate."
+
+## Implemented in DEV (this branch; not deployed)
+Trigger: an automated instruction was received. No deploy, push, route or permission change.
+
+**Code** (`reports/loop/stale_footer_2026-11-18/runtime.diff`, against live 758ebe4):
+- **`core/agent_control.py`**, new pure helpers; `classify_state` is unchanged:
+  - `active_via_footer_only(tail)`: is an active reading resting only on paths 1a/5?
+  - `background_live(claude_pid)`: any child under any thread of the Claude process; `None` if unreadable.
+  - `transcript_idle_secs(cwd)`: `None` if absent or unreadable.
+- **`core/agent_watch.py`**:
+  - `STALE_ACTIVE_SECS` (env `AGENT_WATCH_STALE_ACTIVE_SECS`, default 1800).
+  - `_live_facts` and `_stale_active`.
+  - `classify(..., stale_active=False)`: the only exit from an active state, giving `quiescent` with reason `stale_active_footer_<n>s` and emitting `work_stopped_incomplete`.
+  - In `scan`, facts are read only once the pane has been frozen for the bound.
+- **Fail-safe:** an unknown child, an unknown transcript or a facts exception means live, so no wake.
+- **Dedup** is the existing `notified_digest` gate: one wake per frozen episode, and a new one after any change on screen.
+- **Never:** it does not stop, restart or type into anything. Owner prompts, the payment offer filter and the 300 s at-rest rule are untouched.
+
+**Tests:**
+- New `tests/test_agent_watch_stale_footer.py`, 18 tests (the 11 planned cases, plus the bound edge, three unknown-liveness variants, and no-facts-read before the bound).
+- On 758ebe4: 5 fail, 13 pass. The 13 are the "must stay working" cases, which hold on both versions.
+- **Mutants: 10 of 10 killed** (scratch copy):
+  - ignore `background_live`;
+  - drop the transcript check;
+  - `>=` changed to `>`;
+  - demote a foreground command;
+  - emit a completion;
+  - a read error treated as not live;
+  - an unknown child treated as dead;
+  - footer-only ignores a foreground spinner;
+  - no dedup;
+  - facts read for every pane. This one survived at first; the test was strengthened.
+
+**Release, when authorised:** `TARGET_SHA=e876325 deploy/adaptive_offer/install.sh --check`, then `--apply`. Rollback goes through the backup the installer prints. No schema change.
+
+**Candidate** `e876325`. Full suite: 5556 passed, 4 skipped, EXIT 0 (`reports/loop/stale_footer_2026-11-18/full_suite.txt`).
