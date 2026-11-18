@@ -11,3 +11,9 @@ new tests/test_wake_send_evidence_js.py (real probe executed in node on a minima
 probe mutants: unit-mapping removed -> 4 fail; contained-by guard removed -> 1 fails (2/2 killed)
 related suites: 492 passed
 full suite 5edb575: 5529 passed, 4 skipped, EXIT 0 (1149 s)
+
+follow-up 758ebe4 (reconcile a chat's unresolved sends before typing the next wake)
+tests/test_wake_send_intent.py now 38: on 5edb575 the 7 pre-send tests fail (the ordering test added after)
+mutants 6/6 killed: no pre-send call, look after the draft guard, no self-exclusion, any chat, no bound, errors not swallowed
+related suites: 501 passed
+full suite 758ebe4: 5538 passed, 4 skipped, 31 warnings in 1164.01s (0:19:24), EXIT=0

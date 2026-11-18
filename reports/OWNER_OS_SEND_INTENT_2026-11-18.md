@@ -178,3 +178,19 @@ Live probe check (the companion's own three-bit probe, run once by hand on 88803
 - But the page mounts only the 2 newest user turns. 88803 was pushed out by later wakes to the same chat before any fixed look, so it cannot be proven. It stays `indeterminate` (no resend) and will be abandoned visibly after `MAX_WAKE_AGE_SECS`.
 
 **Remaining risk.** Reconciliation must look before later sends to the same chat push the turn out of the page. Proposed next step, not done: reconcile a conversation's unresolved sends right before a new wake is typed into it.
+
+## Follow-up 758ebe4: reconcile before the next wake (not deployed)
+The owner's word "делай сверку перед новым будильником" closes the window found on 88803.
+- **Where:** inside each send attempt, on the page it already holds, after the page is ready and **before** the draft guard can clear a stranded phrase of ours.
+- **What:** the attempt looks at this chat's own `indeterminate` and `landed` sends:
+  - up to 3, newest first;
+  - the event being sent is excluded;
+  - the verdicts are the same as the periodic reconcile.
+- **Safety:** read-only, and it never blocks the send; any error counts as no evidence. Sends to other chats are not touched.
+- **Tests:** `tests/test_wake_send_intent.py` now has 38 tests.
+  - The 7 pre-send tests fail on 5edb575.
+  - The ordering test was added after, and checks the look against a composer the draft guard really clears.
+  - 6 of 6 mutants killed: no call, look after the guard, no self-exclusion, any chat, no bound, errors not swallowed.
+  - Full suite: 5538 passed, 4 skipped, EXIT 0.
+
+**Release, when authorised:** `TARGET_SHA=758ebe4 deploy/adaptive_offer/install.sh --check`, then `--apply`. No schema change.
