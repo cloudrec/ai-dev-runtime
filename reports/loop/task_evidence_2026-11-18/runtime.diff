@@ -1,0 +1,756 @@
+diff --git a/core/agent_watch.py b/core/agent_watch.py
+index 13e17c7..508fc48 100644
+--- a/core/agent_watch.py
++++ b/core/agent_watch.py
+@@ -149,7 +149,10 @@ _STATE_COLUMNS = (("miss_count", "INTEGER DEFAULT 0"),
+                   ("wait_lapsed_digest", "TEXT"),
+                   # when the tech lead/owner last delivered a task (note_task_delivered):
+                   # a stage_done older than that belongs to the previous task
+-                  ("task_ts", "REAL"))
++                  ("task_ts", "REAL"),
++                  # core.task_evidence: the pane's resolved session and a scan checkpoint
++                  ("tr_pid", "INTEGER"), ("tr_sid", "TEXT"), ("tr_offset", "INTEGER"),
++                  ("tr_offset_ts", "REAL"))
+ 
+ 
+ def _migrate_state(conn) -> None:
+@@ -870,113 +873,11 @@ def _stage_done_covers(conn, target: str, *, digest_since, task_ts) -> Optional[
+     return float(r[0]) if r and r[0] is not None else None
+ 
+ 
+-# A task SUBMITTED straight into the pane (the owner typing in tmux) after the stage_done
+-# is a new task, exactly like one delivered through the API (`note_task_delivered`), but
+-# nothing recorded it: its stop, if it came within REARM_WORK_SECS of the stage_done, was
+-# parked as the old hand-over (residual 2 of the ee9f1fa report).
+-#
+-# The evidence is the session's own transcript, never the pane: Claude Code writes a
+-# `user` entry with `origin.kind == "human"` only when a prompt is SUBMITTED, so an unsent
+-# draft in the composer, the CLI's suggested prompt, a recalled ghost, tool results, task
+-# notifications, compaction summaries and meta entries never count. The session is the
+-# one running as the pane's Claude pid (core.native_sessions), never "the newest file in
+-# the directory", which would mix two agents sharing a cwd. Automated sends type into the
+-# same composer, so a prompt with an agent_control delivery to this session within
+-# DELIVERY_MATCH_SECS is attributed to it: an API delivery already re-armed through
+-# `note_task_delivered`, and an internal nudge must not re-arm (#338). Only the prompt's
+-# time is read; its text is never stored or compared. Unknown (no session, unreadable
+-# transcript) is "no evidence", which keeps the previous behaviour.
+-DELIVERY_MATCH_SECS = int(os.getenv("AGENT_WATCH_DELIVERY_MATCH_SECS", "90"))
+-TRANSCRIPT_SCAN_BYTES = int(os.getenv("AGENT_WATCH_TRANSCRIPT_SCAN_BYTES", str(2 * 1024 * 1024)))
+-
+-
+-def _transcript_for(agent: dict) -> str:
+-    try:
+-        from core import agent_privilege as _ap
+-        from core import native_sessions as _ns
+-        pid = agent.get("claude_pid") or agent.get("pid")
+-        sid = _ns.session_id_for_pid(pid) if pid else ""
+-        if not sid:
+-            return ""
+-        cwd = agent.get("claude_cwd") or agent.get("cwd") or ""
+-        return next((p for p in _ap.transcripts(cwd)
+-                     if os.path.basename(p) == sid + ".jsonl"), "")
+-    except Exception:  # noqa: BLE001 — no opinion
+-        return ""
+-
+-
+-def _iso_epoch(value) -> Optional[float]:
+-    import datetime as _dt
+-    try:
+-        return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+-    except Exception:  # noqa: BLE001
+-        return None
+-
+-
+-def submitted_prompt_times(path: str, since: float) -> list:
+-    """Times of prompts a person or a sender SUBMITTED after `since` (newest last)."""
+-    import json as _json
+-    if not path:
+-        return []
+-    try:
+-        from core import agent_privilege as _ap
+-        size = os.path.getsize(path)
+-        start = max(0, size - TRANSCRIPT_SCAN_BYTES)
+-        with _ap.open_regular(path, "rb") as fh:
+-            fh.seek(start)
+-            if start:
+-                fh.readline()
+-            blob = fh.read()
+-    except Exception:  # noqa: BLE001 — unreadable: no evidence
+-        return []
+-    out = []
+-    for raw in blob.split(b"\n"):
+-        if b'"human"' not in raw:
+-            continue
+-        try:
+-            d = _json.loads(raw.decode("utf-8", "replace"))
+-        except Exception:  # noqa: BLE001 — a torn line
+-            continue
+-        if (d.get("type") != "user" or d.get("isMeta") or d.get("isCompactSummary")
+-                or not isinstance((d.get("message") or {}).get("content"), str)
+-                or (d.get("origin") or {}).get("kind") != "human"):
+-            continue
+-        t = _iso_epoch(d.get("timestamp"))
+-        if t is not None and t > since:
+-            out.append(t)
+-    return sorted(out)
+-
+-
+-def _sender_classes_near(target: str, ts: float) -> list:
+-    """Caller classes of agent_control deliveries to this session around `ts`."""
+-    import sqlite3
+-    try:
+-        from core import agent_control as _ac
+-        session = target.split(":", 1)[0]
+-        db = sqlite3.connect(f"file:{_ac._db_path()}?mode=ro", uri=True, timeout=5)
+-        try:
+-            rows = db.execute(
+-                "SELECT a.actor, a.source FROM deliveries d LEFT JOIN delivery_attribution a "
+-                "ON a.idempotency_key = d.idempotency_key "
+-                "WHERE (d.target=? OR d.target LIKE ? ESCAPE '\\') AND d.action != 'agent_stop' "
+-                "AND d.created_ts BETWEEN ? AND ?",
+-                (target, session.replace("\\", "\\\\").replace("%", "\\%")
+-                 .replace("_", "\\_") + ":%", ts - DELIVERY_MATCH_SECS,
+-                 ts + DELIVERY_MATCH_SECS)).fetchall()
+-        finally:
+-            db.close()
+-        return [_ac.caller_class(r[0], r[1]) for r in rows]
+-    except Exception:  # noqa: BLE001 — no delivery store: nothing is attributed
+-        return []
+-
+-
+-def direct_task_since(agent: dict, target: str, since: float) -> Optional[float]:
+-    """The newest prompt submitted after `since` that no internal sender typed, or None."""
+-    for t in reversed(submitted_prompt_times(_transcript_for(agent), since)):
+-        classes = _sender_classes_near(target, t)
+-        if not classes or "api" in classes:
+-            return t
+-    return None
++# A task given to the agent after its stage_done makes the stop news again. API deliveries
++# re-arm through `note_task_delivered`; a task typed straight into tmux is found, read-only
++# and bounded, in the session transcript (core.task_evidence: task / none / unknown).
++from core import task_evidence as _te  # noqa: E402
++DELIVERY_MATCH_SECS = _te.UNFINGERPRINTED_WINDOW_SECS
+ 
+ 
+ def _declare_dependency_wait(conn, target: str, now: float, digest: str,
+@@ -1147,13 +1048,18 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
+                     and not _ERRORISH_RE.search(_final_message(tail))):
+                 stage_ts = _stage_done_covers(conn, target, digest_since=digest_since,
+                                               task_ts=row[9] if row else None)
++            evidence = None
+             if stage_ts is not None:
+-                direct = direct_task_since(a, target, stage_ts)
+-                if direct is not None:
++                evidence = _te.task_since(a, target, stage_ts, conn)
++                if evidence["verdict"] == "task":
+                     # a task was submitted after the stage: its stop is news. Recorded,
+                     # so closed_loop and every later sweep see the same evidence.
+                     conn.execute("UPDATE agent_watch_state SET task_ts=MAX(COALESCE("
+-                                 "task_ts, 0), ?) WHERE target=?", (direct, target))
++                                 "task_ts, 0), ?) WHERE target=?", (evidence["ts"], target))
++                    stage_ts = None
++                elif evidence["verdict"] == "unknown":
++                    # not knowable: announce the stop once, never park it silently; its
++                    # watch is still the stage's rest, so closed_loop does not re-wake it
+                     stage_ts = None
+             stage_handoff = stage_ts is not None
+             dep_wait = (cls == "quiescent" and bool(a.get("alive"))
+@@ -1249,7 +1155,10 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
+                          "class_reason": c.get("reason", ""),
+                          "cwd": a.get("claude_cwd") or a.get("cwd") or "",
+                          "project": project or "(unmapped -> owner-os)",
+-                         "excerpt": ex},
++                         "excerpt": ex,
++                         **({"stage_done_evidence":
++                             f"{evidence['verdict']}:{evidence['reason']}"}
++                            if evidence else {})},
+                 action_taken=f"{target} [{project or 'unmapped'}]: {cls} — {ex[:120]}",
+                 correlation_id=f"agentwatch:{target}",
+                 dedup_key=f"agentwatch:{target}:{cls}:{dg}",
+diff --git a/core/task_evidence.py b/core/task_evidence.py
+new file mode 100644
+index 0000000..dea71fe
+--- /dev/null
++++ b/core/task_evidence.py
+@@ -0,0 +1,280 @@
++"""Was a new task SUBMITTED to this agent after a given moment? Read-only, bounded.
++
++agent_watch parks a stop that its own stage_done already announced. A task given to the
++agent after that stage makes the stop news again. API deliveries say so themselves
++(`note_task_delivered`); a task typed straight into tmux leaves only one durable trace:
++the session transcript, where Claude Code writes a `user` entry with
++`origin.kind == "human"` exactly when a prompt is submitted (never for a draft, the
++suggested prompt, a tool result, a task notification, a compaction summary or a meta
++entry).
++
++Three answers, never more confident than the evidence:
++  task     a prompt after `since` that no automated sender typed (ts = the newest one);
++  none     the transcript after `since` was read completely and holds no such prompt;
++  unknown  the evidence is not available: no session for the pane, no transcript, more
++           than SCAN_BUDGET_BYTES written since, or a prompt that an unfingerprinted
++           delivery may have typed. The caller announces the stop once and does not
++           re-wake it; it never parks it silently and never guesses a task.
++
++Attribution is by CONTENT, not by clock. Every agent_control delivery stores the sha256 of
++the exact text it typed (`delivery_provenance`). Claude Code records a long paste wrapped
++in a `<pasted_content id=…>` block, so the prompt is hashed as typed and unwrapped, in
++memory only; the text is never stored, logged or returned. A prompt whose hash matches a
++delivery belongs to that delivery's caller (API: a task; anyone else: an internal nudge,
++#338). A human prompt typed seconds after a nudge no longer collides with it.
++
++Identity: the pane's Claude pid -> the runtime's session list (core.native_sessions), else
++Claude Code's own per-pid record (`~/.claude/sessions/<pid>.json`), else the identity this
++module last resolved for the same pid, if that transcript was written after `since`. The
++resolved identity and a scan checkpoint (byte offset + its timestamp) are kept in
++agent_watch_state, so a restart resumes without re-reading and a /clear (a new session id)
++resets them.
++"""
++from __future__ import annotations
++
++import datetime as _dt
++import hashlib
++import json
++import os
++import re
++import sqlite3
++from typing import Optional
++
++SCAN_BUDGET_BYTES = int(os.getenv("TASK_EVIDENCE_SCAN_BUDGET_BYTES", str(16 * 1024 * 1024)))
++PROBE_BYTES = 256 * 1024
++ATTRIBUTION_WINDOW_SECS = int(os.getenv("TASK_EVIDENCE_ATTRIBUTION_WINDOW_SECS", "600"))
++UNFINGERPRINTED_WINDOW_SECS = int(os.getenv("AGENT_WATCH_DELIVERY_MATCH_SECS", "90"))
++
++_TS_RE = re.compile(rb'"timestamp"\s*:\s*"([^"]{10,40})"')
++_WRAP_RE = re.compile(r'^\s*<pasted_content id="([^"]+)">\n?(.*?)\n?</pasted_content id="\1">\s*$',
++                      re.S)
++
++STATE_COLUMNS = (("tr_pid", "INTEGER"), ("tr_sid", "TEXT"), ("tr_offset", "INTEGER"),
++                 ("tr_offset_ts", "REAL"))
++
++
++def _epoch(value) -> Optional[float]:
++    try:
++        v = value.decode() if isinstance(value, bytes) else str(value)
++        return _dt.datetime.fromisoformat(v.replace("Z", "+00:00")).timestamp()
++    except Exception:  # noqa: BLE001
++        return None
++
++
++def _fingerprints(text: str) -> set:
++    forms = {text, text.strip()}
++    m = _WRAP_RE.match(text)
++    if m:
++        forms |= {m.group(2), m.group(2).strip()}
++    return {hashlib.sha256(f.encode("utf-8")).hexdigest() for f in forms}
++
++
++# ── identity ─────────────────────────────────────────────────────────────────────────────
++def _pidfile_session(pid: int) -> str:
++    try:
++        from core import agent_privilege as _ap
++        path = os.path.join(_ap.claude_home(), ".claude", "sessions", f"{int(pid)}.json")
++        with _ap.open_regular(path, "r", encoding="utf-8") as fh:
++            d = json.load(fh)
++        return str(d.get("sessionId") or "") if int(d.get("pid") or 0) == int(pid) else ""
++    except Exception:  # noqa: BLE001 — no record: no opinion
++        return ""
++
++
++def _transcript(cwd: str, sid: str) -> str:
++    try:
++        from core import agent_privilege as _ap
++        return next((p for p in _ap.transcripts(cwd)
++                     if os.path.basename(p) == sid + ".jsonl"), "")
++    except Exception:  # noqa: BLE001
++        return ""
++
++
++def _state(conn, target: str) -> tuple:
++    try:
++        r = conn.execute("SELECT tr_pid, tr_sid, tr_offset, tr_offset_ts FROM "
++                         "agent_watch_state WHERE target=?", (target,)).fetchone()
++        return tuple(r) if r else (None, None, None, None)
++    except Exception:  # noqa: BLE001
++        return (None, None, None, None)
++
++
++def resolve_session(agent: dict, target: str, since: float, conn) -> tuple:
++    """(session id, source) or ("", reason)."""
++    pid = agent.get("claude_pid") or agent.get("pid")
++    if not pid:
++        return "", "no_pid"
++    cwd = agent.get("claude_cwd") or agent.get("cwd") or ""
++    sid, source = "", ""
++    try:
++        from core import native_sessions as _ns
++        sid, source = _ns.session_id_for_pid(pid) or "", "runtime"
++    except Exception:  # noqa: BLE001
++        sid = ""
++    if not sid:
++        sid, source = _pidfile_session(pid), "pidfile"
++    st_pid, st_sid = _state(conn, target)[:2]
++    if not sid and st_sid and st_pid == int(pid):
++        path = _transcript(cwd, st_sid)
++        try:
++            fresh = bool(path) and os.path.getmtime(path) >= since
++        except OSError:
++            fresh = False
++        if fresh:
++            sid, source = st_sid, "checkpoint"
++    if not sid:
++        return "", "session_unresolved"
++    if (st_sid, st_pid) != (sid, int(pid)):
++        conn.execute("UPDATE agent_watch_state SET tr_pid=?, tr_sid=?, tr_offset=NULL, "
++                     "tr_offset_ts=NULL WHERE target=?", (int(pid), sid, target))
++    return sid, source
++
++
++# ── bounded reading ──────────────────────────────────────────────────────────────────────
++def _first_ts_at(fh, offset: int) -> Optional[tuple]:
++    """(line start, timestamp) of the first complete timestamped line at/after offset."""
++    fh.seek(offset)
++    blob = fh.read(PROBE_BYTES)
++    pos = 0
++    if offset:
++        nl = blob.find(b"\n")
++        if nl < 0:
++            return None
++        pos = nl + 1
++    while True:
++        nl = blob.find(b"\n", pos)
++        if nl < 0:
++            return None
++        m = _TS_RE.search(blob, pos, nl)
++        t = _epoch(m.group(1)) if m else None
++        if t is not None:
++            return offset + pos, t
++        pos = nl + 1
++
++
++def _start_offset(fh, size: int, since: float, ckpt: tuple) -> int:
++    """A line start at or before the first line written after `since`."""
++    off, off_ts = ckpt
++    if off is not None and off_ts is not None and off <= size and off_ts <= since:
++        lo = int(off)
++    else:
++        lo = 0
++    hi = size
++    while hi - lo > PROBE_BYTES:
++        mid = (lo + hi) // 2
++        hit = _first_ts_at(fh, mid)
++        if hit is None or hit[1] >= since:
++            hi = mid
++        else:
++            lo = hit[0]
++    return lo
++
++
++def submitted_prompts(path: str, since: float, *, conn=None, target: str = "") -> dict:
++    """{"complete": bool, "prompts": [(ts, {sha256…}), …]} for prompts after `since`."""
++    from core import agent_privilege as _ap
++    out = {"complete": False, "prompts": []}
++    try:
++        size = os.path.getsize(path)
++        ckpt = _state(conn, target)[2:] if conn is not None else (None, None)
++        with _ap.open_regular(path, "rb") as fh:
++            start = _start_offset(fh, size, since, ckpt)
++            fh.seek(start)
++            blob = fh.read(min(size - start, SCAN_BUDGET_BYTES))
++    except Exception:  # noqa: BLE001 — unreadable: incomplete
++        return out
++    end = blob.rfind(b"\n") + 1
++    pos, safe_off, safe_ts, past = 0, start, None, False
++    for raw in blob[:end].split(b"\n"):
++        line_start, pos = pos, pos + len(raw) + 1
++        if not raw:
++            continue
++        m = _TS_RE.search(raw)
++        t_line = _epoch(m.group(1)) if m else None
++        if not past and t_line is not None:
++            if t_line <= since:
++                safe_off, safe_ts = start + line_start, t_line
++            else:
++                past = True
++        if b'"human"' not in raw:
++            continue
++        try:
++            d = json.loads(raw.decode("utf-8", "replace"))
++        except Exception:  # noqa: BLE001 — a torn line
++            continue
++        content = (d.get("message") or {}).get("content")
++        if (d.get("type") != "user" or d.get("isMeta") or d.get("isCompactSummary")
++                or not isinstance(content, str)
++                or (d.get("origin") or {}).get("kind") != "human"):
++            continue
++        t = _epoch(d.get("timestamp"))
++        if t is not None and t > since:
++            out["prompts"].append((t, _fingerprints(content)))
++    out["complete"] = start + len(blob) >= size
++    if conn is not None and target and safe_ts is not None:
++        # a line start whose own time is not after `since`: always safe to resume from
++        conn.execute("UPDATE agent_watch_state SET tr_offset=?, tr_offset_ts=? "
++                     "WHERE target=?", (safe_off, safe_ts, target))
++    return out
++
++
++# ── attribution ──────────────────────────────────────────────────────────────────────────
++def _deliveries_near(target: str, ts: float) -> Optional[list]:
++    """[(created_ts, text_sha256 or None, caller class)] to this session, or None when the
++    delivery store cannot be read."""
++    try:
++        from core import agent_control as _ac
++        session = target.split(":", 1)[0]
++        like = (session.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
++                + ":%")
++        db = sqlite3.connect(f"file:{_ac._db_path()}?mode=ro", uri=True, timeout=5)
++        try:
++            rows = db.execute(
++                "SELECT d.created_ts, p.text_sha256, a.actor, a.source FROM deliveries d "
++                "LEFT JOIN delivery_provenance p ON p.idempotency_key = d.idempotency_key "
++                "LEFT JOIN delivery_attribution a ON a.idempotency_key = d.idempotency_key "
++                "WHERE (d.target=? OR d.target LIKE ? ESCAPE '\\') "
++                "AND d.action != 'agent_stop' AND d.created_ts BETWEEN ? AND ?",
++                (target, like, ts - ATTRIBUTION_WINDOW_SECS,
++                 ts + ATTRIBUTION_WINDOW_SECS)).fetchall()
++        finally:
++            db.close()
++        return [(float(r[0]), r[1], _ac.caller_class(r[2], r[3])) for r in rows]
++    except Exception:  # noqa: BLE001
++        return None
++
++
++def attribute(target: str, ts: float, fingerprints: set) -> str:
++    """'api' / 'internal' (an automated sender typed it), 'human', or 'unknown'."""
++    rows = _deliveries_near(target, ts)
++    if rows is None:
++        return "unknown"
++    for _t, sha, cls in rows:
++        if sha and sha in fingerprints:
++            return "api" if cls == "api" else "internal"
++    if any(sha is None and abs(t - ts) <= UNFINGERPRINTED_WINDOW_SECS for t, sha, _ in rows):
++        return "unknown"            # something typed then, and we cannot tell what
++    return "human"
++
++
++def task_since(agent: dict, target: str, since: float, conn) -> dict:
++    """{"verdict": "task"|"none"|"unknown", "ts": float|None, "reason": str}."""
++    sid, how = resolve_session(agent, target, since, conn)
++    if not sid:
++        return {"verdict": "unknown", "ts": None, "reason": how}
++    path = _transcript(agent.get("claude_cwd") or agent.get("cwd") or "", sid)
++    if not path:
++        return {"verdict": "unknown", "ts": None, "reason": "no_transcript"}
++    seen = submitted_prompts(path, since, conn=conn, target=target)
++    unknown = ""
++    for t, fps in sorted(seen["prompts"], reverse=True):
++        who = attribute(target, t, fps)
++        if who in ("human", "api"):
++            return {"verdict": "task", "ts": t, "reason": f"{who}_prompt_via_{how}"}
++        if who == "unknown":
++            unknown = "unattributed_prompt"
++    if unknown:
++        return {"verdict": "unknown", "ts": None, "reason": unknown}
++    if not seen["complete"]:
++        return {"verdict": "unknown", "ts": None, "reason": "transcript_backlog"}
++    return {"verdict": "none", "ts": None, "reason": f"no_prompt_via_{how}"}
+diff --git a/tests/test_direct_task_after_stage_done.py b/tests/test_direct_task_after_stage_done.py
+index 169c171..a2d965b 100644
+--- a/tests/test_direct_task_after_stage_done.py
++++ b/tests/test_direct_task_after_stage_done.py
+@@ -40,6 +40,10 @@ def _iso(tmp_path, monkeypatch):
+     monkeypatch.setattr(ap, "claude_home", lambda: str(tmp_path))
+     monkeypatch.setattr(ns, "session_id_for_pid", lambda pid, now=None: SID if pid == 4242 else "")
+     os.makedirs(tmp_path / ".claude" / "projects" / CWD.replace("/", "-"))
++    ac._db().close()                              # the live delivery store always exists
++    for sid in (SID, OTHER_SID):                  # a live session always has its file
++        with open(_tpath(tmp_path, sid), "w", encoding="utf-8") as fh:
++            fh.write(json.dumps({"type": "assistant", "timestamp": _iso_ts(1000.0)}) + "\n")
+     return tmp_path
+ 
+ 
+@@ -84,9 +88,9 @@ def _stage_done(epoch, event_id=1):
+         conn.close()
+ 
+ 
+-def _delivery(epoch, actor=None, key="k1", target=T):
++def _delivery(epoch, actor=None, key="k1", target=T, text=SECRET_TASK, fingerprint=True):
+     ac._record_delivery(key, target, "agent_send", {"delivered": True}, actor=actor,
+-                        text_sha256=ac.text_fingerprint("x"))
++                        text_sha256=ac.text_fingerprint(text) if fingerprint else None)
+     db = sqlite3.connect(os.environ["AGENT_CONTROL_DB"])
+     db.execute("UPDATE deliveries SET created_ts=? WHERE idempotency_key=?", (epoch, key))
+     db.execute("UPDATE delivery_attribution SET recorded_ts=? WHERE idempotency_key=?",
+@@ -119,6 +123,7 @@ def _stopped(emit):
+ def test_a_task_typed_in_tmux_after_stage_done_is_announced(_iso):
+     emit, _, _ = _scenario(_iso, submit=lambda ts: _line(_iso, ts))
+     assert _stopped(emit) == ["work_stopped_incomplete"]
++    assert emit.calls[0]["payload"]["stage_done_evidence"] == "task:human_prompt_via_runtime"
+ 
+ 
+ def test_without_a_submitted_prompt_the_stop_stays_parked(_iso):
+@@ -158,7 +163,8 @@ def test_an_unsent_draft_in_the_composer_does_not_count(_iso):
+     _sweep(emit, drafted, t + 21 + aw.QUIESCENT_SECS)
+     _sweep(emit, drafted, t + 30 + 2 * aw.QUIESCENT_SECS)
+     assert emit.calls == []
+-    assert not os.path.exists(_tpath(_iso))         # nothing was submitted or written
++    with open(_tpath(_iso), encoding="utf-8") as fh:  # nothing was submitted
++        assert '"human"' not in fh.read()
+ 
+ 
+ def test_an_internal_nudge_does_not_rearm(_iso):
+@@ -180,7 +186,7 @@ def test_an_api_task_is_announced_once(_iso):
+ 
+ def test_a_nudge_long_before_the_prompt_does_not_mask_it(_iso):
+     def submit(ts):
+-        _delivery(ts - aw.DELIVERY_MATCH_SECS - 30, actor=None)
++        _delivery(ts - aw.DELIVERY_MATCH_SECS - 30, actor=None, text="continue")
+         _line(_iso, ts)
+     emit, _, _ = _scenario(_iso, submit=submit)
+     assert _stopped(emit) == ["work_stopped_incomplete"]
+@@ -196,9 +202,23 @@ def test_another_session_in_the_same_directory_does_not_count(_iso):
+     assert emit.calls == []
+ 
+ 
+-def test_an_unknown_session_keeps_the_previous_behaviour(_iso):
+-    emit, _, _ = _scenario(_iso, submit=lambda ts: _line(_iso, ts), pid=777)
+-    assert emit.calls == []
++def test_an_unknown_session_is_announced_once_and_not_rewoken(_iso):
++    """No identity at all: the stop is announced once (never parked silently, never
++    guessed as a task) and its watch is the stage's rest, so it is not re-woken."""
++    emit, _, t = _scenario(_iso, submit=lambda ts: _line(_iso, ts), pid=777)
++    assert _stopped(emit) == ["work_stopped_incomplete"]
++    assert emit.calls[0]["payload"]["stage_done_evidence"] == "unknown:session_unresolved"
++    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
++    conn.execute("INSERT INTO event (id, ts, ts_epoch, source, type, agent_id, payload) "
++                 "VALUES (501, 'x', ?, 'agent_watch', 'work_stopped_incomplete', ?, ?)",
++                 (t + 402, T, json.dumps({"excerpt": "Сделал шаг 1 из 3"})))
++    conn.commit()
++    conn.close()
++    clw.register_delivery(event_id=501, target=T, project_id="p",
++                          event_type="work_stopped_incomplete", now=t + 410)
++    out = [clw.slo_scan(now=t + 410 + k * (clw.WAKE_LOOP_SLO_SECS + 1), emit_fn=_Emit())
++           for k in (1, 2, 3)]
++    assert not any(r["rewoken"] or r["escalated"] for r in out), out
+ 
+ 
+ # ── persistence, closed loop, real prompts and failures ─────────────────────────────────
+@@ -247,3 +267,204 @@ def test_the_prompt_text_is_never_stored(_iso):
+         dump = "\n".join(conn.iterdump())
+         conn.close()
+         assert "synthetic-owner-task-7f3a" not in dump
++
++
++# ── residuals of c1f629f ────────────────────────────────────────────────────────────────
++# R1: a human prompt typed seconds after an automated nudge was attributed to the nudge.
++def test_r1_a_human_prompt_right_after_a_nudge_is_a_task(_iso):
++    def submit(ts):
++        _delivery(ts - 10, actor=None, text="continue with the next safe step")
++        _line(_iso, ts)                             # the owner's own, different text
++    emit, _, _ = _scenario(_iso, submit=submit)
++    assert _stopped(emit) == ["work_stopped_incomplete"]
++
++
++def test_r1_the_nudge_itself_is_still_not_a_task(_iso):
++    nudge = "continue with the next safe step"
++    def submit(ts):
++        _delivery(ts + 3, actor=None, text=nudge)
++        _line(_iso, ts, text=nudge)
++    emit, _, _ = _scenario(_iso, submit=submit)
++    assert emit.calls == []
++
++
++def test_r1_a_wrapped_paste_is_attributed_to_its_delivery(_iso):
++    body = "line one of a long reminder\nline two"
++    wrapped = f'<pasted_content id="ab12">\n{body}\n</pasted_content id="ab12">'
++    def submit(ts):
++        _delivery(ts + 3, actor=None, text=body)
++        _line(_iso, ts, text=wrapped)
++    emit, _, _ = _scenario(_iso, submit=submit)
++    assert emit.calls == []                         # an internal paste: still parked
++
++
++def test_r1_an_unfingerprinted_delivery_at_that_moment_is_unknown(_iso):
++    def submit(ts):
++        _delivery(ts + 3, actor=None, fingerprint=False)
++        _line(_iso, ts)
++    emit, _, _ = _scenario(_iso, submit=submit)
++    assert _stopped(emit) == ["work_stopped_incomplete"]
++    assert emit.calls[0]["payload"]["stage_done_evidence"] == "unknown:unattributed_prompt"
++
++
++# R2: the runtime's session list could not answer.
++def _pidfile(tmp, pid, sid):
++    d = tmp / ".claude" / "sessions"
++    d.mkdir(parents=True, exist_ok=True)
++    (d / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": sid}))
++
++
++def test_r2_claude_codes_own_pid_record_resolves_the_session(_iso, monkeypatch):
++    monkeypatch.setattr(ns, "session_id_for_pid", lambda pid, now=None: "")
++    _pidfile(_iso, 4242, SID)
++    emit, _, _ = _scenario(_iso, submit=lambda ts: _line(_iso, ts))
++    assert _stopped(emit) == ["work_stopped_incomplete"]
++    assert emit.calls[0]["payload"]["stage_done_evidence"] == "task:human_prompt_via_pidfile"
++
++
++def test_r2_a_pid_record_for_another_pid_is_ignored(_iso, monkeypatch):
++    monkeypatch.setattr(ns, "session_id_for_pid", lambda pid, now=None: "")
++    d = _iso / ".claude" / "sessions"
++    d.mkdir(parents=True, exist_ok=True)
++    (d / "4242.json").write_text(json.dumps({"pid": 1, "sessionId": SID}))
++    emit, _, _ = _scenario(_iso, submit=lambda ts: _line(_iso, ts))
++    assert emit.calls[0]["payload"]["stage_done_evidence"] == "unknown:session_unresolved"
++
++
++def test_r2_the_durable_identity_survives_a_lookup_outage(_iso, monkeypatch):
++    emit, t = _Emit(), 10_000.0
++    _sweep(emit, WORK, t, state="working")
++    _stage_done(t + 10)
++    _sweep(emit, DONE, t + 20)
++    _sweep(emit, DONE, t + 21 + aw.QUIESCENT_SECS)  # resolved once, parked: identity kept
++    assert emit.calls == []
++    monkeypatch.setattr(ns, "session_id_for_pid", lambda pid, now=None: "")  # outage
++    _stage_done(t + 1000, event_id=2)
++    _line(_iso, t + 1030)
++    _sweep(emit, WORK, t + 1035, state="working")
++    _sweep(emit, UNFINISHED, t + 1090)
++    _sweep(emit, UNFINISHED, t + 1091 + aw.QUIESCENT_SECS)
++    assert emit.calls[0]["payload"]["stage_done_evidence"] == \
++        "task:human_prompt_via_checkpoint"
++
++
++def test_r2_the_durable_identity_is_not_reused_for_a_new_process(_iso, monkeypatch):
++    emit, t = _Emit(), 10_000.0
++    _sweep(emit, WORK, t, state="working")
++    _stage_done(t + 10)
++    _sweep(emit, DONE, t + 20)
++    _sweep(emit, DONE, t + 21 + aw.QUIESCENT_SECS)
++    monkeypatch.setattr(ns, "session_id_for_pid", lambda pid, now=None: "")
++    _stage_done(t + 1000, event_id=2)
++    _line(_iso, t + 1030)
++    _sweep(emit, WORK, t + 1035, state="working", pid=5151)    # restarted claude
++    _sweep(emit, UNFINISHED, t + 1090, pid=5151)
++    _sweep(emit, UNFINISHED, t + 1091 + aw.QUIESCENT_SECS, pid=5151)
++    assert emit.calls[0]["payload"]["stage_done_evidence"] == "unknown:session_unresolved"
++
++
++def test_r2_a_new_session_in_the_same_process_resets_the_checkpoint(_iso, monkeypatch):
++    emit, t = _Emit(), 10_000.0
++    _scenario(_iso)                                  # parks; identity + checkpoint stored
++    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
++    assert conn.execute("SELECT tr_sid FROM agent_watch_state").fetchone()[0] == SID
++    conn.close()
++    monkeypatch.setattr(ns, "session_id_for_pid", lambda pid, now=None: OTHER_SID)  # /clear
++    _stage_done(t + 2000, event_id=2)
++    _line(_iso, t + 2030, sid=OTHER_SID)
++    _sweep(emit, WORK, t + 2035, state="working")
++    _sweep(emit, UNFINISHED, t + 2090)
++    _sweep(emit, UNFINISHED, t + 2091 + aw.QUIESCENT_SECS)
++    assert _stopped(emit) == ["work_stopped_incomplete"]
++    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
++    assert conn.execute("SELECT tr_sid FROM agent_watch_state").fetchone()[0] == OTHER_SID
++    conn.close()
++
++
++# R3: much output after the prompt; a long history before it.
++def _bulk(tmp, epoch_from, epoch_to, mb, sid=SID):
++    n = max(1, int(mb * 1024 * 1024 / 2048))
++    pad = "y" * 1900
++    with open(_tpath(tmp, sid), "a", encoding="utf-8") as fh:
++        for i in range(n):
++            ts = epoch_from + (epoch_to - epoch_from) * i / n
++            fh.write(json.dumps({"type": "assistant", "timestamp": _iso_ts(ts),
++                                 "message": {"content": pad}}) + "\n")
++
++
++def test_r3_a_prompt_followed_by_megabytes_of_output_is_found(_iso):
++    def submit(ts):
++        _line(_iso, ts)
++        _bulk(_iso, ts + 1, ts + 50, 3)              # 3 MB after the prompt
++    emit, _, _ = _scenario(_iso, submit=submit)
++    assert _stopped(emit) == ["work_stopped_incomplete"]
++
++
++def test_r3_a_long_history_is_skipped_not_read(_iso, monkeypatch):
++    _bulk(_iso, 1000.0, 9_000.0, 24)                 # 24 MB written before the stage
++    read = {"n": 0}
++    real_open = ap.open_regular
++
++    def counting(path, mode="r", **kw):
++        fh = real_open(path, mode, **kw)
++        orig = fh.read
++
++        def rd(*a):
++            b = orig(*a)
++            read["n"] += len(b)
++            return b
++        fh.read = rd
++        return fh
++    monkeypatch.setattr(ap, "open_regular", counting)
++    emit, _, _ = _scenario(_iso, submit=lambda ts: _line(_iso, ts))
++    assert _stopped(emit) == ["work_stopped_incomplete"]
++    assert read["n"] < 4 * 1024 * 1024, read        # binary search, not 24 MB
++
++
++def test_r3_more_than_the_budget_since_the_stage_is_unknown(_iso, monkeypatch):
++    monkeypatch.setattr(aw._te, "SCAN_BUDGET_BYTES", 1024 * 1024)
++    def submit(ts):
++        _bulk(_iso, ts - 25, ts - 1, 3)               # 3 MB between stage and prompt
++        _line(_iso, ts)
++    emit, _, _ = _scenario(_iso, submit=submit)
++    assert _stopped(emit) == ["work_stopped_incomplete"]
++    assert emit.calls[0]["payload"]["stage_done_evidence"] == "unknown:transcript_backlog"
++
++
++def test_r3_the_checkpoint_is_persisted_before_the_stage(_iso):
++    _bulk(_iso, 1000.0, 9_000.0, 2)
++    _scenario(_iso)
++    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
++    off, off_ts = conn.execute("SELECT tr_offset, tr_offset_ts FROM agent_watch_state"
++                               ).fetchone()
++    conn.close()
++    assert off and off_ts <= 10_010.0               # never past the stage_done
++
++
++def test_r2_a_new_sessions_file_is_read_from_its_start_not_the_old_offset(_iso, monkeypatch):
++    _bulk(_iso, 1000.0, 9_000.0, 2)                  # old session: a 2 MB history
++    _scenario(_iso)                                  # checkpoint ~2 MB into the old file
++    monkeypatch.setattr(ns, "session_id_for_pid", lambda pid, now=None: OTHER_SID)  # /clear
++    emit, t = _Emit(), 10_000.0
++    _stage_done(t + 2000, event_id=2)
++    _line(_iso, t + 2030, sid=OTHER_SID)             # near the start of the new file
++    _bulk(_iso, t + 2031, t + 2080, 3, sid=OTHER_SID)
++    _sweep(emit, WORK, t + 2035, state="working")
++    _sweep(emit, UNFINISHED, t + 2090)
++    _sweep(emit, UNFINISHED, t + 2091 + aw.QUIESCENT_SECS)
++    assert _stopped(emit) == ["work_stopped_incomplete"]
++
++
++def test_r3_the_checkpoint_never_passes_the_stage_even_with_later_output(_iso):
++    _bulk(_iso, 1000.0, 9_000.0, 1)
++    _scenario(_iso, submit=lambda ts: _bulk(_iso, ts, ts + 50, 1))  # output, no prompt
++    conn = sqlite3.connect(os.environ["CONTROL_PLANE_DB"])
++    off_ts = conn.execute("SELECT tr_offset_ts FROM agent_watch_state").fetchone()[0]
++    conn.close()
++    assert off_ts is not None and off_ts <= 10_010.0
++
++
++def test_r1_an_unreadable_delivery_store_is_unknown_not_human(_iso, monkeypatch):
++    monkeypatch.setattr(ac, "_db_path", lambda: str(_iso / "missing" / "ac.db"))
++    emit, _, _ = _scenario(_iso, submit=lambda ts: _line(_iso, ts))
++    assert emit.calls[0]["payload"]["stage_done_evidence"] == "unknown:unattributed_prompt"
+diff --git a/tests/test_watchdog_rewake_after_release.py b/tests/test_watchdog_rewake_after_release.py
+index c037556..8ec42be 100644
+--- a/tests/test_watchdog_rewake_after_release.py
++++ b/tests/test_watchdog_rewake_after_release.py
+@@ -48,6 +48,10 @@ def _iso(tmp_path, monkeypatch):
+     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
+     monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
+     monkeypatch.setenv("AGENT_CONTROL_AUDIT", str(tmp_path / "audit.jsonl"))
++    # these panes read as "transcript checked, no new task" (core.task_evidence has its
++    # own tests in test_direct_task_after_stage_done / test_task_evidence_residuals)
++    monkeypatch.setattr(aw._te, "task_since", lambda *a, **k: {
++        "verdict": "none", "ts": None, "reason": "no_prompt_via_test"})
+ 
+ 
+ PARKED = ("agent_dependency_wait", "stage_done_handoff")

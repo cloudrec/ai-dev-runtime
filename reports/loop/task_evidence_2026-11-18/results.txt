@@ -1,0 +1,6 @@
+candidate 0a0c456 (supersedes c1f629f, kept on owneros/candidate-c1f629f); live ee9f1fa
+base c1f629f: test_direct_task_after_stage_done 15 failed / 21 passed
+head 0a0c456: 36 passed; focused 756 passed
+mutants: 14/14 killed
+full suite 0a0c456: 5493 passed, 4 skipped, EXIT 0
+live read-only check: own pane verdict task/api, 0.39 s, in-memory state

@@ -9,6 +9,8 @@
 
 **Also live since 16:56Z:** the WEST dependency-wait wordings and the changed-task-identity re-arm. See `reports/OWNER_OS_ACCEPTANCE_2026-11-17.md`.
 
+**New candidate (2026-11-18):** 0a0c456 supersedes c1f629f (kept on `owneros/candidate-c1f629f`): content attribution, durable session identity, bounded transcript scan; Full Cycle acceptance spec (`reports/OWNER_OS_TASK_EVIDENCE_2026-11-18.md`).
+
 **On the branch, not live (2026-11-18):** c1f629f, a task typed into tmux after stage_done re-arms the stop; plus a Full Cycle acceptance proposal (`reports/OWNER_OS_DIRECT_TASK_REARM_2026-11-18.md`).
 
 **Released 2026-11-18 04:16Z:** a stage_done rest is not announced again as a stop, and only requests count as an owner confirmation prompt (`reports/OWNER_OS_REWAKE_AFTER_RELEASE_2026-11-17.md`).
