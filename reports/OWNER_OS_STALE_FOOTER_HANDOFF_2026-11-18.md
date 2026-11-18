@@ -118,3 +118,9 @@ Trigger: an automated instruction was received. No deploy, push, route or permis
 **Release, when authorised:** `TARGET_SHA=e876325 deploy/adaptive_offer/install.sh --check`, then `--apply`. Rollback goes through the backup the installer prints. No schema change.
 
 **Candidate** `e876325`. Full suite: 5556 passed, 4 skipped, EXIT 0 (`reports/loop/stale_footer_2026-11-18/full_suite.txt`).
+
+## Released e876325 (owner's direct word "деплой e876325")
+- `install.sh --check` clean, rc 0, payment panes never offered. Then `--apply`: live 758ebe4 → e876325 at 17:55:57Z. No schema change.
+- Rollback: `deploy/adaptive_offer/rollback.sh /root/ai-dev-runtime/backups/adaptive-offer-20261118T175557Z`.
+- Units active: ai-runtime, wake-companion, fullcycle-intake, fullcycle-worker. 0 tracebacks.
+- The first watch sweep ran at 17:57Z: 15 panes classified (working 3, idle 8, owner_prompt 2, blocker 2), 0 `stale_active_footer` demotions.
