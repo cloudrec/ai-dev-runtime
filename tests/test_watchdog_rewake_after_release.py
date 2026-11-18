@@ -48,6 +48,10 @@ def _iso(tmp_path, monkeypatch):
     monkeypatch.setenv("CONTROL_PLANE_DB", str(tmp_path / "cp.db"))
     monkeypatch.setenv("AGENT_CONTROL_DB", str(tmp_path / "ac.db"))
     monkeypatch.setenv("AGENT_CONTROL_AUDIT", str(tmp_path / "audit.jsonl"))
+    # these panes read as "transcript checked, no new task" (core.task_evidence has its
+    # own tests in test_direct_task_after_stage_done / test_task_evidence_residuals)
+    monkeypatch.setattr(aw._te, "task_since", lambda *a, **k: {
+        "verdict": "none", "ts": None, "reason": "no_prompt_via_test"})
 
 
 PARKED = ("agent_dependency_wait", "stage_done_handoff")

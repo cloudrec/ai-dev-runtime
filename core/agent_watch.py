@@ -149,7 +149,10 @@ _STATE_COLUMNS = (("miss_count", "INTEGER DEFAULT 0"),
                   ("wait_lapsed_digest", "TEXT"),
                   # when the tech lead/owner last delivered a task (note_task_delivered):
                   # a stage_done older than that belongs to the previous task
-                  ("task_ts", "REAL"))
+                  ("task_ts", "REAL"),
+                  # core.task_evidence: the pane's resolved session and a scan checkpoint
+                  ("tr_pid", "INTEGER"), ("tr_sid", "TEXT"), ("tr_offset", "INTEGER"),
+                  ("tr_offset_ts", "REAL"))
 
 
 def _migrate_state(conn) -> None:
@@ -870,113 +873,11 @@ def _stage_done_covers(conn, target: str, *, digest_since, task_ts) -> Optional[
     return float(r[0]) if r and r[0] is not None else None
 
 
-# A task SUBMITTED straight into the pane (the owner typing in tmux) after the stage_done
-# is a new task, exactly like one delivered through the API (`note_task_delivered`), but
-# nothing recorded it: its stop, if it came within REARM_WORK_SECS of the stage_done, was
-# parked as the old hand-over (residual 2 of the ee9f1fa report).
-#
-# The evidence is the session's own transcript, never the pane: Claude Code writes a
-# `user` entry with `origin.kind == "human"` only when a prompt is SUBMITTED, so an unsent
-# draft in the composer, the CLI's suggested prompt, a recalled ghost, tool results, task
-# notifications, compaction summaries and meta entries never count. The session is the
-# one running as the pane's Claude pid (core.native_sessions), never "the newest file in
-# the directory", which would mix two agents sharing a cwd. Automated sends type into the
-# same composer, so a prompt with an agent_control delivery to this session within
-# DELIVERY_MATCH_SECS is attributed to it: an API delivery already re-armed through
-# `note_task_delivered`, and an internal nudge must not re-arm (#338). Only the prompt's
-# time is read; its text is never stored or compared. Unknown (no session, unreadable
-# transcript) is "no evidence", which keeps the previous behaviour.
-DELIVERY_MATCH_SECS = int(os.getenv("AGENT_WATCH_DELIVERY_MATCH_SECS", "90"))
-TRANSCRIPT_SCAN_BYTES = int(os.getenv("AGENT_WATCH_TRANSCRIPT_SCAN_BYTES", str(2 * 1024 * 1024)))
-
-
-def _transcript_for(agent: dict) -> str:
-    try:
-        from core import agent_privilege as _ap
-        from core import native_sessions as _ns
-        pid = agent.get("claude_pid") or agent.get("pid")
-        sid = _ns.session_id_for_pid(pid) if pid else ""
-        if not sid:
-            return ""
-        cwd = agent.get("claude_cwd") or agent.get("cwd") or ""
-        return next((p for p in _ap.transcripts(cwd)
-                     if os.path.basename(p) == sid + ".jsonl"), "")
-    except Exception:  # noqa: BLE001 — no opinion
-        return ""
-
-
-def _iso_epoch(value) -> Optional[float]:
-    import datetime as _dt
-    try:
-        return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def submitted_prompt_times(path: str, since: float) -> list:
-    """Times of prompts a person or a sender SUBMITTED after `since` (newest last)."""
-    import json as _json
-    if not path:
-        return []
-    try:
-        from core import agent_privilege as _ap
-        size = os.path.getsize(path)
-        start = max(0, size - TRANSCRIPT_SCAN_BYTES)
-        with _ap.open_regular(path, "rb") as fh:
-            fh.seek(start)
-            if start:
-                fh.readline()
-            blob = fh.read()
-    except Exception:  # noqa: BLE001 — unreadable: no evidence
-        return []
-    out = []
-    for raw in blob.split(b"\n"):
-        if b'"human"' not in raw:
-            continue
-        try:
-            d = _json.loads(raw.decode("utf-8", "replace"))
-        except Exception:  # noqa: BLE001 — a torn line
-            continue
-        if (d.get("type") != "user" or d.get("isMeta") or d.get("isCompactSummary")
-                or not isinstance((d.get("message") or {}).get("content"), str)
-                or (d.get("origin") or {}).get("kind") != "human"):
-            continue
-        t = _iso_epoch(d.get("timestamp"))
-        if t is not None and t > since:
-            out.append(t)
-    return sorted(out)
-
-
-def _sender_classes_near(target: str, ts: float) -> list:
-    """Caller classes of agent_control deliveries to this session around `ts`."""
-    import sqlite3
-    try:
-        from core import agent_control as _ac
-        session = target.split(":", 1)[0]
-        db = sqlite3.connect(f"file:{_ac._db_path()}?mode=ro", uri=True, timeout=5)
-        try:
-            rows = db.execute(
-                "SELECT a.actor, a.source FROM deliveries d LEFT JOIN delivery_attribution a "
-                "ON a.idempotency_key = d.idempotency_key "
-                "WHERE (d.target=? OR d.target LIKE ? ESCAPE '\\') AND d.action != 'agent_stop' "
-                "AND d.created_ts BETWEEN ? AND ?",
-                (target, session.replace("\\", "\\\\").replace("%", "\\%")
-                 .replace("_", "\\_") + ":%", ts - DELIVERY_MATCH_SECS,
-                 ts + DELIVERY_MATCH_SECS)).fetchall()
-        finally:
-            db.close()
-        return [_ac.caller_class(r[0], r[1]) for r in rows]
-    except Exception:  # noqa: BLE001 — no delivery store: nothing is attributed
-        return []
-
-
-def direct_task_since(agent: dict, target: str, since: float) -> Optional[float]:
-    """The newest prompt submitted after `since` that no internal sender typed, or None."""
-    for t in reversed(submitted_prompt_times(_transcript_for(agent), since)):
-        classes = _sender_classes_near(target, t)
-        if not classes or "api" in classes:
-            return t
-    return None
+# A task given to the agent after its stage_done makes the stop news again. API deliveries
+# re-arm through `note_task_delivered`; a task typed straight into tmux is found, read-only
+# and bounded, in the session transcript (core.task_evidence: task / none / unknown).
+from core import task_evidence as _te  # noqa: E402
+DELIVERY_MATCH_SECS = _te.UNFINGERPRINTED_WINDOW_SECS
 
 
 def _declare_dependency_wait(conn, target: str, now: float, digest: str,
@@ -1147,13 +1048,18 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                     and not _ERRORISH_RE.search(_final_message(tail))):
                 stage_ts = _stage_done_covers(conn, target, digest_since=digest_since,
                                               task_ts=row[9] if row else None)
+            evidence = None
             if stage_ts is not None:
-                direct = direct_task_since(a, target, stage_ts)
-                if direct is not None:
+                evidence = _te.task_since(a, target, stage_ts, conn)
+                if evidence["verdict"] == "task":
                     # a task was submitted after the stage: its stop is news. Recorded,
                     # so closed_loop and every later sweep see the same evidence.
                     conn.execute("UPDATE agent_watch_state SET task_ts=MAX(COALESCE("
-                                 "task_ts, 0), ?) WHERE target=?", (direct, target))
+                                 "task_ts, 0), ?) WHERE target=?", (evidence["ts"], target))
+                    stage_ts = None
+                elif evidence["verdict"] == "unknown":
+                    # not knowable: announce the stop once, never park it silently; its
+                    # watch is still the stage's rest, so closed_loop does not re-wake it
                     stage_ts = None
             stage_handoff = stage_ts is not None
             dep_wait = (cls == "quiescent" and bool(a.get("alive"))
@@ -1249,7 +1155,10 @@ def scan(*, agents: Optional[list] = None, read_fn: Optional[Callable] = None,
                          "class_reason": c.get("reason", ""),
                          "cwd": a.get("claude_cwd") or a.get("cwd") or "",
                          "project": project or "(unmapped -> owner-os)",
-                         "excerpt": ex},
+                         "excerpt": ex,
+                         **({"stage_done_evidence":
+                             f"{evidence['verdict']}:{evidence['reason']}"}
+                            if evidence else {})},
                 action_taken=f"{target} [{project or 'unmapped'}]: {cls} — {ex[:120]}",
                 correlation_id=f"agentwatch:{target}",
                 dedup_key=f"agentwatch:{target}:{cls}:{dg}",
