@@ -64,7 +64,30 @@ In `core/fullcycle/intake.py` `start()`, roughly lines 255–345:
 - DEV only: no deploy, restart, push, permission change or payment agent. No GAIKA changes.
 - The schema addition is created on first use. Release later through `deploy/adaptive_offer/install.sh --check`/`--apply`, rolling back with the backup it prints.
 
-## Clean-session start
-In a new Claude session in `/opt/owneros-autonomy-loop` (same branch), send:
+## Clean-session start (updated: live is e876325)
+Live runtime is now **e876325**. `core/fullcycle/` is unchanged between 758ebe4 and e876325 (`git diff --stat 758ebe4 e876325 -- core/fullcycle` is empty), so the code reading above still holds. **Old-version reproduction runs on e876325**, in a scratch copy.
 
-> Read reports/OWNER_OS_INTAKE_RACE_HANDOFF_2026-11-18.md and reports/OWNER_OS_LOOP_HANDOFF_2026-11-17.md (Current state). Implement the intake start race fix as specified there, DEV only, with the listed tests, an old-version failing reproduction, mutants and the full suite; then stage_done. No deploy, push, permission change or GAIKA change.
+**Deliverables** go in `reports/loop/intake_race_2026-11-18/`, so they are readable through agent_report:
+- `runtime.diff`: code **and** test diff against e876325;
+- `full_suite.txt`;
+- `old_version.txt`: the new tests failing on e876325;
+- `mutants.txt`;
+- a short section in this file covering the exact commit, migration implications (new table, created on first use, no data rewrite, still harmless after a rollback) and rollback.
+
+The previous session stopped here because its context was too long. It did not start the work.
+
+**Command, run in a new tmux window** (not the old session):
+
+    cd /opt/owneros-autonomy-loop && claude --model opus
+
+Then send:
+
+> Read reports/OWNER_OS_INTAKE_RACE_HANDOFF_2026-11-18.md (whole file) and the "Current state" section of reports/OWNER_OS_LOOP_HANDOFF_2026-11-17.md. Inspect core/fullcycle intake code first. Implement the intake start race fix in DEV on branch owneros/autonomy-loop-20261117, from live e876325. The fix must:
+> - atomically reserve the project id together with the max_active capacity;
+> - make an identical retry while pending return intake_in_progress;
+> - make a conflicting spec an explicit refusal;
+> - on a crash or partial copy, fail closed and keep the evidence, deleting nothing;
+> - enforce the repo allowlist;
+> - create no duplicate jobs, agents or spec versions.
+>
+> Write deterministic concurrency and crash tests, run them on e876325 to show they fail there, run mutants on a scratch copy, then the full suite. Save the deliverables listed there. Commit locally, run stage_done, then stop. No push, deploy, restart, permission change, payment agent or GAIKA change. No parallel agents.
