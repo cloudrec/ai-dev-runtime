@@ -1,0 +1,27 @@
+# /opt/fc-projects/acc-d3 evidence before removal, 2026-11-18T10:41:43Z
+0b76d9c fullcycle: report (attempt 1) — Complete text statistics report
+844e082 fullcycle: char-stats (attempt 1) — Add character and longest-word statistics
+c79c86f fullcycle: word-count (attempt 2) — Implement word count
+829339d baseline
+dirty_files=0
+./.fullcycle/results/char-stats-1.json
+./.fullcycle/results/report-1.json
+./.fullcycle/results/word-count-1.json
+./.fullcycle/results/word-count-2.json
+./.fullcycle/tasks/char-stats-1.json
+./.fullcycle/tasks/report-1.json
+./.fullcycle/tasks/word-count-1.json
+./.fullcycle/tasks/word-count-2.json
+./.gitignore
+./README.md
+./tests/__init__.py
+./tests/test_char_stats.py
+./tests/test_report.py
+./tests/test_word_count.py
+./text_stats.py
+Ran 20 tests in 0.001s
+
+OK
+
+OK
+412K	/opt/fc-projects/acc-d3

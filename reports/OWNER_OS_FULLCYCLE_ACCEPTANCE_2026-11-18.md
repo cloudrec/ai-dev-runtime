@@ -104,4 +104,4 @@ D1 and D2 are transport defects for a follow-up in DEV. They need no live watch.
   - review ids 138 and 139;
   - events 88629, 88633, 88643, 88652, 88672;
   - the repo log above.
-- Remove `/opt/fc-projects/acc-20261118` only after a go.
+- Removed 2026-11-18 10:39Z on the owner's word; evidence in `reports/loop/acceptance_cleanup_2026-11-18/acc-20261118.txt`.
