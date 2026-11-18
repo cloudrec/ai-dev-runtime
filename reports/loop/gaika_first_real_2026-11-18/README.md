@@ -40,3 +40,29 @@
 - Both late receipts came from the **periodic** reconcile, journal format `wake send reconcile: event N -> delivered`.
 - The **pre-send** reconcile line is `(before event …)` and has still not appeared, so it is still unexercised live.
 - D2 recurred: 4 post-send `WebSocketTimeoutException` between 11:58 and 12:08Z. Without the 2883d2b fix, both events would have stayed undelivered.
+
+## Result: done (event 89118)
+**Timeline:**
+- start 12:49:02Z;
+- attempt 1 delivered at 12:53:33 (R145);
+- the tech lead approved at 12:54:34;
+- done at 12:55:05.
+
+That is 6 minutes, with one agent and no gates.
+
+**Commit.** `cffb09a9` on base 1181e47d, saved as `cffb09a9.patch`. It changes only `tests/project-doc-counts.test.mjs` (+35 −2):
+- A helper, `archiveShopDirectories(root)`, filters with `readdir(..., {withFileTypes:true})` and `isDirectory()`. The selection is by file type, not by name.
+- The ROADMAP blockers walk uses the helper.
+- The other var/catalog walk (the CLAUDE.md age-label test) already swallows read errors with `continue`, so it never threw. It is left unchanged, correctly.
+- The new synthetic temp-dir test asserts that only the shop directory is returned. Plain `refresh-queue.json*` files are excluded.
+- No assertion was removed or weakened.
+
+**Independent check** (scratch export of cffb09a9, not near live):
+- The file: 23 tests, 20 pass, 0 fail, 3 skip (it had 22 at base).
+- With `var/catalog/atb/products.ndjson` plus the real-shaped plain files `refresh-queue.json.post-reconcile-20261117T152856Z` and `.keys`, the blockers test passes. At base 1181e47d the same fixture threw `ENOTDIR`.
+
+**Nits, not blocking:**
+- The helper sits between two import lines.
+- The new test exercises the helper and does not replay the old inline filter.
+
+**Not done:** merging into the GAIKA trunk. That is the integration owner's step (gaika-country-ru) or the owner's. The fix lives only in the project copy `/opt/fc-projects/gaika-catalog-walk` (kept).

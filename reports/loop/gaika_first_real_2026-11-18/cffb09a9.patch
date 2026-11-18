@@ -1,0 +1,75 @@
+From cffb09a98d3d44ac580b244840348bbfc8f5abbe Mon Sep 17 00:00:00 2001
+From: Owner OS fullcycle <fullcycle@localhost>
+Date: Wed, 18 Nov 2026 13:54:33 +0100
+Subject: [PATCH] =?UTF-8?q?fullcycle:=20catalog-walk=20(attempt=201)=20?=
+ =?UTF-8?q?=E2=80=94=20Fix=20catalog=20traversal=20test?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+---
+ tests/project-doc-counts.test.mjs | 37 +++++++++++++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/tests/project-doc-counts.test.mjs b/tests/project-doc-counts.test.mjs
+index 0fba8ad1..a3e5b271 100644
+--- a/tests/project-doc-counts.test.mjs
++++ b/tests/project-doc-counts.test.mjs
+@@ -22,6 +22,14 @@ import test from "node:test";
+ import { marketRows, tableShapeProblems } from "../tools/handoff-table.mjs";
+ import assert from "node:assert/strict";
+ import { readFile } from "node:fs/promises";
++
++// Shop archives are DIRECTORIES under var/catalog/. Ordinary files live beside
++// them too (refresh-queue.json.post-reconcile-*, which no `.json` suffix test
++// catches); probing `<file>/products.ndjson` on one throws ENOTDIR.
++async function archiveShopDirectories(root) {
++  const { readdir } = await import("node:fs/promises");
++  return (await readdir(root, { withFileTypes: true })).filter((entry) => entry.isDirectory()).map((entry) => entry.name);
++}
+ import { listCountryCodes, describeMarket } from "../core/registry.js";
+ 
+ const claude = await readFile(new URL("../CLAUDE.md", import.meta.url), "utf8");
+@@ -762,8 +770,7 @@ test("ROADMAP_EXECUTION.md's cross-cutting blockers are re-derived, not remember
+   // 4. THE CATALOG ROW, which needs the archives and so skips without them.
+   let shops;
+   try {
+-    shops = (await readdir(new URL("../var/catalog/", import.meta.url)))
+-      .filter((name) => !name.endsWith(".json"));
++    shops = await archiveShopDirectories(new URL("../var/catalog/", import.meta.url));
+   } catch {
+     return t.skip("no archives here — var/ is gitignored build output");
+   }
+@@ -787,3 +794,29 @@ test("ROADMAP_EXECUTION.md's cross-cutting blockers are re-derived, not remember
+     "the catalog row must keep its correction, and the figure above must keep matching the disk");
+   t.diagnostic(`${withRows.length} archives, ${lexicons.length} lexicons, ${probes.length} desktop probes`);
+ });
++
++test("archive traversal visits shop directories only and never probes ordinary files (ENOTDIR)", async () => {
++  // SYNTHETIC FIXTURE in a temp dir — no production file is read.
++  const { mkdtemp, mkdir, writeFile, rm, access } = await import("node:fs/promises");
++  const { tmpdir } = await import("node:os");
++  const { join } = await import("node:path");
++  const { pathToFileURL } = await import("node:url");
++  const dir = await mkdtemp(join(tmpdir(), "gaika-archive-fixture-"));
++  try {
++    await mkdir(join(dir, "shop-a"));
++    await writeFile(join(dir, "shop-a", "products.ndjson"), '{"ageRestricted":true}\n');
++    await writeFile(join(dir, "refresh-queue.json"), "{}");
++    await writeFile(join(dir, "refresh-queue.json.post-reconcile-20261118T000000Z"), "{}");
++    const root = pathToFileURL(dir + "/");
++    const shops = await archiveShopDirectories(root);
++    assert.deepEqual(shops, ["shop-a"]);
++    // The real per-shop assertion path still executes on the directory…
++    await access(new URL("shop-a/products.ndjson", root));
++    // …and every traversed entry can be probed without ENOTDIR.
++    for (const shop of shops) {
++      await access(new URL(`${shop}/products.ndjson`, root));
++    }
++  } finally {
++    await rm(dir, { recursive: true, force: true });
++  }
++});
+-- 
+2.43.0
+
